@@ -12985,6 +12985,8 @@ pub const SQLColumn = struct {
     /// Display label. Labels need not be unique; rows use matching ordinal positions.
     name: []const u8,
     type: SQLColumnType,
+    /// Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell.
+    named_type: ?antfly_schema_openapi.SQLNamedTypeIdentity = null,
     temporal_kind: ?SQLTemporalKind = null,
     /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
     element_type: ?SQLArrayElementType = null,
@@ -12995,6 +12997,7 @@ pub const SQLColumn = struct {
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "type", "type", false },
+        .{ "named_type", "named_type", false },
         .{ "temporal_kind", "temporal_kind", true },
         .{ "element_type", "element_type", false },
         .{ "numeric_modifier", "numeric_modifier", false },
@@ -13014,6 +13017,13 @@ pub const SQLColumn = struct {
         try jw.write(self.name);
         try jw.objectField("type");
         try jw.write(self.type);
+        if (self.named_type) |value| {
+            try jw.objectField("named_type");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("named_type");
+            try jw.write(@as(?u8, null));
+        }
         if (self.temporal_kind) |value| {
             try jw.objectField("temporal_kind");
             try jw.write(value);
@@ -13051,6 +13061,7 @@ pub const SQLColumnType = enum {
     daterange,
     tsrange,
     tstzrange,
+    enumeration,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -13067,6 +13078,7 @@ pub const SQLColumnType = enum {
             .daterange => "daterange",
             .tsrange => "tsrange",
             .tstzrange => "tstzrange",
+            .enumeration => "enumeration",
         };
         try jw.write(s);
     }
@@ -13090,6 +13102,7 @@ pub const SQLColumnType = enum {
             .{ "daterange", .daterange },
             .{ "tsrange", .tsrange },
             .{ "tstzrange", .tstzrange },
+            .{ "enumeration", .enumeration },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -13366,6 +13379,8 @@ pub const SQLNotice = struct {
 /// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
 pub const SQLParameterDescriptor = struct {
     type: SQLColumnType,
+    /// Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell.
+    named_type: ?antfly_schema_openapi.SQLNamedTypeIdentity = null,
     temporal_kind: ?SQLTemporalKind = null,
     element_type: ?SQLArrayElementType = null,
     nullable: bool,
@@ -13373,6 +13388,7 @@ pub const SQLParameterDescriptor = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", false },
+        .{ "named_type", "named_type", false },
         .{ "temporal_kind", "temporal_kind", true },
         .{ "element_type", "element_type", false },
         .{ "nullable", "nullable", false },
@@ -13390,6 +13406,13 @@ pub const SQLParameterDescriptor = struct {
         try jw.beginObject();
         try jw.objectField("type");
         try jw.write(self.type);
+        if (self.named_type) |value| {
+            try jw.objectField("named_type");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("named_type");
+            try jw.write(@as(?u8, null));
+        }
         if (self.temporal_kind) |value| {
             try jw.objectField("temporal_kind");
             try jw.write(value);

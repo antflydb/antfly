@@ -24,11 +24,18 @@ const describe = @import("describe.zig");
 const Budget = @import("memory_budget.zig");
 const Json = std.json.Value;
 
+/// Named columns require their prepared domain. Ordinary columns retain the
+/// physical input normalization used by native timestamp and numeric pages.
+fn coerceDeclaredDatum(a: std.mem.Allocator, cell: @import("scalar.zig").Datum, column: anytype) !@import("scalar.zig").Datum {
+    if (column.enum_view != null) return describe.coerceDatumTyped(a, cell, @import("scalar.zig").columnType(column));
+    return describe.coerceDatum(a, cell, column.type, column.element_type);
+}
+
 // Fallback plans expose owned wire cells. Re-enter the typed pipeline only
 // through the declared column identity, never through JSON shape inference.
 fn outputCellDatum(a: std.mem.Allocator, value: Json, sql_null: bool, column: describe.Column) !@import("scalar.zig").Datum {
-    if (@import("range_value.zig").kindFromType(column.type) != null or column.temporal_kind != null) {
-        return describe.coerceDatumTyped(a, .{ .value = value, .sql_null = sql_null }, .{ .kind = column.type, .element_type = column.element_type, .temporal_kind = column.temporal_kind });
+    if (column.enum_view != null or @import("range_value.zig").kindFromType(column.type) != null or column.temporal_kind != null) {
+        return describe.coerceDatumTyped(a, .{ .value = value, .sql_null = sql_null }, .{ .kind = column.type, .element_type = column.element_type, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind });
     }
     if (column.type == .number and column.element_type == .numeric and !sql_null) {
         if (value != .string) return error.SqlTypeMismatch;
@@ -1505,7 +1512,7 @@ pub const Stream = struct {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
                 const source = projection_.projections[ordinal] orelse blk: {
                     const column = projection_.stream.context.binding.columns[ordinal];
-                    const definition = [_]@import("scalar.zig").Column{.{ .name = projection_.stream.fields[ordinal], .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier }};
+                    const definition = [_]@import("scalar.zig").Column{.{ .name = projection_.stream.fields[ordinal], .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view }};
                     const direct: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = projection_.page, .definitions = &definition } };
                     break :blk (direct.dictionaryColumn(alloc, 0) catch |err| {
                         if (err == error.OutOfMemory) return err;
@@ -1516,7 +1523,7 @@ pub const Stream = struct {
                 const values = try alloc.dupe(@import("scalar.zig").Datum, source.dictionary.values);
                 for (values) |*value| {
                     const column = projection_.stream.context.binding.columns[ordinal];
-                    value.* = describe.coerceDatum(alloc, value.*, column.type, column.element_type) catch |err| {
+                    value.* = coerceDeclaredDatum(alloc, value.*, column) catch |err| {
                         if (err == error.OutOfMemory) return err;
                         // Scalar delivery records the precise failing row.
                         return null;
@@ -1543,7 +1550,7 @@ pub const Stream = struct {
                     break :blk raw_;
                 };
                 const column = projection_.stream.context.binding.columns[ordinal];
-                return describe.coerceDatum(alloc, cell_, column.type, column.element_type) catch |err| {
+                return coerceDeclaredDatum(alloc, cell_, column) catch |err| {
                     if (err == error.OutOfMemory) return err;
                     projection_.failures[index] = projection_.failures[index] orelse err;
                     return .{};
@@ -1597,7 +1604,7 @@ pub const Stream = struct {
             var projection_error: ?anyerror = null;
             const row = try a.alloc(@import("scalar.zig").Datum, self.fields.len);
             for (self.fields, self.context.binding.columns, row, 0..) |field, column, *value, ordinal| {
-                const cell = if (self.context.binding.scalars.projections[ordinal]) |program|
+                const cell = if (if (ordinal < self.context.binding.scalars.projections.len) self.context.binding.scalars.projections[ordinal] else null) |program|
                     self.context.evaluate(a, program, cells) catch |err| blk: {
                         if (!self.one_scan_page or err == error.OutOfMemory or err == error.QueryCanceled or err == error.DeadlineExceeded) return err;
                         projection_error = projection_error orelse err;
@@ -1607,7 +1614,7 @@ pub const Stream = struct {
                     const raw = try one.cell(a, 0, field);
                     break :blk raw;
                 };
-                value.* = describe.coerceDatum(a, cell, column.type, column.element_type) catch |err| blk: {
+                value.* = coerceDeclaredDatum(a, cell, column) catch |err| blk: {
                     if (!self.one_scan_page or err == error.OutOfMemory or err == error.QueryCanceled or err == error.DeadlineExceeded) return err;
                     projection_error = projection_error orelse err;
                     break :blk @import("scalar.zig").Datum{};
@@ -1783,7 +1790,7 @@ pub const Stream = struct {
                         else typed: {
                             const stored = try row.cell(field);
                             const column = self.context.binding.columns[index];
-                            break :typed try describe.coerceDatum(eval.allocator(), stored, column.type, column.element_type);
+                            break :typed try coerceDeclaredDatum(eval.allocator(), stored, column);
                         };
                         break :blk fields;
                     } else try self.context.projectValues(eval.allocator(), row, self.fields, values);

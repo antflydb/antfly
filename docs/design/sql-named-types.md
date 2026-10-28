@@ -139,15 +139,15 @@ before the original cases receive implementation credit:
 
 1. Bind SQL type-name intents and scalar descriptors to the schema-owned
    definitions. Public JSON schema binding, catalog dependencies and typed-row
-   APIs are implemented; SQL catalog column discovery still rejects enum columns until named
-   SQL column/result contracts are wired end to end. Bound scalar programs now
-   carry exact enum domains through expression evaluation; this is not public
-   SQL column activation.
+   APIs and SQL discovery of those declared native enum columns are implemented.
+   Public SQL result/parameter descriptors and scalar pgwire OIDs now retain
+   that identity. SQL type-name intents in CREATE TABLE and named scalar casts
+   remain unbound; catalog declaration syntax alone does not qualify them.
 2. Complete enum expression operations, uniqueness/FK type compatibility and
    distributed integrity qualification over those public schemas.
-3. Bind named type intents in SQL columns, scalar casts and parameter/result
-   descriptors. Resolve by immutable identity, retain prepared witnesses and
-   wire actual scalar/array OIDs through the existing public/pgwire interfaces.
+3. Bind named type intents in SQL columns and scalar casts, then activate enum
+   arrays. Scalar parameter/result descriptors now retain immutable identities,
+   prepared witnesses and scalar OIDs; array execution remains unsupported.
 4. Activate ADD VALUE across every dependent schema through the existing
    coordinated schema/owner-ACK protocol. Pending or uncertain publication must
    retain a recoverable job handle; it cannot report ready from catalog commit.
@@ -260,7 +260,46 @@ common types, malformed/truncated spill, budget failure and exhaustive allocatio
 failures. Compatibility JSON hashing now agrees with prepared-row hashing for
 enum labels, empty labels, NULL and absent fields.
 
-These changes establish the shared enum value/expression execution layer. Public SQL type
-name/column/result binding, scalar/array OIDs, named casts, distributed dependent
-schema activation, domains and original enum DDL qualification remain incomplete.
-No original inventory disposition was changed for these runtime probes.
+These changes establish the shared enum value/expression execution layer. SQL
+names, enum arrays, distributed dependent-schema activation, domains and original
+enum DDL qualification remain incomplete. No original inventory disposition was
+changed for these runtime probes.
+
+## Declared-column SQL and transport activation
+
+SQL discovery prepares one owned enum directory per type in a native schema.
+Table reads, projected native column pages, joins, set operations, aggregates,
+windows, assignments, conflict updates and RETURNING preserve the executable
+domain. Existing installed RLS policies use the same declared-column binder and
+pinned native row decoder. Ordinary timestamp pages retain their established
+physical normalization. A direct column read has no scalar projection vector;
+semantic-error recovery must handle that shape without indexing such a vector.
+
+OpenAPI owns the public `enumeration` result type and optional `named_type`
+identity on SQL columns and parameter descriptors. Enum cells contain exact
+labels, including empty strings; SQL NULL remains in the NULL bitmap. Generated
+clients consume these definitions. PostgreSQL text and binary enum input/output
+both carry label bytes; RowDescription and ParameterDescription retain the
+catalog scalar OID and four-byte type length.
+
+Durable prepared descriptors store only immutable identity witnesses. Execution
+resolves all referenced IDs in one current authorized catalog cut and prepares
+shared executable views. Deserialization cannot manufacture an executable view.
+Prepared frames and programs compare logical domain contracts, never allocation
+addresses. Contextual input inference keeps parameters nullable even when a
+referencing table column is NOT NULL; stored-row constraints remain responsible
+for rejecting invalid assignments.
+
+Portals and cursor spools capture their own type directories and payloads before
+prepared statements or producer leases retire. COPY decodes labels through the
+pinned column directory without a per-row enum allocation. Unsupported enum
+arrays remain explicit errors. Durable enum-valued view outputs require a
+future identity/rebinding contract and fail before publication; an explicit
+conversion to TEXT uses the existing durable view contract.
+
+The Debug qualification commands are `sql-test -Dtest-filter='SQL named enum'`,
+`pgwire-test`, and `antfly-api-sql-enum-catalog-test`. The public campaign exercises
+native typed-row ingestion, SQL updates and RETURNING, ordered/filter/aggregate
+reads, prepared parameters and cold restart. This does not qualify SQL named
+CREATE TABLE/casts, dependent type evolution, enum arrays, domains or restore
+activation, and does not promote any original inventory disposition.

@@ -406,10 +406,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     @import("../embedded/source_owner.zig").attach(pgwire_test_mod);
     pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
     pgwire_test_mod.addImport("antfly_platform", platform_mod);
-    // This intentionally remains a storage-independent test root. Every
-    // pgwire-owned test has the pgwire prefix; without a compile filter Zig
-    // also discovers transitive storage tests through the SQL binder and
-    // requires unrelated native imports this module does not provide.
+    // The default filter keeps protocol qualification separate from shared
+    // SQL/storage contracts. Explicit SQL filters also qualify those binder
+    // contracts using the transitive imports declared below.
     const pgwire_tests = b.addTest(.{
         .root_module = pgwire_test_mod,
         .filters = buildArguments(b) orelse &.{"pgwire"},
@@ -418,7 +417,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // Honor stripped CI builds: cold framing/array compiles fit the original
     // 1 GiB reservation. Debugger builds exceeded it, so reserve their larger
     // working set separately.
-    pgwire_tests.step.max_rss = (if (strip) @as(usize, 1) else 2) * 1024 * 1024 * 1024;
+    // SQL-filtered source contracts peaked at 3,540,729,856 bytes on macOS
+    // Debug. Reserve more than 25% headroom for that owner qualification.
+    pgwire_tests.step.max_rss = (if (target.result.os.tag == .macos and optimize == .debug) @as(usize, 5) else if (strip) @as(usize, 1) else 2) * 1024 * 1024 * 1024;
     // Linux includes the launcher's inherited high-water RSS in child rusage:
     // CI reported 93 MiB while standalone Linux tests use only 17-21 MiB.
     // Reserve 128 MiB for that process envelope; allocator bounds stay intact.
@@ -1406,6 +1407,13 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("antfly_structured", structured_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     pgwire_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    pgwire_test_mod.addImport("antfly-json", json_mod);
+    pgwire_test_mod.addImport("antfly_regex", regex_mod);
+    pgwire_test_mod.addImport("antfly_generating", generating_mod);
+    pgwire_test_mod.addImport("antfly_structured", structured_mod);
+    pgwire_test_mod.addImport("antfly_vector", vector_mod);
+    pgwire_test_mod.addImport("antfly_resolver", resolver_mod);
+    pgwire_test_mod.addImport("bloom", bloom_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
     sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     // Native wire parameter frames share the SQL scalar/type owner.

@@ -313,6 +313,9 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
     if (bound.columns.len == 0 or bound.columns.len > max_columns or options.columns.len > bound.columns.len) return error.InvalidSqlViewDefinition;
     const columns = try output.alloc(Output, bound.columns.len);
     for (bound.columns, columns, 0..) |column, *out, index| {
+        // Named output domains require a durable identity witness and current
+        // catalog rebinding. Do not publish an incomplete builtin descriptor.
+        if (column.enum_view != null or column.type == .enumeration) return error.SqlTypeActivationRequired;
         if (index % 64 == 0) try resolver.checkpoint(resolver.ptr);
         const name = if (index < options.columns.len) options.columns[index] else column.name;
         if (!nameValid(name)) return error.InvalidSqlViewDefinition;

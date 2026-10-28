@@ -589,7 +589,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
     if (relation.statement.columns.len != input.columns.len) return error.InvalidSqlBackendResponse;
     const columns = try alloc.alloc(scalar.Column, input.columns.len);
     for (relation.statement.columns, input.columns, columns, 0..) |projection, output, *column, index| {
-        column.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = output.type, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier, .temporal_kind = output.temporal_kind };
+        column.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = output.type, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier, .enum_view = output.enum_view, .temporal_kind = output.temporal_kind };
     }
     const unbound = try alloc.alloc(UnboundArm, statement.arms.len);
     for (statement.arms, unbound) |arm, *out| {
@@ -605,7 +605,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                         break :literal node;
                     };
                     const field = try target.updateTarget(assignment.field);
-                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier }) else null };
+                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier, .enum_view = field.enum_view }) else null };
                 }
                 break :blk .{ .update = values };
             },
@@ -613,7 +613,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                 const values = try alloc.alloc(Expression, insert.values.len);
                 for (insert.columns, insert.values, values) |name, expression, *value| {
                     const field = try target.assignmentColumn(name);
-                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier }) else null };
+                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier, .enum_view = field.enum_view }) else null };
                 }
                 break :blk .{ .insert = values };
             },
@@ -696,7 +696,7 @@ fn bindReturning(alloc: Allocator, backend: catalog.Backend, statement: ast.Merg
     const requested = statement.returning orelse return error.InvalidSqlBackendResponse;
     const scalar_columns = try alloc.alloc(scalar.Column, input.columns.len);
     for (relation.statement.columns, input.columns, scalar_columns, 0..) |projection, column, *out, index| {
-        out.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
+        out.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind };
     }
     return @import("mutation_returning.zig").bind(alloc, backend, relation.root.columns, scalar_columns, requested, statement.alias orelse statement.table.table, parameters);
 }
@@ -1197,7 +1197,7 @@ fn appendCandidate(alloc: Allocator, bound: Candidates, plan: PointPlan, source_
     };
     if (target) |row| for (plan.target_fields, values, bound.input.columns) |field, *value, column| if (field) |name| {
         const cell = try joined_mutation.cell(alloc, row, name);
-        value.* = try @import("document_row.zig").declaredCell(alloc, .{ .name = name, .path = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind }, cell);
+        value.* = try @import("document_row.zig").declaredCell(alloc, .{ .name = name, .path = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind }, cell);
     };
     try Capture.append(capture, values);
 }

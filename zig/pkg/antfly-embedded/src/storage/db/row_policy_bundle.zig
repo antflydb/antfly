@@ -166,9 +166,9 @@ pub const Installed = struct {
 
         // Use the query binder's complete native domain, not a second coarse
         // type mapping that rejects tables containing arrays/exact numerics.
-        const columns = try alloc.alloc(sql_catalog.Column, schema.relational_columns.len);
-        defer alloc.free(columns);
-        for (schema.relational_columns, columns) |column, *out| out.* = try sql_catalog.Column.fromRelational(column);
+        var column_region = std.heap.ArenaAllocator.init(alloc);
+        defer column_region.deinit();
+        const columns = try sql_catalog.relationalColumnsLeaky(column_region.allocator(), schema);
         const table: sql_catalog.Table = .{ .id = table_id, .physical_name = "", .schema_version = schema.version, .columns = columns };
         const SettingOwner = struct {
             fn load(ptr: *anyopaque, arena: std.mem.Allocator, scope: settings.Scope) !settings.Snapshot {
@@ -227,9 +227,9 @@ pub const Installed = struct {
         result.setting_view = try setting_catalog.View.capture(alloc, .{ .ptr = @constCast(self), .load = SettingOwner.load }, .{ .principal = principal.setting_principal orelse principal.principal, .database = principal.database }, &.{});
         errdefer result.setting_view.deinit();
         try result.setting_view.pinSqlUser(principal.principal);
-        const columns = try alloc.alloc(sql_catalog.Column, schema.relational_columns.len);
-        defer alloc.free(columns);
-        for (schema.relational_columns, columns) |column, *out| out.* = try sql_catalog.Column.fromRelational(column);
+        var column_region = std.heap.ArenaAllocator.init(alloc);
+        defer column_region.deinit();
+        const columns = try sql_catalog.relationalColumnsLeaky(column_region.allocator(), schema);
         const PolicyOwner = struct {
             fn load(ptr: *anyopaque, _: std.mem.Allocator, table_id: u64, principal_name: []const u8, database: []const u8) !policies.Snapshot {
                 const installed: *const Installed = @ptrCast(@alignCast(ptr));

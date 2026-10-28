@@ -29,13 +29,14 @@ pub const Key = struct {
     nullable: bool,
     element_type: ?@import("array_value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
 
     pub fn fromColumn(column: catalog.Column) Key {
         const descriptor = scalar.columnType(column);
-        return .{ .path = column.path, .type = column.type, .nullable = column.nullable, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier };
+        return .{ .path = column.path, .type = column.type, .nullable = column.nullable, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier, .enum_view = descriptor.enum_view };
     }
     pub fn definition(self: Key) scalar.Column {
-        return .{ .name = self.path, .type = self.type, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier };
+        return .{ .name = self.path, .type = self.type, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .enum_view = self.enum_view };
     }
 };
 pub const Input = struct {
@@ -74,7 +75,7 @@ pub const Recipe = struct {
     }
 };
 fn keyEql(left: Key, right: Key) bool {
-    return left.type == right.type and left.nullable == right.nullable and left.element_type == right.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) and std.mem.eql(u8, left.path, right.path);
+    return left.type == right.type and left.nullable == right.nullable and left.element_type == right.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) and scalar.sameEnumDomain(left.enum_view, right.enum_view) and std.mem.eql(u8, left.path, right.path);
 }
 fn word(hash: *std.crypto.hash.sha2.Sha256, value: usize) void {
     var bytes: [8]u8 = undefined;
@@ -90,6 +91,11 @@ fn keyHash(hash: *std.crypto.hash.sha2.Sha256, key: Key) void {
     part(hash, @tagName(key.type));
     hash.update(&.{@intFromBool(key.nullable)});
     if (key.element_type) |identity| part(hash, @tagName(identity)) else part(hash, "*");
+    if (key.enum_view) |view| {
+        part(hash, "enum-domain");
+        word(hash, @intCast(view.record.identity.id));
+        part(hash, &view.record.identity.origin_id);
+    }
     if (key.numeric_modifier) |modifier| {
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(u16, bytes[0..2], modifier.precision, .little);

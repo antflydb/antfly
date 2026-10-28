@@ -94,7 +94,7 @@ fn boundDomain(a: A, original: ast.Select, shape: describe.BoundStatement) ![]co
     const scope = table.binding_scope orelse table.scope orelse if (name.namespace) |namespace| catalog.Table.Scope{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;
     for (result, 0..) |*output, index| {
         const column = if (index < table.columns.len) table.columns[index] else virtual[index - table.columns.len];
-        output.* = .{ .name = column.name, .internal = try std.fmt.allocPrint(a, "$distinct_binding_{d}", .{index}), .qualifier = name.table, .scope = scope, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable, .visible = index < table.columns.len };
+        output.* = .{ .name = column.name, .internal = try std.fmt.allocPrint(a, "$distinct_binding_{d}", .{index}), .qualifier = name.table, .scope = scope, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .nullable = column.nullable, .visible = index < table.columns.len };
     }
     return result;
 }
@@ -124,7 +124,7 @@ fn sameKey(domain: []const relations.Column, left: *const ast.Scalar, right: *co
         .literal => same(left, right),
         .unary => |part| part.op == right.unary.op and try sameKey(domain, part.operand, right.unary.operand),
         .binary => |part| part.op == right.binary.op and try sameKey(domain, part.left, right.binary.left) and try sameKey(domain, part.right, right.binary.right),
-        .cast => |part| part.type == right.cast.type and part.element_type == right.cast.element_type and std.meta.eql(part.numeric_modifier, right.cast.numeric_modifier) and try sameKey(domain, part.operand, right.cast.operand),
+        .cast => |part| part.type == right.cast.type and part.element_type == right.cast.element_type and @import("scalar.zig").sameEnumDomain(part.enum_view, right.cast.enum_view) and std.meta.eql(part.numeric_modifier, right.cast.numeric_modifier) and try sameKey(domain, part.operand, right.cast.operand),
         .call => |part| blk: {
             if (!std.mem.eql(u8, functionName(part.name), functionName(right.call.name)) or part.args.len != right.call.args.len) break :blk false;
             if (part.subquery != null or part.window != null or part.within_group != null or part.filter != null or part.star or part.distinct) break :blk same(left, right);

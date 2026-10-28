@@ -1570,7 +1570,7 @@ pub const OrdinalRowView = struct {
         if (cell.is_null) return Datum{};
         const column = self.table_schema.relational_columns[ordinal];
         return switch (column.column_type) {
-            .enumeration => error.SqlTypeMismatch,
+            .enumeration => Datum.typedEnum(try (self.layout.enumView(ordinal) orelse return error.InvalidRelationalRow).bySymbol(std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol)),
             .sql_array => blk: {
                 const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
                 array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});

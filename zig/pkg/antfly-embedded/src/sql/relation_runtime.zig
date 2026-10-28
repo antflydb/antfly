@@ -1337,7 +1337,7 @@ fn Engine(comptime Context: type) type {
                         self.engine.visited += page.selection.len;
                         self.eof = page.after == null;
                         const definitions = try a.alloc(scalar.Column, self.node.columns.len);
-                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
                         return .{ .columns = .{ .page = page, .definitions = definitions } };
                     }
                 }

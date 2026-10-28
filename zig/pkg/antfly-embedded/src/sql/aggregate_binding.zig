@@ -85,7 +85,7 @@ fn domainElement(domain: scalar.Type) ?@import("array_value.zig").ElementType {
 fn sameDomain(left: scalar.Type, right: scalar.Type) bool {
     return left.kind == right.kind and domainElement(left) == domainElement(right) and
         (if (left.kind == .datetime) (left.temporal_kind orelse .timestamp_tz) == (right.temporal_kind orelse .timestamp_tz) else left.temporal_kind == right.temporal_kind) and
-        @import("../common/sql_builtin_type.zig").NumericModifier.eql(left.numeric_modifier, right.numeric_modifier);
+        @import("../common/sql_builtin_type.zig").NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) and @import("scalar.zig").sameEnumDomain(left.enum_view, right.enum_view);
 }
 fn identityRoot(program: scalar.Program, root: u32) u32 {
     var result = root;
@@ -224,7 +224,7 @@ pub fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
         },
         .unary => |unary| unary.op == b.unary.op and same(unary.operand, b.unary.operand),
         .binary => |binary| binary.op == b.binary.op and same(binary.left, b.binary.left) and same(binary.right, b.binary.right),
-        .cast => |cast| cast.type == b.cast.type and cast.temporal_kind == b.cast.temporal_kind and cast.element_type == b.cast.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(cast.numeric_modifier, b.cast.numeric_modifier) and same(cast.operand, b.cast.operand),
+        .cast => |cast| cast.type == b.cast.type and cast.temporal_kind == b.cast.temporal_kind and cast.element_type == b.cast.element_type and scalar.sameEnumDomain(cast.enum_view, b.cast.enum_view) and @import("../common/sql_builtin_type.zig").NumericModifier.eql(cast.numeric_modifier, b.cast.numeric_modifier) and same(cast.operand, b.cast.operand),
         .call => |call| blk: {
             if (call.aggregate != b.call.aggregate or call.operator != b.call.operator or !std.mem.eql(u8, functionName(call.name), functionName(b.call.name)) or call.star != b.call.star or call.distinct != b.call.distinct or (call.filter == null) != (b.call.filter == null) or call.args.len != b.call.args.len) break :blk false;
             // Query and window domains cannot lose their metadata through
@@ -486,7 +486,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     builder.inference = true;
     const source_columns = if (table) |definition| blk: {
         const result = try alloc.alloc(scalar.Column, definition.columns.len + 1);
-        for (definition.columns, result[0..definition.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+        for (definition.columns, result[0..definition.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
         result[definition.columns.len] = .{ .name = "_id", .type = .string, .nullable = false };
         break :blk result;
     } else &.{};
@@ -523,12 +523,13 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     for (columns[0..grouped_width], 0..) |*column, index| column.* = .{ .name = try std.fmt.allocPrint(alloc, "$grouped_{d}", .{index}), .type = .string };
     for (builder.constants, columns[grouped_width..], 0..) |name, *column, index| {
         const definition = try (table orelse return error.InvalidSqlBackendResponse).column(name);
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier, .temporal_kind = definition.temporal_kind, .nullable = definition.nullable };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier, .enum_view = definition.enum_view, .temporal_kind = definition.temporal_kind, .nullable = definition.nullable };
     }
     for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| {
         column.type = program.?.output_type.kind orelse .string;
         column.element_type = program.?.output_type.element_type;
         column.numeric_modifier = program.?.output_type.numeric_modifier;
+        column.enum_view = program.?.output_type.enum_view;
         column.temporal_kind = program.?.output_type.temporal_kind;
     }
     const specs = try alloc.alloc(operators.AggregateSpec, builder.aggregates.items.len);
@@ -541,6 +542,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
                 column.element_type = aggregate.output.element_type;
                 column.temporal_kind = aggregate.output.temporal_kind;
                 column.numeric_modifier = aggregate.output.numeric_modifier;
+                column.enum_view = aggregate.output.enum_view;
             } else if (std.mem.eql(u8, functionName(node.call.name), "string_agg")) {
                 for (builder.collections.items) |item| if (item.index == aggregate_index) for (item.arguments) |slot_| {
                     const type_ = input.projections[slot_].?.output_type.kind;
@@ -565,6 +567,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
                 column.type = result.kind orelse .string;
                 column.element_type = result.element_type;
                 column.temporal_kind = result.temporal_kind;
+                column.enum_view = result.enum_view;
                 column.numeric_modifier = if (reducer == .min or reducer == .max) null else result.numeric_modifier;
             }
             continue;
@@ -591,6 +594,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
             const domain = if (index) |slot| input.projections[slot].?.output_type else scalar.Type{};
             column.element_type = domain.element_type;
             column.temporal_kind = domain.temporal_kind;
+            column.enum_view = domain.enum_view;
             column.numeric_modifier = if (kind == .min or kind == .max) null else domain.numeric_modifier;
         }
         if (kind == .array_agg and column.element_type == null) column.element_type = switch (input_type orelse .string) {

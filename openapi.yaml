@@ -22314,6 +22314,7 @@ components:
         - daterange
         - tsrange
         - tstzrange
+        - enumeration
     SQLArrayElementType:
       type: string
       description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC.
@@ -22411,6 +22412,11 @@ components:
           description: Display label. Labels need not be unique; rows use matching ordinal positions.
         type:
           $ref: '#/components/schemas/SQLColumnType'
+        named_type:
+          $ref: '#/components/schemas/SQLNamedTypeIdentity'
+          description: Required for enumeration values, including NULL. Identifies the immutable catalog
+            type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains
+            a null cell.
         temporal_kind:
           $ref: '#/components/schemas/SQLTemporalKind'
         element_type:
@@ -22524,6 +22530,11 @@ components:
       properties:
         type:
           $ref: '#/components/schemas/SQLColumnType'
+        named_type:
+          $ref: '#/components/schemas/SQLNamedTypeIdentity'
+          description: Required for enumeration values, including NULL. Identifies the immutable catalog
+            type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains
+            a null cell.
         temporal_kind:
           $ref: '#/components/schemas/SQLTemporalKind'
         element_type:
@@ -36012,6 +36023,43 @@ components:
             are applied as additional narrowing.
       required:
         - name
+    SQLNamedTypeIdentity:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - namespace_id
+        - generation
+        - origin_id
+        - oid
+        - array_oid
+      description: Server-resolved immutable SQL type identity. Origin survives restore remapping of local
+        IDs and wire OIDs.
+      properties:
+        id:
+          type: integer
+          format: uint64
+          minimum: 1
+        namespace_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        generation:
+          type: integer
+          format: uint32
+          minimum: 1
+        origin_id:
+          type: string
+          minLength: 32
+          maxLength: 32
+          pattern: ^[0-9a-f]{32}$
+          description: Opaque durable 128-bit origin, encoded as lowercase hexadecimal.
+        oid:
+          type: integer
+          format: uint32
+        array_oid:
+          type: integer
+          format: uint32
     SQLNumericModifier:
       type: object
       additionalProperties: false
@@ -41280,43 +41328,6 @@ components:
           graph: '#/components/schemas/CreateGraphIndexRequest'
           algebraic: '#/components/schemas/CreateAlgebraicIndexRequest'
           relational: '#/components/schemas/CreateRelationalIndexRequest'
-    SQLNamedTypeIdentity:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - namespace_id
-        - generation
-        - origin_id
-        - oid
-        - array_oid
-      description: Server-resolved immutable SQL type identity. Origin survives restore remapping of local
-        IDs and wire OIDs.
-      properties:
-        id:
-          type: integer
-          format: uint64
-          minimum: 1
-        namespace_id:
-          type: integer
-          format: uint64
-          minimum: 1
-        generation:
-          type: integer
-          format: uint32
-          minimum: 1
-        origin_id:
-          type: string
-          minLength: 32
-          maxLength: 32
-          pattern: ^[0-9a-f]{32}$
-          description: Opaque durable 128-bit origin, encoded as lowercase hexadecimal.
-        oid:
-          type: integer
-          format: uint32
-        array_oid:
-          type: integer
-          format: uint32
     SQLNamedEnumLabel:
       type: object
       additionalProperties: false

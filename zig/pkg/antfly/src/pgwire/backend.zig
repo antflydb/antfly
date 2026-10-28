@@ -18,7 +18,7 @@
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
 
-pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange };
+pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
 pub const Column = struct {
     defaulted: bool = false,
@@ -27,13 +27,26 @@ pub const Column = struct {
     temporal_kind: ?@import("antfly_local_sources").sql_temporal_value.Kind = null,
     element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
     numeric_modifier: ?@import("antfly_local_sources").sql_scalar.NumericModifier = null,
+    enum_view: ?*const @import("antfly_local_sources").sql_scalar.EnumValues.View = null,
 };
+/// Metadata survives producer/statement retirement; views are immutable and
+/// deduplicated inside the caller's owning arena.
+pub fn cloneColumnsLeaky(a: std.mem.Allocator, input: []const Column) ![]Column {
+    const output = try a.dupe(Column, input);
+    var views: std.AutoHashMapUnmanaged(*const @import("antfly_local_sources").sql_scalar.EnumValues.View, *const @import("antfly_local_sources").sql_scalar.EnumValues.View) = .empty;
+    for (output) |*column| {
+        column.name = try a.dupe(u8, column.name);
+        column.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(a, &views, column.enum_view);
+    }
+    return output;
+}
 /// Physical output identity shared by prepared plans, stream pages and cursor
 /// spools. Names may change under cached-plan rebinding; wire types may not.
 pub fn sameColumnType(a: Column, b: Column) bool {
     return a.type == b.type and a.element_type == b.element_type and
         (a.type != .datetime or (a.temporal_kind orelse .timestamp_tz) == (b.temporal_kind orelse .timestamp_tz)) and
-        @import("antfly_local_sources").sql_scalar.NumericModifier.eql(a.numeric_modifier, b.numeric_modifier);
+        @import("antfly_local_sources").sql_scalar.NumericModifier.eql(a.numeric_modifier, b.numeric_modifier) and
+        @import("antfly_local_sources").sql_scalar.sameEnumDomain(a.enum_view, b.enum_view);
 }
 
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
@@ -50,7 +63,7 @@ pub const Request = struct {
     copy_source_statement: ?[]const u8 = null,
     copy_source_inputs: []const @import("antfly_local_sources").sql_parameter_frame.Input = &.{},
     copy_source_descriptors: []const Parameter = &.{},
-    statement_instant: ?@import("antfly_local_sources").sql_catalog.Clock.Instant = null,
+    statement_instant: ?@import("antfly_local_sources").sql_statement_clock.Instant = null,
     /// Reclaiming allocator sharing the connection cap. Result envelopes use
     /// the describe/execute arena; backend-owned execution scratch/results can
     /// release memory independently instead of nesting under that arena.
@@ -59,6 +72,8 @@ pub const Request = struct {
     parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
     parameter_owner: ?@import("antfly_local_sources").sql_parameter_frame.PayloadLease = null,
     parameter_types: []const Type = &.{},
+    /// Raw PostgreSQL OIDs are resolved by the authenticated backend before binding.
+    parameter_oids: []const u32 = &.{},
     parameter_descriptors: []const Parameter = &.{},
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
@@ -97,7 +112,7 @@ pub const Request = struct {
 };
 
 /// Fixed-size storage survives error unwinding and per-statement arenas.
-pub const notices = @import("antfly_local_sources").sql_catalog.notices;
+pub const notices = @import("antfly_local_sources").sql_notices;
 pub const Notice = notices.Notice;
 pub const Diagnostic = struct {
     notice_allocator: ?std.mem.Allocator = null,
@@ -241,6 +256,7 @@ pub const Cell = struct {
     array: ?*const @import("antfly_local_sources").sql_array_value.Value = null,
     numeric: ?*const @import("antfly_local_sources").sql_numeric_value.Value = null,
     range: ?*const @import("antfly_local_sources").sql_range_value.Value = null,
+    enumeration: ?*const @import("antfly_local_sources").sql_scalar.EnumValues.Value = null,
 };
 pub const Cells = struct {
     context: *anyopaque,

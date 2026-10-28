@@ -42,6 +42,8 @@ pub const Scalar = union(enum) {
         temporal_kind: ?@import("temporal_value.zig").Kind = null,
         element_type: ?@import("array_value.zig").ElementType = null,
         numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+        /// Immutable statement-bound type; durable SQL retains its type-name intent.
+        enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
         /// Coercion origin controls binding diagnostics, not execution identity.
         coercion: enum { explicit, function } = .explicit,
         context: @import("../system_catalog/casts.zig").Context = .explicit,

@@ -1380,7 +1380,7 @@ components:
     SQLColumnType:
       type: string
       description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
-      enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange]
+      enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration]
     SQLArrayElementType:
       $ref: "schema.yaml#/components/schemas/SQLArrayElementType"
     SQLTemporalKind:
@@ -1441,6 +1441,9 @@ components:
           description: Display label. Labels need not be unique; rows use matching ordinal positions.
         type:
           $ref: "#/components/schemas/SQLColumnType"
+        named_type:
+          $ref: "schema.yaml#/components/schemas/SQLNamedTypeIdentity"
+          description: Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell.
         temporal_kind:
           $ref: "#/components/schemas/SQLTemporalKind"
         element_type:
@@ -1541,6 +1544,9 @@ components:
       properties:
         type:
           $ref: '#/components/schemas/SQLColumnType'
+        named_type:
+          $ref: "schema.yaml#/components/schemas/SQLNamedTypeIdentity"
+          description: Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell.
         temporal_kind:
           $ref: '#/components/schemas/SQLTemporalKind'
         element_type:

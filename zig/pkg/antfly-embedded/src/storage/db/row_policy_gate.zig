@@ -65,7 +65,7 @@ pub const EvaluationScratch = struct {
         const scratch = self.arena.allocator();
         for (evaluator.required_columns) |ordinal| {
             const value = (try row.sqlDatumAlloc(scratch, ordinal)) orelse scalar.Datum{};
-            const column = try @import("../../sql/catalog.zig").Column.fromRelational(row.table_schema.relational_columns[ordinal]);
+            const column = try @import("../../sql/catalog.zig").Column.fromRelational(row.table_schema.relational_columns[ordinal], row.layout.enumView(ordinal));
             self.cells[ordinal] = try @import("../../sql/document_row.zig").declaredCell(scratch, column, value);
         }
         return evaluator.permitsWithScratch(scratch, self.cells);

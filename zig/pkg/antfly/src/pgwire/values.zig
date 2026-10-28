@@ -44,12 +44,53 @@ test "UUIDv7 interval pgwire parameters retain OID binary identity and result de
 
 pub fn parameterOid(descriptor: Parameter) !u32 {
     try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
+    if (descriptor.enum_view) |view| {
+        try view.record.identity.validate();
+        return view.record.identity.oid;
+    }
     if (descriptor.temporal_kind) |kind| return kind.oid();
     if (descriptor.kind == .array) return (descriptor.element_type orelse return error.UnsupportedParameterType).arrayOid();
     if (descriptor.element_type) |element| return element.oid();
     return if (descriptor.kind) |kind| switch (kind) {
         inline else => |tag| oid(@field(Type, @tagName(tag))),
     } else 0;
+}
+
+pub fn parameterKind(descriptor: Parameter) !Type {
+    try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
+    return if (descriptor.kind) |kind| switch (kind) {
+        inline else => |tag| @field(Type, @tagName(tag)),
+    } else .unknown;
+}
+pub fn parameterFromColumn(column: Column) !Parameter {
+    if (column.enum_view) |view| {
+        _ = try columnOid(column);
+        return .{ .kind = .enumeration, .enum_view = view };
+    }
+    return parameterFromOid(try columnOid(column));
+}
+/// Named values decode against an already authorized immutable descriptor.
+/// PostgreSQL enum text and binary payloads both contain the label bytes.
+/// COPY's column contract outlives its batch, so enum atoms can borrow that
+/// prepared directory instead of allocating a payload for every imported row.
+pub fn decodeColumnNative(a: std.mem.Allocator, column: Column, format: u16, bytes: []const u8) !@import("antfly_local_sources").sql_scalar.Datum {
+    if (column.enum_view) |view| {
+        _ = try columnOid(column);
+        if (format > 1) return error.UnsupportedParameterFormat;
+        return .typedEnum(try view.input(bytes));
+    }
+    return decodeNative(a, try columnOid(column), format, bytes);
+}
+pub fn decodeNativeDescriptor(a: std.mem.Allocator, descriptor: Parameter, format: u16, bytes: []const u8, parent: *@import("antfly_local_sources").sql_numeric_value.Context) !@import("antfly_local_sources").sql_scalar.Datum {
+    if (descriptor.enum_view) |view| {
+        try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
+        if (format > 1) return error.UnsupportedParameterFormat;
+        try parent.charge(bytes.len + 1);
+        const atom = try view.input(bytes);
+        try parent.charge(atom.order_key.len + atom.text.len + 1);
+        return .typedEnum(try atom.clone(a));
+    }
+    return decodeNativeWithContext(a, try parameterOid(descriptor), format, bytes, parent);
 }
 
 pub fn parameterFromOid(value: u32) !Parameter {
@@ -91,7 +132,7 @@ pub fn oid(kind: Type) !u32 {
         .json => 3802,
         .uuid => 2950,
         .string, .unknown => 25,
-        .array => error.UnsupportedParameterType,
+        .array, .enumeration => error.UnsupportedParameterType,
         .numrange => 3906,
         .daterange => 3912,
         .tsrange => 3908,
@@ -100,6 +141,11 @@ pub fn oid(kind: Type) !u32 {
 }
 
 pub fn columnOid(column: Column) !u32 {
+    if (column.enum_view) |view| {
+        if (column.type != .enumeration or column.element_type != null or column.temporal_kind != null or column.numeric_modifier != null) return error.InvalidResult;
+        try view.record.identity.validate();
+        return view.record.identity.oid;
+    }
     if (column.temporal_kind) |kind| {
         if (column.type != .datetime or column.element_type != null) return error.InvalidResult;
         return kind.oid();
@@ -199,6 +245,13 @@ const BoundedWriter = struct {
 };
 
 pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, value: std.json.Value, wire_bytes: usize) !void {
+    if (column.type == .enumeration) {
+        if (format > 1 or value != .string) return error.InvalidResult;
+        const view = column.enum_view orelse return error.InvalidResult;
+        const atom = try view.input(value.string);
+        if (atom.text.len > wire_bytes) return error.ProgramLimitExceeded;
+        return writer.writeAll(atom.text);
+    }
     if (@import("antfly_local_sources").sql_range_value.kindFromType(column.type)) |kind| {
         if (value != .string) return error.InvalidResult;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -212,6 +265,13 @@ pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Co
 
 /// Native pages retain typed arrays and numerics through the wire boundary.
 pub fn encodeCellInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, cell: @import("backend.zig").Cell, wire_bytes: usize) !void {
+    if (cell.enumeration) |atom| {
+        if (format > 1 or column.type != .enumeration or cell.sql_null or cell.value != .null or cell.array != null or cell.numeric != null or cell.range != null or cell.json_bytes != null or cell.frozen_json != null) return error.InvalidResult;
+        const view = column.enum_view orelse return error.InvalidResult;
+        const label = try view.output(atom);
+        if (label.len > wire_bytes) return error.ProgramLimitExceeded;
+        return writer.writeAll(label);
+    }
     if (cell.range) |range| {
         if (cell.sql_null or cell.value != .null or cell.array != null or cell.numeric != null or cell.json_bytes != null or cell.frozen_json != null) return error.InvalidResult;
         if (@import("antfly_local_sources").sql_range_value.kindFromType(column.type) != range.kind) return error.InvalidResult;
@@ -322,6 +382,7 @@ pub fn fromOid(value: u32) !Type {
 
 pub fn typeSize(kind: Type) i16 {
     return switch (kind) {
+        .enumeration => 4,
         .boolean => 1,
         .uuid => 16,
         .integer, .number, .datetime => 8,
@@ -535,7 +596,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         try encodeInto(alloc, &output.writer, kind, format, value);
         return output.toOwnedSlice();
     }
-    if (kind == .array) return error.InvalidResult;
+    if (kind == .array or kind == .enumeration) return error.InvalidResult;
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) return switch (kind) {
         .boolean => if (value == .bool) try alloc.dupe(u8, if (value.bool) "t" else "f") else error.InvalidResult,
@@ -552,7 +613,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         else => if (value == .string) try alloc.dupe(u8, value.string) else try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
     return switch (kind) {
-        .numrange, .daterange, .tsrange, .tstzrange => unreachable,
+        .numrange, .daterange, .tsrange, .tstzrange, .enumeration => unreachable,
         .array => error.InvalidResult,
         .boolean => if (value == .bool) try alloc.dupe(u8, &.{@intFromBool(value.bool)}) else error.InvalidResult,
         .integer => try encodeInteger(alloc, try integer(value)),
@@ -608,11 +669,11 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
         var context: @import("antfly_local_sources").sql_range_value.Context = .{ .alloc = arena.allocator(), .max_output_bytes = 16 * 1024 * 1024 };
         return encodeRangeInto(a, writer, try @import("antfly_local_sources").sql_range_value.parseLeaky(&context, range_kind, value.string), format, 16 * 1024 * 1024);
     }
-    if (kind == .array) return error.InvalidResult;
+    if (kind == .array or kind == .enumeration) return error.InvalidResult;
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) {
         switch (kind) {
-            .numrange, .daterange, .tsrange, .tstzrange => unreachable,
+            .numrange, .daterange, .tsrange, .tstzrange, .enumeration => unreachable,
             .boolean => {
                 if (value != .bool) return error.InvalidResult;
                 try writer.writeAll(if (value.bool) "t" else "f");
@@ -636,7 +697,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
         return;
     }
     switch (kind) {
-        .numrange, .daterange, .tsrange, .tstzrange => unreachable,
+        .numrange, .daterange, .tsrange, .tstzrange, .enumeration => unreachable,
         .array => return error.InvalidResult,
         .boolean => {
             if (value != .bool) return error.InvalidResult;
@@ -1402,4 +1463,43 @@ test "pgwire ranges retain PostgreSQL OIDs canonical text binary bytes and owned
             }
         }
     }
+}
+
+test "SQL named enum pgwire identities text binary and COPY share immutable typed labels" {
+    const a = std.testing.allocator;
+    const scalar = @import("antfly_local_sources").sql_scalar;
+    var definition = try scalar.EnumTypes.Owned.create(a, &.{ "z", "a", "" });
+    defer definition.deinit();
+    const record: scalar.EnumTypes.Record = .{ .identity = try scalar.EnumTypes.Identity.init(7, 2, 1, @splat(3)), .definition = definition.definition, .owner = .auth_disabled };
+    var view = try scalar.EnumValues.View.init(a, record);
+    defer view.deinit(a);
+    const descriptor: Parameter = .{ .kind = .enumeration, .enum_view = &view };
+    const column: Column = .{ .name = "state", .type = .enumeration, .enum_view = &view };
+    try std.testing.expectEqual(record.identity.oid, try parameterOid(descriptor));
+    try std.testing.expectEqual(record.identity.oid, try columnOid(column));
+    try std.testing.expectEqual(@as(i16, 4), columnTypeSize(column));
+    try std.testing.expectError(error.UnsupportedParameterType, oid(.enumeration));
+    for ([_][]const u8{ "z", "a", "" }) |label| for ([_]u16{ 0, 1 }) |format| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var parent: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = arena.allocator() };
+        const input = try decodeNativeDescriptor(arena.allocator(), descriptor, format, label, &parent);
+        try std.testing.expect(input.enumeration().? != try view.input(label));
+        try std.testing.expectEqualStrings(label, input.enumeration().?.text);
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        try encodeCellInto(arena.allocator(), &output.writer, column, format, .{ .enumeration = input.enumeration(), .sql_null = false }, 63);
+        try std.testing.expectEqualStrings(label, output.written());
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const copied = try decodeColumnNative(none.allocator(), column, format, label);
+        try std.testing.expect(copied.enumeration().? == try view.input(label));
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var parent: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, decodeNativeDescriptor(arena.allocator(), descriptor, 1, "Z", &parent));
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try std.testing.expectError(error.ProgramLimitExceeded, encodeCellInto(a, &out.writer, column, 1, .{ .enumeration = try view.input("z"), .sql_null = false }, 0));
+    try std.testing.expectError(error.InvalidResult, encodeCellInto(a, &out.writer, .{ .name = "text", .type = .string }, 0, .{ .enumeration = try view.input("z"), .sql_null = false }, 63));
 }

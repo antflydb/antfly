@@ -245,7 +245,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
         {
             scope = relation.root.columns;
             const slots = try alloc.alloc(scalar.Column, scope.len);
-            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier, .temporal_kind = field.temporal_kind };
+            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier, .enum_view = field.enum_view, .temporal_kind = field.temporal_kind };
             const authorized_scope = scope;
             var required = try alloc.alloc(bool, scope.len);
             @memset(required, false);

@@ -24,6 +24,8 @@ const json_order = @import("json_order.zig");
 const setting_catalog = @import("setting_catalog.zig");
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
+pub const EnumValues = @import("../common/sql_enum_value.zig");
+pub const EnumTypes = @import("../system_catalog/named_types.zig");
 pub const PatternSet = struct {
     ptr: *anyopaque,
     count: usize,
@@ -322,6 +324,9 @@ pub const Type = struct {
     /// Inference borrows the pinned schema. Bound programs and invocation
     /// frames capture their own deduplicated immutable directories.
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    /// Durable descriptor only. A catalog-authorized binder must replace this
+    /// witness with an owned executable view before parameter preparation.
+    enum_reference: ?*const EnumReference = null,
     const Wire = struct {
         kind: ?ast.ColumnType = null,
         temporal_kind: ?@import("temporal_value.zig").Kind = null,
@@ -338,20 +343,36 @@ pub const Type = struct {
         }
     };
     pub fn nativeJsonProjection(self: Type) Wire {
-        return .{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = if (self.enum_view) |view| .{ .id = view.record.identity.id, .origin_id = view.record.identity.origin_id, .generation = view.record.identity.generation } else null };
+        return .{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = if (self.enum_view) |view| .{ .id = view.record.identity.id, .origin_id = view.record.identity.origin_id, .generation = view.record.identity.generation } else if (self.enum_reference) |reference| reference.* else null };
     }
     pub fn jsonStringify(self: Type, writer: anytype) !void {
         return writer.write(self.nativeJsonProjection());
     }
     pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Type {
         const wire = try std.json.innerParse(Wire, a, source, options);
-        if (wire.named_type != null or wire.kind == .enumeration) return error.UnexpectedToken;
-        return .{ .kind = wire.kind, .temporal_kind = wire.temporal_kind, .nullable = wire.nullable, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
+        if ((wire.named_type != null) != (wire.kind == .enumeration)) return error.UnexpectedToken;
+        var result: Type = .{ .kind = wire.kind, .temporal_kind = wire.temporal_kind, .nullable = wire.nullable, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
+        if (wire.named_type) |reference| {
+            _ = @import("../system_catalog/named_types.zig").Identity.init(reference.id, 1, reference.generation, reference.origin_id) catch return error.UnexpectedToken;
+            if (wire.element_type != null or wire.temporal_kind != null or wire.numeric_modifier != null) return error.UnexpectedToken;
+            const owned = try a.create(EnumReference);
+            owned.* = reference;
+            result.enum_reference = owned;
+        }
+        return result;
     }
     pub fn jsonParseFromValue(a: Allocator, value: Json, options: std.json.ParseOptions) std.json.ParseFromValueError!Type {
         const wire = try std.json.innerParseFromValue(Wire, a, value, options);
-        if (wire.named_type != null or wire.kind == .enumeration) return error.UnexpectedToken;
-        return .{ .kind = wire.kind, .temporal_kind = wire.temporal_kind, .nullable = wire.nullable, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
+        if ((wire.named_type != null) != (wire.kind == .enumeration)) return error.UnexpectedToken;
+        var result: Type = .{ .kind = wire.kind, .temporal_kind = wire.temporal_kind, .nullable = wire.nullable, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
+        if (wire.named_type) |reference| {
+            _ = @import("../system_catalog/named_types.zig").Identity.init(reference.id, 1, reference.generation, reference.origin_id) catch return error.UnexpectedToken;
+            if (wire.element_type != null or wire.temporal_kind != null or wire.numeric_modifier != null) return error.UnexpectedToken;
+            const owned = try a.create(EnumReference);
+            owned.* = reference;
+            result.enum_reference = owned;
+        }
+        return result;
     }
 };
 
@@ -373,6 +394,21 @@ pub const Column = struct {
 };
 /// Canonical SQL identity for both bound expressions and native materialized
 /// inputs. Legacy integer/number declarations use the same default widths.
+pub fn sameEnumDomain(left: ?*const @import("../common/sql_enum_value.zig").View, right: ?*const @import("../common/sql_enum_value.zig").View) bool {
+    if ((left == null) != (right == null)) return false;
+    return if (left) |value| value.record.sameValueDomain(right.?.record) else true;
+}
+/// Compare executable descriptor contracts independently of arena addresses.
+/// A durable symbolic witness must first pass through catalog rebinding.
+pub fn sameParameterType(left: Type, right: Type) bool {
+    if (left.enum_reference != null or right.enum_reference != null) return false;
+    if (!sameEnumDomain(left.enum_view, right.enum_view)) return false;
+    var lhs = left;
+    var rhs = right;
+    lhs.enum_view = null;
+    rhs.enum_view = null;
+    return std.meta.eql(lhs, rhs);
+}
 pub fn columnType(column: anytype) Type {
     return .{ .kind = column.type, .enum_view = if (@hasField(@TypeOf(column), "enum_view")) column.enum_view else null, .temporal_kind = if (@hasField(@TypeOf(column), "temporal_kind")) column.temporal_kind else null, .nullable = if (@hasField(@TypeOf(column), "nullable")) column.nullable else true, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
 }
@@ -1452,7 +1488,16 @@ pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Sca
     return changed;
 }
 
+pub fn validateParameterDescriptorWire(descriptor: Type) !void {
+    if (descriptor.enum_reference) |reference| {
+        if (descriptor.kind != .enumeration or descriptor.enum_view != null or descriptor.element_type != null or descriptor.temporal_kind != null or descriptor.numeric_modifier != null) return error.InvalidSqlParameters;
+        _ = @import("../system_catalog/named_types.zig").Identity.init(reference.id, 1, reference.generation, reference.origin_id) catch return error.InvalidSqlParameters;
+        return;
+    }
+    return validateParameterType(descriptor);
+}
 pub fn validateParameterType(descriptor: Type) !void {
+    if (descriptor.enum_reference != null) return error.InvalidSqlParameters;
     if ((descriptor.kind == .enumeration) != (descriptor.enum_view != null)) return error.InvalidSqlParameters;
     if (descriptor.enum_view != null and (descriptor.element_type != null or descriptor.temporal_kind != null or descriptor.numeric_modifier != null)) return error.InvalidSqlParameters;
     if (descriptor.temporal_kind != null and (descriptor.kind != .datetime or descriptor.element_type != null)) return error.InvalidSqlParameters;
@@ -1483,7 +1528,7 @@ pub fn assignmentExpression(alloc: Allocator, expression: *const ast.Scalar, exp
     if (kind == .string or (kind != .datetime and (expression.* != .literal or expression.literal != .string))) return expression;
     if (kind == .array and expected.element_type == null) return error.SqlAssignmentTypeMismatch;
     const cast = try alloc.create(ast.Scalar);
-    cast.* = .{ .cast = .{ .operand = expression, .type = kind, .element_type = expected.element_type, .numeric_modifier = expected.numeric_modifier, .temporal_kind = expected.temporal_kind } };
+    cast.* = .{ .cast = .{ .operand = expression, .type = kind, .element_type = expected.element_type, .numeric_modifier = expected.numeric_modifier, .enum_view = expected.enum_view, .temporal_kind = expected.temporal_kind } };
     return cast;
 }
 
@@ -3311,7 +3356,13 @@ const Binder = struct {
                 }
                 if (cast.type == .array) try self.typeArrayConstructors(cast.operand, cast.element_type.?, depth + 1);
                 const source = try self.infer(cast.operand, depth + 1);
-                const target: Type = .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = cast.temporal_kind };
+                const target: Type = .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .enum_view = cast.enum_view, .temporal_kind = cast.temporal_kind };
+                if (cast.enum_view != null) {
+                    try validateParameterType(target);
+                    const unknown = cast.operand.* == .literal and (cast.operand.literal == .string or cast.operand.literal == .null or cast.operand.literal == .parameter);
+                    if (!unknown) _ = try common(source, target);
+                    break :blk target;
+                }
                 if (source.kind == .enumeration) {
                     if (cast.type != .string) return error.SqlCannotCoerce;
                     break :blk .{ .kind = .string, .element_type = .text, .nullable = source.nullable };
@@ -3990,8 +4041,11 @@ const Binder = struct {
             const unknown = expression.* == .literal and (expression.literal == .string or expression.literal == .null or expression.literal == .parameter);
             if (expression.* == .literal and expression.literal == .parameter) {
                 const slot = expression.literal.parameter - 1;
-                if (self.parameters[slot].kind == null) {
+                if (self.parameters[slot].kind == null or (!self.typed_parameters and self.parameters[slot].kind == .enumeration and self.parameters[slot].enum_view == null)) {
                     self.parameters[slot] = domain;
+                    // Column NOT NULL constrains stored rows, not the enum
+                    // input type. WHERE required_enum = $1 must accept NULL.
+                    self.parameters[slot].nullable = true;
                 } else {
                     _ = common(self.parameters[slot], domain) catch return error.ConflictingSqlParameterTypes;
                 }
@@ -4017,6 +4071,296 @@ const Binder = struct {
 
     fn compileArrayContext(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, array_element: ?arrays.ElementType, depth: usize) anyerror!u32 {
         return self.compileTypedContext(expression, expected, array_element, null, depth);
+    }
+
+    /// Keep call-specific scratch off the recursive dispatch frame. Cast and
+    /// literal nodes must not pay for every overload's Debug stack storage.
+    fn compileCallOperation(self: *Binder, expression: *const ast.Scalar, kind: Type, depth: usize) anyerror!@FieldType(Instruction, "operation") {
+        const call = expression.call;
+        return blk: {
+            if (call.aggregate != null) return error.SqlGroupingError;
+            if (std.mem.eql(u8, call.name, "$validate")) {
+                // Discarded EXISTS projections still bind names, types,
+                // functions and parameters. Their code and column reads
+                // must not become runtime dependencies of the count.
+                var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                defer scratch.deinit();
+                var validator: Binder = .{
+                    .alloc = scratch.allocator(),
+                    .columns = self.columns,
+                    .limits = self.limits,
+                    .names = self.names,
+                    .parameters = self.parameters,
+                    .typed_parameters = self.typed_parameters,
+                    .parameter_count = self.parameter_count,
+                    .allow_unresolved = self.allow_unresolved,
+                };
+                for (call.args) |arg| _ = try validator.compile(arg, null, depth + 1);
+                self.parameters = validator.parameters;
+                self.parameter_count = validator.parameter_count;
+                break :blk .{ .literal = .{ .integer = 1 } };
+            }
+            const function = functionId(call.name) catch {
+                const routine = try self.resolveCallable(call.name, call.args, call.operator, depth + 1);
+                const args = try self.alloc.alloc(u32, call.args.len);
+                for (call.args, args, routine.arguments) |arg, *out, target| {
+                    const cast = try self.alloc.create(ast.Scalar);
+                    cast.* = .{ .cast = .{ .operand = arg, .type = target.kind orelse return error.InvalidSqlProgram, .element_type = target.element_type, .temporal_kind = target.temporal_kind, .coercion = .function, .context = .implicit } };
+                    out.* = try self.compileTypedContext(cast, target.kind, target.element_type, target.temporal_kind, depth + 1);
+                }
+                break :blk .{ .call = .{ .function = .@"$routine", .args = args, .routine = routine } };
+            };
+            if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
+                try arity(function, call.args.len);
+                const args = try self.alloc.alloc(u32, call.args.len);
+                for (call.args, args, 0..) |arg, *out, ordinal| {
+                    const expected_kind: ast.ColumnType = if (ordinal == 0) .string else if (ordinal == 1) .integer else .boolean;
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = expected_kind, .element_type = if (ordinal == 0) .text else if (ordinal == 1) .int64 else .boolean, .coercion = .function, .context = .implicit } };
+                    out.* = try self.compileTypedContext(coercion, expected_kind, coercion.cast.element_type, null, depth + 1);
+                }
+                break :blk .{ .call = .{ .function = function, .args = args } };
+            }
+
+            if (function == .@"$current_user") {
+                if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
+                _ = self.settings orelse return error.SettingCatalogUnavailable;
+                break :blk .{ .call = .{ .function = function, .args = &.{} } };
+            }
+            if (function == .current_setting) {
+                if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
+                const view = self.settings orelse return error.SettingCatalogUnavailable;
+                if (call.args[0].* != .literal or call.args[0].literal != .string) return error.UnsupportedSqlShape;
+                const resolved = try view.resolve(call.args[0].literal.string);
+                break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
+            }
+            const args = try self.alloc.alloc(u32, call.args.len);
+            const ranges = @import("range_value.zig");
+            if (rangeConstructor(function)) |range_kind| {
+                const endpoint = rangeEndpointType(range_kind);
+                for (call.args, args, 0..) |arg, *out, i| {
+                    if (i == 2) {
+                        out.* = try self.compile(arg, .string, depth + 1);
+                        continue;
+                    }
+                    const cast = try self.alloc.create(ast.Scalar);
+                    cast.* = .{ .cast = .{ .operand = arg, .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function, .context = .implicit } };
+                    out.* = try self.compileTypedContext(cast, endpoint.kind, endpoint.element_type, endpoint.temporal_kind, depth + 1);
+                }
+                break :blk .{ .call = .{ .function = function, .args = args } };
+            }
+            if (rangeInformation(function) or function == .lower or function == .upper or function == .@"$contains" or function == .@"$overlaps") {
+                const input = try self.infer(call.args[0], depth + 1);
+                if (input.kind != null) if (ranges.kindFromType(input.kind.?)) |range_kind| {
+                    args[0] = try self.compileTypedContext(call.args[0], input.kind, null, null, depth + 1);
+                    if (call.args.len == 2) {
+                        const other = try self.infer(call.args[1], depth + 1);
+                        const unknown = other.kind == null or (call.args[1].* == .literal and call.args[1].literal == .string);
+                        if (other.kind == input.kind) args[1] = try self.compileTypedContext(call.args[1], input.kind, null, null, depth + 1) else if (unknown) {
+                            // PostgreSQL's binary operator resolution first
+                            // tries the known peer's type for an unknown
+                            // operand. Containment therefore selects range
+                            // containment, not the subtype-point overload.
+                            const cast = try self.alloc.create(ast.Scalar);
+                            cast.* = .{ .cast = .{ .operand = call.args[1], .type = input.kind.? } };
+                            args[1] = try self.compileTypedContext(cast, input.kind, null, null, depth + 1);
+                        } else {
+                            const endpoint = rangeEndpointType(range_kind);
+                            const cast = try self.alloc.create(ast.Scalar);
+                            cast.* = .{ .cast = .{ .operand = call.args[1], .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function, .context = .implicit } };
+                            args[1] = try self.compileTypedContext(cast, endpoint.kind, endpoint.element_type, endpoint.temporal_kind, depth + 1);
+                        }
+                    }
+                    break :blk .{ .call = .{ .function = function, .args = args } };
+                };
+            }
+            if ((function == .round or function == .trunc) and call.args.len == 2) {
+                for (call.args, args, 0..) |arg, *out, i| {
+                    const target: arrays.ElementType = if (i == 0) .numeric else .int32;
+                    const desired: ast.ColumnType = if (i == 0) .number else .integer;
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = desired, .element_type = target } };
+                    out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
+                }
+                break :blk .{ .call = .{ .function = function, .args = args } };
+            }
+            if (regexFunction(function)) |regex| {
+                const replace_start = function == .regexp_replace and (call.args.len > 4 or (call.args.len == 4 and (try self.infer(call.args[3], depth + 1)).kind == .integer));
+                for (call.args, args, 0..) |arg, *out, i| {
+                    const integer = regex_functions.argument(regex, call.args.len, i, replace_start) == .integer;
+                    const desired: ast.ColumnType = if (integer) .integer else .string;
+                    const element: arrays.ElementType = if (integer) .int32 else .text;
+                    if (integer and arg.* == .literal and arg.literal == .string) {
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = .integer, .element_type = .int32 } };
+                        out.* = try self.compileArrayContext(coercion, desired, element, depth + 1);
+                    } else out.* = try self.compileArrayContext(arg, desired, element, depth + 1);
+                }
+                break :blk .{ .call = .{ .function = function, .args = args } };
+            }
+            if (kind.element_type == .float64) switch (function) {
+                .ceil, .floor, .round, .trunc, .sign, .sqrt => {
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = call.args[0], .type = .number, .element_type = .float64 } };
+                    args[0] = try self.compileArrayContext(coercion, .number, .float64, depth + 1);
+                    break :blk .{ .call = .{ .function = function, .args = args } };
+                },
+                else => {},
+            };
+            if (arrayCompatibleFunction(function)) {
+                const element = try self.arrayCompatibleElement(call, function, depth);
+                for (call.args, args, 0..) |arg, *out, i| {
+                    const start = function == .array_position and i == 2;
+                    const target: arrays.ElementType = if (start) .int32 else element;
+                    const desired: ast.ColumnType = if (arrayArgument(function, i)) .array else arrayScalarType(target);
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = desired, .element_type = target } };
+                    out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
+                }
+                break :blk .{ .call = .{ .function = function, .args = args } };
+            }
+            if (numeric(kind.kind) and (function == .coalesce or function == .greatest or function == .least)) {
+                // Common-type selectors coerce every argument in both
+                // ordinary and prepared queries. The cast remains inside
+                // COALESCE's demand boundary, preserving short-circuiting.
+                const target = try parameterElementType(kind);
+                for (call.args, args) |arg, *out| {
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = kind.kind.?, .element_type = target, .coercion = .function, .context = .implicit } };
+                    out.* = try self.compileArrayContext(coercion, kind.kind, target, depth + 1);
+                }
+                break :blk .{ .call = .{ .function = function, .args = args } };
+            }
+            const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
+            for (call.args, args, 0..) |arg, *out, i| {
+                const desired: ?ast.ColumnType = switch (function) {
+                    .@"$record_validate" => .json,
+                    .@"$record_field" => if (i == 0) .json else if (i == 1) .string else kind.kind,
+                    .@"$like_escape" => if (i == 3) .boolean else .string,
+                    .string_to_array => .string,
+                    .jsonb_exists => if (i == 0) .json else .string,
+                    .jsonb_exists_any, .jsonb_exists_all => if (i == 0) .json else .array,
+                    .jsonb_set => if (i == 1) .array else if (i == 3) .boolean else .json,
+                    .@"$document_patch" => .json,
+                    .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).kind,
+                    .array_to_string => if (i == 0) .array else .string,
+                    .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
+                    .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
+                    .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
+                    .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
+                    .@"$single" => if (i == 0) kind.kind else .integer,
+                    .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
+                    .@"$array_pattern_quantified" => if (i == 0) .string else if (i == 1) .array else .boolean,
+                    .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse, .translate, .ascii => .string,
+                    .concat_ws => if (i == 0) .string else null,
+                    .jsonb_typeof, .jsonb_array_length => .json,
+                    .initcap, .md5 => .string,
+                    .substring, .repeat, .left, .right => if (i == 0) .string else .integer,
+                    .split_part => if (i == 2) .integer else .string,
+                    .overlay => if (i < 2) .string else .integer,
+                    .chr => .integer,
+                    .lpad, .rpad => if (i == 1) .integer else .string,
+                    .date_part, .extract, .date_trunc => if (i == 0) .string else .datetime,
+                    .uuid_extract_version, .uuid_extract_timestamp => .uuid,
+                    .to_timestamp => .number,
+                    .@"$current_timestamp" => .integer,
+                    .concat => null,
+                    .to_jsonb, .jsonb_build_object => null,
+                    .jsonb_extract_path_text, .jsonb_extract_path => if (i == 0) .json else .string,
+                    .@"$json_path", .@"$json_path_text" => if (i == 0) .json else .array,
+                    else => kind.kind,
+                };
+                const actual = try self.infer(arg, depth + 1);
+                if (function == .date_bin) {
+                    const identity = if (i == 0) @import("temporal_value.zig").Kind.interval else kind.temporal_kind.?;
+                    if (actual.kind == null or (arg.* == .literal and arg.literal == .string)) {
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = identity, .coercion = .function, .context = .implicit } };
+                        out.* = try self.compileTypedContext(coercion, .datetime, null, identity, depth + 1);
+                    } else out.* = try self.compileTypedContext(arg, .datetime, null, actual.temporal_kind, depth + 1);
+                    continue;
+                }
+                if (function == .uuidv7) {
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = .interval, .coercion = .function, .context = .implicit } };
+                    out.* = try self.compileArrayContext(coercion, .datetime, null, depth + 1);
+                    continue;
+                }
+                if ((function == .jsonb_array_length or ((function == .jsonb_extract_path or function == .jsonb_extract_path_text or function == .@"$json_path" or function == .@"$json_path_text") and i == 0)) and arg.* == .literal and arg.literal == .string) {
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = .json, .element_type = .jsonb } };
+                    out.* = try self.compileArrayContext(coercion, .json, .jsonb, depth + 1);
+                    continue;
+                }
+                if ((function == .@"$json_path" or function == .@"$json_path_text") and i == 1) {
+                    out.* = try self.compileArrayContext(arg, .array, .text, depth + 1);
+                    continue;
+                }
+                if (((function == .jsonb_set and i < 3) or function == .@"$document_patch" or function == .jsonb_exists_any or function == .jsonb_exists_all) and arg.* == .literal and arg.literal == .string) {
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    const identity: ?arrays.ElementType = if (function == .@"$document_patch") .jsonb else if (i == 1) .text else null;
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = identity } };
+                    out.* = try self.compileArrayContext(coercion, desired, identity, depth + 1);
+                    continue;
+                }
+                if (function == .@"$array" and self.explicit_arrays.contains(expression) and actual.kind != null) {
+                    const target = kind.element_type orelse return error.InvalidSqlProgram;
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = if (nested_constructor) .array else arrayScalarType(target), .element_type = target } };
+                    out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
+                    continue;
+                }
+                if (function == .@"$array" and arg.* == .literal and arg.literal == .string) {
+                    // Unknown literals use the selected domain's input
+                    // function during binding, just like an explicit raw
+                    // literal cast. Keep that conversion in the program so
+                    // query execution and durable lowering share the same
+                    // bounded preparation and PostgreSQL error boundary.
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = kind.element_type } };
+                    out.* = try self.compileArrayContext(coercion, desired, kind.element_type, depth + 1);
+                    continue;
+                }
+                if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(desired == .enumeration and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
+                const element_context: ?arrays.ElementType = if (function == .uuid_extract_version or function == .uuid_extract_timestamp)
+                    .uuid
+                else if (function == .@"$record_field" or function == .@"$record_validate")
+                    (if (i == 0) .jsonb else if (i == 1) .text else kind.element_type)
+                else if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
+                    .jsonb_exists_any, .jsonb_exists_all => if (i == 1) .text else null,
+                    .jsonb_set => if (i == 1) .text else null,
+                    .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
+                    .array_to_string => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .text,
+                    // Known probes retain their declared domain. Forcing
+                    // NUMERIC into real[]'s element type changes equality;
+                    // only an unknown probe adopts the array domain.
+                    .@"$array_quantified" => if (i == 0 and actual.kind != null) null else if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
+                    .nullif => if (actual.kind != null) null else kind.element_type,
+                    .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
+                    .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
+                    else => if (kind.kind == .array or desired == kind.kind) kind.element_type else null,
+                };
+                out.* = if (kind.kind == .enumeration) try self.compileOperatorOperand(arg, kind, depth + 1) else try self.compileTypedContext(arg, desired, element_context, if (desired == .datetime) kind.temporal_kind else null, depth + 1);
+            }
+            if (function == .translate) {
+                const from = self.instructions.items[args[1]].operation;
+                const to = self.instructions.items[args[2]].operation;
+                if (from == .literal and from.literal == .string and to == .literal and to.literal == .string) {
+                    // Program-owned literal slices outlive the parsed AST.
+                    // A constant alphabet is prepared once, not per row.
+                    const mapping = try self.alloc.create(TextTranslation);
+                    mapping.* = .empty;
+                    var source = (std.unicode.Utf8View.init(from.literal.string) catch return error.SqlTypeMismatch).iterator();
+                    var target = (std.unicode.Utf8View.init(to.literal.string) catch return error.SqlTypeMismatch).iterator();
+                    while (source.nextCodepoint()) |codepoint| {
+                        const replacement = target.nextCodepointSlice() orelse "";
+                        if (!mapping.contains(codepoint)) try mapping.put(self.alloc, codepoint, replacement);
+                    }
+                    try self.translations.put(self.alloc, @intCast(self.instructions.items.len), mapping);
+                }
+            }
+            break :blk .{ .call = .{ .function = function, .args = args } };
+        };
     }
 
     fn compileTypedContext(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, array_element: ?arrays.ElementType, temporal_kind: ?@import("temporal_value.zig").Kind, depth: usize) anyerror!u32 {
@@ -4109,6 +4453,15 @@ const Binder = struct {
                 break :blk .{ .column = ordinal };
             },
             .cast => |cast| blk: {
+                if (cast.enum_view != null) {
+                    const target: Type = .{ .kind = cast.type, .enum_view = cast.enum_view };
+                    const result = try self.compileOperatorOperand(cast.operand, target, depth + 1);
+                    // The boundary appends its own topological instruction;
+                    // reuse that operation at the enclosing cast's boundary.
+                    const emitted = self.instructions.pop().?;
+                    std.debug.assert(result == self.instructions.items.len);
+                    break :blk emitted.operation;
+                }
                 if (self.cast_functions.get(expression)) |optional| if (optional) |function| {
                     const source = try self.infer(cast.operand, depth + 1);
                     const operand = try self.compileTypedContext(cast.operand, source.kind, source.element_type, source.temporal_kind, depth + 1);
@@ -4168,290 +4521,7 @@ const Binder = struct {
                 const operand_domain: Type = .{ .kind = operand_kind, .element_type = merged.element_type, .enum_view = merged.enum_view, .nullable = merged.nullable };
                 break :blk .{ .binary = .{ .op = binary.op, .left = try self.compileOperatorOperand(binary.left, operand_domain, depth + 1), .right = try self.compileOperatorOperand(binary.right, operand_domain, depth + 1) } };
             },
-            .call => |call| blk: {
-                if (call.aggregate != null) return error.SqlGroupingError;
-                if (std.mem.eql(u8, call.name, "$validate")) {
-                    // Discarded EXISTS projections still bind names, types,
-                    // functions and parameters. Their code and column reads
-                    // must not become runtime dependencies of the count.
-                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
-                    defer scratch.deinit();
-                    var validator: Binder = .{
-                        .alloc = scratch.allocator(),
-                        .columns = self.columns,
-                        .limits = self.limits,
-                        .names = self.names,
-                        .parameters = self.parameters,
-                        .typed_parameters = self.typed_parameters,
-                        .parameter_count = self.parameter_count,
-                        .allow_unresolved = self.allow_unresolved,
-                    };
-                    for (call.args) |arg| _ = try validator.compile(arg, null, depth + 1);
-                    self.parameters = validator.parameters;
-                    self.parameter_count = validator.parameter_count;
-                    break :blk .{ .literal = .{ .integer = 1 } };
-                }
-                const function = functionId(call.name) catch {
-                    const routine = try self.resolveCallable(call.name, call.args, call.operator, depth + 1);
-                    const args = try self.alloc.alloc(u32, call.args.len);
-                    for (call.args, args, routine.arguments) |arg, *out, target| {
-                        const cast = try self.alloc.create(ast.Scalar);
-                        cast.* = .{ .cast = .{ .operand = arg, .type = target.kind orelse return error.InvalidSqlProgram, .element_type = target.element_type, .temporal_kind = target.temporal_kind, .coercion = .function, .context = .implicit } };
-                        out.* = try self.compileTypedContext(cast, target.kind, target.element_type, target.temporal_kind, depth + 1);
-                    }
-                    break :blk .{ .call = .{ .function = .@"$routine", .args = args, .routine = routine } };
-                };
-                if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
-                    try arity(function, call.args.len);
-                    const args = try self.alloc.alloc(u32, call.args.len);
-                    for (call.args, args, 0..) |arg, *out, ordinal| {
-                        const expected_kind: ast.ColumnType = if (ordinal == 0) .string else if (ordinal == 1) .integer else .boolean;
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = expected_kind, .element_type = if (ordinal == 0) .text else if (ordinal == 1) .int64 else .boolean, .coercion = .function, .context = .implicit } };
-                        out.* = try self.compileTypedContext(coercion, expected_kind, coercion.cast.element_type, null, depth + 1);
-                    }
-                    break :blk .{ .call = .{ .function = function, .args = args } };
-                }
-
-                if (function == .@"$current_user") {
-                    if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
-                    _ = self.settings orelse return error.SettingCatalogUnavailable;
-                    break :blk .{ .call = .{ .function = function, .args = &.{} } };
-                }
-                if (function == .current_setting) {
-                    if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
-                    const view = self.settings orelse return error.SettingCatalogUnavailable;
-                    if (call.args[0].* != .literal or call.args[0].literal != .string) return error.UnsupportedSqlShape;
-                    const resolved = try view.resolve(call.args[0].literal.string);
-                    break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
-                }
-                const args = try self.alloc.alloc(u32, call.args.len);
-                const ranges = @import("range_value.zig");
-                if (rangeConstructor(function)) |range_kind| {
-                    const endpoint = rangeEndpointType(range_kind);
-                    for (call.args, args, 0..) |arg, *out, i| {
-                        if (i == 2) {
-                            out.* = try self.compile(arg, .string, depth + 1);
-                            continue;
-                        }
-                        const cast = try self.alloc.create(ast.Scalar);
-                        cast.* = .{ .cast = .{ .operand = arg, .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function, .context = .implicit } };
-                        out.* = try self.compileTypedContext(cast, endpoint.kind, endpoint.element_type, endpoint.temporal_kind, depth + 1);
-                    }
-                    break :blk .{ .call = .{ .function = function, .args = args } };
-                }
-                if (rangeInformation(function) or function == .lower or function == .upper or function == .@"$contains" or function == .@"$overlaps") {
-                    const input = try self.infer(call.args[0], depth + 1);
-                    if (input.kind != null) if (ranges.kindFromType(input.kind.?)) |range_kind| {
-                        args[0] = try self.compileTypedContext(call.args[0], input.kind, null, null, depth + 1);
-                        if (call.args.len == 2) {
-                            const other = try self.infer(call.args[1], depth + 1);
-                            const unknown = other.kind == null or (call.args[1].* == .literal and call.args[1].literal == .string);
-                            if (other.kind == input.kind) args[1] = try self.compileTypedContext(call.args[1], input.kind, null, null, depth + 1) else if (unknown) {
-                                // PostgreSQL's binary operator resolution first
-                                // tries the known peer's type for an unknown
-                                // operand. Containment therefore selects range
-                                // containment, not the subtype-point overload.
-                                const cast = try self.alloc.create(ast.Scalar);
-                                cast.* = .{ .cast = .{ .operand = call.args[1], .type = input.kind.? } };
-                                args[1] = try self.compileTypedContext(cast, input.kind, null, null, depth + 1);
-                            } else {
-                                const endpoint = rangeEndpointType(range_kind);
-                                const cast = try self.alloc.create(ast.Scalar);
-                                cast.* = .{ .cast = .{ .operand = call.args[1], .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function, .context = .implicit } };
-                                args[1] = try self.compileTypedContext(cast, endpoint.kind, endpoint.element_type, endpoint.temporal_kind, depth + 1);
-                            }
-                        }
-                        break :blk .{ .call = .{ .function = function, .args = args } };
-                    };
-                }
-                if ((function == .round or function == .trunc) and call.args.len == 2) {
-                    for (call.args, args, 0..) |arg, *out, i| {
-                        const target: arrays.ElementType = if (i == 0) .numeric else .int32;
-                        const desired: ast.ColumnType = if (i == 0) .number else .integer;
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired, .element_type = target } };
-                        out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
-                    }
-                    break :blk .{ .call = .{ .function = function, .args = args } };
-                }
-                if (regexFunction(function)) |regex| {
-                    const replace_start = function == .regexp_replace and (call.args.len > 4 or (call.args.len == 4 and (try self.infer(call.args[3], depth + 1)).kind == .integer));
-                    for (call.args, args, 0..) |arg, *out, i| {
-                        const integer = regex_functions.argument(regex, call.args.len, i, replace_start) == .integer;
-                        const desired: ast.ColumnType = if (integer) .integer else .string;
-                        const element: arrays.ElementType = if (integer) .int32 else .text;
-                        if (integer and arg.* == .literal and arg.literal == .string) {
-                            const coercion = try self.alloc.create(ast.Scalar);
-                            coercion.* = .{ .cast = .{ .operand = arg, .type = .integer, .element_type = .int32 } };
-                            out.* = try self.compileArrayContext(coercion, desired, element, depth + 1);
-                        } else out.* = try self.compileArrayContext(arg, desired, element, depth + 1);
-                    }
-                    break :blk .{ .call = .{ .function = function, .args = args } };
-                }
-                if (kind.element_type == .float64) switch (function) {
-                    .ceil, .floor, .round, .trunc, .sign, .sqrt => {
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = call.args[0], .type = .number, .element_type = .float64 } };
-                        args[0] = try self.compileArrayContext(coercion, .number, .float64, depth + 1);
-                        break :blk .{ .call = .{ .function = function, .args = args } };
-                    },
-                    else => {},
-                };
-                if (arrayCompatibleFunction(function)) {
-                    const element = try self.arrayCompatibleElement(call, function, depth);
-                    for (call.args, args, 0..) |arg, *out, i| {
-                        const start = function == .array_position and i == 2;
-                        const target: arrays.ElementType = if (start) .int32 else element;
-                        const desired: ast.ColumnType = if (arrayArgument(function, i)) .array else arrayScalarType(target);
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired, .element_type = target } };
-                        out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
-                    }
-                    break :blk .{ .call = .{ .function = function, .args = args } };
-                }
-                if (numeric(kind.kind) and (function == .coalesce or function == .greatest or function == .least)) {
-                    // Common-type selectors coerce every argument in both
-                    // ordinary and prepared queries. The cast remains inside
-                    // COALESCE's demand boundary, preserving short-circuiting.
-                    const target = try parameterElementType(kind);
-                    for (call.args, args) |arg, *out| {
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = kind.kind.?, .element_type = target, .coercion = .function, .context = .implicit } };
-                        out.* = try self.compileArrayContext(coercion, kind.kind, target, depth + 1);
-                    }
-                    break :blk .{ .call = .{ .function = function, .args = args } };
-                }
-                const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
-                for (call.args, args, 0..) |arg, *out, i| {
-                    const desired: ?ast.ColumnType = switch (function) {
-                        .@"$record_validate" => .json,
-                        .@"$record_field" => if (i == 0) .json else if (i == 1) .string else kind.kind,
-                        .@"$like_escape" => if (i == 3) .boolean else .string,
-                        .string_to_array => .string,
-                        .jsonb_exists => if (i == 0) .json else .string,
-                        .jsonb_exists_any, .jsonb_exists_all => if (i == 0) .json else .array,
-                        .jsonb_set => if (i == 1) .array else if (i == 3) .boolean else .json,
-                        .@"$document_patch" => .json,
-                        .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).kind,
-                        .array_to_string => if (i == 0) .array else .string,
-                        .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
-                        .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
-                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
-                        .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
-                        .@"$single" => if (i == 0) kind.kind else .integer,
-                        .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
-                        .@"$array_pattern_quantified" => if (i == 0) .string else if (i == 1) .array else .boolean,
-                        .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse, .translate, .ascii => .string,
-                        .concat_ws => if (i == 0) .string else null,
-                        .jsonb_typeof, .jsonb_array_length => .json,
-                        .initcap, .md5 => .string,
-                        .substring, .repeat, .left, .right => if (i == 0) .string else .integer,
-                        .split_part => if (i == 2) .integer else .string,
-                        .overlay => if (i < 2) .string else .integer,
-                        .chr => .integer,
-                        .lpad, .rpad => if (i == 1) .integer else .string,
-                        .date_part, .extract, .date_trunc => if (i == 0) .string else .datetime,
-                        .uuid_extract_version, .uuid_extract_timestamp => .uuid,
-                        .to_timestamp => .number,
-                        .@"$current_timestamp" => .integer,
-                        .concat => null,
-                        .to_jsonb, .jsonb_build_object => null,
-                        .jsonb_extract_path_text, .jsonb_extract_path => if (i == 0) .json else .string,
-                        .@"$json_path", .@"$json_path_text" => if (i == 0) .json else .array,
-                        else => kind.kind,
-                    };
-                    const actual = try self.infer(arg, depth + 1);
-                    if (function == .date_bin) {
-                        const identity = if (i == 0) @import("temporal_value.zig").Kind.interval else kind.temporal_kind.?;
-                        if (actual.kind == null or (arg.* == .literal and arg.literal == .string)) {
-                            const coercion = try self.alloc.create(ast.Scalar);
-                            coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = identity, .coercion = .function, .context = .implicit } };
-                            out.* = try self.compileTypedContext(coercion, .datetime, null, identity, depth + 1);
-                        } else out.* = try self.compileTypedContext(arg, .datetime, null, actual.temporal_kind, depth + 1);
-                        continue;
-                    }
-                    if (function == .uuidv7) {
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = .interval, .coercion = .function, .context = .implicit } };
-                        out.* = try self.compileArrayContext(coercion, .datetime, null, depth + 1);
-                        continue;
-                    }
-                    if ((function == .jsonb_array_length or ((function == .jsonb_extract_path or function == .jsonb_extract_path_text or function == .@"$json_path" or function == .@"$json_path_text") and i == 0)) and arg.* == .literal and arg.literal == .string) {
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = .json, .element_type = .jsonb } };
-                        out.* = try self.compileArrayContext(coercion, .json, .jsonb, depth + 1);
-                        continue;
-                    }
-                    if ((function == .@"$json_path" or function == .@"$json_path_text") and i == 1) {
-                        out.* = try self.compileArrayContext(arg, .array, .text, depth + 1);
-                        continue;
-                    }
-                    if (((function == .jsonb_set and i < 3) or function == .@"$document_patch" or function == .jsonb_exists_any or function == .jsonb_exists_all) and arg.* == .literal and arg.literal == .string) {
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        const identity: ?arrays.ElementType = if (function == .@"$document_patch") .jsonb else if (i == 1) .text else null;
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = identity } };
-                        out.* = try self.compileArrayContext(coercion, desired, identity, depth + 1);
-                        continue;
-                    }
-                    if (function == .@"$array" and self.explicit_arrays.contains(expression) and actual.kind != null) {
-                        const target = kind.element_type orelse return error.InvalidSqlProgram;
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = if (nested_constructor) .array else arrayScalarType(target), .element_type = target } };
-                        out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
-                        continue;
-                    }
-                    if (function == .@"$array" and arg.* == .literal and arg.literal == .string) {
-                        // Unknown literals use the selected domain's input
-                        // function during binding, just like an explicit raw
-                        // literal cast. Keep that conversion in the program so
-                        // query execution and durable lowering share the same
-                        // bounded preparation and PostgreSQL error boundary.
-                        const coercion = try self.alloc.create(ast.Scalar);
-                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = kind.element_type } };
-                        out.* = try self.compileArrayContext(coercion, desired, kind.element_type, depth + 1);
-                        continue;
-                    }
-                    if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(desired == .enumeration and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
-                    const element_context: ?arrays.ElementType = if (function == .uuid_extract_version or function == .uuid_extract_timestamp)
-                        .uuid
-                    else if (function == .@"$record_field" or function == .@"$record_validate")
-                        (if (i == 0) .jsonb else if (i == 1) .text else kind.element_type)
-                    else if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
-                        .jsonb_exists_any, .jsonb_exists_all => if (i == 1) .text else null,
-                        .jsonb_set => if (i == 1) .text else null,
-                        .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
-                        .array_to_string => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .text,
-                        // Known probes retain their declared domain. Forcing
-                        // NUMERIC into real[]'s element type changes equality;
-                        // only an unknown probe adopts the array domain.
-                        .@"$array_quantified" => if (i == 0 and actual.kind != null) null else if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
-                        .nullif => if (actual.kind != null) null else kind.element_type,
-                        .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
-                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
-                        else => if (kind.kind == .array or desired == kind.kind) kind.element_type else null,
-                    };
-                    out.* = if (kind.kind == .enumeration) try self.compileOperatorOperand(arg, kind, depth + 1) else try self.compileTypedContext(arg, desired, element_context, if (desired == .datetime) kind.temporal_kind else null, depth + 1);
-                }
-                if (function == .translate) {
-                    const from = self.instructions.items[args[1]].operation;
-                    const to = self.instructions.items[args[2]].operation;
-                    if (from == .literal and from.literal == .string and to == .literal and to.literal == .string) {
-                        // Program-owned literal slices outlive the parsed AST.
-                        // A constant alphabet is prepared once, not per row.
-                        const mapping = try self.alloc.create(TextTranslation);
-                        mapping.* = .empty;
-                        var source = (std.unicode.Utf8View.init(from.literal.string) catch return error.SqlTypeMismatch).iterator();
-                        var target = (std.unicode.Utf8View.init(to.literal.string) catch return error.SqlTypeMismatch).iterator();
-                        while (source.nextCodepoint()) |codepoint| {
-                            const replacement = target.nextCodepointSlice() orelse "";
-                            if (!mapping.contains(codepoint)) try mapping.put(self.alloc, codepoint, replacement);
-                        }
-                        try self.translations.put(self.alloc, @intCast(self.instructions.items.len), mapping);
-                    }
-                }
-                break :blk .{ .call = .{ .function = function, .args = args } };
-            },
+            .call => try self.compileCallOperation(expression, kind, depth),
             .case_when => |case| blk: {
                 const branches = try self.alloc.alloc(Instruction.Branch, case.branches.len);
                 for (case.branches, branches) |branch, *out| {

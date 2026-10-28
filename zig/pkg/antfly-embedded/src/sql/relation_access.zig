@@ -181,7 +181,7 @@ fn columnOrdinal(columns: []const binding.Column, name: []const u8) ?usize {
     return null;
 }
 fn sameDomain(left: anytype, right: anytype) bool {
-    return left.type == right.type and access.canonicalElement(left.type, left.element_type) == access.canonicalElement(right.type, right.element_type) and scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier);
+    return left.type == right.type and access.canonicalElement(left.type, left.element_type) == access.canonicalElement(right.type, right.element_type) and scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) and scalar.sameEnumDomain(left.enum_view, right.enum_view);
 }
 fn hasVolatile(programs: anytype) bool {
     for (programs) |optional| {
@@ -342,7 +342,7 @@ const State = struct {
 
 fn scalarColumns(a: A, columns: []const binding.Column) ![]const scalar.Column {
     const result = try a.alloc(scalar.Column, columns.len);
-    for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+    for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .nullable = column.nullable };
     return result;
 }
 

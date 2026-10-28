@@ -610,7 +610,8 @@ const OwnedRead = struct {
         }
         self.policies = policies;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
-        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
+        var enum_views: std.AutoHashMapUnmanaged(*const catalog.enum_values.View, *const catalog.enum_values.View) = .empty;
+        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(arena, &enum_views, column.enum_view), .temporal_kind = column.temporal_kind };
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
@@ -766,6 +767,10 @@ const OwnedRead = struct {
                 return .{ .json_bytes = bytes, .sql_null = false };
             }
             const value = try self.page.values.cell(alloc, row, column);
+            if (value.enumeration()) |atom| {
+                try value.validateTemporal();
+                return .{ .enumeration = atom, .sql_null = false };
+            }
             if (value.range()) |range| {
                 try value.validateTemporal();
                 if (@import("antfly_local_sources").sql_range_value.kindFromType(self.page.columns[column].type) != range.kind) return error.InvalidSqlBackendResponse;
@@ -1085,6 +1090,8 @@ const Job = struct {
             .revision = &native_adapter.revision,
             .expected_guard = self.request.binding_guard,
         };
+        var enum_views: std.AutoHashMapUnmanaged(*const catalog.enum_values.View, *const catalog.enum_values.View) = .empty;
+        self.request.parameter_descriptors = try @import("sql_type_schema.zig").parameterDescriptorsLeaky(server, self.alloc, identity, context, self.request.parameter_descriptors, self.request.parameter_oids);
         if (self.kind == .describe) {
             switch (compiled.statement) {
                 .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => {
@@ -1112,7 +1119,7 @@ const Job = struct {
             var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, if (copy_input) |input| input.binding_backend else describe_backend, if (copy_input) |*input| &input.compiled else compiled, if (copy_input != null) &.{} else hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
-            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
+            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .temporal_kind = column.temporal_kind };
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             const copy_columns = if (copy_input) |input| blk: {
@@ -1121,11 +1128,14 @@ const Job = struct {
                 for (selected, input.compiled.statement.insert.columns) |*out, name| {
                     const column = try target.column(name);
                     if (column.generated) return error.SqlGeneratedColumnWrite;
-                    out.* = .{ .defaulted = column.defaulted, .name = try self.alloc.dupe(u8, name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
+                    out.* = .{ .defaulted = column.defaulted, .name = try self.alloc.dupe(u8, name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .temporal_kind = column.temporal_kind };
                 }
                 break :blk selected;
             } else null;
+            const owned_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors);
+            for (owned_descriptors) |*descriptor| descriptor.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, descriptor.enum_view);
             const filter_descriptors: []const wire.Parameter = if (description.binding.copy_filter) |filter| try self.alloc.dupe(wire.Parameter, filter.parameter_descriptors) else &.{};
+            for (@constCast(filter_descriptors)) |*descriptor| descriptor.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, descriptor.enum_view);
             const filter_types = try self.alloc.alloc(wire.Type, filter_descriptors.len);
             for (filter_descriptors, filter_types) |descriptor, *out| out.* = if (descriptor.kind) |kind| try wireType(kind) else .unknown;
             self.description = .{
@@ -1134,7 +1144,7 @@ const Job = struct {
                 .copy_in = if (copy_columns) |selected| .{ .source_statement = if (compiled.statement.copy_from.predicate != null) try self.alloc.dupe(u8, self.request.statement) else null, .table = try cloneName(self.alloc, compiled.statement.copy_from.table), .columns = selected, .options = try compiled.statement.copy_from.options.clone(self.alloc) } else null,
                 .columns = columns,
                 .parameter_types = if (copy_input != null) filter_types else parameter_types,
-                .parameter_descriptors = if (copy_input != null) filter_descriptors else try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
+                .parameter_descriptors = if (copy_input != null) filter_descriptors else owned_descriptors,
                 .binding_guard = if (hasViewBindings(captured_bindings.items)) try encodeViewBindings(self.alloc, captured_bindings.items) else try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
                 .setting_epoch = if (description.settings) |view| view.epoch else null,
             };
@@ -1172,7 +1182,7 @@ const Job = struct {
             }
         };
         const columns = try self.alloc.alloc(wire.Column, result.output.columns.len);
-        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
+        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .temporal_kind = column.temporal_kind };
         const native_owner = if (result.output.native_rows != null) try result.state.arena.allocator().create(NativeResultCells) else null;
         if (native_owner) |owner| owner.* = .{ .result = result };
         self.result = .{
@@ -1361,6 +1371,10 @@ const NativeResultCells = struct {
         const rows = self.result.output.native_rows orelse return error.InvalidSqlBackendResponse;
         if (row >= rows.len or column >= self.result.output.columns.len or rows[row].len != self.result.output.columns.len) return error.InvalidSqlBackendResponse;
         const datum = rows[row][column];
+        if (datum.enumeration()) |atom| {
+            try datum.validateTemporal();
+            return .{ .enumeration = atom, .sql_null = false };
+        }
         if (datum.range()) |range| {
             try datum.validateTemporal();
             if (@import("antfly_local_sources").sql_range_value.kindFromType(self.result.output.columns[column].type) != range.kind) return error.InvalidSqlBackendResponse;

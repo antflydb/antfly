@@ -40,13 +40,18 @@ fn decodeHex(out: []u8, text: []const u8) !void {
 
 /// Region-owned adapter. Labels borrow the record, hexadecimal buffers and
 /// the DTO directory belong to the caller's preparation region.
+/// Shared public identity projection without serializing or copying labels.
+pub fn identityWireLeaky(comptime T: type, a: A, identity: types.Identity) !T {
+    try identity.validate();
+    return .{ .id = identity.id, .namespace_id = identity.namespace_id, .generation = identity.generation, .origin_id = try hexAlloc(a, &identity.origin_id), .oid = identity.oid, .array_oid = identity.array_oid };
+}
 pub fn toWireLeaky(a: A, record: types.Record) !wire.SQLNamedTypeLayout {
     try record.validate(a);
     const labels = try a.alloc(wire.SQLNamedEnumLabel, record.definition.labels.len);
     for (record.definition.labels, labels) |source, *label| label.* = .{ .id = source.id, .text = source.text, .order_key = try hexAlloc(a, source.order_key) };
     return .{
         .kind = "enum",
-        .identity = .{ .id = record.identity.id, .namespace_id = record.identity.namespace_id, .generation = record.identity.generation, .origin_id = try hexAlloc(a, &record.identity.origin_id), .oid = record.identity.oid, .array_oid = record.identity.array_oid },
+        .identity = try identityWireLeaky(wire.SQLNamedTypeIdentity, a, record.identity),
         .labels = labels,
     };
 }

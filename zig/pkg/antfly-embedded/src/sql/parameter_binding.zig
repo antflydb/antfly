@@ -70,9 +70,12 @@ pub const Invocation = struct {
                 if (kind != hint.kind or (descriptor.element_type != null and hint.element_type != null and descriptor.element_type != hint.element_type) or descriptor.nullable != hint.nullable or (kind == .datetime and (descriptor.temporal_kind orelse .timestamp_tz) != (hint.temporal_kind orelse .timestamp_tz))) return error.ConflictingSqlParameterTypes;
             }
             if (self.phase != .binding) {
-                if (!std.meta.eql(descriptor.*, hint)) return error.ConflictingSqlParameterTypes;
+                if (!scalar.sameParameterType(descriptor.*, hint)) return error.ConflictingSqlParameterTypes;
             } else {
                 descriptor.kind = hint.kind;
+                if (descriptor.enum_view != null and hint.enum_view != null) {
+                    descriptor.enum_view = (scalar.comparisonDomain(descriptor.*, hint) catch return error.ConflictingSqlParameterTypes).enum_view;
+                } else if (hint.enum_view != null) descriptor.enum_view = hint.enum_view;
                 descriptor.temporal_kind = hint.temporal_kind;
                 if (hint.element_type != null) descriptor.element_type = hint.element_type;
                 descriptor.nullable = hint.nullable;
@@ -104,8 +107,9 @@ pub const Invocation = struct {
             try scalar.validateParameterType(descriptor);
             const prior = self.descriptors[slot];
             if (prior.kind != null and (prior.kind != descriptor.kind or (prior.element_type != null and prior.element_type != descriptor.element_type) or prior.nullable != descriptor.nullable or (prior.kind == .datetime and (prior.temporal_kind orelse .timestamp_tz) != (descriptor.temporal_kind orelse .timestamp_tz)))) return error.ConflictingSqlParameterTypes;
+            if (prior.enum_view != null and !scalar.sameEnumDomain(prior.enum_view, descriptor.enum_view)) return error.ConflictingSqlParameterTypes;
             if (self.frame != null) {
-                if (!std.meta.eql(prior, descriptor)) return error.ConflictingSqlParameterTypes;
+                if (!scalar.sameParameterType(prior, descriptor)) return error.ConflictingSqlParameterTypes;
             } else self.descriptors[slot] = descriptor;
         }
         if (self.frame == null) try self.contracts.append(self.allocator, .{ .instructions = program.instructions, .descriptors = program.parameter_descriptors });
@@ -160,7 +164,7 @@ pub const Invocation = struct {
             if (instruction.operation != .parameter) continue;
             const slot = instruction.operation.parameter;
             if (slot >= frame.descriptors.len or slot >= contract.descriptors.len) return error.InvalidSqlParameters;
-            if (!std.meta.eql(frame.descriptors[slot], contract.descriptors[slot])) return error.ConflictingSqlParameterTypes;
+            if (!scalar.sameParameterType(frame.descriptors[slot], contract.descriptors[slot])) return error.ConflictingSqlParameterTypes;
         };
     }
 

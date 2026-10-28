@@ -25,6 +25,7 @@ const ColumnPayload = union(enum) {
     array: []?*const @import("antfly_local_sources").sql_array_value.Value,
     numeric: []?*const @import("antfly_local_sources").sql_numeric_value.Value,
     range: []?*const @import("antfly_local_sources").sql_range_value.Value,
+    enumeration: []?*const @import("antfly_local_sources").sql_scalar.EnumValues.Value,
 };
 const Page = struct {
     arena: std.heap.ArenaAllocator,
@@ -35,7 +36,7 @@ const Page = struct {
 // Identity is valid only during one append lease. Entries point to page-owned
 // copies; the fixed table bounds scratch independently of page cardinality.
 const PayloadMemo = struct {
-    const Key = struct { pointer: usize, length: usize, kind: enum { frozen, json, array, numeric, range }, flags: u8 = 0 };
+    const Key = struct { pointer: usize, length: usize, kind: enum { frozen, json, array, numeric, range, enumeration }, flags: u8 = 0 };
     const Entry = struct { key: Key, value: backend.Cell };
     entries: [64]?Entry = @splat(null),
     fn slot(key: Key) usize {
@@ -130,6 +131,7 @@ pub const Store = struct {
             .array => |values| if (values[index]) |value| .{ .array = value, .sql_null = false } else .{ .sql_null = true },
             .numeric => |values| if (values[index]) |value| .{ .numeric = value, .sql_null = false } else .{ .sql_null = true },
             .range => |values| if (values[index]) |value| .{ .range = value, .sql_null = false } else .{ .sql_null = true },
+            .enumeration => |values| if (values[index]) |value| .{ .enumeration = value, .sql_null = false } else .{ .sql_null = true },
         };
     }
     pub fn append(self: *Store, result: backend.Result, max_rows: usize) !void {
@@ -151,24 +153,22 @@ pub const Store = struct {
         }
         const a = page.arena.allocator();
         const definitions = if (self.columns) |existing| existing else owned: {
-            const copied = try a.dupe(backend.Column, result.columns);
-            for (copied) |*definition| definition.name = try a.dupe(u8, definition.name);
-            break :owned copied;
+            break :owned try backend.cloneColumnsLeaky(a, result.columns);
         };
         page.columns = try a.alloc(ColumnPayload, definitions.len);
         const sources = @import("antfly_local_sources");
         for (definitions, page.columns) |definition, *payload| {
             _ = try @import("values.zig").columnOid(definition);
-            payload.* = if (sources.sql_range_value.kindFromType(definition.type) != null) .{ .range = try a.alloc(?*const sources.sql_range_value.Value, count) } else if (definition.type == .array) .{ .array = try a.alloc(?*const sources.sql_array_value.Value, count) } else if (definition.type == .number and definition.element_type == .numeric) .{ .numeric = try a.alloc(?*const sources.sql_numeric_value.Value, count) } else .{ .json = .{ .values = try a.alloc(std.json.Value, count), .nulls = try a.alloc(bool, count), .encoded = if (definition.type == .json) try a.alloc(?[]const u8, count) else &.{}, .frozen = if (definition.type == .json) try a.alloc(?sources.sql_execution_batch.FrozenJson, count) else &.{} } };
+            payload.* = if (definition.type == .enumeration) .{ .enumeration = try a.alloc(?*const sources.sql_scalar.EnumValues.Value, count) } else if (sources.sql_range_value.kindFromType(definition.type) != null) .{ .range = try a.alloc(?*const sources.sql_range_value.Value, count) } else if (definition.type == .array) .{ .array = try a.alloc(?*const sources.sql_array_value.Value, count) } else if (definition.type == .number and definition.element_type == .numeric) .{ .numeric = try a.alloc(?*const sources.sql_numeric_value.Value, count) } else .{ .json = .{ .values = try a.alloc(std.json.Value, count), .nulls = try a.alloc(bool, count), .encoded = if (definition.type == .json) try a.alloc(?[]const u8, count) else &.{}, .frozen = if (definition.type == .json) try a.alloc(?sources.sql_execution_batch.FrozenJson, count) else &.{} } };
         }
         var memo: PayloadMemo = .{};
         for (0..count) |row| for (definitions, page.columns, 0..) |definition, *payload, column| {
             const value = try result.cell(a, row, column);
-            if (value.sql_null and (value.value != .null or value.array != null or value.numeric != null or value.range != null or value.json_bytes != null or value.frozen_json != null)) return error.InvalidResult;
-            if (value.frozen_json != null and (definition.type != .json or value.value != .null or value.array != null or value.numeric != null or value.range != null or value.json_bytes != null)) return error.InvalidResult;
+            if (value.sql_null and (value.value != .null or value.array != null or value.numeric != null or value.range != null or value.enumeration != null or value.json_bytes != null or value.frozen_json != null)) return error.InvalidResult;
+            if (value.frozen_json != null and (definition.type != .json or value.value != .null or value.array != null or value.numeric != null or value.range != null or value.enumeration != null or value.json_bytes != null)) return error.InvalidResult;
             switch (payload.*) {
                 .json => |data| {
-                    if (value.array != null or value.numeric != null or value.range != null) return error.InvalidResult;
+                    if (value.array != null or value.numeric != null or value.range != null or value.enumeration != null) return error.InvalidResult;
                     if (data.frozen.len != 0) data.frozen[row] = null;
                     if (value.frozen_json) |frozen| {
                         var owned = frozen;
@@ -195,7 +195,7 @@ pub const Store = struct {
                         values[row] = null;
                         continue;
                     }
-                    if (value.numeric != null or value.range != null) return error.InvalidResult;
+                    if (value.numeric != null or value.range != null or value.enumeration != null) return error.InvalidResult;
                     var view: ?sources.sql_array_wire.Borrowed = null;
                     defer if (view) |*owned| owned.deinit();
                     const array = if (value.array) |native| native else decoded: {
@@ -218,6 +218,22 @@ pub const Store = struct {
                         const validated = try array.validate(.{});
                         values[row] = (try sources.sql_operators.cloneDatum(a, .{ .array = &validated, .sql_null = false })).array.?;
                     }
+                },
+                .enumeration => |values| {
+                    if (value.sql_null) {
+                        values[row] = null;
+                        continue;
+                    }
+                    if (value.array != null or value.numeric != null or value.range != null or value.json_bytes != null or value.frozen_json != null) return error.InvalidResult;
+                    const view = definition.enum_view orelse return error.InvalidResult;
+                    const atom = if (value.enumeration) |native| native else label: {
+                        if (value.value != .string) return error.InvalidResult;
+                        break :label try view.input(value.value.string);
+                    };
+                    _ = try view.output(atom);
+                    const key: PayloadMemo.Key = .{ .pointer = @intFromPtr(atom), .length = 0, .kind = .enumeration };
+                    values[row] = if (memo.get(key)) |cached| cached.enumeration.? else try atom.clone(a);
+                    memo.put(key, .{ .enumeration = values[row], .sql_null = false });
                 },
                 .range => |values| {
                     if (value.sql_null) {
@@ -250,7 +266,7 @@ pub const Store = struct {
                         values[row] = null;
                         continue;
                     }
-                    if (value.array != null or value.range != null) return error.InvalidResult;
+                    if (value.array != null or value.range != null or value.enumeration != null) return error.InvalidResult;
                     if (value.numeric) |number| {
                         if (value.value != .null) return error.InvalidResult;
                         const key: PayloadMemo.Key = .{ .pointer = @intFromPtr(number), .length = 0, .kind = .numeric };
@@ -656,4 +672,33 @@ test "pgwire cursor spool owns native range endpoints and preserves empty and SQ
     try std.testing.expect((try spool.cell(1, 0)).sql_null);
     try spool.append(.{ .columns = &.{.{ .name = "r", .type = .numrange }}, .rows = &.{&.{.{ .string = "empty" }}}, .command_tag = "SELECT 1" }, 3);
     try std.testing.expect((try spool.cell(2, 0)).range.?.empty);
+}
+
+test "SQL named enum cursor spools own executable identities and values after producer retirement" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var budget: Budget = .{ .child = a, .limit = 1 << 20 };
+    var store = Store.init(&budget);
+    defer store.deinit();
+    {
+        var definition = try sources.sql_scalar.EnumTypes.Owned.create(a, &.{ "z", "a", "" });
+        defer definition.deinit();
+        const record: sources.sql_scalar.EnumTypes.Record = .{ .identity = try sources.sql_scalar.EnumTypes.Identity.init(7, 2, 1, @splat(3)), .definition = definition.definition, .owner = .auth_disabled };
+        var view = try sources.sql_scalar.EnumValues.View.init(a, record);
+        defer view.deinit(a);
+        const Rows = struct {
+            view: *const sources.sql_scalar.EnumValues.View,
+            fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, _: usize) !backend.Cell {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return if (row == 2) .{ .sql_null = true } else .{ .enumeration = try self.view.input(if (row == 0) "z" else ""), .sql_null = false };
+            }
+        };
+        var rows: Rows = .{ .view = &view };
+        try store.append(.{ .columns = &.{.{ .name = "state", .type = .enumeration, .enum_view = &view }}, .cells = .{ .context = &rows, .count = 3, .width = 1, .read = Rows.cell }, .command_tag = "SELECT" }, 10);
+    }
+    try std.testing.expectEqualStrings("z", (try store.cell(0, 0)).enumeration.?.text);
+    try std.testing.expectEqualStrings("", (try store.cell(1, 0)).enumeration.?.text);
+    try std.testing.expect((try store.cell(2, 0)).sql_null);
+    const column = store.columns.?[0];
+    try std.testing.expectEqualStrings("z", try column.enum_view.?.output((try store.cell(0, 0)).enumeration.?));
 }

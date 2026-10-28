@@ -63,7 +63,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     const arbiter_expressions = try alloc.alloc(catalog.ConflictExpression, clause.expressions.len);
     if (clause.expressions.len != 0) {
         const source_columns = try alloc.alloc(scalar.Column, table.columns.len);
-        for (table.columns, source_columns) |column, *out| out.* = .{ .name = column.name, .type = column.type, .nullable = column.nullable, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
+        for (table.columns, source_columns) |column, *out| out.* = .{ .name = column.name, .type = column.type, .nullable = column.nullable, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind };
         for (clause.expressions, arbiter_expressions) |expression, *out| {
             const lowered = try @import("schema_expression.zig").lowerColumns(alloc, source_columns, expression, null);
             out.* = .{ .json = try std.json.Stringify.valueAlloc(alloc, lowered.expression, .{}), .result_type = lowered.type };
@@ -74,8 +74,8 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     const columns = try alloc.alloc(scalar.Column, count * 3 + clause.capture_count);
     for (0..count) |i| {
         const column = if (i < table.columns.len) table.columns[i] else virtual[i - table.columns.len];
-        columns[i] = .{ .name = column.name, .type = column.type, .ambiguous = true, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
-        columns[count + i] = .{ .name = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ name.table, column.name }), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+        columns[i] = .{ .name = column.name, .type = column.type, .ambiguous = true, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+        columns[count + i] = .{ .name = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ name.table, column.name }), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
         if (!aliased) {
             const scope = table.scope orelse if (name.namespace) |namespace| catalog.Table.Scope{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;
             if (scope) |logical| {
@@ -85,10 +85,10 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
                 columns[count + i].aliases = aliases;
             }
         }
-        columns[count * 2 + i] = .{ .name = try std.fmt.allocPrint(alloc, "excluded\x00{s}", .{column.name}), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+        columns[count * 2 + i] = .{ .name = try std.fmt.allocPrint(alloc, "excluded\x00{s}", .{column.name}), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
     }
     for (columns[count * 3 ..], capture_types, 0..) |*column, descriptor, ordinal| {
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$conflict_capture_{d}", .{ordinal}), .type = descriptor.kind orelse return error.InvalidSqlBackendResponse, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier, .temporal_kind = descriptor.temporal_kind, .nullable = true };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$conflict_capture_{d}", .{ordinal}), .type = descriptor.kind orelse return error.InvalidSqlBackendResponse, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier, .enum_view = descriptor.enum_view, .temporal_kind = descriptor.temporal_kind, .nullable = true };
     }
     var pass: usize = 0;
     const column_assignments = try alloc.alloc(?usize, table.columns.len);

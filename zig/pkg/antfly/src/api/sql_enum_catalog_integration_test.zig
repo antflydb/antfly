@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Public enum catalog qualification only. These checks do not certify native
-//! enum columns, indexed values or dependent-schema activation.
+//! Public catalog and native enum ingress qualification across cold owners.
+//! Dependent-schema activation is qualified separately.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const fixture = @import("sql_owner_test_fixture.zig");
@@ -159,10 +159,12 @@ fn lostAck(ctx: *fixture.Context) !void {
 
 const IngressCampaign = struct {
     pub const native_auth = true;
+    pub const native_sessions = true;
     pub const cold_catalog = true;
     credentials: client.ApiKeyHeaders = .{},
     type_id: u64 = 0,
     schema_version: u32 = 0,
+    prepared_id: [32]u8 = undefined,
     pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
         try Campaign.configureAuth(manager);
     }
@@ -225,6 +227,26 @@ const IngressCampaign = struct {
         var updated = try std.json.parseFromSlice(struct { schema: struct { version: u32 } }, ctx.alloc, patched.body, .{ .ignore_unknown_fields = true });
         defer updated.deinit();
         self.schema_version = updated.value.schema.version;
+        for ([_][]const u8{ "a", "z" }) |label| {
+            var mutation = try client.executeParameters(ctx, "UPDATE enum_rows SET state=$1 WHERE _id='first' RETURNING state", &.{.{ .string = label }}, .write_admission);
+            defer mutation.deinit(ctx.alloc);
+            errdefer std.debug.print("enum SQL mutation status={d} body={s}\n", .{ mutation.status, mutation.body });
+            try std.testing.expectEqual(@as(u16, 200), mutation.status);
+            var result = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.SQLResponse, ctx.alloc, mutation.body, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+            try std.testing.expectEqualStrings(label, result.value.rows[0][0].string);
+            try std.testing.expectEqual(self.type_id, result.value.columns[0].named_type.?.id);
+        }
+        var prepared = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/prepared", .POST, "{\"statement\":\"SELECT state FROM enum_rows WHERE state = $1\"}", 15_000);
+        defer prepared.deinit(ctx.alloc);
+        errdefer std.debug.print("enum prepare status={d} body={s}\n", .{ prepared.status, prepared.body });
+        try std.testing.expectEqual(@as(u16, 200), prepared.status);
+        var prepared_body = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.SQLPreparedResponse, ctx.alloc, prepared.body, .{});
+        defer prepared_body.deinit();
+        try std.testing.expectEqual(@as(usize, 32), prepared_body.value.prepared_id.len);
+        @memcpy(&self.prepared_id, prepared_body.value.prepared_id);
+        try std.testing.expectEqual(self.type_id, prepared_body.value.parameter_descriptors[0].named_type.?.id);
         try self.observe(ctx);
     }
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
@@ -273,6 +295,55 @@ const IngressCampaign = struct {
         try std.testing.expectEqualStrings("first", match.value._id);
         try std.testing.expectEqualStrings("z", match.value.row.state.?);
         try std.testing.expect(matches.next() == null);
+        const Query = struct { sql: []const u8, expected: []const u8, enumeration: bool = true };
+        const queries = [_]Query{
+            .{ .sql = "SELECT state FROM enum_rows ORDER BY state", .expected = "[[\"z\"],[\"\"],[null]]" },
+            .{ .sql = "SELECT state FROM enum_rows WHERE state < 'a'", .expected = "[[\"z\"]]" },
+            .{ .sql = "SELECT state::text FROM enum_rows ORDER BY state", .expected = "[[\"\"],[\"z\"],[null]]", .enumeration = false },
+            .{ .sql = "SELECT state::text FROM enum_rows ORDER BY enum_rows.state", .expected = "[[\"z\"],[\"\"],[null]]", .enumeration = false },
+            .{ .sql = "SELECT min(state), max(state) FROM enum_rows", .expected = "[[\"z\",\"\"]]" },
+            .{ .sql = "SELECT DISTINCT state FROM enum_rows ORDER BY state", .expected = "[[\"z\"],[\"\"],[null]]" },
+        };
+        for (queries) |query| {
+            var response = try client.execute(ctx, query.sql, .read);
+            defer response.deinit(ctx.alloc);
+            errdefer std.debug.print("enum SQL query={s} status={d} body={s}\n", .{ query.sql, response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var result = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.SQLResponse, ctx.alloc, response.body, .{});
+            defer result.deinit();
+            const encoded = try std.json.Stringify.valueAlloc(ctx.alloc, result.value.rows, .{});
+            defer ctx.alloc.free(encoded);
+            try std.testing.expectEqualStrings(query.expected, encoded);
+            for (result.value.columns) |column| {
+                if (query.enumeration) {
+                    try std.testing.expectEqual(.enumeration, column.type);
+                    const named = column.named_type orelse return error.MissingEnumIdentity;
+                    try std.testing.expectEqual(self.type_id, named.id);
+                    try std.testing.expectEqual(@as(u32, @intCast(16384 + self.type_id * 2)), named.oid);
+                } else try std.testing.expectEqual(.string, column.type);
+            }
+        }
+        var parameter = try client.executeParameters(ctx, "SELECT state FROM enum_rows WHERE state = $1", &.{.{ .string = "z" }}, .read);
+        defer parameter.deinit(ctx.alloc);
+        errdefer std.debug.print("enum parameter status={d} body={s}\n", .{ parameter.status, parameter.body });
+        try std.testing.expectEqual(@as(u16, 200), parameter.status);
+        var parameter_result = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.SQLResponse, ctx.alloc, parameter.body, .{});
+        defer parameter_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parameter_result.value.rows.len);
+        try std.testing.expectEqualStrings("z", parameter_result.value.rows[0][0].string);
+        const prepared_path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/prepared/{s}/execute", .{self.prepared_id});
+        defer ctx.alloc.free(prepared_path);
+        var prepared = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, prepared_path, .POST, "{\"parameters\":[\"z\"]}", 15_000);
+        defer prepared.deinit(ctx.alloc);
+        errdefer std.debug.print("enum durable execute status={d} body={s}\n", .{ prepared.status, prepared.body });
+        try std.testing.expectEqual(@as(u16, 200), prepared.status);
+        var prepared_result = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.SQLResponse, ctx.alloc, prepared.body, .{});
+        defer prepared_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), prepared_result.value.rows.len);
+        try std.testing.expectEqualStrings("z", prepared_result.value.rows[0][0].string);
+        var invalid = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, prepared_path, .POST, "{\"parameters\":[\"Z\"]}", 15_000);
+        defer invalid.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 400), invalid.status);
     }
 };
 

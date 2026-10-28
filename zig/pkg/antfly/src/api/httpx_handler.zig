@@ -6126,6 +6126,11 @@ pub const AntflyApiHandler = struct {
                             else
                                 try @import("antfly_local_sources").sql_temporal_text.format(temporal.*, &text);
                             try std.json.Stringify.value(exact, .{}, &writer.writer);
+                        } else if (value.enumeration()) |atom| {
+                            try value.validateTemporal();
+                            if (definition.type != .enumeration) return error.InvalidSqlBackendResponse;
+                            const view = definition.enum_view orelse return error.InvalidSqlBackendResponse;
+                            try std.json.Stringify.value(try view.output(atom), .{}, &writer.writer);
                         } else if (value.array) |array| {
                             if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;
                             try @import("antfly_local_sources").sql_array_wire.encode(array.*, &writer.writer, .{ .wire_bytes = self.prepared_response_budget.limit });
@@ -6361,11 +6366,10 @@ pub const AntflyApiHandler = struct {
                 const encoded_owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{self.adapter.server.localSessionNodeId()});
                 const parameter_types = description.arena.allocator().alloc(sql_wire.SQLColumnType, description.binding.parameter_types.len) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 for (description.binding.parameter_types, parameter_types) |kind, *output| output.* = if (kind) |value| switch (value) {
-                    .enumeration => return error.UnsupportedSqlShape,
                     inline else => |tag| @field(sql_wire.SQLColumnType, @tagName(tag)),
                 } else .unknown;
                 const parameter_descriptors = try description.arena.allocator().alloc(sql_wire.SQLParameterDescriptor, parameter_types.len);
-                for (parameter_descriptors, parameter_types, description.binding.parameter_descriptors) |*output, kind, descriptor| output.* = .{ .type = kind, .nullable = descriptor.nullable, .temporal_kind = if (descriptor.temporal_kind) |temporal_kind| switch (temporal_kind) {
+                for (parameter_descriptors, parameter_types, description.binding.parameter_descriptors) |*output, kind, descriptor| output.* = .{ .type = kind, .nullable = descriptor.nullable, .named_type = if (descriptor.enum_view) |view| try @import("antfly_local_sources").sql_catalog.named_layouts.identityWireLeaky(std.meta.Child(@FieldType(sql_wire.SQLColumn, "named_type")), description.arena.allocator(), view.record.identity) else null, .temporal_kind = if (descriptor.temporal_kind) |temporal_kind| switch (temporal_kind) {
                     inline else => |tag| @field(sql_wire.SQLTemporalKind, @tagName(tag)),
                 } else null, .element_type = if (descriptor.element_type) |element| switch (element) {
                     inline else => |tag| @field(sql_wire.SQLArrayElementType, @tagName(tag)),
@@ -6390,7 +6394,9 @@ pub const AntflyApiHandler = struct {
             self.execution_entered = true;
             self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
             var execution_backend = self.adapter.backend();
-            if (resource) |owned| execution_backend.parameter_descriptor_hints = owned.value.parameter_descriptors;
+            var parameter_region = std.heap.ArenaAllocator.init(self.prepared_response_budget.allocator());
+            defer parameter_region.deinit();
+            if (resource) |owned| execution_backend.parameter_descriptor_hints = @import("sql_type_schema.zig").parameterDescriptorsLeaky(self.adapter.server, parameter_region.allocator(), self.adapter.identity.*, self.adapter.context, owned.value.parameter_descriptors, &.{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
             var execution_limits = self.execution_limits;
             execution_limits.result_rows = self.limit;
             self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
@@ -6713,8 +6719,8 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(columns);
         for (result.output.columns, columns) |column, *output| output.* = .{
             .name = column.name,
+            .named_type = if (column.enum_view) |view| try @import("antfly_local_sources").sql_catalog.named_layouts.identityWireLeaky(std.meta.Child(@FieldType(sql_wire.SQLColumn, "named_type")), ctx.allocator, view.record.identity) else null,
             .type = switch (column.type) {
-                .enumeration => return error.UnsupportedSqlShape,
                 inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
             },
             .element_type = if (column.element_type) |element| switch (element) {

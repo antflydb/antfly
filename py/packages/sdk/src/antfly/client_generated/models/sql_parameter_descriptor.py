@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
@@ -9,6 +9,10 @@ from ..models.sql_array_element_type import SQLArrayElementType
 from ..models.sql_column_type import SQLColumnType
 from ..models.sql_temporal_kind import SQLTemporalKind
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.sql_named_type_identity import SQLNamedTypeIdentity
+
 
 T = TypeVar("T", bound="SQLParameterDescriptor")
 
@@ -22,6 +26,8 @@ class SQLParameterDescriptor:
             type_ (SQLColumnType): Logical SQL result type. Integer values and numbers with element_type numeric are decimal
                 strings to preserve exact precision in every client.
             nullable (bool):
+            named_type (SQLNamedTypeIdentity | Unset): Server-resolved immutable SQL type identity. Origin survives restore
+                remapping of local IDs and wire OIDs.
             temporal_kind (SQLTemporalKind | Unset): Exact temporal identity for datetime-family SQL values. Omission means
                 timestamp_tz. Intervals preserve separate calendar months, days, and microseconds and use PostgreSQL interval
                 text in JSON results.
@@ -31,6 +37,7 @@ class SQLParameterDescriptor:
 
     type_: SQLColumnType
     nullable: bool
+    named_type: SQLNamedTypeIdentity | Unset = UNSET
     temporal_kind: SQLTemporalKind | Unset = UNSET
     element_type: SQLArrayElementType | Unset = UNSET
 
@@ -38,6 +45,10 @@ class SQLParameterDescriptor:
         type_ = self.type_.value
 
         nullable = self.nullable
+
+        named_type: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.named_type, Unset):
+            named_type = self.named_type.to_dict()
 
         temporal_kind: str | Unset = UNSET
         if not isinstance(self.temporal_kind, Unset):
@@ -55,6 +66,8 @@ class SQLParameterDescriptor:
                 "nullable": nullable,
             }
         )
+        if named_type is not UNSET:
+            field_dict["named_type"] = named_type
         if temporal_kind is not UNSET:
             field_dict["temporal_kind"] = temporal_kind
         if element_type is not UNSET:
@@ -64,10 +77,19 @@ class SQLParameterDescriptor:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.sql_named_type_identity import SQLNamedTypeIdentity
+
         d = dict(src_dict)
         type_ = SQLColumnType(d.pop("type"))
 
         nullable = d.pop("nullable")
+
+        _named_type = d.pop("named_type", UNSET)
+        named_type: SQLNamedTypeIdentity | Unset
+        if isinstance(_named_type, Unset):
+            named_type = UNSET
+        else:
+            named_type = SQLNamedTypeIdentity.from_dict(_named_type)
 
         _temporal_kind = d.pop("temporal_kind", UNSET)
         temporal_kind: SQLTemporalKind | Unset
@@ -86,6 +108,7 @@ class SQLParameterDescriptor:
         sql_parameter_descriptor = cls(
             type_=type_,
             nullable=nullable,
+            named_type=named_type,
             temporal_kind=temporal_kind,
             element_type=element_type,
         )

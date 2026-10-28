@@ -201,7 +201,7 @@ fn validateParameters(resource: Resource) !void {
     if (resource.parameter_types.len != resource.parameter_descriptors.len or resource.parameter_descriptors.len > 1024) return error.InvalidSqlParameters;
     for (resource.parameter_types, resource.parameter_descriptors) |kind, descriptor| {
         if (kind != descriptor.kind) return error.InvalidSqlParameters;
-        try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
+        try @import("antfly_local_sources").sql_scalar.validateParameterDescriptorWire(descriptor);
     }
 }
 

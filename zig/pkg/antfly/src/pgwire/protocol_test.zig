@@ -38,6 +38,7 @@ const Mock = struct {
     array_parameters: bool = false,
     two_parameters: bool = false,
     native_parameters: bool = false,
+    enum_view: ?*const @import("antfly_local_sources").sql_scalar.EnumValues.View = null,
     native_parameter_checks: usize = 0,
     result_override: ?backend.Result = null,
     result_override_executions: usize = 0,
@@ -242,10 +243,17 @@ const Mock = struct {
         if (self.fail_auth or !std.mem.eql(u8, user, "tester") or !std.mem.eql(u8, password, "secret")) return error.Unauthorized;
         return .{ .context = self, .release = release };
     }
-    fn describe(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
+    fn describe(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.describes += 1;
         try request.check();
+        if (self.enum_view) |view| {
+            const columns = try alloc.alloc(backend.Column, 1);
+            columns[0] = .{ .name = "state", .type = .enumeration, .enum_view = view };
+            const descriptors = try alloc.alloc(backend.Parameter, 1);
+            descriptors[0] = .{ .kind = .enumeration, .enum_view = view };
+            return .{ .columns = columns, .parameter_types = &.{.enumeration}, .parameter_descriptors = descriptors };
+        }
         if (self.cached_shape_change and self.describes > 1) return .{ .columns = &.{.{ .name = "n", .type = .string }}, .parameter_types = &.{.integer} };
         if (self.two_parameters) return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = &.{ .integer, .integer } };
         if (self.array_parameters) {
@@ -264,6 +272,19 @@ const Mock = struct {
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
+        if (self.enum_view) |view| {
+            self.executions += 1;
+            const cells = request.parameter_cells orelse return error.ExpectedNativeEnum;
+            try std.testing.expectEqual(@as(usize, 1), cells.len);
+            try std.testing.expectEqual(@as(usize, 1), request.parameter_descriptors.len);
+            try std.testing.expectEqual(view.record.identity.id, request.parameter_descriptors[0].enum_view.?.record.identity.id);
+            if (!cells[0].sql_null) try std.testing.expectEqualStrings("z", try view.output(cells[0].enumeration().?));
+            const columns = try alloc.alloc(backend.Column, 1);
+            columns[0] = .{ .name = "state", .type = .enumeration, .enum_view = view };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = try alloc.dupe(std.json.Value, &.{if (cells[0].sql_null) .null else .{ .string = "z" }});
+            return .{ .columns = columns, .rows = rows, .command_tag = "SELECT 1" };
+        }
         if (self.procedure_notice_failure) {
             const diagnostic = request.diagnostics orelse return error.InvalidSqlBackendResponse;
             try backend.Diagnostic.emitNotice(diagnostic, .{ .message = "before failure" });
@@ -3408,4 +3429,70 @@ test "pgwire procedure notices survive failing statement arenas and precede the 
     try std.testing.expect(std.mem.endsWith(u8, observed, "NEZ"));
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "SNOTICE\x00C00000\x00Mbefore failure\x00") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "C22012\x00") != null);
+}
+
+test "SQL named enum pgwire Parse Bind close statement and execute retain exact OIDs and labels" {
+    const a = std.testing.allocator;
+    const scalar = @import("antfly_local_sources").sql_scalar;
+    var definition = try scalar.EnumTypes.Owned.create(a, &.{ "z", "a", "" });
+    defer definition.deinit();
+    const record: scalar.EnumTypes.Record = .{ .identity = try scalar.EnumTypes.Identity.init(7, 2, 1, @splat(3)), .definition = definition.definition, .owner = .auth_disabled };
+    var view = try scalar.EnumValues.View.init(a, record);
+    defer view.deinit(a);
+    for ([_]u32{ 0, record.identity.oid }) |declared| for ([_]u16{ 0, 1 }) |format| for ([_]bool{ false, true }) |is_null| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        var p: std.Io.Writer.Allocating = .init(a);
+        defer p.deinit();
+        try p.writer.writeAll("q\x00SELECT $1\x00");
+        try p.writer.writeInt(u16, 1, .big);
+        try p.writer.writeInt(u32, declared, .big);
+        try frame(&input.writer, 'P', p.written());
+        try frame(&input.writer, 'D', "Sq\x00");
+        var b: std.Io.Writer.Allocating = .init(a);
+        defer b.deinit();
+        try b.writer.writeAll("p\x00q\x00");
+        try b.writer.writeInt(u16, 1, .big);
+        try b.writer.writeInt(u16, format, .big);
+        try b.writer.writeInt(u16, 1, .big);
+        try b.writer.writeInt(i32, if (is_null) -1 else 1, .big);
+        if (!is_null) try b.writer.writeByte('z');
+        try b.writer.writeInt(u16, 1, .big);
+        try b.writer.writeInt(u16, format, .big);
+        try frame(&input.writer, 'B', b.written());
+        try frame(&input.writer, 'C', "Sq\x00");
+        try execute(&input.writer, "p", 0);
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .native_parameters = true, .enum_view = &view };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        var messages: protocol.Cursor = .{ .bytes = output.written() };
+        var descriptions: usize = 0;
+        var data: usize = 0;
+        while (messages.offset < messages.bytes.len) {
+            const tag = try messages.int(u8);
+            const length = try messages.int(u32);
+            var payload: protocol.Cursor = .{ .bytes = try messages.take(length - 4) };
+            if (tag == 'E') {
+                std.debug.print("enum wire error={s}\n", .{payload.bytes});
+                return error.UnexpectedEnumParameterError;
+            }
+            if (tag == 't') {
+                descriptions += 1;
+                try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+                try std.testing.expectEqual(record.identity.oid, try payload.int(u32));
+            }
+            if (tag == 'D') {
+                data += 1;
+                try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+                try std.testing.expectEqual(@as(i32, if (is_null) -1 else 1), try payload.int(i32));
+                if (!is_null) try std.testing.expectEqualStrings("z", try payload.take(1));
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), descriptions);
+        try std.testing.expectEqual(@as(usize, 1), data);
+        try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    };
 }

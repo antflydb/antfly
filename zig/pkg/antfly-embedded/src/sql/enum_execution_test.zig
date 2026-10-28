@@ -328,7 +328,13 @@ test "SQL named enum bound programs use symbolic serialization and unwind bindin
     defer a.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "named_type") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "symbols") == null);
-    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(scalar.Type, a, encoded, .{}));
+    var reference = try std.json.parseFromSlice(scalar.Type, a, encoded, .{});
+    defer reference.deinit();
+    try std.testing.expect(reference.value.enum_view == null and reference.value.enum_reference != null);
+    try std.testing.expectEqual(source.view.record.identity.id, reference.value.enum_reference.?.id);
+    try scalar.validateParameterDescriptorWire(reference.value);
+    try std.testing.expectError(error.InvalidSqlParameters, scalar.validateParameterType(reference.value));
+    try std.testing.expectError(error.InvalidSqlParameters, @import("parameter_frame.zig").Frame.prepare(a, &.{reference.value}, &.{.{ .text = "z" }}, .{}));
     const builtin = try std.json.Stringify.valueAlloc(a, scalar.Type{ .kind = .integer }, .{});
     defer a.free(builtin);
     try std.testing.expectEqualStrings("{\"kind\":\"integer\",\"temporal_kind\":null,\"nullable\":true,\"element_type\":null,\"numeric_modifier\":null}", builtin);
@@ -540,7 +546,7 @@ test "SQL named enum compatibility boundaries never reinterpret enum placeholder
     const context: @import("runtime.zig").Context = .{ .alloc = a, .arena = arena.allocator(), .backend = undefined, .binding = .{ .table = null, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty }, .parameters = &.{}, .limits = .{} };
     try std.testing.expectEqualStrings("", (try context.outputDatum(empty, .enumeration, null)).string);
     try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(empty, .json, null));
-    try std.testing.expectError(error.UnsupportedSqlShape, @import("runtime.zig").encodeStorageDatum(arena.allocator(), empty, .{ .name = "v", .path = "v", .type = .string }, 1024));
+    try std.testing.expectEqualStrings("", (try @import("runtime.zig").encodeStorageDatum(arena.allocator(), empty, .{ .name = "v", .path = "v", .type = .string }, 1024)).string);
 }
 
 test "SQL named enum retained numeric transitions preserve both domains in either order" {
@@ -588,4 +594,290 @@ test "SQL named enum literal input is prepared before lazy branches and rank wor
     try std.testing.expect(!result.sql_null and result.value.bool);
     var work: @import("json_order.zig").Budget = .{ .remaining = 2 };
     try std.testing.expectError(error.SqlProgramLimitExceeded, scalar.compareDatumsWithBudget(z, try source.value("a"), &work));
+}
+
+const EnumTableBackend = struct {
+    fixture: *Fixture,
+    fn resolve(raw: *anyopaque, a: A, name: @import("ast.zig").Name, _: @import("catalog.zig").Action) !@import("catalog.zig").Table {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!std.mem.eql(u8, name.table, "enum_rows")) return error.UndefinedTable;
+        const schema = @import("../storage/schema.zig");
+        const columns = [_]schema.RelationalColumn{ .{ .name = "id", .path = "id", .column_type = .integer, .required = true }, .{ .name = "state", .path = "state", .column_type = .enumeration, .named_type_id = 5, .allows_null = true } };
+        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns, .named_types = &.{self.fixture.view.record} };
+        return .{ .id = 1, .physical_name = "enum_rows", .schema_version = 1, .storage_mode = .relational, .columns = try @import("catalog.zig").relationalColumnsLeaky(a, table) };
+    }
+    fn scan(_: *anyopaque, a: A, table: @import("catalog.zig").Table, request: @import("catalog.zig").Scan) !@import("catalog.zig").Page {
+        const catalog = @import("catalog.zig");
+        if (request.after != null) return .{ .rows = &.{} };
+        const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "[{\"id\":1,\"state\":\"z\"},{\"id\":2,\"state\":\"a\"},{\"id\":3,\"state\":\"\"},{\"id\":4,\"state\":null}]", .{});
+        var rows: std.ArrayList(catalog.Row) = .empty;
+        for (input.array.items, 0..) |row, i| {
+            var include = true;
+            for (request.conditions) |condition| {
+                const column = try table.column(condition.column);
+                const value = try @import("document_row.zig").declaredCell(a, column, Datum.fromJson(row.object.get(condition.column) orelse .null));
+                const actual = if (condition.op == .is_null) value.sql_null else if (condition.op == .is_not_null) !value.sql_null else compare: {
+                    if (value.sql_null or condition.value == .null) break :compare false;
+                    const bound = try @import("describe.zig").coerceDatumTyped(a, Datum.fromJson(condition.value), scalar.columnType(column));
+                    const order = try scalar.compareDatums(value, bound);
+                    break :compare switch (condition.op) {
+                        .eq => order == .eq,
+                        .neq => order != .eq,
+                        .lt => order == .lt,
+                        .lte => order != .gt,
+                        .gt => order == .gt,
+                        .gte => order != .lt,
+                        else => return error.UnsupportedSqlShape,
+                    };
+                };
+                include = include and actual;
+            }
+            if (include) try rows.append(a, .{ .id = try std.fmt.allocPrint(a, "{d}", .{i + 1}), .version = 1, .value = row });
+        }
+        return .{ .rows = try rows.toOwnedSlice(a) };
+    }
+    const Cursor = struct {
+        a: A,
+        source: *anyopaque,
+        table: @import("catalog.zig").Table,
+        request: @import("catalog.zig").Scan,
+        done: bool = false,
+        fn next(raw: *anyopaque, a: A, _: u32) !@import("catalog.zig").Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.done) return .{ .rows = &.{} };
+            self.done = true;
+            return EnumTableBackend.scan(self.source, a, self.table, self.request);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.a.destroy(self);
+        }
+    };
+    const Read = struct {
+        a: A,
+        cursors: []@import("catalog.zig").Cursor,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (self.cursors) |cursor| cursor.close(cursor.ptr);
+            self.a.free(self.cursors);
+            self.a.destroy(self);
+        }
+    };
+    fn capture(raw: *anyopaque, a: A, scans: []const @import("catalog.zig").StatementScan) !@import("catalog.zig").StatementRead {
+        const owner = try a.create(Read);
+        errdefer a.destroy(owner);
+        owner.* = .{ .a = a, .cursors = try a.alloc(@import("catalog.zig").Cursor, scans.len) };
+        var initialized: usize = 0;
+        errdefer {
+            for (owner.cursors[0..initialized]) |cursor| cursor.close(cursor.ptr);
+            a.free(owner.cursors);
+        }
+        for (scans, owner.cursors) |request, *cursor| {
+            const state = try a.create(Cursor);
+            state.* = .{ .a = a, .source = raw, .table = request.table, .request = request.request };
+            cursor.* = .{ .ptr = state, .next = Cursor.next, .close = Cursor.close };
+            initialized += 1;
+        }
+        return .{ .ptr = owner, .cursors = owner.cursors, .close = Read.close };
+    }
+    fn mutate(_: *anyopaque, _: A, _: A, _: @import("catalog.zig").Table, _: []const @import("catalog.zig").Mutation) !@import("catalog.zig").MutationOutcome {
+        return error.TestUnexpectedResult;
+    }
+    fn checkpoint(_: *anyopaque) !void {}
+    fn backend(self: *@This()) @import("catalog.zig").Backend {
+        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .open_statement = capture } };
+    }
+};
+
+test "SQL named enum declared tables preserve domains through relational graph execution" {
+    const a = std.testing.allocator;
+    var source = try Fixture.init(a, 5, 1);
+    defer source.deinit(a);
+    var backend: EnumTableBackend = .{ .fixture = &source };
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT state FROM enum_rows ORDER BY state", .rows = "[[\"z\"],[\"a\"],[\"\"],[null]]" },
+        .{ .sql = "SELECT state FROM enum_rows WHERE state < 'a' ORDER BY id", .rows = "[[\"z\"]]" },
+        .{ .sql = "SELECT state::text FROM enum_rows ORDER BY id", .rows = "[[\"z\"],[\"a\"],[\"\"],[null]]" },
+        .{ .sql = "SELECT state::text FROM enum_rows ORDER BY state", .rows = "[[\"\"],[\"a\"],[\"z\"],[null]]" },
+        .{ .sql = "SELECT state::text FROM enum_rows ORDER BY enum_rows.state", .rows = "[[\"z\"],[\"a\"],[\"\"],[null]]" },
+        .{ .sql = "SELECT coalesce(state,'z') FROM enum_rows ORDER BY id", .rows = "[[\"z\"],[\"a\"],[\"\"],[\"z\"]]" },
+        .{ .sql = "SELECT DISTINCT state FROM enum_rows ORDER BY state DESC NULLS LAST", .rows = "[[\"\"],[\"a\"],[\"z\"],[null]]" },
+        .{ .sql = "SELECT state, count(*) FROM enum_rows GROUP BY state ORDER BY state", .rows = "[[\"z\",1],[\"a\",1],[\"\",1],[null,1]]" },
+        .{ .sql = "SELECT min(state),max(state) FROM enum_rows", .rows = "[[\"z\",\"\"]]" },
+        .{ .sql = "SELECT first_value(state) OVER (ORDER BY id) FROM enum_rows ORDER BY id", .rows = "[[\"z\"],[\"z\"],[\"z\"],[\"z\"]]" },
+        .{ .sql = "SELECT lag(state) OVER (ORDER BY id) FROM enum_rows ORDER BY id", .rows = "[[null],[\"z\"],[\"a\"],[\"\"]]" },
+        .{ .sql = "SELECT a.state FROM enum_rows a JOIN enum_rows b ON a.state=b.state ORDER BY a.id", .rows = "[[\"z\"],[\"a\"],[\"\"]]" },
+        .{ .sql = "WITH q AS (SELECT state,id FROM enum_rows) SELECT state FROM q ORDER BY id", .rows = "[[\"z\"],[\"a\"],[\"\"],[null]]" },
+        .{ .sql = "SELECT state FROM enum_rows UNION SELECT state FROM enum_rows ORDER BY state", .rows = "[[\"z\"],[\"a\"],[\"\"],[null]]" },
+    }) |probe| {
+        errdefer std.debug.print("enum declared-table graph: {s}\n", .{probe.sql});
+        var compiled = try @import("compiler.zig").compile(a, probe.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend.backend(), &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        var expected = try std.json.parseFromSlice(std.json.Value, a, probe.rows, .{});
+        defer expected.deinit();
+        const actual = result.output.native_rows orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(expected.value.array.items.len, actual.len);
+        for (expected.value.array.items, actual) |wanted, row| {
+            try std.testing.expectEqual(wanted.array.items.len, row.len);
+            for (wanted.array.items, row) |cell, value| {
+                if (cell == .null) {
+                    try std.testing.expect(value.sql_null);
+                    continue;
+                }
+                try std.testing.expect(!value.sql_null);
+                const logical: std.json.Value = if (value.enumeration()) |atom| .{ .string = atom.text } else value.value;
+                try std.testing.expectEqual(std.math.Order.eq, try scalar.compare(cell, logical));
+            }
+        }
+    }
+}
+
+test "SQL named enum native execution preserves prepared input domains through scan predicates" {
+    const a = std.testing.allocator;
+    var source = try Fixture.init(a, 5, 1);
+    defer source.deinit(a);
+    var fixture: EnumTableBackend = .{ .fixture = &source };
+    var backend = fixture.backend();
+    backend.parameter_descriptor_hints = &.{.{ .kind = .enumeration, .enum_view = &source.view }};
+    var compiled = try @import("compiler.zig").compile(a, "SELECT state FROM enum_rows WHERE state = $1", .{});
+    defer compiled.deinit();
+    var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{.null}, .{ .native_result = true, .parameter_cells = &.{try source.value("a")} });
+    defer result.deinit();
+    const rows = result.output.native_rows orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("a", try source.view.output(rows[0][0].enumeration().?));
+}
+
+test "SQL named enum conflict update bindings preserve excluded and returning domains" {
+    const a = std.testing.allocator;
+    var source = try Fixture.init(a, 5, 1);
+    defer source.deinit(a);
+    var fixture: EnumTableBackend = .{ .fixture = &source };
+    var compiled = try @import("compiler.zig").compile(a, "INSERT INTO enum_rows (_id,id,state) VALUES ('new',5,'z') ON CONFLICT (_id) DO UPDATE SET state=excluded.state RETURNING state", .{});
+    defer compiled.deinit();
+    var description = try @import("describe.zig").describe(a, fixture.backend(), &compiled, &.{});
+    defer description.deinit();
+    try std.testing.expectEqual(@as(usize, 1), description.binding.columns.len);
+    try std.testing.expect(scalar.sameEnumDomain(&source.view, description.binding.columns[0].enum_view));
+}
+
+test "SQL named enum durable views reject incomplete named outputs while explicit text remains executable" {
+    const a = std.testing.allocator;
+    var source = try Fixture.init(a, 5, 1);
+    defer source.deinit(a);
+    var fixture: EnumTableBackend = .{ .fixture = &source };
+    const views = @import("view_definition.zig");
+    const Resolver = struct {
+        fn resolve(raw: *anyopaque, alloc: A, name: @import("ast.zig").Name) !views.ResolvedSource {
+            var table = try EnumTableBackend.resolve(raw, alloc, name, .read);
+            table.scope = .{ .database = "default", .namespace = "public", .name = name.table, .revision = 1 };
+            return .{ .table = table, .schema_digest = @splat(1) };
+        }
+    };
+    const resolver: views.Resolver = .{ .ptr = &fixture, .resolve = Resolver.resolve, .checkpoint = EnumTableBackend.checkpoint };
+    try std.testing.expectError(error.SqlTypeActivationRequired, views.prepare(a, resolver, "SELECT state FROM enum_rows", .{ .owner = .auth_disabled }));
+    var text = try views.prepare(a, resolver, "SELECT state::text AS state FROM enum_rows", .{ .owner = .auth_disabled });
+    defer text.deinit();
+    try std.testing.expectEqual(@import("ast.zig").ColumnType.string, text.value.columns[0].type);
+}
+
+test "SQL named enum invocation descriptors compare immutable domains instead of owner addresses" {
+    const a = std.testing.allocator;
+    var source = try Fixture.init(a, 5, 1);
+    defer source.deinit(a);
+    var clone = try Fixture.init(a, 5, 1);
+    defer clone.deinit(a);
+    var unrelated = try Fixture.init(a, 6, 1);
+    defer unrelated.deinit(a);
+    const descriptor: scalar.Type = .{ .kind = .enumeration, .enum_view = &source.view };
+    try std.testing.expect(scalar.sameParameterType(descriptor, .{ .kind = .enumeration, .enum_view = &clone.view }));
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(region.allocator(), 1);
+    try invocation.mergeInferred(&.{descriptor});
+    try std.testing.expect(invocation.descriptors[0].enum_view != null);
+    try invocation.mergeInferred(&.{.{ .kind = .enumeration, .enum_view = &clone.view }});
+    try std.testing.expectError(error.ConflictingSqlParameterTypes, invocation.mergeInferred(&.{.{ .kind = .enumeration, .enum_view = &unrelated.view }}));
+    try std.testing.expect(scalar.sameEnumDomain(invocation.descriptors[0].enum_view, &source.view));
+}
+
+test "SQL named enum contextual inputs remain nullable for required column comparisons" {
+    const a = std.testing.allocator;
+    var source = try Fixture.init(a, 5, 1);
+    defer source.deinit(a);
+    const expression: @import("ast.zig").Scalar = .{ .literal = .{ .parameter = 1 } };
+    var descriptors = [_]scalar.Type{.{}};
+    _ = try scalar.inferTypedParametersExpected(a, &expression, &.{}, &descriptors, .{ .kind = .enumeration, .enum_view = &source.view, .nullable = false }, .{});
+    try std.testing.expect(descriptors[0].nullable);
+    var parsed = try @import("compiler.zig").compileScalar(a, "v = $1", .{});
+    defer parsed.deinit();
+    var program = try scalar.bind(a, parsed.expression, &.{.{ .name = "v", .type = .enumeration, .enum_view = &source.view, .nullable = false }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(program.parameter_descriptors[0].nullable);
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    try std.testing.expect((try program.evaluate(region.allocator(), &.{try source.value("z")}, &.{.null}, .{})).sql_null);
+}
+
+test "SQL named enum native column streams preserve direct projections and scalar error recovery" {
+    const a = std.testing.allocator;
+    var source = try Fixture.init(a, 5, 1);
+    defer source.deinit(a);
+    const catalog = @import("catalog.zig");
+    const Native = struct {
+        source: EnumTableBackend,
+        invalid: bool,
+        done: bool = false,
+        fn resolve(raw: *anyopaque, alloc: A, name: @import("ast.zig").Name, action: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return EnumTableBackend.resolve(&self.source, alloc, name, action);
+        }
+        fn open(raw: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = raw, .next = rows, .next_columns = columns, .close = close };
+        }
+        fn rows(_: *anyopaque, _: A, _: u32) !catalog.Page {
+            return error.UnexpectedRowScan;
+        }
+        fn close(_: *anyopaque) void {}
+        fn cell(raw: *anyopaque, _: A, row: usize, column: usize) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (column == 0) return .json(.{ .integer = @intCast(row + 1) });
+            if (row == 3) return .{};
+            if (self.invalid and row == 0) return .json(.{ .string = "Z" });
+            return self.source.fixture.value(([_][]const u8{ "z", "a", "" })[row]);
+        }
+        fn columns(raw: *anyopaque, alloc: A, wanted: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.done) return .{ .selection = &.{} };
+            try std.testing.expect(wanted >= 4);
+            self.done = true;
+            const batch = try alloc.create(@import("execution_batch.zig").Batch);
+            batch.* = .{ .reader = .{ .ptr = self, .read = cell, .count = 4, .width = 2 } };
+            return .{ .native = .{ .values = batch, .names = &.{ "id", "state" } }, .selection = &.{ 0, 1, 2, 3 } };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = EnumTableBackend.scan, .open_scan = open, .mutate = EnumTableBackend.mutate, .checkpoint = EnumTableBackend.checkpoint } };
+        }
+    };
+    for ([_]bool{ false, true }) |invalid| {
+        var native: Native = .{ .source = .{ .fixture = &source }, .invalid = invalid };
+        var compiled = try @import("compiler.zig").compile(a, "SELECT state FROM enum_rows", .{});
+        defer compiled.deinit();
+        const stream = (try @import("read_stream.zig").Stream.open(a, native.backend(), &compiled, &.{}, .{})) orelse return error.TestUnexpectedResult;
+        defer stream.close();
+        if (invalid) {
+            try std.testing.expectError(error.SqlInvalidTextRepresentation, stream.nextBatch(8));
+        } else {
+            var page = try stream.nextBatch(8);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 4), page.values.len());
+            for ([_][]const u8{ "z", "a", "" }, 0..) |label, row| {
+                const value = try page.values.cell(page.arena.allocator(), row, 0);
+                try std.testing.expectEqualStrings(label, try source.view.output(value.enumeration().?));
+            }
+            try std.testing.expect((try page.values.cell(page.arena.allocator(), 3, 0)).sql_null);
+        }
+    }
 }

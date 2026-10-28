@@ -180,11 +180,8 @@ pub fn deriveRelationalColumnsLeaky(owned: std.mem.Allocator, temporary: std.mem
             try generated.put(temporary, name.string, {});
         }
     }
-    const columns = try owned.alloc(catalog.Column, native.relational_columns.len);
+    const columns = try catalog.relationalColumnsLeaky(owned, native);
     for (native.relational_columns, columns) |column, *out| {
-        out.* = try catalog.Column.fromRelational(column);
-        out.name = try owned.dupe(u8, column.name);
-        out.path = try owned.dupe(u8, column.path);
         out.generated = generated.contains(column.name);
         out.defaulted = catalog.hasColumnDefault(parsed, column.name);
         out.clock_defaulted = catalog.columnDefaultUsesClock(parsed, column.name);
@@ -302,6 +299,7 @@ pub fn projectValue(alloc: std.mem.Allocator, table: catalog.Table, id: []const 
 /// mutation remains pinned. Already typed cells stay borrowed; exact payloads
 /// never pass through the scalar JSON placeholder coercion path.
 pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catalog.Row.Cell) !catalog.Row.Cell {
+    if (column.enum_view != null) return @import("describe.zig").coerceDatumTyped(alloc, raw, @import("scalar.zig").columnType(column));
     if (column.type == .datetime and !raw.sql_null and raw.temporal() == null) {
         // Prepared native rows carry exact epoch nanos, while public/native
         // JSON readers may carry RFC3339. Decode once into the SQL temporal

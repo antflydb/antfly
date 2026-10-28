@@ -42,6 +42,7 @@ pub const Column = struct {
     temporal_kind: ?@import("temporal_value.zig").Kind = null,
     element_type: ?@import("array_value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     nullable: bool = true,
     /// Optional document properties that reject JSON null represent SQL NULL
     /// by absence. Raw _doc values never pass through this assignment boundary.
@@ -65,10 +66,13 @@ pub const Column = struct {
     /// Borrow one immutable native layout's complete SQL domain. Shared by
     /// query binding and installed RLS: unrelated array/numeric columns must
     /// neither block activation nor lose their widths/modifiers in policies.
-    pub fn fromRelational(column: anytype) !Column {
+    pub fn fromRelational(column: anytype, view: ?*const enum_values.View) !Column {
+        if ((column.column_type == .enumeration) != (view != null)) return error.UnsupportedSqlExecution;
+        if (view) |bound| if (column.named_type_id != bound.record.identity.id) return error.InvalidSqlBackendResponse;
         return .{
             .name = column.name,
             .path = column.path,
+            .enum_view = view,
             .nullable = !column.required or column.allows_null,
             .element_type = column.sql_element_type,
             .numeric_modifier = column.numeric_modifier,
@@ -84,6 +88,7 @@ pub const Column = struct {
                 .datetime => .datetime,
                 .json => .json,
                 .sql_array => .array,
+                .enumeration => .enumeration,
                 else => return error.UnsupportedSqlExecution,
             },
         };
@@ -92,6 +97,8 @@ pub const Column = struct {
     /// A view dependency binds a logical SQL domain, not the spelling of its
     /// name/path, nullability, generation expression, or DEFAULT clause.
     pub fn identitySignature(self: Column, _: std.mem.Allocator) ![32]u8 {
+        if ((self.type == .enumeration) != (self.enum_view != null)) return error.InvalidSqlBackendResponse;
+        if (self.enum_view != null and (self.element_type != null or self.numeric_modifier != null)) return error.InvalidSqlBackendResponse;
         if (self.temporal_kind != null and (self.type != .datetime or self.element_type != null or self.numeric_modifier != null)) return error.InvalidSqlBackendResponse;
         const Kind = @import("../common/sql_builtin_type.zig").Type;
         const identity: ?Kind = self.element_type orelse switch (self.type) {
@@ -102,7 +109,8 @@ pub const Column = struct {
             .boolean => Kind.boolean,
             .json => Kind.jsonb,
             .datetime, .numrange, .daterange, .tsrange, .tstzrange => null,
-            .array, .enumeration => return error.InvalidSqlBackendResponse,
+            .array => return error.InvalidSqlBackendResponse,
+            .enumeration => null,
         };
         if (self.numeric_modifier) |modifier| {
             if (identity != .numeric or (self.type != .number and self.type != .array)) return error.InvalidSqlBackendResponse;
@@ -124,9 +132,39 @@ pub const Column = struct {
             hash.update("\x00temporal-kind\x00");
             hash.update(&.{@backingInt(kind)});
         };
+        if (self.enum_view) |view| {
+            hash.update("\x00enum-domain\x00");
+            var id: [8]u8 = undefined;
+            std.mem.writeInt(u64, &id, view.record.identity.id, .little);
+            hash.update(&id);
+            hash.update(&view.record.identity.origin_id);
+        }
         return hash.finalResult();
     }
 };
+
+/// Owned declared columns for a pinned native schema. Preparation deduplicates
+/// by type ID; row loops borrow the compiled directory without catalog access.
+/// All allocations belong to the caller's region.
+pub fn relationalColumnsLeaky(a: std.mem.Allocator, schema: anytype) ![]Column {
+    const columns = try a.alloc(Column, schema.relational_columns.len);
+    var views: std.AutoHashMapUnmanaged(u64, *const enum_values.View) = .empty;
+    for (schema.relational_columns, columns) |column, *out| {
+        const view = if (column.column_type == .enumeration) resolve: {
+            const id = column.named_type_id orelse return error.InvalidSchema;
+            if (views.get(id)) |existing| break :resolve existing;
+            const record = @import("../storage/schema.zig").namedType(schema, id) orelse return error.InvalidSchema;
+            const prepared = try a.create(enum_values.View);
+            prepared.* = try enum_values.View.init(a, try record.cloneOwned(a));
+            try views.put(a, id, prepared);
+            break :resolve prepared;
+        } else null;
+        out.* = try Column.fromRelational(column, view);
+        out.name = try a.dupe(u8, column.name);
+        out.path = try a.dupe(u8, column.path);
+    }
+    return columns;
+}
 
 test "SQL column identity signatures normalize defaults and retain exact builtin array and numeric domains" {
     const a = std.testing.allocator;

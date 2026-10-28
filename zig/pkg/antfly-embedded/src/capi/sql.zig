@@ -941,7 +941,7 @@ pub fn Adapter(comptime native: type) type {
             if (schema.storage_mode == .document) {
                 return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .storage_mode = .document, .columns = try dependencies.sql_document_row.deriveColumns(alloc, parsed) };
             }
-            const columns = try alloc.alloc(catalog.Column, schema.relational_columns.len);
+            const columns = try catalog.relationalColumnsLeaky(alloc, schema);
             for (schema.relational_columns, columns) |column, *out| {
                 var generated = false;
                 if (parsed.generated_columns) |items| {
@@ -953,9 +953,6 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = try catalog.Column.fromRelational(column);
-                out.name = try alloc.dupe(u8, column.name);
-                out.path = try alloc.dupe(u8, column.path);
                 out.generated = generated;
                 out.defaulted = catalog.hasColumnDefault(parsed, column.name);
                 out.clock_defaulted = catalog.columnDefaultUsesClock(parsed, column.name);

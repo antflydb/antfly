@@ -7105,7 +7105,7 @@ export interface components {
          * @description Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
          * @enum {string}
          */
-        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown" | "numrange" | "daterange" | "tsrange" | "tstzrange";
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown" | "numrange" | "daterange" | "tsrange" | "tstzrange" | "enumeration";
         /**
          * @description Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
          * @enum {string}
@@ -7141,6 +7141,8 @@ export interface components {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;
             type: components["schemas"]["SQLColumnType"];
+            /** @description Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell. */
+            named_type?: components["schemas"]["SQLNamedTypeIdentity"];
             temporal_kind?: components["schemas"]["SQLTemporalKind"];
             /** @description Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays. */
             element_type?: components["schemas"]["SQLArrayElementType"];
@@ -7187,6 +7189,8 @@ export interface components {
         /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. */
         SQLParameterDescriptor: {
             type: components["schemas"]["SQLColumnType"];
+            /** @description Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell. */
+            named_type?: components["schemas"]["SQLNamedTypeIdentity"];
             temporal_kind?: components["schemas"]["SQLTemporalKind"];
             element_type?: components["schemas"]["SQLArrayElementType"];
             nullable: boolean;
@@ -15321,6 +15325,21 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** @description Server-resolved immutable SQL type identity. Origin survives restore remapping of local IDs and wire OIDs. */
+        SQLNamedTypeIdentity: {
+            /** Format: uint64 */
+            id: number;
+            /** Format: uint64 */
+            namespace_id: number;
+            /** Format: uint32 */
+            generation: number;
+            /** @description Opaque durable 128-bit origin, encoded as lowercase hexadecimal. */
+            origin_id: string;
+            /** Format: uint32 */
+            oid: number;
+            /** Format: uint32 */
+            array_oid: number;
+        };
         /** @description PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC. */
         SQLNumericModifier: {
             precision: number;
@@ -18090,21 +18109,6 @@ export interface components {
         };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
         CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"] | components["schemas"]["CreateRelationalIndexRequest"];
-        /** @description Server-resolved immutable SQL type identity. Origin survives restore remapping of local IDs and wire OIDs. */
-        SQLNamedTypeIdentity: {
-            /** Format: uint64 */
-            id: number;
-            /** Format: uint64 */
-            namespace_id: number;
-            /** Format: uint32 */
-            generation: number;
-            /** @description Opaque durable 128-bit origin, encoded as lowercase hexadecimal. */
-            origin_id: string;
-            /** Format: uint32 */
-            oid: number;
-            /** Format: uint32 */
-            array_oid: number;
-        };
         /** @description Immutable enum symbol. Symbol IDs are append-only; order keys are opaque stable ordering metadata. */
         SQLNamedEnumLabel: {
             /** Format: uint32 */

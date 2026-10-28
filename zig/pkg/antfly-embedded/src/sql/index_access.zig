@@ -211,7 +211,7 @@ const Preparation = struct {
             return;
         };
         if (value.sql_null) return;
-        const converted = @import("describe.zig").assignDatum(a, value, source_type.element_type, type_.kind.?, type_.element_type, self.limits()) catch |err| {
+        const converted = (if (type_.enum_view != null) @import("describe.zig").coerceDatumTyped(a, value, type_) else @import("describe.zig").assignDatum(a, value, source_type.element_type, type_.kind.?, type_.element_type, self.limits())) catch |err| {
             try self.state.optional(err, &budget);
             return;
         };
@@ -221,10 +221,10 @@ const Preparation = struct {
                 try self.state.optional(err, &budget);
                 return;
             } };
-        } else converted.value;
+        } else if (converted.enumeration()) |atom| std.json.Value{ .string = atom.text } else converted.value;
         if (wire == .string and wire.string.len > self.limits().output_bytes) return;
         if (wire == .float and !std.math.isFinite(wire.float)) return;
-        if (converted.temporal() != null or converted.range() != null or converted.enumeration() != null or converted.array != null or converted.patterns() != null) return;
+        if (converted.temporal() != null or converted.range() != null or converted.array != null or converted.patterns() != null) return;
         try State.poll(&self.state);
         const owned = try @import("../storage/typed_json.zig").clone(self.output, wire);
         if (direct) |column| {

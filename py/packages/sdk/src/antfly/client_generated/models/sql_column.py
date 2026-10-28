@@ -11,6 +11,7 @@ from ..models.sql_temporal_kind import SQLTemporalKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.sql_named_type_identity import SQLNamedTypeIdentity
     from ..models.sql_numeric_modifier import SQLNumericModifier
 
 
@@ -24,6 +25,8 @@ class SQLColumn:
         name (str): Display label. Labels need not be unique; rows use matching ordinal positions.
         type_ (SQLColumnType): Logical SQL result type. Integer values and numbers with element_type numeric are decimal
             strings to preserve exact precision in every client.
+        named_type (SQLNamedTypeIdentity | Unset): Server-resolved immutable SQL type identity. Origin survives restore
+            remapping of local IDs and wire OIDs.
         temporal_kind (SQLTemporalKind | Unset): Exact temporal identity for datetime-family SQL values. Omission means
             timestamp_tz. Intervals preserve separate calendar months, days, and microseconds and use PostgreSQL interval
             text in JSON results.
@@ -35,6 +38,7 @@ class SQLColumn:
 
     name: str
     type_: SQLColumnType
+    named_type: SQLNamedTypeIdentity | Unset = UNSET
     temporal_kind: SQLTemporalKind | Unset = UNSET
     element_type: SQLArrayElementType | Unset = UNSET
     numeric_modifier: SQLNumericModifier | Unset = UNSET
@@ -43,6 +47,10 @@ class SQLColumn:
         name = self.name
 
         type_ = self.type_.value
+
+        named_type: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.named_type, Unset):
+            named_type = self.named_type.to_dict()
 
         temporal_kind: str | Unset = UNSET
         if not isinstance(self.temporal_kind, Unset):
@@ -64,6 +72,8 @@ class SQLColumn:
                 "type": type_,
             }
         )
+        if named_type is not UNSET:
+            field_dict["named_type"] = named_type
         if temporal_kind is not UNSET:
             field_dict["temporal_kind"] = temporal_kind
         if element_type is not UNSET:
@@ -75,12 +85,20 @@ class SQLColumn:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.sql_named_type_identity import SQLNamedTypeIdentity
         from ..models.sql_numeric_modifier import SQLNumericModifier
 
         d = dict(src_dict)
         name = d.pop("name")
 
         type_ = SQLColumnType(d.pop("type"))
+
+        _named_type = d.pop("named_type", UNSET)
+        named_type: SQLNamedTypeIdentity | Unset
+        if isinstance(_named_type, Unset):
+            named_type = UNSET
+        else:
+            named_type = SQLNamedTypeIdentity.from_dict(_named_type)
 
         _temporal_kind = d.pop("temporal_kind", UNSET)
         temporal_kind: SQLTemporalKind | Unset
@@ -106,6 +124,7 @@ class SQLColumn:
         sql_column = cls(
             name=name,
             type_=type_,
+            named_type=named_type,
             temporal_kind=temporal_kind,
             element_type=element_type,
             numeric_modifier=numeric_modifier,

@@ -168,7 +168,7 @@ pub const Session = struct {
     copy_source_statement: ?[]const u8 = null,
     copy_source_inputs: []const @import("antfly_local_sources").sql_parameter_frame.Input = &.{},
     copy_source_descriptors: []const backend.Parameter = &.{},
-    copy_instant: ?@import("antfly_local_sources").sql_catalog.Clock.Instant = null,
+    copy_instant: ?@import("antfly_local_sources").sql_statement_clock.Instant = null,
     discard_copy_data: bool = false,
     copy_sync_received: bool = false,
 
@@ -424,6 +424,9 @@ pub const Session = struct {
     }
 
     fn describeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter) !backend.Description {
+        return self.describeTypedOids(alloc, statement, types, descriptors, &.{});
+    }
+    fn describeTypedOids(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter, declared_oids: []const u32) !backend.Description {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (types.len != 0) return error.InvalidParameter;
             return .{ .columns = switch (setting) {
@@ -460,25 +463,26 @@ pub const Session = struct {
             },
             else => {},
         };
-        return self.describeNative(alloc, statement, types, descriptors);
+        return self.describeNativeOids(alloc, statement, types, descriptors, declared_oids);
     }
 
     fn describeNative(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter) !backend.Description {
+        return self.describeNativeOids(alloc, statement, types, descriptors, &.{});
+    }
+    fn describeNativeOids(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter, declared_oids: []const u32) !backend.Description {
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(statement, &.{}, types);
         req.parameter_descriptors = descriptors;
+        req.parameter_oids = declared_oids;
         try req.check();
         const result = try self.source.vtable.describe(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req);
         if (result.columns.len > self.limits.columns or result.parameter_types.len > self.limits.parameters) return error.ProgramLimitExceeded;
         if (result.parameter_descriptors.len != 0) {
             if (result.parameter_descriptors.len != result.parameter_types.len) return error.InvalidParameter;
             for (result.parameter_descriptors, result.parameter_types) |descriptor, kind| {
-                const inferred = try values.parameterFromOid(try values.parameterOid(descriptor));
-                if (inferred.kind == null) {
-                    if (kind != .unknown) return error.InvalidParameter;
-                } else if (!std.mem.eql(u8, @tagName(inferred.kind.?), @tagName(kind))) return error.InvalidParameter;
+                if (try values.parameterKind(descriptor) != kind) return error.InvalidParameter;
             }
         }
         return result;
@@ -970,14 +974,22 @@ pub const Session = struct {
                 const descriptors = try a.alloc(backend.Parameter, count);
                 for (declared, types, descriptors) |*oid, *kind, *descriptor| {
                     oid.* = try cursor.int(u32);
-                    kind.* = try values.fromOid(oid.*);
-                    descriptor.* = try values.parameterFromOid(oid.*);
+                    if (oid.* >= 16386 and oid.* % 2 == 0 and self.source.vtable.native_parameters) {
+                        kind.* = .unknown;
+                        descriptor.* = .{};
+                    } else {
+                        kind.* = try values.fromOid(oid.*);
+                        descriptor.* = try values.parameterFromOid(oid.*);
+                    }
                 }
                 try cursor.finish();
-                const description = try self.describeTyped(a, statement, types, descriptors);
+                const description = try self.describeTypedOids(a, statement, types, descriptors, declared);
                 if (count > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
                 for (oids, description.parameter_types, 0..) |*oid, kind, index| {
+                    if (index < declared.len and declared[index] >= 16386) {
+                        if (description.parameter_descriptors.len != oids.len or try values.parameterOid(description.parameter_descriptors[index]) != declared[index]) return error.InvalidParameter;
+                    }
                     oid.* = if (index < declared.len and declared[index] != 0) declared[index] else if (description.parameter_descriptors.len == oids.len) try values.parameterOid(description.parameter_descriptors[index]) else try values.oid(kind);
                 }
                 const owned_statement = try a.dupe(u8, statement);
@@ -1039,8 +1051,13 @@ pub const Session = struct {
                 const parameters = try a.alloc(std.json.Value, count);
                 const types = try a.alloc(backend.Type, count);
                 const frames = @import("antfly_local_sources").sql_parameter_frame;
-                const needs_owner = self.source.vtable.native_parameters and for (statement.parameter_oids) |type_oid| {
-                    const descriptor = try values.parameterFromOid(type_oid);
+                const input_descriptors = try a.alloc(backend.Parameter, count);
+                for (input_descriptors, statement.parameter_oids, 0..) |*descriptor, type_oid, index| {
+                    descriptor.* = if (current.parameter_descriptors.len == count) current.parameter_descriptors[index] else try values.parameterFromOid(type_oid);
+                    if (try values.parameterOid(descriptor.*) != type_oid) return error.InvalidParameter;
+                    if (descriptor.enum_view != null and !self.source.vtable.native_parameters) return error.UnsupportedParameterType;
+                }
+                const needs_owner = self.source.vtable.native_parameters and for (input_descriptors) |descriptor| {
                     if (descriptor.kind == .array or descriptor.kind == .json) break true;
                 } else false;
                 // Ordinary scalars need no extra region/refcount. Compact
@@ -1051,7 +1068,7 @@ pub const Session = struct {
                 const native_cells = if (self.source.vtable.native_parameters) try parameter_alloc.alloc(@import("antfly_local_sources").sql_scalar.Datum, count) else null;
                 for (parameters, types, statement.parameter_oids, 0..) |*parameter, *kind, oid, index| {
                     try parameter_work.charge(1);
-                    kind.* = try values.fromOid(oid);
+                    kind.* = try values.parameterKind(input_descriptors[index]);
                     const len = try cursor.int(i32);
                     if (len == -1) {
                         parameter.* = .null;
@@ -1061,7 +1078,7 @@ pub const Session = struct {
                     if (len < 0) return error.ProtocolViolation;
                     const parameter_bytes = try cursor.take(@intCast(len));
                     if (native_cells) |cells| {
-                        cells[index] = values.decodeNativeWithContext(parameter_alloc, oid, formatAt(formats, index), parameter_bytes, &parameter_work) catch |err| {
+                        cells[index] = values.decodeNativeDescriptor(parameter_alloc, input_descriptors[index], formatAt(formats, index), parameter_bytes, &parameter_work) catch |err| {
                             if (parameter_owner) |owner| if (owner.budget.isExhausted()) return error.ProgramLimitExceeded;
                             return err;
                         };
@@ -1820,7 +1837,7 @@ pub const Session = struct {
             self.copy_instant = null;
             self.executing.store(false, .release);
         }
-        self.copy_instant = try (@import("antfly_local_sources").sql_catalog.Clock.Source{ .io = self.io }).sample();
+        self.copy_instant = try (@import("antfly_local_sources").sql_statement_clock.Source{ .io = self.io }).sample();
         const implicit = self.status == .idle;
         if (implicit) {
             var begin = try self.execute(a, "BEGIN", &.{}, &.{}, null, null);
@@ -1978,7 +1995,7 @@ pub const Session = struct {
             self.modifiers = try a.alloc(?scalar.Program, columns.len);
             @memset(self.modifiers, null);
             for (columns, self.modifiers) |column, *program| if (column.numeric_modifier) |modifier| {
-                const descriptor = try values.parameterFromOid(try values.columnOid(column));
+                const descriptor = try values.parameterFromColumn(column);
                 const operand: ast.Scalar = .{ .column = "copy_value" };
                 const cast: ast.Scalar = .{ .cast = .{ .operand = &operand, .type = descriptor.kind.?, .element_type = descriptor.element_type, .numeric_modifier = modifier } };
                 program.* = try scalar.bindTyped(a, &cast, &.{.{ .name = "copy_value", .type = descriptor.kind.?, .element_type = descriptor.element_type }}, &.{}, .{});
@@ -1996,7 +2013,7 @@ pub const Session = struct {
                 if (column.type == .string) if (field) |bytes| {
                     if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlInvalidTextEncoding;
                 };
-                datum.* = if (field) |bytes| try values.decodeNative(a, try values.columnOid(column), if (input.options.format == .binary) 1 else 0, bytes) else .{};
+                datum.* = if (field) |bytes| try values.decodeColumnNative(a, column, if (input.options.format == .binary) 1 else 0, bytes) else .{};
                 if (program.*) |*value| datum.* = try value.evaluate(a, &.{datum.*}, &.{}, .{});
             }
         }
@@ -2052,7 +2069,7 @@ pub const Session = struct {
                 try self.cells.append(self.session.alloc, datum);
                 try self.parameters.append(self.session.alloc, datum.value);
                 try self.types.append(self.session.alloc, column.type);
-                try self.descriptors.append(self.session.alloc, try values.parameterFromOid(try values.columnOid(column)));
+                try self.descriptors.append(self.session.alloc, try values.parameterFromColumn(column));
             }
             self.count += 1;
             if (self.count == self.max_rows) try self.flush();
@@ -2488,9 +2505,7 @@ fn formatAt(formats: []const u16, index: usize) u16 {
     return if (formats.len == 0) 0 else if (formats.len == 1) formats[0] else formats[index];
 }
 fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]const backend.Column {
-    const result = try alloc.dupe(backend.Column, columns);
-    for (result) |*column| column.name = try alloc.dupe(u8, column.name);
-    return result;
+    return backend.cloneColumnsLeaky(alloc, columns);
 }
 fn cachedColumnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;

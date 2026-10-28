@@ -890,7 +890,7 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
             try scalar.castArrayDatum(a, result, spec.element_type orelse return error.InvalidSqlProgram, .{ .output_bytes = context.limits.retained_bytes })
         else
             result;
-        try setCell(cells, row, column, try describe.coerceDatum(a, typed, spec.type, spec.element_type));
+        try setCell(cells, row, column, try (if (spec.enum_view != null) describe.coerceDatumTyped(a, typed, .{ .kind = spec.type, .element_type = spec.element_type, .enum_view = spec.enum_view }) else describe.coerceDatum(a, typed, spec.type, spec.element_type)));
     }
 }
 

@@ -41,6 +41,14 @@ fn bindValue(server: *http.ApiHttpServer, a: A, identity: ?http.AuthenticatedIde
         _ = root.object.orderedRemove("named_types");
         return;
     }
+    const records = try recordsForIdsLeaky(server, a, identity, context, ids);
+    try context.ensureActive();
+    try local.sql_catalog.named_layouts.canonicalizeSchemaLeaky(a, root, records);
+}
+
+pub fn recordsForIdsLeaky(server: *http.ApiHttpServer, a: A, identity: ?http.AuthenticatedIdentity, context: Context, ids: []const u64) ![]const types.records.Record {
+    try context.ensureActive();
+    if (ids.len == 0) return &.{};
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
     if (!server.source.vtable.supports_sql_types) return error.MetadataCapabilityUnavailable;
     const request: types.BindingsRequest = .{ .ids = ids };
@@ -56,7 +64,52 @@ fn bindValue(server: *http.ApiHttpServer, a: A, identity: ?http.AuthenticatedIde
         record.* = entry.record;
     }
     try context.ensureActive();
-    try local.sql_catalog.named_layouts.canonicalizeSchemaLeaky(a, root, records);
+    return records;
+}
+
+/// Rebind declarative identities through current catalog authority. No process
+/// pointer is accepted from durable JSON or a client-declared PostgreSQL OID.
+/// Empty builtin-only inputs keep their allocation-free negative path.
+pub fn parameterDescriptorsLeaky(server: *http.ApiHttpServer, a: A, identity: ?http.AuthenticatedIdentity, context: Context, input: []const local.sql_scalar.Type, oids: []const u32) ![]const local.sql_scalar.Type {
+    if (oids.len != 0 and oids.len != input.len) return error.InvalidSqlParameters;
+    var ids: std.ArrayList(u64) = .empty;
+    for (input, 0..) |descriptor, ordinal| {
+        const id: ?u64 = if (descriptor.enum_view) |view| view.record.identity.id else if (descriptor.enum_reference) |reference| reference.id else if (oids.len != 0 and oids[ordinal] >= 16386) candidate: {
+            if (oids[ordinal] % 2 != 0) return error.UnsupportedParameterType;
+            break :candidate (oids[ordinal] - 16384) / 2;
+        } else null;
+        if (id) |value| try ids.append(a, value);
+    }
+    if (ids.items.len == 0) return input;
+    std.mem.sort(u64, ids.items, {}, std.sort.asc(u64));
+    var unique: usize = 0;
+    for (ids.items) |id| {
+        if (unique == 0 or ids.items[unique - 1] != id) {
+            ids.items[unique] = id;
+            unique += 1;
+        }
+    }
+    ids.items.len = unique;
+    const records = try recordsForIdsLeaky(server, a, identity, context, ids.items);
+    var views: std.AutoHashMapUnmanaged(u64, *const local.sql_catalog.enum_values.View) = .empty;
+    for (records) |record| {
+        const view = try a.create(local.sql_catalog.enum_values.View);
+        view.* = try local.sql_catalog.enum_values.View.init(a, record);
+        try views.put(a, record.identity.id, view);
+    }
+    const result = try a.dupe(local.sql_scalar.Type, input);
+    for (result, 0..) |*descriptor, ordinal| {
+        const reference: ?local.sql_scalar.EnumReference = if (descriptor.enum_reference) |value| value.* else if (descriptor.enum_view) |view| .{ .id = view.record.identity.id, .origin_id = view.record.identity.origin_id, .generation = view.record.identity.generation } else null;
+        const id = if (reference) |value| value.id else if (oids.len != 0 and oids[ordinal] >= 16386) @as(u64, (oids[ordinal] - 16384) / 2) else continue;
+        const view = views.get(id) orelse return error.SqlTypeNotFound;
+        if (reference) |expected| if (!std.mem.eql(u8, &expected.origin_id, &view.record.identity.origin_id) or view.record.identity.generation < expected.generation) return error.CatalogGenerationChanged;
+        if (oids.len != 0 and oids[ordinal] != 0 and oids[ordinal] != view.record.identity.oid) return error.InvalidSqlParameters;
+        descriptor.kind = .enumeration;
+        descriptor.enum_view = view;
+        descriptor.enum_reference = null;
+        try local.sql_scalar.validateParameterType(descriptor.*);
+    }
+    return result;
 }
 
 /// Returns null without allocation for ordinary schemas. Replacement bytes
@@ -153,6 +206,27 @@ test "SQL named enum schema ingress authorizes one catalog cut and preserves ord
     try std.testing.expectEqualDeep(state.record.identity, compiled.runtime_schema.named_types[0].identity);
     // Both columns resolved through one read cut and one shared executable view.
     try std.testing.expectEqual(@as(usize, 1), state.calls);
+    // Durable descriptors retain only witnesses. Reopening must authorize the
+    // current catalog and rebuild one shared executable directory per type.
+    {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const arena = region.allocator();
+        const raw = try std.json.Stringify.valueAlloc(arena, .{local.sql_scalar.Type{ .kind = .enumeration, .enum_reference = &.{ .id = state.record.identity.id, .origin_id = state.record.identity.origin_id, .generation = state.record.identity.generation } }}, .{});
+        const descriptors = try std.json.parseFromSliceLeaky([]const local.sql_scalar.Type, arena, raw, .{});
+        try std.testing.expect(descriptors[0].enum_view == null);
+        try std.testing.expectError(error.Forbidden, parameterDescriptorsLeaky(&server, arena, null, .{}, descriptors, &.{}));
+        const rebound = try parameterDescriptorsLeaky(&server, arena, actor, .{}, descriptors, &.{});
+        try std.testing.expect(rebound[0].enum_reference == null);
+        try std.testing.expectEqualStrings("z", (try rebound[0].enum_view.?.input("z")).text);
+        const declared = try parameterDescriptorsLeaky(&server, arena, actor, .{}, &.{ .{}, .{} }, &.{ state.record.identity.oid, state.record.identity.oid });
+        try std.testing.expect(declared[0].enum_view == declared[1].enum_view);
+        const forged: local.sql_scalar.EnumReference = .{ .id = state.record.identity.id, .origin_id = @splat(4), .generation = state.record.identity.generation };
+        try std.testing.expectError(error.CatalogGenerationChanged, parameterDescriptorsLeaky(&server, arena, actor, .{}, &.{.{ .kind = .enumeration, .enum_reference = &forged }}, &.{}));
+        state.namespace = "renamed";
+        try std.testing.expectError(error.Forbidden, parameterDescriptorsLeaky(&server, arena, actor, .{}, descriptors, &.{}));
+        state.namespace = "public";
+    }
     state.namespace = "renamed";
     try std.testing.expectError(error.Forbidden, bindSchemaAlloc(&server, a, actor, .{}, input));
     state.namespace = "public";

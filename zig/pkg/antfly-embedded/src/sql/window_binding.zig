@@ -24,7 +24,7 @@ const compiler = @import("compiler.zig");
 const Allocator = std.mem.Allocator;
 pub const Kind = enum { row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, count, sum, avg, min, max, bool_and, bool_or };
 pub const Sort = struct { partition: []const usize, order: []const usize, directions: []const @import("operators.zig").Order };
-pub const Spec = struct { kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, integer_numeric_result: bool = false, star: bool };
+pub const Spec = struct { kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, enum_view: ?*const @import("../common/sql_enum_value.zig").View = null, integer_numeric_result: bool = false, star: bool };
 pub const Bound = struct {
     input: *const describe.BoundStatement,
     statement: ast.Select,
@@ -244,7 +244,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     input.* = try describe.bindInternal(alloc, pinned_backend, &input_compiled, inferred);
     const parameters = @constCast(input.parameter_types);
     const columns = try alloc.alloc(scalar.Column, input.columns.len + builder.specs.items.len);
-    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view };
     const specs = try alloc.alloc(Spec, builder.specs.items.len);
     for (builder.specs.items, specs, columns[input.columns.len..], 0..) |pending, *spec, *column, index| {
         const call = pending.node.call;
@@ -260,6 +260,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         const first_null = nargs != 0 and call.args[0].* == .literal and call.args[0].literal == .null;
         const default_null = nargs == 3 and call.args[2].* == .literal and call.args[2].literal == .null;
         var input_type = if (nargs != 0) input.columns[pending.arguments[0]].type else ast.ColumnType.integer;
+        var input_enum = if (nargs != 0) input.columns[pending.arguments[0]].enum_view else null;
         var input_element = if (nargs != 0) input.columns[pending.arguments[0]].element_type else null;
         if (first_null) input_type = switch (kind) {
             .ntile => .integer,
@@ -268,7 +269,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
             .lag, .lead => if (nargs == 3 and !default_null) input.columns[pending.arguments[2]].type else input_type,
             else => input_type,
         };
-        if (first_null and nargs == 3 and !default_null and (kind == .lag or kind == .lead)) input_element = input.columns[pending.arguments[2]].element_type;
+        if (first_null and nargs == 3 and !default_null and (kind == .lag or kind == .lead)) {
+            input_element = input.columns[pending.arguments[2]].element_type;
+            input_enum = input.columns[pending.arguments[2]].enum_view;
+        }
         switch (kind) {
             .sum, .avg => if (input_type != .integer and input_type != .number) return error.SqlTypeMismatch,
             .bool_and, .bool_or => if (input_type != .boolean) return error.SqlTypeMismatch,
@@ -286,6 +290,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                         input_element = try @import("builtin_cast.zig").commonNumeric(left, right);
                         if (default_type == .number) input_type = .number;
                     } else if (default_type != input_type) return error.SqlTypeMismatch;
+                    if (input_type == .enumeration) {
+                        const common = try scalar.comparisonDomain(.{ .kind = input_type, .enum_view = input_enum }, scalar.columnType(input.columns[pending.arguments[2]]));
+                        input_enum = common.enum_view;
+                    }
                     const default_element = input.columns[pending.arguments[2]].element_type;
                     if (input_type == .array) {
                         const left = input_element orelse return error.SqlTypeMismatch;
@@ -338,8 +346,8 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                 } else slot.* = .integer;
             };
         };
-        spec.* = .{ .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .integer_numeric_result = integer_numeric_result, .star = call.star };
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type, .element_type = result_element };
+        spec.* = .{ .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .enum_view = if (result_type == .enumeration) input_enum else null, .integer_numeric_result = integer_numeric_result, .star = call.star };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type, .element_type = result_element, .enum_view = spec.enum_view };
     }
     const output_programs = try alloc.alloc(scalar.Program, outputs.len);
     const names = try alloc.alloc([]const u8, outputs.len);
