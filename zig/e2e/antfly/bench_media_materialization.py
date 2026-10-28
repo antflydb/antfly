@@ -52,6 +52,10 @@ def main():
         for name, size, shared_mask, duplicates, count in [
             ("tiny_shared_duplicates", 1, True, True, 4),
             ("tiny_distinct_unique", 1, False, False, 4),
+            ("medium_shared_duplicates", 64, True, True, 4),
+            ("medium_distinct_unique", 64, False, False, 4),
+            ("crossover_shared_duplicates", 128, True, True, 4),
+            ("crossover_distinct_unique", 128, False, False, 4),
             ("large_shared_duplicates", 256, True, True, 4),
             ("large_distinct_unique", 256, False, False, 4),
             ("large_distinct_duplicates", 256, False, True, 4),
