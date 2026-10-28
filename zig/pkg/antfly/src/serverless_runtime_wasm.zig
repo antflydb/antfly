@@ -135,6 +135,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate, publication_acquire, publication_validate, publication_release },
         pack_small_bodies: bool = false,
         inline_point_bodies: bool = false,
+        canonical_point_bodies: bool = false,
         compaction_probe_only: bool = false,
         wal_inline_tail: bool = false,
         publication_owner: []const u8 = "",
@@ -206,6 +207,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     var artifacts = object_artifacts.artifactStore();
     artifacts.pack_document_bodies = req.pack_small_bodies;
     artifacts.inline_point_bodies = req.inline_point_bodies;
+    artifacts.canonical_point_bodies = req.canonical_point_bodies;
     defer artifacts.deinit();
     const manifest_prefix = try std.fmt.allocPrint(a, "{s}/manifests", .{req.prefix});
     defer a.free(manifest_prefix);

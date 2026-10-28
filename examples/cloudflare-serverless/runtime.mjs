@@ -116,6 +116,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       reindex_records: Math.min(64, publicationBudget),
       enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),
       ...(env.INLINE_POINT_BODIES === "true"?{inline_point_bodies:true}:{}),
+      ...(env.CANONICAL_POINT_BODIES === "true"?{canonical_point_bodies:true}:{}),
       pack_small_bodies: env.COORDINATOR_BACKEND === "r2" && env.PACK_SMALL_BODIES !== "false",
       paged_text: env.PAGED_TEXT === "true" || env.PAGED_PROJECTIONS === "true",
       paged_projections: env.PAGED_PROJECTIONS === "true",
@@ -131,7 +132,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
     if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
-    const {inline_point_bodies:ignoredInline,compaction_probe_only:ignoredProbe,...nativeInput}=input;
+    const {inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,compaction_probe_only:ignoredProbe,...nativeInput}=input;
     const plannedCompact=env.NATIVE_COMPACTION_PLAN==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="compact"&&input.operation_id===undefined&&env.BATCHED_PUBLICATION!=="false";
     const compactDeadline=Date.now()+30000;let probeOperations=0,probeBytes=0;
     const executeNative=probe=>lane.request({ ...nativeInput, ...settings,...(plannedCompact?{compaction_probe_only:probe,publication_lease:preparedPublication?.lease??null}:{}), bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,...(plannedCompact?{deadlineMs:compactDeadline,maxOperations:1024-probeOperations,maxTransferBytes:32*1024*1024-probeBytes}:{}),...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),

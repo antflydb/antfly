@@ -228,13 +228,13 @@ pub const Context = struct {
                         break;
                     };
                     if (std.mem.eql(u8, row.key, state.after)) continue;
-                    const fact = try facts.Fact.decode(row.value);
+                    const fact = try facts.decodeRecord(row);
                     if (fact.body.bytes > 4 * 1024 * 1024) return error.ReindexDocumentBudgetExceeded;
                     if (bytes + fact.body.bytes > 4 * 1024 * 1024) break;
                     bytes += fact.body.bytes;
                     const id = try self.alloc.dupe(u8, row.key);
                     errdefer self.alloc.free(id);
-                    const body = try facts.readBodyAlloc(self.alloc, &pages, fact.body);
+                    const body = try facts.readRecordBodyAlloc(self.alloc, &pages, row);
                     errdefer self.alloc.free(body);
                     try docs.append(self.alloc, .{ .doc_id = id, .body = body, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns });
                 }

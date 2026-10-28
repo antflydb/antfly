@@ -316,3 +316,13 @@ test("disposable drain retries lost acknowledgements without claiming exact dele
  await assert.rejects(drainBucket(async()=>({done:true,deleted:1,bytes:2})),/InvalidCleanupDrainPage/);
  await assert.rejects(drainBucket(async()=>({done:false,deleted:1,bytes:2}),{maxPages:1}),/CleanupDrainPageLimitExceeded/);
 });
+
+
+test('canonical body provenance is explicit without changing historical optimization profiles',async()=>{
+ const{runtimePlacement}=await import('../qualification/gate-provenance.mjs');
+ const prior=runtimePlacement({vars:{INLINE_POINT_BODIES:'true'}}).native_optimizations;
+ assert.deepEqual(Object.keys(prior),['FUSED_READS','OPTIMISTIC_WAL','INLINE_POINT_BODIES','NATIVE_COMPACTION_PLAN']);
+ const enabled=runtimePlacement({vars:{CANONICAL_POINT_BODIES:'true'}}).native_optimizations;
+ assert.equal(enabled.CANONICAL_POINT_BODIES,true);
+ assert.equal(runtimePlacement({vars:{CANONICAL_POINT_BODIES:'false'}}).native_optimizations.CANONICAL_POINT_BODIES,false);
+});

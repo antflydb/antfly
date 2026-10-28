@@ -212,7 +212,7 @@ pub const Context = struct {
                     } else if (task.kind == .facts_page) {
                         const fact = try facts.Fact.decode(entry.value);
                         if (fact.media_audit) |audit| try appendBody(a, &children, pages.domain, audit, false);
-                        try appendBody(a, &children, pages.domain, fact.body, fact.body_has_dependencies);
+                        if (!fact.canonical_body) try appendBody(a, &children, pages.domain, fact.body, fact.body_has_dependencies);
                     }
                 }
                 if (end < page.entries.len) {

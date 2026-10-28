@@ -242,9 +242,9 @@ pub const Session = struct {
             const reader = self.session.reader.?;
             while (try cursor.next()) |entry| {
                 if (std.mem.order(u8, entry.key, self.after) != .gt) continue;
-                const fact = try facts.Fact.decode(entry.value);
+                const fact = try facts.decodeRecord(entry);
                 if (fact.last_lsn > reader.root.wal_end_lsn) return error.InvalidDocumentFact;
-                self.body = try reader.readBodyAlloc(fact);
+                self.body = try reader.readRecordBodyAlloc(entry);
                 return .{ .doc_id = entry.key, .body = self.body.? };
             }
             return null;

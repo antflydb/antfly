@@ -2076,7 +2076,19 @@ pub const Cursor = struct {
     ahead: [max_read_batch]?Page = @splat(null),
 
     const Frame = struct { page: Page, next: usize, end: ?[]const u8 };
-    pub const Record = struct { key: []const u8, value: []const u8 };
+    pub const Record = struct {
+        key: []const u8,
+        value: []const u8,
+        /// Physical provenance only when the value is contiguous in its verified
+        /// leaf. Expanded dictionary values deliberately have no byte locator.
+        origin: ?struct { ref: Ref, value_offset: u32 } = null,
+        pub fn inPage(page: Page, entry: DecodedEntry) Record {
+            const start = @intFromPtr(page.bytes.ptr);
+            const value = @intFromPtr(entry.value.ptr);
+            const physical = value >= start and value - start <= page.bytes.len and entry.value.len <= page.bytes.len - (value - start);
+            return .{ .key = entry.key, .value = entry.value, .origin = if (physical) .{ .ref = page.ref, .value_offset = @intCast(value - start) } else null };
+        }
+    };
 
     pub fn init(alloc: Allocator, store: Store, root: ?Ref, lower: []const u8, upper: ?[]const u8) !Cursor {
         var self: Cursor = .{ .alloc = alloc, .store = store, .upper = upper };
@@ -2148,7 +2160,7 @@ pub const Cursor = struct {
                     self.deinit();
                     return null;
                 }
-                return .{ .key = entry.key, .value = entry.value };
+                return Record.inPage(frame.page, entry);
             }
         }
         return null;
@@ -2353,7 +2365,7 @@ pub const Cursor = struct {
                 const child = child_ptr.*;
                 const end = if (frame.next < frame.page.entries.len) frame.page.entries[frame.next].key else frame.end;
                 try self.descend(child, "", entry.key, end);
-            } else return .{ .key = entry.key, .value = entry.value };
+            } else return Record.inPage(frame.page, entry);
         }
         return null;
     }

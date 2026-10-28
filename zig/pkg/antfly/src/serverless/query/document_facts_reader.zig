@@ -34,6 +34,8 @@ fn readFailure(err: anyerror) anyerror {
     };
 }
 
+pub const decodeRecord = facts.decodeRecord;
+
 pub const Reader = struct {
     alloc: Allocator,
     session: *runtime.QuerySession,
@@ -87,8 +89,14 @@ pub const Reader = struct {
         defer cursor.deinit();
         const record = (try cursor.next()) orelse return null;
         if (!std.mem.eql(u8, record.key, id)) return null;
+        return try self.readRecordBodyAlloc(record);
+    }
+
+    /// Consume inline bytes while the scan still owns its authenticated leaf.
+    pub fn readRecordBodyAlloc(self: *Reader, record: tree.Cursor.Record) ![]u8 {
+        try self.session.checkCancellation();
         if (!self.root.inline_records and facts.inlineBody(record.value) != null) return error.InvalidDocumentFact;
-        const fact = try Fact.decode(record.value);
+        const fact = try facts.decodeRecord(record);
         if (fact.last_lsn > self.root.wal_end_lsn) return error.InvalidDocumentFact;
         if (facts.inlineBody(record.value)) |body| return try self.alloc.dupe(u8, body);
         return try self.readBodyAlloc(fact);
@@ -97,7 +105,7 @@ pub const Reader = struct {
     pub fn readBodyAlloc(self: *Reader, fact: Fact) ![]u8 {
         try self.session.checkCancellation();
         if (fact.body.bytes > max_materialized_bytes) return error.QueryCandidateBudgetExceeded;
-        return facts.readBodyAlloc(self.alloc, &self.pages, fact.body) catch |err| return readFailure(err);
+        return facts.readBodyWithStoreAlloc(self.alloc, &self.pages, self.cache.store(), fact.body) catch |err| return readFailure(err);
     }
 
     /// Compatibility with callers that genuinely require a full snapshot.
@@ -120,8 +128,8 @@ pub const Reader = struct {
         while (cursor.next() catch |err| return readFailure(err)) |record| {
             try self.session.checkCancellation();
             if (initialized >= count or record.key.len == 0) return error.InvalidDocumentFactsRoot;
-            const fact = try Fact.decode(record.value);
-            const body = try self.readBodyAlloc(fact);
+            const fact = try facts.decodeRecord(record);
+            const body = try facts.readRecordBodyAlloc(self.alloc, &self.pages, record);
             errdefer self.alloc.free(body);
             const doc_bytes = std.math.add(usize, record.key.len, body.len) catch return error.QueryCandidateBudgetExceeded;
             owned_bytes = std.math.add(usize, owned_bytes, doc_bytes) catch return error.QueryCandidateBudgetExceeded;

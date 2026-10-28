@@ -983,3 +983,12 @@ test("inline point bodies preserve exact results and survive disabling new write
  const cold=(await setup(bucket)).host;assert.equal((await cold.request(request("lookup",{doc_id:"small"}))).body,body);
  await cold.request(request("mutate",{operation_id:"inline-update",mutations:[{kind:"upsert",doc_id:"small",body:'{"text":"updated"}'}]}));await cold.request(request("publish",{paged_text:true,inline_point_bodies:false}));assert.equal((await cold.request(request("lookup",{doc_id:"small"}))).body,'{"text":"updated"}');
 });
+
+test("canonical point bodies preserve exact results and survive disabling new writes",async()=>{
+ const{host,bucket}=await setup();const body=JSON.stringify({text:"inline",payload:"x".repeat(1024)});
+ await host.request(request("mutate",{operation_id:"inline-source",mutations:[{kind:"upsert",doc_id:"small",body}]}));
+ await host.request(request("publish",{paged_text:true,canonical_point_bodies:true}));
+ assert.ok([...bucket.objects.values()].some(o=>new TextDecoder().decode(o.body.subarray(0,8))==="AFDFACTC"));
+ const cold=(await setup(bucket)).host;assert.equal((await cold.request(request("lookup",{doc_id:"small"}))).body,body);
+ await cold.request(request("mutate",{operation_id:"inline-update",mutations:[{kind:"upsert",doc_id:"small",body:'{"text":"updated"}'}]}));await cold.request(request("publish",{paged_text:true,canonical_point_bodies:false}));assert.equal((await cold.request(request("lookup",{doc_id:"small"}))).body,'{"text":"updated"}');
+});

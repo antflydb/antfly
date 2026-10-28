@@ -91,8 +91,8 @@ test('native read capsules activate after compatible readers and survive erased 
 
 test('HTTP callers cannot activate experimental inline formats or compaction probes',{timeout:120000},async()=>{
  const f=await fixture('internal-latency-settings',false,true);
- try{f.options.bindings.PAGED_TEXT='false';f.options.bindings.PAGED_PROJECTIONS='false';await f.reopen();await f.call({op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"durable"}'}]});while((await f.call({op:'publish',inline_point_bodies:true})).has_more){}
-  const bucket=await f.bucket();for(const row of(await bucket.list({prefix:'antfly/artifacts/',limit:1000})).objects){const object=await bucket.get(row.key),bytes=new Uint8Array(await object.arrayBuffer());assert.notEqual(new TextDecoder().decode(bytes.subarray(0,8)),'AFDFACTB');}
+ try{f.options.bindings.PAGED_TEXT='false';f.options.bindings.PAGED_PROJECTIONS='false';await f.reopen();await f.call({op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"durable"}'}]});while((await f.call({op:'publish',inline_point_bodies:true,canonical_point_bodies:true})).has_more){}
+  const bucket=await f.bucket();for(const row of(await bucket.list({prefix:'antfly/artifacts/',limit:1000})).objects){const object=await bucket.get(row.key),bytes=new Uint8Array(await object.arrayBuffer());assert.ok(!['AFDFACTB','AFDFACTC'].includes(new TextDecoder().decode(bytes.subarray(0,8))));}
   assert.equal((await f.call({op:'compact',compaction_probe_only:true})).published,true);assert.equal((await f.call({op:'lookup',doc_id:'one'})).body,'{"text":"durable"}');
  }finally{await f.close();}
 });
@@ -150,7 +150,7 @@ test('compaction queue redelivery recovers its completed receipt after ticket co
 test("R2-native coordination survives eviction, both collectors, reindex and erased platform storage",{timeout:240000},async()=>{
   const f=await fixture("r2-native-fixture",false,true);
   try {
-    f.options.bindings.INLINE_POINT_BODIES="true";await f.reopen();
+    f.options.bindings.INLINE_POINT_BODIES="true";f.options.bindings.CANONICAL_POINT_BODIES="true";await f.reopen();
     const mutation={op:"mutate",operation_id:"native-source",mutations:Array.from({length:40},(_,i)=>({kind:"upsert",doc_id:`doc/${i}`,body:JSON.stringify({text:"durable native",embedding:[1,i/40],sparse_embedding:{durable:1}})}))};
     const receipt=await f.call(mutation);
     while((await f.call({op:"publish"})).has_more){}
@@ -166,6 +166,7 @@ test("R2-native coordination survives eviction, both collectors, reindex and era
     let dataDone=false,metaDone=false,dataDelay=0,metaDelay=0;
     for(let i=0;i<128;i++){const r=await f.call({op:"collect"});if(r.done){dataDone=true;break;}if(r.delay_seconds){dataDelay=r.delay_seconds;break;}}
     for(let i=0;i<128;i++){const r=await f.call({op:"collect_metadata"});if(r.done){metaDone=true;break;}if(r.delay_seconds){metaDelay=r.delay_seconds;break;}}
+    f.options.bindings.CANONICAL_POINT_BODIES="false";
     await f.call({},"/wipe-platform"); await f.reopen();
     const wait=Math.max(dataDelay,metaDelay);if(wait)await new Promise(resolve=>setTimeout(resolve,wait*1000+200));
     for(let i=0;i<512&&(!dataDone||!metaDone);i++){

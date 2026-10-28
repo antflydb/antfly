@@ -810,3 +810,18 @@ test('native app metadata cache fills use only the submitting request lifetime',
  const small=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-observe.wasm',import.meta.url))),pool=new RequestPool(()=>instantiateHost(small,null),2,{reservationBytes:8*1024*1024,maxReservedBytes:16*1024*1024}),observer=new NativeReadViews(small,env,{kernel:pool,cohortDelayMs:0}),opening=observer.open({background:p=>pending.push(p)});
  try{const value=await Promise.race([opening,new Promise((_,reject)=>setTimeout(()=>reject(Error('cache fill blocked metadata admission')),1000))]);assert.equal(value.version,'7');assert.ok(pending.length>0);assert.ok(releases.length>0);}finally{for(const release of releases)release();await Promise.allSettled([opening,...pending]);if(descriptor)Object.defineProperty(globalThis,'caches',descriptor);else delete globalThis.caches;}
 });
+
+
+test('physical latency distributions include failed attempts with fixed labels',async()=>{
+ let now=0;const counters={},io=instrumentTransport(async request=>{
+  now+=request.op==='get'?12:1500;
+  if(request.op==='put')throw Error('private object name');
+  return{body:new Uint8Array(3)};
+ },counters,{clock:()=>now});
+ await io({op:'get',key:'private/key'});
+ await assert.rejects(io({op:'put',key:'another/private/key'}),/private object/);
+ assert.equal(counters.io_get_le_50_ms,1);assert.equal(counters.io_put_gt_1000_ms,1);
+ assert.equal(counters.transport_errors,1);assert.equal(counters.calls,2);
+ assert.equal(counters.bytes_read,3);assert.equal(counters.wait_ms,1512);
+ assert.ok(!JSON.stringify(counters).includes('private'));
+});

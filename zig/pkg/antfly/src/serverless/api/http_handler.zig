@@ -6755,7 +6755,7 @@ const PublicGraphRequestCache = struct {
         defer cursor.deinit();
         while (try cursor.next()) |record| {
             if (initialized == count) return error.InvalidDocumentFactsRoot;
-            const fact = try document_facts_reader.Fact.decode(record.value);
+            const fact = try @import("../build/document_facts.zig").decodeRecord(record);
             try self.reserveRetained(record.key.len);
             out[initialized] = .{ .doc_id = try alloc.dupe(u8, record.key), .body = .{ .fact = fact }, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns };
             initialized += 1;

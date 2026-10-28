@@ -49,7 +49,7 @@ minimum unit's actual phase/dependency cost before prescribing its split.
 
 Extend existing prefix/job checkpointing with continuations inside a large input
 record or artifact. Introduce a durable native publication plan containing source identity, the WAL
-prefix, policy/schema identity, stable output attempt identity, completed output
+prefix, policy/schema identity, stable logical job identity, completed output
 references, a bounded continuation and terminal status. Each invocation builds
 or uploads a bounded unit, persists progress and yields with deadline headroom.
 The plan must support input records whose internal work exceeds one slice.
@@ -65,6 +65,21 @@ records completion. It rejects a changed source or replaced owner. Intermediate
 objects never expose a partial published prefix. Crashes before and after each
 checkpoint/finalization must recover to one outcome; abandoned plans eventually
 release protected objects through bounded collection.
+
+A continuation has a versioned native envelope with the base manifest identity,
+accepted WAL prefix, policy fingerprint, phase, input ordinal/offset, completed
+typed output references, and a collector-visible protection root. The phase
+boundary must occur inside materialization and index construction, not only
+between whole artifacts. Bounds apply to input bytes, allocations, output bytes
+and host I/O; record count is an additional bound rather than the only bound.
+
+The job identity survives owner replacement; upload authority does not. Never
+resume writes in an expired owner's `UploadScope`. A resumed owner authenticates
+completed immutable outputs and protects them through the job, creates a fresh
+scope for missing outputs, and regenerates parent references where attempts
+change. A lost final acknowledgement recovers the terminal job result. Neither
+replaying the whole build behind a host-side cache nor publishing intermediate
+HEADs implements this contract.
 
 ## 2. Fuse authority and immutable query planning natively
 
@@ -106,6 +121,15 @@ ABI. Existing optimistic preparation is a safe incremental experiment, not proof
 that the combined native write plan has been implemented or that its cloud p95
 meets the target.
 
+Do not hold the metadata transaction queue across WAL page construction simply
+to combine host calls. That would serialize cold object I/O ahead of unrelated
+read admission and could invert the separate kernel/memory reservations. The
+combined implementation belongs in native library planning and finalization,
+with one bounded caller context and explicit reservations. Prepared immutable
+outputs remain outside the final authority transaction; its native dependency
+checks and sealed-epoch commit remain mandatory. Measure queue latency as well
+as write latency before adopting any combined path.
+
 ## 4. Give small bodies a canonical native representation
 
 The experimental inline format removes a GET but retains external body copies,
@@ -121,6 +145,30 @@ Complete the reader/collector rollout and pin-aware retention transition before
 removing any fallback copies. Measure both retained bytes and COW write
 amplification: saving a GET must not make publication exceed its minimum slice.
 
+The first implementation is opt-in through `CANONICAL_POINT_BODIES`. Native
+facts format 12 (`AFDFACTC`) stores eligible bodies of at most 1536 bytes in a
+single authenticated primary leaf. It does not upload the external fallback
+used by format 11. Existing formats remain readable. Disabling new canonical
+writes preserves readers for already published generations; this is not a
+binary downgrade path to readers that predate format 12.
+
+Scheduling and audit trees store compact logical canonical references. Their
+cursors resolve the body through the primary root of the same pinned generation.
+They must not retain physical locators into an obsolete primary leaf: changing
+one neighbor would otherwise retain the old leaf indefinitely. Native body
+locators used outside those indexes include the full leaf digest, attempt,
+record count and exact envelope offset. Readers authenticate the standalone leaf
+and selected body. Dependency-bearing and larger bodies keep their existing
+external/packed representation. Leaf bodies reuse the operation-local page cache.
+
+Canonical leaves currently disable page packing and value-prefix expansion for
+the facts build only, because offsets must identify contiguous authenticated
+bytes. This can increase storage calls or COW amplification. Keep the switch off
+by default until lifecycle measurements establish its overall tradeoff. Native
+facts publication also buffers independent primary/scheduling tree uploads into
+bounded batches and flushes them before returning a publishable root. This is
+upload batching, not a durable continuation inside a large record.
+
 ## 5. Make operations and cost part of the design
 
 Use stable operation identities and durable status/result receipts for
@@ -132,6 +180,12 @@ Collect bounded numeric phase metrics: storage calls/bytes, dependent waves,
 native/queue/RPC time, stale preparation retries, publication progress, retained
 bytes and physical HTTP attempts. Independent invocation accounting and complete
 resource/error coverage remain separate requirements from latency measurement.
+
+Physical transport instrumentation now records fixed, disjoint per-operation
+latency bins (at most 10, 50, 200, 1000 ms, and over 1000 ms) and counts transport
+errors, including failed attempts. These bounded numeric distributions avoid
+retaining keys or individual samples. Sum bins across invocations; do not average
+per-invocation percentiles or interpret overlapping wait time as serial latency.
 
 Track cost per useful acknowledged operation and published document. Parallel
 uploads reduce elapsed time but do not reduce request counts by themselves.
@@ -153,7 +207,20 @@ The earlier latency matrices enable injected delay after seeding. They do not
 establish bulk-preparation headroom. Apply the declared storage model to seeding
 and publication as well as steady reads/writes in the next fixture.
 
-Replace a uniform-delay-only model with locally replayable storage delay,
+The separate `examples/cloudflare-serverless/qualification/local-lifecycle-latency.mjs`
+fixture now applies uniform injected delay before seeding, bounds publication
+convergence, records preparation/publication latency and retained object bytes,
+and preserves a failure report. Its reports live under
+`dist/qualification/runtime-plan-lab`; earlier sealed evidence remains unchanged.
+Compare `before,current,canonical,canonical-combined` with `--only` and use
+`--documents=512 --delay=20` for the full local population. These local delays
+are an experimental model, not measured Cloudflare storage percentiles. The
+`--model=bursty` option adds deterministic jitter and correlated slow windows,
+so the same declared load can be replayed. All candidate native modules are
+captured once at startup; reports bind every module and generated service bundle
+by checksum. A failed case is retained and subsequent selected cases still run.
+
+Extend this uniform-delay model with locally replayable storage delay,
 correlated slow periods, queue lag, source changes, lease expiry and interrupted
 I/O. Start from measured per-phase data; aggregate operation averages cannot
 establish per-GET/PUT latency distributions. Reproduce the stalled publication
@@ -175,3 +242,65 @@ Placement is a subsequent measurement, not the primary fix. Neither tested
 placement profile improved the observed default p95 pair, and Cloudflare's
 [placement policy](https://developers.cloudflare.com/workers/configuration/placement/)
 affects fetch handlers rather than Durable Object RPC execution.
+
+
+## Local implementation status
+
+The initial full-size lifecycle comparison used four tenants with 512 documents
+each and uniform 20 ms delay from the first storage call. Every case completed
+preparation and data checks. These are one-pass local workerd measurements under
+concurrent local build load, not Cloudflare results or gate qualification.
+
+| Case | Preparation, all tenants | Publication p95 | Read p95 | Builder PUTs | Retained bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous native build | 48.1 s | 1322 ms | 128 ms | 704 | 14,277,228 |
+| Batched facts uploads | 43.4 s | 1115 ms | 132 ms | 704 | 14,279,149 |
+| Canonical bodies | 39.5 s | 1068 ms | 142 ms | 556 | 14,893,655 |
+| Canonical plus existing scheduling experiments | 38.1 s | 981 ms | 145 ms | 556 | 14,907,786 |
+
+The report is `runtime-plan-lab/lifecycle-latency-1793151405274.json` and binds
+all three native modules and all four generated service bundles. Candidate native
+SHA-256 was `29b0faea06cf6bfc357333f89c0a3703c6b2f5c4627772d4a356b3844cdafc50`;
+previous native SHA-256 was
+`c0f96a553ebdeb2be64c94d1cdbb3aa6bd753c8666282a029aa56af68550e8ce`.
+The subsequent scan change consumes canonical bodies directly from the verified
+cursor leaf rather than decoding a second copy of that leaf for every row.
+
+Batching improves dependent upload waves without reducing request counts.
+Canonical bodies save builder requests but have a retained-byte tradeoff in this
+fixture, and neither option establishes a read p95 improvement. Keep the body
+format opt-in and measure page packing/COW amplification before enabling it.
+
+Durable continuations inside large records, the native overlapping read plan,
+and shared native WAL/metadata transaction planning remain implementation work.
+The changes above do not satisfy those three contracts. The bursty local model,
+original gate comparison, module-bound scale/ANN evidence, diagnostic completeness
+and reserved cloud qualification populations remain separate checks. No new
+Cloudflare resources are required for this local work.
+
+
+The subsequent native scan build also passed the 16,384-row metadata workload
+with both full and compact modules: recovery, immutable committed-prefix
+observation, hot WAL/outbox rows, branches with 193 children, and three collection
+cycles. Peak calls per native operation were 101/100, transfer was below 2.11 MB,
+and native working bytes were below 0.98 MB. This checks metadata scale under
+existing caps; it does not substitute for full ANN corpus evidence or cloud
+qualification.
+
+
+The final scan build's deterministic bursty comparison also completed at four
+by 512 documents (`lifecycle-latency-1793151765883.json`). Preparation was
+102.8/97.4/82.3 seconds and publication p95 was 3477/3093/2662 ms for previous,
+batched, and canonical-plus-existing-options respectively. Read p95 was
+359/360/251 ms; write p95 was 879/990/812 ms. The write regression in the
+batching-only case and differing read results across delay models require
+repeated measurements; these samples do not establish a stable SLO win.
+Canonical retained bytes remained about 4% higher. The final full native hash is
+`afcd379963d3488befe1701f902d08a083e1baa52c2f69313e1261394b821eb9`.
+
+Final verification passed 276 Node tests, 25 actual-workerd integration tests,
+663 native serverless tests (six skipped), and the focused native facts tests,
+including canonical source locators serialized through enrichment descriptors.
+The original 117 latency, 108 gate and 35 cleanup artifacts remained hash-valid.
+The code and design are incremental progress; the three native protocol changes
+listed above and cloud gate qualification are still outstanding.

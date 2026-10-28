@@ -27,7 +27,7 @@ function kind(namespace,key,body){
  const prefix=manifestPrefix(namespace);
  if(key.startsWith(prefix)&&/^[0-9]+\.bin$/.test(key.slice(prefix.length)))return 3;
  if(!/\/artifacts\/(?:sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(key))return 0;
- return [512,576].includes(body.byteLength)&&/^AFDFACT[3-9AB]$/.test(text.decode(body.subarray(0,8)))?2:1;
+ return [512,576].includes(body.byteLength)&&/^AFDFACT[3-9ABC]$/.test(text.decode(body.subarray(0,8)))?2:1;
 }
 export function readHintCharge(key,record){return record.body.byteLength+key.length*2+record.etag.length*2+(record.contentType?.length??0)*2+256;}
 export function normalizeReadHints(namespace,generation,input){

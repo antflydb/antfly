@@ -25,17 +25,18 @@ export function resourceFailureCode(error){
  return null;
 }
 const reportResourceFailure=sample=>console.error(JSON.stringify(sample));
-export function instrumentTransport(transport,counters={},{onResourceFailure=reportResourceFailure}={}){
+export function instrumentTransport(transport,counters={},{onResourceFailure=reportResourceFailure,clock=()=>performance.now()}={}){
  let activity=transportActivity.get(counters);if(!activity){activity={active:0,waveStarted:0};transportActivity.set(counters,activity);}
  return async(request,body)=>{
   if(request.op==="bucket_exists")return transport(request,body);
   counters.calls=(counters.calls??0)+1;
   counters.by_op??={};counters.by_op[request.op]=(counters.by_op[request.op]??0)+1;
-  const started=performance.now();
+  const started=clock();
   if(activity.active++===0){activity.waveStarted=started;counters.io_waves=(counters.io_waves??0)+1;}
   counters.concurrency_peak=Math.max(counters.concurrency_peak??0,activity.active);
   counters.bytes_written=(counters.bytes_written??0)+(body?.byteLength??0);
   try{const result=await transport(request,body);counters.bytes_read=(counters.bytes_read??0)+(result.body?.byteLength??0);return result;}catch(error){
+   counters.transport_errors=(counters.transport_errors??0)+1;
    const failure_code=resourceFailureCode(error);
    if(failure_code){
     counters.resource_failures=(counters.resource_failures??0)+1;
@@ -44,7 +45,13 @@ export function instrumentTransport(transport,counters={},{onResourceFailure=rep
     try{onResourceFailure({event:'antfly.resource_failure',failure_code,op:['get','put','head','list','delete','delete_many'].includes(request.op)?request.op:'coordinate'});}catch{}
    }
    throw error;
-  }finally{const ended=performance.now();counters.wait_ms=(counters.wait_ms??0)+ended-started;if(--activity.active===0)counters.wait_union_ms=(counters.wait_union_ms??0)+ended-activity.waveStarted;}
+  }finally{const ended=clock(),duration=Math.max(0,ended-started);
+   // Fixed labels and disjoint latency bins bound cardinality and retain no
+   // object keys, tenant IDs, payloads or individual request samples.
+   const op=["get","put","head","list","delete","delete_many"].includes(request.op)?request.op:"other";
+   const bin=duration<=10?"le_10":duration<=50?"le_50":duration<=200?"le_200":duration<=1000?"le_1000":"gt_1000";
+   const label=`io_${op}_${bin}_ms`;counters[label]=(counters[label]??0)+1;
+   counters.wait_ms=(counters.wait_ms??0)+ended-started;if(--activity.active===0)counters.wait_union_ms=(counters.wait_union_ms??0)+ended-activity.waveStarted;}
  };
 }
 

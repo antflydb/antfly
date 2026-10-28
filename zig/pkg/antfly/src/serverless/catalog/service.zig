@@ -2499,8 +2499,8 @@ fn enrichmentCompletionFromFactsAlloc(
         var count: u64 = 0;
         while (try cursor.next()) |record| {
             try pages.cancellation.check();
-            const fact = try document_facts.Fact.decode(record.value);
-            const body = try document_facts.readBodyAlloc(alloc, pages, fact.body);
+            const fact = try document_facts.decodeRecord(record);
+            const body = try document_facts.readRecordBodyAlloc(alloc, pages, record);
             defer alloc.free(body);
             const flags = try context.flags(.{
                 .doc_id = @constCast(record.key),
