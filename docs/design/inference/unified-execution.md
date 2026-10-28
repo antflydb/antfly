@@ -3347,3 +3347,9 @@ fast paths and expanded independent ownership and device validation.
 [The AN register](unified-execution-an-outcomes.md) records one padded Q/K
 scan owner across fresh and ragged CUDA recurrence, removing 3,383 maintained
 source bytes with identical expanded tokens and the unchanged complete PTX.
+
+### AO shared FP16 row normalization
+
+[The AO register](unified-execution-ao-outcomes.md) records shared ordinary
+and window-packed CUDA normalization, removing 1,281 maintained source bytes
+with identical expanded tokens and the unchanged complete shipping PTX.
