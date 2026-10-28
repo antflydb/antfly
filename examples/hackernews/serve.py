@@ -21,12 +21,45 @@ import base64
 import hashlib
 import json
 import math
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from managed_api import authorization_headers, open_request, validate_backend
+
+
+class RateLimit:
+    """One bounded token bucket per gateway process, independent of client input."""
+
+    def __init__(self, rate, burst):
+        self.rate, self.burst = rate, burst
+        self.tokens, self.updated = float(burst), time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        with self.lock:
+            now = time.monotonic()
+            self.tokens = min(
+                self.burst, self.tokens + (now - self.updated) * self.rate
+            )
+            self.updated = now
+            if self.tokens < 1:
+                return False
+            self.tokens -= 1
+            return True
+
+
+def configure(server, backend, headers=None, concurrency=8, rate=2, burst=8):
+    server.backend = validate_backend(backend, bool(headers))
+    server.backend_headers = dict(headers or {})
+    server.searches = threading.BoundedSemaphore(concurrency)
+    server.rate_limit = RateLimit(rate, burst)
+    server.ready_lock = threading.Lock()
+    server.ready_until, server.ready_value = 0.0, False
 
 
 def search_request(value):
@@ -144,6 +177,20 @@ class Gateway(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def upstream(self, path, body=None, timeout=15):
+        headers = {"Content-Type": "application/json"}
+        headers.update(getattr(self.server, "backend_headers", {}))
+        request = Request(
+            self.server.backend + path,
+            None if body is None else json.dumps(body).encode(),
+            headers,
+        )
+        with open_request(request, timeout=timeout) as response:
+            raw = response.read(4194305)
+        if len(raw) > 4194304:
+            raise ValueError("Search response too large")
+        return json.loads(raw)
+
     def respond(self, status, body, content_type="application/json"):
         payload = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(status)
@@ -175,27 +222,40 @@ class Gateway(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             return self.respond(200, {"ok": True})
         if self.path == "/readyz":
-            try:
-                for table in ("hn_archive", "hn_current"):
-                    with urlopen(
-                        self.server.backend + f"/tables/{table}/indexes/body_text",
-                        timeout=3,
-                    ) as response:
-                        index = json.load(response)
-                    if (
-                        not index.get("status", {})
-                        .get("readiness", {})
-                        .get("queryable")
-                    ):
-                        return self.respond(503, {"ready": False})
-                with urlopen(
-                    self.server.backend + "/sources/hackernews", timeout=3
-                ) as response:
-                    json.load(response)
-                return self.respond(200, {"ready": True})
-            except (URLError, TimeoutError, ValueError):
-                return self.respond(503, {"ready": False})
+            lock = getattr(self.server, "ready_lock", None)
+            if lock is None:
+                ready = self.check_readiness()
+            elif time.monotonic() < self.server.ready_until:
+                ready = self.server.ready_value
+            elif lock.acquire(blocking=False):
+                try:
+                    ready = self.check_readiness()
+                    self.server.ready_value = ready
+                    self.server.ready_until = time.monotonic() + 10
+                finally:
+                    lock.release()
+            else:
+                ready = False
+            return self.respond(200 if ready else 503, {"ready": ready})
         return self.respond(404, {"error": "Not found"})
+
+    def check_readiness(self):
+        try:
+            for table in ("hn_archive", "hn_current"):
+                index = self.upstream(f"/tables/{table}/indexes/body_text", timeout=3)
+                status = index.get("status") if isinstance(index, dict) else None
+                readiness = (
+                    status.get("readiness") if isinstance(status, dict) else None
+                )
+                if not isinstance(readiness, dict) or not readiness.get("queryable"):
+                    return False
+            self.upstream("/sources/hackernews", timeout=3)
+            return True
+        except HTTPError as error:
+            error.close()
+            return False
+        except (URLError, TimeoutError, ValueError):
+            return False
 
     def do_POST(self):
         if self.path != "/api/search":
@@ -208,22 +268,18 @@ class Gateway(BaseHTTPRequestHandler):
             query = search_request(json.loads(self.rfile.read(length)))
         except (ValueError, TimeoutError):
             return self.respond(400, {"error": "Invalid search request"})
+        limiter = getattr(self.server, "rate_limit", None)
+        if limiter is not None and not limiter.acquire():
+            return self.respond(429, {"error": "Search rate reached; retry shortly"})
         if not self.server.searches.acquire(blocking=False):
             return self.respond(
                 429, {"error": "Search capacity reached; retry shortly"}
             )
         try:
-            request = Request(
-                self.server.backend
-                + (f"/tables/{query['table']}/query" if "table" in query else "/query"),
-                json.dumps({k: v for k, v in query.items() if k != "table"}).encode(),
-                {"Content-Type": "application/json"},
-            )
-            with urlopen(request, timeout=15) as response:
-                raw = response.read(4194305)
-            if len(raw) > 4194304:
-                return self.respond(502, {"error": "Search response too large"})
-            result = json.loads(raw)["responses"][0]
+            result = self.upstream(
+                f"/tables/{query['table']}/query" if "table" in query else "/query",
+                {k: v for k, v in query.items() if k != "table"},
+            )["responses"][0]
             output = {
                 "hits": result["hits"],
                 "cursor": next_cursor(query, result),
@@ -232,12 +288,13 @@ class Gateway(BaseHTTPRequestHandler):
                 output["recent_since"] = query["filter_query"]["range"]["gte"]
             return self.respond(200, output)
         except HTTPError as error:
+            error.close()
             if error.code in (409, 410):
                 return self.respond(
                     409, {"error": "Search snapshot expired; start a new search"}
                 )
             return self.respond(503, {"error": "Search is temporarily unavailable"})
-        except (URLError, TimeoutError, ValueError, KeyError, IndexError):
+        except (URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError):
             return self.respond(503, {"error": "Search is temporarily unavailable"})
         finally:
             self.server.searches.release()
@@ -245,13 +302,34 @@ class Gateway(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", default="http://127.0.0.1:8877/db/v1")
+    parser.add_argument(
+        "--backend",
+        default=os.environ.get("ANTFLY_API_BASE", "http://127.0.0.1:8877/db/v1"),
+    )
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--requests-per-second", type=float, default=2)
+    parser.add_argument("--burst", type=int, default=8)
+    parser.add_argument("--require-auth", action="store_true")
     args = parser.parse_args()
+    if not (
+        1 <= args.concurrency <= 32
+        and 0 < args.requests_per_second <= 100
+        and 1 <= args.burst <= 256
+    ):
+        parser.error("Invalid gateway capacity bounds")
+    try:
+        headers = authorization_headers()
+        if args.require_auth and not headers:
+            raise ValueError("Managed hosting requires Antfly authorization")
+        backend = validate_backend(args.backend, bool(headers))
+    except ValueError as error:
+        parser.error(str(error))
     server = ThreadingHTTPServer((args.host, args.port), Gateway)
-    server.backend = args.backend.rstrip("/")
-    server.searches = threading.BoundedSemaphore(8)
+    configure(
+        server, backend, headers, args.concurrency, args.requests_per_second, args.burst
+    )
     server.serve_forever()
 
 
