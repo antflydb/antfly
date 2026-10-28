@@ -24,6 +24,7 @@ pub const Cache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     flights: Flights = .{},
     entries: std.ArrayList(*Entry) = .empty,
+    pending_loads: usize = 0,
     clock: u64 = 0,
     imports: std.atomic.Value(u64) = .init(0),
     loader_context: ?*anyopaque = null,
@@ -111,6 +112,12 @@ pub const Cache = struct {
         self.mutex.unlock();
         for (removed[0..count]) |old| old.destroy();
     }
+    fn cancelLoad(self: *Cache) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.pending_loads > 0);
+        self.pending_loads -= 1;
+    }
     pub fn acquire(self: *Cache, a: std.mem.Allocator, path: []const u8, key: []const u8, control: Control) !Lease {
         var identity: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(key, &identity, .{});
@@ -123,7 +130,23 @@ pub const Cache = struct {
             self.mutex.unlock();
             return .{ .cache = self, .entry = entry };
         };
+        // Count imports in progress so independent cold keys cannot overbook
+        // capacity. Reclaim an idle session before importing its replacement.
+        var evicted: ?*Entry = null;
+        if (self.entries.items.len + self.pending_loads >= max_entries) {
+            var oldest: ?usize = null;
+            for (self.entries.items, 0..) |entry, index| if (entry.refs == 0) {
+                if (oldest == null or entry.used < self.entries.items[oldest.?].used) oldest = index;
+            };
+            if (oldest) |index| evicted = self.entries.swapRemove(index) else {
+                self.mutex.unlock();
+                return error.ResourceTemporarilyUnavailable;
+            }
+        }
+        self.pending_loads += 1;
         self.mutex.unlock();
+        errdefer self.cancelLoad();
+        if (evicted) |old| old.destroy();
         try control.check();
         _ = self.imports.fetchAdd(1, .monotonic);
         var model = try self.loader(self.loader_context, a, path);
@@ -138,14 +161,11 @@ pub const Cache = struct {
         entry.* = .{ .a = a, .path = owned_path, .key = owned_key, .model = model };
         var removed: [max_entries]*Entry = undefined;
         try control.lockWithPoll(&self.mutex, 100 * std.time.ns_per_us);
-        if (self.entries.items.len >= max_entries) {
-            self.mutex.unlock();
-            return error.ResourceTemporarilyUnavailable;
-        }
         self.entries.append(a, entry) catch |err| {
             self.mutex.unlock();
             return err;
         };
+        self.pending_loads -= 1;
         self.touch(entry);
         const count = self.collect(&removed);
         self.mutex.unlock();
@@ -153,6 +173,7 @@ pub const Cache = struct {
         return .{ .cache = self, .entry = entry };
     }
     pub fn deinit(self: *Cache, a: std.mem.Allocator) void {
+        std.debug.assert(self.pending_loads == 0);
         for (self.entries.items) |entry| {
             std.debug.assert(entry.refs == 0);
             entry.destroy();
@@ -292,4 +313,111 @@ test "model aware media cancelled verification preserves healthy cached speaker 
     invalid.deinit();
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), loader.closes.load(.monotonic));
+}
+
+test "model aware media full speaker cache evicts idle models before importing and rejects only busy capacity" {
+    const a = std.testing.allocator;
+    var loader: TestLoader = .{};
+    var cache = Cache{ .loader_context = &loader, .loader = TestLoader.create };
+    defer cache.deinit(a);
+    var held: [Cache.max_entries]?Cache.Lease = @splat(null);
+    defer for (held) |maybe| if (maybe) |lease| lease.deinit();
+    for (&held, 0..) |*slot, i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "capacity-{d}", .{i});
+        slot.* = try cache.acquire(a, name, name, .{});
+    }
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, cache.acquire(a, "new", "new", .{}));
+    try std.testing.expectEqual(@as(usize, Cache.max_entries), loader.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), loader.closes.load(.monotonic));
+    held[0].?.deinit();
+    held[0] = null;
+    const replacement = try cache.acquire(a, "new", "new", .{});
+    defer replacement.deinit();
+    try std.testing.expectEqual(@as(usize, Cache.max_entries), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, Cache.max_entries + 1), loader.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), loader.closes.load(.monotonic));
+    const hit = try cache.acquire(a, "capacity-1", "capacity-1", .{});
+    defer hit.deinit();
+    try std.testing.expect(hit.model() == held[1].?.model());
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, cache.acquire(a, "another", "another", .{}));
+    try std.testing.expectEqual(@as(u64, Cache.max_entries + 1), cache.imports.load(.monotonic));
+}
+
+test "model aware media pending speaker imports reserve the last slot and cancellation releases capacity" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |cancel| {
+        var loader: TestLoader = .{};
+        var cache = Cache{ .loader_context = &loader, .loader = TestLoader.create };
+        defer cache.deinit(a);
+        var held: [Cache.max_entries - 1]?Cache.Lease = @splat(null);
+        defer for (held) |maybe| if (maybe) |lease| lease.deinit();
+        for (&held, 0..) |*slot, i| {
+            var name_buf: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "capacity-{d}", .{i});
+            slot.* = try cache.acquire(a, name, name, .{});
+        }
+        const Worker = struct {
+            cache: *Cache,
+            cancelled: std.atomic.Value(bool) = .init(false),
+            failure: ?anyerror = null,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                if (self.cancelled.load(.acquire)) return error.Cancelled;
+            }
+            fn run(self: *@This()) void {
+                const lease = self.cache.acquire(std.testing.allocator, "pending", "pending", .{ .ptr = self, .check_fn = check }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                lease.deinit();
+            }
+        };
+        loader.entered.store(false, .release);
+        loader.blocked.store(true, .release);
+        var worker = Worker{ .cache = &cache };
+        {
+            const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+            defer {
+                loader.blocked.store(false, .release);
+                thread.join();
+            }
+            while (!loader.entered.load(.acquire)) std.atomic.spinLoopHint();
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, cache.acquire(a, "overflow", "overflow", .{}));
+            try std.testing.expectEqual(@as(usize, Cache.max_entries), loader.calls.load(.monotonic));
+            const hit = try cache.acquire(a, "capacity-0", "capacity-0", .{});
+            hit.deinit();
+            worker.cancelled.store(cancel, .release);
+        }
+        try std.testing.expectEqual(@as(usize, 0), cache.pending_loads);
+        if (cancel) {
+            try std.testing.expectEqual(error.Cancelled, worker.failure.?);
+            try std.testing.expectEqual(@as(usize, Cache.max_entries - 1), cache.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 1), loader.closes.load(.monotonic));
+        } else try std.testing.expectEqual(@as(?anyerror, null), worker.failure);
+        // A failed import frees its reservation; a successful, now-idle import
+        // can be evicted. Both paths permit another cold model at capacity.
+        const retry = try cache.acquire(a, "retry", "retry", .{});
+        retry.deinit();
+        try std.testing.expectEqual(@as(usize, Cache.max_entries), cache.entries.items.len);
+    }
+}
+
+test "model aware media failed speaker imports release their capacity reservations" {
+    const Failure = struct {
+        fn load(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) !Embedder {
+            return error.TestImportFailed;
+        }
+    };
+    const a = std.testing.allocator;
+    var cache = Cache{ .loader = Failure.load };
+    defer cache.deinit(a);
+    try std.testing.expectError(error.TestImportFailed, cache.acquire(a, "failed", "failed", .{}));
+    try std.testing.expectEqual(@as(usize, 0), cache.pending_loads);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    var loader: TestLoader = .{};
+    cache.loader_context = &loader;
+    cache.loader = TestLoader.create;
+    const retry = try cache.acquire(a, "failed", "failed", .{});
+    retry.deinit();
 }
