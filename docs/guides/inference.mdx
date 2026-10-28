@@ -368,3 +368,11 @@ and weighted work, and `request_limits` contains `max_items_per_request`,
 across independent callers. Model loading, prompt caching, and generation batching
 remain under `inference`. The DB and standalone inference use the same policy;
 the previous resource config locations are rejected.
+
+Grouped embedding requests share one aggregate pixel ceiling across all groups,
+including when execution splits them into separate microbatches. Transcription
+shares one output-token budget across the audio item's windows and temperature
+retries; generated timestamp and EOS tokens count, while forced prompt tokens do
+not. Exhaustion returns `OUTPUT_TOKEN_LIMIT_EXCEEDED` rather than a successful
+partial transcript. Session append calls each receive a request budget; a single
+streaming upload shares its budget for the lifetime of that request.
