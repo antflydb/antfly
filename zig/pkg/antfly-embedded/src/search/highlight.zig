@@ -508,7 +508,7 @@ fn collectMatchSpans(
 fn collectProgramSpans(alloc: Allocator, tokens: []const analysis_mod.Token, matchers: []const Matcher, program: ?*const Program, spans: *std.ArrayListUnmanaged(Span), poller: *Poller) !void {
     // Tiny clause lists are faster as direct byte comparisons. Compiled
     // lookups bound larger OR/prefix sets without taxing common one-term queries.
-    const active_program: ?*const Program = if (program) |value| (if (value.terms.count() + value.prefixes.count() + value.patterns.items.len > 8) value else null) else null;
+    const active_program: ?*const Program = if (matchers.len > 8) program else null;
     for (tokens) |tok| {
         // Analyzers may emit several tokens for one surface span (shingles,
         // n-grams); the surface span is what gets highlighted.
@@ -753,7 +753,8 @@ fn boundedEditDistance(alloc: Allocator, a: []const u8, b: []const u8, limit: u8
     return prev[b.len];
 }
 
-/// Free fragments returned by highlight(). Does NOT free the source text.
+/// Free spans and owned stored-page snippets. Borrowed source text remains
+/// owned by the caller.
 pub fn freeFragments(alloc: Allocator, fragments: []Fragment) void {
     for (fragments) |f| {
         alloc.free(f.highlights);
