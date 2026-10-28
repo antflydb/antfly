@@ -3330,6 +3330,60 @@ const Parser = struct {
         self.pos += 1;
         return .{ .namespace = namespace, .table = try self.alloc.dupe(u8, symbol_token.text) };
     }
+    fn aggregateDdl(self: *Parser, creating: bool, replace: bool) Error!ast.CatalogDdl {
+        const conditional = !creating and self.keyword(.@"if");
+        if (conditional) try self.expectKeyword(.exists);
+        const name_value = try self.name();
+        try self.expect(.lparen);
+        var arguments: std.ArrayList(ast.RoutineDefinition.Type) = .empty;
+        if (!self.take(.rparen)) while (true) {
+            if (arguments.items.len >= 99) return self.fail(error.SqlLimitExceeded, "aggregate input limit exceeded");
+            const declared = try self.castType();
+            if (declared.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "aggregate signature modifiers require declaration notices");
+            try arguments.append(self.alloc, .{ .kind = declared.type, .element_type = declared.element_type, .temporal_kind = declared.temporal_kind });
+            if (self.take(.rparen)) break;
+            try self.expect(.comma);
+        };
+        var result: ast.CatalogDdl = .{ .kind = .aggregate, .action = if (creating) .create else .drop, .name = name_value, .conditional = conditional, .routine_signature = try arguments.toOwnedSlice(self.alloc) };
+        if (!creating) {
+            result.cascade = self.keyword(.cascade);
+            if (!result.cascade) _ = self.keyword(.restrict);
+            return result;
+        }
+        try self.expect(.lparen);
+        var state: ?ast.RoutineDefinition.Type = null;
+        var transition: ?ast.Name = null;
+        var final: ?ast.Name = null;
+        var initial: ?[]const u8 = null;
+        var seen: u4 = 0;
+        while (true) {
+            const option = try self.identifier();
+            const bit: u4 = if (std.ascii.eqlIgnoreCase(option, "SFUNC")) 1 else if (std.ascii.eqlIgnoreCase(option, "STYPE")) 2 else if (std.ascii.eqlIgnoreCase(option, "FINALFUNC")) 4 else if (std.ascii.eqlIgnoreCase(option, "INITCOND")) 8 else return self.fail(error.UnsupportedSqlShape, "aggregate option requires retained execution semantics");
+            if (seen & bit != 0) return self.fail(error.InvalidSqlSyntax, "duplicate aggregate option");
+            seen |= bit;
+            try self.expect(.eq);
+            switch (bit) {
+                1 => transition = try self.name(),
+                2 => {
+                    const declared = try self.castType();
+                    if (declared.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "aggregate state modifiers require declaration notices");
+                    state = .{ .kind = declared.type, .element_type = declared.element_type, .temporal_kind = declared.temporal_kind };
+                },
+                4 => final = try self.name(),
+                8 => {
+                    try self.expect(.string);
+                    initial = try self.alloc.dupe(u8, self.tokens[self.pos - 1].text);
+                },
+                else => unreachable,
+            }
+            if (self.take(.rparen)) break;
+            try self.expect(.comma);
+        }
+        if (state == null or transition == null or result.routine_signature.?.len == 0) return self.fail(error.UnsupportedSqlShape, "an ordinary aggregate requires inputs STYPE and SFUNC");
+        result.aggregate_definition = .{ .state = state.?, .transition = transition.?, .final = final, .initial = initial, .replace = replace };
+        return result;
+    }
+
     fn operatorDdl(self: *Parser, creating: bool) Error!ast.CatalogDdl {
         const conditional = !creating and self.keyword(.@"if");
         if (conditional) try self.expectKeyword(.exists);
@@ -4086,11 +4140,13 @@ const Parser = struct {
             return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column } };
         }
         if (self.keyword(.create)) {
+            if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(true, false) };
             if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(true) };
             if (self.keyword(.@"or")) {
                 if (!self.ddlWord("REPLACE")) return self.fail(error.InvalidSqlSyntax, "CREATE OR requires REPLACE");
                 if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.table) or self.tokens[self.pos].isKeyword(.materialized)))
                     return self.fail(error.InvalidSqlSyntax, "PostgreSQL does not permit CREATE OR REPLACE TABLE or MATERIALIZED VIEW");
+                if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(true, true) };
                 if (self.ddlWord("FUNCTION")) return self.routineAdmission(false, true);
                 if (self.ddlWord("PROCEDURE")) return self.routineAdmission(true, true);
                 if (!self.ddlWord("VIEW")) return self.fail(error.UnsupportedSqlShape, "this CREATE OR REPLACE object is not supported");
@@ -4123,6 +4179,7 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(false, false) };
             if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(false) };
             if (self.ddlWord("FUNCTION")) return .{ .catalog_ddl = try self.routineDrop(false) };
             if (self.ddlWord("PROCEDURE")) return .{ .catalog_ddl = try self.routineDrop(true) };
@@ -5707,4 +5764,23 @@ test "compiler SQL original operator declarations retain signatures implementati
     const expression = qualified.statement.select.columns[0].expression.?;
     try std.testing.expect(expression.call.operator);
     try std.testing.expectEqualStrings("public\x00===", expression.call.name);
+}
+
+test "compiler SQL original aggregate declarations retain typed transition state and retirement" {
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0136", "sql-0137", "sql-0138" }, 0..) |identity, ordinal| {
+        const original = try corpus.get(identity);
+        var parsed = try compile(std.testing.allocator, original.sql, .{});
+        defer parsed.deinit();
+        const declared = parsed.statement.catalog_ddl;
+        try std.testing.expectEqual(.aggregate, declared.kind);
+        try std.testing.expectEqualStrings("first_value_text", declared.name.table);
+        try std.testing.expectEqual(@as(usize, 1), declared.routine_signature.?.len);
+        try std.testing.expectEqual(ast.ColumnType.string, declared.routine_signature.?[0].kind);
+        if (ordinal == 0) {
+            try std.testing.expectEqual(ast.ColumnType.string, declared.aggregate_definition.?.state.kind);
+            try std.testing.expectEqualStrings("first_sfunc", declared.aggregate_definition.?.transition.table);
+        } else try std.testing.expectEqual(ordinal == 2, declared.conditional);
+    }
 }

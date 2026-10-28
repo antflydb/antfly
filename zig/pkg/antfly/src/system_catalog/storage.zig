@@ -847,7 +847,10 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
             var record = try routines.Record.decode(alloc, resource.source_json);
             defer record.deinit();
             try validateCallableReference(alloc, txn, group_id, record.value);
-            if (record.value.definition.function_reference) |reference| {
+            const uses = try record.value.functionUsesAlloc(alloc);
+            defer routines.Record.freeFunctionUses(alloc, uses);
+            for (uses) |use| {
+                const reference = use.reference;
                 const key = try functionDependencyKey(alloc, group_id, reference.id, resource.id);
                 defer alloc.free(key);
                 const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
@@ -915,18 +918,31 @@ pub fn functionDependents(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
         const id = std.mem.readInt(u64, item.value[0..8], .little);
         const resource = (try getById(a, txn, group, .routine, id)) orelse return error.InvalidCatalogRecord;
         const record = (try routines.Record.decode(a, resource.value.source_json)).value;
-        if (record.id != id or record.kind != .operator or record.definition.function_reference == null or record.definition.function_reference.?.id != function) return error.InvalidCatalogRecord;
+        if (record.id != id) return error.InvalidCatalogRecord;
+        const uses = try record.functionUsesAlloc(a);
+        defer routines.Record.freeFunctionUses(a, uses);
+        const found = for (uses) |use| {
+            if (use.reference.id == function) break true;
+        } else false;
+        if (!found) return error.InvalidCatalogRecord;
         try result.append(a, resource.value);
     }
     return result.toOwnedSlice(a);
 }
 fn validateCallableReference(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: routines.Record) !void {
-    const reference = record.definition.function_reference orelse return;
-    const resource = (try getById(a, txn, group, .routine, reference.id)) orelse return error.InvalidCatalogRecord;
-    if (resource.value.parent_id != reference.namespace_id) return error.InvalidCatalogRecord;
-    const function = (try routines.Record.decode(a, resource.value.source_json)).value;
-    if (function.kind != .function or function.id != reference.id or function.definition.arguments.len != record.definition.arguments.len or !std.meta.eql(function.definition.result, record.definition.result)) return error.InvalidCatalogRecord;
-    for (function.definition.arguments, record.definition.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared.type)) return error.InvalidCatalogRecord;
+    const uses = try record.functionUsesAlloc(a);
+    defer routines.Record.freeFunctionUses(a, uses);
+    for (uses) |use| {
+        const reference = use.reference;
+        var resource = (try getById(a, txn, group, .routine, reference.id)) orelse return error.InvalidCatalogRecord;
+        defer resource.deinit();
+        if (resource.value.parent_id != reference.namespace_id) return error.InvalidCatalogRecord;
+        var parsed_function = try routines.Record.decode(a, resource.value.source_json);
+        defer parsed_function.deinit();
+        const function = parsed_function.value;
+        if (function.kind != .function or function.id != reference.id or function.definition.arguments.len != use.arguments.len or function.definition.result == null or !std.meta.eql(function.definition.result.?, use.result)) return error.InvalidCatalogRecord;
+        for (function.definition.arguments, use.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared)) return error.InvalidCatalogRecord;
+    }
 }
 
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
@@ -938,7 +954,10 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     if (r.kind == .routine) {
         var parsed = try routines.Record.decode(alloc, r.source_json);
         defer parsed.deinit();
-        if (parsed.value.definition.function_reference) |reference| {
+        const uses = try parsed.value.functionUsesAlloc(alloc);
+        defer routines.Record.freeFunctionUses(alloc, uses);
+        for (uses) |use| {
+            const reference = use.reference;
             const key = try functionDependencyKey(alloc, group_id, reference.id, r.id);
             defer alloc.free(key);
             var id: [8]u8 = undefined;
@@ -974,7 +993,10 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
     if (r.kind == .routine) {
         var parsed = try routines.Record.decode(alloc, r.source_json);
         defer parsed.deinit();
-        if (parsed.value.definition.function_reference) |reference| {
+        const uses = try parsed.value.functionUsesAlloc(alloc);
+        defer routines.Record.freeFunctionUses(alloc, uses);
+        for (uses) |use| {
+            const reference = use.reference;
             const key = try functionDependencyKey(alloc, group_id, reference.id, r.id);
             defer alloc.free(key);
             txn.delete(key) catch |err| switch (err) {

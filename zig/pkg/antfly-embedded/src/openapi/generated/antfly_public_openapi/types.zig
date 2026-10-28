@@ -13374,6 +13374,7 @@ pub const SQLCatalogObjectKind = enum {
     function,
     procedure,
     operator,
+    aggregate,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -13381,6 +13382,7 @@ pub const SQLCatalogObjectKind = enum {
             .function => "function",
             .procedure => "procedure",
             .operator => "operator",
+            .aggregate => "aggregate",
         };
         try jw.write(s);
     }
@@ -13395,6 +13397,7 @@ pub const SQLCatalogObjectKind = enum {
             .{ "function", .function },
             .{ "procedure", .procedure },
             .{ "operator", .operator },
+            .{ "aggregate", .aggregate },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

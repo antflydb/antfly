@@ -1167,6 +1167,21 @@ pub const Program = struct {
         }
     };
 
+    /// Typed frame entry shared by aggregates and ordinary routine calls.
+    /// A caller retains the result before releasing its invocation scratch.
+    pub fn invokeRoutine(routine: *const @import("routine_bindings.zig").Resolved, alloc: Allocator, arguments: []const Datum, limits: EvalLimits) !Datum {
+        if (arguments.len != routine.arguments.len) return error.InvalidSqlProgram;
+        if (routine.strict) for (arguments) |argument| if (argument.sql_null) return .{};
+        var context: Evaluator = .{ .program = routine.program, .alloc = alloc, .cells = arguments, .parameters = &.{}, .typed_parameters = arguments, .limits = limits };
+        context.bytes = if (limits.effect_bytes) |bytes| bytes.* else 0;
+        defer if (limits.effect_bytes) |bytes| {
+            bytes.* = context.bytes;
+        };
+        const result = try context.runDatum(routine.program.root, 0);
+        _ = try context.validateJson(result.value, 0);
+        return result;
+    }
+
     pub fn evaluate(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Datum {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
         context.bytes = if (limits.effect_bytes) |bytes| bytes.* else 0;
@@ -2568,6 +2583,11 @@ pub fn statementConstant(node: *const ast.Scalar) bool {
     };
 }
 
+pub fn builtinFunction(name: []const u8) bool {
+    _ = functionId(name) catch return false;
+    return true;
+}
+
 fn functionId(name: []const u8) !Function {
     // PostgreSQL has starts_with(text,text), not a symmetric ends_with
     // builtin. Do not accidentally promise a nonstandard overload.
@@ -3220,6 +3240,7 @@ const Binder = struct {
                 break :blk .{ .kind = if (binary.op == .concat) .string else .boolean, .element_type = if (binary.op == .concat) .text else .boolean, .nullable = if (binary.op == .is_distinct or binary.op == .is_not_distinct) false else merged.nullable };
             },
             .call => |call| blk: {
+                if (call.aggregate != null) return error.SqlGroupingError;
                 if (call.subquery != null or call.window != null or call.star or call.distinct or call.filter != null or call.within_group != null) return error.UnsupportedSqlShape;
                 if (std.mem.eql(u8, call.name, "$validate")) {
                     if (call.args.len == 0) return error.InvalidSqlParameters;
@@ -3893,6 +3914,7 @@ const Binder = struct {
                 break :blk .{ .binary = .{ .op = binary.op, .left = try self.compileOperatorOperand(binary.left, operand_domain, depth + 1), .right = try self.compileOperatorOperand(binary.right, operand_domain, depth + 1) } };
             },
             .call => |call| blk: {
+                if (call.aggregate != null) return error.SqlGroupingError;
                 if (std.mem.eql(u8, call.name, "$validate")) {
                     // Discarded EXISTS projections still bind names, types,
                     // functions and parameters. Their code and column reads

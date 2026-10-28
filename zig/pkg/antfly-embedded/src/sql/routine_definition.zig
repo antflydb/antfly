@@ -197,12 +197,44 @@ test "SQL routine numeric row execution requires no allocator or catalog work af
 /// Native publication validates syntax before writing catalog state. Procedural
 /// SQL expression binding is deliberately deferred to its statement-owned CALL
 /// plan, matching PostgreSQL's first-execution PL/pgSQL resolution boundary.
+pub fn aggregateInitial(a: A, definition_: records.Definition) !scalar.Datum {
+    const aggregate_definition = definition_.aggregate orelse return error.InvalidSqlRoutineRecord;
+    const initial = aggregate_definition.initial orelse return .{};
+    const target = runtimeType(aggregate_definition.state);
+    const literal: ast.Scalar = .{ .literal = .{ .string = initial } };
+    const cast: ast.Scalar = .{ .cast = .{ .operand = &literal, .type = target.kind.?, .element_type = target.element_type, .temporal_kind = target.temporal_kind } };
+    const program = try a.create(scalar.Program);
+    program.* = try scalar.bind(a, &cast, &.{}, &.{}, .{});
+    return program.evaluate(a, &.{}, &.{}, .{});
+}
+
+pub fn prepareAggregate(a: A, record: records.Record, resolver: bindings.Resolver) !*const bindings.Aggregate {
+    try record.validate();
+    if (record.kind != .aggregate) return error.SqlWrongObjectType;
+    const lookup = resolver.resolve_reference orelse return error.UnsupportedSqlShape;
+    const uses = try record.functionUsesAlloc(a);
+    const inputs = try a.alloc(bindings.Argument, uses[0].arguments.len);
+    for (uses[0].arguments, inputs) |kind, *input| input.* = .{ .type = runtimeType(kind) };
+    const transition = try lookup(resolver.ptr, a, uses[0].reference, inputs);
+    const aggregate_definition = record.definition.aggregate.?;
+    const initial = try aggregateInitial(a, record.definition);
+    if (transition.strict and initial.sql_null and !std.meta.eql(aggregate_definition.state, record.definition.arguments[0].type)) return error.SqlInvalidFunctionDefinition;
+    var final: ?*const bindings.Resolved = null;
+    if (uses.len == 2) final = try lookup(resolver.ptr, a, uses[1].reference, &.{.{ .type = runtimeType(aggregate_definition.state) }});
+    const arguments = try a.alloc(scalar.Type, record.definition.arguments.len);
+    for (record.definition.arguments, arguments) |argument, *kind| kind.* = runtimeType(argument.type);
+    const result = try a.create(bindings.Aggregate);
+    result.* = .{ .id = record.id, .generation = record.generation, .arguments = arguments, .state = runtimeType(aggregate_definition.state), .output = runtimeType(record.definition.result.?), .transition = transition, .final = final, .initial = initial };
+    return result;
+}
+
 pub fn validateBody(a: A, record: records.Record) !void {
     try record.validate();
     switch (record.kind) {
         .function => _ = try prepare(a, record, null, null),
         .procedure => _ = try @import("procedure.zig").compileBody(a, record),
         .operator => {},
+        .aggregate => _ = try aggregateInitial(a, record.definition),
     }
 }
 

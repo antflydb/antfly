@@ -67,6 +67,8 @@ pub const Owner = struct {
     names: std.StringHashMapUnmanaged(*const native.bindings.Resolved) = .empty,
     bodies: std.AutoHashMapUnmanaged(Identity, *const native.bindings.Resolved) = .empty,
     procedure_names: std.StringHashMapUnmanaged(*native.procedures.Resolved) = .empty,
+    aggregate_names: std.StringHashMapUnmanaged(?*const native.bindings.Aggregate) = .empty,
+    declaration_cuts: std.StringHashMapUnmanaged(routines.Snapshot) = .empty,
     settings: ?local.sql_setting_catalog.View = null,
     depth: usize = 0,
 
@@ -90,11 +92,51 @@ pub const Owner = struct {
         self.memory.deinit();
         control.destroy(self);
     }
+    fn captureSettings(self: *Owner, a: A) !void {
+        if (self.settings == null) if (self.root.settingCapture()) |settings_capture| {
+            self.settings = try local.sql_setting_catalog.View.capture(a, settings_capture.owner, settings_capture.scope, settings_capture.overlay);
+            try self.settings.?.pinSqlUser(settings_capture.sql_user);
+        };
+    }
     fn resolver(self: *Owner) native.bindings.Resolver {
         return self.resolverFor(false);
     }
     fn resolverFor(self: *Owner, dynamic: bool) native.bindings.Resolver {
-        return .{ .ptr = self, .resolve = if (dynamic) dynamicResolve else resolve, .resolve_operator = if (dynamic) resolveDynamicOperator else resolveOperator, .resolve_reference = if (dynamic) resolveDynamicReference else resolveReference };
+        return .{ .ptr = self, .resolve = if (dynamic) dynamicResolve else resolve, .resolve_operator = if (dynamic) resolveDynamicOperator else resolveOperator, .resolve_aggregate = resolveAggregate, .resolve_reference = if (dynamic) resolveDynamicReference else resolveReference };
+    }
+    fn resolveAggregate(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) anyerror!?*const native.bindings.Aggregate {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        try self.root.context.ensureActive();
+        const a = self.arena.allocator();
+        const key = try std.json.Stringify.valueAlloc(a, .{ .name = name, .arguments = arguments }, .{});
+        if (self.aggregate_names.get(key)) |ready| return ready;
+        if (self.aggregate_names.count() >= 128) return error.SqlProgramLimitExceeded;
+        // Prepared scalar functions already have a different captured kind.
+        // Classification must not turn their valid manifest into an absent
+        // aggregate witness or re-resolve their function identity by name.
+        if (self.root.prepared_bindings) |manifests| {
+            const plain = if (std.mem.lastIndexOfScalar(u8, name, 0)) |separator| name[separator + 1 ..] else name;
+            var aggregate = false;
+            var function = false;
+            for (manifests) |manifest| if (std.mem.eql(u8, manifest.name, plain)) {
+                aggregate = aggregate or manifest.kind == .aggregate;
+                function = function or manifest.kind == .function;
+            };
+            if (function and !aggregate) {
+                try self.aggregate_names.put(a, key, null);
+                return null;
+            }
+        }
+        const record = self.capture(name, arguments, .aggregate, false) catch |err| {
+            if (err == error.SqlUndefinedFunction or err == error.SqlWrongObjectType) {
+                try self.aggregate_names.put(a, key, null);
+                return null;
+            }
+            return err;
+        };
+        const ready = try native.prepareAggregate(a, record, self.resolver());
+        try self.aggregate_names.put(a, key, ready);
+        return ready;
     }
     fn resolveOperator(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) anyerror!*const native.bindings.Resolved {
         const self: *Owner = @ptrCast(@alignCast(raw));
@@ -110,12 +152,14 @@ pub const Owner = struct {
     fn resolveDynamicReference(raw: *anyopaque, _: A, reference: routines.records.FunctionReference, arguments: []const native.bindings.Argument) anyerror!*const native.bindings.Resolved {
         return (@as(*Owner, @ptrCast(@alignCast(raw)))).lookupReference(reference, arguments, true);
     }
-    fn retainManifest(self: *Owner, a: A, cut: routines.Snapshot, found: routines.Snapshot.Found, dynamic: bool) !void {
+    fn retainManifest(self: *Owner, a: A, cut: routines.Snapshot, found: routines.Snapshot.Found, dynamic: bool, lookup_name: ?[]const u8) !void {
         const Binding = @import("sql_prepared.zig").Binding;
-        const manifest = try Binding.fromRoutine(a, cut.scopes[found.scope].target, found.record, cut.incarnation, cut.revision);
+        var manifest = try Binding.fromRoutine(a, cut.scopes[found.scope].target, found.record, cut.incarnation, cut.revision);
+        manifest.routine_namespace_id = cut.scopes[found.scope].namespace_id;
+        manifest.routine_lookup = lookup_name;
         if (!dynamic) if (self.root.prepared_bindings) |bindings| try Binding.verifyRoutine(bindings, manifest);
         if (!dynamic) if (self.root.collect_prepared_bindings) |bindings| {
-            for (bindings.items) |entry| if (entry.kind == manifest.kind and entry.id == manifest.id) {
+            for (bindings.items) |entry| if (entry.kind == manifest.kind and entry.id == manifest.id and (lookup_name == null or (entry.routine_lookup != null and std.mem.eql(u8, entry.routine_lookup.?, lookup_name.?)))) {
                 try Binding.verifyRoutine(&.{entry}, manifest);
                 return;
             };
@@ -132,13 +176,14 @@ pub const Owner = struct {
         if (found.record.kind != .function or found.record.id != reference.id or found.record.definition.arguments.len != arguments.len) return error.CatalogGenerationChanged;
         if (self.root.server.cfg.auth_enabled and found.record.definition.owner == .auth_disabled) return error.Forbidden;
         self.root.revision = cut.revision;
-        try self.retainManifest(a, cut, found, dynamic);
+        try self.retainManifest(a, cut, found, dynamic, null);
         const identity: Identity = .{ .id = found.record.id, .generation = found.record.generation };
         if (self.bodies.get(identity)) |ready| return ready;
         if (self.depth >= 32) return error.SqlProgramLimitExceeded;
         self.depth += 1;
         defer self.depth -= 1;
-        const ready = try native.prepare(a, found.record, self.resolverFor(dynamic), null);
+        try self.captureSettings(a);
+        const ready = try native.prepare(a, found.record, self.resolverFor(dynamic), if (self.settings) |*settings| settings else null);
         try self.bodies.put(a, identity, ready);
         return ready;
     }
@@ -151,7 +196,6 @@ pub const Owner = struct {
     }
     fn capture(self: *Owner, name: []const u8, arguments: []const native.bindings.Argument, routine_kind: routines.records.Kind, dynamic: bool) !routines.records.Record {
         const a = self.arena.allocator();
-        const binding_kind = std.meta.stringToEnum(@FieldType(@import("sql_prepared.zig").Binding, "kind"), @tagName(routine_kind)).?;
         var parts = std.mem.splitScalar(u8, name, 0);
         const first = parts.next() orelse return error.SqlUndefinedFunction;
         const second = parts.next();
@@ -167,23 +211,34 @@ pub const Owner = struct {
         if (!dynamic) if (self.root.prepared_bindings) |manifests| {
             var candidates: std.ArrayList(routines.records.Header) = .empty;
             for (manifests) |manifest| {
-                if (manifest.kind != binding_kind or !std.mem.eql(u8, manifest.name, reference.table) or !std.mem.eql(u8, manifest.database, reference.database orelse self.root.database)) continue;
-                if (reference.namespace) |namespace| if (!std.mem.eql(u8, manifest.namespace, namespace)) continue;
+                const family = if (routine_kind == .operator) manifest.kind == .operator else manifest.kind == .function or manifest.kind == .procedure or manifest.kind == .aggregate;
+                if (!family or manifest.routine_lookup == null or !std.mem.eql(u8, manifest.routine_lookup.?, name)) continue;
                 try candidates.append(a, .{ .id = manifest.id, .signature = manifest.routine_signature orelse return error.CatalogGenerationChanged });
             }
             const selected = (try routines.records.choose(a, candidates.items, inputs)) orelse return error.CatalogGenerationChanged;
-            for (manifests) |manifest| if (manifest.kind == binding_kind and manifest.id == selected.id) {
+            for (manifests) |manifest| if (manifest.id == selected.id and manifest.routine_lookup != null and std.mem.eql(u8, manifest.routine_lookup.?, name)) {
                 pinned = manifest;
                 break;
             };
         };
-        const scope = try targets(self.root, a, if (pinned) |manifest| .{ .database = manifest.database, .namespace = manifest.namespace, .table = manifest.name } else reference);
-        const cut = try snapshot(self.root, a, .{ .targets = scope, .signature = if (pinned) |manifest| manifest.routine_signature else null, .arguments = if (pinned != null) null else inputs, .expected_revision = self.root.revision, .kind = if (routine_kind == .operator) .operator else null });
-        const found = cut.found orelse return if (routine_kind == .procedure) error.SqlUndefinedProcedure else if (routine_kind == .operator) error.SqlUndefinedOperator else error.SqlUndefinedFunction;
-        if (found.record.kind != routine_kind) return error.SqlWrongObjectType;
+        const scope: []const domain.Target = if (pinned != null) &.{} else try targets(self.root, a, reference);
+        const request: routines.SnapshotRequest = if (pinned) |manifest| .{ .targets = &.{}, .reference = .{ .database = manifest.database, .namespace = manifest.namespace, .name = manifest.name, .namespace_id = manifest.routine_namespace_id orelse return error.CatalogGenerationChanged, .id = manifest.id }, .kind = std.meta.stringToEnum(routines.records.Kind, @tagName(manifest.kind)).?, .expected_revision = self.root.revision } else .{ .targets = scope, .arguments = inputs, .expected_revision = self.root.revision, .kind = if (routine_kind == .operator) .operator else null };
+        // Function/aggregate classification and body binding share one pinned
+        // declaration. Do not transfer/parse a large body twice or select the
+        // callable kind at one revision and execute it at another.
+        const declaration_key = try std.json.Stringify.valueAlloc(a, .{ .targets = scope, .reference = request.reference, .signature = request.signature, .arguments = request.arguments, .operator = routine_kind == .operator, .dynamic = dynamic }, .{});
+        const cut = self.declaration_cuts.get(declaration_key) orelse fresh: {
+            if (self.declaration_cuts.count() >= 512) return error.SqlProgramLimitExceeded;
+            const captured = try snapshot(self.root, a, request);
+            try self.declaration_cuts.put(a, declaration_key, captured);
+            break :fresh captured;
+        };
         self.root.revision = cut.revision;
+        const found = cut.found orelse return if (routine_kind == .procedure) error.SqlUndefinedProcedure else if (routine_kind == .operator) error.SqlUndefinedOperator else error.SqlUndefinedFunction;
+        if (pinned != null and !try @import("sql_catalog_auth.zig").namespaceUsage(self.root.identity.*, a, cut.scopes[found.scope].target)) return error.Forbidden;
+        if (found.record.kind != routine_kind) return error.SqlWrongObjectType;
         if (self.root.server.cfg.auth_enabled and found.record.definition.owner == .auth_disabled) return error.Forbidden;
-        try self.retainManifest(a, cut, found, dynamic);
+        try self.retainManifest(a, cut, found, dynamic, name);
         return found.record;
     }
     fn dynamicResolve(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) anyerror!*const native.bindings.Resolved {
@@ -207,10 +262,7 @@ pub const Owner = struct {
         if (self.procedure_names.get(key)) |ready| return ready;
         if (self.procedure_names.count() >= 128) return error.SqlProgramLimitExceeded;
         const record = try self.capture(name, arguments, .procedure, false);
-        if (self.settings == null) if (self.root.settingCapture()) |capture_settings| {
-            self.settings = try local.sql_setting_catalog.View.capture(a, capture_settings.owner, capture_settings.scope, capture_settings.overlay);
-            try self.settings.?.pinSqlUser(capture_settings.sql_user);
-        };
+        try self.captureSettings(a);
         const backend = self.root.backend();
         const ready = try native.procedures.prepare(a, record, self.resolverFor(true), backend.sequence_resolver, if (self.settings) |*settings| settings else null);
         try self.procedure_names.put(a, key, ready);
@@ -233,7 +285,8 @@ pub const Owner = struct {
             try self.names.put(a, key, ready);
             return ready;
         }
-        const ready = try native.prepare(a, record, self.resolverFor(dynamic), null);
+        try self.captureSettings(a);
+        const ready = try native.prepare(a, record, self.resolverFor(dynamic), if (self.settings) |*settings| settings else null);
         try self.bodies.put(a, identity, ready);
         try self.names.put(a, key, ready);
         return ready;
@@ -257,4 +310,10 @@ pub fn bindOperator(raw: *anyopaque, _: A, name: []const u8, arguments: []const 
     const root: *execution.Adapter = @ptrCast(@alignCast(raw));
     if (root.routine_owner == null) root.routine_owner = try Owner.create(root);
     return Owner.resolveOperator(root.routine_owner.?, undefined, name, arguments);
+}
+
+pub fn bindAggregate(raw: *anyopaque, _: A, name: []const u8, arguments: []const native.bindings.Argument) !?*const native.bindings.Aggregate {
+    const root: *execution.Adapter = @ptrCast(@alignCast(raw));
+    if (root.routine_owner == null) root.routine_owner = try Owner.create(root);
+    return Owner.resolveAggregate(root.routine_owner.?, undefined, name, arguments);
 }

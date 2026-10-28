@@ -32,10 +32,14 @@ const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
-    kind: enum { table, view, sequence, function, procedure, operator } = .table,
+    kind: enum { table, view, sequence, function, procedure, operator, aggregate } = .table,
     sequence_incarnation: ?[16]u8 = null,
     routine_incarnation: ?[16]u8 = null,
     routine_signature: ?[]const u8 = null,
+    routine_namespace_id: ?u64 = null,
+    /// Original normalized lookup spelling. Dependency-only identity witnesses
+    /// have no spelling and never participate in overload selection.
+    routine_lookup: ?[]const u8 = null,
     definition_digest: ?[32]u8 = null,
     database: []const u8,
     namespace: []const u8,
@@ -65,10 +69,10 @@ pub const Binding = struct {
         return .{ .kind = std.meta.stringToEnum(@FieldType(Binding, "kind"), @tagName(record.kind)).?, .database = target.database, .namespace = target.namespace, .name = target.table, .physical_name = "", .id = record.id, .schema_version = record.generation, .revision = revision, .routine_incarnation = incarnation, .routine_signature = try record.definition.signatureAlloc(a) };
     }
     pub fn verifyRoutine(bindings: []const Binding, current: Binding) !void {
-        if ((current.kind != .function and current.kind != .procedure and current.kind != .operator) or current.routine_incarnation == null or current.routine_signature == null) return error.InvalidSqlBackendResponse;
+        if ((current.kind != .function and current.kind != .procedure and current.kind != .operator and current.kind != .aggregate) or current.routine_incarnation == null or current.routine_signature == null or current.routine_namespace_id == null or current.routine_namespace_id == 0) return error.InvalidSqlBackendResponse;
         for (bindings) |entry| {
             if (entry.kind != current.kind or entry.id != current.id) continue;
-            if (entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation) or entry.routine_signature == null or !std.mem.eql(u8, entry.routine_signature.?, current.routine_signature.?)) return error.CatalogGenerationChanged;
+            if (entry.routine_namespace_id != current.routine_namespace_id or entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation) or entry.routine_signature == null or !std.mem.eql(u8, entry.routine_signature.?, current.routine_signature.?)) return error.CatalogGenerationChanged;
             return;
         }
         return error.CatalogGenerationChanged;
@@ -495,7 +499,7 @@ test "SQL prepared resource survives native store restart and transaction cleanu
 }
 
 test "SQL prepared routine manifests reject replaced generations signatures and cluster incarnations" {
-    const first: Binding = .{ .kind = .function, .database = "default", .namespace = "public", .name = "f", .physical_name = "", .id = 7, .schema_version = 1, .revision = 2, .routine_signature = "text", .routine_incarnation = @splat(1) };
+    const first: Binding = .{ .kind = .function, .database = "default", .namespace = "public", .name = "f", .physical_name = "", .id = 7, .schema_version = 1, .revision = 2, .routine_signature = "text", .routine_incarnation = @splat(1), .routine_namespace_id = 2 };
     var current = first;
     current.revision = 90;
     try Binding.verifyRoutine(&.{first}, current);

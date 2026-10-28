@@ -36,6 +36,8 @@ pub const Collector = struct {
     collections: []@import("collection_aggregate.zig").Stream = &.{},
     key_buffer: []Datum = &.{},
     prepared: bool = false,
+    evaluation_limits: scalar.EvalLimits = .{},
+    function_work: ?@import("numeric_value.zig").Context = null,
 
     pub fn init(grouped: *operators.Grouped, bound: *const binding.Bound, manager: *spill.Manager, bytes: usize) !Collector {
         var self: Collector = .{ .grouped = grouped, .bound = bound, .manager = manager };
@@ -100,12 +102,22 @@ pub const Collector = struct {
         }
     }
 
+    fn reductionLimits(self: *Collector) scalar.EvalLimits {
+        var limits = self.evaluation_limits;
+        if (limits.effect_work == null) {
+            if (self.function_work == null) self.function_work = .{ .alloc = self.manager.allocator(), .checkpoint = limits.checkpoint, .ptr = limits.checkpoint_context };
+            limits.effect_work = &self.function_work.?;
+        }
+        return limits;
+    }
     pub fn addCollection(self: *Collector, index: usize, context: anytype, a: A, source: []const Datum, groups: []const Datum) !Datum {
         if (index >= self.collections.len) return error.InvalidSqlBackendResponse;
+        self.collections[index].evaluation_limits = self.reductionLimits();
         return self.collections[index].add(context, a, source, groups, self.bound.input.projections);
     }
     pub fn addCollectionValues(self: *Collector, index: usize, values: []const Datum, groups: []const Datum) !Datum {
         if (index >= self.collections.len) return error.InvalidSqlBackendResponse;
+        self.collections[index].evaluation_limits = self.reductionLimits();
         return self.collections[index].addValues(values, groups);
     }
     fn capture(self: *Collector, keys: []const Datum, inputs: []const Datum) !void {
@@ -268,7 +280,7 @@ pub const Collector = struct {
             const value = summary.values[stream.plan.aggregate_index];
             if (value.sql_null or value.value != .integer or value.value.integer < 0) return error.InvalidSqlSpill;
             const count = std.math.cast(usize, value.value.integer) orelse return error.InvalidSqlSpill;
-            cells[summary.keys.len + stream.plan.aggregate_index] = try stream.finish(a, summary.keys, count);
+            cells[summary.keys.len + stream.plan.aggregate_index] = try stream.finishWithLimits(a, summary.keys, count, self.reductionLimits());
         }
         return .{ .keys = summary.keys, .aggregates = cells[summary.keys.len..width], .ordinal = summary.ordinal };
     }

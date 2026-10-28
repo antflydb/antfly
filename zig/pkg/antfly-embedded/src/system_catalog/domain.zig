@@ -414,13 +414,20 @@ pub const StateIndex = struct {
         for (state.resources) |resource| if (resource.kind == .routine) {
             var record = try @import("routines.zig").Record.decode(alloc, resource.source_json);
             defer record.deinit();
-            if (record.value.definition.function_reference) |reference| {
+            const uses = try record.value.functionUsesAlloc(alloc);
+            defer @import("routines.zig").Record.freeFunctionUses(alloc, uses);
+            for (uses) |use| {
+                const reference = use.reference;
                 const target = self.ids.get(.{ .kind = .routine, .id = reference.id }) orelse return error.InvalidCatalogRecord;
                 if (target.parent_id != reference.namespace_id) return error.InvalidCatalogRecord;
+                const owner_namespace = self.ids.get(.{ .kind = .namespace, .id = resource.parent_id }) orelse if (resource.parent_id == default_namespace_id) default_namespace else return error.InvalidCatalogRecord;
+                const function_namespace = self.ids.get(.{ .kind = .namespace, .id = reference.namespace_id }) orelse if (reference.namespace_id == default_namespace_id) default_namespace else return error.InvalidCatalogRecord;
+                if (owner_namespace.parent_id != function_namespace.parent_id) return error.InvalidCatalogRecord;
                 var function = try @import("routines.zig").Record.decode(alloc, target.source_json);
                 defer function.deinit();
-                if (function.value.kind != .function or function.value.definition.arguments.len != record.value.definition.arguments.len or !std.meta.eql(function.value.definition.result, record.value.definition.result)) return error.InvalidCatalogRecord;
-                for (function.value.definition.arguments, record.value.definition.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared.type)) return error.InvalidCatalogRecord;
+                if (function.value.kind != .function or function.value.definition.arguments.len != use.arguments.len or function.value.definition.result == null or !std.meta.eql(function.value.definition.result.?, use.result)) return error.InvalidCatalogRecord;
+                for (function.value.definition.arguments, use.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared)) return error.InvalidCatalogRecord;
+                if (record.value.kind == .aggregate and reference.id == record.value.definition.function_reference.?.id and function.value.definition.strict and record.value.definition.aggregate.?.initial == null and !std.meta.eql(record.value.definition.aggregate.?.state, record.value.definition.arguments[0].type)) return error.InvalidCatalogRecord;
             }
         };
         return self;

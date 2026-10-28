@@ -79,12 +79,15 @@ fn observeAs(ctx: *fixture.Context, statement: []const u8, expected: Output, rea
 // Lose the ACK only after the real Raft mutation returns, then make the
 // producer's first read-only observation unavailable. Never retry the mutation.
 pub fn lostAck(ctx: *fixture.Context, procedure: bool) !void {
-    return lostAckOperation(ctx, procedure, false);
+    return lostAckOperation(ctx, procedure, false, false);
 }
 pub fn lostCommentAck(ctx: *fixture.Context) !void {
-    return lostAckOperation(ctx, true, true);
+    return lostAckOperation(ctx, true, true, false);
 }
-fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool) !void {
+pub fn lostAggregateAck(ctx: *fixture.Context) !void {
+    return lostAckOperation(ctx, false, false, true);
+}
+fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool, aggregate: bool) !void {
     const http = @import("http_server.zig");
     const Call = @import("../system_catalog/server_call.zig").Call;
     const Context = local.api_operation.RequestContext;
@@ -118,7 +121,9 @@ fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool) !void
     const padding = try ctx.alloc.alloc(u8, 12000);
     defer ctx.alloc.free(padding);
     @memset(padding, 'x');
-    const text = if (comment)
+    const text = if (aggregate)
+        try std.fmt.allocPrint(ctx.alloc, "CREATE AGGREGATE lost_ack_aggregate(text)(SFUNC=first_sfunc,STYPE=text,INITCOND='{s}')", .{padding})
+    else if (comment)
         try std.fmt.allocPrint(ctx.alloc, "COMMENT ON PROCEDURE lost_ack_procedure(text) IS '{s}'", .{padding})
     else if (procedure)
         try std.fmt.allocPrint(ctx.alloc, "CREATE PROCEDURE lost_ack_procedure(text) LANGUAGE plpgsql AS $$BEGIN NULL; /*{s}*/ END$$", .{padding})
@@ -131,7 +136,8 @@ fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool) !void
     const receipt = outcome.catalog_receipt orelse return error.MissingRoutineReceipt;
     defer receipt.deinit(ctx.alloc);
     try std.testing.expectEqual(.unknown, receipt.state);
-    try std.testing.expectEqual(if (procedure) local.sql_catalog.CatalogOperationReceipt.Kind.procedure else .function, receipt.kind);
+    const expected_kind: local.sql_catalog.CatalogOperationReceipt.Kind = if (aggregate) .aggregate else if (procedure) .procedure else .function;
+    try std.testing.expectEqual(expected_kind, receipt.kind);
     try std.testing.expectEqual(if (comment) local.sql_catalog.CatalogOperationReceipt.Operation.alter else .create, receipt.operation);
     try std.testing.expect(receipt.recovery_token.len < 2048);
     try std.testing.expectEqual(@as(usize, 1), probe.mutations);

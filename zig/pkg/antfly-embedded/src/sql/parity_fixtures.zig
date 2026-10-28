@@ -182,3 +182,5 @@ pub const routine_reference = @embedFile("fixtures/sql_routine_reference.json");
 pub const procedure_reference = @embedFile("fixtures/sql_procedure_reference.json");
 
 pub const operator_reference = @embedFile("fixtures/sql_operator_reference.json");
+
+pub const aggregate_lifecycle_reference = @embedFile("fixtures/sql_aggregate_lifecycle_reference.json");

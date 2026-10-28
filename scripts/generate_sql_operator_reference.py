@@ -67,7 +67,13 @@ AFTER = [
 ]
 
 
-def reference():
+def reference(
+    before_sql=BEFORE,
+    cold_sql=COLD,
+    after_sql=AFTER,
+    identities=("sql-0133", "sql-0134", "sql-0135"),
+    label="PostgreSQL 18 operators and function identity",
+):
     from psycopg import Error
 
     cases = {
@@ -114,13 +120,13 @@ def reference():
             result["notices"] = list(notices)
             return result
 
-        before = [run(item) for item in BEFORE]
-        cold = [run(item) for item in COLD]
-        after = [run(item) for item in AFTER]
-    assert credited == {"sql-0133", "sql-0134", "sql-0135"}
+        before = [run(item) for item in before_sql]
+        cold = [run(item) for item in cold_sql]
+        after = [run(item) for item in after_sql]
+    assert credited == set(identities)
     return {
         "format": 1,
-        "reference": "PostgreSQL 18 operators and function identity",
+        "reference": label,
         "before": before,
         "cold": cold,
         "after": after,

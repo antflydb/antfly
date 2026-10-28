@@ -36997,7 +36997,7 @@ pub const RaftApplyStore = struct {
             const namespace = (try system_catalog_storage.getById(a, &txn, group, .namespace, reference.namespace_id)) orelse return error.CatalogGenerationChanged;
             const database = (try system_catalog_storage.getById(a, &txn, group, .database, namespace.value.parent_id)) orelse return error.CatalogGenerationChanged;
             const record = (try sql_routines.records.Record.decode(a, resource.value.source_json)).value;
-            if (record.id != resource.value.id or record.kind != .function) return error.CatalogGenerationChanged;
+            if (record.id != resource.value.id or record.kind != (request.kind orelse .function)) return error.CatalogGenerationChanged;
             const scope: sql_routines.Snapshot.Scope = .{ .target = .{ .database = database.value.name, .namespace = namespace.value.name, .table = resource.value.name }, .namespace_id = namespace.value.id, .database_exists = true };
             const result: sql_routines.Snapshot = .{ .revision = meta.revision, .next_id = meta.next_id, .head = try outcomes.head(a), .incarnation = incarnation, .scopes = &.{scope}, .found = .{ .scope = 0, .record = record } };
             try result.validate(request);
@@ -37106,13 +37106,16 @@ pub const RaftApplyStore = struct {
                     next = .{ .kind = value.kind, .id = meta.next_id, .generation = 1, .definition = value.definition };
                     next_id = std.math.add(u64, meta.next_id, 1) catch return error.CatalogRevisionExhausted;
                 }
-                if (next.?.definition.function_reference) |reference| {
+                const uses = try next.?.functionUsesAlloc(a);
+                for (uses) |use| {
+                    const reference = use.reference;
                     const function_resource = (try system_catalog_storage.getById(a, txn, group, .routine, reference.id)) orelse return error.CatalogGenerationChanged;
                     if (function_resource.value.parent_id != reference.namespace_id) return error.CatalogGenerationChanged;
                     const function = (try sql_routines.records.Record.decode(a, function_resource.value.source_json)).value;
                     const function_namespace = (try system_catalog_storage.getById(a, txn, group, .namespace, reference.namespace_id)) orelse return error.CatalogGenerationChanged;
-                    if (function_namespace.value.parent_id != namespace.parent_id or function.kind != .function or !std.meta.eql(function.definition.result, next.?.definition.result) or function.definition.arguments.len != next.?.definition.arguments.len) return error.CatalogGenerationChanged;
-                    for (function.definition.arguments, next.?.definition.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared.type)) return error.SqlUndefinedFunction;
+                    if (function_namespace.value.parent_id != namespace.parent_id or function.kind != .function or function.definition.result == null or !std.meta.eql(function.definition.result.?, use.result) or function.definition.arguments.len != use.arguments.len) return error.CatalogGenerationChanged;
+                    for (function.definition.arguments, use.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared)) return error.SqlUndefinedFunction;
+                    if (next.?.kind == .aggregate and reference.id == next.?.definition.function_reference.?.id and function.definition.strict and next.?.definition.aggregate.?.initial == null and !std.meta.eql(next.?.definition.aggregate.?.state, next.?.definition.arguments[0].type)) return error.SqlInvalidFunctionDefinition;
                 }
                 // SQL body validation is deterministic native preparation, never
                 // a stored execution callback or an evaluation of the body.
@@ -37155,7 +37158,7 @@ pub const RaftApplyStore = struct {
             const record = (try sql_routines.records.Record.decode(a, dependent.source_json)).value;
             const parent = (try system_catalog_storage.getById(a, txn, group, .namespace, dependent.parent_id)) orelse return error.InvalidCatalogRecord;
             const qualified_name = if (std.mem.eql(u8, parent.value.name, request.target.namespace)) dependent.name else try std.fmt.allocPrint(a, "{s}.{s}", .{ parent.value.name, dependent.name });
-            break :single try std.fmt.allocPrint(a, "drop cascades to operator {s}({s})", .{ qualified_name, try record.definition.displaySignatureAlloc(a) });
+            break :single try std.fmt.allocPrint(a, "drop cascades to {s} {s}({s})", .{ if (record.kind == .operator) "operator" else "function", qualified_name, try record.definition.displaySignatureAlloc(a) });
         } else if (dependents.len > 1) try std.fmt.allocPrint(a, "drop cascades to {d} other objects", .{dependents.len}) else null;
         const result: sql_routines.Result = .{ .revision = revision, .identity = if (next) |value| .{ .id = value.id, .generation = value.generation } else null, .removed = @intFromBool(next == null), .cascade_notice = cascade_notice };
         if (!apply) return result;
@@ -59488,6 +59491,91 @@ test "SQL routine catalog overloads replacements and bounded outcomes survive na
             try std.testing.expect(procedure_cut.found.?.record.definition.result == null);
             try std.testing.expectEqualDeep(identity.id, (try T.apply(&store, temporary, first)).success.identity.?.id);
             try std.testing.expectEqual(@as(usize, 0), (try store.listTables(temporary, group)).len);
+        }
+    }
+}
+
+test "SQL routine catalog aggregate dependency rebuild and retained retirement survive native cold reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/aggregate-dependencies", .{tmp.sub_path});
+    defer alloc.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const incarnation = "02020202020202020202020202020202".*;
+    const T = struct {
+        fn cut(store: *RaftApplyStore, a: std.mem.Allocator) !sql_routines.Snapshot {
+            const bytes = try store.sqlRoutineSnapshot(a, group, .{ .targets = &.{.{ .table = "agg" }}, .arguments = &.{.{ .type = .{ .scalar = .text } }} }, .{});
+            return std.json.parseFromSliceLeaky(sql_routines.Snapshot, a, bytes, .{});
+        }
+        fn apply(store: *RaftApplyStore, a: std.mem.Allocator, request: sql_routines.Mutation) !sql_routines.Outcome {
+            const bytes = try std.json.Stringify.valueAlloc(a, sql_routines.command(request), .{});
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes });
+            const outcome = try store.sqlRoutineOutcome(a, group, try sql_routines.observation(a, request));
+            return (try std.json.parseFromSliceLeaky(?sql_routines.Outcome, a, outcome, .{})) orelse error.TestExpectedRoutineOutcome;
+        }
+    };
+    var transition: sql_routines.Identity = undefined;
+    var final: sql_routines.Identity = undefined;
+    var aggregate: sql_routines.Identity = undefined;
+    var retirement: sql_routines.Mutation = undefined;
+    var retired_revision: u64 = 0;
+    for (0..3) |pass| {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        if (pass == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+            const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+            var request: sql_routines.Mutation = .{ .admission = .{ .nonce = @splat(1), .head = (try T.cut(&store, a)).head }, .target = .{ .table = "transition" }, .namespace_id = 2, .incarnation = (try T.cut(&store, a)).incarnation, .operation = .{ .publish = .{ .definition = .{ .arguments = &.{ .{ .type = .{ .scalar = .text } }, .{ .type = .{ .scalar = .text } } }, .result = .{ .scalar = .text }, .body = "SELECT coalesce($1,$2)", .owner = .auth_disabled } } } };
+            transition = (try T.apply(&store, a, request)).success.identity.?;
+            request.target.table = "finish";
+            request.admission = .{ .nonce = @splat(2), .head = (try T.cut(&store, a)).head };
+            request.operation.publish.definition.arguments = &.{.{ .type = .{ .scalar = .text } }};
+            request.operation.publish.definition.body = "SELECT upper($1)";
+            final = (try T.apply(&store, a, request)).success.identity.?;
+            request.target.table = "agg";
+            request.admission = .{ .nonce = @splat(3), .head = (try T.cut(&store, a)).head };
+            request.operation.publish.kind = .aggregate;
+            request.operation.publish.definition.body = "";
+            request.operation.publish.definition.function_reference = .{ .database = "default", .namespace = "public", .name = "transition", .namespace_id = 2, .id = transition.id };
+            request.operation.publish.definition.aggregate = .{ .state = .{ .scalar = .text }, .final = .{ .database = "default", .namespace = "public", .name = "finish", .namespace_id = 2, .id = final.id } };
+            aggregate = (try T.apply(&store, a, request)).success.identity.?;
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try system_catalog_storage.rebuildNameIndex(a, &txn, group);
+            try system_catalog_storage.validateNameIndex(a, &txn, group);
+            for ([_]u64{ transition.id, final.id }) |function| {
+                const dependencies = try system_catalog_storage.functionDependents(a, &txn, group, function, 1024);
+                try std.testing.expectEqual(@as(usize, 1), dependencies.len);
+                try std.testing.expectEqual(aggregate.id, dependencies[0].id);
+            }
+            try txn.commit();
+        } else if (pass == 1) {
+            const cut = try T.cut(&store, a);
+            try std.testing.expectEqual(aggregate.id, cut.found.?.record.id);
+            retirement = .{ .admission = .{ .nonce = @splat(4), .head = cut.head }, .target = .{ .table = "finish" }, .namespace_id = 2, .incarnation = (try T.cut(&store, a)).incarnation, .operation = .{ .drop = .{ .signature = "text", .expected = final } } };
+            const rejection = try T.apply(&store, a, retirement);
+            try std.testing.expectEqual(.SqlDependentCallable, rejection.rejected);
+            try std.testing.expectEqualDeep(rejection, try T.apply(&store, a, retirement));
+            try std.testing.expectEqual(aggregate.id, (try T.cut(&store, a)).found.?.record.id);
+            retirement.admission = .{ .nonce = @splat(5), .head = (try T.cut(&store, a)).head };
+            retirement.operation.drop.cascade = true;
+            const removed = (try T.apply(&store, a, retirement)).success;
+            try std.testing.expectEqualStrings("drop cascades to function agg(text)", removed.cascade_notice.?);
+            retired_revision = removed.revision;
+        } else {
+            try std.testing.expect((try T.cut(&store, a)).found == null);
+            const replay = (try T.apply(&store, a, retirement)).success;
+            try std.testing.expectEqual(retired_revision, replay.revision);
+            try std.testing.expectEqualStrings("drop cascades to function agg(text)", replay.cascade_notice.?);
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(@as(usize, 0), (try system_catalog_storage.functionDependents(a, &txn, group, transition.id, 1024)).len);
+            try std.testing.expectEqual(@as(usize, 0), (try system_catalog_storage.functionDependents(a, &txn, group, final.id, 1024)).len);
         }
     }
 }

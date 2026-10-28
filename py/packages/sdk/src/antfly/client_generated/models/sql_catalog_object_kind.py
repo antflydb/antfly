@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class SQLCatalogObjectKind(StrEnum):
+    AGGREGATE = "aggregate"
     FUNCTION = "function"
     OPERATOR = "operator"
     PROCEDURE = "procedure"

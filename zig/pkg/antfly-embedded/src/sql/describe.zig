@@ -448,7 +448,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
     }
     if (compiled.statement == .select) try @import("window_binding.zig").validatePlacement(compiled.statement.select);
-    if (compiled.statement == .select and compiled.statement.select.source == null and compiled.statement.select.table != null and backend.vtable.resolve_read != null and backend.prepared_read == null and !@import("relation_binding.zig").accepts(compiled.statement.select) and !@import("subquery_lowering.zig").accepts(compiled.statement.select)) {
+    if (compiled.statement == .select and compiled.statement.select.source == null and compiled.statement.select.table != null and backend.vtable.resolve_read != null and backend.prepared_read == null and !@import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver) and !@import("subquery_lowering.zig").accepts(compiled.statement.select)) {
         const name = compiled.statement.select.table.?;
         const resolved = try backend.resolveRead(allocator, name);
         if (resolved == .view) {
@@ -505,7 +505,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
             return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
         }
     }
-    if (compiled.statement == .select and @import("relation_binding.zig").accepts(compiled.statement.select)) {
+    if (compiled.statement == .select and @import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver)) {
         const relations = @import("relation_binding.zig");
         const parameters = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
         @memset(parameters, null);
@@ -513,7 +513,9 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         const relation = try allocator.create(relations.Bound);
         relation.* = try relations.bind(allocator, backend, compiled.statement.select, parameters);
         var adapter: relations.ResolveAdapter = .{ .backend = backend, .table = relation.table };
-        const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = relation.statement }, .parameter_count = compiled.parameter_count };
+        var resolved_statement = relation.statement;
+        resolved_statement.catalog_calls_bound = true;
+        const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = resolved_statement }, .parameter_count = compiled.parameter_count };
         var result = try bindInternal(allocator, adapter.iface(), &lowered, parameters);
         result.relation = relation;
         const output_columns = try allocator.dupe(Column, result.columns);

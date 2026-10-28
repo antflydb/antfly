@@ -259,6 +259,48 @@ fn textScan(node: *const Node) anyerror!?usize {
     };
 }
 
+fn catalogCall(node: *const ast.Scalar) bool {
+    return switch (node.*) {
+        .call => |call| found: {
+            if (call.aggregate != null) break :found true;
+            if (!call.operator and call.window == null and !scalar.builtinFunction(call.name) and !std.mem.eql(u8, @import("aggregate_binding.zig").functionName(call.name), "string_agg") and !std.mem.eql(u8, @import("aggregate_binding.zig").functionName(call.name), "array_agg") and @import("aggregate_binding.zig").aggregateKind(call.name) == null and @import("aggregate_binding.zig").orderedKind(call.name) == null) break :found true;
+            for (call.args) |argument| if (catalogCall(argument)) break :found true;
+            break :found if (call.filter) |filter| catalogCall(filter) else false;
+        },
+        .unary => |part| catalogCall(part.operand),
+        .binary => |part| catalogCall(part.left) or catalogCall(part.right),
+        .cast => |part| catalogCall(part.operand),
+        .case_when => |part| found: {
+            for (part.branches) |branch| if (catalogCall(branch.condition) or catalogCall(branch.value)) break :found true;
+            break :found if (part.otherwise) |value| catalogCall(value) else false;
+        },
+        .in_list => |part| found: {
+            if (catalogCall(part.operand)) break :found true;
+            for (part.values) |value| if (catalogCall(value)) break :found true;
+            break :found false;
+        },
+        else => false,
+    };
+}
+fn catalogPredicate(predicate: *const ast.Predicate) bool {
+    return switch (predicate.*) {
+        .scalar => |node| catalogCall(node),
+        .negation => |node| catalogPredicate(node),
+        .conjunction, .disjunction => |part| catalogPredicate(part.left) or catalogPredicate(part.right),
+        else => false,
+    };
+}
+pub fn acceptsWithCatalog(statement: ast.Select, resolver: ?@import("routine_bindings.zig").Resolver) bool {
+    if (accepts(statement)) return true;
+    if (statement.catalog_calls_bound or resolver == null or resolver.?.resolve_aggregate == null) return false;
+    for (statement.columns) |projection| if (projection.expression) |node| if (catalogCall(node)) return true;
+    if (statement.predicate) |predicate| if (catalogPredicate(predicate)) return true;
+    for (statement.group_by) |node| if (catalogCall(node)) return true;
+    if (statement.having) |node| if (catalogCall(node)) return true;
+    for (statement.order_by) |order| if (order.expression) |node| if (catalogCall(node)) return true;
+    return false;
+}
+
 pub fn accepts(statement: ast.Select) bool {
     if (@import("text_predicate.zig").contains(statement.predicate)) return true;
     if (statement.source != null or statement.ctes.len != 0 or statement.set_operation != null or statement.values_arms.len != 0) return true;
@@ -461,11 +503,12 @@ const Builder = struct {
                     if (call.within_group) |clause| if (!clause.ordinary) return error.SqlWrongAggregateKind;
                     const arity = try aggregate_binding.collectionArity(call);
                     const name = aggregate_binding.functionName(call.name);
-                    if (!std.mem.eql(u8, name, "string_agg") and aggregate_binding.aggregateKind(name) == null) return error.UndefinedSqlFunction;
+                    if (call.aggregate == null and !std.mem.eql(u8, name, "string_agg") and aggregate_binding.aggregateKind(name) == null) return error.UndefinedSqlFunction;
                     if (self.shape_only) {
                         for (call.args, 0..) |item, ordinal| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(item, columns), .expected = if (std.mem.eql(u8, name, "string_agg") and ordinal < arity) .string else null });
                         if (call.filter) |filter| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(filter, columns), .expected = .boolean });
                     }
+                    if (call.aggregate) |aggregate| break :blk .{ .cast = .{ .operand = try self.scalarNode(.{ .literal = .null }), .type = aggregate.output.kind.?, .element_type = aggregate.output.element_type, .temporal_kind = aggregate.output.temporal_kind } };
                     const argument = try self.inferenceExpression(call.args[0], columns);
                     if (std.mem.eql(u8, name, "string_agg")) break :blk .{ .cast = .{ .operand = argument, .type = .string, .element_type = .text, .coercion = .function } };
                     if (std.mem.eql(u8, name, "array_agg")) break :blk .{ .call = .{ .name = "$array", .args = try self.alloc.dupe(*const ast.Scalar, &.{argument}) } };
@@ -1064,7 +1107,23 @@ const Builder = struct {
                     }
                     spec.order = order;
                 }
-                break :blk .{ .call = .{ .name = part.name, .operator = part.operator, .args = args, .star = part.star, .distinct = part.distinct, .filter = if (part.filter) |filter| try self.expression(columns, filter, aliases) else null, .window = window, .within_group = part.within_group } };
+                var aggregate = part.aggregate;
+                if (aggregate == null and !part.operator and !scalar.builtinFunction(part.name) and @import("aggregate_binding.zig").aggregateKind(part.name) == null and @import("aggregate_binding.zig").orderedKind(part.name) == null) {
+                    const resolver = self.backend.routine_resolver orelse if (self.backend.parameter_invocation) |invocation| invocation.routine_resolver else null;
+                    if (resolver) |provider| if (provider.resolve_aggregate) |lookup| {
+                        const order_count = if (part.within_group) |clause| clause.orders.len else 0;
+                        if (order_count > args.len) return error.InvalidSqlParameters;
+                        const inputs = try self.alloc.alloc(@import("routine_bindings.zig").Argument, args.len - order_count);
+                        const scalar_columns = if (self.shape_only) self.shape_columns.items else try self.scalarColumns(columns);
+                        for (args[0..inputs.len], inputs) |argument, *input_| input_.* = .{ .type = try scalar.inferOutputWithInvocation(self.alloc, argument, scalar_columns, self.parameters, self.backend.parameter_invocation), .unknown_literal = argument.* == .literal and (argument.literal == .string or argument.literal == .null) };
+                        aggregate = try lookup(provider.ptr, self.alloc, part.name, inputs);
+                        if (aggregate) |bound| {
+                            if (bound.arguments.len != inputs.len) return error.InvalidSqlProgram;
+                            for (args[0..inputs.len], bound.arguments) |*argument, target| argument.* = try self.scalarNode(.{ .cast = .{ .operand = argument.*, .type = target.kind.?, .element_type = target.element_type, .temporal_kind = target.temporal_kind, .coercion = .function } });
+                        }
+                    };
+                }
+                break :blk .{ .call = .{ .name = part.name, .operator = part.operator, .aggregate = aggregate, .args = args, .star = part.star, .distinct = part.distinct, .filter = if (part.filter) |filter| try self.expression(columns, filter, aliases) else null, .window = window, .within_group = part.within_group } };
             },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
@@ -3063,4 +3122,33 @@ test "SQL join costing accounts for heavy keys nulls unique domains widths and s
     const resident = plan.transitionCost(1, 2, 10000, 10000, 100);
     plan.estimate.memory_bytes = 4096;
     try std.testing.expect(plan.transitionCost(1, 2, 10000, 10000, 100) > resident);
+}
+
+test "SQL user aggregate catalog routing includes ordinary ORDER BY FILTER and invalid placement domains" {
+    const a = std.testing.allocator;
+    const callbacks = struct {
+        fn function(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const @import("routine_bindings.zig").Argument) anyerror!*const @import("routine_bindings.zig").Resolved {
+            unreachable;
+        }
+        fn aggregate(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const @import("routine_bindings.zig").Argument) anyerror!?*const @import("routine_bindings.zig").Aggregate {
+            unreachable;
+        }
+    };
+    var context: u8 = 0;
+    const resolver: @import("routine_bindings.zig").Resolver = .{ .ptr = &context, .resolve = callbacks.function, .resolve_aggregate = callbacks.aggregate };
+    const queries = [_][]const u8{
+        "SELECT first_value_text(value ORDER BY sort_key) FROM aggregate_rows",
+        "SELECT first_value_text(value) FILTER(WHERE id>1) FROM aggregate_rows",
+        "SELECT first_value_text(value) FROM aggregate_rows",
+        "SELECT id FROM aggregate_rows WHERE first_value_text(value)='x'",
+        "SELECT count(*) FROM aggregate_rows GROUP BY first_value_text(value)",
+    };
+    for (queries) |query| {
+        var compiled = try @import("compiler.zig").compile(a, query, .{});
+        defer compiled.deinit();
+        try std.testing.expect(acceptsWithCatalog(compiled.statement.select, resolver));
+    }
+    var builtin = try @import("compiler.zig").compile(a, "SELECT sum(id ORDER BY id) FROM aggregate_rows", .{});
+    defer builtin.deinit();
+    try std.testing.expect(!acceptsWithCatalog(builtin.statement.select, resolver));
 }

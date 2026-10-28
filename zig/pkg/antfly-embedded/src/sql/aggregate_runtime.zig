@@ -494,6 +494,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     var memory_manager: @import("spill.zig").Manager = .{ .alloc = context.alloc, .io = .failing, .context = context.backend.ptr, .checkpoint = context.backend.vtable.checkpoint, .max_bytes = 0, .async_writes = false };
     defer memory_manager.deinit();
     var collector = try @import("ordered_grouped.zig").Collector.init(grouped, bound, context.spill orelse &memory_manager, context.limits.retained_bytes / 2);
+    collector.evaluation_limits = @import("decision_eval.zig").limitsFor(context.backend);
     defer collector.deinit();
     if (bound.group_count == 0) try grouped.ensureGlobalGroup();
     if (context.binding.table) |table| {

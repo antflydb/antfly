@@ -27,9 +27,41 @@ pub const Resolved = struct {
     program: *const scalar.Program,
     strict: bool = false,
 };
+pub const Aggregate = struct {
+    id: u64,
+    generation: u32,
+    arguments: []const scalar.Type,
+    state: scalar.Type,
+    output: scalar.Type,
+    transition: *const Resolved,
+    final: ?*const Resolved = null,
+    initial: scalar.Datum = .{},
+    const Symbol = struct { id: u64, generation: u32 };
+    const Wire = struct { id: u64, generation: u32, transition: Symbol, final: ?Symbol };
+    pub fn nativeJsonProjection(self: @This()) Wire {
+        return .{ .id = self.id, .generation = self.generation, .transition = .{ .id = self.transition.id, .generation = self.transition.generation }, .final = if (self.final) |function| .{ .id = function.id, .generation = function.generation } else null };
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        return writer.write(self.nativeJsonProjection());
+    }
+    /// Catalog-owned binding is mandatory; JSON cannot construct executable
+    /// function pointers or bypass live prepared-generation authorization.
+    pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!@This() {
+        _ = a;
+        _ = options;
+        return error.UnexpectedToken;
+    }
+    pub fn jsonParseFromValue(a: std.mem.Allocator, value: std.json.Value, options: std.json.ParseOptions) std.json.ParseFromValueError!@This() {
+        _ = a;
+        _ = value;
+        _ = options;
+        return error.UnexpectedToken;
+    }
+};
 pub const Resolver = struct {
     ptr: *anyopaque,
     resolve: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const Argument) anyerror!*const Resolved,
     resolve_reference: ?*const fn (*anyopaque, std.mem.Allocator, @import("../system_catalog/routines.zig").FunctionReference, []const Argument) anyerror!*const Resolved = null,
     resolve_operator: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const Argument) anyerror!*const Resolved = null,
+    resolve_aggregate: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const Argument) anyerror!?*const Aggregate = null,
 };

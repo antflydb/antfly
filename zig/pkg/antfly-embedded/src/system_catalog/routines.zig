@@ -43,11 +43,11 @@ pub const Type = struct {
 };
 pub const Argument = struct { name: ?[]const u8 = null, type: Type };
 pub const Volatility = enum { immutable, stable, @"volatile" };
-pub const Kind = enum { function, procedure, operator };
+pub const Kind = enum { function, procedure, operator, aggregate };
 /// An operator owns its identity while referencing a stable function identity.
 /// Function replacement can advance its executable generation; name reuse can
 /// never retarget this reference.
-pub const FunctionReference = struct {
+pub const RoutineReference = struct {
     database: []const u8,
     namespace: []const u8,
     name: []const u8,
@@ -61,12 +61,26 @@ pub const FunctionReference = struct {
         if (self.namespace_id == 0 or self.id == 0) return error.InvalidSqlRoutineRecord;
     }
 };
+pub const FunctionReference = RoutineReference;
+
+pub const AggregateDefinition = struct {
+    state: Type,
+    initial: ?[]const u8 = null,
+    final: ?FunctionReference = null,
+    pub fn validate(self: @This()) !void {
+        try self.state.validate();
+        if (self.initial) |value| if (value.len > max_body_bytes or !std.unicode.utf8ValidateSlice(value) or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidSqlRoutineRecord;
+        if (self.final) |reference| try reference.validate();
+    }
+};
+pub const FunctionUse = struct { reference: FunctionReference, arguments: []const Type, result: Type };
 pub const Definition = struct {
     arguments: []const Argument,
     result: ?Type = null,
     language: enum { sql, plpgsql } = .sql,
     body: []const u8,
     function_reference: ?FunctionReference = null,
+    aggregate: ?AggregateDefinition = null,
     strict: bool = false,
     volatility: Volatility = .@"volatile",
     owner: @import("owners.zig").Owner,
@@ -74,6 +88,7 @@ pub const Definition = struct {
         if (self.arguments.len > max_arguments or (self.body.len == 0 and self.function_reference == null) or self.body.len > max_body_bytes or
             !std.unicode.utf8ValidateSlice(self.body) or std.mem.indexOfScalar(u8, self.body, 0) != null) return error.InvalidSqlRoutineRecord;
         if (self.function_reference) |reference| try reference.validate();
+        if (self.aggregate) |aggregate| try aggregate.validate();
         if (self.result) |result| try result.validate();
         // There are at most 100 names; validation needs no heap or global state.
         for (self.arguments, 0..) |argument, i| {
@@ -122,11 +137,42 @@ pub const Record = struct {
         if (self.version != 2 or self.id == 0 or self.generation == 0) return error.InvalidSqlRoutineRecord;
         try self.definition.validate();
         switch (self.kind) {
-            .function => if (self.definition.function_reference != null or self.definition.result == null or self.definition.language != .sql) return error.InvalidSqlRoutineRecord,
-            .procedure => if (self.definition.function_reference != null or self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
-            .operator => if (self.definition.function_reference == null or self.definition.body.len != 0 or self.definition.result == null or self.definition.arguments.len != 2 or self.definition.language != .sql or self.definition.strict) return error.InvalidSqlRoutineRecord,
+            .function => if (self.definition.aggregate != null or self.definition.function_reference != null or self.definition.result == null or self.definition.language != .sql) return error.InvalidSqlRoutineRecord,
+            .procedure => if (self.definition.aggregate != null or self.definition.function_reference != null or self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
+            .operator => if (self.definition.aggregate != null or self.definition.function_reference == null or self.definition.body.len != 0 or self.definition.result == null or self.definition.arguments.len != 2 or self.definition.language != .sql or self.definition.strict) return error.InvalidSqlRoutineRecord,
+            .aggregate => {
+                if (self.definition.aggregate == null or self.definition.function_reference == null or self.definition.body.len != 0 or self.definition.result == null or self.definition.arguments.len == 0 or self.definition.arguments.len >= max_arguments or self.definition.language != .sql or self.definition.strict) return error.InvalidSqlRoutineRecord;
+                if (self.definition.aggregate.?.final == null and !std.meta.eql(self.definition.result.?, self.definition.aggregate.?.state)) return error.InvalidSqlRoutineRecord;
+            },
         }
     }
+    /// Every supporting function has an exact declared contract. Native apply,
+    /// restore and execution share these signatures; names cannot retarget them.
+    pub fn functionUsesAlloc(self: Record, a: A) ![]const FunctionUse {
+        try self.validate();
+        const reference = self.definition.function_reference orelse return &.{};
+        const aggregate = self.definition.aggregate;
+        const uses = try a.alloc(FunctionUse, if (aggregate != null and aggregate.?.final != null) 2 else 1);
+        errdefer a.free(uses);
+        const arguments = try a.alloc(Type, self.definition.arguments.len + @intFromBool(aggregate != null));
+        errdefer a.free(arguments);
+        const offset: usize = @intFromBool(aggregate != null);
+        if (aggregate) |value| arguments[0] = value.state;
+        for (self.definition.arguments, arguments[offset..]) |argument, *out| out.* = argument.type;
+        uses[0] = .{ .reference = reference, .arguments = arguments, .result = if (aggregate) |value| value.state else self.definition.result.? };
+        if (uses.len == 2) {
+            const final_arguments = try a.alloc(Type, 1);
+            final_arguments[0] = aggregate.?.state;
+            uses[1] = .{ .reference = aggregate.?.final.?, .arguments = final_arguments, .result = self.definition.result.? };
+        }
+        return uses;
+    }
+
+    pub fn freeFunctionUses(a: A, uses: []const FunctionUse) void {
+        for (uses) |use| a.free(use.arguments);
+        a.free(uses);
+    }
+
     /// Functions/procedures share a signature namespace; operator signatures
     /// are disjoint even from a quoted function named with the same symbol.
     pub fn catalogSignatureAlloc(self: Record, a: A) ![]u8 {

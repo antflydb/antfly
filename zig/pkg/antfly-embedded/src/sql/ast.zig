@@ -22,6 +22,8 @@ pub const Scalar = union(enum) {
     call: struct {
         name: []const u8,
         operator: bool = false,
+        /// Statement-bound definition; never retained in durable SQL text.
+        aggregate: ?*const @import("routine_bindings.zig").Aggregate = null,
         args: []const *const Scalar,
         star: bool = false,
         distinct: bool = false,
@@ -119,6 +121,8 @@ pub const Window = struct {
     pub const Frame = struct { mode: enum { rows, range, groups }, start: Bound, end: Bound = .current, exclusion: Exclusion = .no_others };
 };
 pub const Select = struct {
+    /// A relation graph has already classified user callables for this owner.
+    catalog_calls_bound: bool = false,
     /// null is a bag; an empty list is DISTINCT over output slots; otherwise
     /// the expressions identify PostgreSQL DISTINCT ON's first-row groups.
     distinct: ?[]const *const Scalar = null,
@@ -403,7 +407,7 @@ pub const RelationPopulation = struct {
 };
 
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -429,6 +433,13 @@ pub const CatalogDdl = struct {
     routine: ?RoutineDefinition = null,
     routine_signature: ?[]const RoutineDefinition.Type = null,
     operator_function: ?Name = null,
+    aggregate_definition: ?struct {
+        state: RoutineDefinition.Type,
+        transition: Name,
+        final: ?Name = null,
+        initial: ?[]const u8 = null,
+        replace: bool = false,
+    } = null,
 };
 /// A typed SQL declaration, owned by the compiled request. Durable publication
 /// supplies catalog/owner identities independently of this syntax tree.

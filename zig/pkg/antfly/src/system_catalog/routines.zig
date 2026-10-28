@@ -29,14 +29,14 @@ pub const SnapshotRequest = struct {
     /// Presentation metadata is excluded from hot-path execution capture.
     include_description: bool = false,
     kind: ?records.Kind = null,
-    reference: ?records.FunctionReference = null,
+    reference: ?records.RoutineReference = null,
     signature: ?[]const u8 = null,
     arguments: ?[]const records.Input = null,
     pub fn validate(self: @This()) !void {
         if ((self.targets.len == 0 and self.reference == null) or self.targets.len > 64 or (self.signature != null and self.arguments != null)) return error.InvalidCatalogMutation;
         if (self.reference) |reference| {
             try reference.validate();
-            if (self.targets.len != 0 or self.signature != null or self.arguments != null or self.kind != null) return error.InvalidCatalogMutation;
+            if (self.targets.len != 0 or self.signature != null or self.arguments != null) return error.InvalidCatalogMutation;
         }
         for (self.targets) |target| try target.validate();
         if (self.signature) |signature| if (signature.len > 4096 or std.mem.indexOfScalar(u8, signature, 0) != null) return error.InvalidCatalogMutation;
@@ -66,7 +66,7 @@ pub const Snapshot = struct {
         if (self.found) |found| {
             if (found.scope >= self.scopes.len or self.scopes[found.scope].namespace_id == null or found.record.id >= self.next_id) return error.InvalidSqlBackendResponse;
             try found.record.validate();
-            if (request.reference) |reference| if (found.record.id != reference.id or found.record.kind != .function or self.scopes[found.scope].namespace_id != reference.namespace_id) return error.InvalidSqlBackendResponse;
+            if (request.reference) |reference| if (found.record.id != reference.id or found.record.kind != (request.kind orelse .function) or self.scopes[found.scope].namespace_id != reference.namespace_id) return error.InvalidSqlBackendResponse;
         }
     }
 };

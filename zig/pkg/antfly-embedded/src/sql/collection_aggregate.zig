@@ -26,6 +26,56 @@ const A = std.mem.Allocator;
 const Datum = scalar.Datum;
 const Location = union(enum) { key: usize, value: usize };
 
+/// A reduction retains only its current typed state. Alternating arenas own
+/// borrowed transition results without accumulating allocations over the group.
+const UserState = struct {
+    aggregate: *const @import("routine_bindings.zig").Aggregate,
+    current: std.heap.ArenaAllocator,
+    next: std.heap.ArenaAllocator,
+    scratch: std.heap.ArenaAllocator,
+    value: Datum = .{},
+    initialized: bool = false,
+    seen: usize = 0,
+    fn init(a: A, aggregate: *const @import("routine_bindings.zig").Aggregate) !UserState {
+        if (aggregate.arguments.len == 0 or aggregate.arguments.len >= @import("routine_bindings.zig").max_arguments) return error.InvalidSqlProgram;
+        var self: UserState = .{ .aggregate = aggregate, .current = .init(a), .next = .init(a), .scratch = .init(a) };
+        errdefer self.deinit();
+        self.value = try operators.cloneDatum(self.current.allocator(), aggregate.initial);
+        self.initialized = !self.value.sql_null;
+        return self;
+    }
+    fn deinit(self: *UserState) void {
+        self.current.deinit();
+        self.next.deinit();
+        self.scratch.deinit();
+    }
+    fn update(self: *UserState, arguments: []const Datum, limits: scalar.EvalLimits, maximum: usize) !void {
+        if (arguments.len != self.aggregate.arguments.len) return error.InvalidSqlProgram;
+        self.seen = std.math.add(usize, self.seen, 1) catch return error.SqlProgramLimitExceeded;
+        const function = self.aggregate.transition;
+        if (function.strict) for (arguments) |argument| if (argument.sql_null) return;
+        _ = self.scratch.reset(.retain_capacity);
+        const next_value = if (function.strict and !self.initialized) first: {
+            self.initialized = true;
+            break :first arguments[0];
+        } else reduction: {
+            var frame: [@import("routine_bindings.zig").max_arguments]Datum = undefined;
+            frame[0] = self.value;
+            @memcpy(frame[1..][0..arguments.len], arguments);
+            break :reduction try scalar.Program.invokeRoutine(function, self.scratch.allocator(), frame[0 .. arguments.len + 1], limits);
+        };
+        if (try operators.datumBytes(next_value) > maximum) return error.SqlProgramLimitExceeded;
+        _ = self.next.reset(.retain_capacity);
+        self.value = try operators.cloneDatum(self.next.allocator(), next_value);
+        std.mem.swap(std.heap.ArenaAllocator, &self.current, &self.next);
+    }
+    fn finish(self: *UserState, a: A, limits: scalar.EvalLimits, maximum: usize) !Datum {
+        const result = if (self.aggregate.final) |function| try scalar.Program.invokeRoutine(function, self.scratch.allocator(), &.{self.value}, limits) else self.value;
+        if (try operators.datumBytes(result) > maximum) return error.SqlProgramLimitExceeded;
+        return operators.cloneDatum(a, result);
+    }
+};
+
 pub const Stream = struct {
     plan: binding.Collection,
     group_count: usize,
@@ -33,6 +83,18 @@ pub const Stream = struct {
     keys: []Datum,
     payload: []Datum,
     locations: []Location,
+    running: ?*UserState = null,
+    evaluation_limits: scalar.EvalLimits = .{},
+    function_work: ?@import("numeric_value.zig").Context = null,
+
+    fn reductionLimits(self: *Stream, original: scalar.EvalLimits) scalar.EvalLimits {
+        var limits = original;
+        if (limits.effect_work == null) {
+            if (self.function_work == null) self.function_work = .{ .alloc = self.sort.manager.allocator(), .checkpoint = limits.checkpoint, .ptr = limits.checkpoint_context };
+            limits.effect_work = &self.function_work.?;
+        }
+        return limits;
+    }
 
     pub fn init(manager: *spill.Manager, plan: binding.Collection, groups: usize, bytes: usize) !Stream {
         const a = manager.allocator();
@@ -54,11 +116,23 @@ pub const Stream = struct {
                 break :blk .{ .value = index };
             };
         }
-        return .{ .plan = plan, .group_count = groups, .sort = spill.Sort.init(a, manager, orders, bytes), .keys = keys, .payload = try a.alloc(Datum, width), .locations = locations };
+        const payload = try a.alloc(Datum, width);
+        errdefer a.free(payload);
+        const running: ?*UserState = if (plan.kind == .user and groups == 0 and plan.orders.len == 0 and !plan.distinct) direct: {
+            const value = try a.create(UserState);
+            errdefer a.destroy(value);
+            value.* = try UserState.init(a, plan.user orelse return error.InvalidSqlProgram);
+            break :direct value;
+        } else null;
+        return .{ .plan = plan, .group_count = groups, .sort = spill.Sort.init(a, manager, orders, bytes), .keys = keys, .payload = payload, .locations = locations, .running = running };
     }
     pub fn deinit(self: *Stream) void {
         const a = self.sort.manager.allocator();
         const orders = self.sort.orders;
+        if (self.running) |state| {
+            state.deinit();
+            a.destroy(state);
+        }
         self.sort.deinit();
         a.free(orders);
         a.free(self.keys);
@@ -80,8 +154,16 @@ pub const Stream = struct {
         const first = try self.captured(values, self.plan.arguments[0]);
         // Every argument/order expression above is evaluated exactly once,
         // even for a NULL string input. FILTER is applied by the caller first.
-        if (self.plan.kind != .array and first.sql_null) return .{};
+        if (self.plan.kind != .array and self.plan.kind != .user and first.sql_null) return .{};
         if (groups.len != self.group_count) return error.InvalidSqlBackendResponse;
+        if (self.running) |state| {
+            try self.sort.manager.check();
+            var inputs: [@import("routine_bindings.zig").max_arguments]Datum = undefined;
+            if (self.plan.arguments.len >= inputs.len) return error.InvalidSqlProgram;
+            for (self.plan.arguments, inputs[0..self.plan.arguments.len]) |slot, *input| input.* = try self.captured(values, slot);
+            try state.update(inputs[0..self.plan.arguments.len], self.reductionLimits(self.evaluation_limits), self.sort.manager.max_record_bytes);
+            return Datum.json(.{ .integer = 1 });
+        }
         @memcpy(self.keys[0..groups.len], groups);
         for (self.plan.orders, self.keys[groups.len..]) |order, *key| key.* = try self.captured(values, order.input);
         for (self.locations, self.plan.arguments) |location, argument| switch (location) {
@@ -103,10 +185,20 @@ pub const Stream = struct {
         return left.sql_null or (try scalar.compareDatums(left, right)) == .eq;
     }
     pub fn finish(self: *Stream, a: A, groups: []const Datum, count: usize) !Datum {
+        return self.finishWithLimits(a, groups, count, .{});
+    }
+    pub fn finishWithLimits(self: *Stream, a: A, groups: []const Datum, count: usize, original_limits: scalar.EvalLimits) !Datum {
+        const limits = self.reductionLimits(original_limits);
+        if (self.running) |state| {
+            if (groups.len != 0 or state.seen != count) return error.InvalidSqlSpill;
+            return state.finish(a, limits, self.sort.manager.max_record_bytes);
+        }
         var scratch = std.heap.ArenaAllocator.init(self.sort.manager.allocator());
         defer scratch.deinit();
         var previous = std.heap.ArenaAllocator.init(self.sort.manager.allocator());
         defer previous.deinit();
+        var user_state: ?UserState = if (self.plan.user) |aggregate| try UserState.init(self.sort.manager.allocator(), aggregate) else null;
+        defer if (user_state) |*state| state.deinit();
         var prior: ?[]const Datum = null;
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(a);
@@ -164,9 +256,11 @@ pub const Stream = struct {
                     } else try appendElement(self, a, &elements, &logical_bytes, value);
                 },
                 .reduce => try reducer.?.update(arguments[0]),
+                .user => try user_state.?.update(arguments, limits, self.sort.manager.max_record_bytes),
             }
             accepted += 1;
         }
+        if (user_state) |*state| return state.finish(a, limits, self.sort.manager.max_record_bytes);
         if (self.plan.kind == .reduce) return reducer.?.finishOutput(a);
         if (accepted == 0) return .{};
         if (self.plan.kind == .string) return Datum.json(.{ .string = try text.toOwnedSlice(a) });
@@ -294,4 +388,76 @@ test "SQL collection aggregates preserve volatile argument occurrences and order
     try std.testing.expectEqual(@as(usize, 6), context.calls);
     const result = try stream.finish(arena.allocator(), &.{}, 3);
     try std.testing.expectEqualStrings("14365", result.value.string);
+}
+
+test "SQL user aggregate transitions preserve null initialization finalization and bounded spill state" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definitions = @import("routine_definition.zig");
+    const records = @import("../system_catalog/routines.zig");
+    const transition = try definitions.prepare(a, .{ .id = 7, .generation = 1, .definition = .{ .arguments = &.{ .{ .type = .{ .scalar = .text } }, .{ .type = .{ .scalar = .text } } }, .result = .{ .scalar = .text }, .body = "SELECT coalesce($1,$2)", .owner = .auth_disabled } }, null, null);
+    const final = try definitions.prepare(a, .{ .id = 8, .generation = 1, .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .text } }}, .result = .{ .scalar = .text }, .body = "SELECT upper($1)", .owner = .auth_disabled } }, null, null);
+    const Fixture = struct {
+        transition: *const @import("routine_bindings.zig").Resolved,
+        final: *const @import("routine_bindings.zig").Resolved,
+        calls: usize = 0,
+        fn function(_: *anyopaque, _: A, _: []const u8, _: []const @import("routine_bindings.zig").Argument) anyerror!*const @import("routine_bindings.zig").Resolved {
+            return error.UnexpectedCatalogLookup;
+        }
+        fn reference(raw: *anyopaque, _: A, ref: records.FunctionReference, _: []const @import("routine_bindings.zig").Argument) anyerror!*const @import("routine_bindings.zig").Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (ref.id == 7) self.transition else if (ref.id == 8) self.final else error.CatalogGenerationChanged;
+        }
+    };
+    var fixture: Fixture = .{ .transition = transition, .final = final };
+    const record: records.Record = .{ .kind = .aggregate, .id = 9, .generation = 1, .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .text } }}, .result = .{ .scalar = .text }, .body = "", .owner = .auth_disabled, .function_reference = .{ .database = "default", .namespace = "public", .name = "first_sfunc", .namespace_id = 2, .id = 7 }, .aggregate = .{ .state = .{ .scalar = .text }, .final = .{ .database = "default", .namespace = "public", .name = "upper_result", .namespace_id = 2, .id = 8 } } } };
+    const bound = try definitions.prepareAggregate(a, record, .{ .ptr = &fixture, .resolve = Fixture.function, .resolve_reference = Fixture.reference });
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    for ([_]bool{ false, true }) |disk| {
+        var context: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &context, .checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check, .async_writes = false };
+        defer manager.deinit();
+        var stream = try Stream.init(&manager, .{ .aggregate_index = 0, .kind = .user, .user = bound, .arguments = &.{0}, .orders = if (disk) &.{.{ .input = 0, .order = .{} }} else &.{}, .captures = &.{0}, .distinct = false }, 0, if (disk) 128 else 1024 * 1024);
+        defer stream.deinit();
+        _ = try stream.addValues(&.{.{}}, &.{});
+        _ = try stream.addValues(&.{Datum.json(.{ .string = "first" })}, &.{});
+        for (0..64) |_| _ = try stream.addValues(&.{Datum.json(.{ .string = "later" })}, &.{});
+        try std.testing.expectEqual(if (disk) @as(usize, 66) else 0, stream.sort.total);
+        try stream.sort.finish();
+        const result = try stream.finish(a, &.{}, 66);
+        try std.testing.expectEqualStrings("FIRST", result.value.string);
+        try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    }
+}
+
+test "SQL user aggregate global reduction benchmark avoids input spooling" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definition = @import("routine_definition.zig");
+    const transition = try definition.prepare(a, .{ .id = 12, .generation = 1, .definition = .{ .arguments = &.{ .{ .type = .{ .scalar = .int32 } }, .{ .type = .{ .scalar = .int32 } } }, .result = .{ .scalar = .int32 }, .body = "SELECT $1+$2", .strict = true, .owner = .auth_disabled } }, null, null);
+    const integer = definition.runtimeType(.{ .scalar = .int32 });
+    const aggregate: @import("routine_bindings.zig").Aggregate = .{ .id = 13, .generation = 1, .arguments = &.{integer}, .state = integer, .output = integer, .transition = transition, .initial = Datum.json(.{ .integer = 0 }) };
+    for ([_]bool{ false, true }) |spooled| {
+        var context: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &context, .checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check, .async_writes = false };
+        defer manager.deinit();
+        var stream = try Stream.init(&manager, .{ .aggregate_index = 0, .kind = .user, .user = &aggregate, .arguments = &.{0}, .orders = &.{}, .captures = &.{0}, .distinct = false }, @intFromBool(spooled), 4 * 1024 * 1024);
+        defer stream.deinit();
+        const groups: []const Datum = if (spooled) &.{Datum.json(.{ .integer = 1 })} else &.{};
+        const start = @import("antfly_platform").time.monotonicNs();
+        for (0..5000) |_| _ = try stream.addValues(&.{Datum.json(.{ .integer = 1 })}, groups);
+        try stream.sort.finish();
+        const result = try stream.finish(a, groups, 5000);
+        const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
+        try std.testing.expectEqual(@as(i64, 5000), result.value.integer);
+        try std.testing.expectEqual(if (spooled) @as(usize, 5000) else 0, stream.sort.total);
+        std.debug.print("user aggregate reduction: spooled={any} rows=5000 spooled_input_rows={d} elapsed_ns={d}\n", .{ spooled, stream.sort.total, elapsed });
+    }
 }
