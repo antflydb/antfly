@@ -2797,10 +2797,12 @@ and a 1-MiB reservation cover the largest frozen terminal result.
 
 After a cached terminal is excluded from the requested root set, its full-SHA
 dependencies can establish request-local suffix absence. The memo retains at most
-32 immutable leases and materializes their digests only before a cold walk (or
-when that pending set fills). Warm-only proofs avoid copying entire long paths;
-a new entry into an already validated suffix spends no native forward work.
-Pending leases are released on materialization and every proof exit, and their
+32 immutable leases and binary-searches their sorted full-SHA dependencies.
+It never materializes cached paths into a second hash table. On overflow it
+releases an optional old lease, preserving bounded memory and exact fallback.
+Repeated multi-entry warm proofs spend logarithmic dependency work rather than
+copying a whole path for every page, and spend no native forward work.
+Pending leases are released on replacement and every proof exit, and their
 memory remains charged to the existing routing budget. Root-set verdicts remain
 local and no partially resolved canonical result is published.
 
@@ -2879,8 +2881,8 @@ No request advances owner work. Final head, source and authorization fences rema
 independent. Full rebuilding is reserved for initial enrollment, format upgrade,
 oversized invalidations, or ingestion falling behind retained history.
 
-This generation uses Lite reader 27, topology protocol 66, metadata bootstrap v19,
-and Lite query-pin enrollment v7. Legacy v12-v18 declaration/profile proofs remain
+This generation uses Lite reader 28, topology protocol 67, metadata bootstrap v20,
+and Lite query-pin enrollment v8. Legacy v12-v19 declaration/profile proofs remain
 valid during dependency backfill; older pin projections use exact fallback
 until their owner publishes format 5. Older native readers refuse the new floor.
 A profile enrollment epoch also drives bounded retirement cleanup, so replacing
@@ -3013,8 +3015,8 @@ one bounded turn. Removing a pin during a paused curated boundary walk preserves
 exact results at every repair cut.
 
 An unrelated 8,192-edge native tail still takes 8,194 native reads on its cold
-proof, and zero native reads on subsequent proofs (one bounded journal-range
-scan remains). Two disjoint cold tails can exhaust the shared work budget once;
+proof, and zero native path reads on subsequent proofs (bounded journal and
+coverage reads remain). Two disjoint cold tails can exhaust the shared work budget once;
 the next read resolves the remaining tail in 8,194 reads, then both are warm.
 Regressions cover immediate routing invalidation, distinct configured profiles,
 caller-scratch poisoning and exact behavior when routing-cache admission is denied.
@@ -3051,5 +3053,51 @@ The recent-source and checkpoint regressions add these operation-count bounds:
   coherent fields, compare/publication fencing, immutable dependencies and
   constant cache charges.
 
-These are read-side changes. Projection format 5 and the reader-27 / topology-66 /
-bootstrap-v19 / Lite-enrollment-v7 durable contracts remain unchanged.
+Projection format remains 5. Legacy content qualification adds the reader-28 /
+topology-67 / bootstrap-v20 / Lite-enrollment-v8 durable contract described below.
+
+Native heads carry `lineage_version: 1` only when their base content is known.
+New adoption hashes the full initial namespace; ordinary edits inherit the
+qualification of their actual previous head, ignoring a caller-supplied flag.
+Older marker-less heads, including nonzero hashes that may have been rolled over
+an unknown legacy base, are unqualified. Unqualified reads use exact native
+lookup, bypassing composed, membership, terminal and invalidation-plan caches and
+published graph projections. Hashing an edit over an unknown base never grants
+cache eligibility.
+
+Qualification is owner-only, bounded and resumable through `lineage-v1/` work.
+Each turn hashes at most 128 individual native records within its work limit,
+retaining only a short relative cursor and a SHA-256 chain. Raw records are
+hashed in stable key order with Antfly SHA-256; no namespace scan occurs in a
+foreground query or ordinary mutation. The owner restarts if the head changes
+between turns. Final publication rechecks the exact revision/fingerprint cut,
+publishes a content-qualified head and graph/routing stamps, resets the journal
+origin and barrier, and retires the cursor in the same transaction. Old graph
+projections then rebuild through their existing bounded owner path. The logical
+curation revision does not change. Portable snapshots validate the work cursor;
+reader 28 / topology 67 gate the durable marker and work rows. Existing
+v12-v19 declaration/profile proofs remain usable during this work.
+
+Large negative proofs share only immutable sorted invalidation digests, keyed by
+qualified namespace origin plus exact baseline/current graph and journal cuts.
+A shared decoded-profile cache reservation covers at most 8 MiB scratch and a
+bounded frozen arena; retained bytes and active leases remain charged to the
+existing 48-MiB lane. There is no additional cache budget. Concurrent misses use
+the existing coalescing mechanism. Root selection, dirty markers, full-SHA hits,
+native masks, source proofs and final grants are checked afresh on every request.
+Cache denial uses the same bounded streaming preparation. Missing history or a
+barrier still refuses indexed reuse, independently of retained cache entries.
+
+Additional deterministic regressions:
+
+- Divergent legacy destinations that formerly returned zero distinct pins in
+  the second destination now return the exact result of one. Both qualification
+  before the first edit and edits before qualification are covered; reads remain
+  free of writes throughout backfill, and partial work restarts after mutation.
+- Twenty pages at one unchanged head after 128 retained events formerly repeated
+  2,560 compact-journal reads out of 2,940 total native reads. After the first
+  preparation, they perform zero additional compact reads and 380 total reads.
+  Admission denial preserves the exact result and later indexed cache recovery.
+- Repeated two-entry proofs into an 8,192-hop warm path use 13 sorted dependency
+  comparisons instead of materializing 8,193 digests per page. Native reads remain
+  three and forward steps remain zero. Pending leases remain bounded on spill.

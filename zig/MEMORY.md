@@ -2700,19 +2700,35 @@ Fallback canonicalization decodes each hop in resettable scratch and keeps only
 bounded digest history, so valid long-key paths work with cached membership or
 streaming fallback. Source and final grant fences remain independent. These
 changes preserve projection format 5; the new journal contract advances Lite to
-reader 27, topology to 66, metadata bootstrap to v19 and Lite enrollment to v7.
+reader 28, topology to 67, metadata bootstrap to v20 and Lite enrollment to v8.
 See `RESOLUTION.md` for bounded maintenance, measurements and fallback rules.
 
 Recent routing-source discovery intersects a frozen sorted digest set from the
 bounded recent journal with profile coverage. It never walks old retained source
 versions merely because a small new burst exceeds a point-lookup threshold.
 Canonical cache hits can provide validated suffix dependencies to a bounded local
-memo; those dependencies are materialized only when a cold walk needs them.
+memo; membership probes binary-search the borrowed sorted dependencies without
+materializing whole cached paths, including repeated multi-entry pages.
 Accepted canonical proofs advance synchronized, compare-checked sequence/graph/
 routing checkpoints, so unrelated heads validate the new history suffix without
 replaying the entry's lifetime. The immutable paths and dependencies retain their
 existing cache ownership and accounting. No root-set, source or grant decision
 enters the shared certificate. Failed dependency/ancestry checks and barriers
 still force fallback, and older snapshots cannot overwrite newer checkpoints.
-These changes preserve the existing durable formats and reader floors. The
-operation-count regressions and concurrency contracts are in `RESOLUTION.md`.
+The operation-count regressions and concurrency contracts are in `RESOLUTION.md`.
+
+Legacy native namespaces must qualify their complete base content before sharing
+native graph data. A bounded owner migration hashes stable record pages, fences
+publication on the exact head, and publishes a qualified lineage without changing
+the logical curation revision. Ordinary edits preserve an unqualified state;
+read-only queries remain exact and perform no migration writes. This also covers
+older nonzero fingerprints derived from unknown zero-fingerprint bases. The
+qualification marker and resumable work use Lite reader 28, topology 67, metadata
+bootstrap v20 and Lite enrollment v8; projection format remains 5.
+
+Immutable invalidation preparation is shared across candidate pages at the same
+qualified baseline/current head pair. It uses the existing decoded cache budget
+and lease accounting, and keeps root decisions, native masks and grants outside
+the cache. Denied admission retains exact streaming behavior. Together with
+borrowed sorted suffix dependencies, this removes repeated journal preparation
+and path-length memo fills while preserving final source and authorization fences.

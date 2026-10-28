@@ -97,11 +97,12 @@ const std = @import("std");
 /// Version 64 adds deletable dependency summaries and forward-only pin repair.
 /// Version 65 scopes native paths and adds paged fingerprint dependency summaries.
 /// Version 66 indexes routing sources for dependency-validated canonical proofs.
-pub const current_version: u16 = 66;
+/// Version 67 qualifies legacy resolver content before native cache admission.
+pub const current_version: u16 = 67;
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 66;
+pub const resolver_namespaces_version: u16 = 67;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

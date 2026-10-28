@@ -24472,9 +24472,10 @@ pub const RaftApplyStore = struct {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:job:", .{group_id});
     }
     fn resolverNamespaceReadReady(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !bool {
-        // v19 indexes routing sources. Existing v12-v18
+        // v20 qualifies legacy content. Existing v12-v19
         // declaration and profile proofs remain valid during owner backfill.
         if (try stagingGet(txn, try resolverNamespaceBootstrapKey(a, group)) != null) return true;
+        if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v19", .{group})) != null) return true;
         if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v18", .{group})) != null) return true;
         if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v17", .{group})) != null) return true;
         if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v16", .{group})) != null) return true;
@@ -24484,7 +24485,7 @@ pub const RaftApplyStore = struct {
         return try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v12", .{group})) != null;
     }
     fn resolverNamespaceBootstrapKey(a: std.mem.Allocator, group_id: u64) ![]const u8 {
-        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v19", .{group_id});
+        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v20", .{group_id});
     }
     fn resolverConfigs(a: std.mem.Allocator, root: std.json.Value) ![]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig {
         const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;

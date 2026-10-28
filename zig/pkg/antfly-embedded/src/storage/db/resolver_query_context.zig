@@ -79,6 +79,7 @@ pub const CanonicalCheckpoint = struct {
     }
 };
 pub const Graph = struct {
+    invalidations: []const [32]u8 = &.{},
     canonical: ?CanonicalProof = null,
     routes: []const Route = &.{},
     aliases: []const resolver.KeyAlias = &.{},
@@ -107,6 +108,7 @@ pub const Redirects = struct {
     }
 };
 pub const Context = struct {
+    invalidations: []const [32]u8 = &.{},
     canonical: ?CanonicalProof = null,
     canonical_mutex: std.atomic.Mutex = .unlocked,
     canonical_checkpoint: ?CanonicalCheckpoint = null,
@@ -261,7 +263,7 @@ pub const Context = struct {
             }
         }
         const result = try owner.create(Context);
-        result.* = .{ .canonical = graph.canonical, .arena = arena, .key = cache_key, .base = base, .shared_profile = graph.shared_profile, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins, .routes = graph.routes };
+        result.* = .{ .invalidations = graph.invalidations, .canonical = graph.canonical, .arena = arena, .key = cache_key, .base = base, .shared_profile = graph.shared_profile, .composed = graph.composed, .static_reverse = reverse, .static_targets = statics, .nodes = nodes, .native_targets = natives, .removed = removed, .redirects = redirects, .pins = pins, .routes = graph.routes };
         return result;
     }
 };
@@ -491,6 +493,13 @@ pub fn tryRouting(key: [32]u8, loader: Loader) !?Lease {
     var bounded = loader;
     bounded.estimated_bytes = 12 * 1024 * 1024; // 8 MiB scratch + <=4 MiB frozen data.
     return routing.tryAcquire(key, true, bounded);
+}
+/// Large immutable change sets share the existing decoded-profile lane and
+/// its live-lease accounting. Admission denial retains exact streaming proofs.
+pub fn tryInvalidations(key: [32]u8, loader: Loader) !?Lease {
+    var bounded = loader;
+    bounded.estimated_bytes = 18 * 1024 * 1024; // <=8 MiB scratch + <=8 MiB frozen arena.
+    return shared.tryAcquire(key, true, bounded);
 }
 /// Tail loaders use caller-owned scratch and retain an entry key, terminal
 /// (each at most 16 KiB), and at most 16,384 full-SHA path dependencies. Share
@@ -811,4 +820,25 @@ test "native resolver authority canonical checkpoints publish coherent concurren
     try std.testing.expectEqual(@as(u64, 512), proof.sequence);
     try std.testing.expectEqual(proof.sequence, std.mem.readInt(u64, proof.graph[0..8], .little));
     try std.testing.expectEqual(proof.graph, proof.routing);
+}
+
+test "native resolver authority invalidation plans own leased storage through eviction and allocation failures" {
+    const Fixture = struct {
+        fn load(_: *anyopaque, a: A) !Graph {
+            const values = try a.alloc([32]u8, 128);
+            for (values, 0..) |*digest, i| digest.* = @splat(@intCast(i));
+            return .{ .invalidations = values };
+        }
+        fn run(a: A) !void {
+            var cache: Cache = .{ .allocator = a };
+            defer cache.deinit();
+            var marker: u8 = 0;
+            const lease = try cache.acquire(@splat(123), true, .{ .ptr = &marker, .load = load });
+            defer lease.release();
+            cache.deinit();
+            try std.testing.expectEqual(@as(usize, 128), lease.context.invalidations.len);
+            try std.testing.expectEqual(@as([32]u8, @splat(127)), lease.context.invalidations[127]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
