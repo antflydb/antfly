@@ -17,9 +17,10 @@
 
 from itertools import islice
 import json
-import os
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from managed_api import authorization_headers, open_request as urlopen, validate_backend
 import uuid
 
 
@@ -31,6 +32,8 @@ def publish(
     created_before=None,
     created_after=None,
 ):
+    credentials = authorization_headers()
+    validate_backend(endpoint, bool(credentials))
     if not 1 <= batch_size <= 16384:
         raise ValueError("native batch size must be between 1 and 16384")
     uri = (
@@ -138,8 +141,7 @@ def publish(
             state.set("native_changes_epoch", epoch)
             state.set("native_changes_request", json.dumps(intent))
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if token := os.environ.get("ANTFLY_API_KEY"):
-        headers["Authorization"] = "Bearer " + token
+    headers.update(credentials)
     request = Request(uri, json.dumps(intent["body"]).encode(), headers, method="POST")
     with urlopen(request, timeout=60) as response:
         result = json.load(response)
