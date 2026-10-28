@@ -2741,3 +2741,12 @@ exact sequence window. Recent-source discovery borrows them directly; extension
 for older terminal checkpoints uses private scratch. Root verdicts, source
 coverage, native masks and authorization remain fresh. Cache denial preserves
 bounded streaming fallback; no additional cache budget or durable format is added.
+
+
+Fresh resolver coverage uses adaptive, byte-bounded request-local pages. Dense
+intersections reuse up to 128 rows within 1 MiB of existing scratch; sparse gaps
+retain galloping seeks. Allocation exhaustion shrinks the page width rather than
+truncating matches. Pages are independent of frozen history and event I/O and do
+not survive the request. Both native point reads and scan calls are measured:
+the 128-event/20-query fixture retains 380 point reads while scans drop from
+6,480 to 280, with coverage seeks dropping from 6,340 to 140.

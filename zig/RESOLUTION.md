@@ -3123,3 +3123,25 @@ Warm routing plans use zero routing-compact rereads and 380 native point reads;
 profile-coverage scans remain fresh. Regressions also cover
 private extension to older checkpoints, fresh coverage after deletion, admission
 denial and recovery, and leased data surviving eviction and allocation failures.
+
+
+Coverage intersections now page within the existing request scratch. They begin
+with one-row galloping seeks and switch to bounded pages when recent digests are
+dense relative to coverage or matching rows are consecutive. Page reuse performs
+binary seeks within retained rows. Sparse gaps discard mostly unused pages and
+return to one-row seeks, preserving the nine-recent-source/4,096-historical-row
+regression without scanning the old coverage index.
+
+At most 128 rows are held in a dedicated 1-MiB portion of the existing scratch.
+Read-only page attempts halve on allocation exhaustion and remember the smaller
+byte ceiling; cheap fully consumed pages may grow again. Frozen routing history,
+older-checkpoint extension scratch and event I/O occupy separate regions. Page
+rows survive event-frame reuse, and no coverage or root verdict is cached across
+requests. No new allocation tier, cache budget, durable format or writer work is
+introduced. Maximum 16-KiB keys with heavily escaped values retain exact results.
+
+For 20 warm public queries after 128 retained events, coverage seeks fall from
+6,340 to 140 and total scan calls from 6,480 to 280. Point reads remain 380.
+Returned rows change from 7,140 to 7,280: batching reduces repeated seeks while
+retaining bounded overread. Tests cover all-positive dense pages, sparse gaps,
+byte-limit backoff, event-scratch poisoning and fresh coverage after deletion.

@@ -26,6 +26,7 @@ const A = std.mem.Allocator;
 var test_pin_summary_probes: std.atomic.Value(usize) = .init(0);
 var test_tail_forward_steps: std.atomic.Value(usize) = .init(0);
 var test_tail_pending_probes: std.atomic.Value(usize) = .init(0);
+var test_coverage_page_retries: std.atomic.Value(usize) = .init(0);
 pub const static_profiles = @import("resolver_static_profiles.zig");
 pub const query_context = @import("resolver_query_context.zig");
 const dependency_filter = @import("resolver_dependency_filter.zig");
@@ -2281,13 +2282,22 @@ pub const Store = struct {
         position: usize = 0,
         cursor: [85]u8 = undefined,
         cursor_len: usize = 0,
+        page_storage: []u8 = &.{},
+        page_rows: []const Row = &.{},
+        page_kind: usize = 3,
+        page_at: usize = 0,
+        page_used: usize = 0,
+        page_bytes: usize = 0,
+        page_limit: u32 = 1,
+        page_ceiling: u32 = 128,
+        matching_run: u8 = 0,
         fn deinit(self: @This()) void {
             if (self.plan) |lease| lease.release();
         }
         fn init(store: Store, prepared: PreparedQuery, journal_head: PinEditHead, sequence: u64, changes: *RoutingChanges, storage: []u8, frame: *std.heap.FixedBufferAllocator) !@This() {
             const journal = try store.pinEditRoot(prepared.template);
             const prefix = try std.mem.concat(store.a, u8, &.{ journal, "routed/" });
-            var result: @This() = .{ .store = store, .sequence = sequence, .raw_prefix = prefix };
+            var result: @This() = .{ .store = store, .sequence = sequence, .raw_prefix = prefix, .page_storage = storage[2 * 1024 * 1024 ..] };
             result.cursor_len = (try std.fmt.bufPrint(&result.cursor, "{d:0>20}/~", .{sequence})).len;
             if (prepared.profile_id.len != 64) return result;
             const root = try store.pinProjectionRoot(prepared.template, prepared.profile_id);
@@ -2314,7 +2324,7 @@ pub const Store = struct {
                 }
             }
             try changes.load(store, prepared.template, journal_head, sequence, frame);
-            var workspace: std.heap.FixedBufferAllocator = .init(storage);
+            var workspace: std.heap.FixedBufferAllocator = .init(storage[0 .. 2 * 1024 * 1024]);
             result.recent = try workspace.allocator().dupe(RoutingChanges.Change, changes.entries);
             result.raw = false;
             return result;
@@ -2325,6 +2335,67 @@ pub const Store = struct {
             const a = frame.allocator();
             for (self.coverage) |prefix| if (try self.store.backend.get(self.store.backend.ptr, a, try std.mem.concat(a, u8, &.{ prefix, digest })) != null) return true;
             return false;
+        }
+        /// Page storage is separate from event I/O and frozen routing history.
+        /// Grow only on dense traversal; sparse gaps retain galloping seeks.
+        fn coverageRow(self: *@This(), wanted: []const u8) !?Row {
+            const prefix = self.coverage[self.kind];
+            if (self.page_kind != self.kind) {
+                self.page_rows = &.{};
+                self.page_kind = self.kind;
+                self.page_limit = 1;
+                self.page_ceiling = 128;
+                self.matching_run = 0;
+            }
+            if (self.page_rows.len != 0) {
+                const last = self.page_rows[self.page_rows.len - 1].key[prefix.len..];
+                if (!std.mem.lessThan(u8, last, wanted)) {
+                    var lo = self.page_at;
+                    var hi = self.page_rows.len;
+                    while (lo < hi) {
+                        const mid = lo + (hi - lo) / 2;
+                        if (std.mem.lessThan(u8, self.page_rows[mid].key[prefix.len..], wanted)) lo = mid + 1 else hi = mid;
+                    }
+                    if (lo == self.page_rows.len) return error.InvalidCatalogRecord;
+                    self.page_at = lo + 1;
+                    self.page_used += 1;
+                    return self.page_rows[lo];
+                }
+                if (self.page_rows.len > 1) {
+                    if (self.page_used * 4 < self.page_rows.len) {
+                        self.page_limit = 1;
+                        self.matching_run = 0;
+                    } else if (self.page_bytes < self.page_storage.len / 4) {
+                        self.page_ceiling = @min(128, @max(self.page_ceiling, self.page_limit * 2));
+                        self.page_limit = @min(self.page_ceiling, self.page_limit * 2);
+                    }
+                }
+            }
+            var frame: std.heap.FixedBufferAllocator = .init(self.page_storage);
+            while (true) {
+                frame.reset();
+                const a = frame.allocator();
+                const before = try std.mem.concat(a, u8, &.{ prefix, wanted });
+                before[before.len - 1] -= 1;
+                const page = self.store.backend.scan(self.store.backend.ptr, a, prefix, before, self.page_limit) catch |err| {
+                    if (err != error.OutOfMemory or self.page_limit == 1) return err;
+                    // Long/escaped values reduce the page width, never the
+                    // exact result. The read-only retry cannot publish state.
+                    self.page_limit = @max(1, self.page_limit / 2);
+                    self.page_ceiling = self.page_limit;
+                    if (builtin.is_test) _ = test_coverage_page_retries.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                for (page.rows, 0..) |row, i| {
+                    if (!std.mem.startsWith(u8, row.key, prefix) or row.key.len != prefix.len + 64 or
+                        (i != 0 and !std.mem.lessThan(u8, page.rows[i - 1].key, row.key))) return error.InvalidCatalogRecord;
+                }
+                self.page_rows = page.rows;
+                self.page_at = 1;
+                self.page_used = 1;
+                self.page_bytes = frame.end_index;
+                return if (page.rows.len == 0) null else page.rows[0];
+            }
         }
         fn next(self: *@This(), prepared: PreparedQuery, frame: *std.heap.FixedBufferAllocator, points: *std.heap.FixedBufferAllocator) !?PinInvalidation {
             while (!self.done) {
@@ -2358,15 +2429,11 @@ pub const Store = struct {
                 }
                 const prefix = self.coverage[self.kind];
                 const wanted = std.fmt.bytesToHex(self.recent[self.position].digest, .lower);
-                const before = try std.mem.concat(a, u8, &.{ prefix, &wanted });
-                before[before.len - 1] -= 1;
-                const page = try self.store.backend.scan(self.store.backend.ptr, a, prefix, before, 1);
-                if (page.rows.len == 0) {
+                const covered = (try self.coverageRow(&wanted)) orelse {
                     self.kind += 1;
                     self.position = 0;
                     continue;
-                }
-                const covered = page.rows[0];
+                };
                 if (covered.key.len != prefix.len + 64) return error.InvalidCatalogRecord;
                 var digest: [32]u8 = undefined;
                 _ = std.fmt.hexToBytes(&digest, covered.key[prefix.len..]) catch return error.InvalidCatalogRecord;
@@ -2379,8 +2446,16 @@ pub const Store = struct {
                     const mid = lo + (hi - lo) / 2;
                     if (std.mem.lessThan(u8, &self.recent[mid].digest, &digest)) lo = mid + 1 else hi = mid;
                 }
+                // Many recent digests skipped by one coverage row indicate
+                // a dense recent side. Consecutive matches also justify paging.
+                if (lo - self.position >= 8) self.page_limit = self.page_ceiling;
                 self.position = lo;
-                if (lo == self.recent.len or !std.mem.eql(u8, &self.recent[lo].digest, &digest)) continue;
+                if (lo == self.recent.len or !std.mem.eql(u8, &self.recent[lo].digest, &digest)) {
+                    self.matching_run = 0;
+                    continue;
+                }
+                self.matching_run +|= 1;
+                if (self.matching_run >= 2 and self.page_limit == 1) self.page_limit = @min(8, self.page_ceiling);
                 const change = self.recent[lo];
                 self.position += 1;
                 const key = switch (self.kind) {
@@ -5653,6 +5728,7 @@ const OrderedPinMemory = struct {
     pin_event_reads: usize = 0,
     test_compact_reads: usize = 0,
     test_routed_compact_reads: usize = 0,
+    test_coverage_scans: usize = 0,
     scans: usize = 0,
     writes: usize = 0,
     visited: usize = 0,
@@ -5684,6 +5760,7 @@ const OrderedPinMemory = struct {
     fn scan(ptr: *anyopaque, a: A, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.scans += 1;
+        if (std.mem.endsWith(u8, prefix, "/path/") or std.mem.endsWith(u8, prefix, "/dirty-node/") or std.mem.endsWith(u8, prefix, "/trace/")) self.test_coverage_scans += 1;
         const lower = after orelse prefix;
         var current = self.tree.root;
         var first: ?*Tree.Node = null;
@@ -7946,8 +8023,10 @@ test "resolver curation dependency recent source intersection excludes historica
             try store.appendPinEdit(template, prepared.graph_id, prepared.graph_id, &.{}, &.{source}, &.{"entity/new-tail"});
             if (i < 7) continue;
             const before = memory.scans;
+            const before_rows = memory.visited;
             try std.testing.expect(try store.incomingPinRootsCurrent(prepared, baseline, baseline + i + 1, roots, lookup, &events, &points, &memo, scratch.bytes[0 .. 5 * 1024 * 1024]));
             try std.testing.expect(memory.scans - before < 32);
+            try std.testing.expect(memory.visited - before_rows < 32);
             std.debug.print("RECENT SOURCE INTERSECTION old_covered={d} recent_sources={d} scans={d}\n", .{ old_count, i + 1, memory.scans - before });
         }
     }
@@ -8544,6 +8623,9 @@ test "resolver curation dependency routing plans reuse immutable history and rec
         const compact_reads = memory.test_compact_reads;
         const steady_reads = memory.reads;
         const routed_reads = memory.test_routed_compact_reads;
+        const steady_scans = memory.scans;
+        const coverage_scans = memory.test_coverage_scans;
+        const steady_rows = memory.visited;
         const started = @import("antfly_platform").time.monotonicNs();
         for (0..20) |_| {
             var request = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -8555,6 +8637,8 @@ test "resolver curation dependency routing plans reuse immutable history and rec
         }
         try std.testing.expectEqual(@as(usize, 0), memory.test_compact_reads - compact_reads);
         try std.testing.expectEqual(@as(usize, 0), memory.test_routed_compact_reads - routed_reads);
+        try std.testing.expect(memory.test_coverage_scans - coverage_scans < 400);
+        std.debug.print("PAGED WARM COVERAGE events={d} queries=20 gets={d} scans={d} coverage_seeks={d} rows={d}\n", .{ event_count, memory.reads - steady_reads, memory.scans - steady_scans, memory.test_coverage_scans - coverage_scans, memory.visited - steady_rows });
         std.debug.print("SHARED ROUTING PLAN events={d} queries=20 routed_compact_reads={d} native_reads={d}\n", .{ event_count, memory.test_routed_compact_reads - routed_reads, memory.reads - steady_reads });
         std.debug.print("SHARED INVALIDATION PLAN events={d} queries=20 compact_reads={d} native_reads={d} elapsed_us={d}\n", .{ event_count, memory.test_compact_reads - compact_reads, memory.reads - steady_reads, (@import("antfly_platform").time.monotonicNs() - started) / 1000 });
         if (event_count == 128) {
@@ -8593,5 +8677,63 @@ test "resolver curation dependency routing plans reuse immutable history and rec
             try std.testing.expectEqual(before_routed_warm, memory.test_routed_compact_reads);
         }
         std.debug.print("ADAPTIVE TINY SUMMARY events={d} queried_roots=64 dependencies_per_root=3 unique_invalidations={d} digest_probes={d} reads={d} scans={d} pairs={d}\n", .{ event_count, invalidations.rows.len, probes, memory.reads - reads_before, memory.scans - scans_before, result.namespace.state.distinct.len });
+    }
+}
+
+test "resolver curation dependency coverage pages preserve matches across scratch reuse and maximum escaped keys" {
+    for ([_]bool{ false, true }) |long_keys| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var memory: OrderedPinMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+        const count: usize = if (long_keys) 12 else 257;
+        const root = try a.alloc(u8, if (long_keys) 16384 else 32);
+        @memset(root, 2);
+        @memcpy(root[0..7], "entity/");
+        try c.validKey(root);
+        const next = try a.dupe(u8, root);
+        @memset(next[7..], 3);
+        const changes = try a.alloc(query_context.RoutingChange, count);
+        for (changes, 0..) |*change, i| {
+            const key = try a.alloc(u8, if (long_keys) 16384 else 32);
+            @memset(key, 1);
+            @memcpy(key[0..7], "entity/");
+            _ = try std.fmt.bufPrint(key[key.len - 8 ..], "{d:0>8}", .{i});
+            try c.validKey(key);
+            @import("antfly_hash").Sha256.hash(key, &change.digest, .{});
+            change.sequence = i + 1;
+            const digest = std.fmt.bytesToHex(change.digest, .lower);
+            try store.backend.put(store.backend.ptr, a, try std.mem.concat(a, u8, &.{ "coverage/path/", &digest }), try encode(a, Store.PinPath{ .key = key, .root = root, .next = next }));
+        }
+        std.mem.sortUnstable(query_context.RoutingChange, changes, {}, struct {
+            fn less(_: void, l: query_context.RoutingChange, r: query_context.RoutingChange) bool {
+                return std.mem.lessThan(u8, &l.digest, &r.digest);
+            }
+        }.less);
+        const scratch = try query_context.RoutingScratch.init();
+        defer scratch.deinit();
+        var events: std.heap.FixedBufferAllocator = .init(scratch.bytes[6 * 1024 * 1024 .. 7 * 1024 * 1024]);
+        var points: std.heap.FixedBufferAllocator = .init(scratch.bytes[7 * 1024 * 1024 ..]);
+        var sources: Store.RoutingSources = .{ .store = store, .sequence = 0, .raw_prefix = "unused/", .coverage = .{ "coverage/path/", "coverage/dirty-node/", "coverage/trace/" }, .recent = changes, .raw = false, .page_storage = scratch.bytes[4 * 1024 * 1024 .. 5 * 1024 * 1024] };
+        const prepared: Store.PreparedQuery = .{ .lease = null, .stamp = .{ .revision = 1, .fingerprint = @splat(1) }, .template = "entity/{{_key}}", .distinct = true };
+        const retries = test_coverage_page_retries.load(.monotonic);
+        var received: usize = 0;
+        while (try sources.next(prepared, &events, &points)) |source| {
+            var digest: [32]u8 = undefined;
+            @import("antfly_hash").Sha256.hash(source.key, &digest, .{});
+            try std.testing.expectEqual(changes[received].digest, digest);
+            try std.testing.expectEqual(changes[received].sequence, source.sequence);
+            received += 1;
+            // I/O reuse and older checkpoint validation may overwrite both
+            // caller frames between iterator calls; retained pages must survive.
+            @memset(events.buffer, 0xa5);
+            @memset(points.buffer, 0xb6);
+        }
+        try std.testing.expectEqual(count, received);
+        try std.testing.expect(memory.test_coverage_scans < 20);
+        const retry_count = test_coverage_page_retries.load(.monotonic) - retries;
+        if (long_keys) try std.testing.expect(retry_count > 0 and retry_count <= 8) else try std.testing.expectEqual(@as(usize, 0), retry_count);
+        std.debug.print("COVERAGE BYTE PAGES long_keys={any} matches={d} scans={d} byte_retries={d}\n", .{ long_keys, received, memory.test_coverage_scans, retry_count });
     }
 }
