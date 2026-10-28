@@ -747,7 +747,7 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 /// Build one current namespace outside writer leases and publish all local
 /// consumers atomically. Missing/recreated destinations retract old projections
 /// immediately, independent of physical cleanup of the retired authority.
-const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v3";
+const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v9";
 fn queryPinsWorkPossible(database: *h.db_mod.DB, a: A) !bool {
     if (!database.core.index_manager.hasResolverDefinitions()) return false;
     _ = database.core.store.get(a, query_pins_owner_marker) catch |err| return if (err == error.NotFound) true else err;
@@ -1303,6 +1303,59 @@ pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     return false;
 }
 
+test "capi resolver curation namespace outcomes stay bounded through JSON round trips" {
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-absorbed-response-budget");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    defer h.closeHandle(root);
+    const template = "concept/{{_key}}";
+    const selected = try a.alloc(Consumer, 256);
+    for (selected) |*source| source.* = .{ .db = &root.db, .source = "default", .cfg = .{
+        .name = "r",
+        .table = "entities",
+        .source_artifact = "kg",
+        .resolution_artifact = "resolved",
+        .key_template = template,
+        .promote = false,
+        .retired = true,
+    } };
+    const cascade = try a.alloc(c.AbsorbedResult, 1000);
+    for (cascade, 0..) |*item, i| item.* = .{ .key = try std.fmt.allocPrint(a, "concept/{d}", .{i}), .disposition = .suppress };
+    var heads: ResultHeads = .empty;
+    try heads.put(a, template, .{ .key_template = template, .revision = 1 });
+    const buffer = try a.alloc(u8, 8 * 1024 * 1024);
+    var sizes: [2]usize = undefined;
+    for ([_]usize{ 1, selected.len }, &sizes) |count, *size| {
+        var bounded = std.heap.FixedBufferAllocator.init(buffer);
+        const budget = bounded.allocator();
+        const rows = try results(budget, 0, selected[0..count], undefined, "concept/root", false, true, heads);
+        // Include the complete wire response and the decode/re-encode used
+        // by wait processing. Per-consumer cascades exceed this budget.
+        const bytes = try json(budget, .{
+            .entity_table = "entities",
+            .key = "concept/root",
+            .atomicity = "namespace",
+            .complete = true,
+            .namespaces = &.{.{ .key_template = template, .revision = 1, .changed = true, .absorbed = cascade }},
+            .results = rows,
+        });
+        size.* = bytes.len;
+        try std.testing.expect(bytes.len < 256 * 1024);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, budget, bytes, .{});
+        try std.testing.expectEqual(cascade.len, parsed.object.get("namespaces").?.array.items[0].object.get("absorbed").?.array.items.len);
+        try std.testing.expectEqual(count, parsed.object.get("results").?.array.items.len);
+        for (parsed.object.get("results").?.array.items) |row| try std.testing.expect(!row.object.contains("absorbed"));
+        try std.testing.expectEqualStrings(bytes, try json(budget, parsed));
+    }
+    // Adding consumers adds scalar progress rows, never another cascade.
+    try std.testing.expect(sizes[1] - sizes[0] < selected.len * 512);
+    std.debug.print("EMBEDDED OUTCOMES consumers=1/256 absorbed=1000 response_bytes={d}/{d} round_trip_budget=8MiB\n", .{ sizes[0], sizes[1] });
+}
+
 test "capi resolver curation prepared adoption fences a source config edit" {
     const api = @import("db.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1369,7 +1422,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqualStrings("23", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings(try catalog.readerVersionBytes(catalog.resolver_pin_index_reader_version), try root.db.core.store.get(a, catalog.minimum_reader_key));
 }
 
 test "capi resolver curation static directory fences consumers enrolled after discovery" {
@@ -1890,6 +1943,6 @@ test "capi resolver curation owner materializes graph fenced root pins and reope
         defer prepared.release();
         const page = try authority.queryExecutionPrepared(prepared, &.{"entity/root"}, &.{}, true);
         try std.testing.expectEqual(@as(usize, 1), page.namespace.state.distinct.len);
-        try std.testing.expectEqualStrings("23", try root.db.core.store.get(a, catalog.minimum_reader_key));
+        try std.testing.expectEqualStrings(try catalog.readerVersionBytes(catalog.resolver_pin_index_reader_version), try root.db.core.store.get(a, catalog.minimum_reader_key));
     }
 }

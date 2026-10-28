@@ -49545,9 +49545,9 @@ components:
             Follow its bounded pages for individual consumer proofs.
         namespaces:
           type: array
-          description: Native mutation outcomes, stored once per namespace. Consumer progress rows reference
-            these by key_template. The results array is reserved for inspection and embedded consumer
-            summaries.
+          description: Mutation outcomes, stored once per namespace. Read absorbed keys and dispositions
+            here; consumer progress rows reference these by key_template. The results array is reserved
+            for inspection and embedded consumer summaries.
           items:
             $ref: '#/components/schemas/EntityNamespaceOutcome'
         results:
@@ -49572,23 +49572,6 @@ components:
               revision:
                 type: integer
                 format: uint64
-              absorbed:
-                deprecated: true
-                description: Legacy per-consumer outcomes; native mutations return namespaces instead.
-                type: array
-                items:
-                  type: object
-                  required:
-                    - key
-                    - disposition
-                  properties:
-                    key:
-                      type: string
-                    disposition:
-                      type: string
-                      enum:
-                        - release
-                        - suppress
               changed:
                 type: boolean
               replay_sequence:

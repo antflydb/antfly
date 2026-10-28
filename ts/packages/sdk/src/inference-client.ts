@@ -24,6 +24,7 @@ import type {
   DecideRequest,
   DecideResponse,
   EmbedInput,
+  EmbedOptions,
   EmbedResponse,
   EntityExtractionResult,
   ExtractRequest,
@@ -319,18 +320,19 @@ export class InferenceClient {
    * ]);
    * ```
    */
-  async embed(
-    model: string,
-    input: EmbedInput,
-    options?: { truncate?: boolean }
-  ): Promise<EmbedResponse> {
+  async embed(model: string, input: EmbedInput, options?: EmbedOptions): Promise<EmbedResponse> {
     const { data, error, response } = await this.client.POST("/ai/v1/embed", {
       body: {
         model,
         input,
         truncate: options?.truncate,
+        task_type: options?.task_type,
+        dimensions: options?.dimensions,
+        instruction: options?.instruction,
+        error_policy: options?.error_policy,
       },
       parseAs: "json",
+      signal: options?.signal,
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Embed failed: unexpected empty response");
@@ -344,6 +346,7 @@ export class InferenceClient {
    * The request asks for the packed numeric frame, which keeps every float out
    * of JSON text, and reads the JSON body when the server answers with that
    * instead -- an older server, or a model whose vectors are sparse.
+   * Per-input failures throw; use embed() to inspect indexed results and errors.
    *
    * @param model - Name of the embedder model (e.g., "bge-small-en-v1.5")
    * @param input - Text string, array of strings, or array of content parts (for multimodal)
@@ -356,13 +359,10 @@ export class InferenceClient {
    * console.log(embeddings[0]); // [0.0123, -0.0456, ...]
    * ```
    */
-  async embedDense(
-    model: string,
-    input: EmbedInput,
-    options?: { truncate?: boolean }
-  ): Promise<number[][]> {
+  async embedDense(model: string, input: EmbedInput, options?: EmbedOptions): Promise<number[][]> {
     const response = await fetch(`${this.baseUrl}/ai/v1/embed`, {
       method: "POST",
+      signal: options?.signal,
       headers: {
         ...this.headers,
         Accept: NUMERIC_RESPONSE_ACCEPT,
@@ -371,6 +371,10 @@ export class InferenceClient {
         model,
         input,
         truncate: options?.truncate,
+        task_type: options?.task_type,
+        dimensions: options?.dimensions,
+        instruction: options?.instruction,
+        error_policy: options?.error_policy,
       }),
     });
 
@@ -577,8 +581,14 @@ export class InferenceClient {
    * // result.data[i].score is the relevance of documents[result.data[i].index]
    * ```
    */
-  async rerank(model: string, query: string, documents: RerankDocument[]): Promise<RerankResponse> {
+  async rerank(
+    model: string,
+    query: string,
+    documents: RerankDocument[],
+    options?: { signal?: AbortSignal }
+  ): Promise<RerankResponse> {
     const { data, error, response } = await this.client.POST("/ai/v1/rerank", {
+      signal: options?.signal,
       body: {
         model,
         query,
@@ -1058,7 +1068,13 @@ function denseEmbeddingsFromJSON(bytes: Uint8Array): number[][] {
   if (typeof value !== "object" || value === null) {
     throw new Error("Embedding JSON response must be an object");
   }
-  const data = (value as { data?: unknown }).data;
+  const envelope = value as { data?: unknown; errors?: unknown };
+  if (Array.isArray(envelope.errors) && envelope.errors.length > 0) {
+    throw new Error(
+      "Embedding response contains per-input failures; use embed() to inspect indexed results and errors"
+    );
+  }
+  const data = envelope.data;
   if (!Array.isArray(data)) {
     throw new Error("Embedding JSON response is missing the data array");
   }
