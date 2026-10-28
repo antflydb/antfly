@@ -1636,22 +1636,22 @@ pub fn clampDiscreteDeviceLimits(limits: Limits, device_bytes: usize, process_li
     if (device_bytes == 0) return limits;
     const physical = limitsForDiscreteDevice(limits, device_bytes, process_limit);
     var out = limits;
-    out.host_limit_bytes = @min(out.host_limit_bytes, physical.host_limit_bytes);
-    out.backend_limit_bytes = @min(out.backend_limit_bytes, physical.backend_limit_bytes);
-    out.combined_limit_bytes = @min(out.combined_limit_bytes, out.host_limit_bytes +| out.backend_limit_bytes);
-    out.kv_limit_bytes = @min(out.kv_limit_bytes, out.backend_limit_bytes);
-    out.scratch_limit_bytes = @min(out.scratch_limit_bytes, out.backend_limit_bytes);
+    out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, physical.host_limit_bytes);
+    out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, physical.backend_limit_bytes);
+    out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, out.host_limit_bytes +| out.backend_limit_bytes);
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.backend_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.backend_limit_bytes);
     return out;
 }
 
 /// Integrated CUDA and unified-memory accelerators share one physical pool.
 pub fn clampUnifiedDeviceLimits(limits: Limits, shared_bytes: usize) Limits {
     var out = limits;
-    out.host_limit_bytes = @min(out.host_limit_bytes, shared_bytes);
-    out.backend_limit_bytes = @min(out.backend_limit_bytes, shared_bytes);
-    out.combined_limit_bytes = @min(out.combined_limit_bytes, shared_bytes);
-    out.kv_limit_bytes = @min(out.kv_limit_bytes, out.backend_limit_bytes);
-    out.scratch_limit_bytes = @min(out.scratch_limit_bytes, out.backend_limit_bytes);
+    out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, shared_bytes);
+    out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, shared_bytes);
+    out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, shared_bytes);
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.backend_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.backend_limit_bytes);
     return out;
 }
 
@@ -4595,4 +4595,17 @@ test "embeddinggemma2 live retained admission cannot credit a later kernel sampl
     const capacity = controller.live_capacity_bytes;
     lease.release();
     try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+}
+
+test "physical memory clamping bounds unspecified unlimited domains" {
+    const limits = clampDiscreteDeviceLimits(.{}, gib(24), gib(16));
+    try std.testing.expect(limits.backend_limit_bytes > 0 and limits.backend_limit_bytes < gib(24));
+    try std.testing.expect(limits.host_limit_bytes > 0);
+    try std.testing.expect(limits.combined_limit_bytes > 0);
+    var controller = AdmissionController{};
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = gib(25) }, false));
+    const unified = clampUnifiedDeviceLimits(.{}, gib(16));
+    try std.testing.expectEqual(gib(16), unified.combined_limit_bytes);
+    const tighter = clampDiscreteDeviceLimits(.{ .backend_limit_bytes = gib(4) }, gib(24), gib(16));
+    try std.testing.expectEqual(gib(4), tighter.backend_limit_bytes);
 }

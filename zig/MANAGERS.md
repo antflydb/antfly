@@ -1007,7 +1007,7 @@ policy, also passed unchanged through Colony's `InferencePool.spec.config`:
     "max_decoded_pixels": 4194304
   },
   "max_loaded_models": 1,
-  "admission": {"inference": {"max_concurrent_requests": 1}}
+  "admission": {"inference": {"max_concurrent_requests": 1, "max_work_units": 8}}
 }
 ```
 
@@ -1019,3 +1019,12 @@ contract in both discovery and execution; existing transport, media admission,
 and model ceilings may narrow them further. These settings do not establish
 that a model fits: qualify cold load, request workspace, model switching, and
 overload rejection using the exact released image and hardware.
+
+`admission.inference.max_work_units` sets weighted work/media capacity separately
+from `max_concurrent_requests`. `--max-work-units` overrides the JSON value.
+Omitting it preserves the legacy capacity derived from request concurrency;
+zero disables weighted admission while retaining the configured request-count
+limit. Media admission uses 16 MiB per work unit and also weights image/output
+work. Eight units let a single request admit a full 2048×2048 scan under the
+separate pixel and content-security ceilings. This budget is independent of
+model host/device memory accounting.

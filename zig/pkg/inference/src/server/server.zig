@@ -1273,6 +1273,9 @@ pub const NodeConfig = struct {
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
+    /// Weighted media/work capacity, independent of request-count permits.
+    /// Null preserves the legacy request-count-derived capacity.
+    max_work_units: ?usize = null,
     /// Transport concurrency is bounded independently from inference work.
     /// Keep enough connection headroom for health, discovery, and idle
     /// keep-alive clients without allowing retained Threaded workers to grow
@@ -4198,7 +4201,7 @@ pub const Node = struct {
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
-            .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
+            .inference_admission = inference_admission_mod.InferenceAdmission.initWithLimits(config.max_concurrent_requests, config.max_work_units orelse config.max_concurrent_requests),
             .transcription_sessions = transcription_sessions.Registry.init(allocator),
             .compatibility_cache = .empty,
             .hard_cancellation_watchdog = hard_cancellation_watchdog,
@@ -46255,4 +46258,20 @@ test "deployment request limits narrow executor plans without widening manifest 
     try std.testing.expectEqual(@as(?usize, 1024), contract.batch.max_output_tokens_per_item);
     try std.testing.expectError(error.InferenceInputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .has_text = true, .input_tokens_per_item = 4097 }));
     try std.testing.expectError(error.InvalidInferenceConfig, (RequestLimits{ .max_output_tokens = 0 }).validate());
+}
+
+test "reader media budget admits a full scan independently of single request concurrency" {
+    var node = try Node.init(std.testing.allocator, .{
+        .max_concurrent_requests = 1,
+        .max_work_units = 8,
+        .content_security = .{ .max_image_dimension = 2048, .max_download_size_bytes = 12 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    const admission = readRequestAdmission(&node, 1, 0, 1024);
+    try std.testing.expect(admission.decoded_pixel_cap >= 2048 * 2048);
+    try node.inference_admission.acquireRequestSlot();
+    defer node.inference_admission.releaseRequestSlot();
+    try node.inference_admission.reserveUnits(admission.units);
+    defer node.inference_admission.releaseReservedUnits(admission.units);
+    try std.testing.expectError(error.QueueFull, node.inference_admission.acquireRequestSlot());
 }
