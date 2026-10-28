@@ -2711,6 +2711,111 @@ pub const Handle = struct {
     kind: Kind,
 
     /// Move this pin into cleanup ownership before attempting a fallible wait.
+    /// Transaction teardown can retain an uncontrolled transient while its
+    /// bytes retire. Cached pins use the existing allocation-free transfer;
+    /// transient last references consume credits and return any reserved slot.
+    pub const Retirement = struct {
+        handle: ?Handle,
+        claimed: bool = false,
+        state: ?State.Reclaimer = null,
+        index: ?TableIndex.Retirement = null,
+        field: u2 = 0,
+        offset: usize = 0,
+        pub fn init(handle: Handle) @This() {
+            return .{ .handle = handle };
+        }
+        fn bytes(self: *@This(), a: Allocator, value: []u8, credits: *usize, original: ?read_admission.Port) !bool {
+            while (self.offset < value.len) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                const end = self.offset + @min(value.len - self.offset, 16 * 1024);
+                @memset(value[self.offset..end], undefined);
+                self.offset = end;
+            }
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            if (value.len != 0) a.rawFree(value, .of(u8), @returnAddress());
+            self.offset = 0;
+            return true;
+        }
+        pub fn step(self: *@This(), credits: *usize, original: ?read_admission.Port) !bool {
+            const owned = self.handle orelse return true;
+            if (!self.claimed) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                if (owned.cache != null) {
+                    var handle = owned;
+                    handle.releaseToCache();
+                    self.handle = null;
+                    return true;
+                }
+                self.claimed = true;
+                if (owned.entry.transient_ref_count.fetchSub(1, .acq_rel) != 1) {
+                    self.handle = null;
+                    return true;
+                }
+                switch (owned.entry.value) {
+                    .run_state => |value| self.state = .init(value),
+                    .run_table_index => |value| self.index = .init(value),
+                    else => {},
+                }
+            }
+            if (self.field == 0) {
+                if (!try self.bytes(owned.allocator, owned.entry.path, credits, original)) return false;
+                owned.entry.path = &.{};
+                self.field = 1;
+            }
+            if (self.field == 1) {
+                if (self.state) |*state| {
+                    while (true) {
+                        if (credits.* == 0) return false;
+                        if (original) |port| try port.checkpoint();
+                        var part: usize = 1;
+                        const done = state.step(owned.allocator, &part);
+                        credits.* -= 1 - part;
+                        if (done) break;
+                    }
+                    self.state = null;
+                } else if (self.index) |*index| {
+                    while (true) {
+                        if (credits.* == 0) return false;
+                        credits.* -= 1;
+                        if (try index.step(owned.allocator, original)) break;
+                    }
+                    self.index = null;
+                } else {
+                    const value = switch (owned.entry.value) {
+                        .run_table_raw, .run_table_block, .run_table_physical_block => |value| value,
+                        else => unreachable,
+                    };
+                    if (!try self.bytes(owned.allocator, value, credits, original)) return false;
+                }
+                self.field = 2;
+            }
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            const accounting = owned.entry.transient_accounting_cache;
+            const cost = owned.entry.byte_cost;
+            const slot = owned.entry.transient_cleanup;
+            owned.allocator.destroy(owned.entry);
+            if (slot) |reserved| {
+                // This last reference was never published to pending cleanup.
+                reserved.entry = null;
+                reserved.state.store(.free, .release);
+            }
+            if (accounting) |cache| {
+                cache.transferRetiredResourceBytes(cost);
+                _ = cache.charged_transient_entries.fetchSub(1, .release);
+            }
+            self.handle = null;
+            return true;
+        }
+    };
+
     pub fn takeReleaseOwnership(self: *Handle) PendingRelease {
         const result = PendingRelease{ .handle = self.* };
         self.* = undefined;

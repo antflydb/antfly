@@ -72,6 +72,57 @@ pub const SharedBytes = struct {
         _ = self.refs.fetchAdd(1, .monotonic);
         return self;
     }
+    /// A last unregistered legacy reference still needs bounded destruction.
+    /// Registered payloads transfer to their existing independent cleanup owner.
+    pub const Release = struct {
+        value: ?*SharedBytes,
+        claimed: bool = false,
+        pub fn init(value: *SharedBytes) @This() {
+            return .{ .value = value };
+        }
+        pub fn step(self: *@This(), credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            const value = self.value orelse return true;
+            if (!self.claimed) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                self.claimed = true;
+                if (value.refs.fetchSub(1, .acq_rel) != 1) {
+                    self.value = null;
+                    return true;
+                }
+                if (value.retirement.credit != null) {
+                    value.retirement.publish();
+                    self.value = null;
+                    return true;
+                }
+            }
+            while (!value.data_retired) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                if (value.retirement_offset < value.bytes.len) {
+                    const end = value.retirement_offset + @min(value.bytes.len - value.retirement_offset, 16 * 1024);
+                    @memset(value.bytes[value.retirement_offset..end], undefined);
+                    value.retirement_offset = end;
+                } else {
+                    if (value.bytes.len != 0) value.allocator.rawFree(value.bytes, .of(u8), @returnAddress());
+                    value.bytes = &.{};
+                    value.data_retired = true;
+                }
+            }
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            const allocator = value.allocator;
+            var reservation = value.reservation;
+            allocator.destroy(value);
+            if (reservation) |*credit| credit.release();
+            self.value = null;
+            return true;
+        }
+    };
+
     pub fn release(self: *SharedBytes) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
             if (self.retirement.credit != null) {

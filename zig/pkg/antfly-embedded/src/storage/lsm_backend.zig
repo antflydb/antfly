@@ -4314,7 +4314,13 @@ pub const Backend = struct {
         if (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)) return true;
         if (!self.store_reclaim_in_flight and (self.store_reclaimer != null or self.retired_run_stores != null)) return true;
         if (self.retired_flush_outputs != null and !self.flush_outputs_reclaim_in_flight) return true;
-        if (self.retired_manifest_preparations != null and !self.manifest_preparation_reclaim_in_flight) return true;
+        if (self.retired_manifest_preparations) |head| {
+            // A selected caller may retain the only ordinary CPU. Its private
+            // transaction garbage is already owned and cleanup is deferred;
+            // do not let that inbox suppress unrelated required flush work.
+            if (!self.manifest_preparation_reclaim_in_flight and
+                (head.transaction_owner == null or !@import("lsm_backend/retirement_execution.zig").deferred(self))) return true;
+        }
         if (self.manifest_recovery_required) return false;
         // An accepted detached flush owns its completion lane, including while
         // its producer backs off after refusal. Opportunistic maintenance must
@@ -5069,7 +5075,13 @@ pub const Backend = struct {
             const frame = self.retired_manifest_preparations orelse return true;
             if (original) |port| try port.checkpoint();
             credits.* -= 1;
-            if (!try frame.stepWithAdmission(self.allocator, credits, original)) return false;
+            frame.serialized_retirement = true;
+            const done = frame.stepWithAdmission(self.allocator, credits, original) catch |cause| {
+                frame.serialized_retirement = false;
+                return cause;
+            };
+            frame.serialized_retirement = false;
+            if (!done) return false;
             self.retired_manifest_preparations = frame.next;
             if (self.retired_manifest_preparations == null) self.retired_manifest_preparations_tail = null;
             frame.detachLocked(self);
@@ -7345,6 +7357,22 @@ pub const Backend = struct {
             };
         }
         return @import("lsm_backend/manifest_credit.zig").estimate(self.allocator, self.options, self.root_dir.?.len, incoming, bulk);
+    }
+
+    /// Reserve retirement before a transaction can stage data. Abort and
+    /// post-commit teardown only move ownership into this already funded frame.
+    pub fn reserveWriteRetirement(self: *Backend, comptime Cleanup: type) !?*@import("lsm_backend/manifest_edit_preparation.zig").Frame {
+        const owner = self.background_executor.runtime orelse return null;
+        if (self.options.resource_manager == null or self.options.resource_manager.?.allocator_host_source == null or owner.runnableOwner() == null or !self.background_executor.canRunDetached()) return null;
+        const Frame = @import("lsm_backend/manifest_edit_preparation.zig").Frame;
+        const frame = try Frame.create(self);
+        errdefer frame.finish(self.allocator);
+        try frame.credit.growBoundedOversized(@sizeOf(Cleanup), 1);
+        const cleanup = try self.allocator.create(Cleanup);
+        cleanup.* = .init(self);
+        const bytes: [*]u8 = @ptrCast(cleanup);
+        frame.transaction_owner = .{ .context = cleanup, .bytes = bytes[0..@sizeOf(Cleanup)], .alignment = .of(Cleanup), .advance = Cleanup.advance };
+        return frame;
     }
 
     /// Original caller CPU performs planning outside Backend.mu, including

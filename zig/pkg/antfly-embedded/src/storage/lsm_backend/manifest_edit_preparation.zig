@@ -41,6 +41,13 @@ pub var test_append_hook: ?*const fn (*Frame, admission.Port) anyerror!void = nu
 pub var test_append_join_hook: ?*const fn (admission.Port) anyerror!void = null;
 pub var test_retirement_hook: ?*const fn (admission.Port) anyerror!void = null;
 
+pub const TransactionOwner = struct {
+    context: *anyopaque,
+    bytes: []u8,
+    alignment: std.mem.Alignment,
+    advance: *const fn (*anyopaque, *usize, ?admission.Port, bool) anyerror!bool,
+};
+
 pub const Frame = struct {
     credit: resources.Reservation,
     append_grant: ?storage_io.DurabilityResources = null,
@@ -50,6 +57,9 @@ pub const Frame = struct {
     append_path: [std.fs.max_path_bytes]u8 = undefined,
     append_path_len: usize = 0,
     deadline_ns: u64 = 0,
+    transaction_owner: ?TransactionOwner = null,
+    transaction_offset: usize = 0,
+    serialized_retirement: bool = false,
     credit_owner: ?*credit_planning.OwnedEstimate = null,
     foreground_owner: ?*foreground_append.Owner = null,
     foreground_meter: ?*@import("memory_account.zig").Account = null,
@@ -517,7 +527,7 @@ pub const Frame = struct {
         self.planning_source = null;
     }
     pub fn stepWithAdmission(self: *Frame, a: std.mem.Allocator, credits: *usize, original: ?admission.Port) !bool {
-        if (comptime @import("builtin").is_test) if (self.wal_owner == null) if (original) |port| if (test_retirement_hook) |hook| try hook(port);
+        if (comptime @import("builtin").is_test) if (self.wal_owner == null and self.transaction_owner == null) if (original) |port| if (test_retirement_hook) |hook| try hook(port);
         inline for (.{ .{ "planned_obsolete", "plan_reclaimer" }, .{ "planned_previous", "previous_plan_reclaimer" } }) |fields| {
             if (@field(self, fields[0])) |ledger| {
                 @field(self, fields[1]) = .init(ledger);
@@ -527,6 +537,22 @@ pub const Frame = struct {
                 if (!try reclaimer.stepWithAdmission(a, credits, original)) return false;
                 @field(self, fields[1]) = null;
             }
+        }
+        if (self.transaction_owner) |work| {
+            if (self.transaction_offset == 0 and !try work.advance(work.context, credits, original, self.serialized_retirement)) return false;
+            while (self.transaction_offset < work.bytes.len) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                const end = self.transaction_offset + @min(work.bytes.len - self.transaction_offset, 16 * 1024);
+                @memset(work.bytes[self.transaction_offset..end], undefined);
+                self.transaction_offset = end;
+            }
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            a.rawFree(work.bytes, work.alignment, @returnAddress());
+            self.transaction_owner = null;
         }
         if (self.credit_owner) |work| {
             if (!try work.retireStep(credits, original)) return false;

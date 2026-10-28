@@ -198,6 +198,7 @@ const BulkAppendIndex = struct {
         }
     };
     entries: std.HashMapUnmanaged(Key, usize, Context, 80) = .{},
+    allocation: ?@FieldType(ActiveMemTable, "index").Allocation = null,
     fn deinit(self: *@This(), alloc: Allocator) void {
         self.entries.deinit(alloc);
         self.* = .{};
@@ -208,7 +209,9 @@ const BulkAppendIndex = struct {
     fn append(self: *@This(), alloc: Allocator, state: *State, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
         // Reserve both containers before publishing either change. Failed
         // allocation leaves the prior overlay and its index consistent.
-        try self.entries.ensureUnusedCapacity(alloc, 1);
+        var observed: @FieldType(ActiveMemTable, "index").AllocationObserver = .{ .backing = alloc, .previous = self.allocation };
+        defer self.allocation = observed.finish();
+        try self.entries.ensureUnusedCapacity(observed.allocator(), 1);
         try state.entries.ensureUnusedCapacity(alloc, 1);
         const entry_allocator = try state.ensureArenaAllocator(alloc);
         const entry = try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false);
@@ -5173,6 +5176,271 @@ pub fn BoundProbeCursor(comptime BackendType: type) type {
     };
 }
 
+pub var test_write_retirement_hook: ?*const fn (usize, usize, read_admission.Port) anyerror!void = null;
+
+/// Prepared before staging, then moved into the backend queue without allocation.
+/// All transaction-owned references retire before the fixed owner header; no
+/// caller admission, task, cursor or allocator context is borrowed by cleanup.
+fn WriteRetirement(comptime Txn: type, comptime BackendType: type) type {
+    return struct {
+        backend: *BackendType,
+        txn: ?Txn = null,
+        mutable: ?ActiveMemTable.Reclaimer = null,
+        bulk: ?State.Reclaimer = null,
+        prefix: ?ActiveMemTable.Reclaimer = null,
+        overlay: ?State.Reclaimer = null,
+        base: ?State.Reclaimer = null,
+        base_header: ?*State = null,
+        stage: usize = 0,
+        offset: usize = 0,
+        item: usize = 0,
+        local: ?SharedBytes.Release = null,
+        cached: ?cache_mod.Handle.Retirement = null,
+        arena_pending: ?struct { part: std.heap.ArenaAllocator, bytes: []u8, offset: usize = 0 } = null,
+        arena_list: u2 = 0,
+
+        pub fn init(backend: *BackendType) @This() {
+            return .{ .backend = backend };
+        }
+        pub fn adopt(self: *@This(), source: *Txn) void {
+            std.debug.assert(self.txn == null);
+            self.txn = source.*;
+            const owned = &self.txn.?;
+            self.mutable = .init(owned.mutable);
+            self.bulk = .init(owned.bulk_appends);
+            if (owned.prefix_index.state) |state| self.prefix = .init(state);
+            if (owned.cursor_overlay) |state| self.overlay = .init(state);
+            if (owned.cursor_base_mutable) |snapshot| if (snapshot.owned) {
+                self.base_header = @constCast(snapshot.state);
+                self.base = .init(snapshot.state.*);
+                owned.cursor_base_mutable = null;
+            };
+            inline for (.{ "mutable", "bulk_appends", "bulk_index", "prefix_index", "held_values", "batch_scratch", "probe_scratch" }) |field| {
+                if (@hasField(Txn, field)) @field(source, field) = .{};
+            }
+            if (@hasField(Txn, "held_blocks")) source.held_blocks = .empty;
+            source.cursor_overlay = null;
+            source.cursor_base_mutable = null;
+            source.cursor_read_view = null;
+            source.cursor_immutable_memtables = &.{};
+            source.cursor_runs = &.{};
+            source.cursor_l0_groups = &.{};
+            source.cursor_levels = &.{};
+            source.retirement = null;
+        }
+        fn check(self: *@This(), original: ?read_admission.Port) !void {
+            if (original) |port| {
+                try port.checkpoint();
+                if (comptime builtin.is_test) if (test_write_retirement_hook) |hook| try hook(self.stage, self.offset, port);
+            }
+        }
+        fn bytes(self: *@This(), a: Allocator, data: []u8, alignment: std.mem.Alignment, credits: *usize, original: ?read_admission.Port) !bool {
+            while (self.offset < data.len) {
+                if (credits.* == 0) return false;
+                try self.check(original);
+                credits.* -= 1;
+                const end = self.offset + @min(data.len - self.offset, 16 * 1024);
+                @memset(data[self.offset..end], undefined);
+                self.offset = end;
+            }
+            if (data.len != 0) {
+                if (credits.* == 0) return false;
+                try self.check(original);
+                credits.* -= 1;
+                a.rawFree(data, alignment, @returnAddress());
+            }
+            self.offset = 0;
+            return true;
+        }
+        fn array(self: *@This(), a: Allocator, list: anytype, credits: *usize, original: ?read_admission.Port) !bool {
+            const T = @typeInfo(@TypeOf(list.items)).pointer.child;
+            return self.bytes(a, std.mem.sliceAsBytes(list.allocatedSlice()), .of(T), credits, original);
+        }
+        fn metadata(self: *@This(), serialized: bool) !bool {
+            if (serialized) return false;
+            if (!self.backend.mu.tryLock()) return error.ResourceBudgetExceeded;
+            return true;
+        }
+        pub fn advance(raw: *anyopaque, credits: *usize, original: ?read_admission.Port, serialized: bool) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const txn = if (self.txn) |*value| value else return true;
+            const a = txn.allocator;
+            const meta = txn.metadata_allocator;
+            while (credits.* != 0) {
+                try self.check(original);
+                switch (self.stage) {
+                    0, 1, 2, 3, 4 => {
+                        var part: usize = 1;
+                        const done = switch (self.stage) {
+                            0 => self.mutable.?.step(a, &part),
+                            1 => self.bulk.?.step(a, &part),
+                            2 => if (self.prefix) |*value| value.step(a, &part) else true,
+                            3 => if (self.overlay) |*value| value.step(a, &part) else true,
+                            4 => if (self.base) |*value| value.step(a, &part) else true,
+                            else => unreachable,
+                        };
+                        credits.* -= 1 - part;
+                        if (!done) continue;
+                    },
+                    5 => if (txn.bulk_index.allocation) |allocation| {
+                        if (!try self.bytes(a, allocation.bytes, allocation.alignment, credits, original)) return false;
+                        txn.bulk_index = .{};
+                    },
+                    6 => {
+                        while (self.item < txn.held_values.items.len) {
+                            if (!try self.bytes(a, txn.held_values.items[self.item], .of(u8), credits, original)) return false;
+                            self.item += 1;
+                        }
+                        if (!try self.array(a, txn.held_values.list(), credits, original)) return false;
+                        txn.held_values = .empty;
+                        self.item = 0;
+                    },
+                    7 => if (@hasField(Txn, "held_blocks")) {
+                        while (self.item < txn.held_blocks.items.len) {
+                            if (self.local == null and self.cached == null) switch (txn.held_blocks.items[self.item]) {
+                                .local => |value| self.local = .init(value),
+                                .cached => |value| self.cached = .init(value),
+                            };
+                            if (self.local) |*value| {
+                                if (!try value.step(credits, original)) return false;
+                                self.local = null;
+                            }
+                            if (self.cached) |*value| {
+                                if (!try value.step(credits, original)) return false;
+                                self.cached = null;
+                            }
+                            self.item += 1;
+                        }
+                        if (!try self.array(a, txn.held_blocks, credits, original)) return false;
+                        txn.held_blocks = .empty;
+                        self.item = 0;
+                    },
+                    8 => {
+                        const locked = try self.metadata(serialized);
+                        defer if (locked) self.backend.mu.unlock();
+                        credits.* -= 1;
+                        if (txn.cursor_base_mutable) |snapshot| snapshot.release(self.backend);
+                        txn.cursor_base_mutable = null;
+                        if (self.base_header) |header| a.destroy(header);
+                        self.base_header = null;
+                    },
+                    9 => {
+                        while (self.item + 1 < txn.cursor_immutable_memtables.len) {
+                            if (credits.* == 0) return false;
+                            try self.check(original);
+                            const locked = try self.metadata(serialized);
+                            credits.* -= 1;
+                            releaseImmutableMemtablePins(BackendType, self.backend, txn.cursor_immutable_memtables[self.item + 1 ..][0..1]);
+                            if (locked) self.backend.mu.unlock();
+                            self.item += 1;
+                        }
+                        const values = @constCast(txn.cursor_immutable_memtables);
+                        if (!try self.bytes(a, std.mem.sliceAsBytes(values), .of(*const State), credits, original)) return false;
+                        txn.cursor_immutable_memtables = &.{};
+                        self.item = 0;
+                    },
+                    10 => {
+                        const locked = try self.metadata(serialized);
+                        defer if (locked) self.backend.mu.unlock();
+                        credits.* -= 1;
+                        if (txn.cursor_read_view) |view| {
+                            // Managed native views own a version, or are empty.
+                            std.debug.assert(view.version != null or (view.runs.len == 0 and view.l0_groups.len == 0 and view.levels.len == 0));
+                            view.release(self.backend);
+                        }
+                        txn.cursor_read_view = null;
+                    },
+                    11...14 => if (@hasField(Txn, "batch_scratch")) {
+                        const done = switch (self.stage) {
+                            11 => try self.array(meta, txn.batch_scratch.keys, credits, original),
+                            12 => try self.array(meta, txn.batch_scratch.indexes, credits, original),
+                            13 => try self.array(meta, txn.batch_scratch.values, credits, original),
+                            14 => try self.array(meta, txn.probe_scratch.resolved, credits, original),
+                            else => unreachable,
+                        };
+                        if (!done) return false;
+                    },
+                    15...17 => if (@hasField(Txn, "probe_scratch")) {
+                        const done = switch (self.stage) {
+                            15 => try self.array(meta, txn.probe_scratch.pending.keys, credits, original),
+                            16 => try self.array(meta, txn.probe_scratch.pending.indexes, credits, original),
+                            17 => try self.array(meta, txn.probe_scratch.pending.values, credits, original),
+                            else => unreachable,
+                        };
+                        if (!done) return false;
+                    },
+                    18 => if (@hasField(Txn, "probe_scratch")) {
+                        if (txn.probe_scratch.planner) |planner| {
+                            const arena = &planner.arena;
+                            while (self.arena_list < 2) {
+                                const head = if (self.arena_list == 0) &arena.state.used_list else &arena.state.free_list;
+                                while (self.arena_pending != null or head.* != null) {
+                                    if (credits.* == 0) return false;
+                                    try self.check(original);
+                                    if (self.arena_pending == null) {
+                                        credits.* -= 1;
+                                        const node = head.*.?;
+                                        head.* = node.next;
+                                        node.next = null;
+                                        var part = std.heap.ArenaAllocator.init(arena.child_allocator);
+                                        part.state.used_list = node;
+                                        const pointer: [*]u8 = @ptrCast(node);
+                                        self.arena_pending = .{ .part = part, .bytes = pointer[@sizeOf(@TypeOf(node.*))..][0..part.queryCapacity()] };
+                                    }
+                                    const pending = &self.arena_pending.?;
+                                    while (pending.offset < pending.bytes.len) {
+                                        if (credits.* == 0) return false;
+                                        try self.check(original);
+                                        credits.* -= 1;
+                                        const end = pending.offset + @min(pending.bytes.len - pending.offset, 16 * 1024);
+                                        @memset(pending.bytes[pending.offset..end], undefined);
+                                        pending.offset = end;
+                                    }
+                                    if (credits.* == 0) return false;
+                                    try self.check(original);
+                                    credits.* -= 1;
+                                    pending.part.deinit();
+                                    self.arena_pending = null;
+                                }
+                                self.arena_list += 1;
+                            }
+                            if (credits.* == 0) return false;
+                            try self.check(original);
+                            credits.* -= 1;
+                            if (planner.budget) |*budget| budget.deinit();
+                            meta.destroy(planner);
+                            txn.probe_scratch.planner = null;
+                        }
+                    },
+                    else => return true,
+                }
+                self.stage += 1;
+            }
+            return false;
+        }
+    };
+}
+
+fn reserveWriteRetirement(comptime Txn: type, comptime BackendType: type, backend: *BackendType) !?*@import("manifest_edit_preparation.zig").Frame {
+    if (comptime @hasDecl(BackendType, "reserveWriteRetirement")) {
+        if (builtin.is_test and test_private_read_versions) return null;
+        return backend.reserveWriteRetirement(WriteRetirement(Txn, BackendType));
+    }
+    return null;
+}
+fn retireWriteScratchLocked(writer: anytype) bool {
+    if (comptime !@hasDecl(@TypeOf(writer.backend.*), "reserveWriteRetirement")) return false;
+    const frame = writer.retirement orelse return false;
+    const Txn = @TypeOf(writer.*);
+    const Cleanup = WriteRetirement(Txn, @TypeOf(writer.backend.*));
+    const cleanup: *Cleanup = @ptrCast(@alignCast(frame.transaction_owner.?.context));
+    cleanup.adopt(writer);
+    // Retirement publishes the hint; the normal unlock schedules residual
+    // cleanup after reader finalization, without starting work mid-commit.
+    writer.backend.retireManifestPreparation(frame);
+    return true;
+}
+
 pub fn BoundWriteTxn(comptime BackendType: type) type {
     const LocalCursor = MergeCursor(BackendType, State);
     return struct {
@@ -5195,6 +5463,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         batch_options: backend_types.BatchOptions = .{},
         cursor_reader_retained: bool = false,
         closed: bool = false,
+        retirement: ?*@import("manifest_edit_preparation.zig").Frame = null,
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
             return try openWithOptions(backend, namespace, .{});
@@ -5214,12 +5483,23 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 .namespace = namespace,
                 .mutable = .{ .ordered_enabled = false },
                 .batch_options = options,
+                .retirement = try reserveWriteRetirement(@This(), BackendType, backend),
             };
         }
 
         pub fn abort(self: *@This()) void {
             if (self.closed) return;
             const backend = self.backend;
+            if (self.retirement != null) {
+                const locked = lockBackend(BackendType, backend);
+                defer unlockBackend(BackendType, backend, locked);
+                _ = retireWriteScratchLocked(self);
+                backend.finishBatchMode(self.batch_options);
+                if (self.cursor_reader_retained) releaseWriteReader(BackendType, backend, .current_scan);
+                releaseWriteReader(BackendType, backend, .write_txn);
+                self.* = undefined;
+                return;
+            }
             self.bulk_index.deinit(self.allocator);
             self.prefix_index.deinit(self.allocator);
             self.mutable.deinit(self.allocator);
@@ -5256,6 +5536,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             var retired_without_commit = false;
             var release_on_error = true;
             errdefer if (release_on_error) {
+                _ = retireWriteScratchLocked(self);
                 self.mutable.deinit(self.allocator);
                 self.mutable = .{};
                 self.bulk_appends.deinit(self.allocator);
@@ -5313,6 +5594,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
+            _ = retireWriteScratchLocked(self);
             self.invalidateCursorSnapshotLocked();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
@@ -11234,6 +11516,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         batch_options: backend_types.BatchOptions = .{},
         cursor_reader_retained: bool = false,
         closed: bool = false,
+        retirement: ?*@import("manifest_edit_preparation.zig").Frame = null,
 
         pub fn open(backend: *BackendType) !@This() {
             return try openWithOptions(backend, .{});
@@ -11252,12 +11535,23 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 .backend = backend,
                 .mutable = .{ .ordered_enabled = false },
                 .batch_options = options,
+                .retirement = try reserveWriteRetirement(@This(), BackendType, backend),
             };
         }
 
         pub fn abort(self: *@This()) void {
             if (self.closed) return;
             const backend = self.backend;
+            if (self.retirement != null) {
+                const locked = lockBackend(BackendType, backend);
+                defer unlockBackend(BackendType, backend, locked);
+                _ = retireWriteScratchLocked(self);
+                backend.finishBatchMode(self.batch_options);
+                if (self.cursor_reader_retained) releaseWriteReader(BackendType, backend, .current_scan);
+                releaseWriteReader(BackendType, backend, .write_txn);
+                self.* = undefined;
+                return;
+            }
             self.bulk_index.deinit(self.allocator);
             self.prefix_index.deinit(self.allocator);
             self.mutable.deinit(self.allocator);
@@ -11299,6 +11593,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             var retired_without_commit = false;
             var release_on_error = true;
             errdefer if (release_on_error) {
+                _ = retireWriteScratchLocked(self);
                 self.mutable.deinit(self.allocator);
                 self.mutable = .{};
                 self.bulk_appends.deinit(self.allocator);
@@ -11357,6 +11652,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
+            _ = retireWriteScratchLocked(self);
             self.invalidateCursorSnapshotLocked();
             releaseHeldBlocks(&self.held_blocks, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);

@@ -6309,12 +6309,21 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
         for (0..32) |_| {
             _ = try handle.ptr().runMaintenanceStepBestEffortWithLifetime(&lifetime);
             if (state.owner.scheduler.stats().queued != 0) break;
-            if (mode == .maintenance_budget or mode == .maintenance_unsupported) break;
+            if (mode == .maintenance_budget) break;
+            if (mode == .maintenance_unsupported and handle.ptr().snapshotWriteStats().immutable_flushes != 0) break;
             try io.sleep(.fromMilliseconds(1), .awake);
         }
         original.active.store(false, .release);
     }
     if (mode == .maintenance_unsupported) {
+        // Retirement can own the mutex when a best-effort caller arrives.
+        // The unsupported provider must still flush without another write or
+        // ordinary CPU becoming available.
+        while (handle.ptr().snapshotWriteStats().immutable_flushes == 0) {
+            if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+            _ = try handle.ptr().runMaintenanceStepBestEffort();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
         try std.testing.expectEqual(@as(u64, 1), handle.ptr().snapshotWriteStats().immutable_flushes);
         try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().queued);
         handle.close();
@@ -6357,8 +6366,15 @@ fn normalAdmittedFlushWorker(mode: enum { publish, cancel_queued, retry, mainten
     try std.testing.expectEqual(@as(usize, 1), pending);
     try std.testing.expectEqual(@as(u64, 0), flushes);
     if (maintenance_origin) {
-        const retry_delay = handle.ptr().nextMaintenanceWakeDelayNsBestEffort();
-        if (retry_delay) |delay| try std.testing.expect(delay > 0);
+        // Cleanup debt may be immediately runnable alongside the blocked
+        // constructor. Wait for that finite debt before checking its backoff.
+        while (true) {
+            if (handle.ptr().nextMaintenanceWakeDelayNsBestEffort()) |delay| {
+                if (delay > 0) break;
+            } else break;
+            if (platform.time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
     }
     const synchronous_checks = original.checks.load(.acquire);
     if (maintenance_origin and mode != .waker) {
@@ -7819,13 +7835,14 @@ test "physical cache metadata registered flush publication periodic checkpoint p
     try normalAdmittedPeriodicCheckpoint(.plan_partial);
 }
 
-fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure, retirement_resume, prepare_reject, pressure_cold, pressure_cached, pressure_limit, pressure_soft, pressure_rotate, pressure_legacy, pressure_cancel, pressure_stale, pressure_bootstrap, credit_partitioned, credit_guarded, credit_reject, credit_cleanup_retry }) !void {
+fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure, retirement_resume, prepare_reject, pressure_cold, pressure_cached, pressure_limit, pressure_soft, pressure_rotate, pressure_legacy, pressure_cancel, pressure_stale, pressure_bootstrap, credit_partitioned, credit_guarded, credit_reject, credit_cleanup_retry, txn_abort, txn_abort_bulk, txn_abort_cursor, txn_abort_erased, txn_abort_noalloc }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
     const preparation = local.storage_lsm_backend_compaction_publication.manifest_edit_preparation;
     const foreground = preparation.foreground_append;
     const planner = preparation.credit_planning;
+    const txn_mode = mode == .txn_abort or mode == .txn_abort_bulk or mode == .txn_abort_cursor or mode == .txn_abort_erased or mode == .txn_abort_noalloc;
     const credit_mode = mode == .credit_partitioned or mode == .credit_guarded or mode == .credit_reject or mode == .credit_cleanup_retry;
     const owners = @import("api/runnable_owner_execution.zig");
     const platform = @import("antfly_platform");
@@ -7901,6 +7918,22 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         var wakes: usize = 0;
         fn wake(_: *anyopaque) void {
             wakes += 1;
+        }
+        var failed_alloc: std.testing.FailingAllocator = undefined;
+        var write_retire_calls: usize = 0;
+        var write_retire_refused: bool = false;
+        var write_retire_resumed: bool = false;
+        fn writeRetire(stage: usize, offset: usize, original: read_admission.Port) !void {
+            try original.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
+            write_retire_calls += 1;
+            if (selected == .txn_abort_bulk and stage == 5) {
+                if (offset >= 16 * 1024 and !write_retire_refused) {
+                    write_retire_refused = true;
+                    return error.ResourceBudgetExceeded;
+                }
+                if (write_retire_refused and offset > 16 * 1024) write_retire_resumed = true;
+            }
         }
         var producer_done: std.atomic.Value(bool) = .init(false);
         var plans: usize = 0;
@@ -7983,6 +8016,10 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     H.execution = &state;
     H.calls.store(0, .release);
     H.plans = 0;
+    H.write_retire_calls = 0;
+    H.write_retire_refused = false;
+    H.write_retire_resumed = false;
+    if (txn_mode) local.storage_lsm_backend_runtime.test_write_retirement_hook = H.writeRetire;
     H.producer_done.store(false, .release);
     H.plan_retire_refused = false;
     H.plan_retire_resumed = false;
@@ -8013,6 +8050,22 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         foreground.test_retire_hook = null;
         planner.test_hook = null;
         planner.test_retire_hook = null;
+        local.storage_lsm_backend_runtime.test_write_retirement_hook = null;
+    }
+    if (mode == .txn_abort_noalloc) {
+        const backend = handle.ptr();
+        const backing = backend.allocator;
+        const charged = resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes;
+        for (0..2) |point| {
+            H.failed_alloc = .init(backing, .{ .fail_index = point });
+            backend.allocator = H.failed_alloc.allocator();
+            const attempted = backend.beginWrite();
+            backend.allocator = backing;
+            try std.testing.expectError(error.OutOfMemory, attempted);
+            try std.testing.expectEqual(H.failed_alloc.allocated_bytes, H.failed_alloc.freed_bytes);
+            try std.testing.expectEqual(charged, resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+            try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+        }
     }
     var seed = try handle.ptr().beginWrite();
     defer seed.abort();
@@ -8027,6 +8080,21 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         const physical = try local.storage_lsm_backend_wal.snapshotRetention(native.storage(), a, root);
         try std.testing.expectEqualDeep(physical, handle.ptr().wal_retention.primary.?);
     } else try seed.commit();
+    if (mode == .txn_abort_cursor) try handle.ptr().sync(true);
+    // Subsequent cases deliberately alter retention options and cold-cache
+    // state. Join the seed's retirement first so setup cannot race maintenance.
+    {
+        const until = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
+        while (true) {
+            const backend = handle.ptr();
+            while (!backend.mu.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+            const done = backend.retired_manifest_preparations == null and !backend.manifest_preparation_reclaim_in_flight and !backend.maintenance_job_in_flight;
+            backend.mu.unlock();
+            if (done) break;
+            if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
     const pressure_mode = mode == .pressure_cold or mode == .pressure_cached or mode == .pressure_limit or mode == .pressure_soft or mode == .pressure_rotate or mode == .pressure_legacy or mode == .pressure_cancel or mode == .pressure_stale or mode == .pressure_bootstrap;
     if (pressure_mode) {
         const backend = handle.ptr();
@@ -8074,6 +8142,20 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
             var payload = scope.payload();
             if (self.selected == .guarded or self.selected == .credit_guarded) payload.execution_wait = null;
             const original = read_admission.Port.init(&payload);
+            if (self.selected == .txn_abort_erased) {
+                var runtime = try self.backend.runtimeStore(std.testing.allocator, .{});
+                defer runtime.deinit();
+                runtime.write_gate = &H.store_gate;
+                var batch = try runtime.beginBatch();
+                defer batch.abort();
+                try batch.put("first", self.value);
+                for (0..1024) |i| {
+                    var key: [32]u8 = undefined;
+                    try batch.put(try std.fmt.bufPrint(&key, "erased-{d}", .{i}), "staged");
+                }
+                H.cancelled.store(true, .release);
+                return batch.commitWithAdmission(original);
+            }
             if (self.selected == .docstore or self.selected == .docstore_gate) {
                 var runtime = try self.backend.runtimeStore(std.testing.allocator, .{});
                 defer runtime.deinit();
@@ -8090,18 +8172,45 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
                 try batch.put(.{}, "first", self.value);
                 return batch.commitWithAdmission(original);
             }
-            var write = try self.backend.beginWrite();
+            var write = if (self.selected == .txn_abort_bulk) try self.backend.beginBatchWithOptions(.{ .mode = .bulk_ingest }) else try self.backend.beginWrite();
             defer write.abort();
+            if (self.selected == .txn_abort_bulk) {
+                for (0..2048) |i| {
+                    var key: [32]u8 = undefined;
+                    try write.appendPut(.{}, try std.fmt.bufPrint(&key, "bulk-{d}", .{i}), "staged arena value");
+                }
+                H.cancelled.store(true, .release);
+                return write.commitWithAdmission(original);
+            }
             try write.put(.{}, "first", self.value);
             if (self.selected == .staging_spares) try write.mutable.ordered.prepareEdits(std.testing.allocator, 1);
             if (self.selected == .retirement_resume or self.selected == .prepare_reject or
-                self.selected == .credit_partitioned or self.selected == .credit_guarded or self.selected == .credit_reject or self.selected == .credit_cleanup_retry)
+                self.selected == .credit_partitioned or self.selected == .credit_guarded or self.selected == .credit_reject or self.selected == .credit_cleanup_retry or self.selected == .txn_abort or self.selected == .txn_abort_cursor or self.selected == .txn_abort_noalloc)
             {
                 for (0..1024) |i| {
                     var key: [32]u8 = undefined;
                     const name = try std.fmt.bufPrint(&key, "retired-{d}", .{i});
                     try write.put(.{}, name, "owned staged value");
                 }
+            }
+            if (self.selected == .txn_abort or self.selected == .txn_abort_cursor or self.selected == .txn_abort_noalloc) {
+                try std.testing.expect(try write.hasPrefix(.{}, "retired-"));
+                if (self.selected == .txn_abort_cursor) {
+                    var cursor = try write.openCursor(.{});
+                    _ = try cursor.first();
+                    cursor.close();
+                    const keys = try std.testing.allocator.alloc([]const u8, 1024);
+                    defer std.testing.allocator.free(keys);
+                    const values = try std.testing.allocator.alloc(?[]const u8, 1024);
+                    defer std.testing.allocator.free(values);
+                    @memset(keys, "seed");
+                    try write.getManySorted(.{}, keys, values);
+                }
+                if (self.selected == .txn_abort_noalloc) {
+                    H.failed_alloc = .init(write.allocator, .{ .fail_index = 0 });
+                    write.allocator = H.failed_alloc.allocator();
+                }
+                H.cancelled.store(true, .release);
             }
             if (self.selected == .credit_partitioned or self.selected == .credit_guarded or self.selected == .credit_cleanup_retry) {
                 // Compare production planning with the existing grouping oracle.
@@ -8167,7 +8276,14 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     // commit() has unwound its transaction abort and released staged labels.
     // Rejected planning must retire its borrowed-key scratch only after this.
     H.producer_done.store(true, .release);
-    if (mode == .accepted_reject) {
+    if (txn_mode) {
+        try std.testing.expectEqual(@as(?anyerror, error.Canceled), worker.failure);
+        try std.testing.expectEqual(debt_before, handle.ptr().manifest_unpublished_wire_bytes);
+        if (mode == .txn_abort_erased) {
+            try std.testing.expect(H.store_gate.tryLock());
+            H.store_gate.unlock();
+        }
+    } else if (mode == .accepted_reject) {
         try std.testing.expectEqual(@as(?anyerror, error.ResourceBudgetExceeded), worker.failure);
         try std.testing.expect(H.joined.load(.acquire) >= 2);
     } else if (mode == .credit_reject) {
@@ -8190,10 +8306,10 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     } else if (mode == .pressure) {
         try std.testing.expectEqual(@as(?anyerror, error.WalRecordTooLarge), worker.failure);
     } else if (worker.failure) |cause| return cause;
-    if (mode == .guarded or mode == .credit_guarded or mode == .credit_reject) try std.testing.expectEqual(@as(usize, 0), H.calls.load(.acquire)) else if (mode != .pressure) try std.testing.expect(H.calls.load(.acquire) > 0);
+    if (mode == .guarded or mode == .credit_guarded or mode == .credit_reject or txn_mode) try std.testing.expectEqual(@as(usize, 0), H.calls.load(.acquire)) else if (mode != .pressure) try std.testing.expect(H.calls.load(.acquire) > 0);
     try std.testing.expect(!handle.ptr().foreground_commit_pending and handle.ptr().active_foreground_preparation == null);
     const after = handle.ptr().snapshotWriteStats();
-    const successful = mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append and mode != .prepare_reject and mode != .credit_reject and mode != .pressure_limit and mode != .pressure_rotate and mode != .pressure_cancel;
+    const successful = !txn_mode and mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append and mode != .prepare_reject and mode != .credit_reject and mode != .pressure_limit and mode != .pressure_rotate and mode != .pressure_cancel;
     try std.testing.expectEqual(before.wal_append_records + @intFromBool(successful), after.wal_append_records);
     try std.testing.expectEqual(before.wal_segment_syncs + @intFromBool(successful and mode == .sync), after.wal_segment_syncs);
     if (successful) try std.testing.expect(resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes >= retained_before + after.wal_append_bytes - before.wal_append_bytes);
@@ -8216,7 +8332,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         worker.run();
         if (worker.failure) |cause| return cause;
     }
-    if (mode == .retirement_resume or mode == .prepare_reject or credit_mode) {
+    if (mode == .retirement_resume or mode == .prepare_reject or credit_mode or txn_mode) {
         // Close has a legitimate quiesced fallback. Join the normal admitted
         // reclamation path first so this case cannot pass through that fallback.
         const until = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
@@ -8236,6 +8352,9 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     RegisteredOutputFixture.drain(&resources.resource_manager);
     if (mode == .retirement_resume) try std.testing.expect(H.retire_refused and H.retire_resumed);
     if (credit_mode) try std.testing.expect(H.plans != 0);
+    if (txn_mode) try std.testing.expect(H.write_retire_calls != 0);
+    if (mode == .txn_abort_noalloc) try std.testing.expect(!H.failed_alloc.has_induced_failure);
+    if (mode == .txn_abort_bulk) try std.testing.expect(H.write_retire_refused and H.write_retire_resumed);
     if (mode == .credit_cleanup_retry) try std.testing.expect(H.plan_retire_refused and H.plan_retire_resumed);
     if (mode == .retirement_resume or mode == .prepare_reject) try std.testing.expect(H.retire_calls > 1);
     try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
@@ -8460,4 +8579,78 @@ test "physical cache metadata registered flush publication manifest credit prese
             }
         }
     }
+}
+
+test "physical cache metadata registered flush publication foreground WAL expired original admission transfers staged rows and prefix tree to cleanup" {
+    try foregroundAdmittedCommit(.txn_abort);
+}
+
+test "physical cache metadata registered flush publication foreground WAL expired bulk abort resumes large index and arena retirement" {
+    try foregroundAdmittedCommit(.txn_abort_bulk);
+}
+
+test "physical cache metadata registered flush publication foreground WAL expired abort preserves cursor and read pins through scratch retirement" {
+    try foregroundAdmittedCommit(.txn_abort_cursor);
+}
+
+test "physical cache metadata registered flush publication foreground WAL erased abort releases writer gate after expired admission handoff" {
+    try foregroundAdmittedCommit(.txn_abort_erased);
+}
+
+test "physical cache metadata registered flush publication transaction last block references retire in physical quanta after refusal" {
+    const local = @import("antfly_local_sources");
+    const Shared = local.storage_lsm_backend_shared_bytes.SharedBytes;
+    const cache_module = local.storage_lsm_backend_cache;
+    const a = std.testing.allocator;
+    const Control = struct {
+        deny: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.deny) return error.Canceled;
+        }
+    };
+    var control: Control = .{};
+    const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    const port = read_admission.Port.init(&payload);
+    const raw = try a.alloc(u8, 80 * 1024 + 7);
+    @memset(raw, 'x');
+    const shared = try Shared.create(a, raw);
+    var release = Shared.Release.init(shared);
+    var credits: usize = 2;
+    try std.testing.expect(!try release.step(&credits, port));
+    try std.testing.expectEqual(@as(usize, 16 * 1024), shared.retirement_offset);
+    control.deny = true;
+    credits = 1;
+    try std.testing.expectError(error.Canceled, release.step(&credits, port));
+    try std.testing.expectEqual(@as(usize, 16 * 1024), shared.retirement_offset);
+    control.deny = false;
+    while (true) {
+        credits = 1;
+        if (try release.step(&credits, port)) break;
+    }
+    var cache = cache_module.Cache.init(a, 0);
+    defer cache.deinit();
+    const bytes = try a.alloc(u8, 80 * 1024 + 9);
+    @memset(bytes, 't');
+    const handle = try cache.putRunTablePhysicalBlock("txn-retire-transient", 1, 1, 0, @intCast(bytes.len), bytes);
+    try std.testing.expect(handle.cache == null);
+    var retirement = cache_module.Handle.Retirement.init(handle);
+    while (retirement.field != 1 or retirement.offset == 0) {
+        credits = 1;
+        try std.testing.expect(!try retirement.step(&credits, port));
+    }
+    const offset = retirement.offset;
+    control.deny = true;
+    credits = 1;
+    try std.testing.expectError(error.Canceled, retirement.step(&credits, port));
+    try std.testing.expectEqual(offset, retirement.offset);
+    control.deny = false;
+    while (true) {
+        credits = 1;
+        if (try retirement.step(&credits, port)) break;
+    }
+}
+
+test "physical cache metadata registered flush publication foreground WAL reserves abort ownership before staging and survives exhausted transaction allocator" {
+    try foregroundAdmittedCommit(.txn_abort_noalloc);
 }

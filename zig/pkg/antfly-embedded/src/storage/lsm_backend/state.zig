@@ -64,7 +64,7 @@ const EntryIndex = struct {
     primary_allocation: ?Allocation = null,
     collision_allocation: ?Allocation = null,
 
-    const Allocation = struct {
+    pub const Allocation = struct {
         bytes: []u8,
         alignment: std.mem.Alignment,
     };
@@ -72,12 +72,12 @@ const EntryIndex = struct {
     // Record the allocator's actual backing range rather than duplicating the
     // standard hash map's private header/layout. A growth can briefly own both
     // allocations; an allocation failure must preserve the previous receipt.
-    const AllocationObserver = struct {
+    pub const AllocationObserver = struct {
         backing: Allocator,
         previous: ?Allocation,
         replacement: ?Allocation = null,
 
-        fn allocator(self: *@This()) Allocator {
+        pub fn allocator(self: *@This()) Allocator {
             return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
         }
         fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
@@ -97,7 +97,7 @@ const EntryIndex = struct {
             }
             self.backing.rawFree(bytes, alignment, ret);
         }
-        fn finish(self: *@This()) ?Allocation {
+        pub fn finish(self: *@This()) ?Allocation {
             std.debug.assert(self.previous == null or self.replacement == null);
             return self.replacement orelse self.previous;
         }
@@ -975,6 +975,21 @@ pub const ActiveMemTable = struct {
         }
         self.* = .{};
     }
+
+    /// Move every staging owner without sorting or walking its rows.
+    pub const Reclaimer = struct {
+        tree: OrderedIndex.Reclaimer,
+        rows: State.Reclaimer,
+        index: EntryIndex.Reclaimer,
+        pub fn init(owned: ActiveMemTable) @This() {
+            return .{ .tree = .init(owned.ordered), .rows = .init(.{ .entries = owned.entries, .arena_owner = owned.arena_owner }), .index = .init(owned.index) };
+        }
+        pub fn step(self: *@This(), allocator: Allocator, credits: *usize) bool {
+            if (!self.tree.step(allocator, credits)) return false;
+            if (!self.rows.step(allocator, credits)) return false;
+            return self.index.step(allocator, credits);
+        }
+    };
 
     pub fn clone(self: *const ActiveMemTable, allocator: Allocator) !State {
         if (self.ordered_enabled) {
