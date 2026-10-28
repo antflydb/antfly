@@ -76,7 +76,7 @@ jobs:
         run: |
           mkdir -p ts/packages/embedded-linux-x64/lib
           cp zig/zig-out/lib/libantfly.so ts/packages/embedded-linux-x64/lib/
-          docker build -f examples/express-auth/Dockerfile -t antfly-auth-example .
+          docker build -f ts/examples/express-auth/Dockerfile -t antfly-auth-example .
           docker run -d --name antfly-auth-example -p 13029:3000 -v auth-example-data:/data \
             -e BETTER_AUTH_SECRET="ci-only-secret-at-least-thirty-two-characters" \
             -e APP_ORIGIN=http://localhost:13029 antfly-auth-example

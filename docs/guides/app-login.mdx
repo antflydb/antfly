@@ -37,7 +37,7 @@ export const authOptions = {
 
 Use a durable random secret of at least 32 characters. Mount Better Auth's `toNodeHandler(auth)` at `/api/auth/*splat` in Express 5, **before** `express.json()`. This recipe is ESM. The standard `createAuthClient` from `better-auth/client` handles signup, signin, sessions, and signout.
 
-See [the runnable Express example](https://github.com/antflydb/antfly/tree/main/examples/express-auth). The onboarding target is signup, login, one document creation, and owner-scoped search in under ten minutes with at most three application files. This is an acceptance target, not a measured human onboarding result.
+See [the runnable Express example](https://github.com/antflydb/antfly/tree/main/ts/examples/express-auth). The onboarding target is signup, login, one document creation, and owner-scoped search in under ten minutes with at most three application files. This is an acceptance target, not a measured human onboarding result.
 
 ## Access the signed-in user's documents
 
@@ -106,7 +106,7 @@ Use `remoteDatabase(new AntflyClient(...))` from `@antfly/better-auth/remote` an
 
 Use a server release containing the concurrent SQL connection-directory fix shipped with this integration, together with the updated SDK. SQL transactions must stay on one stable API owner endpoint. The transport retains the HTTP connection ID and active transaction session ID. Arbitrary round-robin routing is unsupported. For committed-but-pending writes, the transport reads the matching transaction receipt until visibility is confirmed. Fresh schema setup similarly checks the receipt’s table identity and schema generation before serving requests. Pending, repair-required, and uncertain writes are never replayed; unresolved outcomes fail closed.
 
-See [the Next.js remote example](https://github.com/antflydb/antfly/tree/main/examples/nextjs-auth). Next.js may use embedded Antfly only as a standalone persistent Node deployment with the same platform restrictions as Express.
+See [the Next.js remote example](https://github.com/antflydb/antfly/tree/main/ts/examples/nextjs-auth). Next.js may use embedded Antfly only as a standalone persistent Node deployment with the same platform restrictions as Express.
 
 ## Support and testing
 

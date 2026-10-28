@@ -1,8 +1,7 @@
 packages:
   - packages/*
   - apps/*
-  - ../examples/express-auth
-  - ../examples/nextjs-auth
+  - examples/*
 
 allowBuilds:
   '@parcel/watcher': true

@@ -6,7 +6,7 @@ Node 24+, ESM, Express 5. Run on one persistent process on macOS arm64 or glibc 
 pnpm install
 pnpm --filter @antfly/sdk --filter @antfly/embedded --filter @antfly/better-auth build
 pnpm --filter @antfly/example-express-auth build
-test -f ../examples/express-auth/.env || printf 'BETTER_AUTH_SECRET=%s\n' "$(openssl rand -hex 32)" > ../examples/express-auth/.env
+test -f examples/express-auth/.env || printf 'BETTER_AUTH_SECRET=%s\n' "$(openssl rand -hex 32)" > examples/express-auth/.env
 pnpm --filter @antfly/example-express-auth start
 ```
 

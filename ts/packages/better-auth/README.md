@@ -11,7 +11,7 @@ await prepareAuthSchema(db, options);
 const auth = betterAuth(options);
 ```
 
-[Complete guide](https://github.com/antflydb/antfly/blob/main/docs/guides/app-login.mdx) · [Express example](https://github.com/antflydb/antfly/tree/main/examples/express-auth) · [Next.js remote example](https://github.com/antflydb/antfly/tree/main/examples/nextjs-auth)
+[Complete guide](https://github.com/antflydb/antfly/blob/main/docs/guides/app-login.mdx) · [Express example](https://github.com/antflydb/antfly/tree/main/ts/examples/express-auth) · [Next.js remote example](https://github.com/antflydb/antfly/tree/main/ts/examples/nextjs-auth)
 
 Requires Better Auth 1.7.14+ within the 1.7 minor. Embedded requires Node 24+ and a persistent macOS arm64 or glibc Linux arm64/x64 host. Use remote Antfly for Node serverless applications. Keep native files on one persistent process, and use a stable API owner for remote SQL connections.
 

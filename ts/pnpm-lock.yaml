@@ -21,14 +21,14 @@ importers:
         specifier: ~5.9.3
         version: 5.9.3
 
-  ../examples/express-auth:
+  examples/express-auth:
     dependencies:
       '@antfly/better-auth':
         specifier: workspace:*
-        version: link:../../ts/packages/better-auth
+        version: link:../../packages/better-auth
       '@antfly/embedded':
         specifier: workspace:*
-        version: link:../../ts/packages/embedded
+        version: link:../../packages/embedded
       better-auth:
         specifier: 1.7.14
         version: 1.7.14(@opentelemetry/api@1.9.1)(next@16.2.9(@opentelemetry/api@1.9.1)(@playwright/test@1.61.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7))(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@4.1.9)
@@ -40,14 +40,14 @@ importers:
         specifier: ^0.25.12
         version: 0.25.12
 
-  ../examples/nextjs-auth:
+  examples/nextjs-auth:
     dependencies:
       '@antfly/better-auth':
         specifier: workspace:*
-        version: link:../../ts/packages/better-auth
+        version: link:../../packages/better-auth
       '@antfly/sdk':
         specifier: workspace:*
-        version: link:../../ts/packages/sdk
+        version: link:../../packages/sdk
       better-auth:
         specifier: 1.7.14
         version: 1.7.14(@opentelemetry/api@1.9.1)(next@16.2.9(@opentelemetry/api@1.9.1)(@playwright/test@1.61.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7))(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@4.1.9)
