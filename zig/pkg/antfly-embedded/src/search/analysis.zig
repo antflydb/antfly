@@ -612,15 +612,16 @@ fn tokenizeUnicodeWordsControlled(alloc: Allocator, text: []const u8, control: C
     var pos: u32 = 0;
     var position: u32 = 0;
     const len: u32 = @intCast(text.len);
+    var checkpoint: usize = 0;
 
     while (pos < len) {
         // Skip non-alphanumeric
-        pos = try advanceRun(text, pos, false, false, control);
+        pos = try advanceRun(text, pos, false, false, control, &checkpoint);
         if (pos >= len) break;
 
         const start = pos;
         // Consume alphanumeric run
-        pos = try advanceRun(text, pos, true, false, control);
+        pos = try advanceRun(text, pos, true, false, control, &checkpoint);
 
         const term = try alloc.dupe(u8, text[start..pos]);
         try tokens.append(alloc, .{
@@ -645,13 +646,14 @@ fn tokenizeWhitespaceControlled(alloc: Allocator, text: []const u8, control: Con
     var pos: u32 = 0;
     var position: u32 = 0;
     const len: u32 = @intCast(text.len);
+    var checkpoint: usize = 0;
 
     while (pos < len) {
-        pos = try advanceRun(text, pos, true, true, control);
+        pos = try advanceRun(text, pos, true, true, control, &checkpoint);
         if (pos >= len) break;
 
         const start = pos;
-        pos = try advanceRun(text, pos, false, true, control);
+        pos = try advanceRun(text, pos, false, true, control, &checkpoint);
 
         const term = try alloc.dupe(u8, text[start..pos]);
         try tokens.append(alloc, .{
@@ -764,11 +766,11 @@ fn tokenizeEdgeNgram(alloc: Allocator, text: []const u8, cfg: EdgeNgramConfig) !
 
 /// Byte-bounded checkpoints, including runs which produce no allocations.
 /// The inner scan has the original branch/copy cost; control runs per 4 KiB.
-fn advanceRun(text: []const u8, start: u32, wanted: bool, whitespace: bool, control: Control) !u32 {
+fn advanceRun(text: []const u8, start: u32, wanted: bool, whitespace: bool, control: Control, checkpoint: *usize) !u32 {
     var pos = start;
     while (pos < text.len) {
-        try control.check();
-        const end = @min(text.len, @as(usize, pos) + 4096);
+        try byteCheckpoint(control, pos, checkpoint);
+        const end = @min(text.len, checkpoint.*);
         while (pos < end and (if (whitespace) isWhitespace(text[pos]) else isAlphanumeric(text[pos])) == wanted) {
             pos += if (whitespace) 1 else utf8ByteLen(text[pos]);
         }
@@ -1910,13 +1912,14 @@ fn analyzeDefaultEnglish(alloc: Allocator, text: []const u8, control: Control) !
     var pos: u32 = 0;
     var position: u32 = 0;
     const len: u32 = @intCast(text.len);
+    var checkpoint: usize = 0;
 
     while (pos < len) {
-        pos = try advanceRun(text, pos, false, false, control);
+        pos = try advanceRun(text, pos, false, false, control, &checkpoint);
         if (pos >= len) break;
 
         const start = pos;
-        pos = try advanceRun(text, pos, true, false, control);
+        pos = try advanceRun(text, pos, true, false, control, &checkpoint);
 
         const raw = text[start..pos];
         var stack_lower: [256]u8 = undefined;
@@ -2777,4 +2780,30 @@ test "logical query substring stream agrees with owned token pipeline" {
     try std.testing.expect(default_analyzer.tokenStream("abc") == null);
     const custom = Analyzer{ .tokenizer = .unicode_words, .filters = &.{ .lowercase, .{ .suffix = .{ .min = 1, .max = 32 } } } };
     try std.testing.expect(custom.tokenStream("abc") == null);
+}
+
+test "highlight byte checkpoints amortize short token runs across one scan" {
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 6 * 1024);
+    defer a.free(text);
+    for (0..1024) |i| @memcpy(text[i * 6 ..][0..6], "alpha ");
+    const Count = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            @as(*@This(), @ptrCast(@alignCast(@constCast(ptr)))).calls += 1;
+        }
+    };
+    var count: Count = .{};
+    const controlled = default_analyzer.withControl(.{ .ptr = &count, .check_fn = Count.check });
+    const tokens = try controlled.analyze(a, text);
+    defer Analyzer.freeTokens(a, tokens);
+    try std.testing.expectEqual(@as(usize, 1024), tokens.len);
+    try std.testing.expectEqual(@as(usize, 2), count.calls);
+    for ([_]Tokenizer{ .unicode_words, .whitespace }) |tokenizer| {
+        count.calls = 0;
+        const words = try tokenizer.tokenizeControlled(a, text, .{ .ptr = &count, .check_fn = Count.check });
+        defer Analyzer.freeTokens(a, words);
+        try std.testing.expectEqual(@as(usize, 1024), words.len);
+        try std.testing.expect(count.calls <= 3);
+    }
 }
