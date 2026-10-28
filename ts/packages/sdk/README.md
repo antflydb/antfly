@@ -1,5 +1,20 @@
 # Antfly TypeScript SDK
 
+## LangChain integration foundations
+
+The companion `@antfly/langchain` package uses this SDK for all database and
+inference operations. Table/index/document lookup failures expose
+`AntflyHTTPError.status` and `.body`; missing records can be distinguished from
+authentication or server failures. Empty batch responses throw
+`AntflyResponseError` instead of manufacturing mutation counts. Callers must still
+inspect the returned batch `status` to distinguish committed, pending, and
+repair-required outcomes. Do not blindly retry a mutation after a missing response.
+
+`InferenceClient.embed()` and `embedDense()` accept retrieval task type,
+dimensions, instruction, item error policy, and cancellation options. `rerank()`
+also accepts an optional `AbortSignal`. These additions preserve the existing
+method forms.
+
 A TypeScript SDK for interacting with the Antfly API, suitable for both frontend and backend applications.
 
 ## Installation
