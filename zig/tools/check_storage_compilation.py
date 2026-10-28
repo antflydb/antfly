@@ -793,7 +793,11 @@ def main() -> None:
                     command,
                     workspace.cwd,
                     progress=progress,
-                    env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache"},
+                    env={
+                        **os.environ,
+                        "ZIG_LOCAL_CACHE_DIR": ".zig-cache",
+                        "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache",
+                    },
                     # The cold graph has several independent archives and
                     # owner/consumer executables. A newly started compiler is
                     # not stalled because earlier units consumed 30 minutes.
@@ -834,6 +838,25 @@ def main() -> None:
                     "\n".join(line for line in output.splitlines() if len(line) < 1000)
                 )
                 raise RuntimeError(f"{label}: build failed ({returncode})")
+            if label.endswith("warm"):
+                rebuilt = sorted(
+                    {
+                        name
+                        for _, name, status in COMPILES.findall(output)
+                        if status == "success"
+                    }
+                )
+                if rebuilt:
+                    with report_lock:
+                        record.update(
+                            status="failed",
+                            error="UnexpectedWarmRebuild",
+                            rebuilt_artifacts=rebuilt,
+                        )
+                        publish()
+                    raise AssertionError(
+                        f"{label}: cache relocation rebuilt production artifacts: {rebuilt}"
+                    )
             missing = (ARCHIVES | CONSUMERS) - states.keys()
             if missing:
                 raise AssertionError(

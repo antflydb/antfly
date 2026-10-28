@@ -255,6 +255,7 @@ class BuildFailureEvidence(unittest.TestCase):
             self.assertEqual(compiler_timeout_seconds, 1800)
             local_cache = cwd / command[command.index("--cache-dir") + 1]
             self.assertNotIn("--global-cache-dir", command)
+            self.assertEqual(env["ZIG_LOCAL_CACHE_DIR"], ".zig-cache")
             self.assertIn("-Dstrip=true", command)
             if measured_memory:
                 self.assertIn("-Dnative-linux-ownership-memory=true", command)
@@ -644,8 +645,6 @@ class ParallelAuditIsolation(unittest.TestCase):
             else:
                 label = "cold" if cold else "warm"
                 self.assertTrue(initial or not current)
-            if dirty_clone and initial and not cold:
-                rebuilt = {"antfly-storage-kernel"}
             local_cache = cwd / command[command.index("--cache-dir") + 1]
             local_cache.mkdir(exist_ok=True)
             (local_cache / "marker").write_text(label)
@@ -657,6 +656,15 @@ class ParallelAuditIsolation(unittest.TestCase):
                 output.extend(
                     f"compile exe {name} debug native success"
                     for name in measurement.CONSUMERS
+                )
+            if dirty_clone and initial and not cold:
+                # Private variants are not in the required root set. Repeated
+                # names must not hide a rebuild behind a later cached result.
+                output.extend(
+                    [
+                        "compile lib antfly-storage-engine debug native success",
+                        "compile lib antfly-storage-engine debug native cached",
+                    ]
                 )
             progress({"wall_seconds": 0.0})
             return (
