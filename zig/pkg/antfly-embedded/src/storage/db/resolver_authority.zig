@@ -1771,6 +1771,7 @@ pub const Store = struct {
         }
     }
     const LineageWork = struct {
+        version: u8 = 1, // Missing on historical lineage-v1 rows.
         key_template: []const u8,
         stamp: Stamp,
         after: ?[]const u8 = null,
@@ -1779,15 +1780,37 @@ pub const Store = struct {
         graph_bytes: u64 = 0,
     };
     fn lineageWorkPath(self: Store, template: []const u8) ![]const u8 {
-        return self.keyPath(try std.fmt.allocPrint(self.a, "lineage-v1/{s}", .{try hash(self.a, template)}));
+        return self.keyPath(try std.fmt.allocPrint(self.a, "lineage-v2/{s}", .{try hash(self.a, template)}));
+    }
+    /// Both scanning and edits extend an unambiguous SHA chain. A processed
+    /// record's edit carries old and new bytes; unvisited records are read later.
+    fn lineageRecord(work: *LineageWork, kind: Kind, suffix: []const u8, old: ?[]const u8, next: ?[]const u8, edit: bool) !void {
+        var buffer: [1024]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
+        try std.json.Stringify.value(.{ if (edit) "resolver-lineage-edit-v2" else "resolver-lineage-record-v2", work.digest, suffix, old, next }, .{}, &writer.writer);
+        try writer.writer.flush();
+        writer.hasher.final(&work.digest);
+        if (old) |raw| {
+            work.bytes = try std.math.sub(u64, work.bytes, raw.len);
+            if (graphKind(kind)) work.graph_bytes = try std.math.sub(u64, work.graph_bytes, raw.len);
+        }
+        if (next) |raw| {
+            work.bytes = try std.math.add(u64, work.bytes, raw.len);
+            if (graphKind(kind)) work.graph_bytes = try std.math.add(u64, work.graph_bytes, raw.len);
+        }
     }
     /// Owner-only migration. Each turn hashes bounded individual records; no
     /// foreground read or ordinary mutation scans the namespace to qualify it.
     fn advanceLineage(self: Store, initial: Head, limit: u32) !void {
         const path = try self.lineageWorkPath(initial.key_template);
+        // Retire an older restart-only cursor without trusting its history.
+        const legacy_path = try self.keyPath(try std.fmt.allocPrint(self.a, "lineage-v1/{s}", .{try hash(self.a, initial.key_template)}));
+        if (try self.backend.get(self.backend.ptr, self.a, legacy_path) != null) try self.backend.remove(self.backend.ptr, self.a, legacy_path);
         const stamp: Stamp = .{ .revision = initial.revision, .fingerprint = initial.fingerprint };
-        var work: LineageWork = if (try self.backend.get(self.backend.ptr, self.a, path)) |raw| try parse(LineageWork, self.a, raw) else .{ .key_template = initial.key_template, .stamp = stamp };
-        if (!std.meta.eql(work.stamp, stamp)) work = .{ .key_template = initial.key_template, .stamp = stamp };
+        var work: LineageWork = if (try self.backend.get(self.backend.ptr, self.a, path)) |raw| try parse(LineageWork, self.a, raw) else .{ .version = 2, .key_template = initial.key_template, .stamp = stamp };
+        if (work.version != 2) return error.InvalidCatalogRecord;
+        // Untracked legacy writes or restored cuts still force a safe restart.
+        if (!std.meta.eql(work.stamp, stamp)) work = .{ .version = 2, .key_template = initial.key_template, .stamp = stamp };
         const scratch = try query_context.RoutingScratch.init();
         defer scratch.deinit();
         var frame: std.heap.FixedBufferAllocator = .init(scratch.bytes);
@@ -1808,7 +1831,7 @@ pub const Store = struct {
                 h.bytes = work.bytes;
                 var buffer: [1024]u8 = undefined;
                 var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
-                try std.json.Stringify.value(.{ "resolver-content-lineage-v1", h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, work.digest }, .{}, &writer.writer);
+                try std.json.Stringify.value(.{ "resolver-content-lineage-v2", h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, work.digest }, .{}, &writer.writer);
                 try writer.writer.flush();
                 writer.hasher.final(&h.fingerprint);
                 try self.putQueryGraph(h, h.fingerprint, work.graph_bytes);
@@ -1829,14 +1852,8 @@ pub const Store = struct {
             const suffix = row.key[prefix.len..];
             const separator = std.mem.indexOfScalar(u8, suffix, '/') orelse return error.InvalidCatalogRecord;
             const kind = std.meta.stringToEnum(Kind, suffix[0..separator]) orelse return error.InvalidCatalogRecord;
-            var buffer: [1024]u8 = undefined;
-            var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
-            try std.json.Stringify.value(.{ work.digest, suffix, row.value }, .{}, &writer.writer);
-            try writer.writer.flush();
-            writer.hasher.final(&work.digest);
-            work.bytes = try std.math.add(u64, work.bytes, row.value.len);
+            try lineageRecord(&work, kind, suffix, null, row.value, false);
             if (self.max_namespace_bytes) |maximum| if (work.bytes > maximum) return error.ResolverCurationLimitExceeded;
-            if (graphKind(kind)) work.graph_bytes = try std.math.add(u64, work.graph_bytes, row.value.len);
             work.after = try self.a.dupe(u8, suffix);
         }
         try self.backend.put(self.backend.ptr, self.a, path, try encode(self.a, work));
@@ -3440,6 +3457,16 @@ pub const Store = struct {
         try mutation.preflight(patch);
         const previous = try mutation.head(patch.next.key_template);
         if ((if (previous) |h| h.revision else 0) != patch.expected_revision or patch.next.revision <= patch.expected_revision) return error.ResolverCurationConflict;
+        var qualification: ?LineageWork = null;
+        var qualification_path: ?[]const u8 = null;
+        if (previous) |old| if (!qualifiedHead(old)) {
+            qualification_path = try mutation.lineageWorkPath(old.key_template);
+            if (try mutation.backend.get(mutation.backend.ptr, mutation.a, qualification_path.?)) |raw| {
+                const work = try parse(LineageWork, mutation.a, raw);
+                if (work.version != 2) return error.InvalidCatalogRecord;
+                if (std.meta.eql(work.stamp, Stamp{ .revision = old.revision, .fingerprint = old.fingerprint })) qualification = work;
+            }
+        };
         var graph = if (previous) |h| try mutation.queryGraph(h) else QueryGraph{ .head = .{ .revision = 0, .fingerprint = @splat(0) }, .fingerprint = @splat(0), .bytes = 0 };
         var routing_fingerprint = if (previous) |h| try mutation.routingFingerprint(h) else @as([32]u8, @splat(0));
         var routing_targets: std.ArrayList([]const u8) = .empty;
@@ -3489,12 +3516,17 @@ pub const Store = struct {
         for (patch.edits) |edit| {
             const path = try mutation.record(h.key_template, edit.kind, edit.id);
             if ((try seen.getOrPut(mutation.a, path)).found_existing) return error.InvalidResolverCurationRequest;
-            if (try mutation.backend.get(mutation.backend.ptr, mutation.a, path)) |old| {
+            const previous_raw = try mutation.backend.get(mutation.backend.ptr, mutation.a, path);
+            const next_raw = if (edit.value) |value_json| try encode(mutation.a, value_json) else null;
+            if (qualification) |*work| if (work.after) |after| {
+                const suffix = try std.fmt.allocPrint(mutation.a, "{s}/{s}", .{ @tagName(edit.kind), try hash(mutation.a, edit.id) });
+                if (std.mem.order(u8, suffix, after) != .gt) try lineageRecord(work, edit.kind, suffix, previous_raw, next_raw, true);
+            };
+            if (previous_raw) |old| {
                 h.bytes = try std.math.sub(u64, h.bytes, old.len);
                 try mutation.indexRecord(h.key_template, edit.kind, edit.id, old, false);
             }
-            if (edit.value) |value_json| {
-                const raw = try encode(mutation.a, value_json);
+            if (next_raw) |raw| {
                 h.bytes = try std.math.add(u64, h.bytes, raw.len);
                 if (mutation.max_namespace_bytes) |maximum| if (h.bytes > maximum) return error.ResolverCurationLimitExceeded;
                 try mutation.backend.put(mutation.backend.ptr, mutation.a, path, raw);
@@ -3546,6 +3578,12 @@ pub const Store = struct {
         try mutation.putRouting(h, routing_fingerprint);
         if (previous == null) try mutation.indexHead(h);
         try mutation.backend.put(mutation.backend.ptr, mutation.a, try mutation.headPath(h.key_template), try encode(mutation.a, h));
+        if (qualification) |*work| {
+            // The cursor, digest, counters and new head fence commit atomically.
+            // No foreground scan or retained mutation queue is required.
+            work.stamp = .{ .revision = h.revision, .fingerprint = h.fingerprint };
+            try mutation.backend.put(mutation.backend.ptr, mutation.a, qualification_path.?, try encode(mutation.a, work.*));
+        }
     }
 };
 
@@ -3862,8 +3900,9 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         if (!std.mem.eql(u8, parts[1], try hash(a, Store.headRoutePrefix(template))) or !std.mem.eql(u8, parts[2], try hash(a, template))) return error.InvalidMetadataBatch;
         return;
     }
-    if (count == 2 and std.mem.eql(u8, parts[0], "lineage-v1")) {
+    if (count == 2 and (std.mem.eql(u8, parts[0], "lineage-v1") or std.mem.eql(u8, parts[0], "lineage-v2"))) {
         const work = try parse(Store.LineageWork, a, raw);
+        if (work.version != (if (std.mem.eql(u8, parts[0], "lineage-v2")) @as(u8, 2) else @as(u8, 1))) return error.InvalidMetadataBatch;
         if (!std.mem.eql(u8, parts[1], try hash(a, work.key_template)) or work.graph_bytes > work.bytes) return error.InvalidMetadataBatch;
         if (work.after) |cursor| {
             const separator = std.mem.indexOfScalar(u8, cursor, '/') orelse return error.InvalidMetadataBatch;
@@ -3955,7 +3994,7 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         }
         return;
     }
-    if (count == 1 and (std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v1") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v2") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v3") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v4") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v5") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v6") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v7") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v8"))) {
+    if (count == 1 and (std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v1") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v2") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v3") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v4") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v5") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v6") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v7") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v8") or std.mem.eql(u8, parts[0], "query-pins-owner-enrolled-v9"))) {
         if (!std.mem.eql(u8, raw, "1")) return error.InvalidMetadataBatch;
         return;
     }
@@ -8488,7 +8527,7 @@ test "resolver curation dependency legacy namespaces qualify distinct content be
         }
     }
 }
-test "resolver curation dependency qualification is bounded read only until publication and restarts on edits" {
+test "resolver curation dependency qualification is bounded read only until publication and tracks edits" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -8736,4 +8775,216 @@ test "resolver curation dependency coverage pages preserve matches across scratc
         if (long_keys) try std.testing.expect(retry_count > 0 and retry_count <= 8) else try std.testing.expectEqual(@as(usize, 0), retry_count);
         std.debug.print("COVERAGE BYTE PAGES long_keys={any} matches={d} scans={d} byte_retries={d}\n", .{ long_keys, received, memory.test_coverage_scans, retry_count });
     }
+}
+
+test "resolver curation dependency qualification progresses under continuous edits without foreground scans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const template = "entity/{{_key}}";
+    const edges = try a.alloc(resolver.KeyAlias, 256);
+    for (edges, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/review-old-{d}", .{i}), .target = "entity/review-root" };
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1, .merges = edges });
+    var legacy = (try store.head(template)).?;
+    legacy.lineage_version = 0;
+    try store.backend.put(store.backend.ptr, a, try store.headPath(template), try encode(a, legacy));
+    var qualified_at: ?usize = null;
+    var last_cursor: ?[]const u8 = null;
+    const visited = memory.visited;
+    for (0..64) |turn| {
+        const before_owner = (try store.head(template)).?;
+        if (!qualifiedHead(before_owner)) try store.advanceLineage(before_owner, 128);
+        if (qualifiedHead((try store.head(template)).?)) {
+            if (qualified_at == null) qualified_at = turn + 1;
+        } else {
+            const work = try parse(Store.LineageWork, a, (try store.backend.get(store.backend.ptr, a, try store.lineageWorkPath(template))).?);
+            if (last_cursor) |cursor| try std.testing.expect(std.mem.lessThan(u8, cursor, work.after.?));
+            last_cursor = try a.dupe(u8, work.after.?);
+        }
+        const old = (try store.head(template)).?;
+        var next = old;
+        next.revision += 1;
+        const key = "entity/review-suppressed-noise";
+        const scans = memory.scans;
+        try store.apply(.{ .expected_revision = old.revision, .next = next, .edits = &.{.{ .kind = .suppressed, .id = key, .value = if (turn % 2 == 0) std.json.Value{ .string = key } else null }} });
+        try std.testing.expectEqual(scans, memory.scans);
+    }
+    try std.testing.expectEqual(@as(?usize, 3), qualified_at);
+    try std.testing.expectEqual(@as(usize, 256), memory.visited - visited);
+    try std.testing.expect(qualifiedHead((try store.head(template)).?));
+    try std.testing.expect(try store.backend.get(store.backend.ptr, a, try store.lineageWorkPath(template)) == null);
+    std.debug.print("QUALIFICATION LIVE PROGRESS records=256 edits=64 qualified_at_turn={d} scanned_rows={d} foreground_scans=0\n", .{ qualified_at.?, memory.visited - visited });
+}
+
+test "resolver curation dependency qualification accounts mutations on both sides of its cursor and fences untracked cuts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: OrderedPinMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    const template = "entity/{{_key}}";
+    const aliases = try a.alloc(resolver.KeyAlias, 90);
+    for (aliases, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "entity/live-{d}", .{i}), .target = "entity/live-root" };
+    const pair: c.Pair = .{ .from = aliases[0].key, .to = "entity/live-other" };
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1, .merges = aliases, .state = .{ .distinct = &.{pair} } });
+    var head = (try store.head(template)).?;
+    head.lineage_version = 0;
+    try store.backend.put(store.backend.ptr, a, try store.headPath(template), try encode(a, head));
+    try store.advanceLineage(head, 32);
+    const work_path = try store.lineageWorkPath(template);
+    const partial = try parse(Store.LineageWork, a, (try store.backend.get(store.backend.ptr, a, work_path)).?);
+    const prefix = try store.records(template, null);
+    var behind: ?resolver.KeyAlias = null;
+    var ahead: [2]?resolver.KeyAlias = @splat(null);
+    var boundary: ?resolver.KeyAlias = null;
+    for (aliases) |edge| {
+        const path = try store.record(template, .redirect, edge.key);
+        const suffix = path[prefix.len..];
+        switch (std.mem.order(u8, suffix, partial.after.?)) {
+            .lt => if (behind == null) {
+                behind = edge;
+            },
+            .eq => boundary = edge,
+            .gt => if (ahead[0] == null) {
+                ahead[0] = edge;
+            } else if (ahead[1] == null) {
+                ahead[1] = edge;
+            },
+        }
+    }
+    var inserted: [2]?resolver.KeyAlias = @splat(null);
+    var attempt: usize = 0;
+    while (inserted[0] == null or inserted[1] == null) : (attempt += 1) {
+        try std.testing.expect(attempt < 1024);
+        const edge: resolver.KeyAlias = .{ .key = try std.fmt.allocPrint(a, "entity/inserted-{d}", .{attempt}), .target = "entity/live-root" };
+        const path = try store.record(template, .redirect, edge.key);
+        const side: usize = if (std.mem.order(u8, path[prefix.len..], partial.after.?) == .lt) 0 else 1;
+        if (inserted[side] == null) inserted[side] = edge;
+    }
+    var edits: std.ArrayList(Edit) = .empty;
+    for ([_]resolver.KeyAlias{ .{ .key = boundary.?.key, .target = "entity/changed-boundary" }, .{ .key = ahead[1].?.key, .target = "entity/changed-ahead" }, inserted[0].?, inserted[1].? }) |edge|
+        try edits.append(a, .{ .kind = .redirect, .id = edge.key, .value = try parse(std.json.Value, a, try encode(a, edge)) });
+    for ([_]resolver.KeyAlias{ behind.?, ahead[0].? }) |edge| try edits.append(a, .{ .kind = .redirect, .id = edge.key, .value = null });
+    try edits.append(a, .{ .kind = .distinct, .id = try encode(a, .{ pair.from, pair.to }), .value = null });
+    const new_pair: c.Pair = .{ .from = aliases[1].key, .to = "entity/new-other" };
+    try edits.append(a, .{ .kind = .distinct, .id = try encode(a, .{ new_pair.from, new_pair.to }), .value = try parse(std.json.Value, a, try encode(a, new_pair)) });
+    try edits.append(a, .{ .kind = .text, .id = "fresh-rule", .value = .{ .string = "fresh-rule" } });
+    var next = head;
+    next.revision += 1;
+    next.min_text_chars = 7;
+    next.lineage_version = 1; // Untrusted caller cannot assert qualification.
+    // Compare ordinary pin-maintenance scans with an identical qualified
+    // namespace. Tracking may add one control-row write, never a record scan.
+    var control_memory: OrderedPinMemory = .{ .a = a };
+    const control: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &control_memory, .get = OrderedPinMemory.get, .put = OrderedPinMemory.put, .remove = OrderedPinMemory.remove, .scan = OrderedPinMemory.scan } };
+    var copy = memory.rows.iterator();
+    while (copy.next()) |row| try control.backend.put(control.backend.ptr, a, row.key_ptr.*, row.value_ptr.*);
+    var qualified_head = head;
+    qualified_head.lineage_version = 1;
+    try control.backend.put(control.backend.ptr, a, try control.headPath(template), try encode(a, qualified_head));
+    var variant_memory: OrderedPinMemory = .{ .a = a };
+    var variant = store;
+    variant.backend.ptr = &variant_memory;
+    copy = memory.rows.iterator();
+    while (copy.next()) |row| try variant.backend.put(variant.backend.ptr, a, row.key_ptr.*, row.value_ptr.*);
+    const variant_edits = try a.dupe(Edit, edits.items);
+    variant_edits[0].value = try parse(std.json.Value, a, try encode(a, resolver.KeyAlias{ .key = boundary.?.key, .target = "entity/changed-boundarx" }));
+    try variant.apply(.{ .expected_revision = head.revision, .next = next, .edits = variant_edits });
+    try control.apply(.{ .expected_revision = head.revision, .next = next, .edits = edits.items });
+    const scans = memory.scans;
+    try store.apply(.{ .expected_revision = head.revision, .next = next, .edits = edits.items });
+    try std.testing.expectEqual(control_memory.scans, memory.scans - scans);
+    head = (try store.head(template)).?;
+    try std.testing.expect(!qualifiedHead(head));
+    const tracked = try parse(Store.LineageWork, a, (try store.backend.get(store.backend.ptr, a, work_path)).?);
+    try std.testing.expectEqualStrings(partial.after.?, tracked.after.?);
+    try std.testing.expectEqual(head.revision, tracked.stamp.revision);
+    try std.testing.expectEqual(head.fingerprint, tracked.stamp.fingerprint);
+    var processed_bytes: u64 = 0;
+    var graph_bytes: u64 = 0;
+    const census = try store.backend.scan(store.backend.ptr, a, prefix, null, 256);
+    for (census.rows) |row| {
+        const suffix = row.key[prefix.len..];
+        if (std.mem.order(u8, suffix, tracked.after.?) == .gt) continue;
+        processed_bytes += row.value.len;
+        const separator = std.mem.indexOfScalar(u8, suffix, '/').?;
+        if (Store.graphKind(std.meta.stringToEnum(Kind, suffix[0..separator]).?)) graph_bytes += row.value.len;
+    }
+    try std.testing.expectEqual(processed_bytes, tracked.bytes);
+    try std.testing.expectEqual(graph_bytes, tracked.graph_bytes);
+    // Header-only edits also advance the fence, without losing the cursor.
+    next = head;
+    next.revision += 1;
+    next.min_text_chars = 9;
+    try store.apply(.{ .expected_revision = head.revision, .next = next, .edits = &.{} });
+    const header_work = try parse(Store.LineageWork, a, (try store.backend.get(store.backend.ptr, a, work_path)).?);
+    try std.testing.expectEqualStrings(tracked.after.?, header_work.after.?);
+    try std.testing.expectEqual(next.revision, header_work.stamp.revision);
+    const variant_head = (try variant.head(template)).?;
+    var variant_next = variant_head;
+    variant_next.revision += 1;
+    variant_next.min_text_chars = 9;
+    try variant.apply(.{ .expected_revision = variant_head.revision, .next = variant_next, .edits = &.{} });
+    var completed_memory: OrderedPinMemory = .{ .a = a };
+    var completed = store;
+    completed.backend.ptr = &completed_memory;
+    copy = memory.rows.iterator();
+    while (copy.next()) |row| try completed.backend.put(completed.backend.ptr, a, row.key_ptr.*, row.value_ptr.*);
+    var completion_turns: usize = 0;
+    for ([_]Store{ completed, variant }) |finishing| {
+        while (!qualifiedHead((try finishing.head(template)).?)) : (completion_turns += 1) {
+            try std.testing.expect(completion_turns < 16);
+            try finishing.advanceLineage((try finishing.head(template)).?, 32);
+        }
+    }
+    const completed_head = (try completed.head(template)).?;
+    const different_head = (try variant.head(template)).?;
+    try std.testing.expectEqual(completed_head.revision, different_head.revision);
+    try std.testing.expectEqual(completed_head.bytes, different_head.bytes);
+    try std.testing.expect(!std.mem.eql(u8, &completed_head.fingerprint, &different_head.fingerprint));
+    try std.testing.expectEqual((try store.head(template)).?.bytes, completed_head.bytes);
+    try std.testing.expectEqual((try store.queryGraph((try store.head(template)).?)).bytes, (try completed.queryGraph(completed_head)).bytes);
+    // Retire v1 work; it is exportable for compatibility, never a v2 certificate.
+    var legacy = partial;
+    legacy.version = 1;
+    legacy.bytes = 999;
+    legacy.graph_bytes = 900;
+    const legacy_path = try store.keyPath(try std.fmt.allocPrint(a, "lineage-v1/{s}", .{try hash(a, template)}));
+    try store.backend.put(store.backend.ptr, a, legacy_path, try encode(a, legacy));
+    try validatePortableRow(a, legacy_path, try encode(a, legacy));
+    // A writer that did not track mutations still invalidates the work fence.
+    head = (try store.head(template)).?;
+    head.revision += 1;
+    head.fingerprint = @splat(77);
+    try store.backend.put(store.backend.ptr, a, try store.record(template, .suppressed, "entity/untracked"), try encode(a, "entity/untracked"));
+    try store.backend.put(store.backend.ptr, a, try store.headPath(template), try encode(a, head));
+    try store.advanceLineage(head, 32);
+    const restarted = try parse(Store.LineageWork, a, (try store.backend.get(store.backend.ptr, a, work_path)).?);
+    const first_page = try store.backend.scan(store.backend.ptr, a, prefix, null, 26);
+    try std.testing.expectEqualStrings(first_page.rows[first_page.rows.len - 1].key[prefix.len..], restarted.after.?);
+    try std.testing.expectEqual(head.revision, restarted.stamp.revision);
+    try std.testing.expect(try store.backend.get(store.backend.ptr, a, legacy_path) == null);
+    var turns: usize = 0;
+    while (!qualifiedHead((try store.head(template)).?)) : (turns += 1) {
+        try std.testing.expect(turns < 16);
+        try store.advanceLineage((try store.head(template)).?, 32);
+    }
+    const final = (try store.head(template)).?;
+    var bytes: u64 = 0;
+    graph_bytes = 0;
+    const all = try store.backend.scan(store.backend.ptr, a, prefix, null, 256);
+    for (all.rows) |row| {
+        bytes += row.value.len;
+        const suffix = row.key[prefix.len..];
+        const separator = std.mem.indexOfScalar(u8, suffix, '/').?;
+        if (Store.graphKind(std.meta.stringToEnum(Kind, suffix[0..separator]).?)) graph_bytes += row.value.len;
+    }
+    try std.testing.expectEqual(bytes, final.bytes);
+    try std.testing.expectEqual(graph_bytes, (try store.queryGraph(final)).bytes);
+    try std.testing.expectEqual(head.revision, final.revision);
+    try std.testing.expectEqual(@as(u32, 9), final.min_text_chars);
+    var rows = memory.rows.iterator();
+    while (rows.next()) |row| try validatePortableRow(a, row.key_ptr.*, row.value_ptr.*);
 }

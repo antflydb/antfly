@@ -2881,8 +2881,8 @@ No request advances owner work. Final head, source and authorization fences rema
 independent. Full rebuilding is reserved for initial enrollment, format upgrade,
 oversized invalidations, or ingestion falling behind retained history.
 
-This generation uses Lite reader 28, topology protocol 67, metadata bootstrap v20,
-and Lite query-pin enrollment v8. Legacy v12-v19 declaration/profile proofs remain
+This generation uses Lite reader 29, topology protocol 68, metadata bootstrap v21,
+and Lite query-pin enrollment v9. Legacy v12-v20 declaration/profile proofs remain
 valid during dependency backfill; older pin projections use exact fallback
 until their owner publishes format 5. Older native readers refuse the new floor.
 A profile enrollment epoch also drives bounded retirement cleanup, so replacing
@@ -3053,8 +3053,8 @@ The recent-source and checkpoint regressions add these operation-count bounds:
   coherent fields, compare/publication fencing, immutable dependencies and
   constant cache charges.
 
-Projection format remains 5. Legacy content qualification adds the reader-28 /
-topology-67 / bootstrap-v20 / Lite-enrollment-v8 durable contract described below.
+Projection format remains 5. Legacy content qualification adds the reader-29 /
+topology-68 / bootstrap-v21 / Lite-enrollment-v9 durable contract described below.
 
 Native heads carry `lineage_version: 1` only when their base content is known.
 New adoption hashes the full initial namespace; ordinary edits inherit the
@@ -3065,18 +3065,21 @@ lookup, bypassing composed, membership, terminal and invalidation-plan caches an
 published graph projections. Hashing an edit over an unknown base never grants
 cache eligibility.
 
-Qualification is owner-only, bounded and resumable through `lineage-v1/` work.
+Qualification is owner-only, bounded and resumable through `lineage-v2/` work.
 Each turn hashes at most 128 individual native records within its work limit,
 retaining only a short relative cursor and a SHA-256 chain. Raw records are
 hashed in stable key order with Antfly SHA-256; no namespace scan occurs in a
-foreground query or ordinary mutation. The owner restarts if the head changes
-between turns. Final publication rechecks the exact revision/fingerprint cut,
+foreground query or ordinary mutation. Each mutation atomically advances a matching
+work fence and folds old/new values for processed records into the SHA chain.
+Edits ahead of the cursor are observed by the later scan. Tracked edits preserve
+progress; untracked writes or restored cuts with a mismatched fence still restart
+safely. Final publication rechecks the exact revision/fingerprint cut,
 publishes a content-qualified head and graph/routing stamps, resets the journal
 origin and barrier, and retires the cursor in the same transaction. Old graph
 projections then rebuild through their existing bounded owner path. The logical
 curation revision does not change. Portable snapshots validate the work cursor;
-reader 28 / topology 67 gate the durable marker and work rows. Existing
-v12-v19 declaration/profile proofs remain usable during this work.
+reader 29 / topology 68 gate the durable marker and work rows. Existing
+v12-v20 declaration/profile proofs remain usable during this work.
 
 Large negative proofs share only immutable sorted invalidation digests, keyed by
 qualified namespace origin plus exact baseline/current graph and journal cuts.
@@ -3093,7 +3096,7 @@ Additional deterministic regressions:
 - Divergent legacy destinations that formerly returned zero distinct pins in
   the second destination now return the exact result of one. Both qualification
   before the first edit and edits before qualification are covered; reads remain
-  free of writes throughout backfill, and partial work restarts after mutation.
+  free of writes throughout backfill, and partial work tracks committed mutations.
 - Twenty pages at one unchanged head after 128 retained events formerly repeated
   2,560 compact-journal reads out of 2,940 total native reads. After the first
   preparation, they perform zero additional compact reads and 380 total reads.
@@ -3145,3 +3148,33 @@ For 20 warm public queries after 128 retained events, coverage seeks fall from
 Returned rows change from 7,140 to 7,280: batching reduces repeated seeks while
 retaining bounded overread. Tests cover all-positive dense pages, sparse gaps,
 byte-limit backoff, event-scratch poisoning and fresh coverage after deletion.
+
+
+Live upgrades retain qualification progress under ordinary edits. The version-2
+work row holds a relative record cursor, bounded SHA-256 transcript, exact byte
+counters and a revision/fingerprint fence. Foreground edits at or behind the
+cursor hash the record suffix and full old/new values with distinct scan/edit
+domains, adjust processed counters, and commit the new work fence with the head.
+Edits ahead of the cursor are picked up by the scan. Inserts, deletes, updates
+and header-only edits are covered; there is no catch-up queue or namespace scan
+on the writer path, and qualification remains owner-only.
+
+The transcript binds every processed record and its later mutations; it need
+not be a canonical fingerprint shared by differently interleaved histories.
+Final publication remains fenced on the exact current head, binds its semantic
+header fields, and resets graph/routing ancestry and the journal barrier as
+before. Unknown or mismatched work is never treated as a qualified base.
+Historical `lineage-v1` rows remain portable and are retired by bounded owner
+work rather than reused as v2 certificates. Reader 29, topology 68, metadata
+bootstrap v21 and Lite enrollment v9 gate the new durable contract; v12-v20 read
+proofs remain available while owner work runs. Already qualified heads retain
+their existing qualification and projection format 5.
+
+The live-upgrade fixture has 256 records and one suppression toggle between
+owner turns. Previously 64 turns reread 7,808 rows without advancing beyond the
+first chunk. Qualification now completes in three turns and reads each original
+record once while 64 edits continue. Mutation tracking adds no record scans;
+ordinary pin-maintenance scans match an identical qualified control namespace.
+Tests check processed byte counters against native row censuses, mutations on
+both sides of the cursor, header-only edits, legacy-work retirement, untracked
+cut restart and portable-row validation.

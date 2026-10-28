@@ -2700,7 +2700,7 @@ Fallback canonicalization decodes each hop in resettable scratch and keeps only
 bounded digest history, so valid long-key paths work with cached membership or
 streaming fallback. Source and final grant fences remain independent. These
 changes preserve projection format 5; the new journal contract advances Lite to
-reader 28, topology to 67, metadata bootstrap to v20 and Lite enrollment to v8.
+reader 29, topology to 68, metadata bootstrap to v21 and Lite enrollment to v9.
 See `RESOLUTION.md` for bounded maintenance, measurements and fallback rules.
 
 Recent routing-source discovery intersects a frozen sorted digest set from the
@@ -2723,8 +2723,8 @@ publication on the exact head, and publishes a qualified lineage without changin
 the logical curation revision. Ordinary edits preserve an unqualified state;
 read-only queries remain exact and perform no migration writes. This also covers
 older nonzero fingerprints derived from unknown zero-fingerprint bases. The
-qualification marker and resumable work use Lite reader 28, topology 67, metadata
-bootstrap v20 and Lite enrollment v8; projection format remains 5.
+qualification marker and resumable work use Lite reader 29, topology 68, metadata
+bootstrap v21 and Lite enrollment v9; projection format remains 5.
 
 Immutable invalidation preparation is shared across candidate pages at the same
 qualified baseline/current head pair. It uses the existing decoded cache budget
@@ -2750,3 +2750,15 @@ truncating matches. Pages are independent of frozen history and event I/O and do
 not survive the request. Both native point reads and scan calls are measured:
 the 128-event/20-query fixture retains 380 point reads while scans drop from
 6,480 to 280, with coverage seeks dropping from 6,340 to 140.
+
+
+Legacy qualification now preserves progress during continuous edits. A version-2
+control row tracks processed records through a bounded Antfly SHA-256 transcript;
+mutations behind the cursor fold in full old/new values and exact byte deltas,
+while later records are read at their current values. The cursor and fence update
+atomically with each native edit, without a foreground namespace scan or an
+unbounded catch-up queue. Final publication still fences the exact current head.
+Untracked cuts restart safely; historical v1 work is retired rather than trusted.
+The 256-record upgrade fixture qualifies in three owner turns under ongoing edits,
+instead of repeatedly hashing the same prefix. The durable gates are reader 29,
+topology 68, metadata bootstrap v21 and Lite enrollment v9.
