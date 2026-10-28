@@ -1979,3 +1979,19 @@ source snapshots, scale/test logs, independent counter probes and the preserved
 compaction experiment. All 27 prior artifact hashes verify before the manifest
 is archived and extended. Artifact integrity is independently verified; none of
 these hashes changes the failed qualification status.
+
+
+## Retirement after the native latency experiments
+
+The six `antfly-1278-g-mvnf29dvfe41-{1,2,3}-{b,c}` disposable stacks were deleted
+under the existing post-test authorization. The final account inventory finds
+zero scoped Workers, Durable Object namespaces (including all original namespace
+IDs), Queues/DLQs or R2 buckets. The prior inventory contained 24 Workers, 18
+namespaces, 12 queues and six buckets. Disposable API-token files were removed.
+Reports and frozen bundle provenance remain local, and the 300 reserved cold
+attempts were never used. This is cleanup, not successful qualification; a new
+run needs freshly provisioned stacks.
+
+The [latency experiment record](cloudflare-latency-experiments.md) describes
+measured outcomes and teardown safeguards. The proposed next implementation
+order is in [Cloudflare runtime architecture steps](cloudflare-runtime-target.md).

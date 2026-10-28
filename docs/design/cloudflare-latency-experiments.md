@@ -238,7 +238,8 @@ run settle with matching repeated hashes, but independent invocation counts and
 transport/acknowledgement/version reconciliation remain incomplete. Live capture
 also has gaps. No resource failure is observed in available live journals or
 client responses; incomplete coverage cannot establish an exhaustive zero.
-All owned tail sessions are removed, all six stacks are paused/sealed, the
+At measurement completion, all owned tail sessions were removed, all six stacks
+were paused/sealed, the
 approved control bundles are unchanged, and all 300 reserved cold epochs remain
 unused. The 512-document preparation failure and prior 108-artifact gate evidence
 remain preserved separately from this experiment's content-addressed manifest.
@@ -249,3 +250,30 @@ authority validation. The scheduling experiment alone does not implement that
 full plan. Keep the inline-body tradeoff opt-in until bulk publication and the
 unchanged full-size gate are qualified; placement is not a substitute for
 reducing dependent storage waves.
+
+
+## Post-test resource retirement
+
+Following the already approved post-test cleanup, all six disposable stacks were
+removed. Account API inventory verifies absence of their 24 Workers, 18 original
+Durable Object namespaces, 12 Queues/DLQs and six R2 buckets. No other
+`antfly-1278-` test Workers, buckets or queues were found. The six local disposable
+API-token files were removed. Local reports and frozen bundle provenance remain
+preserved; the old cold reservations were never used. Future qualification must
+provision fresh stacks rather than reuse deleted run manifests.
+
+Cleanup uses a standalone authenticated R2-only Worker, stops producers before
+emptying storage, bounds work to 1,000 deleted objects/eight list steps per
+invocation with a two-second continuation headroom check, and requires a final
+empty invocation before bucket deletion. Pending storage calls can outlast the
+headroom check; it does not cancel or falsely acknowledge them. Bounded retries
+handle lost drain acknowledgements without claiming exact deletion counts.
+The adapter may return fewer list entries than requested. All 273 Node tests
+pass, including scope/auth rejection, short-page batching, failed deletion,
+ambiguous response handling and bounded retry/page limits.
+
+[R2 retained storage](https://developers.cloudflare.com/r2/pricing/) can remain
+billable while compute is paused. Account-wide subscription charges and usage
+already incurred are separate from deletion; see
+[Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/).
+The cleanup verifies resource absence, not a zero account invoice.
