@@ -132,8 +132,8 @@ def sync_detailed(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `resources.inference.admission.max_work_units` is positive—16 MiB times that capacity. A zero
-    configured
+    `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+    (derived from request concurrency when omitted). A zero configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
@@ -198,8 +198,8 @@ def sync(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `resources.inference.admission.max_work_units` is positive—16 MiB times that capacity. A zero
-    configured
+    `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+    (derived from request concurrency when omitted). A zero configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
@@ -259,8 +259,8 @@ async def asyncio_detailed(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `resources.inference.admission.max_work_units` is positive—16 MiB times that capacity. A zero
-    configured
+    `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+    (derived from request concurrency when omitted). A zero configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
@@ -323,8 +323,8 @@ async def asyncio(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `resources.inference.admission.max_work_units` is positive—16 MiB times that capacity. A zero
-    configured
+    `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+    (derived from request concurrency when omitted). A zero configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and

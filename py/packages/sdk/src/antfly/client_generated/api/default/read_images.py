@@ -137,8 +137,8 @@ def sync_detailed(
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero
-    concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -212,8 +212,8 @@ def sync(
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero
-    concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -282,8 +282,8 @@ async def asyncio_detailed(
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero
-    concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -355,8 +355,8 @@ async def asyncio(
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero
-    concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess

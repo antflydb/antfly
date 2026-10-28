@@ -13825,8 +13825,8 @@ paths:
 
         to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
 
-        `resources.inference.admission.max_work_units` is positive—16 MiB times that capacity. A zero
-        configured
+        `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+        (derived from request concurrency when omitted). A zero configured
 
         download limit disables nonempty media. Remote URL byte potential is reserved before
 
@@ -14264,7 +14264,8 @@ paths:
 
         pixels are admitted at a conservative 16 bytes per pixel against the lower of
 
-        512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero concurrency
+        512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+        capacity
 
         setting still uses the finite 512 MiB ceiling. The reservation grows atomically
 
@@ -66549,10 +66550,11 @@ components:
             and the connection is pinned to a vetted address. Setting it to false explicitly opts into
             private and special destinations. Across generate, dense embed, multimodal rerank, and batch
             generation, downloaded and inline encoded media is capped cumulatively per request at the
-            lower of 100 MiB, max_download_size_bytes, and—when resources.inference.admission.max_concurrent_requests
-            is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media.
-            Remote URL byte potential is reserved before fetch, while inline sources use their actual
-            encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel
+            lower of 100 MiB, max_download_size_bytes, and—when resources.inference.admission.max_work_units
+            is positive—16 MiB times that effective work capacity (which defaults to request concurrency
+            when max_work_units is omitted); zero max_download_size_bytes disables nonempty media. Remote
+            URL byte potential is reserved before fetch, while inline sources use their actual encoded
+            size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel
             admission before model execution. Batch generation accepts bounded image and audio media parts
             and rejects malformed or unsupported parts before dispatch. Embedded direct transcription
             and extraction use the configured encoded-media per-call ceiling, and direct dense embedding
