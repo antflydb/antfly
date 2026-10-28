@@ -13554,7 +13554,7 @@ paths:
     post:
       summary: Chunk content with optional model-aware embeddings
       description: >
-        Splits content into chunks. Without `embedding`, the fixed chunker and
+        Splits content into chunks. Without `embedding` or `outputs`, the fixed chunker and
 
         legacy response remain unchanged. With `embedding`, the resolved target
 
@@ -13578,6 +13578,29 @@ paths:
         Continuations bind the original source version and semantic plan;
 
         retries may deterministically recompute and must deduplicate chunk IDs.
+
+
+        Named `outputs` independently embed, transcribe, classify, or diarize
+
+        each source. A `diarize` target returns source-scoped `speaker_spans`
+
+        without ASR. On transcription outputs, `diarize: true` enables the same
+
+        source-scoped voice identities. Set `policy.audio_speaker_turns: true`
+
+        with a diarization-enabled boundary target to split audio at detected
+
+        turns while respecting model limits. Speaker analysis runs before the
+
+        first chunk only as far as that chunk requires; matching outputs share
+
+        embeddings and timelines. Continuations reuse cached speaker state and
+
+        boundary directories, with durable checkpoints for recovery. Adding speaker
+
+        annotations alone preserves parent IDs; enabling speaker boundaries
+
+        binds the speaker model revision and settings into the plan.
 
 
         ## Models
@@ -36300,6 +36323,46 @@ components:
           default: false
           description: Return explicit per-chunk failures and gaps instead of aborting on the first non-retryable
             embedding failure.
+    ChunkDiarizationConfig:
+      type: object
+      description: Source-wide online speaker clustering on a fixed 1.5 s grid with 3 s embedding windows.
+        Identities are stable within a source and recipe. Silence and ambiguous voices remain unassigned.
+        Analysis advances incrementally; admitted cached timelines and durable centroid/sample-position
+        checkpoints are shared across matching outputs and continuations. Missing checkpoints reconstruct
+        the required prefix deterministically.
+      properties:
+        model:
+          type: string
+          description: Speaker ONNX registry reference; defaults to 3D-Speaker CAM++. For kind=diarize
+            the target model selects the speaker model.
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Optional SHA-256 pin of the speaker ONNX file, including when paired with a transcription
+            model.
+        similarity_threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0.45
+        ambiguity_margin:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0.03
+        min_rms:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0.01
+        max_speakers:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 64
     ChunkOutputTarget:
       type: object
       required:
@@ -36317,6 +36380,7 @@ components:
             - embedding
             - transcribe
             - classify
+            - diarize
         model:
           type: string
           minLength: 1
@@ -36362,6 +36426,12 @@ components:
         diarize:
           type: boolean
           default: false
+          description: Convenience option on transcription outputs; enables source-wide diarization with
+            the default speaker model.
+        diarization:
+          description: Speaker settings for diarize or transcribe outputs; also accepted on the selected
+            audio embedding boundary with audio_speaker_turns=true.
+          $ref: '#/components/schemas/ChunkDiarizationConfig'
         top_k:
           type: integer
           minimum: 1
@@ -36445,6 +36515,13 @@ components:
           type: integer
           minimum: 0
           default: 0
+        audio_speaker_turns:
+          type: boolean
+          default: false
+          description: Split audio chunks at detected speaker transitions, additionally respecting the
+            boundary model limits. Requires a diarization-enabled boundary target, zero overlap_ns and
+            zero audio_pause_ns. The boundary diarization recipe participates in plan identity. Analysis
+            runs even with execute=false because these boundaries depend on audio inference.
         audio_pause_ns:
           type: integer
           format: int64
@@ -42597,6 +42674,8 @@ components:
         transcribe:
           $ref: '#/components/schemas/MediaOutputCoverageValues'
         classify:
+          $ref: '#/components/schemas/MediaOutputCoverageValues'
+        diarize:
           $ref: '#/components/schemas/MediaOutputCoverageValues'
     EnrichmentRuntimeStatus:
       type: object
@@ -64473,6 +64552,11 @@ components:
       description: Original-source coordinates; time intervals are half-open integer nanoseconds and text
         spans are UTF-8 byte offsets.
       properties:
+        speaker_index:
+          type: integer
+          minimum: 0
+          description: Source-scoped speaker of a chunk made with audio_speaker_turns; omitted for unassigned
+            intervals.
         kind:
           type: string
           enum:
@@ -64589,6 +64673,23 @@ components:
         input_tokens:
           type: integer
           minimum: 0
+    ChunkSpeakerSpan:
+      type: object
+      required:
+        - start_ns
+        - end_ns
+      properties:
+        start_ns:
+          type: integer
+          format: int64
+        end_ns:
+          type: integer
+          format: int64
+        speaker_index:
+          type: integer
+          minimum: 0
+          description: Source-scoped voice index in order of first appearance; absent for silence or ambiguous
+            audio.
     ChunkTranscriptSpan:
       type: object
       required:
@@ -64607,8 +64708,8 @@ components:
         speaker_index:
           type: integer
           minimum: 0
-          description: Speaker index local to this output sub-window; global identities require diarization
-            stitching.
+          description: Source-scoped when the output carries speaker_scope=source. Older receipts without
+            that marker use sub-window-local numbering.
     ChunkOutputLabel:
       type: object
       required:
@@ -64633,6 +64734,22 @@ components:
         - sub_index
         - status
       properties:
+        speaker_model_revision:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: SHA-256 of the speaker ONNX bytes used for this output. Included in recipe identity
+            for diarization and paired transcription or embedding boundaries.
+        speaker_scope:
+          type: string
+          enum:
+            - source
+          description: Speaker indices are shared across all windows of this source and diarization recipe.
+        speaker_spans:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChunkSpeakerSpan'
+          description: Timed voice annotations for kind=diarize, including unassigned intervals. No transcript
+            is required.
         name:
           type: string
         kind:
@@ -64641,6 +64758,7 @@ components:
             - embedding
             - transcribe
             - classify
+            - diarize
         required:
           type: boolean
         model:

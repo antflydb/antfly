@@ -4010,6 +4010,11 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
     media_audio_plan_store: @import("../pipelines/media_audio_plan.zig").Store = .{},
+    media_speaker_store: @import("../pipelines/media_speaker_state.zig").Store = .{},
+    speaker_flights: @import("../pipelines/media_speaker_flights.zig").Registry = .{},
+    speaker_revision_cache: @import("../pipelines/speaker_revision_cache.zig").Cache = .{},
+    speaker_analysis_preprocess_runs: std.atomic.Value(u64) = .init(0),
+    speaker_analysis_model_runs: std.atomic.Value(u64) = .init(0),
     metrics: metrics_mod.Metrics,
     inference_admission: inference_admission_mod.InferenceAdmission,
     /// Live streaming transcription sessions (voice API).
@@ -4278,6 +4283,8 @@ pub const Node = struct {
         self.document_artifacts.deinit(self.allocator);
         self.model_manager.setHostCacheReclaimer(null);
         self.media_index_cache.deinit();
+        self.speaker_flights.deinit(self.allocator);
+        self.speaker_revision_cache.deinit(self.allocator);
         // Sessions hold only PCM buffers; drop them before any runtime teardown.
         self.transcription_sessions.deinit();
         var silero_it = self.silero_weights.iterator();
@@ -10668,27 +10675,55 @@ pub const Node = struct {
         return error.SpeakerModelUnavailable;
     }
 
+    fn resolveChunkSpeakerPath(self: *Node, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const ref = try registry_mod.ModelRef.parse(name);
+        if (!std.mem.endsWith(u8, ref.variant, ".onnx")) return error.UnsupportedSpeakerModel;
+        const dir = try registry_mod.modelInstallDirAlloc(a, self.config.models_dir, ref);
+        defer a.free(dir);
+        const path = try std.fs.path.join(a, &.{ dir, ref.variant });
+        if (dirExists(path)) return path;
+        a.free(path);
+        const fallback = try std.fs.path.join(a, &.{ self.config.models_dir, ref.owner, ref.name, ref.variant });
+        if (dirExists(fallback)) return fallback;
+        a.free(fallback);
+        return error.SpeakerModelUnavailable;
+    }
+    fn chunkSpeakerRevision(self: *Node, path: []const u8, io: std.Io, control: InferenceExecutionControl) ![64]u8 {
+        return self.speaker_revision_cache.get(self.allocator, path, io, control);
+    }
+    fn pinnedSpeakerEmbedder(self: *Node, a: std.mem.Allocator, path: []const u8, revision: [64]u8, io: std.Io, control: InferenceExecutionControl) !*speaker_embedding_mod.Embedder {
+        const key = try std.fmt.allocPrint(a, "{s}:{s}", .{ path, revision });
+        defer a.free(key);
+        if (!std.mem.eql(u8, &revision, &try self.chunkSpeakerRevision(path, io, control))) return error.ModelConfigurationChanged;
+        const embedder = try self.cachedSpeakerEmbedder(path, key);
+        if (!std.mem.eql(u8, &revision, &try self.chunkSpeakerRevision(path, io, control))) return error.ModelConfigurationChanged;
+        return embedder;
+    }
+
     /// The loaded default speaker model, shared across requests. The graph
     /// import takes seconds, so it runs outside the map lock; a concurrent
     /// first request may import twice and the later copy is dropped.
     fn speakerEmbedder(self: *Node) !*speaker_embedding_mod.Embedder {
         const model_path = try self.resolveSpeakerModelPath();
         defer self.allocator.free(model_path);
+        return self.cachedSpeakerEmbedder(model_path, model_path);
+    }
+    fn cachedSpeakerEmbedder(self: *Node, model_path: []const u8, cache_key: []const u8) !*speaker_embedding_mod.Embedder {
         {
             spinLock(&self.speaker_embedders_lock);
             defer self.speaker_embedders_lock.unlock();
-            if (self.speaker_embedders.get(model_path)) |embedder| return embedder;
+            if (self.speaker_embedders.get(cache_key)) |embedder| return embedder;
         }
         var loaded = try speaker_embedding_mod.Embedder.load(self.allocator, model_path);
         errdefer loaded.deinit();
         const owned = try self.allocator.create(speaker_embedding_mod.Embedder);
         errdefer self.allocator.destroy(owned);
         owned.* = loaded;
-        const key = try self.allocator.dupe(u8, model_path);
+        const key = try self.allocator.dupe(u8, cache_key);
         errdefer self.allocator.free(key);
         spinLock(&self.speaker_embedders_lock);
         defer self.speaker_embedders_lock.unlock();
-        if (self.speaker_embedders.get(model_path)) |existing| {
+        if (self.speaker_embedders.get(cache_key)) |existing| {
             self.allocator.free(key);
             owned.deinit();
             self.allocator.destroy(owned);
@@ -13325,14 +13360,14 @@ pub const Node = struct {
         const consumers: *MediaOutputExecution = @ptrCast(@alignCast(request.output_executor.?.context));
         const index = try consumers.boundaryIndex();
         const resolved = consumers.resolved[index];
-        const identity = try std.fmt.allocPrint(a, "antfly-transcriber-boundary-v1:{s}:whisper-30s", .{resolved.identity});
+        const identity = if (consumers.config.targets[index].kind == .diarize) try std.fmt.allocPrint(a, "antfly-speaker-boundary-v1:{s}:30s", .{resolved.identity}) else try std.fmt.allocPrint(a, "antfly-transcriber-boundary-v1:{s}:whisper-30s", .{resolved.identity});
         defer a.free(identity);
         const Planner = struct {
             fn describe(raw: *anyopaque) chunks.EmbeddingContext {
                 const active: *MediaOutputExecution = @ptrCast(@alignCast(raw));
                 const boundary_index = active.boundaryIndex() catch unreachable;
                 const target_config = active.config.targets[boundary_index];
-                return .{ .model = target_config.model, .model_identity = active.resolved[boundary_index].identity, .model_revision = active.resolved[boundary_index].revision, .task_type = "TRANSCRIBE" };
+                return .{ .model = target_config.model, .model_identity = active.resolved[boundary_index].identity, .model_revision = active.resolved[boundary_index].revision, .task_type = if (target_config.kind == .diarize) "DIARIZE" else "TRANSCRIBE" };
             }
             fn count(_: *anyopaque, _: []const u8) anyerror!usize {
                 return error.UnsupportedChunkMediaType;
@@ -13396,7 +13431,7 @@ pub const Node = struct {
 
     fn chunkAndEmbedAdmitted(self: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, supplied_request: @import("../pipelines/media_chunking.zig").Request, target: @import("chunk_response.zig").Target, sink: @import("../pipelines/media_chunking.zig").Sink) anyerror!@import("chunk_response.zig").Execution {
         var request = supplied_request;
-        if (request.native_source != null) self.model_manager.setHostCacheReclaimer(.{ .context = &self.media_index_cache, .reclaim = @import("../pipelines/media_index_cache.zig").Cache.reclaim });
+        self.model_manager.setHostCacheReclaimer(.{ .context = &self.media_index_cache, .reclaim = @import("../pipelines/media_index_cache.zig").Cache.reclaim });
         const IndexAdmission = struct {
             fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
                 const manager: *model_manager_mod.ModelManager = @ptrCast(@alignCast(raw));
@@ -13411,7 +13446,14 @@ pub const Node = struct {
             defer consumers.deinit(a);
             request.output_executor = .{ .context = &consumers, .execute = MediaOutputExecution.execute };
             const boundary = try outputs_config.boundary();
-            request.transcribe_boundary = boundary.kind == .transcribe;
+            request.transcribe_boundary = boundary.kind == .transcribe or boundary.kind == .diarize;
+            if (request.policy.audio_speaker_turns and !boundary.hasDiarization()) return error.InvalidChunkPolicy;
+            for (outputs_config.targets) |output| if (output.kind == .embedding and output.diarization != null and (!request.policy.audio_speaker_turns or !std.mem.eql(u8, output.name, boundary.name))) return error.InvalidChunkOutputs;
+            consumers.speaker_turns = request.policy.audio_speaker_turns;
+            consumers.speaker_outputs = request.execute_outputs;
+            var needs_speakers = request.policy.audio_speaker_turns;
+            for (outputs_config.targets) |output| needs_speakers = needs_speakers or (output.execute and output.hasDiarization());
+            if ((needs_speakers and request.execute_outputs) or request.policy.audio_speaker_turns) request.speaker_analysis = .{ .context = &consumers, .prepare = MediaOutputExecution.prepareSpeakers, .ensure = MediaOutputExecution.ensureSpeakers, .samples = MediaOutputExecution.speakerSamples, .checkpoint = MediaOutputExecution.checkpointSpeakers, .close = MediaOutputExecution.closeSpeakers, .boundary = if (request.policy.audio_speaker_turns) MediaOutputExecution.speakerBoundary else null, .recipe_id = if (request.policy.audio_speaker_turns) &consumers.resolved[try consumers.boundaryIndex()].recipe_id else null };
             request.audio_boundary = request.transcribe_boundary or consumers.resolved[try consumers.boundaryIndex()].uses_audio;
             for (consumers.resolved[0..consumers.initialized]) |value| if (value.uses_audio and value.failure == null) {
                 request.needs_audio = true;
@@ -13419,7 +13461,7 @@ pub const Node = struct {
             };
 
             if (request.transcribe_boundary or !boundary.execute) request.execute = false;
-            return self.chunkAndEmbedAdmitted(a, io, supplied, request, .{ .model = boundary.model, .model_identity = boundary.model_identity, .task_type = if (boundary.kind == .transcribe) "TRANSCRIBE" else boundary.task_type, .dimensions = boundary.dimensions }, sink);
+            return self.chunkAndEmbedAdmitted(a, io, supplied, request, .{ .model = boundary.model, .model_identity = boundary.model_identity, .task_type = if (boundary.kind == .diarize) "DIARIZE" else if (boundary.kind == .transcribe) "TRANSCRIBE" else boundary.task_type, .dimensions = boundary.dimensions }, sink);
         };
         inline for (@typeInfo(@import("../pipelines/media_chunk_limits.zig").Limits).@"struct".field_names) |name| @field(request.limits, name) = @min(@field(request.limits, name), @field(self.config.chunking_limits, name));
         request.max_working_bytes = @min(request.max_working_bytes, request.limits.max_working_bytes);
@@ -13590,7 +13632,7 @@ pub const Node = struct {
             }
             return ctx.status(if (err == error.StaleChunkContinuation or err == error.EmbeddingIdentityMismatch or err == error.SourceVersionChanged) @as(u16, 409) else if (err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable) @as(u16, 503) else @as(u16, 400)).json(.{ .@"error" = @errorName(err), .message = "model-aware chunk request could not be initialized" });
         };
-        return results.finish(ctx, try results.response(request, if (boundary) |value| .{ .model = value.model, .task_type = if (value.kind == .transcribe) "TRANSCRIBE" else value.task_type, .dimensions = value.dimensions, .model_identity = value.model_identity } else target, execution));
+        return results.finish(ctx, try results.response(request, if (boundary) |value| .{ .model = value.model, .task_type = if (value.kind == .diarize) "DIARIZE" else if (value.kind == .transcribe) "TRANSCRIBE" else value.task_type, .dimensions = value.dimensions, .model_identity = value.model_identity } else target, execution));
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -45352,15 +45394,74 @@ test "model aware media output generation rejects an alias replacement before ex
 }
 
 const MediaOutputExecution = struct {
+    const speakers = lib_chunker.diarization;
+    const speaker_checkpoint = @import("../pipelines/media_speaker_state.zig");
+    const audio_providers = @import("../pipelines/media_chunking_audio.zig");
+    const SpeakerState = struct {
+        registry: speakers.Registry = .{},
+        timeline: speaker_checkpoint.timeline.Timeline = .{},
+        embedder: ?*speaker_embedding_mod.Embedder = null,
+        identity: [32]u8 = undefined,
+        cacheable: bool = false,
+        next_window: u64 = 0,
+        covered_samples: u64 = 0,
+        total_samples: ?u64 = null,
+        complete: bool = false,
+        valid: bool = true,
+        memory_window: u64 = 0,
+        disk_window: u64 = 0,
+        disk_cursor: ?speaker_checkpoint.DiskCursor = null,
+        borrowed: ?*@import("../pipelines/media_index_cache.zig").Cache.Entry = null,
+        fn snapshot(self: *const @This(), rate: u32) speaker_checkpoint.Snapshot {
+            return .{ .registry = &self.registry, .shared = self.timeline.view(), .sample_rate = rate, .next_window = self.next_window, .covered_samples = self.covered_samples, .total_samples = self.total_samples, .complete = self.complete };
+        }
+        fn borrowComplete(self: *@This(), a: std.mem.Allocator, entry: *@import("../pipelines/media_index_cache.zig").Cache.Entry) !void {
+            std.debug.assert(entry.data.speaker_analysis.complete);
+            try self.restore(a, entry.data.speaker_analysis);
+            self.borrowed = entry;
+        }
+        fn restore(self: *@This(), a: std.mem.Allocator, saved: speaker_checkpoint.Snapshot) !void {
+            try saved.validate();
+            std.debug.assert(self.borrowed == null);
+            if (saved.shared) |view| try self.timeline.restore(a, view) else {
+                var fresh = self.timeline;
+                fresh.blocks = .empty;
+                fresh.count = 0;
+                errdefer fresh.deinit(a);
+                // Disk snapshots retain every recorded boundary, including
+                // adjacent identical labels accepted by older checkpoint codecs.
+                for (saved.spans) |span| try fresh.appendRecorded(a, span);
+                self.timeline.deinit(a);
+                self.timeline = fresh;
+            }
+            self.registry.count = saved.registry.count;
+            @memcpy(self.registry.sums[0..saved.registry.count], saved.registry.sums[0..saved.registry.count]);
+            self.next_window = saved.next_window;
+            self.covered_samples = saved.covered_samples;
+            self.total_samples = saved.total_samples;
+            self.complete = saved.complete;
+        }
+    };
     const chunks = @import("../pipelines/media_chunking.zig");
     const outputs = lib_chunker.outputs;
-    const Resolved = struct { path: []const u8, identity: [64]u8, revision: [64]u8, recipe_id: [64]u8, max_audio_ns: i64 = 30 * std.time.ns_per_s, failure: ?anyerror = null, uses_audio: bool = false, uses_video: bool = false, classifier_profile: ?@import("../models/media_classifier_profile.zig").Profile = null };
+    const Resolved = struct { speaker_path: ?[]const u8 = null, speaker_revision: [64]u8 = @splat(0), path: []const u8, identity: [64]u8, revision: [64]u8, recipe_id: [64]u8, max_audio_ns: i64 = 30 * std.time.ns_per_s, failure: ?anyerror = null, uses_audio: bool = false, uses_video: bool = false, classifier_profile: ?@import("../models/media_classifier_profile.zig").Profile = null };
     node: *Node,
     io: std.Io,
     control: InferenceExecutionControl,
     config: outputs.Config,
     resolved: [16]Resolved = undefined,
     initialized: usize = 0,
+    allocator: std.mem.Allocator = undefined,
+    allow_partial: bool = false,
+    speakers_prepared: bool = false,
+    speaker_turns: bool = false,
+    speaker_outputs: bool = true,
+    speaker_states: [16]?*SpeakerState = @splat(null),
+    speaker_lease: ?runtime.tier.memory.AdmissionLease = null,
+    speaker_provider: ?audio_providers.Provider = null,
+    speaker_fork: ?audio_providers.Fork = null,
+    speaker_scratch: std.mem.Allocator = undefined,
+    speaker_cache_admission: ?@import("../pipelines/media_index_cache.zig").Cache.Admission = null,
     frame_arena: ?std.heap.ArenaAllocator = null,
     prepared_frames: [16][32]?[]const f32 = @splat(@splat(null)),
     frame_errors: [16]?anyerror = @splat(null),
@@ -45534,13 +45635,13 @@ const MediaOutputExecution = struct {
     }
     fn init(node: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, config: outputs.Config, allow_partial: bool) !MediaOutputExecution {
         try config.validate();
-        var self = MediaOutputExecution{ .node = node, .io = io, .control = node.bindExecutionControl(io, supplied), .config = config };
+        var self = MediaOutputExecution{ .node = node, .io = io, .control = node.bindExecutionControl(io, supplied), .config = config, .allocator = a, .allow_partial = allow_partial };
         errdefer self.deinit(a);
         for (config.targets, 0..) |target, i| {
             try self.control.check();
             self.resolved[i] = self.resolve(a, target) catch |err| blk: {
                 if (chunks.abort(err) or std.mem.eql(u8, target.name, config.boundary_model) or (target.required and !allow_partial)) return err;
-                break :blk .{ .path = "", .identity = @splat(0), .revision = @splat(0), .recipe_id = try target.recipeIdentity(a, "", ""), .failure = err };
+                break :blk .{ .path = "", .identity = @splat(0), .revision = @splat(0), .recipe_id = if (target.hasDiarization()) try target.speakerRecipeIdentity(a, "", "", "") else try target.recipeIdentity(a, "", ""), .failure = err };
             };
             self.initialized += 1;
         }
@@ -45551,10 +45652,310 @@ const MediaOutputExecution = struct {
         }
         return self;
     }
+    fn wantsSpeakerAnalysis(self: *const MediaOutputExecution, target: outputs.Target) bool {
+        return target.hasDiarization() and ((self.speaker_outputs and target.execute) or (self.speaker_turns and std.mem.eql(u8, target.name, self.config.boundary_model)));
+    }
+    fn speakerState(self: *MediaOutputExecution, name: []const u8) !*SpeakerState {
+        for (self.config.targets, 0..) |target, i| if (std.mem.eql(u8, name, target.name)) return self.speaker_states[i] orelse return error.SpeakerAnalysisUnavailable;
+        return error.InvalidChunkOutputs;
+    }
+    fn speakerBoundary(raw: *anyopaque, start: i64, end: i64) !speakers.Span {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        const state = self.speaker_states[try self.boundaryIndex()] orelse return error.SpeakerAnalysisUnavailable;
+        const stop = state.timeline.turnEnd(start, end);
+        return .{ .start_ns = start, .end_ns = stop, .speaker_index = state.timeline.label(start, stop) };
+    }
+    fn speakerAdmission(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+        const node: *Node = @ptrCast(@alignCast(raw));
+        return node.model_manager.admitHostPreflight(bytes);
+    }
+    fn speakerContext(self: *MediaOutputExecution) speaker_checkpoint.Store.Context {
+        return .{ .store = &self.node.media_speaker_store, .io = self.io, .models_dir = self.node.config.models_dir };
+    }
+    /// A source/model/settings key deliberately excludes output names and ASR
+    /// identities. Matching transcription, boundary and voice outputs share state.
+    fn prepareSpeakers(raw: *anyopaque, scratch: std.mem.Allocator, provider: audio_providers.Provider, budget: usize, source: [32]u8, version: []const u8, cacheable: bool) !void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        if (self.speakers_prepared) return;
+        if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
+        self.speaker_scratch = scratch;
+        self.speaker_provider = provider;
+        self.speaker_cache_admission = .{ .context = self.node, .acquire = speakerAdmission };
+        var identities: [16]?[32]u8 = @splat(null);
+        var groups: usize = 0;
+        for (self.config.targets, 0..) |target, i| {
+            if (!self.wantsSpeakerAnalysis(target) or self.resolved[i].failure != null) continue;
+            identities[i] = try speaker_checkpoint.key(scratch, source, version, &self.resolved[i].speaker_revision, target.speakerConfig(), provider.sample_rate);
+            var duplicate = false;
+            for (identities[0..i]) |prior| if (prior) |identity| {
+                if (std.mem.eql(u8, &identity, &identities[i].?)) duplicate = true;
+            };
+            if (!duplicate) groups += 1;
+        }
+        const bytes = try std.math.mul(usize, groups, @sizeOf(SpeakerState) + speakers.max_spans * @sizeOf(speakers.Span) * 2);
+        if (bytes > budget) return error.ChunkWorkingBudgetExceeded;
+        self.speaker_lease = try self.node.model_manager.admitHostPreflight(bytes);
+        for (identities, 0..) |maybe_identity, i| {
+            const identity = maybe_identity orelse continue;
+            for (identities[0..i], 0..) |prior, j| if (prior) |key| {
+                if (std.mem.eql(u8, &identity, &key)) {
+                    self.speaker_states[i] = self.speaker_states[j];
+                    break;
+                }
+            };
+            if (self.speaker_states[i] != null) continue;
+            const state = try self.allocator.create(SpeakerState);
+            state.* = .{ .identity = identity, .cacheable = cacheable, .total_samples = if (provider.final_samples == null) provider.samples else null };
+            self.speaker_states[i] = state;
+            state.timeline.admission = .{ .context = self.node, .acquire = speakerAdmission };
+            if (!cacheable) continue;
+            var memory_hit = false;
+            if (self.node.media_index_cache.get(identity)) |entry| {
+                defer if (state.borrowed != entry) self.node.media_index_cache.release(entry);
+                if (entry.data == .speaker_analysis) {
+                    memory_hit = true;
+                    if (entry.data.speaker_analysis.complete) try state.borrowComplete(self.allocator, entry) else try state.restore(self.allocator, entry.data.speaker_analysis);
+                    state.memory_window = state.next_window;
+                    state.disk_cursor = self.node.media_index_cache.speakerDisk(identity);
+                    state.disk_window = if (state.disk_cursor) |cursor| cursor.window else 0;
+                }
+            }
+            if (!memory_hit) if (speaker_checkpoint.Store.loadWithCursor(self.speakerContext(), scratch, identity)) |saved| {
+                defer saved.snapshot.deinit(scratch);
+                try state.restore(self.allocator, saved.snapshot);
+                state.disk_cursor = saved.cursor;
+                state.disk_window = saved.cursor.window;
+            } else |_| {};
+            if (state.registry.count > self.config.targets[i].speakerConfig().max_speakers) return error.InvalidSpeakerCheckpoint;
+            if (state.next_window > state.memory_window) {
+                self.node.media_index_cache.remember(std.heap.smp_allocator, identity, .{ .speaker_analysis = state.snapshot(provider.sample_rate) }, self.speaker_cache_admission.?);
+                state.memory_window = state.next_window;
+                if (state.disk_cursor) |cursor| self.node.media_index_cache.recordSpeakerDisk(identity, cursor);
+            }
+        }
+        self.speakers_prepared = true;
+    }
+    fn leader(self: *const MediaOutputExecution, i: usize) bool {
+        const state = self.speaker_states[i] orelse return false;
+        for (self.speaker_states[0..i]) |prior| if (prior == state) return false;
+        return true;
+    }
+    fn speakerFailure(self: *MediaOutputExecution, index: usize, err: anyerror) !void {
+        const state = self.speaker_states[index].?;
+        state.valid = false;
+        var fatal = chunks.abort(err);
+        for (self.config.targets, 0..) |target, i| if (self.speaker_states[i] == state) {
+            self.resolved[i].failure = err;
+            fatal = fatal or (self.speaker_turns and std.mem.eql(u8, target.name, self.config.boundary_model)) or (target.required and !self.allow_partial);
+        };
+        if (fatal) return err;
+    }
+    fn enough(self: *MediaOutputExecution, state: *const SpeakerState, start: i64, end: i64, stop_at_turn: bool) bool {
+        if (!state.valid or state.complete) return true;
+        if (state.timeline.len() == 0) return false;
+        const spans = state.timeline;
+        if (spans.at(spans.len() - 1).end_ns >= end) return true;
+        if (stop_at_turn) {
+            const boundary_state = self.speaker_states[self.boundaryIndex() catch return false] orelse return false;
+            const index = boundary_state.timeline.first(start);
+            if (index + 1 < boundary_state.timeline.len()) {
+                const turn_end = boundary_state.timeline.at(index).end_ns;
+                return spans.at(spans.len() - 1).end_ns >= turn_end;
+            }
+        }
+        return false;
+    }
+    /// Analyze only the prefix needed by this chunk. One embedding per model
+    /// and grid window feeds every clustering configuration that needs it.
+    fn ensureSpeakers(raw: *anyopaque, _: std.mem.Allocator, start: i64, end: i64, stop_at_turn: bool) !void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        if (self.speaker_provider == null) return;
+        const scratch = self.speaker_scratch;
+        const Flights = @import("../pipelines/media_speaker_flights.zig").Registry;
+        // Keep this set stable while the boundary timeline advances: every
+        // participating configuration can consume the same window embedding.
+        var eligible: [16]bool = @splat(false);
+        var keys: [16][32]u8 = undefined;
+        var keys_count: usize = 0;
+        for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
+            eligible[i] = self.leader(i) and !self.enough(state, start, end, stop_at_turn);
+            if (eligible[i] and state.cacheable) {
+                keys[keys_count] = state.identity;
+                keys_count += 1;
+            }
+        };
+        const Ordering = struct {
+            fn less(_: void, left: [32]u8, right: [32]u8) bool {
+                return std.mem.order(u8, &left, &right) == .lt;
+            }
+        };
+        std.mem.sort([32]u8, keys[0..keys_count], {}, Ordering.less);
+        var held: [16]Flights.Lease = undefined;
+        var held_count: usize = 0;
+        defer {
+            // Waiters must see this accepted model prefix before its gate opens.
+            checkpointSpeakers(raw, false);
+            while (held_count != 0) {
+                held_count -= 1;
+                held[held_count].deinit();
+            }
+        }
+        for (keys[0..keys_count]) |key| {
+            held[held_count] = try self.node.speaker_flights.acquire(self.node.allocator, key, self.control);
+            held_count += 1;
+        }
+        for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
+            if (!self.leader(i) or !state.cacheable or self.enough(state, start, end, stop_at_turn)) continue;
+            if (self.node.media_index_cache.get(state.identity)) |entry| {
+                defer self.node.media_index_cache.release(entry);
+                if (entry.data == .speaker_analysis and entry.data.speaker_analysis.next_window > state.next_window) {
+                    try state.restore(self.allocator, entry.data.speaker_analysis);
+                    state.memory_window = state.next_window;
+                }
+                state.disk_cursor = self.node.media_index_cache.speakerDisk(state.identity);
+                state.disk_window = if (state.disk_cursor) |cursor| cursor.window else state.disk_window;
+            }
+        };
+        while (true) {
+            try self.control.check();
+            var ordinal: ?u64 = null;
+            for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
+                if (eligible[i] and !self.enough(state, start, end, stop_at_turn)) ordinal = @min(ordinal orelse std.math.maxInt(u64), state.next_window);
+            };
+            const next_window = ordinal orelse return;
+            if (self.speaker_fork == null) if (self.speaker_provider.?.fork) |fork| {
+                self.speaker_fork = try fork(self.speaker_provider.?.context, scratch);
+                self.speaker_provider = self.speaker_fork.?.provider;
+            };
+            const provider = self.speaker_provider.?;
+            const first = std.math.cast(usize, @as(u128, next_window) * provider.sample_rate * 3 / 2) orelse return error.TimestampOverflow;
+            const requested = @min(provider.samples, try std.math.add(usize, first, try std.math.mul(usize, provider.sample_rate, 3)));
+            var lease = try provider.read(provider.context, scratch, first, requested);
+            defer lease.deinit(scratch);
+            const next = std.math.cast(usize, @as(u128, next_window + 1) * provider.sample_rate * 3 / 2) orelse return error.TimestampOverflow;
+            const step = @min(lease.pcm.samples.len, next - first);
+            if (step == 0) return error.InvalidSpeakerCheckpoint;
+            const known_total = if (provider.final_samples) |length| length(provider.context) else provider.samples;
+            const total: ?u64 = if (known_total) |samples| samples else if (lease.pcm.samples.len < requested - first) first + lease.pcm.samples.len else null;
+            const final = if (total) |samples| first + step >= samples else step == lease.pcm.samples.len;
+            const start_ns = std.math.cast(i64, @as(u128, first) * std.time.ns_per_s / provider.sample_rate) orelse return error.TimestampOverflow;
+            const end_ns = std.math.cast(i64, (@as(u128, first + step) * std.time.ns_per_s + (if (final) @as(u128, provider.sample_rate - 1) else 0)) / provider.sample_rate) orelse return error.TimestampOverflow;
+            var window: ?[]f32 = null;
+            defer if (window) |owned| scratch.free(owned);
+            var energy: f64 = 0;
+            for (lease.pcm.samples[0..step]) |sample| {
+                if (!std.math.isFinite(sample)) return error.InvalidAudio;
+                energy += @as(f64, sample) * sample;
+            }
+            const rms = @sqrt(energy / @as(f64, @floatFromInt(step)));
+            var vectors: [16]?[]f32 = @splat(null);
+            var vector_revisions: [16][64]u8 = undefined;
+            var vector_count: usize = 0;
+            defer for (vectors[0..vector_count]) |vector| if (vector) |owned| scratch.free(owned);
+            for (self.config.targets, 0..) |target, i| {
+                const state = self.speaker_states[i] orelse continue;
+                if (!self.leader(i) or !state.valid or state.complete or state.next_window != next_window or !eligible[i]) continue;
+                state.valid = false; // Publication excludes a partially applied model result.
+                const config = target.speakerConfig();
+                var label: ?u32 = null;
+                if (rms >= config.min_rms) {
+                    var embedding: ?[]f32 = null;
+                    for (vectors[0..vector_count], vector_revisions[0..vector_count]) |vector, revision| if (std.mem.eql(u8, &revision, &self.resolved[i].speaker_revision)) {
+                        embedding = vector;
+                        break;
+                    };
+                    if (embedding == null) {
+                        if (window == null) {
+                            _ = self.node.speaker_analysis_preprocess_runs.fetchAdd(1, .monotonic);
+                            const pcm = try audio_mod.copyOrResample(scratch, lease.pcm.samples, provider.sample_rate, speaker_embedding_mod.sample_rate);
+                            defer scratch.free(pcm);
+                            if (pcm.len == 0) return error.InvalidSpeakerEmbedding;
+                            const owned = try scratch.alloc(f32, speaker_embedding_mod.window_samples);
+                            for (owned, 0..) |*sample, at| sample.* = pcm[at % pcm.len];
+                            window = owned;
+                        }
+                        if (state.embedder == null) state.embedder = self.node.pinnedSpeakerEmbedder(scratch, self.resolved[i].speaker_path.?, self.resolved[i].speaker_revision, self.io, self.control) catch |err| {
+                            try self.speakerFailure(i, err);
+                            continue;
+                        };
+                        _ = self.node.speaker_analysis_model_runs.fetchAdd(1, .monotonic);
+                        embedding = state.embedder.?.embedAlloc(scratch, window.?, self.control) catch |err| {
+                            try self.speakerFailure(i, err);
+                            continue;
+                        };
+                        vectors[vector_count] = embedding;
+                        vector_revisions[vector_count] = self.resolved[i].speaker_revision;
+                        vector_count += 1;
+                    }
+                    label = state.registry.assign(embedding.?, config) catch |err| {
+                        try self.speakerFailure(i, err);
+                        continue;
+                    };
+                }
+                state.timeline.append(self.allocator, .{ .start_ns = start_ns, .end_ns = end_ns, .speaker_index = label }) catch |err| {
+                    try self.speakerFailure(i, err);
+                    continue;
+                };
+                state.next_window += 1;
+                state.covered_samples = first + step;
+                state.total_samples = total orelse state.total_samples;
+                state.complete = final;
+                state.valid = true;
+            }
+            if ((next_window + 1) % 16 == 0) checkpointSpeakers(self, true);
+        }
+    }
+    fn speakerSamples(raw: *anyopaque) ?usize {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        for (self.speaker_states) |maybe_state| if (maybe_state) |state| {
+            if (state.total_samples) |samples| return std.math.cast(usize, samples);
+        };
+        return null;
+    }
+    fn checkpointSpeakers(raw: *anyopaque, durable: bool) void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        const provider = self.speaker_provider orelse return;
+        for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
+            if (!self.leader(i) or !state.valid or !state.cacheable or state.next_window == 0) continue;
+            const snapshot = state.snapshot(provider.sample_rate);
+            if (state.next_window > state.memory_window) {
+                self.node.media_index_cache.remember(std.heap.smp_allocator, state.identity, .{ .speaker_analysis = snapshot }, self.speaker_cache_admission.?);
+                state.memory_window = state.next_window;
+            }
+            if (self.node.media_index_cache.speakerDisk(state.identity)) |cursor| if (cursor.window > state.disk_window) {
+                state.disk_cursor = cursor;
+                state.disk_window = cursor.window;
+            };
+            if (durable and state.next_window > state.disk_window) {
+                const cursor = speaker_checkpoint.Store.saveWithCursor(self.speakerContext(), self.speaker_scratch, state.identity, snapshot, state.disk_cursor) catch continue;
+                state.disk_cursor = cursor;
+                state.disk_window = cursor.window;
+                self.node.media_index_cache.recordSpeakerDisk(state.identity, cursor);
+            }
+        };
+    }
+    fn closeSpeakers(raw: *anyopaque) void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        checkpointSpeakers(raw, true);
+        if (self.speaker_fork) |fork| fork.deinit();
+        self.speaker_fork = null;
+        self.speaker_provider = null;
+    }
     fn resolve(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target) !Resolved {
+        if (target.kind == .diarize) {
+            const path = try self.node.resolveChunkSpeakerPath(a, target.model);
+            errdefer a.free(path);
+            const revision = try self.node.chunkSpeakerRevision(path, self.io, self.control);
+            if (target.speakerConfig().model_identity) |expected| if (!std.mem.eql(u8, expected, &revision)) return error.EmbeddingIdentityMismatch;
+            if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, &revision)) return error.EmbeddingIdentityMismatch;
+            const speaker_path = try a.dupe(u8, path);
+            errdefer a.free(speaker_path);
+            return .{ .path = path, .identity = revision, .revision = revision, .recipe_id = try target.speakerRecipeIdentity(a, &revision, &revision, &revision), .speaker_path = speaker_path, .speaker_revision = revision, .uses_audio = true };
+        }
         const path = try self.node.resolveRequestModelPath(a, self.io, target.model, switch (target.kind) {
             .embedding => "embedders",
             .transcribe => "transcribers",
+            .diarize => unreachable,
             .classify => "classifiers",
         });
         errdefer a.free(path);
@@ -45595,7 +45996,16 @@ const MediaOutputExecution = struct {
             identity = revision;
         }
         if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, &identity)) return error.EmbeddingIdentityMismatch;
-        return .{ .path = path, .identity = identity, .revision = revision, .max_audio_ns = max_audio_ns, .recipe_id = try target.recipeIdentity(a, &identity, &revision), .uses_audio = uses_audio, .uses_video = uses_video, .classifier_profile = classifier_profile };
+        var value = Resolved{ .path = path, .identity = identity, .revision = revision, .max_audio_ns = max_audio_ns, .recipe_id = try target.recipeIdentity(a, &identity, &revision), .uses_audio = uses_audio, .uses_video = uses_video, .classifier_profile = classifier_profile };
+        if (target.hasDiarization()) {
+            const speaker_path = try self.node.resolveChunkSpeakerPath(a, target.speakerModel());
+            errdefer a.free(speaker_path);
+            value.speaker_path = speaker_path;
+            value.speaker_revision = try self.node.chunkSpeakerRevision(speaker_path, self.io, self.control);
+            if (target.speakerConfig().model_identity) |expected| if (!std.mem.eql(u8, expected, &value.speaker_revision)) return error.EmbeddingIdentityMismatch;
+            value.recipe_id = try target.speakerRecipeIdentity(a, &identity, &revision, &value.speaker_revision);
+        }
+        return value;
     }
     fn deinit(self: *MediaOutputExecution, a: std.mem.Allocator) void {
         if (self.frame_cache) |cache| {
@@ -45603,7 +46013,17 @@ const MediaOutputExecution = struct {
             a.destroy(cache);
         }
         if (self.frame_arena) |*arena| arena.deinit();
-        for (self.resolved[0..self.initialized]) |value| if (value.path.len != 0) a.free(value.path);
+        for (self.speaker_states, 0..) |state, i| if (state) |owned| {
+            if (!self.leader(i)) continue;
+            owned.timeline.deinit(a);
+            if (owned.borrowed) |entry| self.node.media_index_cache.release(entry);
+            a.destroy(owned);
+        };
+        if (self.speaker_lease) |*lease| lease.release();
+        for (self.resolved[0..self.initialized]) |value| {
+            if (value.path.len != 0) a.free(value.path);
+            if (value.speaker_path) |speaker_path| a.free(speaker_path);
+        }
     }
     fn boundaryIndex(self: *const MediaOutputExecution) !usize {
         for (self.config.targets, 0..) |target, i| if (std.mem.eql(u8, target.name, self.config.boundary_model)) return i;
@@ -45642,7 +46062,7 @@ const MediaOutputExecution = struct {
         for (self.config.targets, 0..) |target, index| {
             try self.control.check();
             const resolved = &self.resolved[index];
-            const base = outputs.Result{ .name = target.name, .kind = target.kind, .required = target.required, .model = target.model, .model_identity = if (resolved.failure == null) &resolved.identity else "", .model_revision = if (resolved.failure == null) &resolved.revision else "", .recipe_id = &resolved.recipe_id, .status = .complete, .start_ns = descriptor.coordinates.start_ns, .end_ns = descriptor.coordinates.end_ns };
+            const base = outputs.Result{ .name = target.name, .kind = target.kind, .required = target.required, .model = target.model, .model_identity = if (resolved.path.len != 0) &resolved.identity else "", .model_revision = if (resolved.path.len != 0) &resolved.revision else "", .recipe_id = &resolved.recipe_id, .speaker_model_revision = if (resolved.speaker_path != null) &resolved.speaker_revision else null, .status = .complete, .start_ns = descriptor.coordinates.start_ns, .end_ns = descriptor.coordinates.end_ns };
             if (!target.execute) {
                 var value = base;
                 value.status = .skipped;
@@ -45741,6 +46161,10 @@ const MediaOutputExecution = struct {
                 var value = base;
                 switch (target.kind) {
                     .transcribe => value.spans = &.{},
+                    .diarize => {
+                        value.speaker_spans = &.{};
+                        value.speaker_scope = .source;
+                    },
                     .classify => value.labels = &.{},
                     .embedding => {
                         value.status = .failed;
@@ -45850,6 +46274,43 @@ const MediaOutputExecution = struct {
         const after = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, manifest), .lower);
         if (!std.mem.eql(u8, &after, &resolved.revision)) return error.ModelConfigurationChanged;
     }
+    fn appendSpeakerTranscript(a: std.mem.Allocator, out: *std.ArrayList(outputs.Span), timeline: speaker_checkpoint.timeline.Timeline, segment: transcribing_api.Segment, origin: i64, start: i64, end: i64) !void {
+        const text = segment.text orelse "";
+        const words = segment.words orelse &.{};
+        if (words.len != 0) {
+            const Aligned = struct { char_start: usize, start: i64, label: ?u32 };
+            const aligned = try a.alloc(Aligned, words.len);
+            defer a.free(aligned);
+            var cursor: usize = 0;
+            var count: usize = 0;
+            for (words) |word| {
+                const token = std.mem.trim(u8, word.word orelse break, " \t\r\n");
+                if (token.len == 0) break;
+                const at = std.mem.indexOfPos(u8, text, cursor, token) orelse break;
+                const word_start = try std.math.add(i64, origin, try std.math.mul(i64, word.start_ms orelse break, std.time.ns_per_ms));
+                const word_end = @min(end, try std.math.add(i64, origin, try std.math.mul(i64, word.end_ms orelse break, std.time.ns_per_ms)));
+                if (word_start < start or word_start >= end or word_end < word_start or (count != 0 and word_start < aligned[count - 1].start)) break;
+                aligned[count] = .{ .char_start = at, .start = word_start, .label = timeline.label(word_start, word_end) };
+                count += 1;
+                cursor = at + token.len;
+            }
+            if (count == words.len) {
+                var first: usize = 0;
+                var group_start = start;
+                var label = aligned[0].label;
+                for (aligned[1..]) |word| {
+                    if (word.label == label) continue;
+                    try out.append(a, .{ .text = text[first..word.char_start], .start_ns = group_start, .end_ns = word.start, .speaker_index = label });
+                    first = word.char_start;
+                    group_start = word.start;
+                    label = word.label;
+                }
+                try out.append(a, .{ .text = text[first..], .start_ns = group_start, .end_ns = end, .speaker_index = label });
+                return;
+            }
+        }
+        try out.append(a, .{ .text = text, .start_ns = start, .end_ns = end, .speaker_index = timeline.label(start, end) });
+    }
     fn run(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target, resolved: *const Resolved, payload: chunks.Payload, value: *outputs.Result) !void {
         switch (target.kind) {
             .embedding => {
@@ -45872,9 +46333,18 @@ const MediaOutputExecution = struct {
                 const output = try self.node.embedMediaOutput(a, self.control, resolved, target, payload, shared_frames);
                 value.embedding = output.vector;
             },
+            .diarize => {
+                if (payload != .pcm) return error.ModelDoesNotSupportAudioInput;
+                const state = try self.speakerState(target.name);
+                value.speaker_spans = try state.timeline.slice(a, value.start_ns orelse return error.InvalidChunkCoordinates, value.end_ns orelse return error.InvalidChunkCoordinates);
+                value.speaker_scope = .source;
+                // Source preparation already verified the immutable timeline
+                // against the pinned speaker bytes; there is no ASR manifest.
+                return;
+            },
             .transcribe => {
                 if (payload != .pcm) return error.ModelDoesNotSupportAudioInput;
-                const response = try self.node.transcribeDecodedPcmFromPathPinned(a, resolved.path, .{ .url = "", .language = target.language, .timestamps = true, .diarization = target.diarize }, payload.pcm, self.control, self.node.config.chunking_limits.max_working_bytes, resolved.revision);
+                const response = try self.node.transcribeDecodedPcmFromPathPinned(a, resolved.path, .{ .url = "", .language = target.language, .timestamps = true, .diarization = false }, payload.pcm, self.control, self.node.config.chunking_limits.max_working_bytes, resolved.revision);
                 var spans = std.ArrayList(outputs.Span).empty;
                 const origin = value.start_ns orelse return error.InvalidChunkCoordinates;
                 const end = value.end_ns orelse return error.InvalidChunkCoordinates;
@@ -45885,11 +46355,13 @@ const MediaOutputExecution = struct {
                     // Whisper timestamps have 20ms granularity and may extend
                     // the last token past a sample-exact window tail.
                     if (start_ns >= end) continue;
-                    const speaker = if (segment.speaker) |name| if (std.mem.startsWith(u8, name, "SPEAKER_")) std.fmt.parseInt(u32, name[8..], 10) catch null else null else null;
-                    try spans.append(a, .{ .text = segment.text orelse "", .start_ns = start_ns, .end_ns = @min(end_ns, end), .speaker_index = speaker });
+                    if (target.hasDiarization()) {
+                        try appendSpeakerTranscript(a, &spans, (try self.speakerState(target.name)).timeline, segment, origin, start_ns, @min(end_ns, end));
+                    } else try spans.append(a, .{ .text = segment.text orelse "", .start_ns = start_ns, .end_ns = @min(end_ns, end) });
                 };
                 if (spans.items.len == 0 and response.text != null and response.text.?.len != 0) try spans.append(a, .{ .text = response.text.?, .start_ns = origin, .end_ns = end });
                 value.spans = try spans.toOwnedSlice(a);
+                if (target.hasDiarization()) value.speaker_scope = .source;
             },
             .classify => {
                 var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
@@ -46197,4 +46669,298 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "model aware media source diarization emits standalone turns and splits transcript text at word clocks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const O = lib_chunker.outputs;
+    var state = MediaOutputExecution.SpeakerState{};
+    defer state.timeline.deinit(a);
+    try state.timeline.append(a, .{ .start_ns = 0, .end_ns = std.time.ns_per_s, .speaker_index = 0 });
+    try state.timeline.append(a, .{ .start_ns = std.time.ns_per_s, .end_ns = 2 * std.time.ns_per_s, .speaker_index = 1 });
+    const target = O.Target{ .name = "voices", .kind = .diarize, .model = "speaker" };
+    var execution = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "voices", .targets = &.{target} }, .initialized = 1 };
+    execution.speaker_states[0] = &state;
+    const revision: [64]u8 = @splat('a');
+    const resolved = MediaOutputExecution.Resolved{ .path = "speaker", .identity = revision, .revision = revision, .recipe_id = revision };
+    var receipt = O.Result{ .name = "voices", .kind = .diarize, .model = "speaker", .required = true, .model_identity = &revision, .model_revision = &revision, .recipe_id = &revision, .status = .complete, .speaker_model_revision = &revision, .start_ns = 500 * std.time.ns_per_ms, .end_ns = 1500 * std.time.ns_per_ms };
+    try execution.run(alloc, target, &resolved, .{ .pcm = .{ .samples = &.{0}, .sample_rate = 16000 } }, &receipt);
+    try receipt.validate(target);
+    try std.testing.expectEqual(@as(usize, 2), receipt.speaker_spans.?.len);
+    var spans: std.ArrayList(O.Span) = .empty;
+    try MediaOutputExecution.appendSpeakerTranscript(alloc, &spans, state.timeline, .{ .text = "Hello, world!", .start_ms = 0, .end_ms = 2000, .words = &.{ .{ .word = "Hello,", .start_ms = 0, .end_ms = 900 }, .{ .word = "world!", .start_ms = 1000, .end_ms = 2000 } } }, 0, 0, 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 2), spans.items.len);
+    try std.testing.expectEqualStrings("Hello, ", spans.items[0].text);
+    try std.testing.expectEqualStrings("world!", spans.items[1].text);
+    try std.testing.expectEqual(@as(?u32, 0), spans.items[0].speaker_index);
+    try std.testing.expectEqual(@as(?u32, 1), spans.items[1].speaker_index);
+    try std.testing.expectEqual(@as(i64, std.time.ns_per_s), spans.items[1].start_ns);
+    spans.clearRetainingCapacity();
+    try MediaOutputExecution.appendSpeakerTranscript(alloc, &spans, state.timeline, .{ .text = "No word clocks.", .start_ms = 0, .end_ms = 2000 }, 0, 0, 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(?u32, null), spans.items[0].speaker_index);
+}
+
+test "model aware media speaker checkpoint runs without ASR and replays source scoped identities" {
+    const models = platform.env.getenv("ANTFLY_TEST_SPEAKER_MODELS_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const private_models = try temp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(private_models);
+    const ref = try registry_mod.ModelRef.parse(lib_chunker.diarization.default_model);
+    const installed = try registry_mod.modelInstallDirAlloc(a, models, ref);
+    defer a.free(installed);
+    const variant_path = try std.fs.path.join(a, &.{ installed, ref.variant });
+    defer a.free(variant_path);
+    const fallback = try std.fs.path.join(a, &.{ models, ref.owner, ref.name, ref.variant });
+    defer a.free(fallback);
+    const private_dir = try registry_mod.modelInstallDirAlloc(a, private_models, ref);
+    defer a.free(private_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, private_dir);
+    const private_model = try std.fs.path.join(a, &.{ private_dir, ref.variant });
+    defer a.free(private_model);
+    try std.Io.Dir.cwd().copyFile(if (dirExists(variant_path)) variant_path else fallback, .cwd(), private_model, std.testing.io, .{});
+    var node = try Node.init(a, .{ .models_dir = private_models, .max_concurrent_requests = 4 });
+    defer node.deinit();
+    const receipts = @import("../registry/managed_receipt.zig");
+    const digest = try node.chunkSpeakerRevision(private_model, std.testing.io, .{});
+    const model_stat = try std.Io.Dir.cwd().statFile(std.testing.io, private_model, .{});
+    const receipt = try std.json.Stringify.valueAlloc(a, receipts.DownloadReceipt{
+        .version = 2,
+        .source = .{ .owner = ref.owner, .name = ref.name, .variant = ref.variant, .resolved_revision = "0123456789012345678901234567890123456789" },
+        .artifacts = &.{.{ .path = ref.variant, .size = model_stat.size, .sha256 = &digest }},
+    }, .{});
+    defer a.free(receipt);
+    const receipt_path = try std.fs.path.join(a, &.{ private_dir, receipts.complete_filename });
+    defer a.free(receipt_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = receipt });
+    const fixture_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, platform.env.getenv("ANTFLY_TEST_SPEAKER_AUDIO") orelse "../../e2e/inference/testdata/whisper_quality.wav", a, .limited(16 * 1024 * 1024));
+    defer a.free(fixture_bytes);
+    var fixture = try audio_mod.decodeBounded(a, fixture_bytes, .{}, 16 * 1024 * 1024);
+    defer fixture.deinit();
+    const pcm = try audio_mod.copyOrResample(a, fixture.samples, fixture.sample_rate, 16000);
+    defer a.free(pcm);
+    const samples = try a.alloc(f32, 120000);
+    defer a.free(samples);
+    for (samples[0..48000], 0..) |*sample, i| sample.* = pcm[i % pcm.len];
+    @memset(samples[48000..72000], 0);
+    @memcpy(samples[72000..], samples[0..48000]);
+    const encoded = try audio_mod.wav.encodeInterleaved(a, samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer a.free(encoded);
+    const Capture = struct {
+        count: usize = 0,
+        node: ?*Node = null,
+        first_runs: u64 = 0,
+        expected_outputs: usize = 1,
+        compare_outputs: bool = true,
+        coordinates: [16]lib_chunker.planning.Coordinates = undefined,
+        labels: [16]?u32 = undefined,
+        fn accept(raw: *anyopaque, item: @import("../pipelines/media_chunking.zig").Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.count < self.coordinates.len);
+            try std.testing.expect(item.embedding == null);
+            try std.testing.expectEqual(self.expected_outputs, item.outputs.len);
+            if (self.count == 0) if (self.node) |node_| {
+                self.first_runs = node_.speaker_analysis_model_runs.load(.monotonic);
+            };
+            for (item.outputs) |output| {
+                try std.testing.expect(output.kind == .diarize and output.status == .complete and output.speaker_scope == .source);
+                if (self.compare_outputs) try std.testing.expectEqualDeep(item.outputs[0].speaker_spans.?, output.speaker_spans.?);
+            }
+            try std.testing.expect(item.outputs[0].kind == .diarize and item.outputs[0].status == .complete);
+            try std.testing.expect(item.outputs[0].speaker_scope == .source);
+            try std.testing.expect(item.outputs[0].spans == null);
+            self.coordinates[self.count] = item.descriptor.coordinates;
+            self.labels[self.count] = item.outputs[0].speaker_spans.?[0].speaker_index;
+            self.count += 1;
+        }
+    };
+    const target = lib_chunker.outputs.Target{ .name = "voices", .kind = .diarize, .model = lib_chunker.diarization.default_model };
+    var request = chunk_response.Request{ .input = .{ .binary = .{ .mime_type = "audio/wav", .data = encoded } }, .outputs = .{ .boundary_model = "voices", .targets = &.{target} }, .policy = .{ .audio_speaker_turns = true, .window_ns = 2 * std.time.ns_per_s } };
+    var full = Capture{ .node = &node };
+    const result = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &full, .accept = Capture.accept });
+    if (result.failure) |err| return err;
+    try std.testing.expect(result.summary.complete);
+    const baseline_runs = node.speaker_analysis_model_runs.load(.monotonic);
+    try std.testing.expect(full.first_runs > 0 and full.first_runs < baseline_runs);
+    try std.testing.expect(full.count >= 4);
+    try std.testing.expectEqual(@as(?u32, 0), full.labels[0]);
+    try std.testing.expectEqual(@as(?u32, 0), full.labels[full.count - 1]);
+    var silence = false;
+    for (full.labels[0..full.count]) |label| silence = silence or label == null;
+    try std.testing.expect(silence);
+    const baseline_hashes = node.speaker_revision_cache.full_hashes.load(.monotonic);
+    const baseline_disk_reads = node.media_speaker_store.full_reads.load(.monotonic);
+    request.max_chunks = 1;
+    var ordinal: u64 = 0;
+    var cursor: [85]u8 = undefined;
+    while (ordinal < full.count) {
+        var page = Capture{};
+        request.continuation = if (ordinal == 0) null else result.summary.identity.cursor(ordinal, &cursor);
+        const resumed = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &page, .accept = Capture.accept });
+        if (resumed.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), page.count);
+        try std.testing.expectEqualDeep(full.coordinates[@intCast(ordinal)], page.coordinates[0]);
+        try std.testing.expectEqual(full.labels[@intCast(ordinal)], page.labels[0]);
+        ordinal = resumed.summary.next_ordinal;
+    }
+    try std.testing.expectEqual(baseline_runs, node.speaker_analysis_model_runs.load(.monotonic));
+    try std.testing.expectEqual(baseline_hashes, node.speaker_revision_cache.full_hashes.load(.monotonic));
+    try std.testing.expectEqual(baseline_disk_reads, node.media_speaker_store.full_reads.load(.monotonic));
+    var restarted = try Node.init(a, .{ .models_dir = private_models, .max_concurrent_requests = 1 });
+    defer restarted.deinit();
+    request.continuation = result.summary.identity.cursor(2, &cursor);
+    var recovered = Capture{};
+    const recovery = try restarted.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &recovered, .accept = Capture.accept });
+    if (recovery.failure) |err| return err;
+    try std.testing.expectEqualDeep(full.coordinates[2], recovered.coordinates[0]);
+    try std.testing.expectEqual(@as(u64, 0), restarted.speaker_analysis_model_runs.load(.monotonic));
+    // Persist a partial registry, then finish it in another node. Only the
+    // remaining model windows may execute, with the same labels and boundaries.
+    request.source_version = "partial-recovery";
+    request.continuation = null;
+    var partial = Capture{};
+    const partial_result = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &partial, .accept = Capture.accept });
+    if (partial_result.failure) |err| return err;
+    const partial_runs = node.speaker_analysis_model_runs.load(.monotonic) - baseline_runs;
+    try std.testing.expect(partial_runs > 0 and partial_runs < baseline_runs);
+    ordinal = partial_result.summary.next_ordinal;
+    while (ordinal < full.count) {
+        var resumed_capture = Capture{};
+        request.continuation = partial_result.summary.identity.cursor(ordinal, &cursor);
+        const continued = try restarted.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &resumed_capture, .accept = Capture.accept });
+        if (continued.failure) |err| return err;
+        try std.testing.expectEqualDeep(full.coordinates[@intCast(ordinal)], resumed_capture.coordinates[0]);
+        try std.testing.expectEqual(full.labels[@intCast(ordinal)], resumed_capture.labels[0]);
+        ordinal = continued.summary.next_ordinal;
+    }
+    const remaining_runs = restarted.speaker_analysis_model_runs.load(.monotonic);
+    try std.testing.expectEqual(baseline_runs, partial_runs + remaining_runs);
+    const before_shared_runs = node.speaker_analysis_model_runs.load(.monotonic);
+    // Different output names share one cold analysis and one set of centroids.
+    var targets = [_]lib_chunker.outputs.Target{ target, .{ .name = "also-voices", .kind = .diarize, .model = target.model } };
+    request.outputs = .{ .boundary_model = "voices", .targets = &targets };
+    request.continuation = null;
+    request.max_chunks = 0;
+    request.source_version = "shared-analysis";
+    var shared = Capture{ .expected_outputs = 2 };
+    const sharing = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &shared, .accept = Capture.accept });
+    if (sharing.failure) |err| return err;
+    const shared_runs = node.speaker_analysis_model_runs.load(.monotonic) - before_shared_runs;
+    try std.testing.expectEqual(baseline_runs, shared_runs);
+    // Different clustering configurations still share their model embeddings.
+    targets[1].diarization = .{ .min_rms = 0.02 };
+    request.source_version = "shared-embeddings";
+    var configured = Capture{ .expected_outputs = 2, .compare_outputs = false };
+    const variant = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &configured, .accept = Capture.accept });
+    if (variant.failure) |err| return err;
+    const configured_runs = node.speaker_analysis_model_runs.load(.monotonic) - before_shared_runs - shared_runs;
+    try std.testing.expectEqual(baseline_runs, configured_runs);
+    // Four overlapping requests for a new source share each accepted prefix.
+    const Concurrent = struct {
+        node: *Node,
+        request: chunk_response.Request,
+        ready: *std.atomic.Value(usize),
+        go: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        capture: Capture = .{},
+        fn run(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+            const value = self.node.chunkAndEmbedDirect(std.testing.allocator, std.testing.io, .{}, self.request, .{ .model = lib_chunker.diarization.default_model }, .{ .context = &self.capture, .accept = Capture.accept }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.failure = value.failure;
+        }
+    };
+    request.outputs = .{ .boundary_model = "voices", .targets = &.{target} };
+    request.source_version = "concurrent-shared-analysis";
+    var ready: std.atomic.Value(usize) = .init(0);
+    var go: std.atomic.Value(bool) = .init(false);
+    var concurrent: [4]Concurrent = undefined;
+    var threads: [4]std.Thread = undefined;
+    const before_concurrent = node.speaker_analysis_model_runs.load(.monotonic);
+    for (&concurrent, &threads) |*worker, *thread| {
+        worker.* = .{ .node = &node, .request = request, .ready = &ready, .go = &go };
+        thread.* = try std.Thread.spawn(.{}, Concurrent.run, .{worker});
+    }
+    while (ready.load(.acquire) != threads.len) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    for (threads) |thread| thread.join();
+    for (&concurrent) |*worker| {
+        if (worker.failure) |err| return err;
+        try std.testing.expectEqual(full.count, worker.capture.count);
+        try std.testing.expectEqualDeep(full.coordinates[0..full.count], worker.capture.coordinates[0..full.count]);
+        try std.testing.expectEqualDeep(full.labels[0..full.count], worker.capture.labels[0..full.count]);
+    }
+    const concurrent_runs = node.speaker_analysis_model_runs.load(.monotonic) - before_concurrent;
+    try std.testing.expectEqual(baseline_runs, concurrent_runs);
+    try std.testing.expectEqual(baseline_hashes, node.speaker_revision_cache.full_hashes.load(.monotonic));
+    const before_silence = node.speaker_analysis_preprocess_runs.load(.monotonic);
+    var silent_target = target;
+    silent_target.diarization = .{ .min_rms = 1 };
+    request.outputs = .{ .boundary_model = "voices", .targets = &.{silent_target} };
+    request.source_version = "all-silent-preprocessing";
+    var silent_capture = Capture{};
+    const silent_result = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &silent_capture, .accept = Capture.accept });
+    if (silent_result.failure) |err| return err;
+    try std.testing.expect(silent_result.summary.complete);
+    try std.testing.expectEqual(before_silence, node.speaker_analysis_preprocess_runs.load(.monotonic));
+    try std.testing.expectEqual(before_concurrent + concurrent_runs, node.speaker_analysis_model_runs.load(.monotonic));
+    std.debug.print("speaker concurrent_requests=4 concurrent_model_runs={d} warm_full_hashes=0\n", .{concurrent_runs});
+    std.debug.print("speaker performance first_chunk_runs={d} full_runs={d} warm_page_runs=0 restart_runs=0 shared_outputs_runs={d} shared_configurations_runs={d} partial_restart_runs={d}\n", .{ full.first_runs, baseline_runs, shared_runs, configured_runs, remaining_runs });
+}
+
+test "model aware media speaker planning skips disabled secondary analysis" {
+    const targets = [_]lib_chunker.outputs.Target{ .{ .name = "boundary", .kind = .diarize, .model = "speaker", .execute = false }, .{ .name = "optional", .kind = .diarize, .model = "another-speaker" } };
+    var execution = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "boundary", .targets = &targets }, .speaker_turns = true, .speaker_outputs = false };
+    try std.testing.expect(execution.wantsSpeakerAnalysis(targets[0]));
+    try std.testing.expect(!execution.wantsSpeakerAnalysis(targets[1]));
+    execution.speaker_turns = false;
+    try std.testing.expect(!execution.wantsSpeakerAnalysis(targets[0]));
+    execution.speaker_outputs = true;
+    try std.testing.expect(execution.wantsSpeakerAnalysis(targets[1]));
+}
+
+test "model aware media complete speaker timelines borrow pinned cache storage without copying" {
+    const Cache = @import("../pipelines/media_index_cache.zig").Cache;
+    const a = std.testing.allocator;
+    const Admission = struct {
+        controller: @import("../runtime/tier/memory.zig").AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var admission: Admission = .{};
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const registry = try a.create(lib_chunker.diarization.Registry);
+    defer a.destroy(registry);
+    registry.* = .{ .count = 1 };
+    registry.sums[0][0] = 1;
+    const snapshot = MediaOutputExecution.speaker_checkpoint.Snapshot{ .registry = registry, .spans = &.{.{ .start_ns = 0, .end_ns = 1500 * std.time.ns_per_ms, .speaker_index = 0 }}, .sample_rate = 16000, .next_window = 1, .covered_samples = 24000, .total_samples = 24000, .complete = true };
+    var timeline: MediaOutputExecution.speaker_checkpoint.timeline.Timeline = .{};
+    defer timeline.deinit(a);
+    for (snapshot.spans) |span| try timeline.append(a, span);
+    var shared_snapshot = snapshot;
+    shared_snapshot.spans = &.{};
+    shared_snapshot.shared = timeline.view();
+    cache.remember(a, @splat(7), .{ .speaker_analysis = shared_snapshot }, .{ .context = &admission, .acquire = Admission.acquire });
+    const entry = cache.get(@splat(7)).?;
+    const state = try a.create(MediaOutputExecution.SpeakerState);
+    defer a.destroy(state);
+    state.* = .{};
+    try state.borrowComplete(a, entry);
+    defer state.timeline.deinit(a);
+    try std.testing.expect(state.timeline.view().blocks[0] == entry.data.speaker_analysis.shared.?.blocks[0]);
+    try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
+    try std.testing.expectEqualDeep(snapshot.registry.sums[0], state.registry.sums[0]);
+    cache.release(state.borrowed.?);
+    try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+    try std.testing.expectEqual(@as(usize, 0), admission.controller.snapshot().hostTotalBytes());
 }

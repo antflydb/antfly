@@ -218,12 +218,16 @@ pub const Track = struct {
         errdefer self.deinit();
         try control.check();
         const identity = @import("media_index_cache.zig").Cache.aacKey(source, max_packets, max_bytes);
+        const flight = if (identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null;
+        defer if (flight) |lease| lease.deinit();
         if (identity) |key| if (cache) |retained| if (retained.get(key)) |hit| {
             self.cached = hit;
             self.mp4 = hit.data.aac.reader(a, source);
             return self;
         };
         const audio_identity = @import("media_index_cache.zig").Cache.audioKey(source, max_packets, max_bytes);
+        const audio_flight = if (audio_identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null;
+        defer if (audio_flight) |lease| lease.deinit();
         if (audio_identity) |key| if (cache) |retained| if (retained.get(key)) |hit| {
             self.cached = hit;
             self.seek_reader = .{ .index = &hit.data.audio, .source = source, .control = control };
@@ -238,6 +242,7 @@ pub const Track = struct {
                 else => return err,
             };
             if (self.mp4) |owner| {
+                if (cache) |retained| _ = retained.audio_builds.fetchAdd(1, .monotonic);
                 if (identity) |key| if (cache) |retained| if (admission) |admit| retained.remember(std.heap.smp_allocator, key, .{ .aac = owner }, admit);
                 return self;
             }
@@ -255,6 +260,7 @@ pub const Track = struct {
                 else => return err,
             };
             if (self.seek) |index| {
+                if (cache) |retained| _ = retained.audio_builds.fetchAdd(1, .monotonic);
                 cache.?.remember(std.heap.smp_allocator, audio_identity.?, .{ .audio = index }, admission.?);
                 return self;
             }

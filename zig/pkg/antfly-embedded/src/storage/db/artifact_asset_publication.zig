@@ -278,7 +278,7 @@ fn requireMediaOutput(alloc: std.mem.Allocator, command: publication.Command, co
         for (row.outputs, 0..) |value, sub_index| {
             try value.validate(target);
             if (value.status == .complete) {
-                const recipe = try target.recipeIdentity(alloc, value.model_identity, value.model_revision);
+                const recipe = try target.receiptRecipeIdentity(alloc, value);
                 if (!std.mem.eql(u8, &recipe, value.recipe_id)) return error.InvalidBatchRequest;
             }
             if (value.sub_index != sub_index or (value.required and value.status != .complete and !value.terminal)) return error.InvalidBatchRequest;
