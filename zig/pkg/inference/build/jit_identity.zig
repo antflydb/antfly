@@ -62,6 +62,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/graph/templates/metal_projection_native.metal",
             "src/graph/templates/metal_paged_decode_native.metal",
             "src/backends/metal_compile_options.h",
+            "src/backends/metal_pipeline_catalog.h",
             "src/graph/kernel_jit.zig",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",

@@ -3367,3 +3367,9 @@ It charges the small production-source increase separately from the speedup.
 pipeline lifecycle, decoder phases, CPU projection families and CUDA attention
 launch preparation. It separates a prototype-backed 40–70 KB catalog budget
 from unproven family goals and from device-kernel source accounting.
+
+### AQ large-owner consolidation campaign
+
+[The AQ register](unified-execution-aq-outcomes.md) tracks implementation of the
+large-win audit, beginning with a layout- and order-preserving 462-entry Metal
+pipeline lifecycle owner and separately qualifying the remaining family work.
