@@ -4640,7 +4640,7 @@ pub const AntflyApiHandler = struct {
                         const image_slot = for (self.group.identity_images.items, 0..) |field, i| {
                             if (std.mem.eql(u8, field, reference.field)) break i;
                         } else return error.InferenceSourceMismatch;
-                        const actual = at(identities orelse values, try std.fmt.allocPrint(self.a, "i{d}", .{image_slot})) orelse return error.InferenceSourceMismatch;
+                        const actual = at(identities orelse return error.InferenceSourceMismatch, try std.fmt.allocPrint(self.a, "i{d}", .{image_slot})) orelse return error.InferenceSourceMismatch;
                         if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InferenceSourceMismatch;
                     }
                     const revision = try self.selected(values, reference.revision_field);
@@ -20907,7 +20907,7 @@ test "httpx inference gateway typed consumers retain errors and legacy original 
     const object_groups = try source_media.groups(a, &object_references);
     try std.testing.expect(!object_groups[0].requiresFlatValues());
     try std.testing.expect(groups[0].requiresFlatValues());
-    const object_root = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"images\":{\"preview\":\"image\"},\"version\":\"r1\",\"policy\":{\"public\":true}}", .{});
+    const object_root = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"images\":{\"preview\":\"image\"},\"version\":\"r1\",\"policy\":{\"public\":true},\"i0\":\"pinned\"}", .{});
     var object_hits = [_]@import("antfly_metadata_openapi").QueryHit{.{ ._id = "a", ._score = 0, ._source = .{ .map = object_root.object } }};
     const object_result: @import("antfly_metadata_openapi").QueryResult = .{ .status = 200, .took = 0, .hits = .{ .hits = &object_hits } };
     consumer = .{ .a = a, .references = &object_references, .group = object_groups[0], .output = &output, .wire = .empty, .flat = false };
@@ -20918,6 +20918,9 @@ test "httpx inference gateway typed consumers retain errors and legacy original 
     consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
     try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, object_result));
     try std.testing.expect(consumer.projection_missing);
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    // The wire fallback also calls hit directly; a source key is not a pin.
+    try std.testing.expectError(error.InferenceSourceMismatch, consumer.hit("a", object_root, null));
     object_hits[0]._computed = .{ .bytes = "{\"i0\":\"pinned\"}" };
     consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
     try Consumer.consume(&consumer, object_result);
