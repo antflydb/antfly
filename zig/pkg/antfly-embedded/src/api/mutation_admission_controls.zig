@@ -46,7 +46,11 @@ fn check(controls: Controls) !void {
 pub const Budget = @import("../common/read_execution_budget.zig").Budget(Controls, check);
 
 pub fn init(pre_decision: transaction.PreDecisionContext, borrow: ?runtime.runnable_abi.Borrowed, io: std.Io) Budget {
-    return .{ .controls = .{ .execution_runnable = borrow, .pre_decision = pre_decision }, .io = io };
+    // A group-local invocation may carry its independently owned worker in
+    // the original context without an enclosing coordinator team. Preserve it
+    // for native publication waits as well as lifetime checks. An explicit
+    // synchronous team borrow remains authoritative when one was supplied.
+    return .{ .controls = .{ .execution_runnable = borrow orelse pre_decision.execution_runnable, .pre_decision = pre_decision }, .io = io };
 }
 
 /// Group-local admission receives one independently owned worker token in its

@@ -46,7 +46,32 @@ fn drain(backend: *lsm.Backend) !void {
 
 const Mode = enum { legacy, owned, cancel_preparation, cancel_read, cancel_append, deadline_append };
 
+const Entry = enum { db, table, worker };
+
+/// Use the same callback dispatch and stack-owned controls as bound HTTP/SQL
+/// table commits. The direct DB cases remain useful for legacy-policy coverage.
+fn commit(entry: Entry, db: *DB, writes: []const local.storage_db_mod.types.BatchWrite, controls: local.storage_db_apply_rw_lock.ApplyRwLock.Acquisition, original: local.api_local_transaction_contract.PreDecisionContext, borrow: ?@import("antfly_runtime_abi").runnable_abi.Borrowed) !void {
+    if (entry == .db) return db.batchWithAdmissionControls(.{ .writes = writes }, controls, .none);
+    const a = std.testing.allocator;
+    const converted = try a.alloc(local.storage_db_mod.types.TransactionWrite, writes.len);
+    defer a.free(converted);
+    for (converted, writes) |*target, source| target.* = .{ .key = source.key, .value = source.value };
+    var bound = local.api_local_table_writes.BoundTableWriteSource.init("docs", db);
+    var team: @import("antfly_runtime_abi").runnable_abi.Team = .{ .borrow = borrow.?, .maximum_slots = 1, .allocator = a };
+    var context = original;
+    if (entry == .worker) context.execution_runnable = borrow;
+    const outcome = (try bound.source().commitBatchWithControl(a, &.{.{ .table_name = "docs", .writes = converted }}, .write, original.cancellation, .{ .pre_decision = context, .team = if (entry == .worker) null else &team })) orelse return error.TableCommitNotHandled;
+    switch (outcome) {
+        .committed => |done| try std.testing.expectEqual(@as(usize, 1), done.participant_count),
+        .conflict => return error.UnexpectedCommitConflict,
+    }
+}
+
 fn guardedCommit(mode: Mode) !void {
+    return guardedCommitVia(mode, .db);
+}
+
+fn guardedCommitVia(mode: Mode, entry: Entry) !void {
     const owned_io = mode != .legacy;
     const rejected = mode != .legacy and mode != .owned;
     const paused_io = mode == .cancel_read or mode == .cancel_append or mode == .deadline_append;
@@ -114,6 +139,9 @@ fn guardedCommit(mode: Mode) !void {
         var refused: std.atomic.Value(bool) = .init(false);
         var foreground_calls: std.atomic.Value(usize) = .init(0);
         var canceled: std.atomic.Value(bool) = .init(false);
+        // Keep execution lifetime live when only the original API context is
+        // canceled. Otherwise the owner token could hide a lost request fence.
+        var execution_canceled: std.atomic.Value(bool) = .init(false);
         fn cancellation(raw: ?*const anyopaque) callconv(.c) u8 {
             const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
             return @intFromBool(flag.load(.acquire));
@@ -186,6 +214,7 @@ fn guardedCommit(mode: Mode) !void {
     H.steps.store(0, .release);
     H.foreground_calls.store(0, .release);
     H.canceled.store(false, .release);
+    H.execution_canceled.store(false, .release);
     local.storage_lsm_backend_runtime.test_write_retirement_hook = H.retire;
     foreground.test_hook = H.prepare;
     foreground.test_retire_hook = H.retireNative;
@@ -242,14 +271,15 @@ fn guardedCommit(mode: Mode) !void {
     };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const writes = try arena.allocator().alloc(local.storage_db_mod.types.BatchWrite, if (rejected) 64 else 1024);
+    const writes = try arena.allocator().alloc(local.storage_db_mod.types.BatchWrite, if (rejected or entry == .worker) 64 else 1024);
     for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "doc:{d:0>4}", .{i}), .value = "{\"value\":1}" };
     {
-        var pass = try local.common_background_execution.Pass.init(state.port(), &std.testing.io, platform.time.monotonicNs() +| 60 * std.time.ns_per_s, .{ .context = &H.canceled, .is_cancelled = H.cancellation });
+        var pass = try local.common_background_execution.Pass.init(state.port(), &std.testing.io, platform.time.monotonicNs() +| 60 * std.time.ns_per_s, .{ .context = &H.execution_canceled, .is_cancelled = H.cancellation });
         defer pass.deinit();
         const api_controls = local.api_mutation_admission_controls;
         H.deadline_ns = if (mode == .deadline_append) platform.time.monotonicNs() +| 5 * std.time.ns_per_s else pass.deadline_ns;
-        var budget = api_controls.init(.{ .deadline_ns = H.deadline_ns, .cancellation = local.storage_db_mod.types.CancellationToken.fromAtomic(&H.canceled) }, pass.borrow, std.testing.io);
+        const original: local.api_local_transaction_contract.PreDecisionContext = .{ .deadline_ns = H.deadline_ns, .cancellation = local.storage_db_mod.types.CancellationToken.fromAtomic(&H.canceled) };
+        var budget = api_controls.init(original, pass.borrow, std.testing.io);
         var controls = api_controls.acquisition(&budget);
         if (!owned_io) controls.retained_physical_wait = false;
         if (rejected) {
@@ -260,7 +290,7 @@ fn guardedCommit(mode: Mode) !void {
                 live.join();
             };
             const before = backend.snapshotWriteStats();
-            const result = db.batchWithAdmissionControls(.{ .writes = writes }, controls, .none);
+            const result = commit(entry, &db, writes, controls, original, pass.borrow);
             if (thread) |live| {
                 live.join();
                 thread = null;
@@ -281,7 +311,7 @@ fn guardedCommit(mode: Mode) !void {
             if (round == 1) for (writes) |*write| {
                 write.value = "{\"value\":2}";
             };
-            try db.batchWithAdmissionControls(.{ .writes = writes }, controls, .none);
+            try commit(entry, &db, writes, controls, original, pass.borrow);
             // The public DB path retains apply/snapshot fences. Physical
             // cleanup must finish using its dedicated CPU while this pass
             // still owns the sole ordinary slot, including overwritten roots.
@@ -295,12 +325,13 @@ fn guardedCommit(mode: Mode) !void {
             }
             try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().runnable_slots);
         }
+        try pass.borrow.?.checkLifetime();
         if (!rejected) {
             try std.testing.expect(H.refused.load(.acquire));
             try std.testing.expect(H.retained_peak.load(.acquire) >= writes.len * 32);
             const before = backend.snapshotWriteStats();
             H.canceled.store(true, .release);
-            try std.testing.expectError(error.Canceled, db.batchWithAdmissionControls(.{ .writes = &.{.{ .key = "rejected", .value = "{}" }} }, controls, .none));
+            try std.testing.expectError(error.Canceled, commit(entry, &db, &.{.{ .key = "rejected", .value = "{}" }}, controls, original, pass.borrow));
             try std.testing.expectEqual(before.wal_append_records, backend.snapshotWriteStats().wal_append_records);
         }
     }
@@ -325,9 +356,9 @@ fn guardedCommit(mode: Mode) !void {
     defer a.free(seed);
     try std.testing.expectEqualStrings("{\"old\":true}", seed);
     if (rejected and !uncertain) {
-        try std.testing.expect((try reopened.get(a, if (rejected) "doc:0063" else "doc:1023")) == null);
+        try std.testing.expect((try reopened.get(a, writes[writes.len - 1].key)) == null);
     } else {
-        const recovered = (try reopened.get(a, if (rejected) "doc:0063" else "doc:1023")).?;
+        const recovered = (try reopened.get(a, writes[writes.len - 1].key)).?;
         defer a.free(recovered);
         try std.testing.expectEqualStrings(if (uncertain) "{\"value\":1}" else "{\"value\":2}", recovered);
     }
@@ -355,6 +386,38 @@ test "guarded managed DB commit preserves append uncertainty and recovery after 
 
 test "guarded managed DB commit preserves original deadline and append uncertainty through protected join" {
     try guardedCommit(.deadline_append);
+}
+
+test "guarded managed DB commit table callback preserves owned WAL and complete root retirement" {
+    try guardedCommitVia(.owned, .table);
+}
+
+test "guarded managed DB commit table callback preserves cancellation before WAL publication" {
+    try guardedCommitVia(.cancel_read, .table);
+}
+
+test "guarded managed DB commit table callback preserves uncertain append through original cancellation" {
+    try guardedCommitVia(.cancel_append, .table);
+}
+
+test "guarded managed DB commit table callback preserves original deadline through uncertain append" {
+    try guardedCommitVia(.deadline_append, .table);
+}
+
+test "guarded managed DB commit preserves context worker authority without a coordinator team" {
+    try guardedCommitVia(.owned, .worker);
+}
+
+test "guarded managed DB commit context worker preserves independent request cancellation" {
+    try guardedCommitVia(.cancel_read, .worker);
+}
+
+test "guarded managed DB commit context worker joins uncertain append after request cancellation" {
+    try guardedCommitVia(.cancel_append, .worker);
+}
+
+test "guarded managed DB commit context worker preserves original deadline after accepted append" {
+    try guardedCommitVia(.deadline_append, .worker);
 }
 
 test "guarded incremental publication memory bound covers measured peak across private inserts and overwrites" {
