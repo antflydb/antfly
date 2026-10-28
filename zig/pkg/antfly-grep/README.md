@@ -587,6 +587,52 @@ musl executable supports lexical/HTTP searches and reports
 `DynamicInferenceRequiresDynamicLibc` for local inference. `--version` records
 the compilation target and linkage.
 
+## Releases and installation
+
+Grep has independent versions and release tags: `antfly-grep/vX.Y.Z`, including
+prereleases such as `antfly-grep/v0.1.0-rc.1`. It is distributed separately from
+the Antfly server and embedded library. See the repository's
+[release design](../../../RELEASE.md#independent-grep-releases) for the operator
+workflow and native qualification matrix.
+
+Download the matching `antfly-grep_<version>_<OS>_<arch>[_gnu].tar.gz` archive and
+`SHA256SUMS` from that tag's GitHub Release. Linux x86-64 and ARM64 have portable
+musl and glibc 2.28+ (`_gnu`) builds; Darwin ARM64 requires macOS 15+. Use GNU
+Linux builds for optional local dynamic inference. Verify the archive's entry
+in `SHA256SUMS` before extracting it, then install under a user-owned prefix:
+
+```sh
+# After downloading the archive and SHA256SUMS:
+awk '$2 == "antfly-grep_0.1.0-rc.1_Darwin_arm64.tar.gz"' SHA256SUMS | shasum -a 256 --check
+mkdir -p /path/to/extracted-release
+tar -xzf antfly-grep_0.1.0-rc.1_Darwin_arm64.tar.gz -C /path/to/extracted-release
+/path/to/extracted-release/install.sh --prefix "$HOME/.local"
+"$HOME/.local/bin/antfly-grep" --version
+```
+
+The archive includes the binary, installer, completions, manpage, schemas and
+license notices. Installation does not require an Antfly server or libantfly.
+Server-backed search remains an optional integration with its own endpoint and
+credentials. Grep releases do not change Antfly's stable release channel.
+
+## Continuous integration
+
+The shared Zig workflow runs one native Linux x86-64 grep qualification job for
+its admitted suite:
+
+- `zig-base / grep` runs `grep-test` (unit, CLI, hardening, compatibility and
+  integration fixtures), a seeded 500-case differential campaign against pinned
+  ripgrep, and standalone packaging checks.
+- `zig-full / grep` runs the same checks with 5,000 differential cases and adds
+  the extended/codecs, single-CPU, cold-cache-advice, and 1/2/4/8-worker repository
+  benchmarks.
+
+Each job is required by its `zig-base` or `zig-full` aggregate. Full runs select
+only the full profile, reusing its build for correctness and benchmarks. Base
+runs follow the Zig change filter; inference-only validation skips grep. Reports
+and the standalone archive are uploaded as `zig-base-grep` or `zig-full-grep`.
+Server-backed indexed-search tests continue in the Antfly E2E base/full suites.
+
 ## Generated conformance, hardening and profiling
 
 `tests/differential.py` generates reproducible PCRE2 patterns, malformed syntax,

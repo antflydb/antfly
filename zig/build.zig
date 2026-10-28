@@ -154,7 +154,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const usermgr_mod = shared.usermgr_mod;
     const fst_mod = shared.fst_mod;
     const regex_mod = shared.regex_mod;
-    @import("pkg/antfly-grep/build.zig").addConfigured(b, target, optimize, shared.antfly_version, strip);
+    @import("pkg/antfly-grep/build.zig").addConfigured(b, target, optimize, @import("pkg/antfly-grep/build.zig").releaseVersion(b), strip);
     const jsonschema_mod = shared.jsonschema_mod;
     const toon_mod = shared.toon_mod;
     const mcp_mod = shared.mcp_mod;
