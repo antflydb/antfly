@@ -2104,6 +2104,8 @@ components:
           $ref: '#/components/schemas/MediaOutputCoverageValues'
         classify:
           $ref: '#/components/schemas/MediaOutputCoverageValues'
+        diarize:
+          $ref: '#/components/schemas/MediaOutputCoverageValues'
     MediaOutputCoverageValues:
       type: object
       properties:

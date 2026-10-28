@@ -122,6 +122,7 @@ from .chunk_coordinates import ChunkCoordinates
 from .chunk_coordinates_kind import ChunkCoordinatesKind
 from .chunk_coordinates_picture_basis import ChunkCoordinatesPictureBasis
 from .chunk_descriptor import ChunkDescriptor
+from .chunk_diarization_config import ChunkDiarizationConfig
 from .chunk_embedding_context import ChunkEmbeddingContext
 from .chunk_embedding_error import ChunkEmbeddingError
 from .chunk_embedding_event import ChunkEmbeddingEvent
@@ -142,6 +143,7 @@ from .chunk_output_coverage import ChunkOutputCoverage
 from .chunk_output_label import ChunkOutputLabel
 from .chunk_output_result import ChunkOutputResult
 from .chunk_output_result_kind import ChunkOutputResultKind
+from .chunk_output_result_speaker_scope import ChunkOutputResultSpeakerScope
 from .chunk_output_result_status import ChunkOutputResultStatus
 from .chunk_output_target import ChunkOutputTarget
 from .chunk_output_target_kind import ChunkOutputTargetKind
@@ -150,6 +152,7 @@ from .chunk_outputs import ChunkOutputs
 from .chunk_source_reference import ChunkSourceReference
 from .chunk_source_reference_type import ChunkSourceReferenceType
 from .chunk_source_reference_version_kind import ChunkSourceReferenceVersionKind
+from .chunk_speaker_span import ChunkSpeakerSpan
 from .chunk_transcript_span import ChunkTranscriptSpan
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
@@ -2611,6 +2614,7 @@ __all__ = (
     "ChunkCoordinatesKind",
     "ChunkCoordinatesPictureBasis",
     "ChunkDescriptor",
+    "ChunkDiarizationConfig",
     "ChunkEmbeddingContext",
     "ChunkEmbeddingError",
     "ChunkEmbeddingEvent",
@@ -2634,6 +2638,7 @@ __all__ = (
     "ChunkOutputLabel",
     "ChunkOutputResult",
     "ChunkOutputResultKind",
+    "ChunkOutputResultSpeakerScope",
     "ChunkOutputResultStatus",
     "ChunkOutputs",
     "ChunkOutputTarget",
@@ -2642,6 +2647,7 @@ __all__ = (
     "ChunkSourceReference",
     "ChunkSourceReferenceType",
     "ChunkSourceReferenceVersionKind",
+    "ChunkSpeakerSpan",
     "ChunkTranscriptSpan",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",

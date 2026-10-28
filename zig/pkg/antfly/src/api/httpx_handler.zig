@@ -6288,7 +6288,7 @@ pub const AntflyApiHandler = struct {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };
-        return ctx.status(200).json(.{});
+        return ctx.status(200).json(struct {}{});
     }
 
     fn executeSQLMode(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8) !httpx.Response {
@@ -14073,6 +14073,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var closed = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
     defer closed.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), closed.status);
+    try std.testing.expectEqualStrings("{}", closed.body);
     var after_close = try Route.statement(alloc, &handler, alice_auth, connection_id, "SHOW app.limit");
     defer after_close.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), after_close.status);
@@ -14802,7 +14803,11 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
 }
 
 fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner, comptime indexed_selectors: bool) !void {
-    const alloc = std.testing.allocator;
+    // Retain checked ownership for the full campaign without allocator-stack
+    // unwinding on every native relation and HTTP allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const alloc = fixture_allocator.allocator();
     const parity = @import("sql_parity_reference.zig");
     const Source = @import("sql_parity_sources.zig").Tables(3);
     var completed_campaigns: usize = 0;
@@ -17309,7 +17314,9 @@ test "httpx antfly schema update owns self partial support and requires coordina
     defer e2e_server.deinit();
     var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
-    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    // Observe each deliberately unavailable publication response directly.
+    // The loop below already repeats the request; client backoff is tested in httpx.
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
     defer client.deinit();
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
