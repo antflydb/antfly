@@ -66,7 +66,9 @@ pub fn CohortMemory(comptime Hooks: type) type {
             var retained_decoder = decoder;
             if (self.share_decoder_scratch) {
                 // A single GPU gate owns prefill and decode. Their frame
-                // resources drain before the locked forward/result copy returns.
+                // resources retire after their last queued consumer. CUDA may
+                // release the gate during a retained readback: all subsequent
+                // scratch reuse remains ordered on that same model stream.
                 // Keep a full prompt hidden tensor and logits additive in case
                 // a final-row view or sampling output outlives that gate.
                 const logits = try product(&.{ cfg.vocab_size, @sizeOf(f32) });
@@ -129,8 +131,10 @@ pub fn CohortMemory(comptime Hooks: type) type {
                     persistent.host_scratch_bytes = std.math.add(usize, persistent.host_scratch_bytes, host_state) catch return error.ResourceLimitExceeded;
                 persistent.backend_scratch_bytes = std.math.add(usize, persistent.backend_scratch_bytes, gpu_state) catch return error.ResourceLimitExceeded;
             };
-            // Projected embeddings can await prefill while another page owns
-            // the runtime; token plans and output buffers also outlive vision.
+            // Independently owned device projected embeddings can await prefill
+            // while another page owns the runtime. Their full per-page bytes
+            // remain charged until retirement; no batched parent is borrowed.
+            // Token plans and output buffers also outlive vision.
             const tokens = std.math.add(usize, prompt_tokens, output_tokens) catch return error.ResourceLimitExceeded;
             persistent = try persistent.merge(.{
                 .host_scratch_bytes = try product(&.{ tokens, 128 }),

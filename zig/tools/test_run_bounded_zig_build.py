@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,6 +36,44 @@ SPEC.loader.exec_module(launcher)
 
 
 class BoundedZigBuildTest(unittest.TestCase):
+    def test_unit_inventory_failure_never_launches_the_unit_build(self):
+        monitor = SCRIPT.parents[2] / "scripts/ci/run-zig-unit-tests.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "zig").mkdir()
+            binaries = root / "bin"
+            binaries.mkdir()
+            trace = root / "commands"
+            taskset = binaries / "taskset"
+            taskset.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$PREFLIGHT_TRACE"\n'
+                'case "$*" in *unit-storage-test-audit*) exit 42;; *) exit 99;; esac\n'
+            )
+            taskset.chmod(0o755)
+            # The production watchdog enables ptrace on Linux. This test must
+            # never change the host's settings, even if sudo is available.
+            sudo = binaries / "sudo"
+            sudo.write_text("#!/bin/sh\nexit 0\n")
+            sudo.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(monitor), "0-1", "21474836480"],
+                cwd=root,
+                env={
+                    **os.environ,
+                    "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}",
+                    "RUNNER_TEMP": str(root),
+                    "PREFLIGHT_TRACE": str(trace),
+                },
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+            commands = trace.read_text().splitlines()
+            self.assertEqual(len(commands), 1)
+            self.assertIn("unit-storage-test-audit", commands[0])
+            self.assertNotIn("make zig-unit-test", commands[0])
+
     def test_runtime_memory_profiles(self):
         # Exercise the admission policy itself without constructing or compiling
         # the product graph. In particular, host/target and backend fallbacks

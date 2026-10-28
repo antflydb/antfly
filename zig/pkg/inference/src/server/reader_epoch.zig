@@ -147,6 +147,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 std.debug.print("LIGHTONOCR3 device_recurrent_state={d} recurrent_cache_pages={d} host_recurrent_bytes_total={d}\n", .{ @intFromBool(ctx.cfg.qwen35_device_only_state), ctx.recurrent_cache_pages, ctx.host_recurrent_bytes_total });
                 std.debug.print("LIGHTONOCR3 prefill_await_groups={d} prefill_await_events={d} prefill_decode_streak={d}\n", .{ ctx.prefill_await_groups, @intFromBool(ctx.prefill_await_events), ctx.features.prefill_decode_streak });
                 std.debug.print("LIGHTONOCR3 cpu_preprocess={d} cpu_preprocess_items={d} cpu_preprocess_ns={d} vision_batch_limit={d}\n", .{ @intFromBool(ctx.features.cpu_preprocess), ctx.cpu_preprocess_items, ctx.cpu_preprocess_ns, ctx.features.vision_batch_items });
+                std.debug.print("LIGHTONOCR3 shared_pool_event_waits={d} shared_pool_poll_waits={d}\n", .{ ctx.model.native_reader_stream.event_waits.load(.monotonic), ctx.model.native_reader_stream.poll_waits.load(.monotonic) });
                 std.debug.print("LIGHTONOCR3 gate_events={d} gate_event_acquisitions={d} gate_event_waits={d}\n", .{ @intFromBool(ctx.gate_events), ctx.step_gate.acquisitions, ctx.step_gate.event_waits });
                 std.debug.print("LIGHTONOCR3 executor_steps={d}\n", .{ctx.worker_steps});
                 std.debug.print("LIGHTONOCR3 executor_tail_steps={d}\n", .{ctx.worker_tail_steps});
@@ -280,6 +281,16 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (enabled) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
             return enabled;
         }
+        /// A cancelled receiver still owns a completed device result. Retire
+        /// it under the same lane as its producer, before the page/epoch dies.
+        pub fn retireProjected(ctx: *LightOnStreamContext, projected: *qwen3vl_projector.ProjectedImages) void {
+            if (projected.device_embeddings != null) {
+                ctx.lockStepForCleanup();
+                defer ctx.unlockStep();
+                projected.deinit();
+            } else projected.deinit();
+        }
+
         pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             if (ctx.phase_fair) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
             defer if (ctx.phase_fair) {
@@ -288,6 +299,13 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             const queued = if (ctx.gate_events) try ctx.step_gate.acquireWithPriority(control, true) else null;
             errdefer if (queued) |lease| lease.release();
             try control.lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns);
+            ctx.invalidateCudaDecodeGraph();
+        }
+        fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext) void {
+            // Vision and other foreground phases may resize shared CUDA
+            // scratch. Retire captured addresses before that phase executes.
+            if (comptime build_options.enable_cuda) if (ctx.cb) |*cb|
+                @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraph(cb);
         }
         pub fn lockStepForCleanup(ctx: *LightOnStreamContext) void {
             if (ctx.phase_fair) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
@@ -297,10 +315,14 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (ctx.gate_events) {
                 _ = ctx.step_gate.acquireForCleanup(if (ctx.worker_io) |*owner| owner.io() else null, true);
             }
-            if (ctx.phase_wait_ns == 0) return platform.sync.lockYielding(&ctx.step_mutex);
-            // Cleanup must retain stack-backed state until its owner releases
-            // the backend. An empty control cannot cancel this acquisition.
-            (InferenceExecutionControl{}).lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns) catch unreachable;
+            if (ctx.phase_wait_ns == 0) {
+                platform.sync.lockYielding(&ctx.step_mutex);
+            } else {
+                // Cleanup retains stack-backed state until its owner releases
+                // the backend; an empty control cannot cancel acquisition.
+                (InferenceExecutionControl{}).lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns) catch unreachable;
+            }
+            ctx.invalidateCudaDecodeGraph();
         }
         pub fn unlockStep(ctx: *LightOnStreamContext) void {
             ctx.step_mutex.unlock();
@@ -408,7 +430,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 .gpu_token_burst_lighton_decode = ctx.features.gpu_token_burst,
                 .gpu_token_burst_width = ctx.features.gpu_token_burst_width,
                 .gpu_greedy_stream_lighton_decode = ctx.features.gpu_greedy_stream,
+                .lighton_cuda_execution_id = ctx.execution_id,
             };
+            defer pipeline.deinit();
             var storage: [reader_execution_pool.Pool.max_capacity]runtime.scheduler.native_generate.StepItem = undefined;
             var step = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
             while (!ctx.worker_stop.load(.acquire)) {
@@ -452,7 +476,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (ctx.cb != null) return;
             var cb = try session_factory.getComputeBackendWithBudget(ctx.model.session, ctx.allocator, &ctx.budget);
             errdefer cb.deinit();
-            const config = generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced());
+            // The device hook owns CUDA KV bytes. Both epoch pools retain
+            // logical pages without allocating a second pair of host mirrors.
+            const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced()));
             ctx.pool = try ctx.manager.addPool(config);
             ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, config);
             errdefer ctx.storage.deinit();

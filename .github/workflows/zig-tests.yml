@@ -70,11 +70,38 @@ jobs:
       suite: ${{ inputs.full_validation && 'full' || 'zig' }}
 
   grep-qualification:
-    name: native grep qualification
-    needs: admission
-    if: ${{ !cancelled() && needs.admission.result == 'success' && inputs.validation_scope != 'inference-e2e' && (inputs.pr_number == '' || github.run_attempt == 1) }}
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      inputs.validation_scope != 'inference-e2e' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      ( inputs.full_validation ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (inputs.pr_number == '' && github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
+      github.event.schedule == '0 8 * * *' ||
+      (!inputs.full_validation &&
+      (inputs.pr_number != '' || github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) ) }}
+    name: zig-${{ matrix.suite }} / grep
+    needs: [admission, changes]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      matrix:
+        # Select one profile so full validation does not build/test grep twice.
+        include: >-
+          ${{ fromJSON(
+          (inputs.full_validation ||
+          github.event_name == 'merge_group' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (inputs.pr_number == '' && github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
+          github.event.schedule == '0 8 * * *') &&
+          '[{"suite":"full","cases":5000}]' ||
+          '[{"suite":"base","cases":500}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,11 +123,14 @@ jobs:
           echo 'e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849  '"$RUNNER_TEMP/ripgrep-15.2.0-x86_64-unknown-linux-musl/rg" | sha256sum --check
           echo "$RUNNER_TEMP/ripgrep-15.2.0-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
       - name: Native tests and generated differential campaign
+        env:
+          DIFFERENTIAL_CASES: ${{ matrix.cases }}
         run: |
           zig build --build-file zig/build.zig -Dgrep-only=true -Doptimize=ReleaseFast -Dstrip=true grep grep-test
           mkdir -p zig/zig-out/grep-qualification
-          python3 zig/pkg/antfly-grep/tests/differential.py zig/zig-out/bin/antfly-grep "$(command -v rg)" --seed 116417 --cases 5000 --output zig/zig-out/grep-qualification/differential.json
+          python3 zig/pkg/antfly-grep/tests/differential.py zig/zig-out/bin/antfly-grep "$(command -v rg)" --seed 116417 --cases "$DIFFERENTIAL_CASES" --output zig/zig-out/grep-qualification/differential.json
       - name: Benchmark native CPU and cache configurations
+        if: matrix.suite == 'full'
         shell: bash
         run: |
           python3 zig/pkg/antfly-grep/bench/compare.py zig/zig-out/bin/antfly-grep --extended --codecs --mib 8 --rounds 7 --quiet --output zig/zig-out/grep-qualification/warm.json
@@ -112,11 +142,12 @@ jobs:
       - name: Verify standalone release contents
         run: |
           python3 -m unittest discover -s scripts/packaging -p test_grep_packaging.py
+          python3 -m unittest discover -s scripts/release -p test_grep_release.py
           python3 scripts/packaging/package_grep_release.py --binary zig/zig-out/bin/antfly-grep --output zig/zig-out/grep-qualification/antfly-grep-linux-x86_64.tar.gz
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: native-grep-qualification
+          name: zig-${{ matrix.suite }}-grep
           path: zig/zig-out/grep-qualification/
 
   changes:
@@ -1930,7 +1961,17 @@ jobs:
       - name: Test embedded SDK against the installed C ABI
         env:
           ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/embedded-sdk-native-models
+          ANTFLY_SDK_NATIVE_REPORT_DIR: ${{ runner.temp }}/embedded-sdk-native-reports
         run: scripts/ci/test-embedded-sdk-native.sh "${RUNNER_TEMP}/native-sdk" "${{ matrix.sdk }}"
+
+      - name: Retain Python native test results and timings
+        if: always() && matrix.sdk == 'python'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: embedded-sdk-python-results-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/embedded-sdk-native-reports
+          if-no-files-found: ignore
+          retention-days: 14
 
   pgwire-driver-conformance:
     if: >-
