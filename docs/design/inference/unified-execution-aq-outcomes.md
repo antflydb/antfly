@@ -39,14 +39,49 @@ Evidence: `.benchmark-assets/1166/aq-campaign/`, including the original source,
 Metal check results. The rejected byte-offset ARC prototype is retained in the
 initial syntax log.
 
+## CPU fixed-cardinality projection family: implemented
+
+Q1 and Q8 projection pairs/triples share validation and traversal owners. Q1,
+Q8 and Q8_1 single/pair/triple activation preparation shares one stack/heap
+ownership scope with compile-time codec/cardinality policies. Q1 keeps its
+serial quantizer; Q8 keeps its dispatching quantizer. Single-Q8 profiling and
+all existing worker/dot-kernel selections remain explicit.
+
+The final source removes **19041 maintained production bytes**.
+Generated activation/worker regions remain byte-identical. The reduction is
+slightly below the audit's 20 KB prototype goal; Q4/Q6 packed-layout/bias routes
+are retained rather than forcing distinct schedules through this owner.
+
+Acceptance and limits:
+
+- Existing format/routing regressions: **31 passed / one skipped**.
+- The initial 48-profile Q1/Q8 kernel-owner matrix passes AA/AB/BA on both
+  native and portable non-SDOT builds, with exact original-function outputs.
+- The expanded 108-profile matrix includes original Q1 dispatch and scan
+  bodies, raw Q8 and prepared Q8_1, one/two/three planes, tails, panel and
+  row-major storage, and stack/heap-sized inputs. Both binaries pass all exact
+  output comparisons and their 38 imported smoke tests.
+- All 324 native profile/order checks pass. Maximum candidate AB/BA median
+  ratio is 1.032574.
+- Every portable candidate AB/BA comparison meets the same 1.05 median / 1.10
+  p95 bounds (maximum median 1.013484). One **baseline-versus-itself AA p95
+  control fails at 1.128196**, while its median is 1.002605. The full portable
+  matrix remains recorded as failed; no failed measurement is retried or
+  relabeled. Portable timing is therefore not fully qualified.
+
+Evidence and exact source/binary pins: `.benchmark-assets/1166/aq-campaign/cpu/`.
+Temporary original-function references live inside the retained qualification
+fixture; they are removed from production before committing. The numerical
+implementation remains in the production source.
+
 ## Remaining campaign work
 
 - Prototype pipeline sharing/demand preparation independently of the catalog;
   preserve precise-library provenance and required failure behavior.
 - Prototype Metal whole-decoder phase ownership across the audited direct and
   planned routes, without changing kernel schedules or frame resource rules.
-- Prototype the fixed-cardinality CPU projection family, preserving specialized
-  microkernels and measuring independent arithmetic/performance references.
+- Preserve the portable timing-control limitation above; any further CPU
+  timing work must retain the failed matrix and use a justified protocol.
 - Prototype CUDA attention launch preparation using existing descriptors and
   native ABI owners; preserve capture slots and all physical KV formats.
 

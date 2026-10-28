@@ -24173,6 +24173,79 @@ fn q1_0PreparedActivationApply(
     }
 }
 
+inline fn q1_0PreparedActivationColumn(
+    comptime n: usize,
+    comptime width: usize,
+    q_values: []const u8,
+    scales: []const f32,
+    prepared: [n][]const u8,
+    panels: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    output_rows: [n][]f32,
+    row_blocks: usize,
+    row_stride: usize,
+    o: usize,
+) void {
+    var acc: [n][width]f32 = undefined;
+    inline for (0..n) |plane| inline for (0..width) |lane| {
+        acc[plane][lane] = optionalLinearBiasAt(biases[plane], o + lane);
+    };
+    for (0..row_blocks) |block_idx| {
+        const sums = if (width == 4) blk: {
+            var blocks: [n][4][]const u8 = undefined;
+            inline for (0..n) |plane| inline for (0..4) |lane| {
+                blocks[plane][lane] = preparedQ1_0PanelBlock(panels[plane], prepared[plane], row_blocks, row_stride, o, block_idx, lane);
+            };
+            break :blk dotQ1_0PreparedQ8_0GroupedBlock4(n, q_values, scales, blocks, block_idx);
+        } else blk: {
+            var blocks: [n][]const u8 = undefined;
+            inline for (0..n) |plane| blocks[plane] = prepared[plane][o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes];
+            const scalar = dotQ1_0PreparedQ8_0GroupedBlock(n, q_values, scales, blocks, block_idx);
+            var result: [n][1]f32 = undefined;
+            inline for (0..n) |plane| result[plane] = .{scalar[plane]};
+            break :blk result;
+        };
+        inline for (0..n) |plane| inline for (0..width) |lane| {
+            acc[plane][lane] += sums[plane][lane];
+        };
+    }
+    inline for (0..n) |plane| inline for (0..width) |lane| {
+        output_rows[plane][o + lane] = acc[plane][lane];
+    };
+}
+
+fn q1_0PreparedActivationProjections(
+    comptime n: usize,
+    q_values: []const u8,
+    input_scales: []const f32,
+    prepared: [n][]const u8,
+    panels: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out_start: usize,
+    out_end: usize,
+) void {
+    const row_blocks = in_dim / 128;
+    const input_blocks = in_dim / 32;
+    const row_stride = row_blocks * prepared_q1_0_block_bytes;
+    for (0..rows) |r| {
+        const q_row = q_values[r * in_dim ..][0..in_dim];
+        const scales_row = input_scales[r * input_blocks ..][0..input_blocks];
+        var out_rows: [n][]f32 = undefined;
+        inline for (0..n) |plane| out_rows[plane] = outputs[plane][r * out_dim ..][0..out_dim];
+        var o = out_start;
+        while (o < out_end and (o % prepared_q8_0_panel_nr) != 0) : (o += 1)
+            q1_0PreparedActivationColumn(n, 1, q_row, scales_row, prepared, panels, biases, out_rows, row_blocks, row_stride, o);
+        while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr)
+            q1_0PreparedActivationColumn(n, 4, q_row, scales_row, prepared, panels, biases, out_rows, row_blocks, row_stride, o);
+        while (o < out_end) : (o += 1)
+            q1_0PreparedActivationColumn(n, 1, q_row, scales_row, prepared, panels, biases, out_rows, row_blocks, row_stride, o);
+    }
+}
+
 fn q1_0PreparedActivationPairApply(
     q_values: []const u8,
     input_scales: []const f32,
@@ -24188,104 +24261,7 @@ fn q1_0PreparedActivationPairApply(
     out_start: usize,
     out_end: usize,
 ) void {
-    const row_blocks = in_dim / 128;
-    const input_blocks = in_dim / 32;
-    const row_stride = row_blocks * prepared_q1_0_block_bytes;
-    for (0..rows) |r| {
-        const q_values_row = q_values[r * in_dim ..][0..in_dim];
-        const input_scales_row = input_scales[r * input_blocks ..][0..input_blocks];
-        const out_row_a = output_a[r * out_dim ..][0..out_dim];
-        const out_row_b = output_b[r * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_q8_0_panel_nr) != 0) : (o += 1) {
-            var acc_a: f32 = 0.0;
-            var acc_b: f32 = 0.0;
-            for (0..row_blocks) |block_idx| {
-                const sums = dotQ1_0PreparedQ8_0GroupedBlock(
-                    2,
-                    q_values_row,
-                    input_scales_row,
-                    .{
-                        prepared_blocks_a[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                        prepared_blocks_b[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                    },
-                    block_idx,
-                );
-                acc_a += sums[0];
-                acc_b += sums[1];
-            }
-            out_row_a[o] = acc_a;
-            out_row_b[o] = acc_b;
-        }
-        while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc_a0: f32 = 0.0;
-            var acc_a1: f32 = 0.0;
-            var acc_a2: f32 = 0.0;
-            var acc_a3: f32 = 0.0;
-            var acc_b0: f32 = 0.0;
-            var acc_b1: f32 = 0.0;
-            var acc_b2: f32 = 0.0;
-            var acc_b3: f32 = 0.0;
-            for (0..row_blocks) |block_idx| {
-                const sums = dotQ1_0PreparedQ8_0GroupedBlock4(
-                    2,
-                    q_values_row,
-                    input_scales_row,
-                    .{
-                        .{
-                            preparedQ1_0PanelBlock(panel_blocks_a, prepared_blocks_a, row_blocks, row_stride, o, block_idx, 0),
-                            preparedQ1_0PanelBlock(panel_blocks_a, prepared_blocks_a, row_blocks, row_stride, o, block_idx, 1),
-                            preparedQ1_0PanelBlock(panel_blocks_a, prepared_blocks_a, row_blocks, row_stride, o, block_idx, 2),
-                            preparedQ1_0PanelBlock(panel_blocks_a, prepared_blocks_a, row_blocks, row_stride, o, block_idx, 3),
-                        },
-                        .{
-                            preparedQ1_0PanelBlock(panel_blocks_b, prepared_blocks_b, row_blocks, row_stride, o, block_idx, 0),
-                            preparedQ1_0PanelBlock(panel_blocks_b, prepared_blocks_b, row_blocks, row_stride, o, block_idx, 1),
-                            preparedQ1_0PanelBlock(panel_blocks_b, prepared_blocks_b, row_blocks, row_stride, o, block_idx, 2),
-                            preparedQ1_0PanelBlock(panel_blocks_b, prepared_blocks_b, row_blocks, row_stride, o, block_idx, 3),
-                        },
-                    },
-                    block_idx,
-                );
-                acc_a0 += sums[0][0];
-                acc_a1 += sums[0][1];
-                acc_a2 += sums[0][2];
-                acc_a3 += sums[0][3];
-                acc_b0 += sums[1][0];
-                acc_b1 += sums[1][1];
-                acc_b2 += sums[1][2];
-                acc_b3 += sums[1][3];
-            }
-            out_row_a[o] = acc_a0;
-            out_row_a[o + 1] = acc_a1;
-            out_row_a[o + 2] = acc_a2;
-            out_row_a[o + 3] = acc_a3;
-            out_row_b[o] = acc_b0;
-            out_row_b[o + 1] = acc_b1;
-            out_row_b[o + 2] = acc_b2;
-            out_row_b[o + 3] = acc_b3;
-        }
-        while (o < out_end) : (o += 1) {
-            var acc_a: f32 = 0.0;
-            var acc_b: f32 = 0.0;
-            for (0..row_blocks) |block_idx| {
-                const sums = dotQ1_0PreparedQ8_0GroupedBlock(
-                    2,
-                    q_values_row,
-                    input_scales_row,
-                    .{
-                        prepared_blocks_a[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                        prepared_blocks_b[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                    },
-                    block_idx,
-                );
-                acc_a += sums[0];
-                acc_b += sums[1];
-            }
-            out_row_a[o] = acc_a;
-            out_row_b[o] = acc_b;
-        }
-    }
+    q1_0PreparedActivationProjections(2, q_values, input_scales, .{ prepared_blocks_a, prepared_blocks_b }, .{ panel_blocks_a, panel_blocks_b }, .{ null, null }, .{ output_a, output_b }, rows, in_dim, out_dim, out_start, out_end);
 }
 
 fn q1_0PreparedActivationTripleApply(
@@ -24309,131 +24285,7 @@ fn q1_0PreparedActivationTripleApply(
     out_start: usize,
     out_end: usize,
 ) void {
-    const row_blocks = in_dim / 128;
-    const input_blocks = in_dim / 32;
-    const row_stride = row_blocks * prepared_q1_0_block_bytes;
-    for (0..rows) |r| {
-        const q_values_row = q_values[r * in_dim ..][0..in_dim];
-        const input_scales_row = input_scales[r * input_blocks ..][0..input_blocks];
-        const out_row_a = output_a[r * out_dim ..][0..out_dim];
-        const out_row_b = output_b[r * out_dim ..][0..out_dim];
-        const out_row_c = output_c[r * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_q8_0_panel_nr) != 0) : (o += 1) {
-            var acc_a = optionalLinearBiasAt(bias_a, o);
-            var acc_b = optionalLinearBiasAt(bias_b, o);
-            var acc_c = optionalLinearBiasAt(bias_c, o);
-            for (0..row_blocks) |block_idx| {
-                const sums = dotQ1_0PreparedQ8_0GroupedBlock(
-                    3,
-                    q_values_row,
-                    input_scales_row,
-                    .{
-                        prepared_blocks_a[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                        prepared_blocks_b[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                        prepared_blocks_c[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                    },
-                    block_idx,
-                );
-                acc_a += sums[0];
-                acc_b += sums[1];
-                acc_c += sums[2];
-            }
-            out_row_a[o] = acc_a;
-            out_row_b[o] = acc_b;
-            out_row_c[o] = acc_c;
-        }
-        while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc_a0 = optionalLinearBiasAt(bias_a, o);
-            var acc_a1 = optionalLinearBiasAt(bias_a, o + 1);
-            var acc_a2 = optionalLinearBiasAt(bias_a, o + 2);
-            var acc_a3 = optionalLinearBiasAt(bias_a, o + 3);
-            var acc_b0 = optionalLinearBiasAt(bias_b, o);
-            var acc_b1 = optionalLinearBiasAt(bias_b, o + 1);
-            var acc_b2 = optionalLinearBiasAt(bias_b, o + 2);
-            var acc_b3 = optionalLinearBiasAt(bias_b, o + 3);
-            var acc_c0 = optionalLinearBiasAt(bias_c, o);
-            var acc_c1 = optionalLinearBiasAt(bias_c, o + 1);
-            var acc_c2 = optionalLinearBiasAt(bias_c, o + 2);
-            var acc_c3 = optionalLinearBiasAt(bias_c, o + 3);
-            for (0..row_blocks) |block_idx| {
-                const sums = dotQ1_0PreparedQ8_0GroupedBlock4(
-                    3,
-                    q_values_row,
-                    input_scales_row,
-                    .{
-                        .{
-                            preparedQ1_0PanelBlock(panel_blocks_a, prepared_blocks_a, row_blocks, row_stride, o, block_idx, 0),
-                            preparedQ1_0PanelBlock(panel_blocks_a, prepared_blocks_a, row_blocks, row_stride, o, block_idx, 1),
-                            preparedQ1_0PanelBlock(panel_blocks_a, prepared_blocks_a, row_blocks, row_stride, o, block_idx, 2),
-                            preparedQ1_0PanelBlock(panel_blocks_a, prepared_blocks_a, row_blocks, row_stride, o, block_idx, 3),
-                        },
-                        .{
-                            preparedQ1_0PanelBlock(panel_blocks_b, prepared_blocks_b, row_blocks, row_stride, o, block_idx, 0),
-                            preparedQ1_0PanelBlock(panel_blocks_b, prepared_blocks_b, row_blocks, row_stride, o, block_idx, 1),
-                            preparedQ1_0PanelBlock(panel_blocks_b, prepared_blocks_b, row_blocks, row_stride, o, block_idx, 2),
-                            preparedQ1_0PanelBlock(panel_blocks_b, prepared_blocks_b, row_blocks, row_stride, o, block_idx, 3),
-                        },
-                        .{
-                            preparedQ1_0PanelBlock(panel_blocks_c, prepared_blocks_c, row_blocks, row_stride, o, block_idx, 0),
-                            preparedQ1_0PanelBlock(panel_blocks_c, prepared_blocks_c, row_blocks, row_stride, o, block_idx, 1),
-                            preparedQ1_0PanelBlock(panel_blocks_c, prepared_blocks_c, row_blocks, row_stride, o, block_idx, 2),
-                            preparedQ1_0PanelBlock(panel_blocks_c, prepared_blocks_c, row_blocks, row_stride, o, block_idx, 3),
-                        },
-                    },
-                    block_idx,
-                );
-                acc_a0 += sums[0][0];
-                acc_a1 += sums[0][1];
-                acc_a2 += sums[0][2];
-                acc_a3 += sums[0][3];
-                acc_b0 += sums[1][0];
-                acc_b1 += sums[1][1];
-                acc_b2 += sums[1][2];
-                acc_b3 += sums[1][3];
-                acc_c0 += sums[2][0];
-                acc_c1 += sums[2][1];
-                acc_c2 += sums[2][2];
-                acc_c3 += sums[2][3];
-            }
-            out_row_a[o] = acc_a0;
-            out_row_a[o + 1] = acc_a1;
-            out_row_a[o + 2] = acc_a2;
-            out_row_a[o + 3] = acc_a3;
-            out_row_b[o] = acc_b0;
-            out_row_b[o + 1] = acc_b1;
-            out_row_b[o + 2] = acc_b2;
-            out_row_b[o + 3] = acc_b3;
-            out_row_c[o] = acc_c0;
-            out_row_c[o + 1] = acc_c1;
-            out_row_c[o + 2] = acc_c2;
-            out_row_c[o + 3] = acc_c3;
-        }
-        while (o < out_end) : (o += 1) {
-            var acc_a = optionalLinearBiasAt(bias_a, o);
-            var acc_b = optionalLinearBiasAt(bias_b, o);
-            var acc_c = optionalLinearBiasAt(bias_c, o);
-            for (0..row_blocks) |block_idx| {
-                const sums = dotQ1_0PreparedQ8_0GroupedBlock(
-                    3,
-                    q_values_row,
-                    input_scales_row,
-                    .{
-                        prepared_blocks_a[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                        prepared_blocks_b[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                        prepared_blocks_c[o * row_stride + block_idx * prepared_q1_0_block_bytes ..][0..prepared_q1_0_block_bytes],
-                    },
-                    block_idx,
-                );
-                acc_a += sums[0];
-                acc_b += sums[1];
-                acc_c += sums[2];
-            }
-            out_row_a[o] = acc_a;
-            out_row_b[o] = acc_b;
-            out_row_c[o] = acc_c;
-        }
-    }
+    q1_0PreparedActivationProjections(3, q_values, input_scales, .{ prepared_blocks_a, prepared_blocks_b, prepared_blocks_c }, .{ panel_blocks_a, panel_blocks_b, panel_blocks_c }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim, out_start, out_end);
 }
 
 fn quantizeQ1_0Activation(
@@ -24462,22 +24314,7 @@ fn linearNoBiasQ1_0PreparedActivation(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    _ = try validatePreparedQ1_0ActivationBlocks(prepared_blocks, panel_blocks, in_dim, out_dim);
-    const values_per_block: usize = 32;
-    const input_blocks = in_dim / values_per_block;
-    if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-        var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-        var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-        const q_values = q_values_buf[0..in_dim];
-        const input_scales = input_scales_buf[0..input_blocks];
-        quantizeQ8_0ActivationRows(input, q_values, input_scales, rows, in_dim, input_blocks);
-        try linearQ1_0PreparedActivationDispatch(io, q_values, input_scales, prepared_blocks, panel_blocks, null, output, rows, in_dim, out_dim);
-        return;
-    }
-    const q = try quantizeQ1_0Activation(allocator, input, rows, in_dim);
-    defer allocator.free(q.q_values);
-    defer allocator.free(q.input_scales);
-    try linearQ1_0PreparedActivationDispatch(io, q.q_values, q.input_scales, prepared_blocks, panel_blocks, null, output, rows, in_dim, out_dim);
+    return linearPreparedActivationProjections(.q1, 1, allocator, io, input, .{prepared_blocks}, .{panel_blocks}, @splat(null), @splat(null), .{output}, rows, in_dim, out_dim);
 }
 
 // quant-kernel-codegen:begin CPU worker schedule linearQ1_0PreparedActivationParallel
@@ -24801,24 +24638,7 @@ fn linearNoBiasQ1_0PreparedActivationPair(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    const row_blocks = try validatePreparedQ1_0ActivationBlocks(prepared_blocks_a, panel_blocks_a, in_dim, out_dim);
-    const row_blocks_b = try validatePreparedQ1_0ActivationBlocks(prepared_blocks_b, panel_blocks_b, in_dim, out_dim);
-    if (row_blocks_b != row_blocks) return error.InvalidQuantizedLinearShape;
-    const values_per_block: usize = 32;
-    const input_blocks = in_dim / values_per_block;
-    if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-        var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-        var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-        const q_values = q_values_buf[0..in_dim];
-        const input_scales = input_scales_buf[0..input_blocks];
-        quantizeQ8_0ActivationRows(input, q_values, input_scales, rows, in_dim, input_blocks);
-        try linearQ1_0PreparedActivationPairDispatch(io, q_values, input_scales, prepared_blocks_a, panel_blocks_a, prepared_blocks_b, panel_blocks_b, output_a, output_b, rows, in_dim, out_dim);
-        return;
-    }
-    const q = try quantizeQ1_0Activation(allocator, input, rows, in_dim);
-    defer allocator.free(q.q_values);
-    defer allocator.free(q.input_scales);
-    try linearQ1_0PreparedActivationPairDispatch(io, q.q_values, q.input_scales, prepared_blocks_a, panel_blocks_a, prepared_blocks_b, panel_blocks_b, output_a, output_b, rows, in_dim, out_dim);
+    return linearPreparedActivationProjections(.q1, 2, allocator, io, input, .{ prepared_blocks_a, prepared_blocks_b }, .{ panel_blocks_a, panel_blocks_b }, @splat(null), @splat(null), .{ output_a, output_b }, rows, in_dim, out_dim);
 }
 
 fn linearQ1_0PreparedActivationTriple(
@@ -24841,25 +24661,7 @@ fn linearQ1_0PreparedActivationTriple(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    const row_blocks = try validatePreparedQ1_0ActivationBlocks(prepared_blocks_a, panel_blocks_a, in_dim, out_dim);
-    const row_blocks_b = try validatePreparedQ1_0ActivationBlocks(prepared_blocks_b, panel_blocks_b, in_dim, out_dim);
-    const row_blocks_c = try validatePreparedQ1_0ActivationBlocks(prepared_blocks_c, panel_blocks_c, in_dim, out_dim);
-    if (row_blocks_b != row_blocks or row_blocks_c != row_blocks) return error.InvalidQuantizedLinearShape;
-    const values_per_block: usize = 32;
-    const input_blocks = in_dim / values_per_block;
-    if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-        var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-        var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-        const q_values = q_values_buf[0..in_dim];
-        const input_scales = input_scales_buf[0..input_blocks];
-        quantizeQ8_0ActivationRows(input, q_values, input_scales, rows, in_dim, input_blocks);
-        try linearQ1_0PreparedActivationTripleDispatch(io, q_values, input_scales, prepared_blocks_a, panel_blocks_a, prepared_blocks_b, panel_blocks_b, prepared_blocks_c, panel_blocks_c, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim);
-        return;
-    }
-    const q = try quantizeQ1_0Activation(allocator, input, rows, in_dim);
-    defer allocator.free(q.q_values);
-    defer allocator.free(q.input_scales);
-    try linearQ1_0PreparedActivationTripleDispatch(io, q.q_values, q.input_scales, prepared_blocks_a, panel_blocks_a, prepared_blocks_b, panel_blocks_b, prepared_blocks_c, panel_blocks_c, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim);
+    return linearPreparedActivationProjections(.q1, 3, allocator, io, input, .{ prepared_blocks_a, prepared_blocks_b, prepared_blocks_c }, .{ panel_blocks_a, panel_blocks_b, panel_blocks_c }, @splat(null), .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim);
 }
 
 inline fn preparedK16Dsc(prepared_block: []const u8, sub: usize) f32 {
@@ -28197,24 +27999,7 @@ fn linearNoBiasQ8_1PreparedActivation(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    const row_blocks = try validatePreparedQ8_1ActivationBlocks(prepared_blocks, prepared_panel_blocks, rows, in_dim, out_dim);
-    const values_per_block: usize = 32;
-    if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-        var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-        var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-        const q_values = q_values_buf[0 .. row_blocks * values_per_block];
-        const input_scales = input_scales_buf[0..row_blocks];
-        try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-        try linearQ8_0QuantizedInputDispatch(io, q_values, input_scales, &empty_u8, prepared_blocks, prepared_panel_blocks, null, null, output, rows, in_dim, out_dim);
-        return;
-    }
-    const q_values = try allocator.alloc(u8, rows * row_blocks * values_per_block);
-    defer allocator.free(q_values);
-    const input_scales = try allocator.alloc(f32, rows * row_blocks);
-    defer allocator.free(input_scales);
-    try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-
-    try linearQ8_0QuantizedInputDispatch(io, q_values, input_scales, &empty_u8, prepared_blocks, prepared_panel_blocks, null, null, output, rows, in_dim, out_dim);
+    return linearPreparedActivationProjections(.q8, 1, allocator, io, input, .{prepared_blocks}, .{prepared_panel_blocks}, @splat(null), @splat(null), .{output}, rows, in_dim, out_dim);
 }
 
 fn linearNoBiasQ8_1PreparedActivationPair(
@@ -28233,64 +28018,7 @@ fn linearNoBiasQ8_1PreparedActivationPair(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    const row_blocks = try validatePreparedQ8_1ActivationBlocks(prepared_blocks_a, prepared_panel_blocks_a, rows, in_dim, out_dim);
-    const row_blocks_b = try validatePreparedQ8_1ActivationBlocks(prepared_blocks_b, prepared_panel_blocks_b, rows, in_dim, out_dim);
-    if (row_blocks_b != row_blocks) return error.InvalidQuantizedLinearShape;
-    const values_per_block: usize = 32;
-    if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-        var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-        var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-        const q_values = q_values_buf[0 .. row_blocks * values_per_block];
-        const input_scales = input_scales_buf[0..row_blocks];
-        try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-        try linearQ8_0QuantizedInputPairDispatch(
-            io,
-            q_values,
-            input_scales,
-            &empty_u8,
-            prepared_blocks_a,
-            prepared_panel_blocks_a,
-            prepared_panel8_blocks_a,
-            null,
-            output_a,
-            &empty_u8,
-            prepared_blocks_b,
-            prepared_panel_blocks_b,
-            prepared_panel8_blocks_b,
-            null,
-            output_b,
-            rows,
-            in_dim,
-            out_dim,
-        );
-        return;
-    }
-    const q_values = try allocator.alloc(u8, rows * row_blocks * values_per_block);
-    defer allocator.free(q_values);
-    const input_scales = try allocator.alloc(f32, rows * row_blocks);
-    defer allocator.free(input_scales);
-    try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-
-    try linearQ8_0QuantizedInputPairDispatch(
-        io,
-        q_values,
-        input_scales,
-        &empty_u8,
-        prepared_blocks_a,
-        prepared_panel_blocks_a,
-        prepared_panel8_blocks_a,
-        null,
-        output_a,
-        &empty_u8,
-        prepared_blocks_b,
-        prepared_panel_blocks_b,
-        prepared_panel8_blocks_b,
-        null,
-        output_b,
-        rows,
-        in_dim,
-        out_dim,
-    );
+    return linearPreparedActivationProjections(.q8, 2, allocator, io, input, .{ prepared_blocks_a, prepared_blocks_b }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b }, .{ prepared_panel8_blocks_a, prepared_panel8_blocks_b }, @splat(null), .{ output_a, output_b }, rows, in_dim, out_dim);
 }
 
 fn linearQ8_1PreparedActivationTriple(
@@ -28316,77 +28044,7 @@ fn linearQ8_1PreparedActivationTriple(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    const row_blocks = try validatePreparedQ8_1ActivationBlocks(prepared_blocks_a, prepared_panel_blocks_a, rows, in_dim, out_dim);
-    const row_blocks_b = try validatePreparedQ8_1ActivationBlocks(prepared_blocks_b, prepared_panel_blocks_b, rows, in_dim, out_dim);
-    const row_blocks_c = try validatePreparedQ8_1ActivationBlocks(prepared_blocks_c, prepared_panel_blocks_c, rows, in_dim, out_dim);
-    if (row_blocks_b != row_blocks or row_blocks_c != row_blocks) return error.InvalidQuantizedLinearShape;
-    const values_per_block: usize = 32;
-    if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-        var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-        var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-        const q_values = q_values_buf[0 .. row_blocks * values_per_block];
-        const input_scales = input_scales_buf[0..row_blocks];
-        try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-        try linearQ8_0QuantizedInputTripleDispatch(
-            io,
-            q_values,
-            input_scales,
-            &empty_u8,
-            prepared_blocks_a,
-            prepared_panel_blocks_a,
-            prepared_panel8_blocks_a,
-            bias_a,
-            output_a,
-            &empty_u8,
-            prepared_blocks_b,
-            prepared_panel_blocks_b,
-            prepared_panel8_blocks_b,
-            bias_b,
-            output_b,
-            &empty_u8,
-            prepared_blocks_c,
-            prepared_panel_blocks_c,
-            prepared_panel8_blocks_c,
-            bias_c,
-            output_c,
-            rows,
-            in_dim,
-            out_dim,
-        );
-        return;
-    }
-    const q_values = try allocator.alloc(u8, rows * row_blocks * values_per_block);
-    defer allocator.free(q_values);
-    const input_scales = try allocator.alloc(f32, rows * row_blocks);
-    defer allocator.free(input_scales);
-    try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-
-    try linearQ8_0QuantizedInputTripleDispatch(
-        io,
-        q_values,
-        input_scales,
-        &empty_u8,
-        prepared_blocks_a,
-        prepared_panel_blocks_a,
-        prepared_panel8_blocks_a,
-        bias_a,
-        output_a,
-        &empty_u8,
-        prepared_blocks_b,
-        prepared_panel_blocks_b,
-        prepared_panel8_blocks_b,
-        bias_b,
-        output_b,
-        &empty_u8,
-        prepared_blocks_c,
-        prepared_panel_blocks_c,
-        prepared_panel8_blocks_c,
-        bias_c,
-        output_c,
-        rows,
-        in_dim,
-        out_dim,
-    );
+    return linearPreparedActivationProjections(.q8, 3, allocator, io, input, .{ prepared_blocks_a, prepared_blocks_b, prepared_blocks_c }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel_blocks_c }, .{ prepared_panel8_blocks_a, prepared_panel8_blocks_b, prepared_panel8_blocks_c }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim);
 }
 
 fn linearNoBiasQ8_0WithPolicy(
@@ -28403,51 +28061,9 @@ fn linearNoBiasQ8_0WithPolicy(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    const block_size: usize = 34;
-    const values_per_block: usize = 32;
-    if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
-    const row_blocks = in_dim / values_per_block;
-    const row_stride = row_blocks * block_size;
-    if (weight_raw.len != out_dim * row_stride) return error.InvalidQuantizedDataSize;
-    if (prepared_blocks) |blocks| {
-        if (blocks.len != out_dim * row_blocks * prepared_q8_0_block_bytes) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel_blocks) |blocks| {
-        if (blocks.len != preparedQ8_0PanelByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel8_blocks) |blocks| {
-        if (blocks.len != preparedQ8_0Panel8ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-
-    if (policy == .automatic and shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
-        if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-            var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-            var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-            const q_values = q_values_buf[0 .. row_blocks * values_per_block];
-            const input_scales = input_scales_buf[0..row_blocks];
-            const quant_start = nativeQuantPhaseStart();
-            try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-            noteNativeQuantPhase(.q8_0_activation_quant, quant_start);
-            const compute_start = nativeQuantPhaseStart();
-            try linearQ8_0QuantizedInputDispatch(io, q_values, input_scales, weight_raw, prepared_blocks, prepared_panel_blocks, prepared_panel8_blocks, null, output, rows, in_dim, out_dim);
-            noteNativeQuantPhase(.q8_0_compute, compute_start);
-            return;
-        }
-        const alloc_start = nativeQuantPhaseStart();
-        const q_values = try allocator.alloc(u8, rows * row_blocks * values_per_block);
-        defer allocator.free(q_values);
-        const input_scales = try allocator.alloc(f32, rows * row_blocks);
-        defer allocator.free(input_scales);
-        noteNativeQuantPhase(.q8_0_activation_alloc, alloc_start);
-        const quant_start = nativeQuantPhaseStart();
-        try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-        noteNativeQuantPhase(.q8_0_activation_quant, quant_start);
-
-        const compute_start = nativeQuantPhaseStart();
-        try linearQ8_0QuantizedInputDispatch(io, q_values, input_scales, weight_raw, prepared_blocks, prepared_panel_blocks, prepared_panel8_blocks, null, output, rows, in_dim, out_dim);
-        noteNativeQuantPhase(.q8_0_compute, compute_start);
-        return;
-    }
+    const row_blocks = try validateQ8_0ProjectionFamily(1, .{weight_raw}, .{prepared_blocks}, .{prepared_panel_blocks}, .{prepared_panel8_blocks}, in_dim, out_dim);
+    if (policy == .automatic and shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks))
+        return applyQuantizedActivationProjections(.q8, 1, true, allocator, io, input, .{weight_raw}, .{prepared_blocks}, .{prepared_panel_blocks}, .{prepared_panel8_blocks}, .{null}, .{output}, rows, in_dim, out_dim);
 
     if (try linearNoBiasQ8_0Parallel(io, input, weight_raw, prepared_blocks, prepared_panel_blocks, output, rows, in_dim, out_dim)) return;
     q8_0F32Apply(input, weight_raw, prepared_blocks, prepared_panel_blocks, null, output, rows, in_dim, out_dim, 0, out_dim);
@@ -28474,6 +28090,183 @@ fn linearNoBiasQ8_0Pair(
     try linearQ8_0Pair(allocator, io, input, weight_raw_a, weight_raw_b, prepared_blocks_a, prepared_blocks_b, prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel8_blocks_a, prepared_panel8_blocks_b, null, null, output_a, output_b, rows, in_dim, out_dim);
 }
 
+// Cardinality is static; existing quantized and F32 microkernels retain their
+// schedules. Only validation, activation ownership and plane routing are shared.
+const ActivationProjectionCodec = enum { q1, q8 };
+
+inline fn dispatchActivationProjections(
+    comptime codec: ActivationProjectionCodec,
+    comptime n: usize,
+    io: ?std.Io,
+    q_values: []const u8,
+    scales: []const f32,
+    weights: [n][]const u8,
+    prepared: [n]?[]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    if (codec == .q8) return dispatchQ8_0Projections(n, io, q_values, scales, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
+    if (n == 1) {
+        return linearQ1_0PreparedActivationDispatch(io, q_values, scales, prepared[0].?, panels[0], biases[0], outputs[0], rows, in_dim, out_dim);
+    } else if (n == 2) {
+        return linearQ1_0PreparedActivationPairDispatch(io, q_values, scales, prepared[0].?, panels[0], prepared[1].?, panels[1], outputs[0], outputs[1], rows, in_dim, out_dim);
+    } else {
+        return linearQ1_0PreparedActivationTripleDispatch(io, q_values, scales, prepared[0].?, panels[0], prepared[1].?, panels[1], prepared[2].?, panels[2], biases[0], biases[1], biases[2], outputs[0], outputs[1], outputs[2], rows, in_dim, out_dim);
+    }
+}
+
+// One ownership scope for the same Q8 activation representation. Codec policy
+// retains the Q1 serial quantizer and the Q8 dispatching quantizer exactly.
+inline fn applyQuantizedActivationProjections(
+    comptime codec: ActivationProjectionCodec,
+    comptime n: usize,
+    comptime profile: bool,
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    weights: [n][]const u8,
+    prepared: [n]?[]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    const blocks = in_dim / 32;
+    if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
+        var values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
+        var scales_buf: [small_row_q8_0_stack_max_in_dim / 32]f32 = undefined;
+        const values = values_buf[0..in_dim];
+        const scales = scales_buf[0..blocks];
+        const quant_start = if (profile) nativeQuantPhaseStart() else 0;
+        if (codec == .q1) quantizeQ8_0ActivationRows(input, values, scales, rows, in_dim, blocks) else try quantizeQ8_0ActivationRowsDispatch(io, input, values, scales, rows, in_dim, blocks);
+        if (profile) noteNativeQuantPhase(.q8_0_activation_quant, quant_start);
+        const compute_start = if (profile) nativeQuantPhaseStart() else 0;
+        try dispatchActivationProjections(codec, n, io, values, scales, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
+        if (profile) noteNativeQuantPhase(.q8_0_compute, compute_start);
+        return;
+    }
+    const alloc_start = if (profile) nativeQuantPhaseStart() else 0;
+    const values = try allocator.alloc(u8, rows * blocks * 32);
+    defer allocator.free(values);
+    const scales = try allocator.alloc(f32, rows * blocks);
+    defer allocator.free(scales);
+    if (profile) noteNativeQuantPhase(.q8_0_activation_alloc, alloc_start);
+    const quant_start = if (profile) nativeQuantPhaseStart() else 0;
+    if (codec == .q1) quantizeQ8_0ActivationRows(input, values, scales, rows, in_dim, blocks) else try quantizeQ8_0ActivationRowsDispatch(io, input, values, scales, rows, in_dim, blocks);
+    if (profile) noteNativeQuantPhase(.q8_0_activation_quant, quant_start);
+    const compute_start = if (profile) nativeQuantPhaseStart() else 0;
+    try dispatchActivationProjections(codec, n, io, values, scales, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
+    if (profile) noteNativeQuantPhase(.q8_0_compute, compute_start);
+    return;
+}
+
+inline fn linearPreparedActivationProjections(
+    comptime codec: ActivationProjectionCodec,
+    comptime n: usize,
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    prepared: [n][]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    var blocks: [n]usize = undefined;
+    var optional_prepared: [n]?[]const u8 = undefined;
+    inline for (0..n) |plane| {
+        blocks[plane] = if (codec == .q1)
+            try validatePreparedQ1_0ActivationBlocks(prepared[plane], panels[plane], in_dim, out_dim)
+        else
+            try validatePreparedQ8_1ActivationBlocks(prepared[plane], panels[plane], rows, in_dim, out_dim);
+        optional_prepared[plane] = prepared[plane];
+    }
+    inline for (1..n) |plane| if (blocks[plane] != blocks[0]) return error.InvalidQuantizedLinearShape;
+    return applyQuantizedActivationProjections(codec, n, false, allocator, io, input, @splat(&empty_u8), optional_prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
+}
+
+inline fn validateQ8_0ProjectionFamily(
+    comptime n: usize,
+    weights: [n][]const u8,
+    prepared: [n]?[]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    in_dim: usize,
+    out_dim: usize,
+) !usize {
+    const values_per_block: usize = 32;
+    if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
+    const row_blocks = in_dim / values_per_block;
+    inline for (weights) |weight| if (weight.len != out_dim * row_blocks * 34) return error.InvalidQuantizedDataSize;
+    inline for (prepared) |maybe| if (maybe) |blocks| {
+        if (blocks.len != out_dim * row_blocks * prepared_q8_0_block_bytes) return error.InvalidQuantizedDataSize;
+    };
+    inline for (panels) |maybe| if (maybe) |blocks| {
+        if (blocks.len != preparedQ8_0PanelByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
+    };
+    inline for (panels8) |maybe| if (maybe) |blocks| {
+        if (blocks.len != preparedQ8_0Panel8ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
+    };
+    return row_blocks;
+}
+
+inline fn linearQ8_0Projections(
+    comptime n: usize,
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    weights: [n][]const u8,
+    prepared: [n]?[]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    const row_blocks = try validateQ8_0ProjectionFamily(n, weights, prepared, panels, panels8, in_dim, out_dim);
+    if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks))
+        return applyQuantizedActivationProjections(.q8, n, false, allocator, io, input, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
+    if (try linearQ8_0ProjectedParallel(n, io, input, weights, prepared, panels, biases, outputs, rows, in_dim, out_dim)) return;
+    inline for (0..n) |plane| q8_0F32Apply(input, weights[plane], prepared[plane], panels[plane], biases[plane], outputs[plane], rows, in_dim, out_dim, 0, out_dim);
+}
+
+inline fn dispatchQ8_0Projections(
+    comptime n: usize,
+    io: ?std.Io,
+    q_values: []const u8,
+    scales: []const f32,
+    weights: [n][]const u8,
+    prepared: [n]?[]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    if (n == 1) {
+        return linearQ8_0QuantizedInputDispatch(io, q_values, scales, weights[0], prepared[0], panels[0], panels8[0], biases[0], outputs[0], rows, in_dim, out_dim);
+    } else if (n == 2) {
+        return linearQ8_0QuantizedInputPairDispatch(io, q_values, scales, weights[0], prepared[0], panels[0], panels8[0], biases[0], outputs[0], weights[1], prepared[1], panels[1], panels8[1], biases[1], outputs[1], rows, in_dim, out_dim);
+    } else {
+        return linearQ8_0QuantizedInputTripleDispatch(io, q_values, scales, weights[0], prepared[0], panels[0], panels8[0], biases[0], outputs[0], weights[1], prepared[1], panels[1], panels8[1], biases[1], outputs[1], weights[2], prepared[2], panels[2], panels8[2], biases[2], outputs[2], rows, in_dim, out_dim);
+    }
+}
+
 fn linearQ8_0Pair(
     allocator: std.mem.Allocator,
     io: ?std.Io,
@@ -28494,93 +28287,7 @@ fn linearQ8_0Pair(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    const block_size: usize = 34;
-    const values_per_block: usize = 32;
-    if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
-    const row_blocks = in_dim / values_per_block;
-    const row_stride = row_blocks * block_size;
-    if (weight_raw_a.len != out_dim * row_stride) return error.InvalidQuantizedDataSize;
-    if (weight_raw_b.len != out_dim * row_stride) return error.InvalidQuantizedDataSize;
-    if (prepared_blocks_a) |blocks| {
-        if (blocks.len != out_dim * row_blocks * prepared_q8_0_block_bytes) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_blocks_b) |blocks| {
-        if (blocks.len != out_dim * row_blocks * prepared_q8_0_block_bytes) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel_blocks_a) |blocks| {
-        if (blocks.len != preparedQ8_0PanelByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel_blocks_b) |blocks| {
-        if (blocks.len != preparedQ8_0PanelByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel8_blocks_a) |blocks| {
-        if (blocks.len != preparedQ8_0Panel8ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel8_blocks_b) |blocks| {
-        if (blocks.len != preparedQ8_0Panel8ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-
-    if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
-        if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-            var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-            var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-            const q_values = q_values_buf[0 .. row_blocks * values_per_block];
-            const input_scales = input_scales_buf[0..row_blocks];
-            try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-            try linearQ8_0QuantizedInputPairDispatch(
-                io,
-                q_values,
-                input_scales,
-                weight_raw_a,
-                prepared_blocks_a,
-                prepared_panel_blocks_a,
-                prepared_panel8_blocks_a,
-                bias_a,
-                output_a,
-                weight_raw_b,
-                prepared_blocks_b,
-                prepared_panel_blocks_b,
-                prepared_panel8_blocks_b,
-                bias_b,
-                output_b,
-                rows,
-                in_dim,
-                out_dim,
-            );
-            return;
-        }
-        const q_values = try allocator.alloc(u8, rows * row_blocks * values_per_block);
-        defer allocator.free(q_values);
-        const input_scales = try allocator.alloc(f32, rows * row_blocks);
-        defer allocator.free(input_scales);
-        try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-
-        try linearQ8_0QuantizedInputPairDispatch(
-            io,
-            q_values,
-            input_scales,
-            weight_raw_a,
-            prepared_blocks_a,
-            prepared_panel_blocks_a,
-            prepared_panel8_blocks_a,
-            bias_a,
-            output_a,
-            weight_raw_b,
-            prepared_blocks_b,
-            prepared_panel_blocks_b,
-            prepared_panel8_blocks_b,
-            bias_b,
-            output_b,
-            rows,
-            in_dim,
-            out_dim,
-        );
-        return;
-    }
-
-    if (try linearQ8_0ProjectedParallel(2, io, input, .{ weight_raw_a, weight_raw_b }, .{ prepared_blocks_a, prepared_blocks_b }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim)) return;
-    q8_0F32Apply(input, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, bias_a, output_a, rows, in_dim, out_dim, 0, out_dim);
-    q8_0F32Apply(input, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, bias_b, output_b, rows, in_dim, out_dim, 0, out_dim);
+    return linearQ8_0Projections(2, allocator, io, input, .{ weight_raw_a, weight_raw_b }, .{ prepared_blocks_a, prepared_blocks_b }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b }, .{ prepared_panel8_blocks_a, prepared_panel8_blocks_b }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim);
 }
 
 fn linearQ8_0Triple(
@@ -28609,116 +28316,7 @@ fn linearQ8_0Triple(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    const block_size: usize = 34;
-    const values_per_block: usize = 32;
-    if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
-    const row_blocks = in_dim / values_per_block;
-    const row_stride = row_blocks * block_size;
-    if (weight_raw_a.len != out_dim * row_stride) return error.InvalidQuantizedDataSize;
-    if (weight_raw_b.len != out_dim * row_stride) return error.InvalidQuantizedDataSize;
-    if (weight_raw_c.len != out_dim * row_stride) return error.InvalidQuantizedDataSize;
-    if (prepared_blocks_a) |blocks| {
-        if (blocks.len != out_dim * row_blocks * prepared_q8_0_block_bytes) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_blocks_b) |blocks| {
-        if (blocks.len != out_dim * row_blocks * prepared_q8_0_block_bytes) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_blocks_c) |blocks| {
-        if (blocks.len != out_dim * row_blocks * prepared_q8_0_block_bytes) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel_blocks_a) |blocks| {
-        if (blocks.len != preparedQ8_0PanelByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel_blocks_b) |blocks| {
-        if (blocks.len != preparedQ8_0PanelByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel_blocks_c) |blocks| {
-        if (blocks.len != preparedQ8_0PanelByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel8_blocks_a) |blocks| {
-        if (blocks.len != preparedQ8_0Panel8ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel8_blocks_b) |blocks| {
-        if (blocks.len != preparedQ8_0Panel8ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-    if (prepared_panel8_blocks_c) |blocks| {
-        if (blocks.len != preparedQ8_0Panel8ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
-    }
-
-    if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
-        if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
-            var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
-            var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
-            const q_values = q_values_buf[0 .. row_blocks * values_per_block];
-            const input_scales = input_scales_buf[0..row_blocks];
-            try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-            try linearQ8_0QuantizedInputTripleDispatch(
-                io,
-                q_values,
-                input_scales,
-                weight_raw_a,
-                prepared_blocks_a,
-                prepared_panel_blocks_a,
-                prepared_panel8_blocks_a,
-                bias_a,
-                output_a,
-                weight_raw_b,
-                prepared_blocks_b,
-                prepared_panel_blocks_b,
-                prepared_panel8_blocks_b,
-                bias_b,
-                output_b,
-                weight_raw_c,
-                prepared_blocks_c,
-                prepared_panel_blocks_c,
-                prepared_panel8_blocks_c,
-                bias_c,
-                output_c,
-                rows,
-                in_dim,
-                out_dim,
-            );
-            return;
-        }
-        const q_values = try allocator.alloc(u8, rows * row_blocks * values_per_block);
-        defer allocator.free(q_values);
-        const input_scales = try allocator.alloc(f32, rows * row_blocks);
-        defer allocator.free(input_scales);
-        try quantizeQ8_0ActivationRowsDispatch(io, input, q_values, input_scales, rows, in_dim, row_blocks);
-
-        try linearQ8_0QuantizedInputTripleDispatch(
-            io,
-            q_values,
-            input_scales,
-            weight_raw_a,
-            prepared_blocks_a,
-            prepared_panel_blocks_a,
-            prepared_panel8_blocks_a,
-            bias_a,
-            output_a,
-            weight_raw_b,
-            prepared_blocks_b,
-            prepared_panel_blocks_b,
-            prepared_panel8_blocks_b,
-            bias_b,
-            output_b,
-            weight_raw_c,
-            prepared_blocks_c,
-            prepared_panel_blocks_c,
-            prepared_panel8_blocks_c,
-            bias_c,
-            output_c,
-            rows,
-            in_dim,
-            out_dim,
-        );
-        return;
-    }
-
-    if (try linearQ8_0ProjectedParallel(3, io, input, .{ weight_raw_a, weight_raw_b, weight_raw_c }, .{ prepared_blocks_a, prepared_blocks_b, prepared_blocks_c }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel_blocks_c }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim)) return;
-    q8_0F32Apply(input, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, bias_a, output_a, rows, in_dim, out_dim, 0, out_dim);
-    q8_0F32Apply(input, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, bias_b, output_b, rows, in_dim, out_dim, 0, out_dim);
-    q8_0F32Apply(input, weight_raw_c, prepared_blocks_c, prepared_panel_blocks_c, bias_c, output_c, rows, in_dim, out_dim, 0, out_dim);
+    return linearQ8_0Projections(3, allocator, io, input, .{ weight_raw_a, weight_raw_b, weight_raw_c }, .{ prepared_blocks_a, prepared_blocks_b, prepared_blocks_c }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel_blocks_c }, .{ prepared_panel8_blocks_a, prepared_panel8_blocks_b, prepared_panel8_blocks_c }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim);
 }
 
 fn linearNoBiasI2SActivationQuantized(
