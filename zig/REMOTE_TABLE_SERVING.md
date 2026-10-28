@@ -1825,9 +1825,11 @@ stripes without letting warm-cache state bypass memory admission.
 Stored-source hydration keeps an ordinal vector proportional to returned hits.
 After each required chunk transition, its authenticated row-range directory
 identifies up to four subsequent chunks containing selected rows, with at most
-1 MiB of compressed hint bytes. A binary jump skips repeated IDs in the current
-chunk. Unselected intervening chunks, legacy columns and oversized values do not
-create speculative reads. Hints enter the existing query-owned native source
+1 MiB of compressed hint bytes and at most 64 selection probes per call. A binary
+jump skips repeated IDs in the current chunk; a full byte allowance stops lookahead. Only chunks containing selected rows create hints; legacy columns and
+oversized values remain demand reads. Physical reads retain the native source
+block granularity and its separately admitted transport bounds. Hints enter the
+existing query-owned native source
 queue, which owns shared I/O admission, deduplication, cancellation and joins.
 They perform no source decode and transfer no cursor/value ownership. Required
 reads continue validating every selected chunk and row identity, whether a hint

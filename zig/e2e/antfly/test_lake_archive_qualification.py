@@ -1668,6 +1668,7 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
     tmp_path,
 ):
     """Cross batch/chunk boundaries without physical source or hidden-field leaks."""
+    import hashlib
     import importlib.util
 
     import conftest as harness
@@ -1689,7 +1690,12 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
         "id": list(range(count)),
         "bucket": [i // 16 for i in range(count)],
         "body": ["common needle"] * count,
-        "note": [f"unrelated {i} " + "n" * 4096 for i in range(count)],
+        # Incompressible projected source spans real native transport blocks,
+        # so chunk lookahead reaches the query-owned I/O queue.
+        "note": [
+            f"unrelated {i} " + hashlib.shake_256(str(i).encode()).hexdigest(2048)
+            for i in range(count)
+        ],
         "counter": [None if i % 7 == 0 else 9007199254740993 + i for i in range(count)],
         "payload": ["p" * 8192] * count,
     }

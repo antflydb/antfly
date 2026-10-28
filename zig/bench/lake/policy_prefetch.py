@@ -59,7 +59,10 @@ values = {
     ],
 }
 if case != "phrase":
-    values["note"] = [f"note {i} " + "n" * 4096 for i in range(count)]
+    values["note"] = [
+        f"note {i} " + hashlib.shake_256(str(i).encode()).hexdigest(2048)
+        for i in range(count)
+    ]
     for column in range(8):
         values[f"v{column}"] = [9007199254740993 + i * 8 + column for i in range(count)]
 archive = shared / "archive.parquet"

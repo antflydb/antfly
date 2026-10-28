@@ -451,7 +451,7 @@ pub const Cursor = struct {
         self.records.deinit(self.reader.alloc);
         self.reader.deinit();
     }
-    pub const Prefetch = struct { ranges: usize = 0, bytes: u64 = 0 };
+    pub const Prefetch = struct { ranges: usize = 0, bytes: u64 = 0, examined: usize = 0 };
     /// Hints for the next selected chunks, never intervening archive rows.
     /// The enclosing segment authenticates this directory; required get still
     /// validates decoded IDs. The source owns admission, cancellation and joins.
@@ -462,7 +462,8 @@ pub const Cursor = struct {
         const view = self.reader.range orelse return result;
         if (view.source != .ranges or view.source.ranges.prefetch == null) return result;
         var position: usize = 0;
-        while (position < docs.len and result.ranges < 4) {
+        while (position < docs.len and result.ranges < 4 and result.examined < 64) {
+            result.examined += 1;
             const doc = docs[position];
             if (doc < base or doc >= end) break;
             const chunk = self.reader.chunkForDoc(doc - base) orelse {
@@ -484,7 +485,7 @@ pub const Cursor = struct {
             const length = self.reader.endOffset(chunk) - start;
             // Oversized required values remain demand reads. Speculation has
             // a byte cap as well as the existing four-task source queue.
-            if (length > 1024 * 1024 - result.bytes) continue;
+            if (length > 1024 * 1024 - result.bytes) break;
             view.source.prefetch(view.offset + self.reader.data_start + start, length);
             result.ranges += 1;
             result.bytes += length;
@@ -875,8 +876,15 @@ test "external lake bounded window profiles source chunk prefetch selects exact 
             try std.testing.expectEqual(@as(?u32, 0), cursor.chunk);
             try std.testing.expectEqual(@as(usize, 1), cursor.decode_count);
             try std.testing.expectEqual(@as(usize, 0), cursor.prefetchSelected(&.{116}, 100, 116).ranges);
+            // Sparse absent rows cannot make each chunk transition scan the
+            // entire remaining selection. Bound metadata work independently.
+            var missing: [256]u32 = undefined;
+            for (&missing, 0..) |*doc, i| doc.* = @intCast(1000 + i);
+            const sparse_hint = cursor.prefetchSelected(&missing, 0, 2000);
+            try std.testing.expectEqual(@as(usize, 0), sparse_hint.ranges);
+            try std.testing.expectEqual(@as(usize, 64), sparse_hint.examined);
             try std.testing.expectEqualSlices(u8, payload, (try cursor.get(14)).?);
-            std.debug.print("SOURCE_PREFETCH large={} ranges={} bytes={} demand_reads_during_hint=0\n", .{ large, hint.ranges, hint.bytes });
+            std.debug.print("SOURCE_PREFETCH large={} ranges={} bytes={} sparse_probes={} demand_reads_during_hint=0\n", .{ large, hint.ranges, hint.bytes, sparse_hint.examined });
         }
         fn faults(a: Allocator) !void {
             try run(a, false);
