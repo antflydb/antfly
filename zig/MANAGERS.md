@@ -981,3 +981,41 @@ the execution job logs its cgroup baseline before starting inference.
 - A future ABI version may expose node-owned device capacity domains. Until the
   node owner has reliable per-device capacity information, inference's
   backend-aware limits remain authoritative for accelerator memory.
+
+### CUDA capacity and standalone policy
+
+CUDA admission discovers total memory on the same device selected by the CUDA
+context. This probe does not create or replace a thread's current context. For
+discrete GPUs the default device ceiling reserves ten percent (at least 512 MiB,
+never more than half on very small devices) for the driver and other overhead.
+The host ceiling still follows the finite process/cgroup envelope. On integrated
+CUDA devices, host and device memory share the physical combined ceiling.
+Unknown capacity retains conservative defaults; it never means unlimited VRAM.
+Model tuning floors and explicit overrides cannot exceed discovered physical
+capacity. Explicit lower limits remain authoritative.
+
+Standalone `antfly inference run --config` accepts the following deployment
+policy, also passed unchanged through Colony's `InferencePool.spec.config`:
+
+```json
+{
+  "memory": {"host": 20480, "backend": 21504, "kv": 1024, "scratch": 2048},
+  "request_limits": {
+    "max_items": 1,
+    "max_input_tokens": 8192,
+    "max_output_tokens": 1024,
+    "max_decoded_pixels": 4194304
+  },
+  "max_loaded_models": 1,
+  "admission": {"inference": {"max_concurrent_requests": 1}}
+}
+```
+
+Memory values are MiB; omitted/zero fields retain automatic policy. CLI budget
+flags override their corresponding configuration field, including an explicit
+zero. An omitted combined override is recomputed from the effective host and
+device limits. Request ceilings must be positive, and narrow the manifest
+contract in both discovery and execution; existing transport, media admission,
+and model ceilings may narrow them further. These settings do not establish
+that a model fits: qualify cold load, request workspace, model switching, and
+overload rejection using the exact released image and hardware.

@@ -5905,13 +5905,25 @@ pub const ModelManager = struct {
         return self.reclaimOneActiveCacheForAdmission(pressure);
     }
 
+    fn tightenUnifiedDeviceAdmission(self: *const ModelManager) void {
+        if (backends.cudaUsesUnifiedMemory())
+            self.admissionController().tightenUnifiedLimit(runtime.tier.memory.defaultSharedAdmissionLimitsWithProcessLimit(self.process_memory_limit_bytes).host_limit_bytes);
+    }
+
+    fn physicalRunLimits(self: *const ModelManager, backend_class: runtime.tier.memory.BackendClass, limits: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
+        if (backend_class != .gpu) return limits;
+        return backends.clampPhysicalMemoryLimits(.cuda, limits, self.process_memory_limit_bytes);
+    }
+
     fn acquireAmountsWithEviction(
         self: *ModelManager,
         backend_class: runtime.tier.memory.BackendClass,
-        limits: runtime.tier.memory.Limits,
+        requested_limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
     ) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
+        const limits = self.physicalRunLimits(backend_class, requested_limits);
+        self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admissionController().tryAcquireWithPressure(
             backend_class,
@@ -5953,9 +5965,13 @@ pub const ModelManager = struct {
 
     fn acquireRequestsWithEviction(
         self: *ModelManager,
-        requests: []const runtime.tier.memory.AdmissionRequest,
+        requested: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
+        const requests = try self.allocator.dupe(runtime.tier.memory.AdmissionRequest, requested);
+        defer self.allocator.free(requests);
+        for (requests) |*request| request.limits = self.physicalRunLimits(request.backend_class, request.limits);
+        self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admissionController().tryAcquireRequestsWithPressure(
             requests,
@@ -6459,12 +6475,12 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         backend_runtime: backends.BackendRuntime,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
-        return limits;
+        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, limits, self.process_memory_limit_bytes);
     }
 
     /// Apply architecture/artifact residency floors before attaching the hard
@@ -6477,8 +6493,8 @@ pub const ModelManager = struct {
         backend_runtime: backends.BackendRuntime,
         load_plan_floor: runtime.tier.memory.Limits,
     ) !runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = try session_factory.widenBudgetLimitsForModelPath(
@@ -6488,7 +6504,7 @@ pub const ModelManager = struct {
             backend_runtime.backend,
         );
         limits = runtime.tier.memory.maxCompositeLimits(limits, load_plan_floor);
-        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
     }
 
     /// Architecture sessions may carry a minimum safe cache/workspace floor
@@ -6500,12 +6516,12 @@ pub const ModelManager = struct {
         backend_runtime: backends.BackendRuntime,
         session: backends.Session,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = session_factory.widenBudgetLimitsForSession(session, limits);
-        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
     }
 
     /// Lazily loaded composite-model components participate in the same
@@ -10801,6 +10817,14 @@ fn loadSessionForPreferredBackends(
             rememberPreferredLoadError(&first_err, err);
             continue;
         };
+        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
+            if (err == error.ProcessIsolationRequired) {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            }
+            return err;
+        };
+        defer hard_cancellation.deinit();
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         // This attempt owns admission until the successful result explicitly
         // takes it. Includes cancellation, guard-arm failure, and fallback.
@@ -10852,14 +10876,6 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
         }
-        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
-            if (err == error.ProcessIsolationRequired) {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            }
-            return err;
-        };
-        defer hard_cancellation.deinit();
         var close_protection = manager.prepareSessionClose(backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
                 rememberPreferredLoadError(&first_err, err);

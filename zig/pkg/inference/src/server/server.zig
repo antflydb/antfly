@@ -1234,6 +1234,35 @@ pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
     return std.math.mul(usize, mib, 1024 * 1024) catch error.InvalidHttpBodyLimit;
 }
 
+/// Deployment ceilings narrow the manifest's executor contract. They apply to
+/// linked/direct execution as well as HTTP and discovery; zero is invalid.
+pub const RequestLimits = struct {
+    max_items: ?usize = null,
+    max_input_tokens: ?usize = null,
+    max_output_tokens: ?usize = null,
+    max_decoded_pixels: ?u64 = null,
+
+    pub fn validate(self: @This()) !void {
+        inline for (comptime std.meta.fieldNames(@This())) |field| {
+            if (@field(self, field)) |value| if (value == 0) return error.InvalidInferenceConfig;
+        }
+    }
+
+    fn narrow(self: @This(), batch: ResolvedInferenceBatchCapabilities) ResolvedInferenceBatchCapabilities {
+        var out = batch;
+        if (self.max_items) |limit| {
+            out.max_items = @min(out.max_items, limit);
+            out.preferred_items = @min(out.preferred_items, out.max_items);
+        }
+        if (self.max_input_tokens) |limit| out.max_input_tokens_per_item = minOptionalLimit(out.max_input_tokens_per_item, limit);
+        if (self.max_output_tokens) |limit| out.max_output_tokens_per_item = minOptionalLimit(out.max_output_tokens_per_item, limit);
+        if (self.max_decoded_pixels) |limit| if (out.max_decoded_pixels) |current| {
+            out.max_decoded_pixels = @min(current, limit);
+        };
+        return out;
+    }
+};
+
 pub const NodeConfig = struct {
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
@@ -1267,6 +1296,7 @@ pub const NodeConfig = struct {
     process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     resource_ownership: model_manager_mod.ResourceOwnership = .local,
     generation_budget_overrides: BudgetOverrides = .{},
+    request_limits: RequestLimits = .{},
     generation_batching: GenerationBatchingConfig = .{},
     /// Maximum queueing delay used only by resolved native executor batches.
     /// Serial compatibility paths bypass the broker and never pay this delay.
@@ -4119,6 +4149,7 @@ pub const Node = struct {
     pub fn init(allocator: std.mem.Allocator, supplied_config: NodeConfig) !Node {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
+        try config.request_limits.validate();
         if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
@@ -4212,8 +4243,8 @@ pub const Node = struct {
         self: *const Node,
         backend: runtime.tier.memory.BackendClass,
     ) runtime.tier.memory.Limits {
-        return runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            backend,
+        return backends_mod.defaultMemoryLimits(
+            if (backend == .gpu and backends_mod.discreteDeviceMemoryBytes(.cuda) != 0) .cuda else if (backend == .gpu) .metal else .native,
             self.config.process_memory_limit_bytes,
         );
     }
@@ -24352,6 +24383,7 @@ pub const Node = struct {
                         false,
                         "compatible",
                         false,
+                        self.config.request_limits,
                     );
                     try listed_model_names.put(a, name, {});
                     model_count += 1;
@@ -24401,6 +24433,7 @@ pub const Node = struct {
                     chat_template_failed,
                     listing.compatibility_level,
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, entry.path),
+                    self.config.request_limits,
                 );
                 try appendModelMetadata(&body, a, &listing.manifest, task);
                 if (isOpenAiListTask(task)) {
@@ -24459,6 +24492,7 @@ pub const Node = struct {
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, listing.canonical_model_dir),
+                    self.config.request_limits,
                 );
                 try appendModelMetadata(&body, a, &model.manifest, task);
                 if (isOpenAiListTask(task)) {
@@ -27212,6 +27246,7 @@ fn appendModelInfo(
     compatibility_level: []const u8,
     /// REBEL emits generic ENTITY nodes and accepts untyped relation names.
     untyped_entities: bool,
+    request_limits: RequestLimits,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_zero_shot = zero_shot_classification and !model_caps.hasCapability(capabilities, "zero_shot");
@@ -27350,6 +27385,7 @@ fn appendModelInfo(
         accepts_audio,
         accepts_document,
         accepts_video,
+        request_limits,
     );
     if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
     if (compatibility_level.len > 0) {
@@ -27494,6 +27530,7 @@ test "REBEL catalog advertises generic entity schema independently of model name
         false,
         "compatible",
         true,
+        .{},
     );
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27527,6 +27564,7 @@ test "reranker catalog advertises rerank documents" {
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27557,6 +27595,7 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27588,13 +27627,14 @@ fn appendResolvedInferenceCapabilities(
     accepts_audio: bool,
     accepts_document: bool,
     accepts_video: bool,
+    request_limits: RequestLimits,
 ) !void {
     // Kept in lockstep with antfly inference.work.MimeTypes' bounded native
     // capability representation. The wire catalog may contain any validated
     // essence, but no node may publish more extensions than a peer can retain.
     const resolved_task = normalizedInferenceTask(task) orelse return;
     if (!accepts_text and !accepts_image and !accepts_audio and !accepts_document and !accepts_video) return;
-    const resolved = try resolveInferenceBatchCapabilities(
+    const resolved = request_limits.narrow(try resolveInferenceBatchCapabilities(
         resolved_task,
         manifest_capabilities,
         resolvedExecutorBatchImplementation(resolved_task, executor_kind),
@@ -27603,7 +27643,7 @@ fn appendResolvedInferenceCapabilities(
         accepts_image,
         accepts_audio,
         accepts_document,
-    );
+    ));
 
     try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":4,\"task\":");
     try jsonEncodeString(buf, allocator, resolved_task);
@@ -28478,7 +28518,7 @@ fn resolvedInferenceExecutorContract(
     const max_images = if (modalities.image) executorMaxImages(resolved_task) else 0;
     return .{
         .task = resolved_task,
-        .batch = try resolveInferenceBatchCapabilities(
+        .batch = node.config.request_limits.narrow(try resolveInferenceBatchCapabilities(
             resolved_task,
             manifest.capabilities,
             resolvedExecutorBatchImplementation(resolved_task, executor_kind),
@@ -28487,7 +28527,7 @@ fn resolvedInferenceExecutorContract(
             modalities.image,
             modalities.audio,
             false,
-        ),
+        )),
         .accepts_text = modalities.text,
         .accepts_image = modalities.image,
         .accepts_audio = modalities.audio,
@@ -29070,6 +29110,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
     defer parsed.deinit();
@@ -29129,6 +29170,7 @@ test "standalone inference catalog validates extensible MIME against executor co
         false,
         false,
         false,
+        .{},
     );
     try body.append(alloc, '}');
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
@@ -29161,6 +29203,7 @@ test "standalone inference catalog validates extensible MIME against executor co
             false,
             false,
             false,
+            .{},
         ),
     );
 
@@ -29319,6 +29362,7 @@ test "normalized inference capabilities cover every model family" {
             false,
             "compatible",
             false,
+            .{},
         );
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
         defer parsed.deinit();
@@ -46197,4 +46241,18 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "deployment request limits narrow executor plans without widening manifest bounds" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_items = 1, .max_input_tokens = 8192, .max_output_tokens = 1024, .max_decoded_pixels = 4_194_304 } });
+    defer node.deinit();
+    var capabilities = [_][]const u8{"inference.limits.max_input_tokens_per_item=4096"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .generator, .capabilities = &capabilities };
+    const contract = try resolvedInferenceExecutorContract(&node, "generate", &manifest);
+    try std.testing.expectEqual(@as(usize, 1), contract.batch.max_items);
+    try std.testing.expectEqual(@as(?usize, 4096), contract.batch.max_input_tokens_per_item);
+    try std.testing.expectEqual(@as(?usize, 1024), contract.batch.max_output_tokens_per_item);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .has_text = true, .input_tokens_per_item = 4097 }));
+    try std.testing.expectError(error.InvalidInferenceConfig, (RequestLimits{ .max_output_tokens = 0 }).validate());
 }

@@ -84,7 +84,22 @@ const RunConfig = struct {
     kernel_jit: ?inference.graph.kernel_jit.Config = null,
     prompt_cache: ?PromptCacheConfig = null,
     process_memory_budget_mb: ?usize = null,
+    memory: ?inference.runtime.tier.memory.BudgetOverridesMib = null,
+    request_limits: ?inference.server.RequestLimits = null,
 };
+
+const MemoryBudgetFields = std.EnumSet(std.meta.FieldEnum(inference.runtime.tier.memory.BudgetOverridesMib));
+
+fn mergedMemoryBudgets(config: ?inference.runtime.tier.memory.BudgetOverridesMib, cli: inference.runtime.tier.memory.BudgetOverridesMib, selected: MemoryBudgetFields) inference.runtime.tier.memory.BudgetOverridesMib {
+    var result = cli;
+    if (config) |memory| {
+        inline for (comptime std.meta.fieldNames(inference.runtime.tier.memory.BudgetOverridesMib)) |field| {
+            if (!selected.contains(@field(std.meta.FieldEnum(inference.runtime.tier.memory.BudgetOverridesMib), field)))
+                @field(result, field) = @field(memory, field);
+        }
+    }
+    return result;
+}
 
 fn resolvedMaxConcurrentRequests(cfg: RunConfig) !?u32 {
     const canonical = if (cfg.admission) |admission|
@@ -126,6 +141,14 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
         .object => |object| object,
         else => return error.InvalidInferenceConfig,
     };
+    if (root.get("request_limits")) |value| {
+        if (value != .object) return error.InvalidInferenceConfig;
+        try validateKnownObjectFields(inference.server.RequestLimits, value.object);
+    }
+    if (root.get("memory")) |memory_value| {
+        if (memory_value != .object) return error.InvalidInferenceConfig;
+        try validateKnownObjectFields(inference.runtime.tier.memory.BudgetOverridesMib, memory_value.object);
+    }
     if (root.get("preload")) |preload_value| {
         const preload = switch (preload_value) {
             .array => |array| array,
@@ -170,6 +193,8 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
         }).validate();
     }
     if (parsed.value.kernel_jit) |value| try value.validate();
+    if (parsed.value.request_limits) |limits| try limits.validate();
+    if (parsed.value.memory) |memory| _ = try memory.toByteLimits();
     _ = try resolvedMaxConcurrentRequests(parsed.value);
     return parsed;
 }
@@ -494,6 +519,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     var http_max_body_bytes_override: ?usize = null;
     var process_memory_budget_mb_override: ?usize = null;
     var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
+    var budget_cli_fields: MemoryBudgetFields = .{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
     var allow_unknown_models = true;
@@ -535,18 +561,23 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--host-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.host = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.host);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--backend-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.backend = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.backend);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--combined-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.combined = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.combined);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--kv-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.kv = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.kv);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--scratch-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.scratch = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.scratch);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--kernel-jit-mode")) {
             if (i + 1 >= args.len) return error.MissingKernelJitMode;
@@ -593,6 +624,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     var config_preload_models: []inference.server.WarmModel = &.{};
     defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
 
+    budget_overrides_mib = mergedMemoryBudgets(if (loaded_cfg) |parsed| parsed.value.memory else null, budget_overrides_mib, budget_cli_fields);
     const budget_override_limits = try budget_overrides_mib.toByteLimits();
     const process_memory_resolution = try resolveProcessMemoryBudgetMib(
         process_memory_budget_mb_override,
@@ -634,6 +666,10 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;
+        if (cfg.request_limits) |limits| {
+            try limits.validate();
+            node_cfg.request_limits = limits;
+        }
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
         if (preload_models.items.len == 0) {
@@ -1130,4 +1166,20 @@ test "run config preserves per-model GLiNER CUDA precision" {
     try std.testing.expectEqual(.fp32, models[0].cuda_precision.?);
     try std.testing.expect(models[1].cuda_precision == null);
     try std.testing.expect(models[0].a4bRequest() == null);
+}
+
+test "standalone memory configuration accepts finite domain budgets and rejects misspellings" {
+    var parsed = try parseRunConfig(std.testing.allocator, "{\"memory\":{\"host\":8192,\"backend\":20480,\"kv\":1024,\"scratch\":2048}}");
+    defer parsed.deinit();
+    const limits = try parsed.value.memory.?.toByteLimits();
+    try std.testing.expectEqual(@as(usize, 20480 * 1024 * 1024), limits.backend_limit_bytes);
+    try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator, "{\"memory\":{\"backned\":20480}}"));
+}
+
+test "standalone memory configuration preserves CLI precedence including explicit automatic zero" {
+    const merged = mergedMemoryBudgets(.{ .host = 8192, .backend = 20480 }, .{ .host = 0, .kv = 1024 }, MemoryBudgetFields.init(.{ .host = true, .kv = true }));
+    try std.testing.expectEqual(@as(usize, 0), merged.host);
+    try std.testing.expectEqual(@as(usize, 20480), merged.backend);
+    try std.testing.expectEqual(@as(usize, 1024), merged.kv);
+    try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator, "{\"request_limits\":{\"max_items\":0}}"));
 }
