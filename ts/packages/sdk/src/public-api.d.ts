@@ -13092,6 +13092,14 @@ export interface components {
              * @example 0.5
              */
             search_effort?: number;
+            /** @description Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging. */
+            select?: {
+                [key: string]: components["schemas"]["ProjectionExpression"];
+            };
+            /** @description Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters. */
+            params?: {
+                [key: string]: unknown;
+            };
             /**
              * @description List of fields to include in the results. If not specified, all fields are returned.
              *     Use to reduce response size and improve performance. This field is required when
@@ -14122,6 +14130,58 @@ export interface components {
              * @description Published graph metric score generation used for this hit.
              */
             published_generation: number;
+        };
+        /**
+         * @description Exactly one expression node: literal, field, ref, param, call with args,
+         *     case with optional else, cast, or a binary operator. Pure expressions
+         *     lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider
+         *     calls remain in evaluate, never execute implicitly in select.
+         *     value_identity(field) returns an opaque identity for a present logical
+         *     value (including JSON null); missing has no identity. is_missing(field)
+         *     distinguishes missing from present null. Identity reads require the same
+         *     authorization and retained source revision as value reads. Metadata may
+         *     accelerate them; unsupported/old metadata falls back to ordinary reads.
+         *     Untaken CASE branches do not load fields or evaluate erroring calls.
+         *     Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
+         *     is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
+         *     Expressions are limited to depth 64 including referenced aliases, and
+         *     8192 nodes per request. Alias dependencies are acyclic; each alias is a
+         *     requested output and is evaluated once per row.
+         */
+        ProjectionExpression: {
+            literal?: unknown;
+            /** @description Logical source path. Dots traverse objects; numeric array components select an original index (items.1.name), and named components traverse arrays collecting present values (items.name). Nested user keys such as metadata._type are allowed. Internal root fields are reserved except _id. */
+            field?: string;
+            ref?: string;
+            param?: string;
+            /** @description Public pure SQL scalar function name, including value_identity and is_missing. Internal and provider-backed functions are forbidden. */
+            call?: string;
+            args?: components["schemas"]["ProjectionExpression"][];
+            case?: {
+                when: components["schemas"]["ProjectionExpression"];
+                then: components["schemas"]["ProjectionExpression"];
+            }[];
+            else?: components["schemas"]["ProjectionExpression"];
+            cast?: {
+                /** @enum {string} */
+                type: "string" | "integer" | "number" | "boolean" | "json" | "datetime";
+                expression: components["schemas"]["ProjectionExpression"];
+            };
+            eq?: components["schemas"]["ProjectionExpression"][];
+            neq?: components["schemas"]["ProjectionExpression"][];
+            lt?: components["schemas"]["ProjectionExpression"][];
+            lte?: components["schemas"]["ProjectionExpression"][];
+            gt?: components["schemas"]["ProjectionExpression"][];
+            gte?: components["schemas"]["ProjectionExpression"][];
+            is_distinct_from?: components["schemas"]["ProjectionExpression"][];
+            is_not_distinct_from?: components["schemas"]["ProjectionExpression"][];
+            and?: components["schemas"]["ProjectionExpression"][];
+            or?: components["schemas"]["ProjectionExpression"][];
+            add?: components["schemas"]["ProjectionExpression"][];
+            subtract?: components["schemas"]["ProjectionExpression"][];
+            multiply?: components["schemas"]["ProjectionExpression"][];
+            divide?: components["schemas"]["ProjectionExpression"][];
+            concat?: components["schemas"]["ProjectionExpression"][];
         };
         /** @description A single query result hit */
         QueryHit: {
@@ -29127,12 +29187,44 @@ export interface components {
              */
             detail?: "auto" | "low" | "high";
         };
+        /** @description Antfly gateway-only, request-local table image reference. The gateway uses the ingress identity through the ordinary query path, checks the current revision, optional source identity, digest, MIME, byte length and pixel bound, then materializes provider-compatible image evidence. It never forwards this locator or a credential upstream. The digest is not an access grant. Direct inference servers without table access reject this form. */
+        DecisionTableSource: {
+            table: string;
+            document_id: string;
+            field: string;
+            revision_field: string;
+            revision: string;
+            identity?: string;
+            sha256: string;
+            /** @enum {string} */
+            mime_type: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+            byte_length: number;
+            /** @default 67108864 */
+            max_pixels?: number;
+            /** @description Additional caller selection, conjoined with the gateway's live row policy; never an authorization override. */
+            filter_query?: {
+                [key: string]: unknown;
+            };
+            permissions_field?: string;
+            /** @description Optional narrowing check against permissions_field.public/readers; it cannot grant table or row access. */
+            principals?: string[];
+        };
+        DecisionEvidenceTableImage: {
+            /** @enum {string} */
+            type: "input_image";
+            source: components["schemas"]["DecisionTableSource"];
+            /**
+             * @default auto
+             * @enum {string}
+             */
+            detail?: "auto" | "low" | "high";
+        };
         DecisionEvidenceMessage: {
             /** @enum {string} */
             type?: "message";
             /** @enum {string} */
             role: "user";
-            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[];
+            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"] | components["schemas"]["DecisionEvidenceTableImage"])[];
         };
         /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
         DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];
