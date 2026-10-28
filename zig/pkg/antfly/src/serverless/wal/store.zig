@@ -25,6 +25,7 @@ pub const WalStore = struct {
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         append: *const fn (*anyopaque, []const u8, u64, []const u8) anyerror!u64,
+        append_batch: ?*const fn (*anyopaque, []const u8, u64, []const []const u8) anyerror!wal_types.BatchResult = null,
         append_batch_idempotent: ?*const fn (*anyopaque, []const u8, u64, []const []const u8, []const u8) anyerror!wal_types.BatchResult = null,
         append_idempotent: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8) anyerror!u64 = null,
         append_idempotent_if_latest: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, u64) anyerror!?u64 = null,
@@ -43,6 +44,16 @@ pub const WalStore = struct {
 
     pub fn append(self: *WalStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
         return try self.vtable.append(self.ptr, namespace, timestamp_ns, payload);
+    }
+
+    pub fn supportsBatchAppend(self: *const WalStore) bool {
+        return self.vtable.append_batch != null;
+    }
+    /// One bounded atomic append without a retry identity. An ambiguous result
+    /// remains ambiguous; callers needing replay must use appendBatchIdempotent.
+    pub fn appendBatch(self: *WalStore, namespace: []const u8, timestamp: u64, payloads: []const []const u8) !wal_types.BatchResult {
+        const call = self.vtable.append_batch orelse return error.AtomicBatchAppendUnsupported;
+        return call(self.ptr, namespace, timestamp, payloads);
     }
 
     /// Append exactly once for a durable caller-supplied operation identity.

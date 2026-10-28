@@ -54,6 +54,32 @@ pub const Service = struct {
             return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = result.start_lsn, .end_lsn = result.end_lsn };
         }
 
+        if (self.wal.supportsBatchAppend()) {
+            var cursor: usize = 0;
+            var first: u64 = 0;
+            var last: u64 = 0;
+            while (cursor < req.mutations.len) {
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const temporary = arena.allocator();
+                var payloads = std.ArrayList([]const u8).empty;
+                var bytes: usize = 0;
+                while (cursor < req.mutations.len and payloads.items.len < 1024) {
+                    const encoded = try api_codec.encodeMutationAlloc(temporary, req.mutations[cursor]);
+                    const charge = std.math.add(usize, encoded.len, 32) catch return error.WalRecordTooLarge;
+                    if (charge > 8 * 1024 * 1024) return error.WalRecordTooLarge;
+                    if (charge > 8 * 1024 * 1024 - bytes and payloads.items.len != 0) break;
+                    try payloads.append(temporary, encoded);
+                    bytes += charge;
+                    cursor += 1;
+                }
+                const result = try self.wal.appendBatch(req.namespace, req.timestamp_ns, payloads.items);
+                if (first == 0) first = result.start_lsn;
+                last = result.end_lsn;
+            }
+            return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = first, .end_lsn = last };
+        }
+
         var start_lsn: u64 = 0;
         var end_lsn: u64 = 0;
         for (req.mutations, 0..) |mutation, idx| {
@@ -75,6 +101,7 @@ pub const Service = struct {
     pub fn ingestTableBatch(self: *Service, req: api_types.TableIngestBatchDomainRequest) !api_types.TableIngestBatchResult {
         var result = try self.ingestBatch(.{
             .namespace = req.table_name,
+            .operation_id = req.operation_id,
             .timestamp_ns = req.timestamp_ns,
             .mutations = req.mutations,
         });

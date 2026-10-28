@@ -50,7 +50,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     let pending;
     const launch=admission=>{
       if(pending)return pending;
-      const execute=host=>run(env,input,signal,collection,host,trace,admission,requestOptions),options={signal,...(admission?.nativeResume?{preferredHostIdentity:admission.nativeResume.hostIdentity}:{}),...(admission?.nativePlan?{deadlineMs:admission.nativePlan.deadlineMs,beforePromote:()=>admission.nativePlan.fresh}:admission?.deadlineMs?{deadlineMs:admission.deadlineMs}:{}),fairKey:env.ANTFLY_INCARNATION,priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)};
+      const execute=host=>run(env,input,signal,collection,host,trace,admission,requestOptions),options={signal,...(admission?.nativeResume?{preferredHostIdentity:admission.nativeResume.hostIdentity}:{}),...(admission?.nativePlan?{deadlineMs:admission.nativePlan.deadlineMs,beforePromote:()=>admission.nativePlan.fresh}:admission?.deadlineMs?{deadlineMs:admission.deadlineMs}:{}),fairKey:env.ANTFLY_INCARNATION,...(env.NATIVE_READ_AFFINITY==="true"?{affinityKey:env.ANTFLY_INCARNATION}:{}),priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)};
       const small=pointReadLanes&&env.DIRECT_READS==="true"&&input.op==="lookup"&&!input.cursor&&(admission?.view||admission?.nativePlan)&&JSON.stringify(input).length<=4096;
       pending=small?withPointReadLane(kernel,execute,{...options,onPromote:()=>trace.stage({name:"point_read_capacity_promotion",duration_ms:0})}):kernel.withHost(execute,options);
       pending.catch(()=>{});return pending;
@@ -87,7 +87,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
                   });
                 };
                 const opportunistic=env.OPPORTUNISTIC_READ_PREPARE==="true";
-                const options={signal,deadlineMs,fairKey:env.ANTFLY_INCARNATION,onStage:sample=>trace.stage(sample),...(opportunistic?{tryOnly:true,preparationOnly:true}:{})};
+                const options={signal,deadlineMs,fairKey:env.ANTFLY_INCARNATION,...(env.NATIVE_READ_AFFINITY==="true"?{affinityKey:env.ANTFLY_INCARNATION}:{}),onStage:sample=>trace.stage(sample),...(opportunistic?{tryOnly:true,preparationOnly:true}:{})};
                 const runPreparation=async host=>{
                   if(!opportunistic)return execute(host);
                   kernel.waitingReadPlans=(kernel.waitingReadPlans??0)+1;

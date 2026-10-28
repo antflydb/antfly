@@ -60,7 +60,7 @@ export class RequestPool {
   const job=this.pending.splice(selected,1)[0];this.lastKey=job.options.fairKey;
   const compatible=s=>s.host&&s.hostKey===job.hostKey&&s.hostReservationBytes===job.reservationBytes;
   // Best-effort immutable-cache affinity never waits for a busy host.
-  const slot=idle.find(s=>compatible(s)&&s.host.poolIdentity===job.options.preferredHostIdentity)??idle.find(compatible)??idle.find(s=>!s.host)??idle[0];
+  const slot=idle.find(s=>compatible(s)&&s.host.poolIdentity===job.options.preferredHostIdentity)??idle.find(s=>compatible(s)&&job.options.affinityKey!==undefined&&s.affinityKey===job.options.affinityKey)??idle.find(compatible)??idle.find(s=>!s.host)??idle[0];
   if(slot.host&&(slot.hostKey!==job.hostKey||slot.hostReservationBytes!==job.reservationBytes))slot.host=null;
   // Count busy reservations, including hosts still being instantiated, and
   // retained idle hosts. Evict idle variants before reserving more memory.
@@ -69,7 +69,7 @@ export class RequestPool {
    if(retained-(slot.host?slot.hostReservationBytes??0:0)+job.reservationBytes<=this.maxReservedBytes)break;
    if(other!==slot&&!other.busy)other.host=null;
   }
-  this.reservedBytes+=job.reservationBytes;slot.activeReservationBytes=job.reservationBytes;slot.busy=true;job.admit(slot);
+  this.reservedBytes+=job.reservationBytes;slot.activeReservationBytes=job.reservationBytes;slot.affinityKey=job.options.affinityKey;slot.busy=true;job.admit(slot);
  }}finally{for(const notify of this.capacityListeners??[])notify();}}
 
  async execute(slot,job){

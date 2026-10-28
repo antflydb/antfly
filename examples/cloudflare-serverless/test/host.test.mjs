@@ -1154,3 +1154,15 @@ test('a failed WAL HEAD cannot publish document projection rows or receipts',asy
  const accepted=await host.request(mutation);assert.equal((await reader.request(native('lookup',{doc_id:'one',required_visibility:accepted.visibility}))).body,'{"text":"new"}');
  assert.deepEqual(await host.request(mutation),accepted);
 });
+
+test('warm namespace affinity chooses an idle compatible kernel without waiting for a busy one',async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');let created=0;
+ const pool=new RequestPool(()=>({id:++created,usable:()=>true,memoryBytes:()=>0}),2);
+ let releaseA,releaseB,enteredA,enteredB;const aEntered=new Promise(r=>enteredA=r),bEntered=new Promise(r=>enteredB=r);
+ const a=pool.withHost(async host=>{enteredA();await new Promise(r=>releaseA=r);return host.id;},{affinityKey:'a'});
+ const b=pool.withHost(async host=>{enteredB();await new Promise(r=>releaseB=r);return host.id;},{affinityKey:'b'});
+ await Promise.all([aEntered,bEntered]);releaseA();releaseB();const[aId,bId]=await Promise.all([a,b]);assert.notEqual(aId,bId);
+ assert.equal(await pool.withHost(host=>host.id,{affinityKey:'b'}),bId);
+ let release,entered;const started=new Promise(r=>entered=r),held=pool.withHost(async host=>{entered();await new Promise(r=>release=r);return host.id;},{affinityKey:'b'});
+ await started;assert.equal(await pool.withHost(host=>host.id,{affinityKey:'b'}),aId,'affinity must not queue behind a busy host');release();assert.equal(await held,bId);assert.equal(created,2);
+});

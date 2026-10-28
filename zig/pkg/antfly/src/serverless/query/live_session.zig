@@ -32,6 +32,7 @@ pub const Session = struct {
     remaining_read_bytes: u64,
     view: View = undefined,
     cancellation: CancellationToken,
+    wal_cancellation: ?@import("objectstore").CancellationToken = null,
     io: ?std.Io,
 
     pub const Options = struct {
@@ -42,9 +43,10 @@ pub const Session = struct {
         io: ?std.Io = null,
     };
     pub fn open(alloc: A, query: *runtime.QueryRuntime, wal: *WalStore, namespace: []const u8, options: Options) !*Session {
+        try options.cancellation.check();
         const self = try alloc.create(Session);
         errdefer alloc.destroy(self);
-        self.* = .{ .alloc = alloc, .remaining_read_bytes = options.max_read_bytes, .cancellation = options.cancellation, .io = options.io };
+        self.* = .{ .alloc = alloc, .remaining_read_bytes = options.max_read_bytes, .cancellation = options.cancellation, .wal_cancellation = options.view.cancellation, .io = options.io };
         errdefer if (self.published) |*published| published.deinit();
         self.published = if (options.version) |version|
             if (version == 0) null else try query.openVersionSessionWithCancellation(namespace, version, options.cancellation)
@@ -59,8 +61,15 @@ pub const Session = struct {
         errdefer if (self.reader) |reader| reader.destroy();
         var view_options = options.view;
         view_options.body_resolver = .{ .ptr = self, .resolve = resolveCheckpoint };
+        // The heap-stable session owns this bridge for the whole synchronous
+        // WAL operation. Preserve both the request and explicit view signals.
+        view_options.cancellation = .{ .ptr = self, .is_cancelled_fn = transportCancelled };
         self.view = try View.open(alloc, wal, namespace, if (self.published) |published| published.manifest.wal_end_lsn else 0, view_options);
         return self;
+    }
+    fn transportCancelled(raw: *const anyopaque) bool {
+        const self: *const Session = @ptrCast(@alignCast(raw));
+        return self.cancellation.isCancelled() or if (self.wal_cancellation) |token| token.isCancelled() else false;
     }
     fn resolveCheckpoint(raw: *anyopaque, alloc: A, bytes: []const u8) ![]u8 {
         const self: *Session = @ptrCast(@alignCast(raw));
@@ -255,3 +264,19 @@ pub const Session = struct {
         }
     };
 };
+
+test "serverless multiprovider live session preserves request and view cancellation before WAL admission" {
+    var signal = std.atomic.Value(bool).init(true);
+    // Version zero has no published session. Uninitialized stores are poison
+    // witnesses: either cancellation path must return before touching them.
+    var query: runtime.QueryRuntime = undefined;
+    var wal: WalStore = undefined;
+    try std.testing.expectError(error.Canceled, Session.open(std.testing.allocator, &query, &wal, "docs", .{
+        .version = 0,
+        .cancellation = CancellationToken.fromAtomic(&signal),
+    }));
+    try std.testing.expectError(error.Canceled, Session.open(std.testing.allocator, &query, &wal, "docs", .{
+        .version = 0,
+        .view = .{ .cancellation = @import("objectstore").CancellationToken.fromAtomic(&signal) },
+    }));
+}

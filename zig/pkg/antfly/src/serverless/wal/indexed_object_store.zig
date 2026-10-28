@@ -171,7 +171,7 @@ pub const IndexedObjectStore = struct {
             updated.latest_lsn = next;
             updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(encoded) else null;
             try uploads.flush();
-            ctx.writeHead(updated, current.etag) catch |err| switch (err) {
+            ctx.writeHead(updated, current.revision) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
             };
@@ -192,11 +192,23 @@ pub const IndexedObjectStore = struct {
     }
 
     pub const Group = struct { timestamp: u64, payloads: []const []const u8, id: []const u8 };
+    const PendingGroup = struct { timestamp: u64, payloads: []const []const u8, id: ?[]const u8 };
+    pub fn appendBatch(self: *@This(), namespace: []const u8, timestamp: u64, payloads: []const []const u8) !BatchResult {
+        const results = try self.appendGroups(namespace, &.{.{ .timestamp = timestamp, .payloads = payloads, .id = null }});
+        defer self.alloc.free(results);
+        return results[0];
+    }
 
     /// Share path copies and one HEAD CAS across independent caller receipts.
     /// Existing receipts keep their original interval, including duplicates in
     /// this group. No receipt or record becomes visible before the shared CAS.
     pub fn appendGroupsIdempotent(self: *@This(), namespace: []const u8, groups: []const Group) ![]BatchResult {
+        if (groups.len == 0 or groups.len > 16) return error.InvalidWalBatch;
+        var pending: [16]PendingGroup = undefined;
+        for (groups, pending[0..groups.len]) |group, *item| item.* = .{ .timestamp = group.timestamp, .payloads = group.payloads, .id = group.id };
+        return self.appendGroups(namespace, pending[0..groups.len]);
+    }
+    fn appendGroups(self: *@This(), namespace: []const u8, groups: []const PendingGroup) ![]BatchResult {
         if (groups.len == 0 or groups.len > 16) return error.InvalidWalBatch;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -207,8 +219,8 @@ pub const IndexedObjectStore = struct {
         var total: usize = 0;
         for (groups, receipts, ids) |group, *receipt, *id| {
             if (group.payloads.len == 0 or group.payloads.len > 1024) return error.InvalidWalBatch;
-            if (group.id.len == 0 or group.id.len > 4096) return error.InvalidWalOperationId;
-            id.* = group.id;
+            if (group.id) |identity_| if (identity_.len == 0 or identity_.len > 4096) return error.InvalidWalOperationId;
+            id.* = group.id orelse "";
             count = std.math.add(usize, count, group.payloads.len) catch return error.InvalidWalBatch;
             if (count > 1024) return error.InvalidWalBatch;
             var hash = Sha256.init(.{});
@@ -240,14 +252,18 @@ pub const IndexedObjectStore = struct {
             var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
             defer cache.deinit();
             const pages = cache.store();
-            const found = try tree.lookupMany(scratch, pages, current.value.operations, ids);
+            const found = if (groups.len == 1 and groups[0].id == null) blk: {
+                const empty = try scratch.alloc(?tree.BatchEntry, 1);
+                empty[0] = null;
+                break :blk empty;
+            } else try tree.lookupMany(scratch, pages, current.value.operations, ids);
             var changes = std.ArrayList(tree.Mutation).empty;
             var operations = std.ArrayList(tree.Mutation).empty;
             var last = current.value.latest_lsn;
             for (groups, receipts, found, 0..) |group, *receipt, existing, index| {
                 var duplicate: ?usize = null;
                 for (groups[0..index], 0..) |prior, i| {
-                    if (std.mem.eql(u8, prior.id, group.id)) {
+                    if (prior.id != null and group.id != null and std.mem.eql(u8, prior.id.?, group.id.?)) {
                         duplicate = i;
                         break;
                     }
@@ -257,13 +273,15 @@ pub const IndexedObjectStore = struct {
                     results[index] = results[i];
                     continue;
                 }
-                if (existing) |value| {
-                    if (value.value.len != receipt.len or !std.mem.eql(u8, value.value[16..], receipt[16..])) return error.WalIdempotencyConflict;
-                    const first = std.mem.readInt(u64, value.value[0..8], .little);
-                    const end = std.mem.readInt(u64, value.value[8..16], .little);
-                    if (first == 0 or end < first or end > current.value.latest_lsn or end - first + 1 != group.payloads.len) return error.InvalidWal;
-                    results[index] = .{ .start_lsn = first, .end_lsn = end };
-                    continue;
+                if (group.id != null) {
+                    if (existing) |value| {
+                        if (value.value.len != receipt.len or !std.mem.eql(u8, value.value[16..], receipt[16..])) return error.WalIdempotencyConflict;
+                        const first = std.mem.readInt(u64, value.value[0..8], .little);
+                        const end = std.mem.readInt(u64, value.value[8..16], .little);
+                        if (first == 0 or end < first or end > current.value.latest_lsn or end - first + 1 != group.payloads.len) return error.InvalidWal;
+                        results[index] = .{ .start_lsn = first, .end_lsn = end };
+                        continue;
+                    }
                 }
                 const first = last + 1;
                 last = std.math.add(u64, last, group.payloads.len) catch return error.WalLsnExhausted;
@@ -276,7 +294,7 @@ pub const IndexedObjectStore = struct {
                 }
                 std.mem.writeInt(u64, receipt[0..8], first, .little);
                 std.mem.writeInt(u64, receipt[8..16], last, .little);
-                try operations.append(scratch, .{ .key = group.id, .value = receipt });
+                if (group.id) |identity_| try operations.append(scratch, .{ .key = identity_, .value = receipt });
                 results[index] = .{ .start_lsn = first, .end_lsn = last };
             }
             if (changes.items.len == 0) return results;
@@ -293,7 +311,7 @@ pub const IndexedObjectStore = struct {
             updated.latest_lsn = last;
             updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(changes.items[changes.items.len - 1].value.?) else null;
             try uploads.flush();
-            ctx.writeHead(updated, current.etag) catch |err| switch (err) {
+            ctx.writeHead(updated, current.revision) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
             };
@@ -530,7 +548,7 @@ pub const IndexedObjectStore = struct {
             if (next_floor <= head.value.first_lsn) return 0;
             var updated = head.value;
             updated.first_lsn = next_floor;
-            ctx.writeHead(updated, head.etag) catch |err| switch (err) {
+            ctx.writeHead(updated, head.revision) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
             };
@@ -570,7 +588,7 @@ pub const IndexedObjectStore = struct {
             updated.records = try tree.apply(self.alloc, pages, head.value.records, changes[0..count]);
             updated.physical_first_lsn = end;
             try uploads.flush();
-            ctx.writeHead(updated, head.etag) catch |err| switch (err) {
+            ctx.writeHead(updated, head.revision) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
             };
@@ -598,7 +616,7 @@ pub const IndexedObjectStore = struct {
                 next.gc_operations = next.operations;
                 next.gc_documents = if (next.document_index) |index| index.root else null;
                 next.gc_retired_before = next.write_epoch;
-                ctx.writeHead(next, head.etag) catch |err| switch (err) {
+                ctx.writeHead(next, head.revision) catch |err| switch (err) {
                     error.PreconditionFailed => continue,
                     else => return err,
                 };
@@ -621,9 +639,12 @@ pub const IndexedObjectStore = struct {
 
     const Snapshot = struct {
         value: Head = .{},
-        etag: ?[]u8 = null,
+        revision: ?objectstore.ObjectRevision = null,
         fn deinit(self: *@This(), alloc: A) void {
-            if (self.etag) |value| alloc.free(value);
+            if (self.revision) |value| {
+                var owned = value;
+                owned.deinit(alloc);
+            }
         }
     };
 
@@ -660,7 +681,7 @@ pub const IndexedObjectStore = struct {
             const a = self.owner.alloc;
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);
-            var result = self.owner.client.getObject(self.owner.bucket, key, .{ .max_response_bytes = 4096, .cancellation = self.cancellation }) catch |err| switch (err) {
+            var result = self.owner.client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 4096, .cancellation = self.cancellation }) catch |err| switch (err) {
                 error.FileNotFound => return .{},
                 else => return err,
             };
@@ -701,10 +722,10 @@ pub const IndexedObjectStore = struct {
                 try ref.validate();
                 if (ref.records > head.latest_lsn) return error.InvalidWal;
             }
-            const etag = result.metadata.etag orelse return error.MissingObjectEtag;
-            return .{ .value = head, .etag = try a.dupe(u8, etag) };
+            const revision = result.metadata.writeRevision() orelse return error.MissingObjectRevision;
+            return .{ .value = head, .revision = try revision.clone(a) };
         }
-        fn writeHead(self: *@This(), head: Head, etag: ?[]const u8) !void {
+        fn writeHead(self: *@This(), head: Head, revision: ?objectstore.ObjectRevision) !void {
             const a = self.owner.alloc;
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);
@@ -720,9 +741,7 @@ pub const IndexedObjectStore = struct {
             }
             defer a.free(bytes);
             if (bytes.len > 4096) return error.WalHeadTooLarge;
-            var result = try self.owner.client.putObject(self.owner.bucket, key, bytes, .{
-                .if_none_match = etag == null,
-                .if_match_etag = etag,
+            var result = try self.owner.client.compareAndPut(self.owner.bucket, key, bytes, revision, .{
                 .content_type = "application/json",
                 .cancellation = self.cancellation,
             });
@@ -738,7 +757,7 @@ pub const IndexedObjectStore = struct {
             defer a.free(key);
             var client = self.owner.client;
             client.allocator = a;
-            var result = try client.getObject(self.owner.bucket, key, .{ .max_response_bytes = ref.bytes, .cancellation = self.cancellation });
+            var result = try client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = ref.bytes, .cancellation = self.cancellation });
             defer result.metadata.deinit(a);
             return result.body;
         }
@@ -790,6 +809,7 @@ pub const IndexedObjectStore = struct {
         .deinit = erasedDeinit,
         .append = erasedAppend,
         .append_idempotent = erasedIdempotent,
+        .append_batch = erasedUnkeyedBatch,
         .append_batch_idempotent = erasedBatch,
         .append_idempotent_if_latest = erasedConditional,
         .read_snapshot = erasedSnapshot,
@@ -814,6 +834,10 @@ pub const IndexedObjectStore = struct {
     fn erasedConditional(raw: *anyopaque, ns: []const u8, t: u64, p: []const u8, id: []const u8, latest: u64) !?u64 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return self.appendIdempotentIfLatest(ns, t, p, id, latest);
+    }
+    fn erasedUnkeyedBatch(raw: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8) !BatchResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.appendBatch(ns, timestamp, payloads);
     }
     fn erasedBatch(raw: *anyopaque, ns: []const u8, t: u64, payloads: []const []const u8, id: []const u8) !BatchResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1116,12 +1140,78 @@ test "serverless indexed WAL document projection rejects an authenticated row fo
     @memcpy(value[8..], encoded);
     var changed = head.value;
     changed.document_index.?.root = try tree.apply(a, ctx.store(), changed.document_index.?.root, &.{ .{ .key = "one", .value = value }, .{ .key = "other", .value = null } });
-    try ctx.writeHead(changed, head.etag);
+    try ctx.writeHead(changed, head.revision);
     try std.testing.expectError(error.InvalidWal, wal.readPointAlloc(a, "docs", "one", .{ .start_lsn = 1, .end_lsn = 1 }));
     var current = try ctx.readHead();
     defer current.deinit(a);
     var absent = current.value;
     absent.document_index.?.root = null;
-    try ctx.writeHead(absent, current.etag);
+    try ctx.writeHead(absent, current.revision);
     try std.testing.expectError(error.InvalidWal, wal.readPointAlloc(a, "docs", "missing", .{ .start_lsn = 1, .end_lsn = 1 }));
+}
+
+test "serverless multiprovider unkeyed WAL batching shares publication without fabricating receipts" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var scalar = try IndexedObjectStore.init(a, client, "db", "scalar");
+    defer scalar.deinit();
+    var batched = try IndexedObjectStore.init(a, client, "db", "batched");
+    defer batched.deinit();
+    const payloads: [32][]const u8 = @splat("body");
+    memory.resetOperationCount();
+    for (payloads) |payload| _ = try scalar.append("docs", 1, payload);
+    const scalar_operations = memory.operationCount();
+    memory.resetOperationCount();
+    var wal = batched.walStore();
+    const result = try wal.appendBatch("docs", 1, &payloads);
+    const batch_operations = memory.operationCount();
+    try std.testing.expectEqual(@as(u64, 1), result.start_lsn);
+    try std.testing.expectEqual(@as(u64, 32), result.end_lsn);
+    try std.testing.expect(batch_operations * 4 < scalar_operations);
+    var context = try IndexedObjectStore.Context.init(&batched, "docs", null);
+    defer context.deinit();
+    var head = try context.readHead();
+    defer head.deinit(a);
+    try std.testing.expect(head.value.operations == null);
+    const records = try wal.readRangeAlloc("docs", .{ .start_lsn = 1, .end_lsn = 32 });
+    defer types.freeRecords(a, records);
+    try std.testing.expectEqual(@as(usize, 32), records.len);
+    for (records, 1..) |record, lsn| {
+        try std.testing.expectEqual(@as(u64, @intCast(lsn)), record.lsn);
+        try std.testing.expectEqualStrings("body", record.payload);
+    }
+    std.debug.print("unkeyed WAL batching: records=32 scalar_operations={d} batch_operations={d}\n", .{ scalar_operations, batch_operations });
+}
+
+test "serverless multiprovider unkeyed WAL batch preserves the committed outcome after a lost acknowledgement" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var backing = memory.client();
+    try backing.makeBucket("db");
+    var faults = objectstore.ScriptedFaultClient.init(a, backing);
+    defer faults.deinit();
+    var store = try IndexedObjectStore.init(a, faults.client(), "db", "lost");
+    defer store.deinit();
+    var marker: u8 = 0;
+    faults.put_filter = .{ .ptr = &marker, .matches = struct {
+        fn matches(_: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            return std.mem.endsWith(u8, key, "/HEAD");
+        }
+    }.matches };
+    faults.commitNextPutThenFail(error.InjectedAckLoss);
+    try std.testing.expectError(error.InjectedAckLoss, store.appendBatch("docs", 1, &.{ "one", "two" }));
+    var reopened = try IndexedObjectStore.init(a, backing, "db", "lost");
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 2), try reopened.latestLsn("docs"));
+    const rows = try reopened.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 2 });
+    defer types.freeRecords(a, rows);
+    try std.testing.expectEqualStrings("one", rows[0].payload);
+    try std.testing.expectEqualStrings("two", rows[1].payload);
+    const another = try reopened.appendBatch("docs", 1, &.{ "one", "two" });
+    try std.testing.expectEqual(@as(u64, 3), another.start_lsn);
+    try std.testing.expectEqual(@as(u64, 4), another.end_lsn);
 }

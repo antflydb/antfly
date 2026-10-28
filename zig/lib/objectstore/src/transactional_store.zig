@@ -720,7 +720,17 @@ test "object-native buffered commit allocation failures release private ownershi
             defer memory.deinit();
             var client = memory.client();
             try client.makeBucket("db");
-            const ctx = Context{ .alloc = alloc, .client = client, .bucket = "db", .prefix = "native", .namespace = "buffer-allocation", .io = std.testing.io };
+            // Decimal JSON serialization of a random epoch changes allocation
+            // counts across failure-enumeration iterations. Fix fixture entropy;
+            // production recovery and ownership still use the real I/O source.
+            var io_vtable = std.testing.io.vtable.*;
+            io_vtable.random = struct {
+                fn fill(_: ?*anyopaque, buffer: []u8) void {
+                    @memset(buffer, 17);
+                }
+            }.fill;
+            const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &io_vtable };
+            const ctx = Context{ .alloc = alloc, .client = client, .bucket = "db", .prefix = "native", .namespace = "buffer-allocation", .io = io };
             const initial = try ctx.execute(.{ .action = .begin, .owner = @splat(1) });
             defer alloc.free(initial);
             const header = try std.json.parseFromSlice(struct { state: journal.State }, alloc, initial, .{ .ignore_unknown_fields = true });

@@ -61,7 +61,7 @@ pub const Pages = struct {
         defer a.free(k);
         var client = self.client;
         client.allocator = a;
-        var result = try client.getObject(self.bucket, k, .{ .cancellation = self.cancellation });
+        var result = try client.getObject(self.bucket, k, .{ .skip_metadata_probe = true, .max_response_bytes = ref.bytes, .cancellation = self.cancellation });
         defer result.deinit(a);
         if (result.body.len != ref.bytes) return error.ArtifactIntegrityMismatch;
         const body = result.body;

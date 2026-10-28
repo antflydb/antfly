@@ -103,16 +103,44 @@ pub const ObjectChecksumScope = enum {
     response_body,
 };
 
+/// A provider's atomic current-object publication token. An S3 version ID is
+/// not an ETag, and a GCS generation is not an HTTP ETag. Borrowed unless cloned.
+pub const ObjectRevision = union(enum) {
+    etag: []const u8,
+    generation: []const u8,
+
+    pub fn clone(self: ObjectRevision, alloc: Allocator) !ObjectRevision {
+        return switch (self) {
+            .etag => |value| .{ .etag = try alloc.dupe(u8, value) },
+            .generation => |value| .{ .generation = try alloc.dupe(u8, value) },
+        };
+    }
+    pub fn deinit(self: *ObjectRevision, alloc: Allocator) void {
+        switch (self.*) {
+            inline else => |value| alloc.free(value),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const ObjectMetadata = struct {
     bucket: []u8,
     key: []u8,
     etag: ?[]u8 = null,
     version_id: ?[]u8 = null,
+    revision_kind: enum { etag, generation } = .etag,
     checksum: ?ObjectChecksum = null,
     checksum_scope: ObjectChecksumScope = .object,
     content_length: u64,
     content_type: ?[]u8 = null,
     last_modified_unix_ms: ?i64 = null,
+
+    pub fn writeRevision(self: ObjectMetadata) ?ObjectRevision {
+        return switch (self.revision_kind) {
+            .etag => .{ .etag = self.etag orelse return null },
+            .generation => .{ .generation = self.version_id orelse return null },
+        };
+    }
 
     pub fn deinit(self: *ObjectMetadata, alloc: Allocator) void {
         alloc.free(self.bucket);

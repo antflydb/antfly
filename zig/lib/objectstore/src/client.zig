@@ -36,6 +36,8 @@ pub const Client = struct {
 
     pub const VTable = struct {
         supports_guarded_put: bool = false,
+        put_at_revision: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.ObjectRevision, types.PutOptions) anyerror!types.PutResult = null,
+        delete_at_revision: ?*const fn (*anyopaque, []const u8, []const u8, types.ObjectRevision, types.DeleteOptions) anyerror!void = null,
         supports_object_versions: ?*const fn (*anyopaque, Allocator, []const u8, ?types.CancellationToken) anyerror!bool = null,
         /// Optional provider-enforced protection of current object names against
         /// deletion AND replacement. Version retention alone is insufficient.
@@ -122,6 +124,43 @@ pub const Client = struct {
     pub fn makeBucketWithOptions(self: *Client, bucket: []const u8, opts: types.BucketOptions) !void {
         if (opts.cancellation) |token| try token.check();
         try self.vtable.make_bucket(self.ptr, bucket, opts);
+    }
+
+    /// Null means create-only. A non-null revision must come from the same
+    /// object's captured payload/metadata. No read/check/unconditional fallback.
+    pub fn compareAndPut(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, revision: ?types.ObjectRevision, opts: types.PutOptions) !types.PutResult {
+        if (opts.if_match_etag != null or opts.if_none_match) return error.InvalidArgument;
+        if (opts.cancellation) |token| try token.check();
+        if (opts.guard != null and !self.vtable.supports_guarded_put) return error.ObjectOperationUnsupported;
+        var conditional = opts;
+        if (revision) |value| switch (value) {
+            .etag => |etag| {
+                if (etag.len == 0) return error.InvalidArgument;
+                conditional.if_match_etag = etag;
+            },
+            .generation => {
+                const call = self.vtable.put_at_revision orelse return error.ObjectOperationUnsupported;
+                return call(self.ptr, self.allocator, bucket, key, body, value, opts);
+            },
+        } else conditional.if_none_match = true;
+        return self.putObject(bucket, key, body, conditional);
+    }
+
+    pub fn compareAndDelete(self: *Client, bucket: []const u8, key: []const u8, revision: types.ObjectRevision, opts: types.DeleteOptions) !void {
+        if (opts.if_match_etag != null or opts.version_id != null) return error.InvalidArgument;
+        if (opts.cancellation) |token| try token.check();
+        switch (revision) {
+            .etag => |etag| {
+                if (etag.len == 0) return error.InvalidArgument;
+                var conditional = opts;
+                conditional.if_match_etag = etag;
+                return self.deleteObject(bucket, key, conditional);
+            },
+            .generation => {
+                const call = self.vtable.delete_at_revision orelse return error.ObjectOperationUnsupported;
+                return call(self.ptr, bucket, key, revision, opts);
+            },
+        }
     }
 
     pub fn putObject(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
@@ -502,4 +541,29 @@ test "guarded objectstore writes fail closed without transactional capability" {
     try std.testing.expectError(error.ObjectOperationUnsupported, client.putFile("fixture", "progress/REINDEX", "missing-file", options));
     try std.testing.expectError(error.ObjectOperationUnsupported, client.putFileWithIo(std.testing.io, "fixture", "progress/REINDEX", "missing-file", options));
     try std.testing.expectError(error.FileNotFound, client.statObject("fixture", "progress/REINDEX"));
+}
+
+test "revision conditional publication is atomic and unsupported generation never falls back" {
+    const a = std.testing.allocator;
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var first = try client.compareAndPut("db", "HEAD", "one", null, .{});
+    defer first.deinit(a);
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndPut("db", "HEAD", "overwrite", null, .{}));
+    var captured = try client.getObject("db", "HEAD", .{});
+    defer captured.deinit(a);
+    const revision = captured.metadata.writeRevision().?;
+    var owned = try revision.clone(a);
+    defer owned.deinit(a);
+    var next = try client.compareAndPut("db", "HEAD", "two", owned, .{});
+    defer next.deinit(a);
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndPut("db", "HEAD", "stale", owned, .{}));
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndDelete("db", "HEAD", owned, .{}));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.compareAndPut("db", "HEAD", "bad", .{ .generation = "1" }, .{}));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.compareAndDelete("db", "HEAD", .{ .generation = "1" }, .{}));
+    var unchanged = try client.getObject("db", "HEAD", .{});
+    defer unchanged.deinit(a);
+    try std.testing.expectEqualStrings("two", unchanged.body);
 }

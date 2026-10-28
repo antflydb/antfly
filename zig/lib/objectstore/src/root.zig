@@ -29,6 +29,7 @@ pub const gcs = @import("gcs.zig");
 pub const s3_compat = @import("s3_compat.zig");
 pub const scripted_fault = @import("scripted_fault.zig");
 
+pub const ObjectRevision = types.ObjectRevision;
 pub const ObjectMetadata = types.ObjectMetadata;
 pub const ObjectChecksum = types.ObjectChecksum;
 pub const ObjectChecksumAlgorithm = types.ObjectChecksumAlgorithm;
@@ -89,6 +90,7 @@ test "objectstore module compiles" {
     _ = gcs;
     _ = s3_compat;
     _ = scripted_fault;
+    _ = wasm_host;
     _ = ObjectMetadata;
     _ = PutOptions;
     _ = GetOptions;

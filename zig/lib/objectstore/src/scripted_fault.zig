@@ -174,39 +174,44 @@ pub const Client = struct {
         options: types.PutOptions,
     ) !types.PutResult {
         const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.putWithRevision(alloc, bucket, key, body, options, null);
+    }
+    fn putAtRevision(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, revision: types.ObjectRevision, options: types.PutOptions) !types.PutResult {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.putWithRevision(alloc, bucket, key, body, options, revision);
+    }
+    fn forwardPut(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, options: types.PutOptions, revision: ?types.ObjectRevision) !types.PutResult {
+        var backing = self.backing;
+        backing.allocator = alloc;
+        return if (revision) |value| backing.compareAndPut(bucket, key, body, value, options) else backing.putObject(bucket, key, body, options);
+    }
+    fn putWithRevision(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, options: types.PutOptions, revision: ?types.ObjectRevision) !types.PutResult {
         self.put_attempts +|= 1;
         if (self.put_filter) |filter| {
             if (!filter.matches(filter.ptr, bucket, key, body))
-                return self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                return self.forwardPut(alloc, bucket, key, body, options, revision);
             self.put_filter = null;
         }
         return switch (self.takePutFault()) {
-            .none => self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options),
+            .none => self.forwardPut(alloc, bucket, key, body, options, revision),
             .fail_before => |err| err,
             .commit_then_fail => |err| blk: {
-                var result = try self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                var result = try self.forwardPut(alloc, bucket, key, body, options, revision);
                 result.deinit(alloc);
                 break :blk err;
             },
             .partial_then_fail => |fault| blk: {
-                var result = try self.backing.vtable.put_object(
-                    self.backing.ptr,
-                    alloc,
-                    bucket,
-                    key,
-                    body[0..@min(fault.bytes, body.len)],
-                    options,
-                );
+                var result = try self.forwardPut(alloc, bucket, key, body[0..@min(fault.bytes, body.len)], options, revision);
                 result.deinit(alloc);
                 break :blk fault.err;
             },
             .duplicate => blk: {
-                var first = try self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                var first = try self.forwardPut(alloc, bucket, key, body, options, revision);
                 first.deinit(alloc);
-                break :blk self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                break :blk self.forwardPut(alloc, bucket, key, body, options, revision);
             },
             .hide_after_success => |reads| blk: {
-                const result = try self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                const result = try self.forwardPut(alloc, bucket, key, body, options, revision);
                 self.rememberHidden(bucket, key, reads) catch {
                     var owned = result;
                     owned.deinit(alloc);
@@ -260,7 +265,13 @@ pub const Client = struct {
         return self.backing.vtable.list_objects(self.backing.ptr, alloc, bucket, options);
     }
 
+    fn deleteAtRevision(ptr: *anyopaque, bucket: []const u8, key: []const u8, revision: types.ObjectRevision, options: types.DeleteOptions) !void {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.backing.compareAndDelete(bucket, key, revision, options);
+    }
     const vtable: client_mod.Client.VTable = .{
+        .put_at_revision = putAtRevision,
+        .delete_at_revision = deleteAtRevision,
         .deinit = erasedDeinit,
         .bucket_exists = bucketExists,
         .make_bucket = makeBucket,

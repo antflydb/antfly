@@ -28,9 +28,12 @@ pub const ObjectStore = struct {
     gcs_client: ?*objectstore.Gcs.JsonApiClient = null,
     s3_client: ?*objectstore.S3.Client = null,
     owns_client: bool = true,
+    indexed: ?*@import("indexed_object_store.zig").IndexedObjectStore = null,
+    layout: std.atomic.Value(u8) = .init(0),
     bucket: []u8,
     prefix: []u8,
     mutex: std.atomic.Mutex = .unlocked,
+    const Layout = enum(u8) { legacy = 1, indexed = 2 };
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -132,7 +135,89 @@ pub const ObjectStore = struct {
         };
     }
 
+    fn formatKey(self: *ObjectStore) ![]u8 {
+        return if (self.prefix.len == 0) self.alloc.dupe(u8, ".antfly/WAL_FORMAT") else std.fmt.allocPrint(self.alloc, "{s}/.antfly/WAL_FORMAT", .{self.prefix});
+    }
+    fn readLayout(self: *ObjectStore) !?Layout {
+        const key = try self.formatKey();
+        defer self.alloc.free(key);
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 32 }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        if (std.mem.eql(u8, result.body, "antfly-wal:legacy:1")) return .legacy;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed:1")) return .indexed;
+        return error.UnsupportedWalLayout;
+    }
+    fn ensureLayout(self: *ObjectStore, wanted: Layout, create: bool) !void {
+        const cached = self.layout.load(.acquire);
+        if (cached != 0) {
+            if (cached != @backingInt(wanted)) return error.WalLayoutMismatch;
+            return;
+        }
+        if (try self.readLayout()) |selected| {
+            if (selected != wanted) return error.WalLayoutMismatch;
+            self.layout.store(@backingInt(selected), .release);
+            return;
+        }
+        if (!create) return;
+        const key = try self.formatKey();
+        defer self.alloc.free(key);
+        const value = if (wanted == .legacy) "antfly-wal:legacy:1" else "antfly-wal:indexed:1";
+        var published = self.client.compareAndPut(self.bucket, key, value, null, .{}) catch |err| {
+            // The immutable selection may have committed before an ACK was
+            // lost, or another compatible opener may have selected it first.
+            if (try self.readLayout()) |selected| {
+                if (selected != wanted) return error.WalLayoutMismatch;
+                self.layout.store(@backingInt(selected), .release);
+                return;
+            }
+            return err;
+        };
+        defer published.deinit(self.alloc);
+        self.layout.store(@backingInt(wanted), .release);
+    }
+    pub fn selectLegacy(self: *ObjectStore) !void {
+        try self.ensureLayout(.legacy, false);
+    }
+
+    /// Explicit format selection. Existing legacy WALs must be migrated into a
+    /// new prefix; activation may never silently hide acknowledged records.
+    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, inline_tail: bool = true }) !void {
+        if (self.indexed != null) return error.WalAlreadyConfigured;
+        const selected = try self.readLayout();
+        if (selected == .legacy) return error.LegacyWalMigrationRequired;
+        if (selected == .indexed) self.layout.store(@backingInt(Layout.indexed), .release);
+        if (selected == null) {
+            var cursor: ?[]u8 = null;
+            defer if (cursor) |value| self.alloc.free(value);
+            const listing_prefix = if (self.prefix.len == 0) try self.alloc.dupe(u8, "") else try std.fmt.allocPrint(self.alloc, "{s}/", .{self.prefix});
+            defer self.alloc.free(listing_prefix);
+            while (true) {
+                var page = try self.client.listObjects(self.bucket, .{ .prefix = listing_prefix, .continuation_token = cursor, .max_keys = 1000 });
+                defer page.deinit(self.alloc);
+                for (page.entries) |item| if (std.mem.endsWith(u8, item.key, "/wal.log")) return error.LegacyWalMigrationRequired;
+                if (page.next_continuation_token == null) break;
+                const next = try self.alloc.dupe(u8, page.next_continuation_token orelse return error.InvalidObjectListing);
+                if (cursor) |value| self.alloc.free(value);
+                cursor = next;
+            }
+        }
+        try self.ensureLayout(.indexed, true);
+        const indexed = try self.alloc.create(@import("indexed_object_store.zig").IndexedObjectStore);
+        errdefer self.alloc.destroy(indexed);
+        indexed.* = try @import("indexed_object_store.zig").IndexedObjectStore.init(self.alloc, self.client, self.bucket, self.prefix);
+        indexed.read_state_enabled = options.read_state;
+        indexed.document_index_enabled = options.document_index;
+        indexed.inline_tail_enabled = options.inline_tail;
+        self.indexed = indexed;
+    }
     pub fn deinit(self: *ObjectStore) void {
+        if (self.indexed) |value| {
+            value.deinit();
+            self.alloc.destroy(value);
+        }
         if (self.owns_client) self.client.deinit();
         if (self.fs_client) |fs| self.alloc.destroy(fs);
         if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
@@ -146,11 +231,13 @@ pub const ObjectStore = struct {
         return .{
             .allocator = self.alloc,
             .ptr = self,
-            .vtable = &vtable,
+            .vtable = if (self.indexed != null) &indexed_vtable else &vtable,
         };
     }
 
     pub fn append(self: *ObjectStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
+        if (self.indexed) |value| return value.append(namespace, timestamp_ns, payload);
+        try self.ensureLayout(.legacy, true);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -160,7 +247,7 @@ pub const ObjectStore = struct {
         var current = try self.tryReadLog(self.alloc, key);
         defer if (current) |*value| {
             self.alloc.free(value.body);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         const next_lsn: u64 = if (current) |value| (try lastLsn(value.body)) + 1 else 1;
@@ -173,10 +260,8 @@ pub const ObjectStore = struct {
             try self.alloc.dupe(u8, encoded);
         defer self.alloc.free(combined);
 
-        var result = try self.client.putObject(self.bucket, key, combined, .{
+        var result = try self.client.compareAndPut(self.bucket, key, combined, if (current) |value| value.revision else null, .{
             .content_type = "application/octet-stream",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |value| value.etag else null,
         });
         defer result.deinit(self.alloc);
         return next_lsn;
@@ -217,6 +302,11 @@ pub const ObjectStore = struct {
         operation_id: []const u8,
         expected_latest_lsn: ?u64,
     ) !?u64 {
+        if (self.indexed) |value| {
+            if (expected_latest_lsn) |expected| return value.appendIdempotentIfLatest(namespace, timestamp_ns, payload, operation_id, expected);
+            return try value.appendIdempotent(namespace, timestamp_ns, payload, operation_id);
+        }
+        try self.ensureLayout(.legacy, true);
         if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
             return error.InvalidWalOperationId;
         if (payload.len > idempotent_payload_max) return error.WalRecordTooLarge;
@@ -229,7 +319,7 @@ pub const ObjectStore = struct {
         var current = try self.tryReadLog(self.alloc, key);
         defer if (current) |*value| {
             self.alloc.free(value.body);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         if (current) |value| {
@@ -241,7 +331,7 @@ pub const ObjectStore = struct {
             // An update without an ETag would turn the promised conditional
             // append into an unconditional whole-log replacement. Fail closed
             // on providers that omit the version token.
-            if (value.etag == null) return error.MissingObjectEtag;
+            if (value.revision == null) return error.MissingObjectEtag;
         }
 
         const next_lsn: u64 = if (current) |value| (try lastLsn(value.body)) + 1 else 1;
@@ -262,10 +352,8 @@ pub const ObjectStore = struct {
             try self.alloc.dupe(u8, encoded);
         defer self.alloc.free(combined);
 
-        var result = self.client.putObject(self.bucket, key, combined, .{
+        var result = self.client.compareAndPut(self.bucket, key, combined, if (current) |value| value.revision else null, .{
             .content_type = "application/octet-stream",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |value| value.etag else null,
         }) catch |err| switch (err) {
             error.PreconditionFailed => if (expected_latest_lsn != null) return null else return err,
             else => return err,
@@ -275,10 +363,16 @@ pub const ObjectStore = struct {
     }
 
     pub fn readFromAlloc(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
+        if (self.indexed) |value| {
+            var wal = value.walStore();
+            wal.allocator = alloc;
+            return wal.readFromAlloc(namespace, start_lsn);
+        }
+        try self.ensureLayout(.legacy, false);
         const key = try logKeyAlloc(alloc, self.prefix, namespace);
         defer alloc.free(key);
 
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return try alloc.alloc(wal_types.Record, 0),
             else => return err,
         };
@@ -287,9 +381,11 @@ pub const ObjectStore = struct {
     }
 
     pub fn latestLsn(self: *ObjectStore, namespace: []const u8) !u64 {
+        if (self.indexed) |value| return value.latestLsn(namespace);
+        try self.ensureLayout(.legacy, false);
         const key = try logKeyAlloc(self.alloc, self.prefix, namespace);
         defer self.alloc.free(key);
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return 0,
             else => return err,
         };
@@ -298,6 +394,8 @@ pub const ObjectStore = struct {
     }
 
     pub fn truncatePrefix(self: *ObjectStore, namespace: []const u8, keep_from_lsn: u64) !u64 {
+        if (self.indexed) |value| return value.truncatePrefix(namespace, keep_from_lsn);
+        try self.ensureLayout(.legacy, true);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -307,7 +405,7 @@ pub const ObjectStore = struct {
         var current = try self.tryReadLog(self.alloc, key);
         defer if (current) |*value| {
             self.alloc.free(value.body);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
         if (current == null) return 0;
 
@@ -338,17 +436,14 @@ pub const ObjectStore = struct {
         }
 
         if (kept.items.len == 0) {
-            try self.client.deleteObject(self.bucket, key, .{
-                .if_match_etag = current.?.etag,
-            });
+            try self.client.compareAndDelete(self.bucket, key, current.?.revision orelse return error.MissingObjectRevision, .{});
             return removed;
         }
 
         const encoded = try encodeRecordsAlloc(self.alloc, kept.items);
         defer self.alloc.free(encoded);
-        var result = try self.client.putObject(self.bucket, key, encoded, .{
+        var result = try self.client.compareAndPut(self.bucket, key, encoded, current.?.revision orelse return error.MissingObjectRevision, .{
             .content_type = "application/octet-stream",
-            .if_match_etag = current.?.etag,
         });
         defer result.deinit(self.alloc);
         return removed;
@@ -356,19 +451,51 @@ pub const ObjectStore = struct {
 
     const CurrentLog = struct {
         body: []u8,
-        etag: ?[]u8,
+        revision: ?objectstore.ObjectRevision,
     };
 
     fn tryReadLog(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?CurrentLog {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(alloc);
+        const body = try alloc.dupe(u8, result.body);
+        errdefer alloc.free(body);
         return .{
-            .body = try alloc.dupe(u8, result.body),
-            .etag = if (result.metadata.etag) |value| try alloc.dupe(u8, value) else null,
+            .body = body,
+            .revision = if (result.metadata.writeRevision()) |value| try value.clone(alloc) else null,
         };
+    }
+
+    const indexed_vtable: wal_store.WalStore.VTable = blk: {
+        var value = vtable;
+        value.read_snapshot = erasedSnapshot;
+        value.read_point_alloc = erasedPoint;
+        value.read_range_alloc = erasedRange;
+        value.append_batch = erasedUnkeyedBatch;
+        value.append_batch_idempotent = erasedBatch;
+        break :blk value;
+    };
+    fn erasedSnapshot(ptr: *anyopaque, ns: []const u8) !wal_types.ReadSnapshot {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.readSnapshot(ns);
+    }
+    fn erasedPoint(ptr: *anyopaque, a: std.mem.Allocator, ns: []const u8, id: []const u8, range: wal_types.ReadRange) !wal_types.PointRead {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.readPointAlloc(a, ns, id, range);
+    }
+    fn erasedRange(ptr: *anyopaque, a: std.mem.Allocator, ns: []const u8, range: wal_types.ReadRange) ![]wal_types.Record {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.readRangeAlloc(a, ns, range);
+    }
+    fn erasedUnkeyedBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8) !wal_types.BatchResult {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.appendBatch(ns, timestamp, payloads);
+    }
+    fn erasedBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8) !wal_types.BatchResult {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.appendBatchIdempotent(ns, timestamp, payloads, id);
     }
 
     const vtable: wal_store.WalStore.VTable = .{
@@ -471,6 +598,11 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
+fn freeRevision(alloc: std.mem.Allocator, revision: objectstore.ObjectRevision) void {
+    var owned = revision;
+    owned.deinit(alloc);
+}
+
 test "serverless objectstore WAL retained record cloning is allocation-failure safe" {
     const Runner = struct {
         fn run(alloc: std.mem.Allocator) !void {
@@ -549,4 +681,94 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless indexed WAL selection preserves transport ownership capabilities and rejects legacy prefixes" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var store = try ObjectStore.initWithClient(a, client, "db", "new");
+    defer store.deinit();
+    try store.enableIndexed(.{ .read_state = true, .document_index = true });
+    var wal = store.walStore();
+    const payload = try @import("../api/codec.zig").encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "one", .body = "value" });
+    defer a.free(payload);
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 1, payload, "operation"));
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 1, payload, "operation"));
+    try std.testing.expectEqual(@as(u64, 1), (try wal.readSnapshot("docs")).?.latest_lsn);
+    const point = try wal.readPointAlloc("docs", "one", .{ .start_lsn = 1, .end_lsn = 1 });
+    defer if (point.record) |record| {
+        a.free(record.payload);
+        if (record.operation_id) |id| a.free(id);
+    };
+    try std.testing.expect(point.indexed);
+    try std.testing.expectEqualStrings(payload, point.record.?.payload);
+    var legacy = try ObjectStore.initWithClient(a, client, "db", "old");
+    defer legacy.deinit();
+    _ = try legacy.append("docs", 1, "acknowledged");
+    try std.testing.expectError(error.LegacyWalMigrationRequired, legacy.enableIndexed(.{}));
+    try std.testing.expectEqual(@as(u64, 1), try legacy.latestLsn("docs"));
+}
+
+test "serverless multiprovider WAL format selection survives lost acknowledgement and bounds reopen" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var backing = memory.client();
+    try backing.makeBucket("db");
+    var faults = objectstore.ScriptedFaultClient.init(a, backing);
+    defer faults.deinit();
+    faults.commitNextPutThenFail(error.InjectedFormatAckLoss);
+    var selected = try ObjectStore.initWithClient(a, faults.client(), "db", "selected");
+    defer selected.deinit();
+    try selected.enableIndexed(.{});
+    var legacy = try ObjectStore.initWithClient(a, backing, "db", "selected");
+    defer legacy.deinit();
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.selectLegacy());
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.latestLsn("docs"));
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.append("docs", 1, "must-not-shadow"));
+    memory.resetOperationCount();
+    var reopened = try ObjectStore.initWithClient(a, backing, "db", "selected");
+    defer reopened.deinit();
+    try reopened.enableIndexed(.{});
+    try std.testing.expectEqual(@as(u64, 2), memory.operationCount()); // bucket + immutable format, no LIST
+    var malformed = try backing.putObject("db", "future/.antfly/WAL_FORMAT", "antfly-wal:future:8", .{});
+    malformed.deinit(a);
+    var future = try ObjectStore.initWithClient(a, backing, "db", "future");
+    defer future.deinit();
+    try std.testing.expectError(error.UnsupportedWalLayout, future.enableIndexed(.{}));
+    try std.testing.expectError(error.UnsupportedWalLayout, future.selectLegacy());
+}
+
+test "serverless multiprovider concurrent layout selection cannot create a shadow legacy WAL" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var backing = memory.client();
+    try backing.makeBucket("db");
+    var indexed = try ObjectStore.initWithClient(a, backing, "db", "race");
+    defer indexed.deinit();
+    const Race = struct {
+        store: *ObjectStore,
+        activated: bool = false,
+        fn claim(raw: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.endsWith(u8, key, "/WAL_FORMAT")) return false;
+            self.store.enableIndexed(.{}) catch return true;
+            self.activated = true;
+            return true;
+        }
+    };
+    var race: Race = .{ .store = &indexed };
+    var faults = objectstore.ScriptedFaultClient.init(a, backing);
+    defer faults.deinit();
+    faults.put_filter = .{ .ptr = &race, .matches = Race.claim };
+    var legacy = try ObjectStore.initWithClient(a, faults.client(), "db", "race");
+    defer legacy.deinit();
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.append("docs", 1, "must-not-shadow"));
+    try std.testing.expect(race.activated);
+    try std.testing.expectError(error.FileNotFound, backing.getObject("db", "race/docs/wal.log", .{}));
+    try std.testing.expectEqual(@as(u64, 0), try indexed.latestLsn("docs"));
 }

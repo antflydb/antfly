@@ -2877,6 +2877,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_serverless_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, serverless_tests, selectTestFilters(b, &serverless_default_filters));
+    const multiprovider_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &serverless_default_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_multiprovider_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, multiprovider_tests, &.{ "multiprovider", "indexed WAL selection" });
+    b.step("antfly-multiprovider-test", "Run shared provider revision, runtime ownership and indexed WAL selection contracts").dependOn(&run_multiprovider_tests.step);
     const serverless_test_step = b.step("antfly-serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
 

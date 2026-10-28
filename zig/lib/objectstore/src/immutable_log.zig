@@ -66,7 +66,7 @@ pub const Log = struct {
     fn read(self: Log, a: A, k: []const u8) !?types.GetResult {
         var client = self.client;
         client.allocator = a;
-        var result = client.getObject(self.bucket, k, .{ .cancellation = self.cancellation }) catch |err| switch (err) {
+        var result = client.getObject(self.bucket, k, .{ .skip_metadata_probe = true, .cancellation = self.cancellation }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -344,7 +344,7 @@ pub const Log = struct {
         if (bytes.len > 16384) return error.InvalidImmutableLog;
         var client = self.client;
         client.allocator = a;
-        var receipt = client.putObject(self.bucket, k, bytes, .{ .if_none_match = previous == null, .if_match_etag = if (previous) |value| value.metadata.etag orelse return error.ConditionalReadUnsupported else null, .content_type = "application/json", .cancellation = self.cancellation }) catch |err| switch (err) {
+        var receipt = client.compareAndPut(self.bucket, k, bytes, if (previous) |value| value.metadata.writeRevision() orelse return error.ConditionalReadUnsupported else null, .{ .content_type = "application/json", .cancellation = self.cancellation }) catch |err| switch (err) {
             error.PreconditionFailed, error.ObjectStoreRateLimited => return false,
             else => return err,
         };

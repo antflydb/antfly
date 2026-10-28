@@ -235,7 +235,7 @@ pub const Host = struct {
         var checksum = if (value.checksum) |v| try v.clone(a) else null;
         errdefer if (checksum) |*v| v.deinit(a);
         const content_type = if (value.content_type) |v| try a.dupe(u8, v) else null;
-        return .{ .bucket = bucket, .key = key, .etag = etag, .version_id = version, .checksum = checksum, .checksum_scope = value.checksum_scope, .content_type = content_type, .content_length = value.content_length, .last_modified_unix_ms = value.last_modified_unix_ms };
+        return .{ .bucket = bucket, .key = key, .etag = etag, .version_id = version, .revision_kind = value.revision_kind, .checksum = checksum, .checksum_scope = value.checksum_scope, .content_type = content_type, .content_length = value.content_length, .last_modified_unix_ms = value.last_modified_unix_ms };
     }
     const vtable: Client.VTable = .{
         .supports_guarded_put = true,
@@ -252,3 +252,23 @@ pub const Host = struct {
         .list_objects = list,
     };
 };
+
+test "WASM metadata retains generation semantics instead of turning a version into an ETag" {
+    const a = std.testing.allocator;
+    var bucket = "db".*;
+    var key = "HEAD".*;
+    var etag = "http-etag".*;
+    var generation = "123".*;
+    var copied = try Host.cloneMetadata(a, .{
+        .bucket = &bucket,
+        .key = &key,
+        .etag = &etag,
+        .version_id = &generation,
+        .revision_kind = .generation,
+        .content_length = 0,
+    });
+    defer copied.deinit(a);
+    generation[0] = '9';
+    try std.testing.expectEqualStrings("123", copied.writeRevision().?.generation);
+    try std.testing.expectEqualStrings("http-etag", copied.etag.?);
+}

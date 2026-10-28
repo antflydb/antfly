@@ -253,6 +253,7 @@ pub const TableIngestBatchRequest = struct {
 /// paths, so it intentionally does not carry public JSON shape semantics.
 pub const TableIngestBatchDomainRequest = struct {
     table_name: []const u8,
+    operation_id: ?[]const u8 = null,
     timestamp_ns: u64,
     mutations: []const DocumentMutation,
 };

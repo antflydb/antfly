@@ -52,6 +52,10 @@ pub const BootstrapConfig = struct {
     artifacts_uri: []const u8,
     manifests_uri: []const u8,
     wal_uri: []const u8,
+    /// Explicit namespace format selection; legacy prefixes require migration.
+    indexed_wal: bool = false,
+    native_read_state: bool = false,
+    wal_document_index: bool = false,
     progress_uri: []const u8,
     catalog_uri: []const u8,
     s3_options: [5]?S3Options = .{ null, null, null, null, null },
@@ -407,6 +411,9 @@ pub const OwnedStack = struct {
     external_source_plan_resolver: build_mod.ExternalSourcePublicationPlanResolver = undefined,
     api: api_mod.Service,
     query_cache: ?query_mod.QueryCache = null,
+    read_states: query_mod.ReadStateCache = .{},
+    read_state_enabled: bool = false,
+    point_index_enabled: bool = false,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     managed_query_embedder: ?managed_embedder.ManagedEmbedder = null,
     dense_query_index_name: ?[]u8 = null,
@@ -426,6 +433,9 @@ pub const OwnedStack = struct {
         errdefer self.s3_client_pool.deinit();
         self.gcs_client_pool = GcsClientPool.init(alloc, self.s3_client_pool.io_impl.io());
         errdefer self.gcs_client_pool.deinit();
+        self.read_states = .{};
+        self.read_state_enabled = cfg.native_read_state;
+        self.point_index_enabled = cfg.wal_document_index;
         self.query_cache = null;
         self.managed_query_embedder = null;
         self.dense_query_index_name = null;
@@ -488,6 +498,16 @@ pub const OwnedStack = struct {
             try ensureConfiguredBucket(client, target.bucket, shouldCreateGcsBucket(cfg.gcs_options[2]));
             break :blk try wal_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
+        self.wal = self.wal_impl.walStore();
+        // Establish unwind ownership before configuration can perform I/O.
+        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index }) catch |err| {
+            self.wal.deinit();
+            return err;
+        };
+        if (!cfg.indexed_wal) self.wal_impl.selectLegacy() catch |err| {
+            self.wal.deinit();
+            return err;
+        };
         self.wal = self.wal_impl.walStore();
         errdefer self.wal.deinit();
 
@@ -690,7 +710,20 @@ pub const OwnedStack = struct {
         query_cache_owned = false;
     }
 
+    /// Open a caller-owned fresh session over the same core used by the WASM
+    /// host. Only derived bounded overlays survive in the stack's cache.
+    pub fn openLiveSession(self: *OwnedStack, alloc: Allocator, namespace: []const u8, options: query_mod.live_session.Session.Options) !*query_mod.live_session.Session {
+        var configured = options;
+        if (self.read_state_enabled) {
+            configured.view.state_cache = &self.read_states;
+            configured.view.cache_allocator = self.alloc;
+        }
+        if (!self.point_index_enabled) configured.view.point_id = null;
+        return query_mod.live_session.Session.open(alloc, &self.query, &self.wal, namespace, configured);
+    }
+
     pub fn deinit(self: *OwnedStack) void {
+        self.read_states.deinit();
         self.runtime.deinit();
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_provider_runtime.deinit();
@@ -726,6 +759,7 @@ fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
 }
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
+    if ((cfg.native_read_state or cfg.wal_document_index) and !cfg.indexed_wal) return error.IndexedWalRequired;
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
@@ -1480,4 +1514,149 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless multiprovider bootstrap owns indexed WAL and bounded live read state through publication" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var stack: OwnedStack = undefined;
+    try stack.init(a, .{
+        .native_location = .{ .client = client, .bucket = "db", .prefix = "native" },
+        .artifacts_uri = "file:///unused",
+        .manifests_uri = "file:///unused",
+        .wal_uri = "file:///unused",
+        .progress_uri = "file:///unused",
+        .catalog_uri = "file:///unused",
+        .indexed_wal = true,
+        .native_read_state = true,
+        .wal_document_index = true,
+    }, std.testing.io);
+    defer stack.deinit();
+    try std.testing.expect(try stack.catalog.ensureTable("docs", 100));
+    const ns = try stack.catalog.resolveTableNamespaceAlloc("docs");
+    defer a.free(ns);
+    const mutations = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha" }};
+    var ingested = try stack.api.ingestTableBatch(.{ .table_name = "docs", .timestamp_ns = 123, .mutations = &mutations });
+    defer ingested.deinit(a);
+    for (0..2) |_| {
+        const session = try stack.openLiveSession(a, ns, .{ .io = std.testing.io, .view = .{ .point_id = "doc-a" } });
+        defer session.deinit();
+        const body = (try session.lookupAlloc("doc-a")).?;
+        defer a.free(body);
+        try std.testing.expectEqualStrings("alpha", body);
+    }
+    try std.testing.expect(stack.read_states.hits > 0);
+    try std.testing.expect(stack.read_states.bytes <= query_mod.ReadStateCache.max_bytes);
+    var published = try stack.catalog.buildTable("docs");
+    defer published.deinit(a);
+    try std.testing.expect(published.published);
+    const reopened = try stack.openLiveSession(a, ns, .{ .io = std.testing.io });
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try reopened.countDocuments());
+}
+
+test "serverless multiprovider live runtime persists indexed receipts and fresh reads across reopen" {
+    const enabled = std.c.getenv("ANTFLY_PROVIDER_LIVE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
+    const uri = std.mem.span(std.c.getenv("ANTFLY_QUALIFY_STORAGE_URI") orelse return error.MissingQualificationStorageUri);
+    const a = std.testing.allocator;
+    const artifacts = try std.fmt.allocPrint(a, "{s}/artifacts", .{uri});
+    defer a.free(artifacts);
+    const manifests = try std.fmt.allocPrint(a, "{s}/manifests", .{uri});
+    defer a.free(manifests);
+    const wal = try std.fmt.allocPrint(a, "{s}/wal", .{uri});
+    defer a.free(wal);
+    const progress = try std.fmt.allocPrint(a, "{s}/progress", .{uri});
+    defer a.free(progress);
+    const catalog = try std.fmt.allocPrint(a, "{s}/catalog", .{uri});
+    defer a.free(catalog);
+    const cfg: BootstrapConfig = .{ .artifacts_uri = artifacts, .manifests_uri = manifests, .wal_uri = wal, .progress_uri = progress, .catalog_uri = catalog, .indexed_wal = true, .native_read_state = true, .wal_document_index = true };
+    const mutations = [_]api_mod.DocumentMutation{ .{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha" }, .{ .kind = .upsert, .doc_id = "doc-b", .body = "beta" } };
+    var first_end: u64 = 0;
+    {
+        var stack: OwnedStack = undefined;
+        try stack.init(a, cfg, std.testing.io);
+        defer stack.deinit();
+        try std.testing.expect(try stack.catalog.ensureTable("docs", 100));
+        var ingested = try stack.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "qualification-seed", .timestamp_ns = 123, .mutations = &mutations });
+        defer ingested.deinit(a);
+        first_end = ingested.end_lsn;
+        {
+            const indexed = stack.wal_impl.indexed.?;
+            const backing = indexed.client;
+            var faults = objectstore.ScriptedFaultClient.init(a, backing);
+            defer faults.deinit();
+            indexed.client = faults.client();
+            defer indexed.client = backing;
+            var marker: u8 = 0;
+            faults.put_filter = .{ .ptr = &marker, .matches = struct {
+                fn matches(_: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+                    return std.mem.endsWith(u8, key, "/HEAD");
+                }
+            }.matches };
+            faults.commitNextPutThenFail(error.InjectedQualificationAckLoss);
+            const update = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-b", .body = "beta-updated" }};
+            try std.testing.expectError(error.InjectedQualificationAckLoss, stack.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "qualification-update", .timestamp_ns = 124, .mutations = &update }));
+            var recovered = try stack.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "qualification-update", .timestamp_ns = 124, .mutations = &update });
+            defer recovered.deinit(a);
+            try std.testing.expectEqual(first_end + 1, recovered.end_lsn);
+        }
+
+        const ns = try stack.catalog.resolveTableNamespaceAlloc("docs");
+        defer a.free(ns);
+        const live = try stack.openLiveSession(a, ns, .{ .io = std.testing.io });
+        defer live.deinit();
+        const body = (try live.lookupAlloc("doc-a")).?;
+        defer a.free(body);
+        try std.testing.expectEqualStrings("alpha", body);
+        var published = try stack.catalog.buildTable("docs");
+        defer published.deinit(a);
+        try std.testing.expect(published.published);
+    }
+    {
+        var reopened: OwnedStack = undefined;
+        try reopened.init(a, cfg, std.testing.io);
+        defer reopened.deinit();
+        var replay = try reopened.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "qualification-seed", .timestamp_ns = 123, .mutations = &mutations });
+        defer replay.deinit(a);
+        try std.testing.expectEqual(first_end, replay.end_lsn);
+        const ns = try reopened.catalog.resolveTableNamespaceAlloc("docs");
+        defer a.free(ns);
+        const live = try reopened.openLiveSession(a, ns, .{ .io = std.testing.io });
+        defer live.deinit();
+        try std.testing.expectEqual(@as(u64, 2), try live.countDocuments());
+        const body = (try live.lookupAlloc("doc-b")).?;
+        defer a.free(body);
+        try std.testing.expectEqualStrings("beta-updated", body);
+    }
+    {
+        // Exercise the ordinary provider-backed pruner as well as serving.
+        // Release every read session before retiring the previous generation.
+        var maintained: OwnedStack = undefined;
+        try maintained.init(a, cfg, std.testing.io);
+        defer maintained.deinit();
+        const update = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha-maintained" }};
+        var ingested = try maintained.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "qualification-maintenance", .timestamp_ns = 125, .mutations = &update });
+        defer ingested.deinit(a);
+        var published = try maintained.catalog.buildTable("docs");
+        defer published.deinit(a);
+        try std.testing.expect(published.published);
+        const ns = try maintained.catalog.resolveTableNamespaceAlloc("docs");
+        defer a.free(ns);
+        var pruned = try maintained.runtime.pruner.pruneNamespace(ns, 1);
+        defer pruned.deinit(a);
+        try std.testing.expect(!pruned.gc_watermark_conflict and !pruned.work_lease_conflict);
+        var replay = try maintained.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "qualification-seed", .timestamp_ns = 123, .mutations = &mutations });
+        defer replay.deinit(a);
+        try std.testing.expectEqual(first_end, replay.end_lsn);
+        const live = try maintained.openLiveSession(a, ns, .{ .io = std.testing.io });
+        defer live.deinit();
+        try std.testing.expectEqual(@as(u64, 2), try live.countDocuments());
+        const body = (try live.lookupAlloc("doc-a")).?;
+        defer a.free(body);
+        try std.testing.expectEqualStrings("alpha-maintained", body);
+    }
 }
