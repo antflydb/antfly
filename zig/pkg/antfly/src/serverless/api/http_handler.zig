@@ -1875,6 +1875,7 @@ pub const HttpHandler = struct {
                 error.SparseSegmentNotFound,
                 => return error.FileNotFound,
                 else => {
+                    if (public_table_http.queryCancellationError(err)) |operation| return operation;
                     std.log.err("serverless public table search failed table={s} err={}", .{ table_name, err });
                     return error.InternalQueryFailure;
                 },
@@ -1906,7 +1907,7 @@ pub const HttpHandler = struct {
             computed_aggregations = computeServerlessAggregationResultsAlloc(self, &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
                 error.InvalidQueryRequest => return error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
-                else => return error.InternalQueryFailure,
+                else => return public_table_http.queryCancellationError(err) orelse error.InternalQueryFailure,
             };
             const computed = &computed_aggregations.?;
             total_hits_u32 = computed.total_hits;
@@ -6190,6 +6191,7 @@ pub const HttpHandler = struct {
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.Canceled => return error.Canceled,
             else => {
+                if (public_table_http.queryCancellationError(err)) |operation| return operation;
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },
@@ -10348,10 +10350,9 @@ fn unsupportedQueryResponse(alloc: Allocator) !HttpResponse {
 
 /// Match the existing public query contract at both serverless boundaries.
 fn queryOperationalFailureResponse(alloc: Allocator, err: anyerror) !?HttpResponse {
-    switch (err) {
-        error.Canceled, error.Cancelled => return try textResponse(alloc, 499, "client closed request"),
+    switch (public_table_http.queryCancellationError(err) orelse return null) {
+        error.Canceled => return try textResponse(alloc, 499, "client closed request"),
         error.Timeout, error.DeadlineExceeded => {},
-        else => return null,
     }
     var response = try public_table_http.queryDependencyErrorOwnedResponse(alloc, 504, "query_timeout", "query timed out", true);
     errdefer response.deinit(alloc);
