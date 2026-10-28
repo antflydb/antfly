@@ -346,6 +346,7 @@ export class InferenceClient {
    * The request asks for the packed numeric frame, which keeps every float out
    * of JSON text, and reads the JSON body when the server answers with that
    * instead -- an older server, or a model whose vectors are sparse.
+   * Per-input failures throw; use embed() to inspect indexed results and errors.
    *
    * @param model - Name of the embedder model (e.g., "bge-small-en-v1.5")
    * @param input - Text string, array of strings, or array of content parts (for multimodal)
@@ -1067,7 +1068,13 @@ function denseEmbeddingsFromJSON(bytes: Uint8Array): number[][] {
   if (typeof value !== "object" || value === null) {
     throw new Error("Embedding JSON response must be an object");
   }
-  const data = (value as { data?: unknown }).data;
+  const envelope = value as { data?: unknown; errors?: unknown };
+  if (Array.isArray(envelope.errors) && envelope.errors.length > 0) {
+    throw new Error(
+      "Embedding response contains per-input failures; use embed() to inspect indexed results and errors"
+    );
+  }
+  const data = envelope.data;
   if (!Array.isArray(data)) {
     throw new Error("Embedding JSON response is missing the data array");
   }

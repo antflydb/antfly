@@ -15,6 +15,10 @@ dimensions, instruction, item error policy, and cancellation options. `rerank()`
 also accepts an optional `AbortSignal`. These additions preserve the existing
 method forms.
 
+`embedDense()` throws if a per-item response contains any failures, preserving
+the positional mapping between inputs and returned vectors. Use `embed()` to
+inspect successful input indexes and per-item errors when handling partial results.
+
 A TypeScript SDK for interacting with the Antfly API, suitable for both frontend and backend applications.
 
 ## Installation
