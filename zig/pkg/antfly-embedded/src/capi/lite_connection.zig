@@ -582,6 +582,9 @@ fn releaseGate(gate: *PathGate) void {
 // Compatible connections borrow one persistent generation and one maintenance
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
 pub const Owner = struct {
+    // Only bootstrap small files at close. Large files must finish their
+    // existing worker proof; shutdown never starts another whole-file walk.
+    const close_allocator_proof_max_bytes = 4 * 1024 * 1024;
     const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
@@ -626,6 +629,13 @@ pub const Owner = struct {
     // the worker only try-locks under that gate and yields to an active proof.
     allocator_proof_mutex: std.Io.Mutex = .init,
     verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
+    allocator_certificate_pending: bool = false,
+    // Historical attempts suppress close-time retries; only active work is
+    // allowed to finish when shutdown cancels the remaining maintenance.
+    allocator_verification_started: bool = false,
+    allocator_verification_active: bool = false,
+    // Directory progress belongs to the path owner, not a serving generation.
+    artifact_marker_sweep: @FieldType(NativeStore, "artifact_marker_sweep") = .{},
     reader_coordinator: *native.ReaderCoordinator = undefined,
     maintenance_pending: bool = false,
     // Replay can move the checkpoint on every turn. Give physical storage a
@@ -663,6 +673,8 @@ pub const Owner = struct {
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
     test_after_allocator_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *native.NativeFile) void } else void = if (h.builtin.is_test) null else {},
     test_capacity_wait: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
+    test_after_stop: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
+    test_before_maintenance_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
@@ -833,6 +845,7 @@ pub const Owner = struct {
     }
 
     pub fn notifyMutation(self: *Owner) void {
+        self.allocator_certificate_pending = true;
         if (self.worker == null) return;
         self.maintenance_pending = true;
         self.wake.set(h.handleLockIo());
@@ -1102,11 +1115,13 @@ pub const Owner = struct {
         }
         const io = h.handleLockIo();
         if (self.stopping.load(.acquire)) return false;
+        if (comptime h.builtin.is_test) if (self.test_before_maintenance_capture) |hook| hook.notify(hook.ptr);
         // Yield briefly to foreground work, then join the fair queue. Capture
         // stays short; queued traffic must not indefinitely postpone replay/TTL.
         if (!acquireMaintenanceCapture(&self.gate.mutex, &self.maintenance_capture_misses)) return true;
         var gate_locked = true;
         defer if (gate_locked) self.gate.mutex.unlock(io);
+        if (self.stopping.load(.acquire)) return false;
         var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         var lease_held = true;
         defer if (lease_held) lease.close();
@@ -1117,7 +1132,7 @@ pub const Owner = struct {
         // Reap crash/normal-exit leftovers even if this short-lived owner is
         // canceled before its detached graph walk can finish.
         if (self.options.open_mode == .writer)
-            try foreground.owned_lite_backend.?.native_docstore.?.artifact_marker_sweep.run(foreground_file);
+            try self.artifact_marker_sweep.run(foreground_file);
         if (self.options.open_mode == .writer and !foreground_file.free_pages_verified) {
             if (!self.allocator_proof_mutex.tryLock()) return true;
             defer self.allocator_proof_mutex.unlock(io);
@@ -1398,9 +1413,11 @@ pub const Owner = struct {
     fn storageMaintenanceTurn(self: *Owner) !bool {
         const io = h.handleLockIo();
         if (self.stopping.load(.acquire)) return true;
+        if (comptime h.builtin.is_test) if (self.test_before_maintenance_capture) |hook| hook.notify(hook.ptr);
         if (!acquireMaintenanceCapture(&self.gate.mutex, &self.maintenance_capture_misses)) return false;
         var gate_locked = true;
         defer if (gate_locked) self.gate.mutex.unlock(io);
+        if (self.stopping.load(.acquire)) return true;
         var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         var lease_held = true;
         defer if (lease_held) lease.close();
@@ -1499,6 +1516,10 @@ pub const Owner = struct {
             self.collectRetired();
         }
         const reader = try file.captureAllocatorVerificationSnapshot(&self.verification_cancel);
+        self.allocator_verification_started = true;
+        std.debug.assert(!self.allocator_verification_active);
+        self.allocator_verification_active = true;
+        defer self.allocator_verification_active = false;
         const proof_alloc = reader.allocator;
         defer {
             // Reader/ledger teardown can release substantial cached metadata.
@@ -1543,21 +1564,52 @@ pub const Owner = struct {
         const io = h.handleLockIo();
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
-        var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
-        defer lease.close();
-        var tip = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
-        defer tip.close();
-        for ([_]?*h.Handle{ self.current, self.maintenance_snapshot }) |candidate| {
-            const root = candidate orelse continue;
-            const store = root.owned_lite_backend.?.native_docstore.?;
-            store.mutex.lock();
-            defer store.mutex.unlock();
-            const file = &store.file;
-            if (!file.free_pages_verified or file.read_only or !std.meta.eql(file.header, tip.header) or
-                (try file.file.stat(file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) continue;
-            try file.sync();
-            _ = try file.certifyAllocator();
-            return;
+        var lease: ?native.PathWriterLock = try native.lockWriterPathWithIo(alloc, io, self.path);
+        defer if (lease) |*held| held.close();
+        for (0..2) |attempt| {
+            var proof_bytes: u64 = 0;
+            var can_prove_current = false;
+            {
+                var tip = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
+                defer tip.close();
+                // Revision-3 files cannot carry this certificate. Their
+                // conversion belongs to maintenance, never shutdown.
+                if (!tip.header.indexed_reclamation) return;
+                // The walk checks both recovery slots. Bound the physical
+                // file, including a larger inactive slot or unpublished tail.
+                proof_bytes = (try tip.file.stat(tip.runtime())).size;
+                for ([_]?*h.Handle{ self.current, self.maintenance_snapshot }) |candidate| {
+                    const root = candidate orelse continue;
+                    const store = root.owned_lite_backend.?.native_docstore.?;
+                    store.mutex.lock();
+                    defer store.mutex.unlock();
+                    const file = &store.file;
+                    if (file.read_only or !std.meta.eql(file.header, tip.header) or
+                        (try file.file.stat(file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) continue;
+                    if (!file.free_pages_verified) {
+                        if (self.current == root and !needsOutcomeReconciliation(root) and
+                            file.transaction_header == null and file.durable_header == null) can_prove_current = true;
+                        continue;
+                    }
+                    try file.sync();
+                    _ = try file.certifyAllocator();
+                    return;
+                }
+            }
+            if (attempt != 0 or !can_prove_current or !self.allocator_certificate_pending or self.allocator_verification_started or
+                proof_bytes > close_allocator_proof_max_bytes) return;
+            // Registry close has drained foreground calls and joined the
+            // worker. Bootstrap a small, never-scheduled pool, but never
+            // repeat a failed/canceled walk or start a large one at close.
+            // Never rebuild a runtime for a foreign publication just to seal it.
+            // Reuse the detached proof path, releasing both publication locks
+            // during the walk and reader teardown. A moving external tip may
+            // still refuse certification; never retry indefinitely at close.
+            self.verification_cancel.requested.store(false, .release);
+            self.allocator_proof_mutex.lockUncancelable(io);
+            defer self.allocator_proof_mutex.unlock(io);
+            try self.verifyAllocatorAssumeLocked(&lease);
+            if (lease == null) lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         }
     }
 
@@ -1568,6 +1620,7 @@ pub const Owner = struct {
             // remains recoverable and the next owner uses ordinary proof.
             std.log.warn("native Lite allocator certificate deferred: {s}", .{@errorName(err)});
         };
+        self.artifact_marker_sweep.deinit(h.handleLockIo());
         if (self.maintenance_snapshot) |snapshot| closeMaintenanceSnapshot(snapshot);
         if (self.embedding_memo) |*memo| memo.deinit(&self.embedding_memo_budget);
         for (self.retired.items) |retired| h.closeHandle(retired);
@@ -1786,7 +1839,13 @@ pub const Connection = struct {
         const last = owner.connections.items.len == 0;
         if (last) {
             owner.stopping.store(true, .release);
-            owner.verification_cancel.request();
+            // Retain progress from a mutating v4 owner's in-flight proof.
+            // Replay/inference still observe stopping and cancel normally.
+            const finish_proof = owner.options.profile == .native and owner.options.open_mode == .writer and
+                owner.allocator_certificate_pending and owner.allocator_verification_active and
+                if (owner.current) |root| root.owned_lite_backend.?.native_docstore.?.file.header.indexed_reclamation else false;
+            if (!finish_proof) owner.verification_cancel.request();
+            if (comptime h.builtin.is_test) if (owner.test_after_stop) |hook| hook.notify(hook.ptr);
             owner.wake.set(io);
             for (self.gate.owners.items, 0..) |candidate, i| {
                 if (candidate == owner) {
@@ -1902,6 +1961,417 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         models_dir = null;
     }
     return wrapper;
+}
+
+test "capi native marker sweep survives foreground replacement while proof is busy" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("foreground-marker-progress");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const owner = wrapper.lite_connection.?.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.allocator_proof_mutex.lockUncancelable(io);
+    defer owner.allocator_proof_mutex.unlock(io);
+    var markers: std.ArrayList(std.Io.File) = .empty;
+    var orphan: ?usize = null;
+    defer {
+        for (markers.items, 0..) |marker, i| if (orphan == null or i != orphan.?) marker.close(io);
+        markers.deinit(a);
+    }
+    for (0..130) |i| {
+        const name = try std.fmt.allocPrint(a, "{s}/.aflite-lease-{x:0>32}", .{ tmp.path(), i });
+        defer a.free(name);
+        const marker = try std.Io.Dir.cwd().createFile(io, name, .{ .read = true, .exclusive = true, .lock = .exclusive });
+        errdefer marker.close(io);
+        try markers.append(a, marker);
+    }
+    // Select the last marker in actual directory order, so more than one
+    // bounded batch of live markers precedes it on every supported filesystem.
+    var dir = try std.Io.Dir.cwd().openDir(io, tmp.path(), .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, ".aflite-lease-") and entry.name.len == 46)
+            orphan = try std.fmt.parseInt(usize, entry.name[14..], 16);
+    }
+    try std.testing.expect(orphan != null);
+    markers.items[orphan.?].close(io);
+    for (0..6) |turn| {
+        {
+            owner.gate.mutex.lockUncancelable(io);
+            defer owner.gate.mutex.unlock(io);
+            var lease = try native.lockWriterPathWithIo(a, io, path);
+            defer lease.close();
+            var foreign = try native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+            defer foreign.close();
+            foreign.defer_allocator_verification = true;
+            var text: [16]u8 = undefined;
+            try foreign.putCatalogRecord("test/changed-runtime", try std.fmt.bufPrint(&text, "{d}", .{turn}));
+        }
+        _ = try owner.maintenanceTurnForTest();
+    }
+    const name = try std.fmt.allocPrint(a, ".aflite-lease-{x:0>32}", .{orphan.?});
+    defer a.free(name);
+    try std.testing.expectError(error.FileNotFound, dir.openFile(io, name, .{}));
+    // Live leases must survive every sweep.
+    for (0..130) |i| {
+        if (i == orphan.?) continue;
+        const live_name = try std.fmt.allocPrint(a, ".aflite-lease-{x:0>32}", .{i});
+        defer a.free(live_name);
+        const live = try dir.openFile(io, live_name, .{});
+        live.close(io);
+    }
+}
+
+test "capi native allocator proof survives close and foreground runtime replacement" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const Scenario = enum { foreground, closing, canceled, queued, queued_storage };
+    for ([_]Scenario{ .foreground, .closing, .canceled, .queued, .queued_storage }) |scenario| {
+        const queued = scenario == .queued or scenario == .queued_storage;
+        var tmp = try api.TestDirectory.init("inflight-proof-lifetime");
+        defer tmp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+        defer a.free(path);
+        const value: [32768]u8 = @splat('x');
+        {
+            // Seed the pool before a DB runtime can pin any input generations.
+            var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            defer seed.close();
+            for (0..16) |i| {
+                var key: [16]u8 = undefined;
+                try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+            }
+            for (0..16) |i| {
+                var key: [16]u8 = undefined;
+                try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+            }
+            _ = try seed.reclaimPages(4096);
+            if ((try seed.allocatorStats()).?.reusable_pages <= 64) return error.ProofFixtureHasNoFreePool;
+        }
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+        var closed = false;
+        defer if (!closed) h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        owner.verification_cancel.requested.store(false, .release);
+        owner.allocator_verification_started = false;
+        owner.maintenance_storage_pending = false;
+        {
+            var lease = try connection.acquire();
+            defer {
+                lease.close();
+                connection.gate.mutex.unlock(io);
+            }
+            const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+            store.file.free_pages_verified = false;
+            store.file.defer_allocator_verification = true;
+            store.file.max_file_bytes = null;
+            store.maintenance_policy.options.max_storage_bytes = 0;
+            store.maintenance_policy.options.capacity_probe = null;
+            store.disk_admission_limit = null;
+            owner.notifyMutation();
+        }
+        if (queued) {
+            // Finish a real earlier proof, then move the tip. A historical
+            // attempt must not be mistaken for a currently running walk.
+            _ = try owner.maintenanceTurnForTest();
+            try std.testing.expect(owner.allocator_verification_started);
+            try std.testing.expect(!owner.allocator_verification_active);
+            var lease = try connection.acquire();
+            defer {
+                lease.close();
+                connection.gate.mutex.unlock(io);
+            }
+            var foreign = try native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+            defer foreign.close();
+            foreign.defer_allocator_verification = true;
+            const large = try a.alloc(u8, Owner.close_allocator_proof_max_bytes);
+            defer a.free(large);
+            @memset(large, 'q');
+            try foreign.putCatalogRecord("foreign-large", large);
+            try std.testing.expect((try foreign.file.stat(io)).size > Owner.close_allocator_proof_max_bytes);
+            // Whether the worker runs before or after close drops the gate,
+            // force admission through the fair queue rather than yielding.
+            owner.maintenance_capture_misses = 2;
+            owner.maintenance_storage_pending = scenario == .queued_storage;
+        }
+        const Probe = struct {
+            owner: *Owner,
+            entry_header: native.Header,
+            exit_header: ?native.Header = null,
+            captured: std.Io.Event = .unset,
+            released: std.Io.Event = .unset,
+            calls: usize = 0,
+            failure: ?anyerror = null,
+            canceled_on_stop: bool = false,
+            fn beforeGate(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.captured.set(h.handleLockIo());
+                self.released.waitUncancelable(h.handleLockIo());
+            }
+            fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+                self.captured.set(h.handleLockIo());
+                self.released.waitUncancelable(h.handleLockIo());
+            }
+            fn stopped(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.canceled_on_stop = self.owner.verification_cancel.requested.load(.acquire);
+                self.released.set(h.handleLockIo());
+            }
+            fn turn(self: *@This()) void {
+                _ = self.owner.maintenanceTurnForTest() catch |err| {
+                    self.failure = err;
+                    self.captured.set(h.handleLockIo());
+                    return;
+                };
+                self.exit_header = self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.header;
+                self.captured.set(h.handleLockIo());
+            }
+        };
+        var probe: Probe = .{ .owner = owner, .entry_header = owner.current.?.owned_lite_backend.?.native_docstore.?.file.header };
+        defer probe.released.set(io);
+        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+        if (queued) owner.test_before_maintenance_capture = .{ .ptr = &probe, .notify = Probe.beforeGate };
+        owner.worker = try std.Thread.spawn(.{}, Probe.turn, .{&probe});
+        probe.captured.waitUncancelable(io);
+        if (probe.failure) |err| return err;
+        if (scenario == .closing or queued) {
+            owner.test_after_stop = .{ .ptr = &probe, .notify = Probe.stopped };
+        } else if (scenario == .canceled) {
+            owner.verification_cancel.request();
+            probe.released.set(io);
+            owner.worker.?.join();
+            owner.worker = null;
+            if (probe.failure) |err| {
+                if (err != error.MaintenanceCanceled) return error.CanceledProofUnexpectedOutcome;
+            } else return error.CanceledProofUnexpectedOutcome;
+            probe.failure = null;
+        } else {
+            {
+                var lease: ?native.PathWriterLock = try connection.acquire();
+                defer {
+                    connection.detach();
+                    if (lease) |*held| held.close();
+                    connection.gate.mutex.unlock(io);
+                }
+                const previous = owner.current.?;
+                const replacement = blk: {
+                    // Retire the runtime captured by the proof while retaining
+                    // its allocator/executor until the original walk finishes.
+                    previous.maintenance_references += 1;
+                    defer previous.maintenance_references -= 1;
+                    break :blk try owner.refresh();
+                };
+                try std.testing.expect(replacement != previous);
+                const store = replacement.owned_lite_backend.?.native_docstore.?;
+                store.file.max_file_bytes = null;
+                store.maintenance_policy.options.max_storage_bytes = 0;
+                store.maintenance_policy.options.capacity_probe = null;
+                store.disk_admission_limit = null;
+                _ = try connection.refresh(&lease);
+                try store.file.putCatalogRecord("during-proof", "foreground progress");
+                if (store.file.free_pages_verified) return error.ReplacementVerifiedBeforeOriginalProof;
+                connection.notifyMutation();
+            }
+            probe.released.set(io);
+            owner.worker.?.join();
+            owner.worker = null;
+            if (probe.failure) |err| return err;
+            {
+                var lease: ?native.PathWriterLock = try connection.acquire();
+                defer {
+                    connection.detach();
+                    if (lease) |*held| held.close();
+                    connection.gate.mutex.unlock(io);
+                }
+                const root = try connection.refresh(&lease);
+                const file = &root.owned_lite_backend.?.native_docstore.?.file;
+                if (!file.free_pages_verified) return error.CompletedProofLostAcrossReplacement;
+                const before = (try file.allocatorStats()).?.reused_pages;
+                const before_pages = file.activeCheckpoint().page_count;
+                for (0..8) |_| try file.putCatalogRecord("during-proof", &value);
+                if ((try file.allocatorStats()).?.reused_pages <= before) return error.CompletedProofDidNotEnableReuse;
+                if (file.activeCheckpoint().page_count >= before_pages + 32) return error.CompletedProofKeptAppending;
+                connection.notifyMutation();
+            }
+        }
+        h.closeHandle(wrapper);
+        closed = true;
+        if (probe.failure) |err| return err;
+        if (queued) {
+            if (!probe.canceled_on_stop) return error.CloseDidNotCancelQueuedWork;
+            if (!std.meta.eql(probe.entry_header, probe.exit_header.?)) return error.StoppedMaintenanceRefreshedRuntime;
+        } else if (probe.canceled_on_stop) return error.CloseCanceledExistingProof;
+        try std.testing.expectEqual(@as(usize, if (queued) 0 else 1), probe.calls);
+        var certificate = try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+        defer certificate.close();
+        if (try certificate.inheritAllocatorCertificate() != (scenario != .canceled and !queued)) return error.CloseCertificateUnexpectedOutcome;
+        try std.testing.expect((try certificate.check()).valid);
+    }
+}
+
+test "capi native close bounds proof work and skips legacy files" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const Reason = enum { legacy, large, foreign };
+    for ([_]Reason{ .legacy, .large, .foreign }) |reason| {
+        const indexed = reason != .legacy;
+        var tmp = try api.TestDirectory.init("close-proof-budget");
+        defer tmp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+        defer a.free(path);
+        {
+            var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = indexed, .no_sync = true });
+            defer seed.close();
+            if (reason == .large) {
+                const large = try a.alloc(u8, Owner.close_allocator_proof_max_bytes);
+                defer a.free(large);
+                @memset(large, 'x');
+                try seed.putDocument("large", large);
+            } else try seed.putDocument("legacy", "revision 3");
+        }
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+        var closed = false;
+        defer if (!closed) h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.allocator_verification_started = false;
+        {
+            var lease = try connection.acquire();
+            defer {
+                lease.close();
+                connection.gate.mutex.unlock(io);
+            }
+            const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+            try std.testing.expectEqual(indexed, file.header.indexed_reclamation);
+            if (reason == .large) try std.testing.expect(file.activeCheckpoint().page_count *| file.header.page_size > Owner.close_allocator_proof_max_bytes);
+            file.free_pages_verified = false;
+            file.defer_allocator_verification = true;
+            file.max_file_bytes = null;
+            try file.putCatalogRecord("changed", "one small publication");
+            owner.notifyMutation();
+            if (reason == .foreign) {
+                var foreign = try native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+                defer foreign.close();
+                foreign.defer_allocator_verification = true;
+                try foreign.putCatalogRecord("foreign", "a newer publication");
+            }
+        }
+        const Probe = struct {
+            calls: usize = 0,
+            fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+            }
+        };
+        var probe: Probe = .{};
+        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+        h.closeHandle(wrapper);
+        closed = true;
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        var file = try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+        defer file.close();
+        try std.testing.expect(!try file.inheritAllocatorCertificate());
+        const value = (try file.getCatalogRecordAlloc(a, "changed")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("one small publication", value);
+    }
+}
+
+test "capi native short lived writers carry reuse across clean closes without a worker turn" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("short-lived-reuse");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const value: [32768]u8 = @splat('x');
+    {
+        // A crash/older writer left a valid free pool without a certificate.
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        for (0..16) |_| try seed.putCatalogRecord("pool", &value);
+        try seed.deleteCatalogRecord("pool");
+        _ = try seed.reclaimPages(4096);
+        try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 16);
+    }
+    for (0..3) |process| {
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+        var closed = false;
+        defer if (!closed) h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        // Deterministically model a process that exits before background
+        // verification finishes. No sleeps or importer-sized fixture needed.
+        owner.stopping.store(true, .release);
+        owner.verification_cancel.request();
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.allocator_verification_started = false;
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        {
+            defer {
+                connection.detach();
+                if (lease) |*held| held.close();
+                connection.gate.mutex.unlock(io);
+            }
+            const root = try connection.refresh(&lease);
+            const file = &root.owned_lite_backend.?.native_docstore.?.file;
+            if (process == 0) {
+                // Model a refreshed, unchecked unbounded generation. Ambient
+                // disk pressure may otherwise make admission prove it inline.
+                file.free_pages_verified = false;
+                file.defer_allocator_verification = true;
+                file.max_file_bytes = null;
+            }
+            if (process != 0) try std.testing.expect(file.free_pages_verified);
+            const before = (try file.allocatorStats()).?.reused_pages;
+            const before_pages = file.activeCheckpoint().page_count;
+            for (0..8) |_| try file.putCatalogRecord("next", &value);
+            connection.notifyMutation();
+            if (process == 0) {
+                try std.testing.expect(!file.free_pages_verified);
+            } else {
+                try std.testing.expect((try file.allocatorStats()).?.reused_pages > before);
+                try std.testing.expect(file.activeCheckpoint().page_count < before_pages + 32);
+            }
+        }
+        h.closeHandle(wrapper);
+        closed = true;
+        var probe = try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        try std.testing.expect(try probe.inheritAllocatorCertificate());
+        try std.testing.expect((try probe.check()).valid);
+    }
 }
 
 test "capi resolver curation publication proofs skip large catalogs and fence changed records" {
