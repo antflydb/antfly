@@ -302,6 +302,25 @@ pre-append backpressure, publication, multiple keys and an earlier session that
 retains its old cut. Allocation-failure enumeration checks replacement ownership;
 real-provider qualification repeats a published-base transform and full reopen.
 
+At production source `257397f236`, the final native suite passes 612 tests with
+seven skips and no failures/leaks; all 328 Node and 31 actual-workerd cases pass.
+The workerd log still records recovered platform `SQLITE_NOMEM`. Rebuilding all
+three native WASM modules produces exactly the hashes from the earlier qualified
+scale/ANN snapshot. The HTTP changes do not alter those emitted modules.
+
+The new real-GCS run passes all ten focused native contracts, including a public
+replacement, publication, bounded transform over that base and full reopen.
+It deletes its 56 disposable objects (17,825 bytes) and bucket, then verifies
+absence. This remains correctness evidence from a local host. AWS authentication,
+matched provider placement/performance and the live Cloudflare gate remain open.
+
+The short-diagnostic pair uses approved corrected control `c44896ac8c` and sealed
+candidate `131a703fed`, with affinity, indexing and detached proofs off. Both
+stacks are deployed and paused with scheduled maintenance disabled. Automatic
+approval review rejected upload of the new disposable API tokens because the
+previous approval named other Workers; authorization for this pair is pending.
+No live latency result, invocation coverage result or cold epoch is claimed.
+
 Reports, exact role bundles/bindings and failed/intermediate runs remain local
 under `examples/cloudflare-serverless/dist/qualification/multiprovider-lab/`.
 All 1,592 previously sealed artifacts remain hash-valid. No Cloudflare resources
