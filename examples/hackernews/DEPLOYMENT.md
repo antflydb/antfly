@@ -43,6 +43,22 @@ uv run --project examples/hackernews python examples/hackernews/cloud_plan.py \
 The plan contains a single-mode pinned instance (1 CPU/4 GiB/20 GiB initial sample,
 not archive sizing), GCS provider selectors and scoped server-owned keys. Create
 the instance through Cloud's management API after reviewing credits/capacity.
+Artifact placement uses the same nested name as Antfly's engine configuration:
+
+```json
+{
+  "storage": {
+    "artifacts": {
+      "protocol": "gcs",
+      "bucket": "antfly-showcases-hn-warehouse",
+      "prefix": "native-indexes"
+    }
+  }
+}
+```
+
+Cloud binds credentials and appends the instance UUID internally. This destination
+is immutable after creation; relocating it requires an explicit migration.
 Review the expected tenant namespace and grant its exact bucket IAM before first
 boot; artifact initialization can need GCS immediately. Verify the actual runtime
 digest and namespace after creation, before using it.

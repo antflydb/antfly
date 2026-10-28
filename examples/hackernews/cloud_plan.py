@@ -64,10 +64,12 @@ def management_plan(project, image):
                 "image": image,
                 "image_digest": match[1],
             },
-            "native_artifacts": {
-                "protocol": "gcs",
-                "bucket": project + "-hn-warehouse",
-                "prefix": "native-indexes",
+            "storage": {
+                "artifacts": {
+                    "protocol": "gcs",
+                    "bucket": project + "-hn-warehouse",
+                    "prefix": "native-indexes",
+                },
             },
         },
         "archive-provider.json": binding(

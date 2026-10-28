@@ -41,6 +41,13 @@ def test_separate_object_tables_and_scoped_cloud_keys():
         "antfly-showcases", "ghcr.io/antflydb/antfly@sha256:" + "a" * 64
     )
     assert plan["create-instance.json"]["version_policy"] == "pinned"
+    assert "native_artifacts" not in plan["create-instance.json"]
+    assert plan["create-instance.json"]["storage"]["artifacts"] == {
+        "protocol": "gcs",
+        "bucket": "antfly-showcases-hn-warehouse",
+        "prefix": "native-indexes",
+    }
+
     assert plan["gateway-key.json"]["key_type"] == "read_only"
     assert not plan["gateway-key.json"]["browser_access"]
     assert plan["producer-key.json"]["grants"] == [
