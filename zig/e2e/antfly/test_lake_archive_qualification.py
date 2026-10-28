@@ -1716,6 +1716,9 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
     }
     for i in range(4):
         data[f"extra_{i}"] = [9007199254740993 + row + i for row in range(count)]
+    highlight_fields = ["body"] + [f"highlight_{i}" for i in range(7)]
+    for name in highlight_fields[1:]:
+        data[name] = [f"needle {name} {i} " + "alpha " * 170 for i in range(count)]
     archive = tmp_path / "archive.parquet"
     pq.write_table(pa.table(data), archive, row_group_size=16, use_dictionary=False)
     fixture_root = tmp_path / "fixture"
@@ -1735,6 +1738,8 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
         note={"type": "string", "x-antfly-field": {"type": "text"}},
         payload={"type": "string", "x-antfly-field": {"type": "text", "index": False}},
     )
+    for name in highlight_fields[1:]:
+        properties[name] = {"type": "string", "x-antfly-field": {"type": "text"}}
     definition = {
         "schema": {
             "storage_mode": "relational",
@@ -1805,18 +1810,46 @@ def test_native_source_column_batches_preserve_wide_projections_and_hidden_highl
                             assert set(row) == set(request["fields"])
                             for name in request["fields"]:
                                 assert row[name] == data[name][row["id"]]
+                        highlight_query = {
+                            "disjuncts": [
+                                {"match": "needle", "field": name}
+                                for name in highlight_fields
+                            ]
+                        }
+                        visible = client.query(
+                            {
+                                "request": dict(
+                                    request,
+                                    full_text_search=highlight_query,
+                                    fields=["id"] + highlight_fields,
+                                    highlight={
+                                        "fields": list(reversed(highlight_fields))
+                                    },
+                                )
+                            }
+                        )["hits"]["hits"]
                         hidden = client.query(
                             {
                                 "request": dict(
                                     request,
                                     fields=["id"],
-                                    highlight={"fields": ["body"]},
+                                    full_text_search=highlight_query,
+                                    highlight={
+                                        "fields": list(reversed(highlight_fields))
+                                    },
                                 )
                             }
                         )["hits"]["hits"]
-                        for hit in hidden:
+                        assert len(hidden) == len(visible) == 192
+                        for hit, projected in zip(hidden, visible, strict=True):
                             assert set(hit["_source"]) == {"id"}
-                            assert hit["_highlights"]["body"]
+                            assert set(hit["_highlights"]) == set(highlight_fields)
+                            assert list(hit["_highlights"]) == list(
+                                reversed(highlight_fields)
+                            )
+                            assert {k: v for k, v in hit.items() if k != "_source"} == {
+                                k: v for k, v in projected.items() if k != "_source"
+                            }
             finally:
                 unavailable.rename(original)
         finally:

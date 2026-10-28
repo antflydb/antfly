@@ -1704,6 +1704,14 @@ conservatively require complete source. The lake path maps these dependencies
 once per batch, reuses already projected values when they cover the plan, and
 fetches hidden fields under the same native identity checks when needed. Final
 response projection continues to hide fields requested only for highlighting.
+Hidden source uses the same field-major visitor as projected source. It retains
+only a row permutation, row-type context, four field cursors and finished
+snippets. Each decoded field value is borrowed for one callback and released
+before the next row. The shared highlight consumer appends disjoint source-field
+results and restores explicit highlight-field order; it does not retain complete
+hidden rows. Alias, nested-array, cancellation and row-key checks remain shared
+with ordinary hydration. More than four hidden fields therefore do not cycle
+all cursors once per result.
 
 ### Compressed ordered-key navigation
 
@@ -1769,7 +1777,14 @@ SQL windows load projection and predicate dependencies; already-ranked gathers
 load only requested columns. Selected stripes retain decoded cache leases and
 row identity while preserving caller rank. Independent blocks use joined I/O
 waves with bounded workspace and exact selected-range read admission. Unrequested
-stripes are not fetched or decoded. The small result view has null placeholders
+stripes are not fetched or decoded. Preparation also uses joined, scheduler-admitted
+waves of at most four directories. An authenticated decoded-directory lease is
+shared with direct reads, checked against a 1 MiB decode allowance, and held
+until the payload wave is consumed. Cold directory misses can overlap; warm
+preparation needs neither raw-cache residency nor JSON reparsing. Directory
+wire bytes are admitted before preparation and exact selected stripe bytes
+before payload jobs start. Every failure joins all jobs before releasing leases
+or allocator owners. The small result view has null placeholders
 for omitted columns and is consumed only under the supplied projection plan.
 
 Incremental publication changes the forward, reverse and physical-cover roots

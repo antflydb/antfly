@@ -1185,14 +1185,63 @@ const Execution = struct {
                 return left.ordinal < right.ordinal;
             }
         }.less);
-        var hydrator = @import("lake_index_source_projection.zig").Hydrator.init(a);
+        try self.attachHighlightRows(a, prepared, pin.snapshot, hits, winners, fields, false);
+    }
+    /// A compact permutation and row-type values are retained; hidden bodies
+    /// are borrowed one field/row at a time from the field-major hydrator.
+    fn attachHighlightRows(self: *Execution, a: A, prepared: *const search.PreparedHighlights, snapshot: *const local.index.IndexSnapshot, hits: []types.SearchHit, winners: anytype, fields: []const []const u8, comptime located: bool) !void {
+        const Hydrator = @import("lake_index_source_projection.zig").Hydrator;
+        const Consumer = struct {
+            execution: *Execution,
+            prepared: *const search.PreparedHighlights,
+            allocator: A,
+            metadata: A,
+            hits: []types.SearchHit,
+            winners: @TypeOf(winners),
+            types: []?std.json.Value,
+            skip: []bool,
+            output: []search.PreparedHighlights.Accumulator,
+            fn doc(raw: *anyopaque, i: usize) u32 {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                return if (located) value.winners[i].location.document else value.winners[i].ordinal;
+            }
+            fn key(raw: *anyopaque, scratch: A, i: usize) ![]const u8 {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                return nativeKey(value.execution, scratch, value.hits[value.winners[i].index].id);
+            }
+            fn check(raw: *anyopaque) !void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                try value.execution.context.ensureActive();
+            }
+            fn accept(raw: *anyopaque, scratch: A, i: usize, field: []const u8, value: std.json.Value) !void {
+                const consumer: *@This() = @ptrCast(@alignCast(raw));
+                if (consumer.skip[i]) return;
+                var source: std.json.Value = .{ .object = .empty };
+                if (std.mem.eql(u8, field, "_type")) {
+                    consumer.types[i] = try local.storage_db_types.cloneJsonValue(consumer.metadata, value);
+                } else if (consumer.types[i]) |kind| try source.object.put(scratch, "_type", kind);
+                try source.object.put(scratch, field, value);
+                try consumer.prepared.appendSourceField(consumer.allocator, scratch, &consumer.output[i], source, field);
+            }
+        };
+        var metadata = std.heap.ArenaAllocator.init(a);
+        defer metadata.deinit();
+        const types_ = try metadata.allocator().alloc(?std.json.Value, winners.len);
+        @memset(types_, null);
+        const skip = try metadata.allocator().alloc(bool, winners.len);
+        for (winners, skip) |winner, *value| value.* = hits[winner.index].highlights.len != 0;
+        const output = try a.alloc(search.PreparedHighlights.Accumulator, winners.len);
+        defer a.free(output);
+        @memset(output, .{});
+        defer for (output) |*item| item.deinit(a);
+        var consumer: Consumer = .{ .execution = self, .prepared = prepared, .allocator = a, .metadata = metadata.allocator(), .hits = hits, .winners = winners, .types = types_, .skip = skip, .output = output };
+        var hydrator = Hydrator.init(a);
         defer hydrator.deinit();
-        for (winners) |winner| {
-            if (hits[winner.index].highlights.len != 0) continue;
-            try self.context.ensureActive();
-            _ = input.reset(.retain_capacity);
-            try self.attachStoredSnippet(a, input.allocator(), prepared, &hydrator, pin.snapshot, winner.ordinal, &hits[winner.index], fields);
-        }
+        try hydrator.visitRows(a, snapshot, .{ .ptr = &consumer, .len = winners.len, .document = Consumer.doc, .key = Consumer.key, .checkpoint = Consumer.check }, fields, .{ .ptr = &consumer, .accept = Consumer.accept });
+        for (winners, skip, output) |winner, skipped, *item| if (!skipped) {
+            hits[winner.index].highlights = try item.finish(a);
+            prepared.orderFields(&hits[winner.index]);
+        };
     }
     fn highlightHydrationFields(self: *Execution, a: A, prepared: *const search.PreparedHighlights) ![]const []const u8 {
         var fields: std.ArrayList([]const u8) = .empty;
@@ -1203,14 +1252,8 @@ const Execution = struct {
         } else for (self.table.columns) |column| try appendHydrationPath(a, self.table, &fields, column.path);
         return fields.toOwnedSlice(a);
     }
-    fn attachStoredSnippet(self: *Execution, a: A, scratch: A, prepared: *const search.PreparedHighlights, hydrator: *@import("lake_index_source_projection.zig").Hydrator, snapshot: *const local.index.IndexSnapshot, ordinal: u32, hit: *types.SearchHit, fields: []const []const u8) !void {
-        const expected = try nativeKey(self, scratch, hit.id);
-        var value: std.json.Value = .{ .object = .empty };
-        try hydrator.append(scratch, snapshot, ordinal, expected, fields, &value);
-        try prepared.attachValue(a, scratch, hit, value);
-    }
-    /// Sort a compact permutation, retaining result order and only one reader
-    /// and decoded stored block. Hidden source is released after each snippet.
+    /// Group a compact permutation under one pack pin at a time. Four field
+    /// cursors bound decoding; each hidden field value is released immediately.
     fn attachLocatedHighlights(self: *Execution, a: A, prepared: *const search.PreparedHighlights, hits: []types.SearchHit) !void {
         const fields = try self.highlightHydrationFields(a, prepared);
         defer a.free(fields);
@@ -1226,8 +1269,6 @@ const Execution = struct {
         }.less);
         var reader_arena = std.heap.ArenaAllocator.init(a);
         defer reader_arena.deinit();
-        var input = std.heap.ArenaAllocator.init(a);
-        defer input.deinit();
         var begin: usize = 0;
         while (begin < winners.len) {
             try self.context.ensureActive();
@@ -1244,17 +1285,7 @@ const Execution = struct {
             };
             defer pin.deinit();
             if (pin.snapshot.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
-            var hydrator = @import("lake_index_source_projection.zig").Hydrator.init(a);
-            defer hydrator.deinit();
-            for (winners[begin..end], begin..) |winner, position| {
-                if (hits[winner.index].highlights.len != 0) continue;
-                for (winners[position..@min(end, position + 4)]) |upcoming| try pin.snapshot.prefetchStoredDoc(upcoming.location.document);
-                try self.context.ensureActive();
-                _ = input.reset(.retain_capacity);
-                const ia = input.allocator();
-                const page = hits[winner.index .. winner.index + 1];
-                try self.attachStoredSnippet(a, ia, prepared, &hydrator, pin.snapshot, winner.location.document, &page[0], fields);
-            }
+            try self.attachHighlightRows(a, prepared, pin.snapshot, hits, winners[begin..end], fields, true);
             begin = end;
         }
     }

@@ -22088,9 +22088,46 @@ pub const PreparedHighlights = struct {
         self.arena.deinit();
         a.destroy(self.arena);
     }
+    pub const Accumulator = struct {
+        fields: std.ArrayListUnmanaged(types.HighlightedField) = .empty,
+        pub fn deinit(self: *Accumulator, a: Allocator) void {
+            for (self.fields.items) |*field| types.freeHighlightedField(a, field);
+            self.fields.deinit(a);
+            self.* = .{};
+        }
+        pub fn finish(self: *Accumulator, a: Allocator) ![]types.HighlightedField {
+            return self.fields.toOwnedSlice(a);
+        }
+    };
     /// Parsed source and scratch are borrowed only for this call.
     pub fn attachValue(self: *const PreparedHighlights, alloc: Allocator, hit_arena: Allocator, hit: *types.SearchHit, parsed: std.json.Value) !void {
-        if (self.entries.len == 0 or hit.highlights.len != 0) return;
+        if (hit.highlights.len != 0) return;
+        var output: Accumulator = .{};
+        defer output.deinit(alloc);
+        try self.collectValue(alloc, hit_arena, &output.fields, parsed, null);
+        hit.highlights = try output.finish(alloc);
+    }
+    /// Consume one complete source column with optional row-type context.
+    /// Snippets grow amortized across fields while borrowed source bodies can
+    /// be released after every callback. The accumulator owns partial output.
+    pub fn appendSourceField(self: *const PreparedHighlights, alloc: Allocator, scratch: Allocator, output: *Accumulator, parsed: std.json.Value, source_field: []const u8) !void {
+        try self.collectValue(alloc, scratch, &output.fields, parsed, source_field);
+    }
+    pub fn orderFields(self: *const PreparedHighlights, hit: *types.SearchHit) void {
+        const paths = if (self.options.fields.len != 0) self.options.fields else self.source_fields orelse return;
+        const Order = struct {
+            fn rank(fields: []const []const u8, name: []const u8) usize {
+                for (fields, 0..) |field, i| if (std.mem.eql(u8, field, name)) return i;
+                return fields.len;
+            }
+            fn less(fields: []const []const u8, l: types.HighlightedField, r: types.HighlightedField) bool {
+                return rank(fields, l.field) < rank(fields, r.field);
+            }
+        };
+        std.mem.sort(types.HighlightedField, hit.highlights, paths, Order.less);
+    }
+    fn collectValue(self: *const PreparedHighlights, alloc: Allocator, hit_arena: Allocator, highlighted: *std.ArrayListUnmanaged(types.HighlightedField), parsed: std.json.Value, source_field: ?[]const u8) !void {
+        if (self.entries.len == 0) return;
         const indexed_queries = self.indexed_queries;
         const options = self.options;
         const fragment_size = @max(options.fragment_size, 1);
@@ -22113,12 +22150,10 @@ pub const PreparedHighlights = struct {
             }
         }
 
-        var highlighted = std.ArrayListUnmanaged(types.HighlightedField).empty;
-        errdefer {
-            for (highlighted.items) |*item| types.freeHighlightedField(alloc, item);
-            highlighted.deinit(alloc);
-        }
         for (fields.items) |field| {
+            if (source_field) |source| {
+                if (!std.mem.eql(u8, field, source) and !(field.len > source.len and std.mem.startsWith(u8, field, source) and field[source.len] == '.')) continue;
+            }
             var source_values = std.ArrayListUnmanaged(HighlightSourceValue).empty;
             try collectHighlightSourceValues(hit_arena, &source_values, parsed, field, null, 0, false);
             if (source_values.items.len == 0) continue;
@@ -22196,11 +22231,6 @@ pub const PreparedHighlights = struct {
             }
             try highlighted.append(alloc, .{ .field = owned_field, .fragments = owned_fragments });
         }
-        if (highlighted.items.len == 0) {
-            highlighted.deinit(alloc);
-            return;
-        }
-        hit.highlights = try highlighted.toOwnedSlice(alloc);
     }
 };
 
@@ -37803,4 +37833,51 @@ test "external lake bounded window profiles prepared highlight dependencies pres
     var conservative = try PreparedHighlights.init(a, .{}, &unknown);
     defer conservative.deinit();
     try std.testing.expect(conservative.source_fields == null);
+}
+
+test "external lake bounded window profiles streamed highlights preserve aliases arrays order and allocation ownership" {
+    const Harness = struct {
+        fn run(a: Allocator, explicit: bool) !void {
+            const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{
+                .{ .path = "body", .emitted_name = "body_alias", .analyzer = "standard" },
+                .{ .path = "nested.tags", .emitted_name = "tags_alias", .analyzer = "standard" },
+            } }} };
+            const should = [_]types.TextQuery{
+                .{ .match = .{ .field = "body_alias", .text = "needle" } },
+                .{ .match = .{ .field = "tags_alias", .text = "needle" } },
+            };
+            const queries = [_]HighlightQuery{.{ .query = .{ .bool_query = .{ .should = &should } }, .text_analysis = .{}, .runtime_schema = schema }};
+            var prepared = try PreparedHighlights.init(a, .{ .fields = if (explicit) &.{ "nested.tags", "body" } else &.{}, .max_fragments = 3 }, &queries);
+            defer prepared.deinit();
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"body\":\"a needle here\",\"nested\":{\"tags\":[\"needle one\",\"needle two\"]}}", .{});
+            defer parsed.deinit();
+            var full: types.SearchHit = .{ .id = try a.dupe(u8, "one") };
+            defer full.deinit(a);
+            var streamed: types.SearchHit = .{ .id = try a.dupe(u8, "one") };
+            defer streamed.deinit(a);
+            var output: PreparedHighlights.Accumulator = .{};
+            defer output.deinit(a);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            try prepared.attachValue(a, scratch.allocator(), &full, parsed.value);
+            // Deliberately invert source-column and requested output order.
+            for ([_][]const u8{ "body", "nested" }) |field| {
+                _ = scratch.reset(.retain_capacity);
+                var value: std.json.Value = .{ .object = .empty };
+                try value.object.put(scratch.allocator(), field, parsed.value.object.get(field).?);
+                try prepared.appendSourceField(a, scratch.allocator(), &output, value, field);
+            }
+            streamed.highlights = try output.finish(a);
+            prepared.orderFields(&streamed);
+            const expected = try std.json.Stringify.valueAlloc(a, full.highlights, .{});
+            defer a.free(expected);
+            const actual = try std.json.Stringify.valueAlloc(a, streamed.highlights, .{});
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+            try std.testing.expectEqual(@as(usize, 2), streamed.highlights.len);
+        }
+    };
+    try Harness.run(std.testing.allocator, true);
+    try Harness.run(std.testing.allocator, false);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{true});
 }

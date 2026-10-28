@@ -125,7 +125,25 @@ fn parse(a: A, ref: Ref, bytes: []const u8) !Directory {
 pub fn readDirectory(a: A, store: stores.ArtifactStore, ref: Ref, token: Token) !Directory {
     return parse(a, ref, try artifacts.readArtifact(a, store, ref, token, null));
 }
-pub const Prepared = struct { reference: Ref, directory: ?Directory, bytes: u64 };
+pub const directory_limit = 1024 * 1024;
+pub const Prepared = struct {
+    reference: Ref,
+    directory: ?Directory,
+    bytes: u64,
+    lease: ?metadata.Owned(Directory) = null,
+    pub fn deinit(self: *Prepared) void {
+        if (self.lease) |owned| owned.release();
+        self.* = undefined;
+    }
+};
+fn acquireDirectory(cache: artifacts.CachedRead, store: stores.ArtifactStore, ref: Ref, token: Token) !metadata.Owned(Directory) {
+    const Loader = struct {
+        fn decode(out: A, source: stores.ArtifactStore, reference: local.serverless_manifest_artifact_ref.ArtifactRef, cancel: Token, caching: artifacts.CachedRead, _: void) !Directory {
+            return parse(out, .{ .artifact_id = reference.artifact_id, .checksum = reference.checksum, .byte_len = reference.byte_len }, try artifacts.readArtifact(out, source, .{ .artifact_id = reference.artifact_id, .checksum = reference.checksum, .byte_len = reference.byte_len }, cancel, caching));
+        }
+    };
+    return metadata.acquireRequiredInterpretedBounded(Directory, cache, store, .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, "", {}, Loader.decode, directory_limit);
+}
 /// Reserve exact selected wire bytes before scheduling independent reads.
 pub fn prepare(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns: []const usize, width: usize, token: Token, cached: ?artifacts.CachedRead, reads: *u64) !Prepared {
     try token.check();
@@ -133,14 +151,16 @@ pub fn prepare(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, colum
     for (columns) |column| if (column >= width) return error.InvalidNativeLakeRowIndex;
     try stores.chargeReadBudget(reads, ref.byte_len);
     if (!striped) return .{ .reference = ref, .directory = null, .bytes = ref.byte_len };
-    const directory = try parse(a, ref, try artifacts.readArtifact(a, store, ref, token, cached));
+    const lease = if (cached) |cache| try acquireDirectory(cache, store, ref, token) else null;
+    errdefer if (lease) |owned| owned.release();
+    const directory = if (lease) |owned| owned.value.* else try readDirectory(a, store, ref, token);
     if (directory.sections.len != width + 1) return error.InvalidNativeLakeRowIndex;
     var bytes: u64 = 0;
     for (directory.sections, 0..) |section, index| if (index == 0 or std.mem.indexOfScalar(usize, columns, index - 1) != null) {
         bytes += section.bytes;
     };
     try stores.chargeReadBudget(reads, bytes);
-    return .{ .reference = ref, .directory = directory, .bytes = bytes + ref.byte_len };
+    return .{ .reference = ref, .directory = directory, .bytes = bytes + ref.byte_len, .lease = lease };
 }
 pub const Loaded = struct {
     a: A,
@@ -233,12 +253,7 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
         try value.validate();
         break :verified value;
     } else if (cached) |cache| blk: {
-        const Loader = struct {
-            fn decode(out: A, source: stores.ArtifactStore, reference: local.serverless_manifest_artifact_ref.ArtifactRef, cancel: Token, caching: artifacts.CachedRead) !Directory {
-                return parse(out, .{ .artifact_id = reference.artifact_id, .checksum = reference.checksum, .byte_len = reference.byte_len }, try artifacts.readArtifact(out, source, .{ .artifact_id = reference.artifact_id, .checksum = reference.checksum, .byte_len = reference.byte_len }, cancel, caching));
-            }
-        };
-        const owned = try metadata.acquire(Directory, cache, store, .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, Loader.decode);
+        const owned = try acquireDirectory(cache, store, ref, token);
         result.directory = owned;
         break :blk owned.value.*;
     } else try readDirectory(a, store, ref, token);
@@ -250,7 +265,10 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
     for (values) |*value| value.* = .{ .flags = nulls, .values = .empty };
     var ordinals: []const u64 = &.{};
     var identity_keys: []const Column = &.{};
-    var live: usize = if (result.directory) |owned| owned.lease.item.budget.live else 0;
+    // Prepared is borrowed through the complete payload wave. Its decoded
+    // lease is charged just like a directory acquired by this loader.
+    var live: usize = if (result.directory) |owned| owned.lease.item.budget.live else if (prepared) |known| (if (known.lease) |owned| owned.lease.item.budget.live else 0) else 0;
+    if (live > limit) return error.SqlMemoryLimitExceeded;
     var selected: std.ArrayList(usize) = .empty;
     for (directory.sections, 0..) |_, index| {
         if (index == 0 or std.mem.indexOfScalar(usize, columns, index - 1) != null) try selected.append(a, index);
@@ -367,10 +385,13 @@ test "external lake bounded window profiles covering stripes prune wide columns 
         var active: *@This() = undefined;
         original: *const stores.ArtifactStore.VTable,
         pack: []const u8,
+        directory: []const u8,
+        directory_calls: usize = 0,
         calls: usize = 0,
         max_length: usize = 0,
         fn get(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, cancel: Token) ![]u8 {
             const self = active;
+            if (std.mem.eql(u8, id, self.directory)) self.directory_calls += 1;
             if (std.mem.eql(u8, id, self.pack)) {
                 self.calls += 1;
                 self.max_length = @max(self.max_length, length);
@@ -379,7 +400,7 @@ test "external lake bounded window profiles covering stripes prune wide columns 
         }
     };
     const proof = try readDirectory(ia, store, ref, .none);
-    var probe: Probe = .{ .original = store.vtable, .pack = proof.pack.artifact_id };
+    var probe: Probe = .{ .original = store.vtable, .pack = proof.pack.artifact_id, .directory = ref.artifact_id };
     Probe.active = &probe;
     var traced = store.vtable.*;
     traced.get_range_alloc_with_cancellation = Probe.get;
@@ -413,7 +434,11 @@ test "external lake bounded window profiles covering stripes prune wide columns 
         cache.physical.max_entries = 0;
         const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
         var allowance: u64 = 64 * 1024;
-        var first = try load(a, store, ref, true, &.{ 0, 1 }, 3, .none, cached, 256 * 1024, &allowance, null);
+        var prepared_cold = try prepare(a, store, ref, true, &.{ 0, 1 }, 3, .none, cached, &allowance);
+        defer prepared_cold.deinit();
+        try std.testing.expect(prepared_cold.lease != null);
+        const directory_gets = probe.directory_calls;
+        var first = try load(a, store, ref, true, &.{ 0, 1 }, 3, .none, cached, 256 * 1024, &allowance, prepared_cold);
         first.deinit();
         try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
         try std.testing.expectEqual(@as(usize, 0), cache.physical.entries.count());
@@ -421,12 +446,17 @@ test "external lake bounded window profiles covering stripes prune wide columns 
         const decoded_entries = cache.decoded.entries.count();
         // A different projection and allowance must reuse its successful
         // stripes even when no encoded cache can conceal a decode miss.
-        var narrow = try load(a, store, ref, true, &.{0}, 3, .none, cached, 128 * 1024, &allowance, null);
+        var prepared_warm = try prepare(a, store, ref, true, &.{0}, 3, .none, cached, &allowance);
+        defer prepared_warm.deinit();
+        try std.testing.expectEqual(prepared_cold.lease.?.value, prepared_warm.lease.?.value);
+        try std.testing.expectEqual(directory_gets, probe.directory_calls);
+        var narrow = try load(a, store, ref, true, &.{0}, 3, .none, cached, 128 * 1024, &allowance, prepared_warm);
         narrow.deinit();
         var second = try load(a, store, ref, true, &.{ 0, 1 }, 3, .none, cached, 512 * 1024, &allowance, null);
         try std.testing.expectEqual(decoded_entries, cache.decoded.entries.count());
         defer second.deinit();
         try std.testing.expectEqual(before, probe.calls);
+        try std.testing.expectEqual(directory_gets, probe.directory_calls);
         try std.testing.expectEqual(@as(i64, 9007199254740993), (try second.block.cell(0, 1)).value.integer);
         std.debug.print("COVER_RANGE decoded_warm_raw_cache_empty_requests=0\n", .{});
     }

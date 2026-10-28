@@ -129,6 +129,36 @@ pub const Hydrator = struct {
     }
     pub fn appendRows(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, input: Input, fields: []const []const u8, targets: []?std.json.Value) !void {
         if (input.len != targets.len) return error.InvalidNativeLakeTextCorpus;
+        const Output = struct {
+            allocator: A,
+            targets: []?std.json.Value,
+            fn accept(raw: *anyopaque, _: A, i: usize, field: []const u8, value: std.json.Value) !void {
+                const output: *@This() = @ptrCast(@alignCast(raw));
+                const target = &output.targets[i].?;
+                if (target.object.contains(field)) return error.InvalidNativeLakeTextCorpus;
+                const key = try output.allocator.dupe(u8, field);
+                errdefer output.allocator.free(key);
+                var owned = try local.storage_db_types.cloneJsonValue(output.allocator, value);
+                errdefer local.storage_db_types.deinitJsonValue(output.allocator, &owned);
+                try target.object.put(output.allocator, key, owned);
+            }
+        };
+        for (targets) |target| if (target == null or target.? != .object) return error.InvalidNativeLakeTextCorpus;
+        var output: Output = .{ .allocator = a, .targets = targets };
+        return self.visitRows(a, snapshot, input, fields, .{ .ptr = &output, .accept = Output.accept });
+    }
+    /// Each value and its scratch allocator are borrowed for one callback.
+    /// Consumers retain only their output, never a batch of hidden source.
+    pub const Visitor = struct {
+        ptr: *anyopaque,
+        accept: *const fn (*anyopaque, A, usize, []const u8, std.json.Value) anyerror!void,
+        fn stored(self: Visitor, a: A, i: usize, data: []const u8, fields: []const []const u8) !void {
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{});
+            if (parsed != .object) return error.InvalidNativeLakeTextCorpus;
+            for (fields) |field| try self.accept(self.ptr, a, i, field, local.api_json_helpers.extractJsonPathValue(parsed, field) orelse return error.InvalidNativeLakeTextCorpus);
+        }
+    };
+    pub fn visitRows(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, input: Input, fields: []const []const u8, visitor: Visitor) !void {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const Entry = struct { doc: u32, position: usize };
@@ -146,7 +176,6 @@ pub const Hydrator = struct {
             const segment = try snapshot.readSegment(resolved.seg_idx);
             const id = (try segment.reader.storedIdScoped(row.allocator(), resolved.local_id)) orelse return error.InvalidNativeLakeTextCorpus;
             if (!std.mem.eql(u8, id, (try input.key(input.ptr, row.allocator(), i)))) return error.ExternalLakeSnapshotMismatch;
-            if (targets[i] == null or targets[i].? != .object) return error.InvalidNativeLakeTextCorpus;
             const columnar = block: {
                 for (segment.reader.fields) |field| for (field.sections) |section| {
                     if (section.section_type == .columnar_stored) break :block true;
@@ -156,7 +185,8 @@ pub const Hydrator = struct {
             if (!columnar) {
                 legacy[i] = true;
                 const stored = (try snapshot.storedDocWithBlockCache(&self.blocks, doc)) orelse return error.InvalidNativeLakeTextCorpus;
-                try appendStoredValue(a, stored.id, stored.data, (try input.key(input.ptr, row.allocator(), i)), fields, &targets[i].?);
+                if (!std.mem.eql(u8, stored.id, try input.key(input.ptr, row.allocator(), i))) return error.ExternalLakeSnapshotMismatch;
+                try visitor.stored(row.allocator(), i, stored.data, fields);
             }
         }
         std.mem.sort(Entry, permutation, {}, struct {
@@ -187,17 +217,12 @@ pub const Hydrator = struct {
                 };
                 const root = try local.storage_typed_json.decodeBinary(row.allocator(), encoded);
                 const value = if (tail) |suffix| local.api_json_helpers.extractJsonPathValue(root, suffix) orelse return error.InvalidNativeLakeTextCorpus else root;
-                const target = &targets[i].?;
-                if (target.object.contains(field)) return error.InvalidNativeLakeTextCorpus;
-                const key = try a.dupe(u8, field);
-                errdefer a.free(key);
-                var owned = try local.storage_db_types.cloneJsonValue(a, value);
-                errdefer local.storage_db_types.deinitJsonValue(a, &owned);
-                try target.object.put(a, key, owned);
+                try visitor.accept(visitor.ptr, row.allocator(), i, field, value);
                 self.column_values += 1;
             } else {
                 const stored = (try snapshot.storedDocWithBlockCache(&self.blocks, entry.doc)) orelse return error.InvalidNativeLakeTextCorpus;
-                try appendStoredValue(a, stored.id, stored.data, (try input.key(input.ptr, row.allocator(), i)), &.{field}, &targets[i].?);
+                if (!std.mem.eql(u8, stored.id, try input.key(input.ptr, row.allocator(), i))) return error.ExternalLakeSnapshotMismatch;
+                try visitor.stored(row.allocator(), i, stored.data, &.{field});
             }
         };
     }
@@ -481,6 +506,30 @@ test "external lake bounded window profiles field-major returned rows reuse chun
             try std.testing.expectEqual(@as(usize, 0), hydrator.blocks.decode_count);
             return .{ hydrator.column_opens, hydrator.decodeCount() };
         }
+        fn stream(alloc: A, snapshot: *const local.index.IndexSnapshot, rows: *Rows) ![2]usize {
+            const Output = struct {
+                docs: []const u32,
+                count: usize = 0,
+                fn accept(raw: *anyopaque, _: A, i: usize, field: []const u8, value: std.json.Value) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const column_ = for (fields, 0..) |name, at| {
+                        if (std.mem.eql(u8, name, field)) break at;
+                    } else return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(@as(i64, @intCast(9007199254740993 + @as(usize, self.docs[i]) * 8 + column_)), value.integer);
+                    self.count += 1;
+                }
+            };
+            var output: Output = .{ .docs = rows.docs };
+            var hydrator = Hydrator.init(alloc);
+            defer hydrator.deinit();
+            try hydrator.visitRows(alloc, snapshot, rows.input(), &fields, .{ .ptr = &output, .accept = Output.accept });
+            try std.testing.expectEqual(rows.docs.len * fields.len, output.count);
+            return .{ hydrator.column_opens, hydrator.decodeCount() };
+        }
+        fn streamFaults(alloc: A, snapshot: *const local.index.IndexSnapshot, docs: []const u32, ids: []const []const u8) !void {
+            var rows: Rows = .{ .docs = docs, .keys = ids };
+            _ = try stream(alloc, snapshot, &rows);
+        }
         fn faults(alloc: A, snapshot: *const local.index.IndexSnapshot, docs: []const u32, ids: []const []const u8) !void {
             var rows: Rows = .{ .docs = docs, .keys = ids };
             _ = try run(alloc, snapshot, &rows, false);
@@ -493,6 +542,9 @@ test "external lake bounded window profiles field-major returned rows reuse chun
     try std.testing.expectEqual(@as(usize, 32), before[1]);
     try std.testing.expectEqual(@as(usize, 8), after[0]);
     try std.testing.expectEqual(@as(usize, 8), after[1]);
+    const streamed = try Run.stream(a, writer.snapshot(), &input);
+    try std.testing.expectEqual(after, streamed);
+    try std.testing.checkAllAllocationFailures(a, Run.streamFaults, .{ writer.snapshot(), ordinals[0..3], keys[0..3] });
     std.debug.print("SOURCE_FIELD_MAJOR rows=256 fields=8 opens={d}->{d} decodes={d}->{d}\n", .{ before[0], after[0], before[1], after[1] });
     try std.testing.checkAllAllocationFailures(a, Run.faults, .{ writer.snapshot(), ordinals[0..3], keys[0..3] });
     var canceled: Rows = .{ .docs = ordinals[0..3], .keys = keys[0..3], .cancel = true };

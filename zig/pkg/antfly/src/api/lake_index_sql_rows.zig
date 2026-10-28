@@ -800,20 +800,28 @@ const CoveringWave = struct {
         columns: []const usize,
         width: usize,
         token: @import("antfly_cancellation").CancellationToken,
-        prepared: cover_columns.Prepared,
-        limit: usize,
+        prepared: ?cover_columns.Prepared = null,
+        limit: usize = 0,
         block: ?cover_columns.Loaded = null,
+        fn prepare(self: *@This()) anyerror!void {
+            var reads: u64 = self.cover.block.byte_len + @import("lake_index_aggregate_artifact.zig").max_block_bytes;
+            self.prepared = try cover_columns.prepare(self.a, self.store, self.cover.block, self.cover.striped, self.columns, self.width, self.token, self.cached, &reads);
+        }
         fn run(self: *@This()) anyerror!void {
-            var reads = self.prepared.bytes;
+            var reads = self.prepared.?.bytes;
             self.block = try cover_columns.load(self.a, self.store, self.cover.block, self.cover.striped, self.columns, self.width, self.token, self.cached, self.limit, &reads, self.prepared);
         }
     };
+    scheduler: *local.sql_parallel_scheduler.Scheduler = local.sql_parallel_scheduler.global(),
     jobs: [4]Job = undefined,
     count: usize = 0,
     retained: usize = 0,
     fn deinit(self: *CoveringWave) void {
-        for (self.jobs[0..self.count]) |*job| if (job.block) |*block| block.deinit();
-        if (self.retained != 0) local.sql_parallel_scheduler.global().releasePull(0, self.retained);
+        for (self.jobs[0..self.count]) |*job| {
+            if (job.block) |*block| block.deinit();
+            if (job.prepared) |*prepared| prepared.deinit();
+        }
+        if (self.retained != 0) self.scheduler.releasePull(0, self.retained);
         self.* = .{};
     }
     fn read(self: *CoveringWave, a: A, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, store: @import("../serverless/artifacts/store.zig").ArtifactStore, refs: []const ordered.Reader.Cover, columns: []const usize, width: usize, token: @import("antfly_cancellation").CancellationToken, reads: *u64) !void {
@@ -822,21 +830,37 @@ const CoveringWave = struct {
         // A is shared between jobs only through this locked owner. All jobs
         // join before it leaves scope; loaded arenas keep the backing A below.
         var allocations: scheduler.LockedAllocator = .{ .backing = a };
-        var reservation: usize = 0;
-        for (refs, self.jobs[0..refs.len]) |ref, *job| {
-            const prepared = try cover_columns.prepare(a, store, ref.block, ref.striped, columns, width, token, cached, reads);
-            const limit: usize = @intCast(@min(16 * 1024 * 1024, prepared.bytes *| 4 +| 256 * 1024));
-            job.* = .{ .a = allocations.allocator(), .cached = cached, .store = store, .cover = ref, .columns = columns, .width = width, .token = token, .prepared = prepared, .limit = limit };
-            reservation += limit;
-        }
-        if (!scheduler.global().reservePull(0, reservation)) return error.SqlMemoryLimitExceeded;
-        self.retained = reservation;
+        // Admit directory wire bytes before any work; exact stripe wire bytes
+        // are charged on the caller after all preparation jobs have joined.
+        for (refs) |ref| try @import("../serverless/artifacts/store.zig").chargeReadBudget(reads, ref.block.byte_len);
+        for (refs, self.jobs[0..refs.len]) |ref, *job| job.* = .{ .a = allocations.allocator(), .cached = cached, .store = store, .cover = ref, .columns = columns, .width = width, .token = token };
         self.count = refs.len;
+        {
+            const reservation = refs.len * cover_columns.directory_limit;
+            if (!self.scheduler.reservePull(0, reservation)) return error.SqlMemoryLimitExceeded;
+            defer self.scheduler.releasePull(0, reservation);
+            try self.runJobs(cached, Job.prepare);
+        }
+        var reservation: usize = 0;
+        for (self.jobs[0..self.count]) |*job| {
+            const prepared = job.prepared.?;
+            try @import("../serverless/artifacts/store.zig").chargeReadBudget(reads, prepared.bytes - job.cover.block.byte_len);
+            job.limit = @intCast(@min(16 * 1024 * 1024, prepared.bytes *| 4 +| 256 * 1024));
+            reservation += job.limit;
+        }
+        if (!self.scheduler.reservePull(0, reservation)) return error.SqlMemoryLimitExceeded;
+        self.retained = reservation;
         defer for (self.jobs[0..self.count]) |*job| if (job.block) |*block| if (block.scratch_owner) |arena| {
             _ = arena;
             block.budget.?.backing = a;
             block.backing = a;
         };
+        try self.runJobs(cached, Job.run);
+        try token.check();
+        try cached.context.ensureActive();
+    }
+    fn runJobs(self: *CoveringWave, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, comptime run: fn (*Job) anyerror!void) !void {
+        const scheduler = local.sql_parallel_scheduler;
         var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
         defer if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
             held.cancel(io) catch {};
@@ -845,9 +869,9 @@ const CoveringWave = struct {
         for (self.jobs[0..self.count], 0..) |*job, i| {
             if (failure != null) break;
             if (cached.context.io) |io| if (self.count > 1) {
-                tasks[i] = scheduler.global().submitIo(io, job.limit, Job.run, .{job});
+                tasks[i] = self.scheduler.submitIo(io, if (run == Job.prepare) cover_columns.directory_limit else job.limit, run, .{job});
             };
-            if (tasks[i] == null) job.run() catch |err| {
+            if (tasks[i] == null) run(job) catch |err| {
                 failure = err;
             };
         }
@@ -858,8 +882,6 @@ const CoveringWave = struct {
             task.* = null;
         };
         if (failure) |err| return err;
-        try token.check();
-        try cached.context.ensureActive();
     }
 };
 
@@ -2882,5 +2904,119 @@ test "external lake dynamic exact keys primary boundary ignores suffixes and pre
         try std.testing.expectEqual(if (reverse) std.math.Order.lt else .gt, try order.compare(a, key, &.{.{ .integer = -9007199254740992 }}));
         const null_key = try boundKey(a, order.tuple, &.{ .{ .integer = 7 }, .null });
         try std.testing.expectEqual(if (reverse) std.math.Order.gt else .lt, try order.compare(a, null_key, &.{.{ .integer = 0 }}));
+    }
+}
+
+test "external lake bounded window profiles covering directory waves overlap reuse decoded leases and join failures" {
+    const stores = @import("../serverless/artifacts/store.zig");
+    const artifacts = @import("lake_index_aggregate_artifact.zig");
+    const Token = @import("antfly_cancellation").CancellationToken;
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("cover-directory-wave");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope: stores.UploadScope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    store.upload_scope = scope;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var refs: [4]ordered.Reader.Cover = undefined;
+    var directory_bytes: u64 = 0;
+    for (&refs, 0..) |*ref, i| {
+        const key = try std.fmt.allocPrint(arena.allocator(), "row-{d:0>16}", .{i});
+        const keys = [_]local.sql_scalar.Datum{local.sql_scalar.Datum.fromJson(.{ .string = key })};
+        const values = [_]local.sql_scalar.Datum{ local.sql_scalar.Datum.fromJson(.{ .integer = @intCast(i) }), local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }) };
+        ref.* = .{ .block = try cover_columns.publish(arena.allocator(), store, scope, &.{.{ .keys = &keys, .values = &values, .ordinal = i }}, .none, &directory_bytes), .row = 0, .striped = true };
+    }
+    const Probe = struct {
+        var active: *@This() = undefined;
+        original: *const stores.ArtifactStore.VTable,
+        refs: []const ordered.Reader.Cover,
+        live: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        calls: std.atomic.Value(usize) = .init(0),
+        directories: std.atomic.Value(usize) = .init(0),
+        fail: bool = false,
+        fn get(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token) ![]u8 {
+            const probe = active;
+            _ = probe.calls.fetchAdd(1, .monotonic);
+            for (probe.refs, 0..) |ref, i| if (std.mem.eql(u8, ref.block.artifact_id, id)) {
+                const live = probe.live.fetchAdd(1, .acq_rel) + 1;
+                defer _ = probe.live.fetchSub(1, .release);
+                _ = probe.peak.fetchMax(live, .monotonic);
+                _ = probe.directories.fetchAdd(1, .monotonic);
+                try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+                if (probe.fail and i == 1) return error.InjectedDirectoryFailure;
+                break;
+            };
+            return if (probe.original.get_range_alloc_with_cancellation) |read| read(raw, alloc, id, offset, length, token) else probe.original.get_range_alloc(raw, alloc, id, offset, length);
+        }
+    };
+    var traced = store.vtable.*;
+    traced.get_range_alloc_with_cancellation = Probe.get;
+    const original = store.vtable;
+    store.vtable = &traced;
+    for ([_]usize{ 0, 4 }) |lanes| {
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_io_workers = lanes };
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        cache.max_entries = 0;
+        cache.physical.max_entries = 0;
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+        var probe: Probe = .{ .original = original, .refs = &refs };
+        Probe.active = &probe;
+        for (0..2) |iteration| {
+            const before = probe.calls.load(.acquire);
+            var wave: CoveringWave = .{ .scheduler = &scheduler };
+            defer wave.deinit();
+            var reads: u64 = 1024 * 1024;
+            try wave.read(a, cached, store, &refs, &.{0}, 2, .none, &reads);
+            for (wave.jobs[0..wave.count], 0..) |job, i| {
+                try std.testing.expect(job.prepared.?.lease != null);
+                try std.testing.expectEqual(@as(i64, @intCast(i)), (try job.block.?.block.cell(0, 0)).value.integer);
+                try std.testing.expect((try job.block.?.block.cell(0, 1)).sql_null);
+            }
+            if (iteration == 1) try std.testing.expectEqual(before, probe.calls.load(.acquire));
+        }
+        try std.testing.expectEqual(@as(usize, 4), probe.directories.load(.acquire));
+        if (lanes == 0) try std.testing.expectEqual(@as(usize, 1), probe.peak.load(.acquire)) else try std.testing.expect(probe.peak.load(.acquire) > 1);
+        try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+        try std.testing.expectEqual(@as(usize, 0), cache.physical.entries.count());
+        {
+            var wave: CoveringWave = .{ .scheduler = &scheduler };
+            defer wave.deinit();
+            var reads: u64 = 0;
+            const before = probe.calls.load(.acquire);
+            try std.testing.expectError(error.ArtifactReadBudgetExceeded, wave.read(a, cached, store, &refs, &.{0}, 2, .none, &reads));
+            try std.testing.expectEqual(before, probe.calls.load(.acquire));
+        }
+        // Rejected payload allowance and canceled warm readers must unwind
+        // already-resident directory leases without starting payload reads.
+        for ([_]bool{ false, true }) |canceled| {
+            var wave: CoveringWave = .{ .scheduler = &scheduler };
+            defer wave.deinit();
+            var signal: std.atomic.Value(bool) = .init(canceled);
+            var reads: u64 = 0;
+            for (refs) |ref| reads += ref.block.byte_len;
+            const before = probe.calls.load(.acquire);
+            try std.testing.expectError(if (canceled) error.Canceled else error.ArtifactReadBudgetExceeded, wave.read(a, cached, store, &refs, &.{0}, 2, Token.fromAtomic(&signal), &reads));
+            try std.testing.expectEqual(before, probe.calls.load(.acquire));
+        }
+        // A distinct cache scope forces fresh preparation and a provider error.
+        {
+            var failed_cache = cached;
+            failed_cache.scope = @splat(8);
+            probe.fail = true;
+            var wave: CoveringWave = .{ .scheduler = &scheduler };
+            defer wave.deinit();
+            var reads: u64 = 1024 * 1024;
+            try std.testing.expectError(error.InjectedDirectoryFailure, wave.read(a, failed_cache, store, &refs, &.{0}, 2, .none, &reads));
+        }
+        try std.testing.expectEqual(@as(usize, 0), probe.live.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+        std.debug.print("COVER_DIRECTORY_WAVE lanes={d} peak={d} warm_raw_empty_gets=0\n", .{ lanes, probe.peak.load(.acquire) });
     }
 }
