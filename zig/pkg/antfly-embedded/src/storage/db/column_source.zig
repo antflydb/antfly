@@ -418,7 +418,10 @@ pub const Row = struct {
     /// not a final field mask: nested exclusions still belong to the projector.
     /// Do not decode unrelated JSON columns merely to select one logical path.
     pub fn valueForProjection(self: Row, arena: *std.heap.ArenaAllocator, options: anytype) !std.json.Value {
-        const a = arena.allocator();
+        return self.valueForProjectionAlloc(arena.allocator(), options);
+    }
+    /// Containers belong to a; immutable scalar bytes remain leased by page.
+    pub fn valueForProjectionAlloc(self: Row, a: A, options: anytype) !std.json.Value {
         var object: std.json.ObjectMap = .empty;
         const includes = for (options.fields) |field| {
             if (field.len == 0 or field[0] != '-') break true;

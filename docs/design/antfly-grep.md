@@ -1306,3 +1306,15 @@ and skewed image sizes. Shared deterministic PNG generation lives in
 `e2e/antfly/media_fixture.py`. No model/provider call is needed for these checks.
 Qualification results and the source/host limitations follow below; raw reports
 remain ignored under `output/projection-followup/`.
+
+
+Typed consumers retain producer leases until the callback finishes and do not
+opt into spooled/consumed delivery. Lake execution therefore hydrates before the
+typed callback. Archive column plans include bound scalar dependencies independently
+of the public source mask: `fields: []` cannot erase operands needed by `select`,
+and constant-only outputs need no source columns. This is a conservative column
+read set for archive providers, not a claim of native per-field lazy I/O there.
+Column-backed scalar output also retains requested `_source` values; public array
+masking and scalar resolution use separate views of original positions. Ordinary
+column wire responses without scalar outputs keep streaming rather than building
+an extra DOM. Owned fallback plans use reclaimable scratch without bypassing quotas.

@@ -990,3 +990,12 @@ query result before encoding; it cannot bypass admission, policy, read-cut,
 revision or lifecycle checks. It must copy retained data before returning and
 preserve query cancellation and failure semantics. No public API or persistent
 format is introduced by this delivery optimization.
+
+
+Column-backed producers must plan `select` dependencies independently of public
+`fields`, including with an empty public mask. Hydration may conservatively fetch
+all potential scalar operands while evaluation remains lazy. Requested `_source`
+and `_computed` are both delivered; public array compaction cannot change scalar
+indexes. A typed borrowed consumer requires eager hydration before its callback
+and cannot opt into spooled/consumed page delivery. Ordinary column-only wire
+encoding continues to stream without an extra source DOM.

@@ -4001,7 +4001,7 @@ fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hi
     }
     // Rebind normalized response receipts before choosing raw source delivery.
     // Reuse the validated output, rather than scanning large payloads twice.
-    return toOpenApiHitPreparedSource(a, req, hit.*, projection, canStreamFinalizedSource(req, hit.*, projection), ready);
+    return toOpenApiHitPreparedSource(a, req, hit.*, projection, canStreamFinalizedSource(req, hit.*, projection) or (hit.column_source != null and projection == null and req.document_authority_mode == .none), ready);
 }
 fn hasFinalizedWireSources(req: db_mod.types.SearchRequest, hits: []const db_mod.types.SearchHit, projection: ?*const field_projection.Plan) bool {
     for (hits) |hit| if (canStreamFinalizedSource(req, hit, projection)) return true;
@@ -4488,17 +4488,17 @@ pub fn encodeQueryResponsesWithDelivery(
     };
 }
 
-const ProjectionLease = struct {
+pub const ProjectionLease = struct {
     plan: *const field_projection.Plan,
     owned: ?*field_projection.Plan = null,
-    fn deinit(self: ProjectionLease, a: std.mem.Allocator) void {
+    pub fn deinit(self: ProjectionLease, a: std.mem.Allocator) void {
         if (self.owned) |plan| {
             plan.deinit();
             a.destroy(plan);
         }
     }
 };
-fn prepareFieldProjection(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !?ProjectionLease {
+pub fn prepareFieldProjection(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !?ProjectionLease {
     if (req.field_projection_json.len == 0 or req.document_authority_mode != .none) return null;
     if (req.field_projection_plan) |shared| if (shared.get(req.field_projection_json)) |plan| return .{ .plan = plan };
     const plan = try alloc.create(field_projection.Plan);
@@ -4556,6 +4556,8 @@ fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.Search
                 })
             else
                 try parseStoredSourceValue(alloc, stored_data))
+        else if (hit.column_source) |columns|
+            (if (req.include_stored) try takeOpenApiObjectMap(alloc, try projectPublicSourceView(alloc, try columns.valueForProjectionAlloc(alloc, .{ .fields = req.fields, .include_all_fields = req.include_all_fields }), .{ .fields = req.fields, .include_all_fields = req.include_all_fields })) else null)
         else
             null,
         .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
@@ -20315,4 +20317,62 @@ test "api query contract typed delivery consumes admitted projections without JS
         .write_fn = Sink.write,
         .typed_result = .{ .ptr = &sink, .consume = Sink.consume },
     }));
+}
+
+test "api query contract column scalar outputs retain independent source masks in wire and typed consumers" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "a" }};
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "items", .values = .{ .json = &.{"[{\"value\":\"first\"},{\"value\":\"second\"}]"} } },
+        .{ .name = "hidden", .values = .{ .bytes = &.{"requested only by select"} } },
+    };
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "a"), .column_source = page.row(0) };
+    defer hit.deinit(a);
+    const select = try std.json.parseFromSliceLeaky(std.json.Value, temp, "{\"chosen\":{\"field\":\"items.1.value\"},\"hidden\":{\"field\":\"hidden\"}}", .{});
+    const encoded = try field_projection.encodePrepared(temp, &.{"items.1.value"}, select, .{ .object = .empty });
+    defer {
+        encoded.plan.deinit();
+        temp.destroy(encoded.plan);
+    }
+    const req: db_mod.types.SearchRequest = .{ .include_stored = true, .include_all_fields = false, .fields = &.{"items.1.value"}, .field_projection_json = encoded.json, .field_projection_plan = .{ .encoded = encoded.json, .plan = encoded.plan } };
+    var hits = [_]db_mod.types.SearchHit{hit};
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1 };
+    var response = try encodeQueryResponses(a, "docs", req, .{}, result);
+    defer response.deinit(a);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, temp, response.json, .{});
+    const public_hit = parsed.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+    try std.testing.expectEqualStrings("{\"items\":[{\"value\":\"second\"}]}", try std.json.Stringify.valueAlloc(temp, public_hit.object.get("_source").?, .{}));
+    try std.testing.expectEqualStrings("second", public_hit.object.get("_computed").?.object.get("chosen").?.string);
+    const Sink = struct {
+        a: std.mem.Allocator,
+        called: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, value: metadata_openapi.QueryResult) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+            const selected = value.hits.?.hits.?[0];
+            const source = selected._source.?.map;
+            try std.testing.expect(source.get("hidden") == null);
+            try std.testing.expectEqual(@as(usize, 1), source.get("items").?.array.items.len);
+            try std.testing.expectEqualStrings("second", source.get("items").?.array.items[0].object.get("value").?.string);
+            const computed = try std.json.parseFromSliceLeaky(std.json.Value, self.a, selected._computed.?.bytes, .{});
+            try std.testing.expectEqualStrings("second", computed.object.get("chosen").?.string);
+            try std.testing.expectEqualStrings("requested only by select", computed.object.get("hidden").?.string);
+        }
+    };
+    var sink: Sink = .{ .a = temp };
+    var delivered = try encodeQueryResponsesWithDelivery(a, "docs", req, .{}, result, .{ .ptr = &sink, .start_fn = Sink.start, .write_fn = Sink.write, .typed_result = .{ .ptr = &sink, .consume = Sink.consume } });
+    defer delivered.deinit(a);
+    try std.testing.expect(sink.called);
 }
