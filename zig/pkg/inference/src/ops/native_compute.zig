@@ -32981,6 +32981,54 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
     linalg.ropeCore(output, positions, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
 }
 
+// Axis selection specializes at compile time; heads share each token/pair's
+// phase without changing its F32 expression or the two-component store order.
+inline fn axisRopeCore(
+    comptime vision: bool,
+    comptime single_head: bool,
+    output: []f32,
+    input: []const f32,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    freq_scale: f32,
+    positions: []const u32,
+    sections: [3]u32,
+) void {
+    const rotary_pairs = head_dim / 2;
+    const chunks_per_token = if (single_head) 1 else input.len / head_dim / token_count;
+    for (0..token_count) |token| {
+        for (0..rotary_pairs) |pair| {
+            const axis: usize = if (vision)
+                @intFromBool(pair >= rotary_pairs / 2)
+            else if (pair % 3 == 1 and pair < @as(usize, sections[1]) * 3)
+                1
+            else if (pair % 3 == 2 and pair < @as(usize, sections[2]) * 3)
+                2
+            else
+                0;
+            const position = positions[axis * token_count + token];
+            const local_pair = if (vision) pair % (rotary_pairs / 2) else pair;
+            const frequency_dim = if (vision) head_dim / 2 else head_dim;
+            const exponent = @as(f32, @floatFromInt(2 * local_pair)) / @as(f32, @floatFromInt(frequency_dim));
+            const frequency = 1.0 / std.math.pow(f32, theta, exponent);
+            const angle = if (vision)
+                @as(f32, @floatFromInt(position)) * frequency
+            else
+                @as(f32, @floatFromInt(position)) * freq_scale * frequency;
+            const cosine = @cos(angle);
+            const sine = @sin(angle);
+            for (0..chunks_per_token) |head| {
+                const base = (token * chunks_per_token + head) * head_dim;
+                const left = input[base + pair];
+                const right = input[base + rotary_pairs + pair];
+                output[base + pair] = left * cosine - right * sine;
+                output[base + rotary_pairs + pair] = left * sine + right * cosine;
+            }
+        }
+    }
+}
+
 /// Reference Qwen3-VL interleaved M-RoPE. Section counts address rotary
 /// pairs, and therefore sum to head_dim / 2.
 pub fn mropeCore(
@@ -33004,32 +33052,7 @@ pub fn mropeCore(
     const chunks_per_token = total_chunks / token_count;
     if (chunks_per_token == 0) return error.InvalidRoPEInput;
 
-    // Heads of one token share every rotary phase. Evaluate pow/sin/cos once
-    // per token/pair, preserving the arithmetic and supporting exact in-place
-    // aliasing: each pair reads and writes its own two disjoint components.
-    for (0..token_count) |token| {
-        for (0..rotary_pairs) |pair| {
-            const axis: usize = if (pair % 3 == 1 and pair < @as(usize, sections[1]) * 3)
-                1
-            else if (pair % 3 == 2 and pair < @as(usize, sections[2]) * 3)
-                2
-            else
-                0;
-            const position = positions[axis * token_count + token];
-            const exponent = @as(f32, @floatFromInt(2 * pair)) / @as(f32, @floatFromInt(head_dim));
-            const frequency = 1.0 / std.math.pow(f32, theta, exponent);
-            const angle = @as(f32, @floatFromInt(position)) * freq_scale * frequency;
-            const cosine = @cos(angle);
-            const sine = @sin(angle);
-            for (0..chunks_per_token) |head| {
-                const base = (token * chunks_per_token + head) * head_dim;
-                const left = input[base + pair];
-                const right = input[base + rotary_pairs + pair];
-                output[base + pair] = left * cosine - right * sine;
-                output[base + rotary_pairs + pair] = left * sine + right * cosine;
-            }
-        }
-    }
+    axisRopeCore(false, false, output, input, token_count, head_dim, theta, freq_scale, positions, sections);
 }
 
 fn mropeOp(
@@ -33072,26 +33095,10 @@ pub fn visionRopeCore(
     if (total_chunks % token_count != 0) return error.InvalidRoPEInput;
     const heads_per_token = total_chunks / token_count;
     if (heads_per_token == 0) return error.InvalidRoPEInput;
-    const rotary_pairs = head_dim / 2;
-    const pairs_per_axis = rotary_pairs / 2;
-    for (0..total_chunks) |chunk| {
-        const token = chunk / heads_per_token;
-        const base = chunk * head_dim;
-        for (0..rotary_pairs) |pair| {
-            const axis: usize = if (pair < pairs_per_axis) 0 else 1;
-            const local_pair = pair % pairs_per_axis;
-            const exponent = @as(f32, @floatFromInt(2 * local_pair)) /
-                @as(f32, @floatFromInt(head_dim / 2));
-            const frequency = 1.0 / std.math.pow(f32, theta, exponent);
-            const angle = @as(f32, @floatFromInt(positions[axis * token_count + token])) * frequency;
-            const cosine = @cos(angle);
-            const sine = @sin(angle);
-            const left = input[base + pair];
-            const right = input[base + rotary_pairs + pair];
-            output[base + pair] = left * cosine - right * sine;
-            output[base + rotary_pairs + pair] = left * sine + right * cosine;
-        }
-    }
+    if (heads_per_token == 1)
+        axisRopeCore(true, true, output, input, token_count, head_dim, theta, 1, positions, .{ 0, 0, 0 })
+    else
+        axisRopeCore(true, false, output, input, token_count, head_dim, theta, 1, positions, .{ 0, 0, 0 });
 }
 
 fn visionNormRopeOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.VisionNormRopeParams) anyerror!?CT {
@@ -43591,6 +43598,38 @@ test "Qwen3-VL interleaved M-RoPE selects temporal height and width lanes" {
         error.InvalidRoPEInput,
         mropeCore(&output, &input, 1, 6, 10_000.0, 1.0, &.{ 1, 2, 3 }, .{ 1, 1, 0 }),
     );
+}
+
+test "vision RoPE shared phases preserve original per-head arithmetic and in-place aliasing" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 3 }) |tokens| for ([_]usize{ 1, 4, 16 }) |heads| for ([_]usize{ 4, 64, 128 }) |dim| {
+        const input = try a.alloc(f32, tokens * heads * dim);
+        defer a.free(input);
+        for (input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.17);
+        const positions = try a.alloc(u32, 2 * tokens);
+        defer a.free(positions);
+        for (positions, 0..) |*x, i| x.* = if (i == 0) 0 else @intCast(i * 97 + 3);
+        const actual = try a.alloc(f32, input.len);
+        defer a.free(actual);
+        const expected = try a.alloc(f32, input.len);
+        defer a.free(expected);
+        for (0..tokens * heads) |chunk| for (0..dim / 2) |pair| {
+            const axis = pair / (dim / 4);
+            const local_pair = pair % (dim / 4);
+            const exponent = @as(f32, @floatFromInt(2 * local_pair)) / @as(f32, @floatFromInt(dim / 2));
+            const frequency = 1.0 / std.math.pow(f32, 10000, exponent);
+            const angle = @as(f32, @floatFromInt(positions[axis * tokens + chunk / heads])) * frequency;
+            const left = input[chunk * dim + pair];
+            const right = input[chunk * dim + dim / 2 + pair];
+            expected[chunk * dim + pair] = left * @cos(angle) - right * @sin(angle);
+            expected[chunk * dim + dim / 2 + pair] = left * @sin(angle) + right * @cos(angle);
+        };
+        try visionRopeCore(actual, input, tokens, dim, 10000, positions);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+        @memcpy(actual, input);
+        try visionRopeCore(actual, actual, tokens, dim, 10000, positions);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+    };
 }
 
 test "Qwen3-VL vision RoPE restarts frequencies for height and width" {

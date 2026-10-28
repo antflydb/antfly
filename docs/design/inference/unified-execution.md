@@ -3353,3 +3353,10 @@ source bytes with identical expanded tokens and the unchanged complete PTX.
 [The AO register](unified-execution-ao-outcomes.md) records shared ordinary
 and window-packed CUDA normalization, removing 1,281 maintained source bytes
 with identical expanded tokens and the unchanged complete shipping PTX.
+
+### AP shared CPU axis rotation
+
+[The AP register](unified-execution-ap-outcomes.md) records shared M-RoPE and
+vision rotation, per-token vision phase reuse, single-head specialization,
+independent bitwise oracles and the complete retained performance matrices.
+It charges the small production-source increase separately from the speedup.
