@@ -2352,7 +2352,11 @@ pub fn build(b: *std.Build) void {
     // admission and packing regressions an explicit owner so filtered and
     // default test runs cannot silently omit them.
     const grouped_embedding_tests = b.addTest(.{
-        .max_rss = 7 * 1024 * 1024 * 1024,
+        // CUDA ReleaseSafe measured 10.24 GiB on native AArch64. Keep 25%
+        // compiler headroom; the portable owner retains its existing claim.
+        .max_rss = @as(usize, if (enable_cuda) 13 else 7) * 1024 * 1024 * 1024,
+        // Match the runtime owner instead of compiling unrelated test bodies.
+        .filters = if (suite.selected_test_filters.len == 0) &.{"embeddinggemma2"} else suite.selected_test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_embedding_gemma2_groups.zig"),
             .target = target,

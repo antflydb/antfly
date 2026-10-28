@@ -18,6 +18,63 @@
 const std = @import("std");
 const Json = std.json.Value;
 
+/// Gateway-only source locator. It carries no credentials or read grant;
+/// ordinary provider adapters accept only materialized evidence.
+pub const TableSourceReference = struct {
+    table: []const u8,
+    document_id: []const u8,
+    field: []const u8,
+    revision_field: []const u8,
+    revision: []const u8,
+    sha256: []const u8,
+    identity: ?[]const u8 = null,
+    mime_type: []const u8,
+    byte_length: usize,
+    filter_query: ?std.json.Value = null,
+    permissions_field: ?[]const u8 = null,
+    principals: []const []const u8 = &.{},
+    max_pixels: u64 = 64 * 1024 * 1024,
+    pub fn jsonStringify(self: @This(), stream: *std.json.Stringify) std.json.Stringify.Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            const value = @field(self, name);
+            if (@typeInfo(@TypeOf(value)) == .optional) {
+                if (value) |present| {
+                    try stream.objectField(name);
+                    try stream.write(present);
+                }
+            } else {
+                try stream.objectField(name);
+                try stream.write(value);
+            }
+        }
+        try stream.endObject();
+    }
+    pub fn validate(self: @This()) !void {
+        if (self.table.len == 0 or self.table.len > 1024 or self.document_id.len == 0 or self.document_id.len > 4096 or self.revision.len == 0 or self.revision.len > 4096 or self.byte_length == 0 or self.byte_length > 16 * 1024 * 1024 or self.max_pixels == 0 or self.max_pixels > 64 * 1024 * 1024) return error.InvalidInferenceSource;
+        for ([_][]const u8{ self.field, self.revision_field }) |path| {
+            if (path.len == 0 or path.len > 1024 or std.mem.indexOfAny(u8, path, "*?[]\x00") != null) return error.InvalidInferenceSource;
+            var parts = std.mem.splitScalar(u8, path, '.');
+            while (parts.next()) |part| if (part.len == 0 or part[0] == '_' or part[0] == '-') return error.InvalidInferenceSource;
+        }
+        if (self.filter_query) |filter| if (filter != .object) return error.InvalidInferenceSource;
+        if (self.principals.len > 256 or (self.permissions_field == null and self.principals.len != 0)) return error.InvalidInferenceSource;
+        for (self.principals) |principal| if (principal.len == 0 or principal.len > 4096) return error.InvalidInferenceSource;
+        if (self.permissions_field) |path| {
+            if (path.len == 0 or path.len > 1024 or std.mem.indexOfAny(u8, path, "*?[]\x00") != null) return error.InvalidInferenceSource;
+            var parts = std.mem.splitScalar(u8, path, '.');
+            while (parts.next()) |part| if (part.len == 0 or part[0] == '_' or part[0] == '-') return error.InvalidInferenceSource;
+        }
+        if (self.identity) |identity| {
+            if (identity.len != 68 or !std.mem.startsWith(u8, identity, "sv1-")) return error.InvalidInferenceSource;
+            for (identity[4..]) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidInferenceSource;
+        }
+        if (self.sha256.len != 64) return error.InvalidInferenceSource;
+        for (self.sha256) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidInferenceSource;
+        if (!std.mem.eql(u8, self.mime_type, "image/png") and !std.mem.eql(u8, self.mime_type, "image/jpeg") and !std.mem.eql(u8, self.mime_type, "image/webp") and !std.mem.eql(u8, self.mime_type, "image/gif")) return error.InvalidInferenceSource;
+    }
+};
+
 pub const Input = union(enum) {
     text: []const u8,
     messages: []const Json,

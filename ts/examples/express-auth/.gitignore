@@ -1,0 +1,4 @@
+node_modules/
+public/client.js
+data/
+.env

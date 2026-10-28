@@ -31262,6 +31262,11 @@ test "embeddinggemma2 CUDA vision graphs replay fresh batches with bounded geome
         compute.ctx.synchronize() catch {};
         // Graphs must retire before their fixture weights.
         compute.embedding_gemma2_execution.clear(a, &compute.ctx) catch {};
+        // These resident slots alias the two fixture-owned allocations below.
+        // Model teardown owns every resident slot regardless of owns_buffer;
+        // detach the aliases before zero/ones free their shared storage.
+        var weights = compute.resident_weights.valueIterator();
+        while (weights.next()) |weight| weight.buffer = .{};
     }
     const host = try a.alloc(u16, 3072 * 768);
     defer a.free(host);

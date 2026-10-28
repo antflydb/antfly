@@ -75,6 +75,16 @@ jobs:
           pnpm --filter @antfly/embedded test
           pnpm --filter @antfly/embedded build
 
+      - name: Qualify Better Auth against the release library
+        working-directory: ts
+        env:
+          ANTFLY_LIBRARY: ${{ github.workspace }}/dist/embedded-package-source/ts/packages/embedded-linux-x64/lib/libantfly.so
+        run: |
+          pnpm --filter @antfly/sdk --filter @antfly/better-auth build
+          pnpm --filter @antfly/better-auth typecheck
+          pnpm --filter @antfly/better-auth test
+          pnpm --filter @antfly/better-auth test:integration
+
       - name: Pack Apache npm packages
         run: |
           set -euo pipefail

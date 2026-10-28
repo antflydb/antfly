@@ -115,7 +115,8 @@ const InferenceRuntimeConfig = struct {
     embedded_enabled: bool = true,
     /// Environment forwarded only when a server host launches its worker.
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
-    max_concurrent_requests: ?usize = null,
+    resources: inference.platform.resource_policy.Resources = .{},
+    generation_batching: inference.platform.inference_settings.GenerationBatching = .{},
     kernel_jit: inference.graph.kernel_jit.Config = .{},
     prompt_cache: inference.server.PromptCacheConfig = .{},
 };
@@ -749,38 +750,7 @@ test "standalone preload bridge preserves A4B residency controls" {
     try std.testing.expectError(error.InvalidArguments, convertWarmModels(std.testing.allocator, &context));
 }
 
-pub fn parseKeepAliveMs(raw: []const u8) !u64 {
-    if (std.mem.eql(u8, raw, "0")) return 0;
-    if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
-    var i: usize = 0;
-    var total_ns: u64 = 0;
-    while (i < raw.len) {
-        const start = i;
-        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
-        if (i == start) return error.InvalidInferenceModelCacheConfig;
-        const value = std.fmt.parseUnsigned(u64, raw[start..i], 10) catch
-            return error.InvalidInferenceModelCacheConfig;
-        const unit_ns: u64 = if (std.mem.startsWith(u8, raw[i..], "ms")) blk: {
-            i += 2;
-            break :blk std.time.ns_per_ms;
-        } else if (i < raw.len and raw[i] == 's') blk: {
-            i += 1;
-            break :blk std.time.ns_per_s;
-        } else if (i < raw.len and raw[i] == 'm') blk: {
-            i += 1;
-            break :blk std.time.ns_per_min;
-        } else if (i < raw.len and raw[i] == 'h') blk: {
-            i += 1;
-            break :blk std.time.ns_per_hour;
-        } else return error.InvalidInferenceModelCacheConfig;
-        const part_ns = std.math.mul(u64, value, unit_ns) catch
-            return error.InvalidInferenceModelCacheConfig;
-        total_ns = std.math.add(u64, total_ns, part_ns) catch
-            return error.InvalidInferenceModelCacheConfig;
-    }
-    if (total_ns == 0) return 0;
-    return @max(@as(u64, 1), total_ns / std.time.ns_per_ms);
-}
+pub const parseKeepAliveMs = inference.platform.inference_settings.parseKeepAliveMs;
 
 test "standalone inference keep alive parses compound durations and zero" {
     try std.testing.expectEqual(@as(u64, 0), try parseKeepAliveMs("0"));
@@ -900,8 +870,19 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     if (context.has_max_loaded_models != 0)
         node_config.max_loaded_models = std.math.cast(usize, context.max_loaded_models) orelse
             return error.InvalidInferenceModelCacheConfig;
-    if (runtime_config.value.max_concurrent_requests) |limit|
-        node_config.max_concurrent_requests = limit;
+    try runtime_config.value.resources.validate();
+    const policy = runtime_config.value.resources.inference;
+    node_config.max_concurrent_requests = policy.admission.max_concurrent_requests;
+    node_config.max_work_units = policy.admission.workCapacity();
+    node_config.request_limits = policy.request_limits;
+    node_config.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(runtime_config.value.generation_batching);
+    const configured_limits = policy.memory.limits(inference.runtime.tier.memory.Limits);
+    // CLI/bridge overrides take precedence field by field, while physical caps
+    // are applied by ModelManager after backend discovery.
+    inline for (comptime std.meta.fieldNames(inference.runtime.tier.memory.Limits)) |field| {
+        if (@field(node_config.generation_budget_overrides, field) == 0)
+            @field(node_config.generation_budget_overrides, field) = @field(configured_limits, field);
+    }
 
     state.* = .{
         .alloc = alloc,

@@ -183,9 +183,25 @@ pub fn releaseResultPayloads(a: Allocator, metadata: *chunker.types.ModelMetadat
             value.embedding = null;
             value.spans = null;
             value.labels = null;
+            value.speaker_spans = null;
         }
         const receipts = try std.json.Stringify.valueAlloc(a, values.value, .{ .emit_null_optional_fields = false });
         a.free(encoded);
         metadata.outputs_json = receipts;
     }
+}
+
+test "model aware media compacted speaker receipts retain dependency identity without timeline payloads" {
+    const a = std.testing.allocator;
+    const revision: [64]u8 = @splat('a');
+    const output = chunker.outputs.Result{ .name = "voices", .kind = .diarize, .required = true, .model = "speaker", .model_identity = &revision, .model_revision = &revision, .speaker_model_revision = &revision, .recipe_id = &revision, .status = .complete, .start_ns = 0, .end_ns = 1, .speaker_scope = .source, .speaker_spans = &.{.{ .start_ns = 0, .end_ns = 1, .speaker_index = 0 }} };
+    var metadata = chunker.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 1 } }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "speaker", .model_identity = &revision, .task_type = "DIARIZE", .dimensions = 0, .policy = .{}, .outputs_json = try std.json.Stringify.valueAlloc(a, &[_]chunker.outputs.Result{output}, .{ .emit_null_optional_fields = false }) };
+    defer if (metadata.outputs_json) |bytes| a.free(bytes);
+    try releaseResultPayloads(a, &metadata);
+    const receipts = try std.json.parseFromSlice([]chunker.outputs.Result, a, metadata.outputs_json.?, .{});
+    defer receipts.deinit();
+    try std.testing.expect(receipts.value[0].speaker_spans == null);
+    try std.testing.expect(!receipts.value[0].reusable());
+    try std.testing.expectEqualStrings(&revision, receipts.value[0].speaker_model_revision.?);
+    try std.testing.expectEqualStrings(&revision, receipts.value[0].recipe_id);
 }
