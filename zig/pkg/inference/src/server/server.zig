@@ -10670,6 +10670,7 @@ pub const Node = struct {
             model.getTokenizer(),
             .{
                 .max_length = @intCast(whisper_config.max_target_positions),
+                .max_output_tokens = (try resolvedInferenceExecutorContract(self, "transcribe", &model.manifest)).batch.max_output_tokens_per_item,
                 .decoder_start_token_id = whisper_config.decoder_start_token_id,
                 .vocab_size = whisper_config.vocab_size,
                 .eos_token_id = whisper_config.eos_token_id,
@@ -21286,6 +21287,7 @@ pub const Node = struct {
             error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
             error.OutOfMemory => return err,
             error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+            error.InferenceOutputTokensExceeded => return inferenceExecutorContractFailureResponse(ctx, err),
             else => if (isTransientInferenceCapacityError(err))
                 return modelResourceBusyResponse(ctx)
             else
@@ -21391,6 +21393,7 @@ pub const Node = struct {
                 self.tokenizer,
                 .{
                     .max_length = self.decoder_config.max_length,
+                    .max_output_tokens = (try resolvedInferenceExecutorContract(self.node, "transcribe", &self.manifest.?)).batch.max_output_tokens_per_item,
                     .decoder_start_token_id = self.decoder_config.decoder_start_token_id,
                     .vocab_size = self.decoder_config.vocab_size,
                     .eos_token_id = self.decoder_config.eos_token_id,
@@ -21801,6 +21804,7 @@ pub const Node = struct {
                 error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
                 error.OutOfMemory => return err,
                 error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+                error.InferenceOutputTokensExceeded => return inferenceExecutorContractFailureResponse(ctx, err),
                 else => if (isTransientInferenceCapacityError(err))
                     return modelResourceBusyResponse(ctx)
                 else
@@ -22413,6 +22417,7 @@ pub const Node = struct {
         entry.session.process(&pipeline, &events, commit) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+            error.InferenceOutputTokensExceeded => return inferenceExecutorContractFailureResponse(ctx, err),
             else => if (isTransientInferenceCapacityError(err))
                 return modelResourceBusyResponse(ctx)
             else
@@ -22741,7 +22746,7 @@ pub const Node = struct {
             };
         } else if (!commit) return true;
         entry.session.process(pipeline, events, commit) catch |err| {
-            writeSessionStreamError(writer, payload, session_id, if (isTransientInferenceCapacityError(err)) "MODEL_RESOURCE_BUSY" else "INFERENCE_FAILED", @errorName(err));
+            writeSessionStreamError(writer, payload, session_id, if (isInferenceExecutorContractError(err)) generateExecutorContractError(err).batch.code else if (isTransientInferenceCapacityError(err)) "MODEL_RESOURCE_BUSY" else "INFERENCE_FAILED", @errorName(err));
             return false;
         };
         if (events.items.len == 0) return !ctx.isCancellationRequested();
@@ -23700,11 +23705,13 @@ pub const Node = struct {
         var retained = ParsedDenseEmbedInputs{};
         defer retained.deinit(a);
         var budget = RequestMediaBudget.init(byte_cap);
+        var request_budget: EmbeddingGroupRequestBudget = .{};
         for (raw_groups, groups) |raw, *group| {
             group.* = try parseEmbeddingGroup(self, a, manifest, raw, &retained, &budget, .{ .io = io, .control = control }, &.{});
             try grouped.validateGroup(group.*, options);
-            try validateEmbeddingGroupContract(self, contract, group.*, groups.len, control);
+            try request_budget.add(try validateEmbeddingGroupContract(self, contract, group.*, groups.len, control));
         }
+        try request_budget.validate(contract, groups.len);
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
@@ -23713,7 +23720,9 @@ pub const Node = struct {
         try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, options);
-        for (groups) |group| try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control);
+        request_budget = .{};
+        for (groups) |group| try request_budget.add(try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control));
+        try request_budget.validate(active_contract, groups.len);
         const vectors = try out.alloc([]f32, groups.len);
         var count: usize = 0;
         errdefer {
@@ -23771,6 +23780,7 @@ pub const Node = struct {
         defer retained.deinit(a);
         var media_budget = RequestMediaBudget.init(byte_cap);
         var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
+        var request_budget: EmbeddingGroupRequestBudget = .{};
         for (raw_groups, 0..) |raw, index| {
             groups[index] = parseEmbeddingGroup(self, a, manifest, raw, &retained, &media_budget, .{ .io = ctx.io, .control = control }, attachments) catch |err| {
                 if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
@@ -23785,13 +23795,16 @@ pub const Node = struct {
                     groups[index] = null;
                     break :preflight;
                 };
-                validateEmbeddingGroupContract(self, contract, groups[index].?, groups.len, control) catch |err| {
+                const shape = validateEmbeddingGroupContract(self, contract, groups[index].?, groups.len, control) catch |err| {
                     if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.ResourceTemporarilyUnavailable or err == error.MemoryBudgetExceeded) return err;
                     try errors.append(a, embedItemFailure(index, err, "input"));
                     groups[index] = null;
+                    break :preflight;
                 };
+                try request_budget.add(shape);
             }
         }
+        try request_budget.validate(contract, raw_groups.len);
         const vectors = try a.alloc(?[]f32, groups.len);
         @memset(vectors, null);
         var input_tokens: usize = 0;
@@ -23810,7 +23823,18 @@ pub const Node = struct {
             .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT),
             .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768,
         });
-        try validateInferenceExecutorInvocation(active_contract, .{ .item_count = raw_groups.len });
+        request_budget = .{};
+        for (groups, 0..) |maybe, index| {
+            const group = maybe orelse continue;
+            const shape = validateEmbeddingGroupContract(self, active_contract, group, groups.len, control) catch |err| {
+                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
+                try errors.append(a, embedItemFailure(index, err, "embedding"));
+                groups[index] = null;
+                continue;
+            };
+            try request_budget.add(shape);
+        }
+        try request_budget.validate(active_contract, raw_groups.len);
         const compact = try a.alloc(grouped.Group, groups.len);
         var complete = true;
         for (groups, compact) |maybe, *value| {
@@ -23833,10 +23857,7 @@ pub const Node = struct {
         } else {
             for (groups, 0..) |maybe_group, index| {
                 const group = maybe_group orelse continue;
-                const result = group_result: {
-                    validateEmbeddingGroupContract(self, active_contract, group, groups.len, control) catch |err| break :group_result @as(anyerror!grouped.Result, err);
-                    break :group_result grouped.embedCached(a, loaded.session, loaded.getTokenizer(), group, active_options, loaded.embeddingExecutionLock(), control, &frame_cache);
-                } catch |err| {
+                const result = grouped.embedCached(a, loaded.session, loaded.getTokenizer(), group, active_options, loaded.embeddingExecutionLock(), control, &frame_cache) catch |err| {
                     if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
                     try errors.append(a, embedItemFailure(index, err, "embedding"));
                     continue;
@@ -36335,7 +36356,7 @@ test "EmbeddingGemma2 grouped frontend rechecks loaded manifest limits and modal
     const options = try groupedEmbeddingOptions(&manifest, contract, .{});
     try std.testing.expectEqual(@as(usize, 512), options.max_tokens);
     try std.testing.expectEqual(@as(usize, 256), (try groupedEmbeddingOptions(&manifest, contract, .{ .max_tokens = 256 })).max_tokens);
-    try validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .text = "document" }} }, 1, .{});
+    _ = try validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .text = "document" }} }, 1, .{});
     try std.testing.expectError(error.UnsupportedInferenceModality, validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .audio = "audio" }} }, 1, .{}));
     manifest.max_position_embeddings = 128;
     try std.testing.expectEqual(@as(usize, 128), (try groupedEmbeddingOptions(&manifest, contract, .{})).max_tokens);
@@ -37407,7 +37428,24 @@ fn hasGroupedEmbeddingInput(input: std.json.Value) bool {
     return false;
 }
 
-fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !void {
+/// Groups share one public request, even when executed serially or split into
+/// multiple native microbatches. Retain aggregate accounting independently of
+/// per-item error handling and the backend's batching decision.
+const EmbeddingGroupRequestBudget = struct {
+    encoded_media_bytes: usize = 0,
+    decoded_pixels: u64 = 0,
+
+    fn add(self: *@This(), shape: InferenceExecutorInvocationShape) !void {
+        self.encoded_media_bytes = std.math.add(usize, self.encoded_media_bytes, shape.encoded_media_bytes) catch return error.InferenceEncodedBytesExceeded;
+        self.decoded_pixels = std.math.add(u64, self.decoded_pixels, shape.decoded_pixels) catch return error.InferenceDecodedPixelsExceeded;
+    }
+
+    fn validate(self: @This(), contract: ResolvedInferenceExecutorContract, count: usize) !void {
+        try validateInferenceExecutorInvocation(contract, .{ .item_count = count, .encoded_media_bytes = self.encoded_media_bytes, .decoded_pixels = self.decoded_pixels });
+    }
+};
+
+fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !InferenceExecutorInvocationShape {
     var text_bytes: usize = if (group.title) |title| title.len else 0;
     var media_bytes: usize = 0;
     var pixels: u64 = 0;
@@ -37418,21 +37456,21 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
     var media_parts: usize = 0;
     for (group.content) |part| switch (part) {
         .text => |text| {
-            text_bytes += text.len;
+            text_bytes = std.math.add(usize, text_bytes, text.len) catch return error.InferenceTextBytesExceeded;
             has_text = true;
         },
         .image => |bytes| {
             media_parts += 1;
-            media_bytes += bytes.len;
+            media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_image = true;
             const info = try image_pipeline.inspectEncodedForInference(bytes, null);
-            pixels += try info.pixels();
+            pixels = std.math.add(u64, pixels, try info.pixels()) catch return error.InferenceDecodedPixelsExceeded;
         },
         .raster => |raster| {
             try raster.validate();
             media_parts += 1;
             has_image = true;
-            pixels += try raster.pixels();
+            pixels = std.math.add(u64, pixels, try raster.pixels()) catch return error.InferenceDecodedPixelsExceeded;
         },
         inline .video, .sampled_video => |payload| {
             try control.check();
@@ -37441,9 +37479,9 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
             const bytes = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.bytes else payload;
             const sampling: @import("../pipelines/embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.sampling else .reference;
             media_parts += 1;
-            media_bytes += bytes.len;
+            media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_video = true;
-            pixels += try @import("../pipelines/embedding_gemma2_video.zig").inspectPixelsWithSampling(bytes, control, sampling);
+            pixels = std.math.add(u64, pixels, try @import("../pipelines/embedding_gemma2_video.zig").inspectPixelsWithSampling(bytes, control, sampling)) catch return error.InferenceDecodedPixelsExceeded;
         },
         .pcm => |pcm| {
             media_parts += 1;
@@ -37452,11 +37490,13 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
         },
         .audio => |bytes| {
             media_parts += 1;
-            media_bytes += bytes.len;
+            media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_audio = true;
         },
     };
-    try validateInferenceExecutorInvocation(contract, .{ .item_count = count, .text_bytes_per_item = text_bytes, .encoded_media_bytes = media_bytes, .decoded_pixels = pixels, .media_parts_per_item = media_parts, .has_text = has_text, .has_image = has_image, .has_audio = has_audio, .has_video = has_video });
+    const shape: InferenceExecutorInvocationShape = .{ .item_count = count, .text_bytes_per_item = text_bytes, .encoded_media_bytes = media_bytes, .decoded_pixels = pixels, .media_parts_per_item = media_parts, .has_text = has_text, .has_image = has_image, .has_audio = has_audio, .has_video = has_video };
+    try validateInferenceExecutorInvocation(contract, shape);
+    return shape;
 }
 
 fn parseVideoSampling(value: std.json.Value) !@import("../pipelines/embedding_gemma2_video.zig").Sampling {
@@ -47150,4 +47190,68 @@ test "generate batch HTTP enforces public cardinality before dispatch" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "BATCH_TOO_LARGE") != null);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "grouped embedding request rejects aggregate pixels before model loading in direct and HTTP paths" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_decoded_pixels_per_batch = 1 } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"image"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    // Each valid PNG contains one pixel and fits individually. The two groups
+    // exceed the request ceiling even if the executor would process them serially.
+    var input = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"}}]},{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"}}]}]
+    , .{});
+    defer input.deinit();
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.embedGroupsFromPath(a, std.testing.io, "missing-model", &manifest, contract, input.value, .{}, .{}, 4096));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
+        try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, 4096, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "grouped embedding request aggregate allows the exact boundary and checks overflow" {
+    var node = try Node.init(std.testing.allocator, .{ .request_limits = .{ .max_decoded_pixels_per_batch = 6 } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"image"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    var budget: EmbeddingGroupRequestBudget = .{};
+    try budget.add(.{ .decoded_pixels = 3 });
+    try budget.add(.{ .decoded_pixels = 3 });
+    try budget.validate(contract, 2);
+    try budget.add(.{ .decoded_pixels = 1 });
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, budget.validate(contract, 2));
+    budget.decoded_pixels = std.math.maxInt(u64);
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, budget.add(.{ .decoded_pixels = 1 }));
+}
+
+test "Whisper HTTP pipelines inherit narrowed output policy and preserve typed failures" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_output_tokens_per_item = 64 } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"audio"};
+    var capabilities = [_][]const u8{"inference.limits.max_output_tokens_per_item=32"};
+    var ids: [0]whisper_prompt_mod.ForcedDecoderId = .{};
+    var languages: [0]whisper_prompt_mod.LanguageToken = .{};
+    const cache = whisper_prompt_mod.PromptCache{ .allocator = a, .automatic_ids = &ids, .language_tokens = &languages, .transcribe_id = 50359, .no_timestamps_id = 50363 };
+    var whisper = Node.WhisperRuntime{ .node = &node, .allocator = a, .prompt_cache = &cache, .manifest = .{ .allocator = a, .model_type = .transcriber, .inputs = &inputs, .capabilities = &capabilities } };
+    var pipeline = try whisper.pipeline(null, 1024, .{}, false, .full);
+    try std.testing.expectEqual(@as(?usize, 32), pipeline.output_token_budget.remaining);
+    pipeline.output_token_budget.remaining = 0;
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditioned(&.{0.1}, 16000, &.{}));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/transcribe");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try inferenceExecutorContractFailureResponse(&ctx, error.InferenceOutputTokensExceeded);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "OUTPUT_TOKEN_LIMIT_EXCEEDED") != null);
 }
