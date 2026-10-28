@@ -219,11 +219,17 @@ pub const Hydrator = struct {
             defer if (cursor) |value| {
                 value.control = .none;
             };
-            if (tail == null) if (visitor.text) |consume| if (cursor) |value| if (try value.text(resolved.local_id)) |text| {
-                if (try consume(visitor.ptr, row.allocator(), i, field, text)) {
+            if (tail == null) if (cursor) |value| if (try value.text(resolved.local_id)) |text| {
+                if (visitor.text) |consume| if (try consume(visitor.ptr, row.allocator(), i, field, text)) {
                     self.column_values += 1;
                     continue;
-                }
+                };
+                // Unsupported highlight programs still consume original bytes
+                // directly, without a full AJV1 encode/decode round trip.
+                const bytes = try text.read(visitor.decode_allocator orelse row.allocator(), 0, text.length, value.control);
+                try visitor.accept(visitor.ptr, row.allocator(), i, field, .{ .string = bytes });
+                self.column_values += 1;
+                continue;
             };
             const previous_chunk = if (cursor) |value| value.chunk else null;
             if (if (cursor) |value| try value.get(resolved.local_id) else null) |encoded| {
