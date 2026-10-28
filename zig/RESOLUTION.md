@@ -2757,10 +2757,21 @@ walking chains or publishing per-profile rows. A latest-version `tails/` index
 and `tail-key/` ownership postings deduplicate these entry points across slots;
 slot expiration removes only descriptors it still owns. Negative dependency
 proofs stream new entries and resolve their current mixed native/configured
-paths. A fixed full-SHA memo shares converging suffixes, with at most 16,384 hops
-in reusable scratch. Reaching a requested root, a cycle or exhausting this
-budget selects exact fallback. Flat unrelated edits require one empty range
-scan. Tail-index enrollment has its own journal readiness flag and barrier;
+paths. A fixed full-SHA memo shares converging suffixes within one proof. Exact
+tail terminals also share the existing 16-MiB routing LRU, miss coalescing and
+live-lease accounting. Antfly SHA-256 keys include the template, immutable profile,
+native routing lineage and tail key. A routing change or different configured
+profile cannot reuse the old result. Root sets, pin memberships, source proofs
+and authorization decisions are never cached in a terminal entry. Pin-only edits
+can reuse unchanged routing. Retained keys and terminals own their bytes; lookups
+use caller-owned scratch with a 256-KiB frozen-entry admission reservation.
+
+A proof spends at most 16,384 cold forward steps. Cache hits spend no forward
+steps. A cycle, affected canonical root or exhausted budget selects exact fallback.
+Completed entries survive a later entry exhausting the work budget: the next read
+can finish that entry instead of repeating the completed walks. Cache admission
+and retention are optional; denied entries use the same bounded exact walker.
+Flat unrelated edits require one empty range scan. Tail-index enrollment has its own journal readiness flag and barrier;
 legacy history cannot authorize a scoped projection accidentally.
 
 Owner repair expands reverse dependencies from changed routing nodes, rather than
@@ -2776,8 +2787,10 @@ New edits enter deduplicated next-work queues without rewinding active expansion
 path reconstruction or membership cursors. Ingestion consumes the shared turn
 budget until it catches up, then active repair uses the remaining capacity.
 A fixed quarter-turn quota must not idle spare capacity and starve active work.
-Each event is decoded once per turn in reusable scratch; only queued writes
-survive in the transaction arena. Active work pauses only after exhausting its
+Each event is decoded once per turn in a separate 1-MiB scratch frame. The
+remaining 7-MiB item frame resets after every boundary, routing or target lookup;
+valid 16-KiB canonical keys cannot accumulate decoded strings across a batch.
+Only queued writes survive in the transaction arena. Active work pauses only after exhausting its
 available ingestion capacity while still behind. A persisted set of visited walk
 nodes invalidates only walks whose prefix intersects a routing edit. Unrelated heads do
 not restart a long walk, even across more than 256 updates, provided ingestion
@@ -2935,3 +2948,30 @@ Repeated-edit proof coverage holds 130 unique invalidations across 64 events and
 Native-tail tests cover chains present before and constructed after a redirect,
 correct results at every partial owner cut, orphan pruning while native
 declarations survive, shared thousand-hop suffixes and ring ownership expiry.
+
+The membership backfill now merge-seeks configured node and native pin-count
+indexes. Either index skips unrelated gaps, so neither all native pins nor all
+configured aliases are enumerated merely to find a sparse intersection. The
+exclusive digest cursor remains compatible with an in-progress format-5 posting
+pass. A paused boundary walk finishes its original key even if that pin disappears;
+queued repair retracts the old member before readiness. No storage-format or
+reader-floor change is needed for these improvements.
+
+With 16 configured aliases and 0, 1,000 or 6,000 unrelated native distinct pairs,
+enrollment takes four owner turns, 122 writes and 192 point reads at every size.
+The former 6,000-pair case took 107 turns and 25,032 point reads. A separate
+membership-phase fixture with two relevant pins uses 10 reads and eight scans
+(including result verification) with either 1,000 or 10,000 configured aliases.
+A historical native-posting cursor resumes and restores four missing members in
+one bounded turn. Removing a pin during a paused curated boundary walk preserves
+exact results at every repair cut.
+
+An unrelated 8,192-edge native tail still takes 8,194 native reads on its cold
+proof, and zero native reads on subsequent proofs (one bounded journal-range
+scan remains). Two disjoint cold tails can exhaust the shared work budget once;
+the next read resolves the remaining tail in 8,194 reads, then both are warm.
+Regressions cover immediate routing invalidation, distinct configured profiles,
+caller-scratch poisoning and exact behavior when routing-cache admission is denied.
+The 128-key, maximum escaped canonical-key fixture that formerly exhausted 8 MiB
+after 72 entries now completes with 128-work turns; mixed routing/target events
+also complete with the supported 4,096-work quantum.

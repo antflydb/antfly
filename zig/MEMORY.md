@@ -2684,5 +2684,12 @@ native paths. A shared latest-version native-tail index fences newly incoming
 paths without copying an entire native namespace into every profile. Unreferenced
 native paths are pruned even if native declarations survive. Native memory
 identities without static consumers create neither this projection nor its
-journal. See `RESOLUTION.md` for upgrade floors, bounded maintenance, measurements
-and fallback rules.
+journal. Membership backfill merge-seeks configured nodes and native pin counts,
+with resumable cursors for either sparse direction. Event and per-item lookup
+scratch have separate lifetimes, so large canonical keys do not accumulate
+throughout an event. Exact native-tail terminals reuse the shared bounded routing
+cache under profile and routing-lineage keys; routing changes invalidate reuse
+immediately, while source and final grant fences remain independent. Cold proofs
+and cache denial retain bounded exact fallback. These changes preserve format 5
+and its existing reader floors. See `RESOLUTION.md` for upgrade floors, bounded
+maintenance, measurements and fallback rules.

@@ -412,6 +412,14 @@ pub fn tryRouting(key: [32]u8, loader: Loader) !?Lease {
     bounded.estimated_bytes = 12 * 1024 * 1024; // 8 MiB scratch + <=4 MiB frozen data.
     return routing.tryAcquire(key, true, bounded);
 }
+/// Tail loaders use caller-owned bounded scratch and retain only an entry key
+/// and terminal (each at most 16 KiB). Share routing's LRU, coalescing and live
+/// lease accounting, with admission proportional to this smaller frozen result.
+pub fn tryTailCanonical(key: [32]u8, loader: Loader) !?Lease {
+    var bounded = loader;
+    bounded.estimated_bytes = 256 * 1024;
+    return routing.tryAcquire(key, true, bounded);
+}
 pub fn acquire(key: [32]u8, cacheable: bool, loader: Loader) !Lease {
     return shared.acquire(key, cacheable, loader);
 }
