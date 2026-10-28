@@ -498,7 +498,7 @@ pub const Runner = struct {
             building = null;
             try self.soundWindows(owner.provider());
         } else {
-            var index = @import("media_audio_seek.zig").Index.init(self.allocator, bytes, self.request.limits.max_index_packets) catch |err| switch (err) {
+            var index = @import("media_audio_seek.zig").Index.initAdmitted(self.allocator, bytes, self.request.limits.max_index_packets, .{ .context = admission.context, .acquire = admission.acquire }) catch |err| switch (err) {
                 error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => return false,
                 else => return err,
             };
@@ -853,7 +853,7 @@ pub const Runner = struct {
         if (audio_key != null and self.request.index_cache != null and self.request.index_cache_admission != null) {
             const audio_scope = @import("inference_audio").work_control.Scope.enter(.{ .context = adapter.context, .check_fn = adapter.check_fn });
             defer audio_scope.deinit();
-            var index = @import("media_audio_seek.zig").Index.init(self.allocator, bytes, self.request.limits.max_index_packets) catch |err| switch (err) {
+            var index = @import("media_audio_seek.zig").Index.initAdmitted(self.allocator, bytes, self.request.limits.max_index_packets, .{ .context = self.request.index_cache_admission.?.context, .acquire = self.request.index_cache_admission.?.acquire }) catch |err| switch (err) {
                 error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => {
                     try self.sound(bytes);
                     return;

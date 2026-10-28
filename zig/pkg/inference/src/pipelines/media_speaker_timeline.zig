@@ -88,6 +88,7 @@ pub const View = struct {
 pub const Timeline = struct {
     blocks: std.ArrayList(*Block) = .empty,
     count: usize = 0,
+    max_blocks: usize = speakers.max_spans / block_size,
     admission: ?Admission = null,
     backing: std.mem.Allocator = std.heap.smp_allocator,
     pub fn view(self: Timeline) View {
@@ -143,6 +144,7 @@ pub const Timeline = struct {
         } else if (span.start_ns != 0) return error.InvalidSpeakerTimeline;
         if (self.count == speakers.max_spans) return error.SpeakerTimelineTooLarge;
         if (self.count % block_size == 0) {
+            if (self.blocks.items.len >= self.max_blocks) return error.ChunkWorkingBudgetExceeded;
             try self.blocks.ensureUnusedCapacity(a, 1);
             const block = try Block.create(self.backing, self.admission);
             if (self.count > 0) {
@@ -258,4 +260,12 @@ test "model aware media shared speaker blocks keep admission until the last read
     try std.testing.expectEqual(@as(usize, @sizeOf(Block) * 2), owner.controller.snapshot().hostTotalBytes());
     timeline_.deinit(a);
     try std.testing.expectEqual(@as(usize, @sizeOf(Block)), owner.controller.snapshot().hostTotalBytes());
+}
+
+test "model aware media incremental speaker blocks respect small working budgets" {
+    const a = std.testing.allocator;
+    var timeline_ = Timeline{ .backing = a, .max_blocks = 1 };
+    defer timeline_.deinit(a);
+    for (0..block_size) |i| try timeline_.append(a, .{ .start_ns = @intCast(i), .end_ns = @intCast(i + 1), .speaker_index = @intCast(i % 2) });
+    try std.testing.expectError(error.ChunkWorkingBudgetExceeded, timeline_.append(a, .{ .start_ns = block_size, .end_ns = block_size + 1, .speaker_index = 0 }));
 }

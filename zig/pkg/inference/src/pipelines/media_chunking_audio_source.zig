@@ -255,7 +255,7 @@ pub const Track = struct {
             const check = control.imageWorkControl();
             const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
             defer scope.deinit();
-            self.seek = @import("media_audio_seek.zig").Index.init(a, self.bytes.?, max_packets) catch |err| switch (err) {
+            self.seek = @import("media_audio_seek.zig").Index.initAdmitted(a, self.bytes.?, max_packets, .{ .context = admission.?.context, .acquire = admission.?.acquire }) catch |err| switch (err) {
                 error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => null,
                 else => return err,
             };

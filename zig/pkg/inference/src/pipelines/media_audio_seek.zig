@@ -21,10 +21,14 @@ const providers = @import("media_chunking_audio.zig");
 pub const Index = union(enum) {
     mp3: audio.mp3.pure_zig.WindowIndex,
     flac: audio.flac.WindowIndex,
-    opus: audio.opus.WindowIndex,
+    opus: @import("media_opus_seek.zig").Index,
     vorbis: audio.vorbis.WindowIndex,
-    webm: audio.webm.WindowIndex,
+    webm: audio.webm.WindowIndexFor(@import("media_opus_seek.zig").Index),
+    pub const Admission = @import("media_opus_seek.zig").Admission;
     pub fn init(a: std.mem.Allocator, bytes: []const u8, max_frames: usize) !Index {
+        return initAdmitted(a, bytes, max_frames, null);
+    }
+    pub fn initAdmitted(a: std.mem.Allocator, bytes: []const u8, max_frames: usize, admission: ?Admission) !Index {
         const format = audio.detectFormat(bytes) orelse return error.UnsupportedAudioFormat;
         if (format == .ogg or format == .opus) {
             var streams = try audio.ogg.parsePacketStreamsAlloc(a, bytes);
@@ -34,9 +38,14 @@ pub const Index = union(enum) {
         return switch (format) {
             .mp3 => .{ .mp3 = try audio.mp3.pure_zig.WindowIndex.init(a, bytes, max_frames) },
             .flac => .{ .flac = try audio.flac.WindowIndex.init(a, bytes, max_frames) },
-            .webm => .{ .webm = try audio.webm.WindowIndex.init(a, bytes, max_frames) },
+            .webm => blk: {
+                var index = try audio.webm.WindowIndexFor(@import("media_opus_seek.zig").Index).init(a, bytes, max_frames);
+                errdefer index.deinit();
+                if (index.codec == .opus) try index.codec.opus.admit(admission);
+                break :blk .{ .webm = index };
+            },
             .ogg, .opus => switch (try audio.ogg.sniffCodec(a, bytes)) {
-                .opus => .{ .opus = try audio.opus.WindowIndex.init(a, bytes, max_frames) },
+                .opus => .{ .opus = try @import("media_opus_seek.zig").Index.init(bytes, max_frames, admission) },
                 .vorbis => .{ .vorbis = try audio.vorbis.WindowIndex.init(a, bytes, max_frames) },
                 else => error.UnsupportedAudioFormat,
             },
@@ -64,6 +73,7 @@ pub const Index = union(enum) {
     }
     pub fn samples(self: Index) usize {
         return switch (self) {
+            .opus => |index| index.samples(),
             inline else => |index| index.samples,
         };
     }
@@ -81,12 +91,28 @@ pub const Reader = struct {
     index: *const Index,
     source: ?*media.source.Source = null,
     bytes: []const u8 = &.{},
+    lane: u1 = 0,
+    fork_allocator: ?std.mem.Allocator = null,
     control: @import("../execution_control.zig").InferenceExecutionControl = .{},
     pub fn provider(self: *Reader) providers.Provider {
-        return .{ .context = self, .samples = self.index.samples(), .sample_rate = self.index.rate(), .read = read };
+        return .{ .context = self, .samples = self.index.samples(), .sample_rate = self.index.rate(), .read = read, .fork = fork };
+    }
+    fn fork(raw: *anyopaque, a: std.mem.Allocator) !providers.Fork {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        const copy = try a.create(Reader);
+        copy.* = self.*;
+        copy.lane = 1;
+        copy.fork_allocator = a;
+        return .{ .provider = copy.provider(), .context = copy, .destroy = destroyFork };
+    }
+    fn destroyFork(raw: *anyopaque) void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        self.fork_allocator.?.destroy(self);
     }
     fn read(raw: *anyopaque, a: std.mem.Allocator, first: usize, last: usize) !providers.Lease {
         const self: *Reader = @ptrCast(@alignCast(raw));
+        const lane = @import("media_opus_seek.zig").Lane.enter(self.lane);
+        defer lane.deinit();
         try self.control.check();
         const check = self.control.imageWorkControl();
         const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
@@ -212,7 +238,8 @@ test "benchmark media seek windows and AAC metadata" {
         defer index.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        const cached = try index.copy(arena.allocator());
+        var cached = try index.copy(arena.allocator());
+        defer cached.deinit();
         const cold = std.Io.Clock.awake.now(io).toNanoseconds() - started;
         var times: [2]i128 = undefined;
         var checksums: [2]f64 = @splat(0);

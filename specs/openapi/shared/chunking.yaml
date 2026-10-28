@@ -378,6 +378,7 @@ components:
           format: int64
         speaker_index:
           type: integer
+          x-go-type-skip-optional-pointer: false
           minimum: 0
           description: Source-scoped voice index in order of first appearance; absent for silence or ambiguous audio.
     ChunkTranscriptSpan:
@@ -394,6 +395,7 @@ components:
           format: int64
         speaker_index:
           type: integer
+          x-go-type-skip-optional-pointer: false
           minimum: 0
           description: Source-scoped when the output carries speaker_scope=source. Older receipts without that marker use sub-window-local numbering.
     ChunkOutputLabel:
@@ -606,6 +608,7 @@ components:
       properties:
         speaker_index:
           type: integer
+          x-go-type-skip-optional-pointer: false
           minimum: 0
           description: Source-scoped speaker of a chunk made with audio_speaker_turns; omitted for unassigned intervals.
         kind:

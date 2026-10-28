@@ -628,7 +628,7 @@ pub const WindowIndex = struct {
         if (filled != last - first) return error.UnsupportedAudioFormat;
     }
 };
-fn decodeWindowPacket(a: std.mem.Allocator, state: *OpusFrameState, packet: []const u8, toc: Toc, channels: u8) ![]f32 {
+pub fn decodeWindowPacket(a: std.mem.Allocator, state: *OpusFrameState, packet: []const u8, toc: Toc, channels: u8) ![]f32 {
     var split = try splitFramesAlloc(a, packet);
     defer split.deinit();
     var values = std.ArrayList(f32).empty;
@@ -649,7 +649,11 @@ fn decodeWindowPacket(a: std.mem.Allocator, state: *OpusFrameState, packet: []co
     return values.toOwnedSlice(a);
 }
 
-const OpusFrameState = struct {
+pub const WindowSink = @import("pcm_sink.zig").Sink;
+pub fn initialFrameState(channels: u8) !OpusFrameState {
+    return .{ .celt = try opus_celt.Decoder.init(channels) };
+}
+pub const OpusFrameState = struct {
     celt: opus_celt.Decoder,
     silk: opus_silk.Decoder = opus_silk.Decoder.init(),
     prev_mode: ?Mode = null,

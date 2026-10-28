@@ -4023,10 +4023,7 @@ pub const Node = struct {
     /// for the node's lifetime; session configs point into this cache.
     silero_weights: std.StringHashMapUnmanaged(*silero_vad_mod.Weights) = .empty,
     silero_weights_lock: std.atomic.Mutex = .unlocked,
-    /// Speaker-embedding models for diarization by resolved ONNX path,
-    /// loaded on first use and kept for the node's lifetime.
-    speaker_embedders: std.StringHashMapUnmanaged(*speaker_embedding_mod.Embedder) = .empty,
-    speaker_embedders_lock: std.atomic.Mutex = .unlocked,
+    speaker_models: @import("../pipelines/speaker_model_cache.zig").Cache = .{},
     /// Lazily allocates only while compatible native executor work is queued.
     /// Ownership is here, rather than the storage BackendRuntime, because Node
     /// owns resolved model generations and concrete fused executor callbacks.
@@ -4294,13 +4291,7 @@ pub const Node = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.silero_weights.deinit(self.allocator);
-        var speaker_it = self.speaker_embedders.iterator();
-        while (speaker_it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.speaker_embedders.deinit(self.allocator);
+        self.speaker_models.deinit(self.allocator);
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| {
@@ -10691,46 +10682,24 @@ pub const Node = struct {
     fn chunkSpeakerRevision(self: *Node, path: []const u8, io: std.Io, control: InferenceExecutionControl) ![64]u8 {
         return self.speaker_revision_cache.get(self.allocator, path, io, control);
     }
-    fn pinnedSpeakerEmbedder(self: *Node, a: std.mem.Allocator, path: []const u8, revision: [64]u8, io: std.Io, control: InferenceExecutionControl) !*speaker_embedding_mod.Embedder {
+    fn pinnedSpeakerEmbedder(self: *Node, a: std.mem.Allocator, path: []const u8, revision: [64]u8, io: std.Io, control: InferenceExecutionControl) !@import("../pipelines/speaker_model_cache.zig").Cache.Lease {
         const key = try std.fmt.allocPrint(a, "{s}:{s}", .{ path, revision });
         defer a.free(key);
         if (!std.mem.eql(u8, &revision, &try self.chunkSpeakerRevision(path, io, control))) return error.ModelConfigurationChanged;
-        const embedder = try self.cachedSpeakerEmbedder(path, key);
+        const lease = try self.speaker_models.acquire(self.allocator, path, key, control);
+        errdefer {
+            lease.retire();
+            lease.deinit();
+        }
         if (!std.mem.eql(u8, &revision, &try self.chunkSpeakerRevision(path, io, control))) return error.ModelConfigurationChanged;
-        return embedder;
+        return lease;
     }
-
-    /// The loaded default speaker model, shared across requests. The graph
-    /// import takes seconds, so it runs outside the map lock; a concurrent
-    /// first request may import twice and the later copy is dropped.
-    fn speakerEmbedder(self: *Node) !*speaker_embedding_mod.Embedder {
-        const model_path = try self.resolveSpeakerModelPath();
-        defer self.allocator.free(model_path);
-        return self.cachedSpeakerEmbedder(model_path, model_path);
-    }
-    fn cachedSpeakerEmbedder(self: *Node, model_path: []const u8, cache_key: []const u8) !*speaker_embedding_mod.Embedder {
-        {
-            spinLock(&self.speaker_embedders_lock);
-            defer self.speaker_embedders_lock.unlock();
-            if (self.speaker_embedders.get(cache_key)) |embedder| return embedder;
-        }
-        var loaded = try speaker_embedding_mod.Embedder.load(self.allocator, model_path);
-        errdefer loaded.deinit();
-        const owned = try self.allocator.create(speaker_embedding_mod.Embedder);
-        errdefer self.allocator.destroy(owned);
-        owned.* = loaded;
-        const key = try self.allocator.dupe(u8, cache_key);
-        errdefer self.allocator.free(key);
-        spinLock(&self.speaker_embedders_lock);
-        defer self.speaker_embedders_lock.unlock();
-        if (self.speaker_embedders.get(cache_key)) |existing| {
-            self.allocator.free(key);
-            owned.deinit();
-            self.allocator.destroy(owned);
-            return existing;
-        }
-        try self.speaker_embedders.put(self.allocator, key, owned);
-        return owned;
+    fn speakerEmbedder(self: *Node, control: InferenceExecutionControl) !@import("../pipelines/speaker_model_cache.zig").Cache.Lease {
+        const path = try self.resolveSpeakerModelPath();
+        defer self.allocator.free(path);
+        const io = control.io orelse std.Options.debug_io;
+        const revision = try self.chunkSpeakerRevision(path, io, control);
+        return self.pinnedSpeakerEmbedder(self.allocator, path, revision, io, control);
     }
 
     /// Local diarization: replaces the phrases of `result` with
@@ -10746,7 +10715,9 @@ pub const Node = struct {
         control: ?InferenceExecutionControl,
     ) !void {
         if (result.segments.len == 0) return;
-        const embedder = try self.speakerEmbedder();
+        const speaker_lease = try self.speakerEmbedder(control orelse .{});
+        defer speaker_lease.deinit();
+        const embedder = speaker_lease.model();
         const pcm = try audio_mod.copyOrResample(allocator, samples, sample_rate, speaker_embedding_mod.sample_rate);
         defer allocator.free(pcm);
         const labelled = try speaker_embedding_mod.diarizeSegmentsAlloc(allocator, embedder, pcm, result.segments, .{}, control);
@@ -45400,7 +45371,7 @@ const MediaOutputExecution = struct {
     const SpeakerState = struct {
         registry: speakers.Registry = .{},
         timeline: speaker_checkpoint.timeline.Timeline = .{},
-        embedder: ?*speaker_embedding_mod.Embedder = null,
+        embedder: ?@import("../pipelines/speaker_model_cache.zig").Cache.Lease = null,
         identity: [32]u8 = undefined,
         cacheable: bool = false,
         next_window: u64 = 0,
@@ -45692,7 +45663,8 @@ const MediaOutputExecution = struct {
             };
             if (!duplicate) groups += 1;
         }
-        const bytes = try std.math.mul(usize, groups, @sizeOf(SpeakerState) + speakers.max_spans * @sizeOf(speakers.Span) * 2);
+        const root_bytes = (speakers.max_spans / speaker_checkpoint.timeline.block_size) * @sizeOf(*speaker_checkpoint.timeline.Block);
+        const bytes = try std.math.mul(usize, groups, @sizeOf(SpeakerState) + root_bytes + @sizeOf(speaker_checkpoint.timeline.Block));
         if (bytes > budget) return error.ChunkWorkingBudgetExceeded;
         self.speaker_lease = try self.node.model_manager.admitHostPreflight(bytes);
         for (identities, 0..) |maybe_identity, i| {
@@ -45708,6 +45680,7 @@ const MediaOutputExecution = struct {
             state.* = .{ .identity = identity, .cacheable = cacheable, .total_samples = if (provider.final_samples == null) provider.samples else null };
             self.speaker_states[i] = state;
             state.timeline.admission = .{ .context = self.node, .acquire = speakerAdmission };
+            state.timeline.max_blocks = (budget / groups - @sizeOf(SpeakerState) - root_bytes) / @sizeOf(speaker_checkpoint.timeline.Block);
             if (!cacheable) continue;
             var memory_hit = false;
             if (self.node.media_index_cache.get(identity)) |entry| {
@@ -45879,7 +45852,7 @@ const MediaOutputExecution = struct {
                             continue;
                         };
                         _ = self.node.speaker_analysis_model_runs.fetchAdd(1, .monotonic);
-                        embedding = state.embedder.?.embedAlloc(scratch, window.?, self.control) catch |err| {
+                        embedding = state.embedder.?.model().embedAlloc(scratch, window.?, self.control) catch |err| {
                             try self.speakerFailure(i, err);
                             continue;
                         };
@@ -46015,6 +45988,7 @@ const MediaOutputExecution = struct {
         if (self.frame_arena) |*arena| arena.deinit();
         for (self.speaker_states, 0..) |state, i| if (state) |owned| {
             if (!self.leader(i)) continue;
+            if (owned.embedder) |lease| lease.deinit();
             owned.timeline.deinit(a);
             if (owned.borrowed) |entry| self.node.media_index_cache.release(entry);
             a.destroy(owned);
@@ -46793,6 +46767,9 @@ test "model aware media speaker checkpoint runs without ASR and replays source s
     for (full.labels[0..full.count]) |label| silence = silence or label == null;
     try std.testing.expect(silence);
     const baseline_hashes = node.speaker_revision_cache.full_hashes.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, 1), node.speaker_models.imports.load(.monotonic));
+    const old_budget = request.max_working_bytes;
+    request.max_working_bytes = 512 * 1024;
     const baseline_disk_reads = node.media_speaker_store.full_reads.load(.monotonic);
     request.max_chunks = 1;
     var ordinal: u64 = 0;
@@ -46810,6 +46787,7 @@ test "model aware media speaker checkpoint runs without ASR and replays source s
     try std.testing.expectEqual(baseline_runs, node.speaker_analysis_model_runs.load(.monotonic));
     try std.testing.expectEqual(baseline_hashes, node.speaker_revision_cache.full_hashes.load(.monotonic));
     try std.testing.expectEqual(baseline_disk_reads, node.media_speaker_store.full_reads.load(.monotonic));
+    request.max_working_bytes = old_budget;
     var restarted = try Node.init(a, .{ .models_dir = private_models, .max_concurrent_requests = 1 });
     defer restarted.deinit();
     request.continuation = result.summary.identity.cursor(2, &cursor);

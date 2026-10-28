@@ -98,6 +98,7 @@ pub const Cache = struct {
         refs: usize = 1,
         audio_plan_digest: ?[32]u8 = null,
         speaker_blocks_owned: bool = false,
+        opus_owned: bool = false,
         speaker_disk: ?@import("media_speaker_state.zig").DiskCursor = null,
         hash_next: ?*Entry = null,
         older: ?*Entry = null,
@@ -105,6 +106,11 @@ pub const Cache = struct {
         bytes: usize = 0,
         fn destroy(self: *Entry) void {
             const a = self.allocation.backing;
+            if (self.opus_owned) switch (self.data.audio) {
+                .opus => |*index| index.deinit(),
+                .webm => |*index| index.codec.opus.deinit(),
+                else => unreachable,
+            };
             if (self.speaker_blocks_owned) self.data.speaker_analysis.shared.?.releaseBlocks();
             self.arena.deinit();
             self.allocation.deinit();
@@ -299,6 +305,7 @@ pub const Cache = struct {
             },
         };
         entry.bytes = entry.allocation.reserved_bytes + @sizeOf(Entry);
+        if (entry.opus_owned) entry.bytes += entry.data.audio.estimatedBytes();
         if (entry.speaker_blocks_owned) entry.bytes += entry.data.speaker_analysis.shared.?.blocks.len * @sizeOf(@import("media_speaker_timeline.zig").Block);
         if (entry.bytes > max_bytes) {
             entry.destroy();
@@ -376,7 +383,10 @@ pub const Cache = struct {
             },
             .audio_plan => |plan| entry.data = .{ .audio_plan = .{ .points = try a.dupe(@import("media_audio_plan.zig").Point, plan.points), .stride = plan.stride, .hot_ordinals = try a.dupe(u64, plan.hot_ordinals) } },
             .aac => |owner| entry.data = .{ .aac = try @import("media_chunking_audio_source.zig").Mp4.Snapshot.copy(a, owner) },
-            .audio => |index| entry.data = .{ .audio = try index.copy(a) },
+            .audio => |index| {
+                entry.data = .{ .audio = try index.copy(a) };
+                entry.opus_owned = index == .opus or (index == .webm and index.webm.codec == .opus);
+            },
             .mp4 => |original| {
                 var track = original.track;
                 track.avcc = try a.dupe(u8, track.avcc);
