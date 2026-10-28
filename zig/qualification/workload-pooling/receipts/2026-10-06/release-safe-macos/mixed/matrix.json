@@ -1,0 +1,75 @@
+{
+  "passed": false,
+  "failures": [
+    "macos-mixed-load-r01: comparison with candidate-failfast",
+    "macos-mixed-load-r02: comparison with candidate-failfast"
+  ],
+  "profiles": [
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "origin-main",
+      "repetition": 1,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r01-origin-main.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "candidate-fixed",
+      "repetition": 1,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r01-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "candidate-failfast",
+      "repetition": 1,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r01-candidate-failfast.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "candidate-fixed",
+      "repetition": 2,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r02-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "candidate-failfast",
+      "repetition": 2,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r02-candidate-failfast.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "origin-main",
+      "repetition": 2,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r02-origin-main.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "candidate-failfast",
+      "repetition": 3,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r03-candidate-failfast.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "origin-main",
+      "repetition": 3,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r03-origin-main.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "candidate-fixed",
+      "repetition": 3,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-post-main/macos-mixed-load-r03-candidate-fixed.json",
+      "exit_code": 0
+    }
+  ],
+  "automatic_defaults_qualified": false,
+  "repetitions": 3,
+  "order": "rotated each repetition"
+}

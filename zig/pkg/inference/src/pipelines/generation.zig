@@ -4153,6 +4153,7 @@ pub const NativeGenerationPipeline = struct {
     checkpoint_prepare: ?*NativeCheckpointPrepare = null,
     checkpoint_resume: ?*NativeCheckpointResume = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
+    device_memory_budget: ?runtime.kv.device_memory.Budget = null,
     tokenizer: tokenizer_mod.Tokenizer,
     add_bos_token: bool = false,
     bos_token: []const u8 = "",

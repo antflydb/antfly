@@ -1,0 +1,30 @@
+{
+  "pid": 34630,
+  "state": "terminal",
+  "await_pid": 29427,
+  "started": 1791401752.884566,
+  "source_sha256": {
+    "pkg/antfly-embedded/src/storage/inference_provider.zig": "e708c80d260abc0b5284690c84d50d53e9e05cf90912fde5c66a2a06838ced90",
+    "pkg/antfly/src/standalone/runtime.zig": "d1c43c3682c452f48c377ec9cb40f03cd55d641a3336d19c1c98429e70ae6582",
+    "pkg/antfly/build/tests.zig": "5a57ef9582d81bde44db556e418e3cd5ac02d645de7d32a04ab294776a1fcb52",
+    "pkg/inference/src/host/host.zig": "e8e811456fe140c20404d97fc26b4dc1520486888e9d2fc9aa8fdfba8912c3bd",
+    "pkg/inference/src/execution_control.zig": "d9d2fadcc2b6704e917cd40cf269ffd9f93f32ed1b26ace8a9860dea0ef17961"
+  },
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-inference-response-cleanup-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "34359738368",
+    "--cache-dir",
+    "/private/tmp/antfly-default-pooling-cache",
+    "--summary",
+    "all"
+  ],
+  "compile_started": 1791402383.051478,
+  "compiler_pid": 40200,
+  "exit_code": 0,
+  "finished": 1791403946.035557
+}

@@ -19,6 +19,7 @@
 //! borrow serializes cursor advancement; revocation defers destruction until
 //! that borrow ends. The transport must cancel in-flight work on disconnect.
 const std = @import("std");
+const attempts = @import("../common/remote_attempts.zig");
 
 pub const Scope = struct {
     principal: [32]u8,
@@ -30,10 +31,16 @@ pub const Scope = struct {
 };
 pub const Token = struct { incarnation: u128, sequence: u64, slot: u32 };
 pub const Kind = enum { capture, snapshot, cursor };
+/// Physical close, not just revocation of a borrowed capability.
+pub const Retirement = enum { pending, retired };
 pub const Resource = struct {
     ptr: *anyopaque,
     close: *const fn (*anyopaque) void,
     kind: Kind,
+    /// Move-only worker reference acquired before native creation. The caller
+    /// transfers it only on successful insert; release follows physical close.
+    /// It pins the worker registry/attempt, never an ingress-stack Lease.
+    retention: ?attempts.Retention = null,
     /// Optional owner-owned cancellation signal whose lifetime extends through
     /// close. Native page/capture work must use this rather than an RPC stack
     /// token. Revocation sets it even when destruction waits for a borrower.
@@ -50,6 +57,7 @@ pub const Registry = struct {
     mutex: std.Io.Mutex = .init,
     sequence: u64 = 0,
     sweep_position: usize = 0,
+    closed: bool = false,
 
     const Slot = struct {
         entry: ?Entry = null,
@@ -62,6 +70,8 @@ pub const Registry = struct {
         resource: Resource,
         borrowed: bool = false,
         revoked: bool = false,
+        /// Keep global and principal admission charged through physical close.
+        retiring: bool = false,
     };
     pub const Borrow = struct {
         registry: ?*Registry,
@@ -87,10 +97,9 @@ pub const Registry = struct {
             const entry = &slot.entry.?;
             std.debug.assert(entry.borrowed);
             entry.borrowed = false;
-            const retired = if (entry.revoked) entry.resource else null;
-            if (retired != null) slot.entry = null;
+            const retired = if (entry.revoked) registry.revoke(self.slot) else null;
             registry.mutex.unlock(registry.io);
-            if (retired) |resource| resource.close(resource.ptr);
+            if (retired) |resource| registry.retire(self.slot, resource);
         }
     };
 
@@ -105,10 +114,18 @@ pub const Registry = struct {
 
     /// Shutdown must join all request tasks before destroying the registry.
     pub fn deinit(self: *Registry) void {
-        for (self.slots) |slot| if (slot.entry) |entry| {
-            std.debug.assert(!entry.borrowed);
-            entry.resource.close(entry.resource.ptr);
-        };
+        self.mutex.lockUncancelable(self.io);
+        self.closed = true;
+        self.mutex.unlock(self.io);
+        for (0..self.slots.len) |index| {
+            self.mutex.lockUncancelable(self.io);
+            const resource = if (self.slots[index].entry) |entry| value: {
+                std.debug.assert(!entry.borrowed and !entry.retiring);
+                break :value self.revoke(index);
+            } else null;
+            self.mutex.unlock(self.io);
+            if (resource) |value| self.retire(index, value);
+        }
         self.alloc.free(self.slots);
         self.* = undefined;
     }
@@ -119,6 +136,7 @@ pub const Registry = struct {
         if (expires_ns <= now_ns or expires_ns - now_ns > self.max_lease_ns) return error.InvalidRetainedReadLease;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (self.closed) return error.RetainedReadAdmissionExceeded;
         var available: ?usize = null;
         var principal_count: usize = 0;
         for (self.slots, 0..) |slot, i| {
@@ -135,16 +153,32 @@ pub const Registry = struct {
     }
 
     pub fn borrow(self: *Registry, token: Token, scope: Scope, kind: Kind, now_ns: u64) !Borrow {
+        return self.borrowForAttempt(token, scope, kind, now_ns, null);
+    }
+
+    /// Signed request identity is supplied by authenticated ingress, never the
+    /// body. Sequences may differ across capture/open/page requests of one
+    /// operation; coordinator, generation and operation must remain identical.
+    /// Legacy borrows cannot acquire an owned token, or vice versa. Cleanup
+    /// remains scope-authenticated and idempotent even after the owner stops.
+    pub fn borrowForAttempt(self: *Registry, token: Token, scope: Scope, kind: Kind, now_ns: u64, parent: ?attempts.Id) !Borrow {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const index = self.find(token) orelse return error.RetainedReadNotFound;
         const entry = &self.slots[index].entry.?;
         if (!std.meta.eql(entry.scope, scope)) return error.RetainedReadScopeChanged;
+        if (!sameOperation(if (entry.resource.retention) |retained| retained.id else null, parent)) return error.RetainedReadScopeChanged;
         if (entry.revoked or now_ns >= entry.expires_ns) return error.RetainedReadExpired;
         if (entry.resource.kind != kind) return error.InvalidRetainedReadKind;
         if (entry.borrowed) return error.RetainedReadBusy;
         entry.borrowed = true;
         return .{ .registry = self, .slot = index, .resource = entry.resource };
+    }
+
+    fn sameOperation(owned: ?attempts.Id, request: ?attempts.Id) bool {
+        const original = owned orelse return request == null;
+        const current = request orelse return false;
+        return original.coordinator == current.coordinator and original.generation == current.generation and original.operation == current.operation;
     }
 
     pub fn close(self: *Registry, token: Token, scope: Scope) !void {
@@ -159,7 +193,37 @@ pub const Registry = struct {
         }
         const resource = self.revoke(index);
         self.mutex.unlock(self.io);
-        if (resource) |value| value.close(value.ptr);
+        if (resource) |value| self.retire(index, value);
+    }
+
+    /// A cleanup acknowledgement is authoritative only in this exact process
+    /// and for an already issued token. Revocation can leave a borrower or an
+    /// out-of-lock destructor alive; both keep admission charged and pending.
+    /// A disappeared issued token cannot be republished: sequence never wraps.
+    pub fn closeAcknowledged(self: *Registry, token: Token, scope: Scope) !Retirement {
+        self.mutex.lockUncancelable(self.io);
+        if (token.incarnation != self.incarnation) {
+            self.mutex.unlock(self.io);
+            return error.RetainedReadRestartRequired;
+        }
+        if (token.slot >= self.slots.len or token.sequence == 0 or token.sequence > self.sequence) {
+            self.mutex.unlock(self.io);
+            return error.InvalidRetainedReadToken;
+        }
+        const index = self.find(token) orelse {
+            self.mutex.unlock(self.io);
+            return .retired;
+        };
+        if (!std.meta.eql(self.slots[index].entry.?.scope, scope)) {
+            self.mutex.unlock(self.io);
+            return error.RetainedReadScopeChanged;
+        }
+        const resource = self.revoke(index);
+        self.mutex.unlock(self.io);
+        if (resource) |value| self.retire(index, value);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return if (self.find(token) == null) .retired else .pending;
     }
 
     /// Bounded maintenance: at most budget slots and callbacks per invocation.
@@ -174,7 +238,7 @@ pub const Registry = struct {
             else
                 null;
             self.mutex.unlock(self.io);
-            if (resource) |value| value.close(value.ptr);
+            if (resource) |value| self.retire(index, value);
         }
     }
 
@@ -186,7 +250,7 @@ pub const Registry = struct {
             else
                 null;
             self.mutex.unlock(self.io);
-            if (resource) |value| value.close(value.ptr);
+            if (resource) |value| self.retire(index, value);
         }
     }
 
@@ -201,7 +265,7 @@ pub const Registry = struct {
             else
                 null;
             self.mutex.unlock(self.io);
-            if (resource) |value| value.close(value.ptr);
+            if (resource) |value| self.retire(index, value);
         }
     }
 
@@ -214,12 +278,28 @@ pub const Registry = struct {
     }
     fn revoke(self: *Registry, index: usize) ?Resource {
         const entry = &self.slots[index].entry.?;
+        // The destructor may already have freed its owned cancellation signal.
+        // Reentrant/concurrent revocation must not touch physical resources.
+        if (entry.retiring) return null;
         entry.revoked = true;
         if (entry.resource.cancellation) |signal| signal.store(true, .release);
         if (entry.borrowed) return null;
-        const resource = entry.resource;
+        entry.retiring = true;
+        return entry.resource;
+    }
+    fn retire(self: *Registry, index: usize, resource: Resource) void {
+        // Mandatory cleanup neither holds the registry lock nor asks for a new
+        // execution grant. The occupied slot prevents reuse until it returns.
+        resource.close(resource.ptr);
+        // Only now can the signed worker attempt become physically terminal.
+        // Both callbacks run outside this lock while the token slot and its
+        // principal quota remain occupied, including a blocked worker release.
+        if (resource.retention) |parent| parent.release();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.slots[index].entry.?;
+        std.debug.assert(entry.retiring and entry.revoked and !entry.borrowed);
         self.slots[index].entry = null;
-        return resource;
     }
 };
 
@@ -337,4 +417,216 @@ test "retained read registry rejects every changed scope dimension and stale pro
     var live = try registry.borrow(token, scope, .cursor, 2);
     defer live.deinit();
     try live.validate(2);
+}
+
+test "retained read registry charges admission through physical destruction and tolerates reentrant revocation" {
+    const Cleanup = enum { close, expire, disconnect, scoped_disconnect };
+    const Fixture = struct {
+        registry: *Registry,
+        scope: Scope,
+        token: Token = undefined,
+        signal: ?*std.atomic.Value(bool),
+        closed: usize = 0,
+        failure: ?anyerror = null,
+        fn noop(_: *anyopaque) void {}
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+            if (self.closed != 1) {
+                self.failure = error.TestDuplicatePhysicalClose;
+                return;
+            }
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This()) !void {
+            try std.testing.expect(self.signal.?.load(.acquire));
+            std.testing.allocator.destroy(self.signal.?);
+            self.signal = null;
+            // The registry still holds the now-dangling signal pointer. Every
+            // reentrant revocation must skip it while physical close runs.
+            try self.registry.close(self.token, self.scope);
+            self.registry.expire(100, self.registry.slots.len);
+            self.registry.disconnect(10);
+            self.registry.disconnectScoped(self.scope, 10);
+            try std.testing.expectError(error.RetainedReadExpired, self.registry.borrow(self.token, self.scope, .snapshot, 2));
+            const replacement: Resource = .{ .ptr = self, .close = noop, .kind = .snapshot };
+            try std.testing.expectError(error.RetainedReadAdmissionExceeded, self.registry.insert(self.scope, 10, 1, 100, replacement));
+            var other = self.scope;
+            other.principal = @splat(8);
+            if (self.registry.slots.len == 1) {
+                try std.testing.expectError(error.RetainedReadAdmissionExceeded, self.registry.insert(other, 20, 1, 100, replacement));
+            } else {
+                // Only this principal is full; another principal may use the
+                // separate slot. No lock is held through either destructor.
+                const token = try self.registry.insert(other, 20, 1, 100, replacement);
+                try self.registry.close(token, other);
+            }
+        }
+    };
+    for ([_]usize{ 1, 2 }) |capacity| for ([_]bool{ false, true }) |borrowed| for (std.enums.values(Cleanup)) |cleanup| {
+        var registry = try Registry.init(std.testing.allocator, std.testing.io, 5, capacity, 1, 100);
+        defer registry.deinit();
+        const scope: Scope = .{ .principal = @splat(7), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+        const signal = try std.testing.allocator.create(std.atomic.Value(bool));
+        signal.* = .init(false);
+        var fixture: Fixture = .{ .registry = &registry, .scope = scope, .signal = signal };
+        // Physical cleanup owns the signal after insertion.
+        fixture.token = try registry.insert(scope, 10, 1, 100, .{ .ptr = &fixture, .close = Fixture.close, .kind = .snapshot, .cancellation = signal });
+        var active: ?Registry.Borrow = if (borrowed) try registry.borrow(fixture.token, scope, .snapshot, 2) else null;
+        switch (cleanup) {
+            .close => try registry.close(fixture.token, scope),
+            .expire => registry.expire(100, capacity),
+            .disconnect => registry.disconnect(10),
+            .scoped_disconnect => registry.disconnectScoped(scope, 10),
+        }
+        if (active) |*value| {
+            try std.testing.expectEqual(@as(usize, 0), fixture.closed);
+            try std.testing.expectError(error.RetainedReadExpired, value.validate(2));
+            value.deinit();
+        }
+        if (fixture.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+        try std.testing.expect(fixture.signal == null);
+        try std.testing.expectError(error.RetainedReadNotFound, registry.borrow(fixture.token, scope, .snapshot, 2));
+        const replacement = try registry.insert(scope, 10, 1, 100, .{ .ptr = &fixture, .close = Fixture.noop, .kind = .snapshot });
+        try std.testing.expect(replacement.sequence != fixture.token.sequence);
+        try registry.close(replacement, scope);
+    };
+}
+
+test "retained read registry concurrent revocation cannot reuse a closing snapshot slot" {
+    const Fixture = struct {
+        registry: *Registry,
+        token: Token,
+        scope: Scope,
+        entered: std.atomic.Value(bool) = .init(false),
+        released: std.atomic.Value(bool) = .init(false),
+        closes: std.atomic.Value(usize) = .init(0),
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.closes.fetchAdd(1, .monotonic);
+            self.entered.store(true, .release);
+            while (!self.released.load(.acquire)) std.Thread.yield() catch {};
+        }
+        fn run(self: *@This()) void {
+            self.registry.close(self.token, self.scope) catch @panic("unexpected scope change");
+        }
+        fn noop(_: *anyopaque) void {}
+    };
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, 5, 1, 1, 100);
+    defer registry.deinit();
+    const scope: Scope = .{ .principal = @splat(7), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    var fixture: Fixture = .{ .registry = &registry, .token = undefined, .scope = scope };
+    fixture.token = try registry.insert(scope, 10, 1, 100, .{ .ptr = &fixture, .close = Fixture.close, .kind = .snapshot });
+    const closer = try std.Thread.spawn(.{}, Fixture.run, .{&fixture});
+    var joined = false;
+    defer if (!joined) {
+        fixture.released.store(true, .release);
+        closer.join();
+    };
+    while (!fixture.entered.load(.acquire)) std.Thread.yield() catch {};
+    try std.testing.expectError(error.RetainedReadAdmissionExceeded, registry.insert(scope, 10, 1, 100, .{ .ptr = &fixture, .close = Fixture.noop, .kind = .snapshot }));
+    try registry.close(fixture.token, scope);
+    try std.testing.expectEqual(Retirement.pending, try registry.closeAcknowledged(fixture.token, scope));
+    registry.expire(100, 1);
+    registry.disconnect(10);
+    registry.disconnectScoped(scope, 10);
+    try std.testing.expectEqual(@as(usize, 1), fixture.closes.load(.acquire));
+    fixture.released.store(true, .release);
+    closer.join();
+    joined = true;
+    try std.testing.expectEqual(Retirement.retired, try registry.closeAcknowledged(fixture.token, scope));
+    const replacement = try registry.insert(scope, 10, 1, 100, .{ .ptr = &fixture, .close = Fixture.noop, .kind = .snapshot });
+    try registry.close(replacement, scope);
+}
+
+test "retained read registry shutdown closes admission before reentrant physical cleanup" {
+    const Fixture = struct {
+        registry: *Registry,
+        token: Token = undefined,
+        scope: Scope,
+        signal: std.atomic.Value(bool) = .init(false),
+        closed: usize = 0,
+        failure: ?anyerror = null,
+        fn noop(_: *anyopaque) void {}
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This()) !void {
+            try std.testing.expect(self.signal.load(.acquire));
+            try self.registry.close(self.token, self.scope);
+            var other = self.scope;
+            other.principal = @splat(8);
+            // A free slot exists, but shutdown must never publish a new owner.
+            try std.testing.expectError(error.RetainedReadAdmissionExceeded, self.registry.insert(other, 20, 1, 100, .{ .ptr = self, .close = noop, .kind = .cursor }));
+        }
+    };
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, 5, 2, 1, 100);
+    const scope: Scope = .{ .principal = @splat(7), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    var fixture: Fixture = .{ .registry = &registry, .scope = scope };
+    fixture.token = try registry.insert(scope, 10, 1, 100, .{ .ptr = &fixture, .close = Fixture.close, .kind = .cursor, .cancellation = &fixture.signal });
+    registry.deinit();
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+}
+
+test "retained read registry retirement evidence excludes active borrows future tokens and process changes" {
+    const Fixture = struct {
+        owner: *Registry,
+        scope: Scope,
+        token: Token = undefined,
+        closed: usize = 0,
+        failure: ?anyerror = null,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This()) !void {
+            // Reentrant cleanup runs outside the lock but cannot claim the
+            // destructor finished or recycle its still-charged quota.
+            try std.testing.expectEqual(Retirement.pending, try self.owner.closeAcknowledged(self.token, self.scope));
+            try std.testing.expectError(error.RetainedReadAdmissionExceeded, self.owner.insert(self.scope, 11, 1, 100, .{ .ptr = self, .close = close, .kind = .cursor }));
+        }
+    };
+    var owner = try Registry.init(std.testing.allocator, std.testing.io, 5, 1, 1, 100);
+    defer owner.deinit();
+    const scope: Scope = .{ .principal = @splat(7), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    var fixture: Fixture = .{ .owner = &owner, .scope = scope };
+    fixture.token = try owner.insert(scope, 10, 1, 100, .{ .ptr = &fixture, .close = Fixture.close, .kind = .cursor });
+    var wrong = scope;
+    wrong.authorization_revision += 1;
+    try std.testing.expectError(error.RetainedReadScopeChanged, owner.closeAcknowledged(fixture.token, wrong));
+    var future = fixture.token;
+    future.sequence += 1;
+    try std.testing.expectError(error.InvalidRetainedReadToken, owner.closeAcknowledged(future, scope));
+    var old_process = fixture.token;
+    old_process.incarnation -= 1;
+    try std.testing.expectError(error.RetainedReadRestartRequired, owner.closeAcknowledged(old_process, scope));
+    var borrow = try owner.borrow(fixture.token, scope, .cursor, 2);
+    defer borrow.deinit();
+    try std.testing.expectEqual(Retirement.pending, try owner.closeAcknowledged(fixture.token, scope));
+    try std.testing.expectEqual(@as(usize, 0), fixture.closed);
+    try std.testing.expectError(error.RetainedReadAdmissionExceeded, owner.insert(scope, 11, 1, 100, .{ .ptr = &fixture, .close = Fixture.close, .kind = .cursor }));
+    borrow.deinit();
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+    try std.testing.expectEqual(Retirement.retired, try owner.closeAcknowledged(fixture.token, scope));
+    const retired = fixture.token;
+    fixture.token = try owner.insert(scope, 11, 1, 100, .{ .ptr = &fixture, .close = Fixture.close, .kind = .cursor });
+    try std.testing.expectEqual(retired.slot, fixture.token.slot);
+    try std.testing.expectEqual(Retirement.retired, try owner.closeAcknowledged(retired, scope));
+    var replacement = try owner.borrow(fixture.token, scope, .cursor, 2);
+    replacement.deinit();
+    try std.testing.expectEqual(Retirement.retired, try owner.closeAcknowledged(fixture.token, scope));
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), fixture.closed);
 }

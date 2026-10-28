@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-workload-pooling-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "23622320128",
+    "--cache-dir",
+    "/private/tmp/antfly-default-pooling-cache",
+    "--summary",
+    "all"
+  ],
+  "pid": 57950,
+  "exit_code": 0,
+  "finished": 1791396671.92708,
+  "state": "terminal"
+}

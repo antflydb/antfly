@@ -1,0 +1,50 @@
+{
+  "base_commit": "72796babc4",
+  "source_sha256": {
+    "zig/lib/runtime/src/root.zig": "1e786aa836e14cd80249703aef640242894f22c0d885789803389cebb2f88b3f",
+    "zig/lib/runtime/src/runtime_runnable_abi.zig": "9a291be962d57065d0ec88fa104a00a8f97afd5a0a899baef80e61a75e6365fd",
+    "zig/pkg/antfly/src/api/runnable_owner_execution.zig": "852a353a4d0c4d45feb2e527658a97a877eeb3888b3147a6fa4b47f5d7bab453",
+    "zig/pkg/antfly/src/api/kernel_abi.zig": "0b1cbd80179f3d70b77b912c29cf982b6c675b1a0c98143cf4479735e4b386f8",
+    "zig/pkg/antfly/src/api/kernel_exports.zig": "c0157492b056385d0a7a864b8582d081ca0e26f8dc2deda189438013247dd374",
+    "zig/pkg/antfly/src/api/kernel_bridge.zig": "da90199f7acc51e3ca2deedfd5f1a56b18ae7599b5889aeb62ade03fc3a0787b",
+    "zig/pkg/antfly/build/api_tests.zig": "e79c63c20ede80e6f2c57e8f075fbe00e9f239f770a4bb63ede516fa9c3d184f",
+    "zig/pkg/inference/src/host/bridge.zig": "2be968e874d4d76f0d662fb4b4e729cc421168f7d9e757f3031a2e8e963619be",
+    "zig/pkg/inference/src/host/host.zig": "dbf876fd16ee74b1b61362eaeba3f2eeb094452a5f1216cde22c1cd1ebcab757",
+    "zig/pkg/antfly/src/standalone/runtime.zig": "3078cb207c1fa59cec0669535ab2c9d94f3fc3a90b7c29aa59f68b8a8d0ed824"
+  },
+  "native_tests": {
+    "owned_capsules": 5,
+    "protocol_and_imported_layouts": 33,
+    "kernel_layout": 3,
+    "inference_layout": 2
+  },
+  "linux_tests": {
+    "owned_capsules": 5,
+    "protocol_and_imported_layouts": 33,
+    "kernel_layout": 3,
+    "inference_layout": 2
+  },
+  "linux_compiler_image": "sha256:fb3236b6cc7411028d62f76eb418110a6c34e246b9437a9d093d58a53a3e2954",
+  "linux_target": "aarch64-linux-gnu",
+  "linux_limits": {
+    "cpus": 2,
+    "memory_bytes": 1073741824,
+    "memory_and_swap_bytes": 1073741824
+  },
+  "pending": [
+    "Full inference configure/destroy integration gate; stored lease wiring is not execution admission",
+    "Production archive linkage and standalone startup/shutdown for these bytes",
+    "Inference and background consumer integration",
+    "CPU team enforcement, automatic sizing, and pressure qualification"
+  ],
+  "native_api": {
+    "command": "ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-default-pooling-global /Users/ajroetker/bin/zig-0.17.0/zig build antfly-workload-pooling-test -Doptimize=ReleaseSafe -j1 --cache-dir /private/tmp/antfly-default-pooling-cache --summary all",
+    "exit_code": 0,
+    "build_steps": 50,
+    "embedded_tests": 38,
+    "coordinator_tests": 46,
+    "skips": 0,
+    "leaks": 0,
+    "scope": "API factory/getter/wrapper and execution callbacks; full inference configure/destroy and production linkage remain pending"
+  }
+}

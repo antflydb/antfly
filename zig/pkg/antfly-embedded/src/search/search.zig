@@ -134,7 +134,10 @@ pub const NamedGraphResult = struct {
     result: graph_query.GraphQueryResult,
 };
 
+pub const WorkAuthority = @import("work_authority.zig").Authority;
+
 pub const SearchRequest = struct {
+    authority: ?WorkAuthority = null,
     tie_rank: ?scorer_mod.TieRank = null,
     control: query_mod.ExecutionControl = .{},
     query: SearchQuery,
@@ -560,7 +563,8 @@ pub fn execute(
         .prefix, .wildcard, .regexp, .fuzzy => true,
         else => false,
     };
-    var result = if (!pure_pattern and request.sort == null and (request.search_after != null or request.minimum_competitive_score != null or request.text_navigation_plan != null) and request.aggregations.len == 0 and canStreamBool(request.query, 0))
+    if (request.authority) |owner| try owner.check();
+    var result = if (request.authority == null and !pure_pattern and request.sort == null and (request.search_after != null or request.minimum_competitive_score != null or request.text_navigation_plan != null) and request.aggregations.len == 0 and canStreamBool(request.query, 0))
         (try executeStreamingTextBool(alloc, snap, if (request.query == .bool_query) request.query.bool_query else .{ .should = &.{request.query}, .min_should = 1, .pure_should_optional = true }, request, .{})).?
     else if (request.sort != null)
         try executeSort(alloc, snap, request)
@@ -611,19 +615,30 @@ pub fn countMatches(alloc: Allocator, snap: *const index_mod.IndexSnapshot, quer
 pub fn countMatchesPrepared(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, prepared: ?*const TextNavigationPlan) !u32 {
     return countMatchesPreparedWithControl(alloc, snap, query, prepared, .{});
 }
+
+pub fn countMatchesWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, authority: ?WorkAuthority) !u32 {
+    return countMatchesControlled(alloc, snap, query, .{}, authority);
+}
 pub fn countMatchesWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, control: query_mod.ExecutionControl) !u32 {
     return countMatchesPreparedWithControl(alloc, snap, query, null, control);
 }
-pub fn countMatchesPreparedWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, prepared: ?*const TextNavigationPlan, unprepared: query_mod.ExecutionControl) !u32 {
+pub fn countMatchesControlled(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, control: query_mod.ExecutionControl, authority: ?WorkAuthority) !u32 {
+    return countMatchesPreparedControlled(alloc, snap, query, null, control, authority);
+}
+pub fn countMatchesPreparedWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, prepared: ?*const TextNavigationPlan, control: query_mod.ExecutionControl) !u32 {
+    return countMatchesPreparedControlled(alloc, snap, query, prepared, control, null);
+}
+pub fn countMatchesPreparedControlled(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, prepared: ?*const TextNavigationPlan, unprepared: query_mod.ExecutionControl, authority: ?WorkAuthority) !u32 {
     var programs = query_mod.PatternPrograms.init(alloc, 2 * 1024 * 1024);
     defer programs.deinit();
     var control = unprepared;
     if (control.pattern_programs == null) control.pattern_programs = &programs;
     try control.check();
+    if (authority) |owner| try owner.check();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const filter = try searchQueryToFilterWithPreparation(arena.allocator(), query, if (prepared) |plan| if (plan.stats.count == snap.scoringDocCount()) plan else null else null);
-    return std.math.cast(u32, try snap.countFilter(alloc, filter.withControl(control))) orelse error.CountOverflow;
+    return std.math.cast(u32, try query_mod.countFilterWithAuthority(alloc, snap, filter.withControl(control), authority)) orelse error.CountOverflow;
 }
 
 pub fn executeCountCandidates(
@@ -631,29 +646,38 @@ pub fn executeCountCandidates(
     snap: *const index_mod.IndexSnapshot,
     query: SearchQuery,
 ) !SearchResult {
-    return executeCountCandidatesWithControl(alloc, snap, query, .{});
+    return executeCountCandidatesWithAuthority(alloc, snap, query, null);
 }
 
-pub fn executeCountCandidatesWithControl(
-    alloc: Allocator,
-    snap: *const index_mod.IndexSnapshot,
-    query: SearchQuery,
-    unprepared: query_mod.ExecutionControl,
-) !SearchResult {
+pub fn executeCountCandidatesWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, authority: ?WorkAuthority) !SearchResult {
+    return executeCountCandidatesControlled(alloc, snap, query, .{}, authority);
+}
+
+pub fn executeCountCandidatesWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, control: query_mod.ExecutionControl) !SearchResult {
+    return executeCountCandidatesControlled(alloc, snap, query, control, null);
+}
+
+pub fn executeCountCandidatesControlled(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, unprepared: query_mod.ExecutionControl, authority: ?WorkAuthority) !SearchResult {
     var programs = query_mod.PatternPrograms.init(alloc, 2 * 1024 * 1024);
     defer programs.deinit();
     var control = unprepared;
     if (control.pattern_programs == null) control.pattern_programs = &programs;
+    try control.check();
+    if (authority) |owner| try owner.check();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
     const filter = try searchQueryToFilterArena(arena.allocator(), query);
-    const doc_ids = try snap.executeFilter(alloc, filter.withControl(control));
+    const doc_ids = try query_mod.executeFilterWithAuthority(alloc, snap, filter.withControl(control), authority);
     defer alloc.free(doc_ids);
 
     var hits = try alloc.alloc(ScoredHit, doc_ids.len);
     errdefer alloc.free(hits);
     for (doc_ids, 0..) |doc_id, i| {
+        if (i % 64 == 0) {
+            if (authority) |owner| try owner.check();
+            try control.check();
+        }
         hits[i] = .{
             .doc_id = doc_id,
             .score = 0,
@@ -662,6 +686,7 @@ pub fn executeCountCandidatesWithControl(
         };
     }
 
+    if (authority) |owner| try owner.check();
     return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(doc_ids.len) };
 }
 
@@ -782,25 +807,15 @@ fn searchSnapshotTerms(
 ) !scorer_mod.SearchResults {
     const stats = matchingFieldStats(request.distributed_text_stats, field, terms);
     const k = if (requestHasDocNumConstraints(request)) @as(u32, @intCast(@min(snap.liveDocCount(), std.math.maxInt(u32)))) else effectiveK(request, snap);
-    if (request.diagnostics) |diagnostics| {
-        if (stats == null) {
-            return snap.searchWithConfigDiagnostics(
-                alloc,
-                field,
-                terms,
-                k,
-                request.bm25_config,
-                diagnostics,
-            );
-        }
-    }
-    return snap.searchWithOverrideAndConfig(
+    return snap.searchWithAuthority(
         alloc,
         field,
         terms,
         k,
         stats,
         request.bm25_config,
+        if (stats == null) request.diagnostics else null,
+        request.authority,
     );
 }
 
@@ -994,7 +1009,7 @@ fn executeFilterQuery(
         // Expansion queries have constant scores. Keep exact membership in a
         // bitmap and retain only the requested page prefix, rather than one
         // document-ID array plus one ScoredHit for every matching document.
-        var matches = try snap.executeFilterBitmap(alloc, filter.withControl(request.control));
+        var matches = try query_mod.executeFilterBitmapWithAuthority(alloc, snap, filter.withControl(request.control), request.authority);
         defer matches.deinit();
         try applyDocNumConstraintsToBitmap(alloc, &matches, request);
         var scored = std.ArrayListUnmanaged(scorer_mod.ScoredHit).empty;
@@ -1012,7 +1027,10 @@ fn executeFilterQuery(
         while (scan_page) {
             if (scored.items.len >= keep) break;
             const doc_id = iterator.next() orelse break;
-            if (visited % 256 == 0) try request.control.check();
+            if (visited % 64 == 0) {
+                if (request.authority) |owner| try owner.check();
+                try request.control.check();
+            }
             visited += 1;
             if (request.search_after) |cursor| {
                 if (!(boost < cursor.score or (boost == cursor.score and doc_id > cursor.doc_id))) continue;
@@ -1055,7 +1073,7 @@ fn executeFilterQuery(
         defer alloc.free(hits);
         return buildResult(alloc, snap, hits, collector.total_count, .exact, request);
     }
-    const doc_ids = try snap.executeFilter(alloc, filter.withControl(request.control));
+    const doc_ids = try query_mod.executeFilterWithAuthority(alloc, snap, filter.withControl(request.control), request.authority);
 
     defer alloc.free(doc_ids);
 
@@ -1515,7 +1533,7 @@ fn executeMatchAll(
 ) !SearchResult {
     // Use filter to get all doc IDs
     const filter = query_mod.Filter{ .match_all = {} };
-    const raw_doc_ids = try snap.executeFilter(alloc, filter.withControl(request.control));
+    const raw_doc_ids = try query_mod.executeFilterWithAuthority(alloc, snap, filter.withControl(request.control), request.authority);
     defer alloc.free(raw_doc_ids);
 
     // Unlike every other query type, match_all never goes through the
@@ -2652,6 +2670,7 @@ fn collectFastMustSegment(
 fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEntry, inv_reader: anytype, terms: []const SimpleTextTerm, frequencies: []const u32, offset: u32, request: SearchRequest, collector: *FastTopK, doc_count: u32, avg_dl: f32, bound_table: ?*const inverted.BM25BoundTable) !void {
     var wand = scorer_mod.WANDScorer.init(alloc, collector.k, doc_count, avg_dl, request.bm25_config);
     defer wand.deinit();
+    wand.authority = request.authority;
     if (bound_table) |table| wand.setBoundTable(table);
     for (terms, frequencies) |term, frequency| {
         const lookup = (try inv_reader.lookup(term.term)) orelse continue;
@@ -5262,6 +5281,7 @@ fn scoreStreamingBoolPlans(alloc: Allocator, snap: *const index_mod.IndexSnapsho
 }
 
 fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, producers: ProducerConstraints) !?SearchResult {
+    if (request.authority != null) return null;
     if (request.aggregations.len != 0 or !canStreamBool(.{ .bool_query = bq }, 0)) return null;
     var collector: FastTopK = .{ .tie_rank = request.tie_rank, .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .minimum_competitive_score = request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
     defer collector.deinit();
@@ -5846,7 +5866,7 @@ fn executeSort(
     // Get matching doc IDs via filter
     const owned_filter = try queryToFilter(alloc, request.query);
     defer owned_filter.deinit(alloc);
-    const doc_ids = try snap.executeFilter(alloc, owned_filter.filter.withControl(request.control));
+    const doc_ids = try query_mod.executeFilterWithAuthority(alloc, snap, owned_filter.filter.withControl(request.control), request.authority);
     defer alloc.free(doc_ids);
 
     // Read sort field values and pair with doc IDs
@@ -9251,6 +9271,144 @@ test "external lake producer top k shares segment bound planning across fragment
     try std.testing.expectEqual(@as(u64, 20), diagnostics.segments_considered);
     try std.testing.expect(diagnostics.segments_pruned > 0);
     try std.testing.expect(diagnostics.segments_searched < 20);
+}
+
+test "native text search propagates lifetime authority through snapshot scoring and recovers" {
+    const a = std.testing.allocator;
+    var inv = inverted.InvertedIndexBuilder.init(a, .{});
+    defer inv.deinit();
+    for (0..512) |doc| try inv.addDocument(@intCast(doc), &.{
+        .{ .term = "hello", .freq = 1, .norm = 1 },
+    });
+    const inv_data = try inv.build();
+    defer a.free(inv_data);
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    const field = try segment.addField("title");
+    try segment.addSection(field, .inverted_text, inv_data);
+    for (0..512) |doc| {
+        const id = try std.fmt.allocPrint(a, "doc-{d}", .{doc});
+        defer a.free(id);
+        try segment.addStoredDoc(id, "{}");
+    }
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    const State = struct {
+        calls: usize = 0,
+        reject: bool = true,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.reject and self.calls == 8) return error.SchedulerClosed;
+        }
+    };
+    var state: State = .{};
+    const request: SearchRequest = .{
+        .query = .{ .term = .{ .field = "title", .term = "hello" } },
+        .k = 512,
+        .include_stored = false,
+        .authority = .{ .context = &state, .check_fn = State.check },
+    };
+    try std.testing.expectError(error.SchedulerClosed, execute(a, snapshot, request));
+    try std.testing.expectEqual(@as(usize, 8), state.calls);
+    // Reuse the snapshot after failure and compare controlled and legacy runs.
+    // The test allocator also checks retirement of request-owned output.
+    state.reject = false;
+    var controlled = try execute(a, snapshot, request);
+    defer controlled.deinit();
+    var legacy_request = request;
+    legacy_request.authority = null;
+    var legacy = try execute(a, snapshot, legacy_request);
+    defer legacy.deinit();
+    try std.testing.expectEqual(legacy.total_hits, controlled.total_hits);
+    try std.testing.expectEqual(legacy.hits.len, controlled.hits.len);
+    for (legacy.hits, controlled.hits) |expected, actual| {
+        try std.testing.expectEqual(expected.doc_id, actual.doc_id);
+        try std.testing.expectEqual(expected.score, actual.score);
+    }
+}
+
+test "native text count authority covers exact and candidate count entry points" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 1 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    _ = try writer.deleteById("one");
+    const snapshot = writer.snapshot();
+    const query: SearchQuery = .{ .term = .{ .field = "title", .term = "hello" } };
+    const State = struct {
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.fail_at == self.calls) return error.SchedulerClosed;
+        }
+    };
+    var state: State = .{};
+    const authority: WorkAuthority = .{ .context = &state, .check_fn = State.check };
+    try std.testing.expectEqual(@as(u32, 1), try countMatchesWithAuthority(a, snapshot, query, authority));
+    const exact_checks = state.calls;
+    state = .{};
+    var candidates = try executeCountCandidatesWithAuthority(a, snapshot, query, authority);
+    defer candidates.deinit();
+    try std.testing.expectEqual(@as(u32, 1), candidates.total_hits);
+    const candidate_checks = state.calls;
+    for (1..exact_checks + 1) |fail_at| {
+        state = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.SchedulerClosed, countMatchesWithAuthority(a, snapshot, query, authority));
+    }
+    for (1..candidate_checks + 1) |fail_at| {
+        state = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.SchedulerClosed, executeCountCandidatesWithAuthority(a, snapshot, query, authority));
+    }
+}
+
+test "native dictionary search entry retains lifetime authority through filters" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "help", .freq = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    const State = struct {
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.fail_at == self.calls) return error.SchedulerClosed;
+        }
+    };
+    var state: State = .{};
+    const request: SearchRequest = .{
+        .query = .{ .prefix = .{ .field = "title", .prefix = "hel" } },
+        .include_stored = false,
+        .authority = .{ .context = &state, .check_fn = State.check },
+    };
+    var actual = try execute(a, snapshot, request);
+    defer actual.deinit();
+    try std.testing.expectEqual(@as(usize, 2), actual.hits.len);
+    const checks = state.calls;
+    try std.testing.expect(checks > 5);
+    for (1..checks + 1) |fail_at| {
+        state = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.SchedulerClosed, execute(a, snapshot, request));
+        try std.testing.expectEqual(fail_at, state.calls);
+    }
 }
 
 test "streaming boolean nested mixed fields match all hit reference" {

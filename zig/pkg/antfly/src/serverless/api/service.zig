@@ -19,6 +19,8 @@ const api_types = @import("types.zig");
 const api_codec = @import("codec.zig");
 const builder_mod = @import("../build/builder.zig");
 const wal_mod = @import("../wal/mod.zig");
+const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+const Cancellation = @import("antfly_cancellation").CancellationToken;
 
 pub const Service = struct {
     alloc: Allocator,
@@ -34,12 +36,72 @@ pub const Service = struct {
     }
 
     pub fn ingestBatch(self: *Service, req: api_types.IngestBatchRequest) !api_types.IngestBatchResult {
-        if (req.mutations.len == 0) return .{
-            .namespace = try self.alloc.dupe(u8, req.namespace),
-            .mutation_count = 0,
-            .start_lsn = 0,
-            .end_lsn = 0,
+        return self.ingestBatchWithCancellation(req, .none);
+    }
+
+    pub fn ingestBatchWithCancellation(self: *Service, req: api_types.IngestBatchRequest, cancellation: Cancellation) !api_types.IngestBatchResult {
+        return self.ingestBatchControlled(req, cancellation, null);
+    }
+
+    /// Charge the task node, joined handle, stable bridge and callback packet
+    /// in the ingress root before any worker or durable phase is published.
+    pub fn completionRetainedBytes() usize {
+        return @import("../../api/runnable_completion_task.zig").Task.retainedBytes() + @sizeOf(@import("../../api/runnable_local_completion.zig").Bridge) + @sizeOf(IngestCompletion);
+    }
+
+    /// Reserve the real worker before possible durable acceptance. The caller
+    /// retains request inputs, allocator, executor and execution through join.
+    pub fn ingestBatchWithExecution(self: *Service, req: api_types.IngestBatchRequest, cancellation: Cancellation, execution: *Runnable.Execution, io: std.Io) !api_types.IngestBatchResult {
+        try cancellation.check();
+        const entry = execution.entry orelse return error.InvalidRunnableTransition;
+        if (entry.bytes < completionRetainedBytes()) return error.InvalidRunnableDemand;
+        const runtime = @import("antfly_runtime_abi");
+        var bridge: @import("../../api/runnable_local_completion.zig").Bridge = .{
+            .read = .{ .execution = execution, .allocator = self.alloc },
+            .io = io,
         };
+        var work: IngestCompletion = .{ .service = self, .request = req, .execution = execution };
+        defer if (work.result) |*result| result.deinit(self.alloc);
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        var task = try @import("../../api/runnable_completion_task.zig").Task.reserve(self.alloc, io, try bridge.borrow(), &.{
+            .io = &io_borrow,
+            .native_deadline = 1,
+            .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s,
+        }, &work, IngestCompletion.run);
+        defer task.deinit();
+        try cancellation.check();
+        try task.runAndJoin();
+        const result = work.result orelse return error.InvalidRunnableTransition;
+        work.result = null;
+        return result;
+    }
+
+    const IngestCompletion = struct {
+        service: *Service,
+        request: api_types.IngestBatchRequest,
+        execution: *Runnable.Execution,
+        result: ?api_types.IngestBatchResult = null,
+        fn run(raw: *anyopaque, _: @import("antfly_runtime_abi").runnable_abi.Borrowed, _: std.Io) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.result = try self.service.ingestBatchControlled(self.request, .none, self.execution);
+        }
+    };
+
+    fn ingestBatchControlled(self: *Service, req: api_types.IngestBatchRequest, cancellation: Cancellation, execution: ?*Runnable.Execution) !api_types.IngestBatchResult {
+        try cancellation.check();
+        const namespace = try self.alloc.dupe(u8, req.namespace);
+        errdefer self.alloc.free(namespace);
+        // Prepare application-owned encoding before any WAL record is accepted.
+        const encoded_mutations = try self.alloc.alloc([]u8, req.mutations.len);
+        defer self.alloc.free(encoded_mutations);
+        var prepared: usize = 0;
+        defer for (encoded_mutations[0..prepared]) |encoded| self.alloc.free(encoded);
+        for (req.mutations) |mutation| {
+            try cancellation.check();
+            if (execution) |active| try active.checkpoint();
+            encoded_mutations[prepared] = try api_codec.encodeMutationAlloc(self.alloc, mutation);
+            prepared += 1;
+        }
 
         for (req.mutations) |mutation| {
             if (mutation.kind == .checkpoint or mutation.kind == .enriched) return error.InvalidDocumentMutation;
@@ -55,16 +117,23 @@ pub const Service = struct {
         }
         var start_lsn: u64 = 0;
         var end_lsn: u64 = 0;
-        for (req.mutations, 0..) |mutation, idx| {
-            const encoded = try api_codec.encodeMutationAlloc(self.alloc, mutation);
-            defer self.alloc.free(encoded);
-            const lsn = try self.wal.append(req.namespace, req.timestamp_ns, encoded);
+        for (encoded_mutations, 0..) |encoded, idx| {
+            if (execution) |active| try active.checkpoint();
+            // The first append crosses the durable acceptance boundary.
+            // Check after encoding, then finish the accepted batch without
+            // replacing its acknowledgement with foreground cancellation.
+            if (idx == 0) try cancellation.check();
+            if (execution) |active| try active.checkpoint();
+            const lsn = if (execution) |active|
+                try self.wal.appendWithExecution(req.namespace, req.timestamp_ns, encoded, active)
+            else
+                try self.wal.append(req.namespace, req.timestamp_ns, encoded);
             if (idx == 0) start_lsn = lsn;
             end_lsn = lsn;
         }
 
         return .{
-            .namespace = try self.alloc.dupe(u8, req.namespace),
+            .namespace = namespace,
             .mutation_count = req.mutations.len,
             .start_lsn = start_lsn,
             .end_lsn = end_lsn,
@@ -72,15 +141,14 @@ pub const Service = struct {
     }
 
     pub fn ingestTableBatch(self: *Service, req: api_types.TableIngestBatchDomainRequest) !api_types.TableIngestBatchResult {
-        var result = try self.ingestBatch(.{
+        const result = try self.ingestBatch(.{
             .namespace = req.table_name,
             .timestamp_ns = req.timestamp_ns,
             .mutations = req.mutations,
         });
-        defer result.deinit(self.alloc);
-
+        // The namespace already owns the identical table name. Transfer it.
         return .{
-            .table_name = try self.alloc.dupe(u8, req.table_name),
+            .table_name = result.namespace,
             .mutation_count = result.mutation_count,
             .start_lsn = result.start_lsn,
             .end_lsn = result.end_lsn,
@@ -105,6 +173,67 @@ pub const Service = struct {
         };
     }
 };
+
+test "serverless execution ingest prepares application memory before the first WAL record" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var path_buf: [256]u8 = undefined;
+            const root = tmpPath(&path_buf, "prepared-ingest");
+            defer cleanupTmp(root);
+            var fs = try wal_mod.FsStore.init(std.testing.allocator, std.mem.span(root));
+            var wal = fs.walStore();
+            defer wal.deinit();
+            var api = Service.init(alloc, &wal, undefined);
+            const mutations = [_]api_types.DocumentMutation{
+                .{ .kind = .upsert, .doc_id = "one", .body = "{}" },
+                .{ .kind = .upsert, .doc_id = "two", .body = "{}" },
+            };
+            var result = api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &mutations }) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expectEqual(@as(u64, 0), try wal.latestLsn("docs"));
+                return err;
+            };
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 2), try wal.latestLsn("docs"));
+            try std.testing.expectEqual(@as(usize, 2), result.mutation_count);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+
+    const Budget = @import("../../common/allocation_budget.zig").Shared;
+    const State = struct {
+        original: *wal_mod.WalStore,
+        budget: *Budget,
+        fn append(raw: *anyopaque, namespace: []const u8, timestamp: u64, payload: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const lsn = try self.original.append(namespace, timestamp, payload);
+            self.budget.limit = 0;
+            return lsn;
+        }
+    };
+    var path_buf: [256]u8 = undefined;
+    const root = tmpPath(&path_buf, "accepted-ingest-memory");
+    defer cleanupTmp(root);
+    var fs = try wal_mod.FsStore.init(std.testing.allocator, std.mem.span(root));
+    var original = fs.walStore();
+    defer original.deinit();
+    var budget: Budget = .{ .child = std.testing.allocator, .limit = 4096 };
+    var state: State = .{ .original = &original, .budget = &budget };
+    var vtable = original.vtable.*;
+    vtable.append = State.append;
+    var intercepted: wal_mod.WalStore = .{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &vtable };
+    var api = Service.init(budget.allocator(), &intercepted, undefined);
+    const mutations = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "one", .body = "{}" },
+        .{ .kind = .upsert, .doc_id = "two", .body = "{}" },
+    };
+    var result = try api.ingestTableBatch(.{ .table_name = "docs", .timestamp_ns = 1, .mutations = &mutations });
+    try std.testing.expectEqualStrings("docs", result.table_name);
+    try std.testing.expectEqual(@as(u64, 2), result.end_lsn);
+    try std.testing.expectEqual(@as(u64, 2), try original.latestLsn("docs"));
+    result.deinit(budget.allocator());
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().used_bytes);
+}
 
 test "api service ingests typed mutations and builds published namespace" {
     const alloc = std.testing.allocator;

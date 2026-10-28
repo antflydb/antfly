@@ -69,6 +69,9 @@ pub fn build(b: *std.Build) void {
     if (b.option(bool, "embedded-only", "Compose only the Apache embedded products") orelse false) {
         return @import("embedded.build.zig").buildDependency(b, @This());
     }
+    const joinable_threaded = @import("build_support/joinable_threaded.zig");
+    const owned_worker_library = joinable_threaded.prepare(b);
+    defer joinable_threaded.attach(b, owned_worker_library);
 
     _ = create(b);
 }
@@ -177,7 +180,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_imports = shared.antfly_imports;
     const production_antfly_imports = shared.production_antfly_imports;
     production_antfly_imports.configureRuntimeContracts(usermgr_mod);
-    production_antfly_imports.storage_boundary.configureSources(usermgr_mod, false, false);
+    production_antfly_imports.storage_boundary.configureProfile(usermgr_mod, false, false, .common);
     const onnx_build = @import("onnx_graph").support;
     const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)") orelse false;
     if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))
@@ -451,9 +454,99 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = httpx_mod,
         .filters = selectTestFilters(b, &.{}),
     });
+    const request_lifetime_mod = b.createModule(.{
+        .root_source_file = b.path("lib/httpx/src/request_lifetime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    request_lifetime_mod.addImport("antfly-json", json_mod);
+    const httpx_request_lifetime_tests = b.addTest(.{
+        .name = "httpx-request-lifetime-tests",
+        .root_module = request_lifetime_mod,
+        .filters = &.{ "HTTP request lifetime", "H1 orderly half close", "H1 context preserves buffered pipeline", "H1 context does not treat a partial pipeline suffix", "H1 hard disconnect remains observable" },
+        .max_rss = 2 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const request_lifetime_run = b.addRunArtifact(httpx_request_lifetime_tests);
+    request_lifetime_run.addArg("--require-no-skips");
+    b.step("lib-httpx-request-lifetime-test", "Verify total request ceilings, physical output and H1 half-close compatibility")
+        .dependOn(&request_lifetime_run.step);
+
+    const runtime_http_control_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_http_bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    runtime_http_control_mod.addImport("httpx", httpx_mod);
+    const runtime_http_control_tests = b.addTest(.{
+        .name = "runtime-http-control-tests",
+        .root_module = runtime_http_control_mod,
+        .filters = &.{ "runtime HTTP streaming", "outbound", "missing linked callbacks", "linked request bodies", "linked callbacks", "opaque HTTP controls", "runtime HTTP values retain", "linked incremental" },
+        .max_rss = 2 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const runtime_http_control_run = b.addRunArtifact(runtime_http_control_tests);
+    runtime_http_control_run.addArg("--require-no-skips");
+    b.step("lib-runtime-http-control-test", "Verify synchronous opaque HTTP controls and physical I/O retirement")
+        .dependOn(&runtime_http_control_run.step);
+
     const run_httpx_tests = b.addRunArtifact(httpx_tests);
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
+
+    const httpx_response_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/httpx/src/response_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    httpx_response_test_mod.addImport("antfly-json", json_mod);
+    const httpx_response_tests = b.addTest(.{
+        .name = "httpx-response-tests",
+        .root_module = httpx_response_test_mod,
+        .max_rss = 512 * 1024 * 1024,
+    });
+    b.step("lib-httpx-response-test", "Run HTTP response ownership and builder contracts")
+        .dependOn(&b.addRunArtifact(httpx_response_tests).step);
+
+    const h2_flow_mod = b.createModule(.{
+        .root_source_file = b.path("lib/httpx/src/h2_flow_control_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const h2_flow_tests = b.addTest(.{
+        .name = "httpx-h2-flow-tests",
+        .root_module = h2_flow_mod,
+        .max_rss = 1024 * 1024 * 1024,
+        .filters = &.{ "H2 flow", "flow", "window", "Window", "controlled", "credit", "signalAllStreams" },
+    });
+    b.step("lib-httpx-h2-flow-test", "Run H2 flow-control waits, cancellation and original deadlines")
+        .dependOn(&b.addRunArtifact(h2_flow_tests).step);
+
+    if (target.result.os.tag == .macos or (target.result.os.tag == .linux and target.result.abi.isGnu())) {
+        const signal_stack_mod = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true });
+        signal_stack_mod.addCSourceFile(.{ .file = b.path("lib/platform/src/native_signal_stack.c"), .flags = &.{ "-std=c11", "-pthread", "-DANTFLY_SIGNAL_STACK_TEST" } });
+        if (target.result.os.tag == .linux) signal_stack_mod.linkSystemLibrary("dl", .{});
+        const signal_stack_test = b.addExecutable(.{ .name = "shared-signal-stack-test", .root_module = signal_stack_mod });
+        b.step("shared-signal-stack-test", "Verify a native worker overflow uses the shared full-size signal stack").dependOn(&b.addRunArtifact(signal_stack_test).step);
+    }
+
+    const protected_dispatch_mod = b.createModule(.{
+        .root_source_file = b.path("lib/httpx/src/protected_dispatch_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    protected_dispatch_mod.addImport("antfly-json", json_mod);
+    const protected_dispatch_tests = b.addTest(.{
+        .name = "httpx-protected-dispatch-tests",
+        .root_module = protected_dispatch_mod,
+        .filters = &.{ "protected dispatch", "HTTP runtime reserves", "HTTP runtime observer startup failure", "HTTP application memory", "large raw stream", "explicit large stream" },
+    });
+    b.step("lib-httpx-protected-dispatch-test", "Run protected HTTP dispatch and executor reservation contracts")
+        .dependOn(&b.addRunArtifact(protected_dispatch_tests).step);
 
     const httpx_client_lifecycle_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -462,7 +555,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = &.{ "admitted transport", "request gate", "request watchdog", "request task admission", "request cancellation before socket publication", "successful H1 requests do not wait" },
+        .filters = &.{ "admitted transport", "busy H1 pool admission", "request gate", "request watchdog", "request task admission", "request cancellation before socket publication", "successful H1 requests do not wait", "outbound admission", "outbound pool", "H2StreamReader", "H2 entry lease", "pooled H2 stream", "H2 stream response", "H2 stream cleanup", "HTTPS client round trip", "Socket owned", "Socket controlled resolver", "Socket output wait", "Socket controlled receive", "HTTP1 request controls", "HTTPS request controls", "HTTPS pooled reuse", "H2 completion waits", "H2 health probe", "H2 cleanup lock deadline", "H2 cleanup reset", "H2 setup denied", "H2 setup deadline", "direct cached connect", "original request control deadline" },
     });
     const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
     b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
@@ -1043,6 +1136,12 @@ pub fn create(b: *std.Build) ?Artifacts {
         inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
             tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
+    // This host consumer deliberately calls the external API table symbol.
+    // Preserve consumer-before-provider archive order, as in production.
+    const api_kernel_owner_boundary_tests = owner_tests.api_kernel_owner_boundary_tests;
+    api_kernel_owner_boundary_tests.root_module.addObject(consumer_test_metadata.object);
+    inline for (.{ .api_kernel, .storage_kernel, .enrichment_compute, .inference }) |unit|
+        api_kernel_owner_boundary_tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const standalone_initial_fk_tests = owner_tests.standalone_initial_fk_tests;
     standalone_initial_fk_tests.root_module.addObject(consumer_test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|

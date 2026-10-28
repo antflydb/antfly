@@ -1,0 +1,16 @@
+Build Summary: 13/13 steps succeeded; 3/3 tests passed
+antfly-table-write-execution-contract-test success
++- run test table-write-execution-contract-tests 3 pass (3 total) 2ms MaxRSS:34M
+   +- compile test table-write-execution-contract-tests safe aarch64-linux-gnu success 11s MaxRSS:665M
+      +- options cached
+      +- options cached
+      +- options cached
+      +- WriteFile tokenizer.json cached
+      +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf cached
+      +- options cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+         +- compile exe patch_sentencepiece_proto safe native cached 19ms MaxRSS:57M
+         +- run exe protoc-zig (sentencepiece_proto_raw) cached
+         |  +- compile exe protoc-zig safe native cached 21ms MaxRSS:59M
+         +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+

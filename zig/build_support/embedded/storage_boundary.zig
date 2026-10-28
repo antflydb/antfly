@@ -102,6 +102,7 @@ pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     identity.addImport("runtime_failure_abi", failure);
     const owner = b.createModule(.{ .root_source_file = local_path.path(b, "storage/kernel_owner_abi.zig"), .target = target, .optimize = optimize });
     owner.addImport("runtime_failure_abi", failure);
+    owner.addImport("runtime_memory_abi", memory);
     const enrichment = b.createModule(.{ .root_source_file = local_path.path(b, "storage/enrichment_compute_abi.zig"), .target = target, .optimize = optimize });
     enrichment.addImport("runtime_failure_abi", failure);
     enrichment.addImport("runtime_memory_abi", memory);

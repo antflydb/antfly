@@ -30,7 +30,15 @@ pub const install_receipt_key = "\x00\x00__metadata__:empty_generation_handoff_i
 pub const Install = topology.GenerationHandoffInstall;
 
 pub fn installReceiptDigest(command: Install) !integrity.Digest {
-    try command.validate();
+    return installReceiptDigestInner(command, null);
+}
+
+pub fn installReceiptDigestWithAdmission(command: Install, control: @import("../../common/read_admission.zig").Port) !integrity.Digest {
+    return installReceiptDigestInner(command, control);
+}
+
+fn installReceiptDigestInner(command: Install, control: ?@import("../../common/read_admission.zig").Port) !integrity.Digest {
+    if (control) |original| try command.validateWithAdmission(original) else try command.validate();
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly empty generation mapped admissions v1");
     hash.update(&command.scope);
@@ -42,6 +50,7 @@ pub fn installReceiptDigest(command: Install) !integrity.Digest {
     std.mem.writeInt(u64, &number, @intCast(command.mappings.len), .little);
     hash.update(&number);
     for (command.mappings) |mapping| {
+        if (control) |original| try original.checkpoint();
         inline for (.{ mapping.source_child_table_id, mapping.target_child_table_id }) |value| {
             std.mem.writeInt(u64, &number, value, .little);
             hash.update(&number);
@@ -59,6 +68,7 @@ pub fn installReceiptDigest(command: Install) !integrity.Digest {
     }
     var digest: integrity.Digest = undefined;
     hash.final(&digest);
+    if (control) |original| try original.checkpoint();
     return digest;
 }
 

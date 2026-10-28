@@ -354,7 +354,7 @@ fn serial(items: []const micro.ExecuteItem) void {
             item.slot.fail(err);
             continue;
         };
-        item.slot.setValue([]Tensor, output, .fallback);
+        item.slot.setOwnedValue([]Tensor, output, .fallback, std.heap.smp_allocator, destroy);
     }
 }
 
@@ -375,7 +375,7 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     if (items.len == 1) {
         const output = try direct(std.heap.smp_allocator, items[0].payloadAs(Ticket).*);
         items[0].slot.physical_group_key = @intFromPtr(items[0].slot);
-        items[0].slot.setValue([]Tensor, output, if (items[0].payloadAs(Ticket).rows > 1) .native_batch else .serial);
+        items[0].slot.setOwnedValue([]Tensor, output, if (items[0].payloadAs(Ticket).rows > 1) .native_batch else .serial, std.heap.smp_allocator, destroy);
         return;
     }
     const alloc = std.heap.smp_allocator;
@@ -526,7 +526,7 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
             continue;
         };
         item.slot.physical_group_key = @intFromPtr(items[0].slot);
-        item.slot.setValue([]Tensor, views, .native_batch);
+        item.slot.setOwnedValue([]Tensor, views, .native_batch, alloc, destroy);
     }
 }
 

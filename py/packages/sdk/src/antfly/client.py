@@ -3,6 +3,8 @@
 import base64
 import json
 import math
+import threading
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -73,8 +75,10 @@ from antfly.client_generated.models import (
 )
 from antfly.client_generated.types import UNSET, Unset
 
+from ._admission import Admission
 from .exceptions import (
     AntflyException,
+    ClientCapacityError,
     AntflyHTTPError,
     AntflyNotFoundError,
     AntflyResponseError,
@@ -776,6 +780,9 @@ class AntflyClient:
         max_write_request_bytes: int = DEFAULT_WRITE_MAX_REQUEST_BYTES,
         max_json_response_bytes: int = DEFAULT_MAX_JSON_RESPONSE_BYTES,
         max_error_response_bytes: int = DEFAULT_MAX_ERROR_RESPONSE_BYTES,
+        max_concurrent_requests: int = 100,
+        max_queued_requests: int = 100,
+        max_queue_wait: float = 1.0,
     ):
         """
         Initialize Antfly client.
@@ -795,9 +802,19 @@ class AntflyClient:
             max_write_request_bytes: Maximum encoded JSON bytes for write requests
             max_json_response_bytes: Maximum bytes read for a successful JSON response
             max_error_response_bytes: Maximum bytes read from an error response
+            max_concurrent_requests: Maximum operations holding HTTP responses
+            max_queued_requests: Maximum operations waiting for local admission
+            max_queue_wait: Maximum local admission wait in seconds, within timeout
         """
         if max_json_response_bytes <= 0 or max_error_response_bytes <= 0:
             raise ValueError("response byte limits must be positive")
+        if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and positive")
+        self._admission = Admission(max_concurrent_requests, max_queued_requests, max_queue_wait)
+        self._request_timeout = timeout
+        # The generated owner's lazy pool construction is not synchronized.
+        # Serialize construction and close, while network work remains concurrent.
+        self._transport_lock = threading.Lock()
         self.base_url = normalize_base_url(base_url)
         self.max_write_request_bytes = max_write_request_bytes
         self.max_json_response_bytes = max_json_response_bytes
@@ -842,6 +859,49 @@ class AntflyClient:
         self.entities = EntityOperations(self)
         self.curation_proposals = CurationProposalOperations(self)
 
+    def close(self) -> None:
+        """Release this client's pooled HTTP connections. May be called repeatedly."""
+        self._admission.close()
+        with self._transport_lock:
+            self._client.get_httpx_client().close()
+
+    def __enter__(self) -> "AntflyClient":
+        """Reuse one HTTP connection pool for the lifetime of this context."""
+        with self._transport_lock:
+            self._client.__enter__()
+        return self
+
+    def __exit__(self, *args: Any, **kwargs: Any) -> None:
+        self.close()
+
+    @contextmanager
+    def _stream(self, method: str, path: str, **kwargs: Any) -> Iterator[Response]:
+        limits = Timeout(kwargs.pop("timeout", self._request_timeout))
+        phases = (limits.connect, limits.read, limits.write, limits.pool)
+        finite_phases = [value for value in phases if value is not None]
+        budget = min(self._request_timeout, max(finite_phases)) if finite_phases else self._request_timeout
+        deadline = time.monotonic() + budget
+        with self._admission.acquire(deadline):
+            # Large encoded bodies belong to admitted work, rather than every
+            # caller that may ultimately be refused by the bounded queue.
+            if encode_content := kwargs.pop("_encode_content", None):
+                kwargs["content"] = encode_content()
+            with self._transport_lock:
+                transport = self._client.get_httpx_client()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ClientCapacityError("deadline_exceeded")
+            # Admission never restarts the request's budget. HTTPX applies
+            # these remaining limits to its individual I/O phases.
+            kwargs["timeout"] = Timeout(
+                connect=min(limits.connect, remaining) if limits.connect is not None else remaining,
+                read=min(limits.read, remaining) if limits.read is not None else remaining,
+                write=min(limits.write, remaining) if limits.write is not None else remaining,
+                pool=min(limits.pool, remaining) if limits.pool is not None else remaining,
+            )
+            with transport.stream(method, path, **kwargs) as response:
+                yield response
+
     def _request(
         self,
         method: str,
@@ -865,7 +925,7 @@ class AntflyClient:
         Raises:
             AntflyException: If the request fails
         """
-        with self._client.get_httpx_client().stream(method, path, **kwargs) as response:
+        with self._stream(method, path, **kwargs) as response:
             if response.status_code >= 400 or (
                 _expected_status is not None and response.status_code != _expected_status
             ):
@@ -986,9 +1046,7 @@ class AntflyClient:
             if isinstance(request, (InferenceDecideRequest, GeneratedDecideRequest))
             else dict(request)
         )
-        with self._client.get_httpx_client().stream(
-            "POST", "/ai/v1/decisions", json=body, headers={"Accept": "application/json"}
-        ) as response:
+        with self._stream("POST", "/ai/v1/decisions", json=body, headers={"Accept": "application/json"}) as response:
             if response.status_code < 200 or response.status_code >= 300:
                 _raise_inference_error(response)
             raw, truncated = _read_limited_response(response, self.max_json_response_bytes)
@@ -1033,9 +1091,7 @@ class AntflyClient:
         body = (
             request.to_dict() if isinstance(request, (ExtractionRequest, GeneratedExtractionRequest)) else dict(request)
         )
-        with self._client.get_httpx_client().stream(
-            "POST", "/ai/v1/extract", json=body, headers={"Accept": "application/json"}
-        ) as response:
+        with self._stream("POST", "/ai/v1/extract", json=body, headers={"Accept": "application/json"}) as response:
             if response.status_code < 200 or response.status_code >= 300:
                 _raise_inference_error(response)
             limit = min(self.max_json_response_bytes, MAX_EXTRACTION_RESPONSE_BYTES)
@@ -1066,7 +1122,7 @@ class AntflyClient:
         """Generate one non-streaming chat completion."""
         body = request.to_dict()
         body["stream"] = False
-        with self._client.get_httpx_client().stream(
+        with self._stream(
             "POST",
             "/ai/v1/generate",
             json=body,
@@ -1116,7 +1172,7 @@ class AntflyClient:
         """Open a context-managed SSE generation stream."""
         body = request.to_dict()
         body["stream"] = True
-        with self._client.get_httpx_client().stream(
+        with self._stream(
             "POST",
             "/ai/v1/generate",
             json=body,
@@ -1228,9 +1284,7 @@ class AntflyClient:
         if not body.get("embedding"):
             raise ValueError("chunk embedding target is required")
         body["stream"] = False
-        with self._client.get_httpx_client().stream(
-            "POST", "/ai/v1/chunk", json=body, headers={"Accept": "application/json"}
-        ) as response:
+        with self._stream("POST", "/ai/v1/chunk", json=body, headers={"Accept": "application/json"}) as response:
             if not 200 <= response.status_code < 300:
                 _raise_inference_error(response)
             raw, truncated = _read_limited_response(response, MAX_EXTRACTION_RESPONSE_BYTES)
@@ -1254,9 +1308,7 @@ class AntflyClient:
         if not body.get("embedding"):
             raise ValueError("chunk embedding target is required")
         body["stream"] = True
-        with self._client.get_httpx_client().stream(
-            "POST", "/ai/v1/chunk", json=body, headers={"Accept": "application/x-ndjson"}
-        ) as response:
+        with self._stream("POST", "/ai/v1/chunk", json=body, headers={"Accept": "application/x-ndjson"}) as response:
             if not 200 <= response.status_code < 300:
                 _raise_inference_error(response)
             if response.headers.get("content-type", "").partition(";")[0].strip() != "application/x-ndjson":
@@ -1380,14 +1432,16 @@ class AntflyClient:
     ) -> dict[str, Any]:
         from .sql_transport import encode_sql_request
 
-        try:
-            encoded = encode_sql_request(value) if value is not None else b""
-        except (TypeError, ValueError) as error:
-            raise AntflyException(f"Invalid SQL request: {error}") from error
+        def encode() -> bytes:
+            try:
+                return encode_sql_request(value) if value is not None else b""
+            except (TypeError, ValueError) as error:
+                raise AntflyException(f"Invalid SQL request: {error}") from error
+
         return self._request(
             method,
             path,
-            content=encoded,
+            _encode_content=encode,
             headers={
                 "Content-Type": "application/json",
                 **({"X-Antfly-SQL-Connection-Id": connection_id} if connection_id is not None else {}),
@@ -1876,12 +1930,11 @@ class AntflyClient:
             sync_level=SyncLevel(sync_level) if sync_level is not None else UNSET,
             transforms=[Transform.from_dict(item) for item in transforms] if transforms is not None else UNSET,
         )
-        encoded = self._encode_write_request("Batch", request.to_dict())
 
         result = self._request(
             "POST",
             f"/db/v1/tables/{quote(table, safe='')}/batch",
-            content=encoded,
+            _encode_content=lambda: self._encode_write_request("Batch", request.to_dict()),
             headers={"Content-Type": "application/json"},
         )
 

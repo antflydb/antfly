@@ -19,6 +19,7 @@
 const std = @import("std");
 const View = @import("antfly_local_sources").storage_relational_read_view.View;
 const types = @import("antfly_local_sources").storage_db_types;
+const Admission = View.Admission;
 
 pub const Set = struct {
     alloc: std.mem.Allocator,
@@ -51,12 +52,13 @@ pub const Set = struct {
         const heap = try alloc.alloc(usize, views.len);
         for (owners, views) |*owner, view| owner.* = .{ .view = view };
         self.* = .{ .alloc = alloc, .owners = owners, .heap = heap, .primary_order = primary_order, .fetch_rows = @intCast(@max(1, 256 / views.len)) };
-        return .{ .ptr = self, .vtable = &.{ .next = next, .close = close, .normalize = normalize } };
+        return .{ .ptr = self, .vtable = &.{ .next = next, .next_with_admission = nextWithAdmission, .close = close, .normalize = normalize, .normalize_with_admission = normalizeWithAdmission } };
     }
 
-    fn ensure(self: *Set, index: usize) !bool {
+    fn ensure(self: *Set, index: usize, control: ?Admission) !bool {
         const owner = &self.owners[index];
         while (true) {
+            if (control) |port| try port.checkpoint();
             if (owner.page) |*page| {
                 if (owner.position < page.rows.len) return true;
                 owner.done = page.after == null;
@@ -69,7 +71,7 @@ pub const Set = struct {
             if (owner.done) return false;
             self.fetched_pages += 1;
             if (self.fetched_pages > 4096) return error.SqlProgramLimitExceeded;
-            owner.page = try owner.view.next(self.alloc, self.fetch_rows);
+            owner.page = if (control) |port| try owner.view.nextWithAdmission(self.alloc, self.fetch_rows, port) else try owner.view.next(self.alloc, self.fetch_rows);
             owner.position = 0;
             if (owner.page.?.rows.len > self.fetch_rows) return error.InvalidSqlBackendResponse;
             // RLS/TTL filtering can produce an empty page with a physical
@@ -99,11 +101,11 @@ pub const Set = struct {
         }
     }
 
-    fn initialize(self: *Set) !void {
+    fn initialize(self: *Set, control: ?Admission) !void {
         if (self.initialized) return;
         self.initialized = true;
         if (!self.primary_order) return;
-        for (self.owners, 0..) |_, index| if (try self.ensure(index)) {
+        for (self.owners, 0..) |_, index| if (try self.ensure(index, control)) {
             self.heap[self.heap_len] = index;
             self.heap_len += 1;
         };
@@ -114,18 +116,18 @@ pub const Set = struct {
         }
     }
 
-    fn selected(self: *Set) !?usize {
+    fn selected(self: *Set, control: ?Admission) !?usize {
         if (self.primary_order) return if (self.heap_len == 0) null else self.heap[0];
         while (self.current < self.owners.len) : (self.current += 1) {
-            if (try self.ensure(self.current)) return self.current;
+            if (try self.ensure(self.current, control)) return self.current;
         }
         return null;
     }
 
-    fn advance(self: *Set, index: usize, prior_key: []const u8) !void {
+    fn advance(self: *Set, index: usize, prior_key: []const u8, control: ?Admission) !void {
         self.owners[index].position += 1;
         if (!self.primary_order) return;
-        if (try self.ensure(index)) {
+        if (try self.ensure(index, control)) {
             if (std.mem.order(u8, prior_key, self.row(index).id) != .lt) return error.InvalidSqlBackendResponse;
         } else {
             self.heap_len -= 1;
@@ -139,6 +141,17 @@ pub const Set = struct {
     }
 
     fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
+        return nextControlled(ptr, alloc, limit, null);
+    }
+
+    fn nextWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32, control: Admission) !View.Page {
+        return nextControlled(ptr, alloc, limit, control);
+    }
+
+    // The admission borrow belongs to this page call, never to the set or an
+    // owner. Pass it through every refill so remote credit waits can park the
+    // caller's CPU and retain its original cancellation and read authority.
+    fn nextControlled(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32, control: ?Admission) !View.Page {
         const self: *Set = @ptrCast(@alignCast(ptr));
         if (self.failed) return error.InvalidSqlCursor;
         if (limit == 0 or limit > 4096) return error.InvalidSqlLimit;
@@ -152,9 +165,10 @@ pub const Set = struct {
         var retained: std.ArrayList(View.Page) = .empty;
         errdefer for (retained.items) |*page| page.deinit();
         var retained_leases: std.AutoHashMapUnmanaged(usize, void) = .empty;
-        try self.initialize();
+        try self.initialize(control);
         while (rows.items.len < limit) {
-            const index = (try self.selected()) orelse break;
+            if (control) |port| try port.checkpoint();
+            const index = (try self.selected(control)) orelse break;
             const source = self.row(index);
             // Pin a source page once per delivery page. Rows, column blocks,
             // directories and large arrays remain borrowed instead of cloned.
@@ -169,18 +183,26 @@ pub const Set = struct {
             }
             try rows.append(owned, source);
             const id = source.id;
-            try self.advance(index, id);
+            try self.advance(index, id, control);
         }
-        const more = (try self.selected()) != null;
+        const more = (try self.selected(control)) != null;
         self.failed = false;
         return .{ .arena = arena, .rows = rows.items, .retained_pages = retained.items, .after = if (more) rows.items[rows.items.len - 1].id else null };
     }
 
     fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
+        return normalizeControlled(ptr, alloc, writes, null);
+    }
+
+    fn normalizeWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite, control: Admission) ![]types.BatchWrite {
+        return normalizeControlled(ptr, alloc, writes, control);
+    }
+
+    fn normalizeControlled(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite, control: ?Admission) ![]types.BatchWrite {
         const self: *Set = @ptrCast(@alignCast(ptr));
         if (self.failed) return error.InvalidSqlCursor;
         // Each owner was opened with the same expected immutable schema.
-        return self.owners[0].view.normalize(alloc, writes);
+        return if (control) |port| self.owners[0].view.normalizeWithAdmission(alloc, writes, port) else self.owners[0].view.normalize(alloc, writes);
     }
 
     fn close(ptr: *anyopaque) void {
@@ -354,4 +376,78 @@ fn nativeMergeFixture(alloc: std.mem.Allocator) !void {
 
 test "relational index system coordinated read set owns native arrays after source pages and cursors close" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, nativeMergeFixture, .{});
+}
+
+test "relational index system coordinated read set forwards admission through refills and normalization" {
+    const admission = @import("antfly_local_sources").common_read_admission;
+    const Scope = struct {
+        canceled: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    const AdmittedOwner = struct {
+        source: Fixture,
+        expected: Admission,
+        scope: *Scope,
+        cancel_after_fetch: bool,
+        admitted_fetches: usize = 0,
+        normalized: bool = false,
+        fn view(self: *@This()) View {
+            return .{ .ptr = self, .vtable = &.{ .next = rejectPlain, .next_with_admission = fetch, .normalize_with_admission = normalizeWrites, .close = release } };
+        }
+        fn rejectPlain(_: *anyopaque, _: std.mem.Allocator, _: u32) !View.Page {
+            return error.ExecutionWaitUnsupported;
+        }
+        fn fetch(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32, control: Admission) !View.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.expected.payload, control.payload);
+            try control.checkpoint();
+            self.admitted_fetches += 1;
+            const page = try Fixture.next(&self.source, alloc, limit);
+            if (self.cancel_after_fetch) self.scope.canceled = true;
+            return page;
+        }
+        fn normalizeWrites(raw: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite, control: Admission) ![]types.BatchWrite {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.expected.payload, control.payload);
+            try control.checkpoint();
+            self.normalized = true;
+            return alloc.dupe(types.BatchWrite, writes);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            Fixture.close(&self.source);
+        }
+    };
+    for ([_]bool{ false, true }) |ordered| {
+        for ([_]bool{ false, true }) |cancel_after_fetch| {
+            var scope: Scope = .{};
+            const payload: admission.Payload = .{ .ptr = &scope, .vtable = &.{ .checkpoint = Scope.check } };
+            const port = Admission.init(&payload);
+            var owner: AdmittedOwner = .{ .source = .{ .ids = &.{ "a", "b", "c" }, .empty_pages = 1 }, .expected = port, .scope = &scope, .cancel_after_fetch = cancel_after_fetch };
+            const merged = try Set.create(std.testing.allocator, &.{owner.view()}, ordered);
+            {
+                defer merged.deinit();
+                const writes = try merged.normalizeWithAdmission(std.testing.allocator, &.{}, port);
+                defer std.testing.allocator.free(writes);
+                try std.testing.expect(owner.normalized);
+                if (cancel_after_fetch) {
+                    try std.testing.expectError(error.Canceled, merged.nextWithAdmission(std.testing.allocator, 2, port));
+                    try std.testing.expectEqual(@as(usize, 1), owner.admitted_fetches);
+                    scope.canceled = false;
+                    try std.testing.expectError(error.InvalidSqlCursor, merged.nextWithAdmission(std.testing.allocator, 2, port));
+                } else {
+                    var page = try merged.nextWithAdmission(std.testing.allocator, 2, port);
+                    defer page.deinit();
+                    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+                    try std.testing.expectEqualStrings("a", page.rows[0].id);
+                    try std.testing.expectEqualStrings("b", page.rows[1].id);
+                    try std.testing.expect(owner.admitted_fetches >= 3);
+                }
+            }
+            try std.testing.expect(owner.source.closed);
+        }
+    }
 }

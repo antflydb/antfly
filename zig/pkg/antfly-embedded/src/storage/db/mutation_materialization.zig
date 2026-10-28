@@ -199,11 +199,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const shouldDeferBacklogPressureForExternalDenseBulk = S.shouldDeferBacklogPressureForExternalDenseBulk;
         const syncLevelParticipatesInDerivedBacklogPressure = S.syncLevelParticipatesInDerivedBacklogPressure;
         const truncateReplayJournalIfSafeContext = S.truncateReplayJournalIfSafeContext;
-        pub const DenseArtifactCounterBootstrap = struct {
-            repair_id: u128,
-            attempt_id: u128,
-            delta: i64 = 0,
-        };
+        pub const DenseArtifactCounterBootstrap = @import("dense_artifact_counter_deltas.zig").Bootstrap;
 
         pub const DenseArtifactCounterCatalog = struct {
             targets: std.ArrayListUnmanaged(DenseArtifactCounterTarget) = .empty,
@@ -412,7 +408,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendDenseArtifactCounterMutations(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *const index_manager_mod.IndexManager,
             store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             delete_keys: []const []const u8,
@@ -433,13 +429,42 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendDenseArtifactCounterMutationsWithPromotions(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *const index_manager_mod.IndexManager,
             store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             delete_keys: []const []const u8,
             promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
             owned_keys: *std.ArrayListUnmanaged([]u8),
             owned_values: *std.ArrayListUnmanaged([]u8),
+        ) !void {
+            return appendDenseArtifactCounterMutationsInner(alloc, store, index_manager, store_writes, delete_keys, promotions, owned_keys, owned_values, null, null);
+        }
+
+        pub fn prepareDenseArtifactCounterMutations(
+            alloc: Allocator,
+            store: anytype,
+            index_manager: *const index_manager_mod.IndexManager,
+            store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            delete_keys: []const []const u8,
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            deltas: *@import("dense_artifact_counter_deltas.zig").Program,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
+            return appendDenseArtifactCounterMutationsInner(alloc, store, index_manager, store_writes, delete_keys, &.{}, owned_keys, owned_values, deltas, control);
+        }
+
+        fn appendDenseArtifactCounterMutationsInner(
+            alloc: Allocator,
+            store: anytype,
+            index_manager: *const index_manager_mod.IndexManager,
+            store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            delete_keys: []const []const u8,
+            promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            deltas: ?*@import("dense_artifact_counter_deltas.zig").Program,
+            control: ?@import("../../common/read_admission.zig").Port,
         ) !void {
             var may_mutate_embedding_artifact = false;
             for (delete_keys) |key| {
@@ -519,13 +544,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (artifact_keys, old_values) |artifact_key, old_value| {
                 const final_mutation = final_artifact_mutations.get(artifact_key).?;
                 if (old_value) |value| {
-                    try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, artifact_key, value, -1);
+                    if (deltas) |output| try prepareDenseArtifactCounterDelta(alloc, &catalog, output, artifact_key, value, -1, control) else try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, artifact_key, value, -1);
                 }
                 switch (final_mutation) {
                     .deleted => {},
                     .write => |write_idx| {
                         const write = store_writes.items[write_idx];
-                        try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
+                        if (deltas) |output| try prepareDenseArtifactCounterDelta(alloc, &catalog, output, write.key, write.value, 1, control) else try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
                     },
                     .promotion => |promotion_idx| {
                         const promotion = promotions[promotion_idx];
@@ -534,11 +559,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             else => return err,
                         };
                         defer alloc.free(staged_value);
-                        try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, promotion.final_key, staged_value, 1);
+                        if (deltas) |output| try prepareDenseArtifactCounterDelta(alloc, &catalog, output, promotion.final_key, staged_value, 1, control) else try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, promotion.final_key, staged_value, 1);
                     },
                 }
             }
 
+            if (deltas != null) return;
             var it = mutations.iterator();
             while (it.next()) |entry| {
                 const target = &catalog.targets.items[entry.key_ptr.*];
@@ -715,9 +741,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             });
         }
 
+        fn prepareDenseArtifactCounterDelta(
+            alloc: Allocator,
+            catalog: *const DenseArtifactCounterCatalog,
+            output: *@import("dense_artifact_counter_deltas.zig").Program,
+            artifact_key: []const u8,
+            artifact_value: ?[]const u8,
+            delta: i64,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
+            if (control) |owner| try owner.checkpoint();
+            var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |cause| switch (cause) {
+                error.InvalidInternalUserKey => return,
+                else => return cause,
+            }) orelse return;
+            defer identity.deinit(alloc);
+            const value = artifact_value orelse return;
+            const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
+            if (dims == 0) return;
+            for (catalog.targetsFor(identity.embedding_name, dims)) |target| try output.append(catalog.targets.items[target].index_name, delta, control);
+        }
+
         pub fn applyDenseArtifactCounterDelta(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             catalog: *const DenseArtifactCounterCatalog,
             mutations: *std.AutoHashMapUnmanaged(usize, PendingDenseArtifactCounterMutation),
             artifact_key: []const u8,
@@ -788,21 +835,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn decodeDenseArtifactCounterBootstrap(raw: []const u8) !DenseArtifactCounterBootstrap {
-            if (raw.len != dense_artifact_counter_bootstrap_encoded_len or
-                !std.mem.eql(u8, raw[0..dense_artifact_counter_bootstrap_magic.len], dense_artifact_counter_bootstrap_magic))
-            {
-                return error.InvalidDenseArtifactCounterBootstrap;
-            }
-            var offset = dense_artifact_counter_bootstrap_magic.len;
-            const repair_id = std.mem.readInt(u128, raw[offset..][0..@sizeOf(u128)], .little);
-            offset += @sizeOf(u128);
-            const attempt_id = std.mem.readInt(u128, raw[offset..][0..@sizeOf(u128)], .little);
-            offset += @sizeOf(u128);
-            return .{
-                .repair_id = repair_id,
-                .attempt_id = attempt_id,
-                .delta = std.mem.readInt(i64, raw[offset..][0..@sizeOf(i64)], .little),
-            };
+            return DenseArtifactCounterBootstrap.decode(raw);
         }
 
         pub fn deinitOwnedGraphEdgeDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
@@ -829,11 +862,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn deleteDocumentArtifactChildRangeOutboxEntry(self: anytype, key: []const u8) !void {
-            var replication_mutation = self.acquireReplicationMutationShared();
+            try deleteDocumentArtifactChildRangeOutboxEntryWithRoot(self, key, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        pub fn deleteDocumentArtifactChildRangeOutboxEntryWithRoot(self: anytype, key: []const u8, root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease) !void {
+            var replication_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
             defer if (replication_mutation) |*lease| lease.release();
             try self.enforceReplicationWriteGate();
             try self.lockApplyForPortableRuntime();
             defer S.ownerField(self, "core").*.unlockApply();
+            try self.enforceReplicationWriteGate();
             const deletes = [_][]const u8{key};
             try S.ownerField(self, "core").*.store.putBatch(&.{}, deletes[0..]);
         }
@@ -889,8 +927,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dispatcher: DocumentArtifactChildRangeDispatcher,
             limit: usize,
         ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
+            return drainDocumentArtifactChildRangeOutboxWithRoot(self, dispatcher, limit, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        pub fn drainDocumentArtifactChildRangeOutboxWithRoot(
+            self: anytype,
+            dispatcher: DocumentArtifactChildRangeDispatcher,
+            limit: usize,
+            root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease,
+        ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
             if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
-            var replication_mutation = self.acquireReplicationMutationShared();
+            var replication_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
             defer if (replication_mutation) |*lease| lease.release();
             try self.enforceReplicationWriteGate();
 
@@ -906,22 +953,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer docstore_mod.DocStore.freeResults(S.ownerField(self, "alloc").*, scanned);
 
             const Removal = struct {
+                owner: @TypeOf(self),
+                root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease,
                 fn remove(ptr: *anyopaque, key: []const u8) !void {
-                    const owner: @TypeOf(self) = @ptrCast(@alignCast(ptr));
-                    return owner.deleteDocumentArtifactChildRangeOutboxEntry(key);
+                    const context: *@This() = @ptrCast(@alignCast(ptr));
+                    return deleteDocumentArtifactChildRangeOutboxEntryWithRoot(context.owner, key, context.root);
                 }
             };
-            return document_child_range_outbox.drain(S.ownerField(self, "alloc").*, scanned, dispatcher, limit, self, Removal.remove);
+            var removal: Removal = .{ .owner = self, .root = root };
+            return document_child_range_outbox.drainWithRetirement(S.ownerField(self, "alloc").*, scanned, dispatcher, limit, &removal, Removal.remove, .{ .current = &replication_mutation });
         }
 
         pub fn encodeDenseArtifactCounterBootstrap(value: DenseArtifactCounterBootstrap, out: *[dense_artifact_counter_bootstrap_encoded_len]u8) void {
-            @memcpy(out[0..dense_artifact_counter_bootstrap_magic.len], dense_artifact_counter_bootstrap_magic);
-            var offset = dense_artifact_counter_bootstrap_magic.len;
-            std.mem.writeInt(u128, out[offset..][0..@sizeOf(u128)], value.repair_id, .little);
-            offset += @sizeOf(u128);
-            std.mem.writeInt(u128, out[offset..][0..@sizeOf(u128)], value.attempt_id, .little);
-            offset += @sizeOf(u128);
-            std.mem.writeInt(i64, out[offset..][0..@sizeOf(i64)], value.delta, .little);
+            out.* = value.encode();
         }
 
         pub fn graphMutationIdentityEql(left: anytype, right: anytype) bool {
@@ -939,7 +983,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn loadDenseArtifactCounterBootstrap(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
         ) !?DenseArtifactCounterBootstrap {
             const key = try denseArtifactCounterBootstrapKeyAlloc(alloc, index_name);
@@ -952,7 +996,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try decodeDenseArtifactCounterBootstrap(raw);
         }
 
-        pub fn loadDenseArtifactTargetCounter(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8) !?u64 {
+        pub fn loadDenseArtifactTargetCounter(alloc: Allocator, store: anytype, index_name: []const u8) !?u64 {
             const key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
             defer alloc.free(key);
             const raw = store.get(alloc, key) catch |err| switch (err) {
@@ -2143,7 +2187,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendGraphEdgeArtifactWrite(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
             write: types.GraphEdgeWrite,
             generation: u64,
@@ -2205,7 +2249,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendGraphLifecycleGeneration(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             ordered_index: u64,
             writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             owned_values: *std.ArrayListUnmanaged([]u8),
@@ -2230,7 +2274,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendImportedGraphContenderMutations(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             manager: *index_manager_mod.IndexManager,
             imported: []const types.BatchWrite,
             writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -2250,10 +2294,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 changes: GraphContenderChanges = .empty,
                 extra_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
             };
+            const Store = @TypeOf(store);
             const Capture = struct {
                 alloc: Allocator,
                 backing_alloc: Allocator,
-                store: *docstore_mod.DocStore,
+                store: Store,
                 writes: []const docstore_mod.KVPair,
                 positions: *const StoreWritePositions,
                 groups: std.ArrayListUnmanaged(Group) = .empty,
@@ -2344,16 +2389,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const key = try internal_keys.rebindGraphEdgeTtlStateKeyGenerationAlloc(scratch, row.key, entry.config.coverage_generation);
                     const state: docstore_mod.KVPair = .{ .key = key, .value = row.value };
                     const prefix = try internal_keys.graphGlobalEdgeContenderPrefixForTtlStateAlloc(scratch, key);
-                    var txn = try store.beginReadTxn();
-                    defer txn.abort();
-                    var cursor = try txn.openCursor();
-                    defer cursor.close();
-                    var next = try cursor.seekAtOrAfter(prefix);
-                    while (next) |existing| : (next = try cursor.next()) {
-                        if (!std.mem.startsWith(u8, existing.key, prefix)) break;
-                        if (positions.contains(existing.key)) continue;
-                        try capture.contender(entry, existing.key, existing.value, state);
-                    }
+                    const Scan = struct {
+                        capture: *Capture,
+                        index: *index_manager_mod.IndexManager.GraphIndex,
+                        state: docstore_mod.KVPair,
+                        fn visit(ptr: ?*anyopaque, selected: []const u8, value: []const u8) !docstore_mod.DocStore.ScanAction {
+                            const context: *@This() = @ptrCast(@alignCast(ptr.?));
+                            if (!context.capture.positions.contains(selected)) try context.capture.contender(context.index, selected, value, context.state);
+                            return .@"continue";
+                        }
+                    };
+                    var scan: Scan = .{ .capture = &capture, .index = entry, .state = state };
+                    const upper = try internal_keys.nextPrefixAlloc(scratch, prefix);
+                    try store.scanWithContext(prefix, upper orelse "", .{}, &scan, Scan.visit);
                     for (writes.items) |pending| {
                         if (std.mem.startsWith(u8, pending.key, prefix))
                             try capture.contender(entry, pending.key, pending.value, state);
@@ -2568,7 +2616,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendMixedDirectGraphContenderMutations(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *index_manager_mod.IndexManager,
             direct_writes: []const types.BatchWrite,
             store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -2840,9 +2888,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try out.append(alloc, .{ .request = cloned, .produced = produced });
         }
 
+        pub fn preparePrecomputedCoverageOutcomes(
+            store: anytype,
+            index_manager: *index_manager_mod.IndexManager,
+            outcomes: []const PrecomputedCoverageOutcome,
+            sequence: u64,
+            program: *@import("prepared_coverage_outcomes.zig").Program,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
+            if (outcomes.len == 0 or try orderedCoverageActive(store)) return;
+            for (outcomes) |candidate| {
+                if (control) |owner| try owner.checkpoint();
+                const generation = index_manager.coverageGenerationForIndex(@import("artifact_producer_readiness.zig").localScopeIndex(candidate.index_name)) orelse continue;
+                try program.append(candidate.index_name, generation, candidate.doc_key, candidate.outcome, sequence, control);
+            }
+        }
+
         pub fn appendPrecomputedCoverageOutcomeMutations(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *index_manager_mod.IndexManager,
             outcomes: []const PrecomputedCoverageOutcome,
             source_sequence: u64,
@@ -2990,7 +3054,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendPreparedGraphEdgeArtifactWrite(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
             write: types.GraphEdgeWrite,
             generation: u64,
@@ -3054,7 +3118,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendRetiredDirectGraphTtlDueDeletes(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *index_manager_mod.IndexManager,
             writes: []const docstore_mod.KVPair,
             deletes: []const []const u8,
@@ -3383,6 +3447,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try applyDerivedBatchTargetsContextProfiled(ctx, batch, &.{}, profile);
         }
 
+        pub fn applyDerivedBatchContextProfiledWithReplay(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, profile: ?*BatchProfile, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+            try applyDerivedBatchTargetsContextProfiledWithReplay(ctx, batch, &.{}, profile, admitted_replay);
+        }
+
         pub fn applyDerivedBatchProfiled(self: anytype, batch: derived_types.DerivedBatch, profile: ?*BatchProfile) !void {
             var ctx = self.batchContext();
             try applyDerivedBatchContextProfiled(&ctx, batch, profile);
@@ -3392,7 +3460,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
         }
 
+        fn acquireBatchReplayAdmission(ctx: *const BatchExecutionContext) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+            const admission = ctx.snapshot_replay_admission orelse return null;
+            if (ctx.io) |io| return try admission.acquireMutationIo(io, @as(?types.CancellationToken, null));
+            return admission.acquireMutation();
+        }
+
+        /// Call before holding apply. Callers already holding a replay lease use
+        /// the explicit WithReplay form instead of requesting fresh admission.
         pub fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
+            var replay = try acquireBatchReplayAdmission(ctx);
+            defer if (replay) |*lease| lease.release();
+            try applyDerivedBatchTargetsContextProfiledWithReplay(ctx, batch, index_names, profile, if (replay) |*lease| lease else null);
+        }
+
+        /// The caller keeps admission alive across index replay, checkpoints and
+        /// replay truncation. A nested index application borrows that lease so a
+        /// waiting capture cannot close reader admission behind its own reader.
+        pub fn applyDerivedBatchTargetsContextProfiledWithReplay(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+            std.debug.assert(ctx.snapshot_replay_admission == null or admitted_replay != null);
+            if (admitted_replay) |lease| {
+                std.debug.assert(lease.active and lease.admission == ctx.snapshot_replay_admission);
+            }
             const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
             defer {
                 for (managed_indexes) |index_ref| ctx.alloc.free(@constCast(index_ref.name));
@@ -3419,7 +3508,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         try clearPublishedAssetArtifactRepairIssuesContext(ctx.async_context orelse &async_ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
                         continue;
                     }
-                    try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile, false, null);
+                    try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile, false, admitted_replay);
                     const index_sync_start_ns = monotonicTimeNs();
                     try ctx.index_manager.syncReplayStateByName(ctx.store, index_ref.name);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.index_sync_ns, index_sync_start_ns);
@@ -5230,7 +5319,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn collectGraphArtifactsForDocIndex(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             doc_key: []const u8,
             index_name: []const u8,
         ) ![]docstore_mod.OwnedKVPair {
@@ -7466,7 +7555,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn derivedCoverageOutcomeCounterValueForStore(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
             generation: u64,
             outcome: []const u8,
@@ -8314,7 +8403,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn encodeGraphEdgeArtifactWithTtlAlloc(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             key: []const u8,
             generation: u64,
             ttl_duration_ns: u64,
@@ -8330,7 +8419,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 if (existing) |raw| {
                     defer alloc.free(raw);
-                    var previous = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, raw) catch null;
+                    var previous = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, raw) catch |err| if (err == error.OutOfMemory) return err else null;
                     if (previous) |*edge| {
                         defer edge.deinit(alloc);
                         if (edge.generation == generation and edge.ttl_created_ns != 0) ttl_created_ns = edge.ttl_created_ns;
@@ -9317,7 +9406,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn loadDerivedCoverageOutcomeCounterFromStore(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
             generation: u64,
             outcome: []const u8,
@@ -10518,11 +10607,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn precomputedCoverageOutcomePriority(outcome: DerivedCoverageOutcome) u8 {
-            return switch (outcome) {
-                .skipped => 0,
-                .produced => 1,
-                .terminal_failed => 2,
-            };
+            return @import("prepared_coverage_outcomes.zig").priority(outcome);
         }
 
         pub fn precomputedEmbeddingCoverageOutcome(
@@ -10622,7 +10707,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reconcileGlobalGraphEdgeWinner(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
             expected_generation: u64,
             ttl_duration_ns: u64,
@@ -10874,7 +10959,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reconcileGraphEdgeContenders(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             doc_key: []const u8,
             index_name: []const u8,
             expected_generation: u64,
@@ -10888,7 +10973,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reconcileGraphEdgeContendersWithLifetimePolicy(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             doc_key: []const u8,
             index_name: []const u8,
             expected_generation: u64,
@@ -10905,7 +10990,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reconcileGraphEdgeContendersWithOverlay(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             doc_key: []const u8,
             index_name: []const u8,
             expected_generation: u64,
@@ -11858,7 +11943,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn scanDerivedCoverageOutcomeFromStore(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
             generation: u64,
             outcome: []const u8,

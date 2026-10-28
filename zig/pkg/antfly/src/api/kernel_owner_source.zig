@@ -51,6 +51,7 @@ const table_reads = @import("antfly_local_sources").api_local_query_contract;
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("antfly_local_sources").api_table_write_source;
+const request_execution_io = @import("request_execution_io.zig");
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const common_config = @import("antfly_local_sources").common_config;
@@ -61,6 +62,12 @@ const scraping = @import("antfly_scraping");
 /// budget once, before both cold owner acquisition and the compiled boundary.
 fn platformDeadlineContext(context: request_operation.RequestContext) !request_operation.RequestContext {
     return context.platformDeadline();
+}
+
+test "source owner restore context rejects before resource access" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.DeadlineExceeded, source.batchGroupLocalWithDescriptor(std.testing.allocator, 1, "rows", .{}, null, .{ .deadline_ns = 0 }, null));
+    try std.testing.expectError(error.DeadlineExceeded, source.writeSource().batchGroupLocalWithPreDecisionContext(std.testing.allocator, 1, "rows", .{}, .{ .deadline_ns = 0 }));
 }
 
 test "distributed txn native lookup read-index rejects leader loss before storage execution" {
@@ -286,11 +293,16 @@ pub const ProvisionedKernelOwnerSource = struct {
     remote_content_configured: bool = false,
     secret_store: ?*anyopaque = null,
     context: client.Context = .{},
+    context_runtime: ?*@import("antfly_local_sources").storage_background_runtime.BackendRuntime = null,
+    context_runtime_options: @import("../storage/kernel_runtime_services.zig").RuntimeRequest.Options = .{},
     owns_context: bool = true,
     context_init_mutex: std.atomic.Mutex = .unlocked,
     mutex: std.atomic.Mutex = .unlocked,
     quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    lsm_selection: @import("maintenance_selection.zig").Policy = .{},
+    lsm_scan: @import("maintenance_selection.zig").Scan = .{},
+    lsm_selection_claim: std.atomic.Value(bool) = .init(false),
     publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
     owner_cache_misses: std.atomic.Value(u64) = .init(0),
@@ -298,10 +310,15 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// apply. The bounded queue holds owned, exact committed descriptors.
     apply_control_io: ?std.Io = null,
     apply_control_future: ?std.Io.Future(void) = null,
+    apply_open_future: ?std.Io.Future(void) = null,
     apply_control_started: std.atomic.Value(bool) = .init(false),
+    close_execution_owner: ?@import("antfly_runtime_abi").runnable_abi.Lease = null,
     apply_control_wake: std.Io.Event = .unset,
+    apply_open_wake: std.Io.Event = .unset,
     apply_control_pending: std.ArrayListUnmanaged(*ApplyOpen) = .empty,
     apply_control_active: ?*ApplyOpen = null,
+    online_open_queue: @import("owner_preparation_queue.zig").Queue = .{},
+    apply_open_debt: std.atomic.Value(usize) = .init(0),
     apply_control_stopping: bool = false,
     apply_ready_wake: ?ApplyReadyWake = null,
     apply_ready_wake_inflight: usize = 0,
@@ -330,6 +347,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         retry_delay_ms: u32 = 2,
         next_log_ns: u64 = 0,
+
+        fn retainedBytes(self: *const ApplyOpen) !u64 {
+            var total: u64 = @sizeOf(ApplyOpen) + @sizeOf(Entry);
+            for ([_][]const u8{ self.table_name, self.path, self.descriptor.schema_json, self.descriptor.indexes_json, self.descriptor.restore_bootstrap_json, self.descriptor.initial_child_bootstrap_json }) |bytes|
+                total = try std.math.add(u64, total, bytes.len);
+            if (self.descriptor.initial_range) |range| {
+                total = try std.math.add(u64, total, range.start.len);
+                total = try std.math.add(u64, total, range.end.len);
+            }
+            if (self.descriptor.restore) |restore| inline for (.{ "backup_id", "location", "snapshot_path", "artifact_sha256", "native_manifest_sha256" }) |field| {
+                total = try std.math.add(u64, total, @field(restore, field).len);
+            };
+            // Both the durable queued descriptor and the installed owner's
+            // descriptor can coexist through physical return.
+            return std.math.mul(u64, total, 2);
+        }
 
         fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !*ApplyOpen {
             const pending = try alloc.create(ApplyOpen);
@@ -434,6 +467,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     const LeaseAdmission = enum { shared, exclusive, exclusive_if_idle };
 
     const Entry = struct {
+        lsm_last_served: u64 = 0,
         group_id: u64,
         table_name: []u8,
         generation: u64,
@@ -452,6 +486,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         /// reconciliation. The next ordinary acquisition must reopen against
         /// the catalog, even when the descriptor bytes happen to match.
         opened_for_historical_apply: bool = false,
+        online_preparation_pending: bool = false,
         // Exact descriptor/target proof, owned by this physical generation.
         // Shared repair steps may reuse it until a structural follow-up is due.
         repair_target: ?[]u8 = null,
@@ -481,6 +516,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     const Lease = struct {
         source: *ProvisionedKernelOwnerSource,
         entry: *Entry,
+        maintenance_last_served: u64 = 0,
         exclusive: bool = false,
         apply_only: bool = false,
         active: bool = true,
@@ -548,18 +584,36 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     /// Called on the hosting control path before linked data-Raft apply starts.
-    /// The borrowed lane is independent of Raft progress and is joined before
-    /// its worker lease is released.
+    /// Retain this scheduler authority for both ordinary background cold opens
+    /// and protected cleanup. The independent worker joins before its I/O and
+    /// scheduler leases are released.
+    pub fn withCloseExecutionOwner(self: *ProvisionedKernelOwnerSource, owner: @import("antfly_runtime_abi").runnable_abi.Owner) !*ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0 and self.close_execution_owner == null);
+        self.close_execution_owner = try @import("antfly_runtime_abi").runnable_abi.Lease.init(owner);
+        return self;
+    }
+
     pub fn startApplyControl(self: *ProvisionedKernelOwnerSource, io: std.Io) !void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         if (self.apply_control_future != null) return;
-        if (self.quiescing) return error.Canceled;
+        if (self.quiescing or self.apply_control_stopping) return error.Canceled;
         // Apply admission never grows the queue under the Raft mutex.
         try self.apply_control_pending.ensureTotalCapacity(self.alloc, apply_control_max_pending);
         self.apply_control_io = io;
         errdefer self.apply_control_io = null;
         self.apply_control_future = try io.concurrent(applyControlMain, .{self});
+        self.apply_open_future = io.concurrent(applyOpenMain, .{self}) catch |err| {
+            // Roll back the first task before returning a partially started
+            // source. Joining must release the registry lock used by that task.
+            self.apply_control_stopping = true;
+            self.apply_control_wake.set(io);
+            self.mutex.unlock();
+            self.apply_control_future.?.await(io);
+            lock(&self.mutex);
+            self.apply_control_future = null;
+            return err;
+        };
         self.apply_control_started.store(true, .release);
     }
 
@@ -582,13 +636,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.apply_control_stopping = true;
         self.apply_control_started.store(false, .release);
         const io = self.apply_control_io;
-        if (io) |control_io| self.apply_control_wake.set(control_io);
+        if (io) |control_io| {
+            self.apply_control_wake.set(control_io);
+            self.apply_open_wake.set(control_io);
+        }
         self.mutex.unlock();
     }
 
     fn stopApplyControl(self: *ProvisionedKernelOwnerSource) void {
         self.beginApplyControlShutdown();
         const io = self.apply_control_io;
+        if (self.apply_open_future) |*future| future.await(io.?);
+        self.apply_open_future = null;
         if (self.apply_control_future) |*future| future.await(io.?);
         self.apply_control_future = null;
         // Keep the borrowed Io value stable until source destruction: an
@@ -598,6 +657,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         for (self.apply_control_pending.items) |pending| pending.deinit(self.alloc);
         self.apply_control_pending.deinit(self.alloc);
         self.apply_control_pending = .empty;
+        self.apply_open_debt.store(0, .release);
+        self.online_open_queue = .{};
     }
 
     fn applyControlMain(self: *ProvisionedKernelOwnerSource) void {
@@ -614,9 +675,44 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (entry.retired and !entry.closing and entry.active_users == 0) break index;
             } else null;
             if (retired_index) |index| {
-                self.destroyEntryAtIndexLocked(index);
+                const closed = self.destroyEntryAtIndexLocked(index);
                 self.mutex.unlock();
+                if (!closed) io.sleep(.fromMilliseconds(1), .awake) catch {};
                 continue;
+            }
+            self.mutex.unlock();
+            self.apply_control_wake.wait(io) catch {};
+        }
+    }
+
+    // Waiting for ordinary admission must never occupy the worker that drains
+    // releases and closes. Both tasks borrow the same bounded node worker lease.
+    fn applyOpenMain(self: *ProvisionedKernelOwnerSource) void {
+        const io = self.apply_control_io.?;
+        while (true) {
+            lock(&self.mutex);
+            self.apply_open_wake.reset();
+            if (self.apply_control_stopping) {
+                self.mutex.unlock();
+                return;
+            }
+            // Online quorum certification can depend on committed apply.
+            // Never put that dependency behind optional online warming.
+            if (self.apply_control_pending.items.len == 0) {
+                if (self.online_open_queue.take(platform_time.monotonicNs())) |request| {
+                    self.mutex.unlock();
+                    const outcome = self.openOnlineControlRequest(&request, io) catch |err| switch (err) {
+                        error.TableNotFound, error.NotLeader, error.RestoreStagingScopeChanged, error.PreparedTransactionProtocolUnavailable, error.Canceled, error.Timeout => OnlineOpenOutcome.discard,
+                        else => OnlineOpenOutcome.retry,
+                    };
+                    lock(&self.mutex);
+                    const retry = !self.apply_control_stopping and (outcome == .retry or outcome == .grow);
+                    self.online_open_queue.finish(retry, outcome == .grow, platform_time.monotonicNs());
+                    self.mutex.unlock();
+                    if (retry and self.apply_open_debt.load(.acquire) == 0)
+                        io.sleep(.fromMilliseconds(request.retry_delay_ms), .awake) catch {};
+                    continue;
+                }
             }
             const pending: ?*ApplyOpen = if (self.apply_control_pending.items.len != 0)
                 self.apply_control_pending.orderedRemove(0)
@@ -625,14 +721,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.apply_control_active = pending;
             self.mutex.unlock();
             const request = pending orelse {
-                self.apply_control_wake.wait(io) catch {};
+                self.apply_open_wake.wait(io) catch {};
                 continue;
             };
-            if (@import("builtin").is_test) if (self.test_apply_control_hooks) |hooks| {
-                if (hooks.before_open) |before_open| before_open(hooks.ptr);
-            };
             const opened = blk: {
-                var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{ .historical_raft_apply = true }) catch |err| {
+                self.openApplyControlRequest(request, io) catch |err| {
                     switch (err) {
                         error.StorageKernelOwnerTransitionRequired,
                         error.StorageReadTemporarilyUnavailable,
@@ -650,12 +743,13 @@ pub const ProvisionedKernelOwnerSource = struct {
                     }
                     break :blk false;
                 };
-                lease.deinit();
                 break :blk true;
             };
             if (opened) {
                 lock(&self.mutex);
                 self.apply_control_active = null;
+                const debt = self.apply_open_debt.fetchSub(1, .acq_rel);
+                std.debug.assert(debt != 0);
                 const wake = self.apply_ready_wake;
                 if (wake != null) self.apply_ready_wake_inflight += 1;
                 self.mutex.unlock();
@@ -671,6 +765,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             lock(&self.mutex);
             self.apply_control_active = null;
             if (self.apply_control_stopping) {
+                const debt = self.apply_open_debt.fetchSub(1, .acq_rel);
+                std.debug.assert(debt != 0);
                 self.mutex.unlock();
                 request.deinit(self.alloc);
                 return;
@@ -681,6 +777,212 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.mutex.unlock();
             io.sleep(.fromMilliseconds(request.retry_delay_ms), .awake) catch {};
         }
+    }
+
+    fn applyPreparationCanceled(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const ProvisionedKernelOwnerSource = @ptrCast(@alignCast(raw.?));
+        return @intFromBool(!self.apply_control_started.load(.acquire));
+    }
+
+    fn openApplyControlRequest(self: *ProvisionedKernelOwnerSource, request: *const ApplyOpen, io: std.Io) !void {
+        const execution = @import("runnable_status_refresh.zig");
+        // This independent producer waits fairly for ordinary background
+        // capacity, never the health or cleanup reserve. The separate control
+        // worker keeps draining releases and closes throughout this wait.
+        var pass = try execution.Pass.initWithOptions(
+            if (self.close_execution_owner) |lease| lease.owner else null,
+            &io,
+            platform_time.monotonicNs() +| 30 * std.time.ns_per_s,
+            .{ .context = self, .is_cancelled = applyPreparationCanceled },
+            .{ .retained_bytes = try request.retainedBytes() },
+        );
+        defer pass.deinit();
+        if (@import("builtin").is_test) if (self.test_apply_control_hooks) |hooks| {
+            if (hooks.before_open) |before_open| before_open(hooks.ptr);
+        };
+        try pass.check();
+        const Cancel = struct {
+            fn check(raw: *const anyopaque) !void {
+                const original: *const execution.Pass = @ptrCast(@alignCast(raw));
+                try original.checkLifetime();
+            }
+        };
+        var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{
+            .historical_raft_apply = true,
+            .retain_cpu = true,
+            .execution_runnable = pass.borrow,
+            .execution_deadline_ns = pass.deadline_ns,
+            .cancellation = .{ .ptr = &pass, .check_fn = Cancel.check },
+        }) catch |err| {
+            // Native cancellation is a bool; restore the original deadline or
+            // scheduler rejection before translating the native operation.
+            try pass.check();
+            return err;
+        };
+        defer lease.deinit();
+        try pass.check();
+    }
+
+    fn scheduleOnlinePreparation(self: *ProvisionedKernelOwnerSource, group: u64, table: []const u8, control: @import("antfly_local_sources").common_read_admission.Port) !void {
+        try control.checkpoint();
+        if (!self.mutex.tryLock()) return error.StorageReadTemporarilyUnavailable;
+        if (self.quiescing or self.apply_control_stopping or !self.apply_control_started.load(.acquire)) {
+            self.mutex.unlock();
+            return error.StorageReadTemporarilyUnavailable;
+        }
+        const pushed = self.online_open_queue.push(group, table, platform_time.monotonicNs() +| 30 * std.time.ns_per_s) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        if (pushed) self.apply_open_wake.set(self.apply_control_io.?);
+        try control.checkpoint();
+    }
+
+    const OnlinePreparationControls = struct {
+        require_checked_reentry: bool = true,
+        pass: *@import("runnable_status_refresh.zig").Pass,
+        execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+        fn check(value: @This()) !void {
+            try value.pass.checkLifetime();
+            if (value.execution_runnable) |borrow| {
+                const status = borrow.checkpoint(borrow.context);
+                if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+            }
+            try value.pass.checkLifetime();
+        }
+    };
+    const OnlinePreparationBudget = @import("antfly_local_sources").common_read_execution_budget.Budget(OnlinePreparationControls, OnlinePreparationControls.check);
+    const OnlineOpenOutcome = enum { ready, discard, retry, grow };
+    const OnlinePreparationAttempt = struct {
+        source: *ProvisionedKernelOwnerSource,
+        yield_to_apply: std.atomic.Value(bool) = .init(true),
+        fn canceled(raw: ?*const anyopaque) callconv(.c) u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(!self.source.apply_control_started.load(.acquire) or
+                (self.yield_to_apply.load(.acquire) and self.source.apply_open_debt.load(.acquire) != 0));
+        }
+    };
+    fn openOnlineControlRequest(self: *ProvisionedKernelOwnerSource, request: *const @import("owner_preparation_queue.zig").Request, io: std.Io) !OnlineOpenOutcome {
+        var attempt: OnlinePreparationAttempt = .{ .source = self };
+        return self.openOnlineControlAttempt(request, io, &attempt) catch |err| {
+            if (err == error.Canceled and self.apply_control_started.load(.acquire) and self.apply_open_debt.load(.acquire) != 0)
+                return .retry;
+            return err;
+        };
+    }
+    fn openOnlineControlAttempt(self: *ProvisionedKernelOwnerSource, request: *const @import("owner_preparation_queue.zig").Request, io: std.Io, attempt: *OnlinePreparationAttempt) !OnlineOpenOutcome {
+        const execution = @import("runnable_status_refresh.zig");
+        const read = @import("antfly_local_sources").common_read_admission;
+        const retained = try std.math.add(u64, @sizeOf(Entry) + @sizeOf(@TypeOf(request.*)), try std.math.mul(u64, request.workspace_bytes, 3));
+        var pass = try execution.Pass.initWithOptions(
+            if (self.close_execution_owner) |lease| lease.owner else null,
+            &io,
+            request.deadline_ns,
+            .{ .context = attempt, .is_cancelled = OnlinePreparationAttempt.canceled },
+            .{ .retained_bytes = retained },
+        );
+        defer pass.deinit();
+        var budget: OnlinePreparationBudget = .{ .controls = .{ .pass = &pass, .execution_runnable = pass.borrow }, .io = io };
+        var adapter: read.Adapter(*OnlinePreparationBudget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = read.Port.init(&payload);
+        const Lifetime = struct {
+            fn check(raw: *const anyopaque) !void {
+                const original: *const execution.Pass = @ptrCast(@alignCast(raw));
+                try original.checkLifetime();
+            }
+        };
+        const cancellation: db_types.CancellationToken = .{ .ptr = &pass, .check_fn = Lifetime.check };
+        const barrier = self.read_safety_barrier;
+        const proof = if (self.online_source_authority == .raft) block: {
+            if (barrier.vtable.capture_frozen == null or barrier.vtable.validate_frozen_with_admission == null or barrier.vtable.validate_retained_snapshot == null)
+                return error.PreparedTransactionProtocolUnavailable;
+            const frozen = try barrier.captureFrozen(request.group_id);
+            try barrier.validateFrozenWithAdmission(request.group_id, frozen, pass.deadline_ns, cancellation, control);
+            break :block frozen;
+        } else null;
+        // Certification has crossed the apply dependency. A physical open
+        // already admitted below must now finish before another open starts.
+        attempt.yield_to_apply.store(false, .release);
+        const bytes = try self.alloc.alloc(u8, request.workspace_bytes);
+        defer self.alloc.free(bytes);
+        var workspace = std.heap.FixedBufferAllocator.init(bytes);
+        var catalog_budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = pass.deadline_ns }));
+        catalog_budget.cancellation = cancellation;
+        catalog_budget.admission = control;
+        var lease = block: {
+            var descriptor = self.loadDescriptorWithBudget(workspace.allocator(), request.group_id, request.table(), catalog_budget) catch |err| {
+                if (err == error.OutOfMemory) return .grow;
+                return err;
+            };
+            defer descriptor.deinit(workspace.allocator());
+            break :block self.acquireDescriptorOnce(request.group_id, request.table(), descriptor.path, descriptor.view(), .shared, .resident, .{
+                .execution_runnable = pass.borrow,
+                .retain_cpu = true,
+                .execution_deadline_ns = pass.deadline_ns,
+                .cancellation = cancellation,
+                .online_preparation = true,
+            }) catch |err| {
+                try pass.check();
+                return err;
+            };
+        };
+        defer lease.deinit();
+        try control.checkpoint();
+        // Reuse the funded workspace only after native open and all borrowed
+        // descriptor arguments returned. The owner owns its installed copies.
+        workspace.reset();
+        var confirmation = self.loadDescriptorWithBudget(workspace.allocator(), request.group_id, request.table(), catalog_budget) catch |err| {
+            if (err == error.OutOfMemory) return .grow;
+            return err;
+        };
+        defer confirmation.deinit(workspace.allocator());
+        if (!try onlineDescriptorMatches(lease.entry, confirmation.view(), control)) return .retry;
+        if (proof) |frozen| try barrier.validateRetainedSnapshotWithAdmission(request.group_id, frozen, pass.deadline_ns, cancellation, control);
+        const generation = self.visibleRootGeneration(request.group_id);
+        try control.checkpoint();
+        if (!self.mutex.tryLock()) return .retry;
+        defer self.mutex.unlock();
+        const entry = lease.entry;
+        if (self.quiescing or self.apply_control_stopping or self.publicationPendingLocked(request.group_id, request.table()) or
+            entry.retired or entry.closing or entry.catalog_deferred or entry.opened_for_historical_apply or entry.generation != generation)
+            return .retry;
+        entry.online_preparation_pending = false;
+        return .ready;
+    }
+
+    fn onlineDescriptorMatches(entry: *const Entry, descriptor: descriptor_contract.Descriptor, control: @import("antfly_local_sources").common_read_admission.Port) !bool {
+        try control.checkpoint();
+        if (entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity) or
+            entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or entry.restore_ha_replay != descriptor.restore_ha_replay or
+            !std.meta.eql(entry.table_storage, descriptor.table_storage) or (entry.restore == null) != (descriptor.restore == null) or
+            (entry.initial_range == null) != (descriptor.initial_range == null)) return false;
+        inline for (.{ "schema_json", "indexes_json", "restore_bootstrap_json", "initial_child_bootstrap_json" }) |field|
+            if (!try onlineBytesEqual(@field(entry, field), @field(descriptor, field), control)) return false;
+        if (entry.restore) |actual| {
+            const expected = descriptor.restore.?;
+            if (actual.native_manifest_size_bytes != expected.native_manifest_size_bytes) return false;
+            inline for (.{ "backup_id", "location", "snapshot_path", "artifact_sha256", "native_manifest_sha256" }) |field|
+                if (!try onlineBytesEqual(@field(actual, field), @field(expected, field), control)) return false;
+        }
+        if (entry.initial_range) |range| {
+            if (!try onlineBytesEqual(range.start, descriptor.initial_range.?.start, control) or !try onlineBytesEqual(range.end, descriptor.initial_range.?.end, control)) return false;
+        }
+        try control.checkpoint();
+        return true;
+    }
+    fn onlineBytesEqual(a: []const u8, b: []const u8, control: @import("antfly_local_sources").common_read_admission.Port) !bool {
+        if (a.len != b.len) return false;
+        var pos: usize = 0;
+        while (pos < a.len) {
+            try control.checkpoint();
+            const end = @min(a.len, pos + 4096);
+            if (!std.mem.eql(u8, a[pos..end], b[pos..end])) return false;
+            pos = end;
+        }
+        try control.checkpoint();
+        return true;
     }
 
     pub fn withGroupVisibleRootGeneration(
@@ -765,13 +1067,33 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self;
     }
 
+    /// The runtime outlives lazy context construction and final owner retirement.
+    pub fn withBackendRuntime(self: *ProvisionedKernelOwnerSource, runtime: *@import("antfly_local_sources").storage_background_runtime.BackendRuntime, options: @import("../storage/kernel_runtime_services.zig").RuntimeRequest.Options) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0 and self.context.handle == null);
+        self.context_runtime = runtime;
+        self.context_runtime_options = options;
+        return self;
+    }
+    pub fn ensureStorageContext(self: *ProvisionedKernelOwnerSource) !void {
+        return self.ensureContextConfigured();
+    }
+    fn borrowRequestIo(self: *ProvisionedKernelOwnerSource, receiver: *request_execution_io.Borrow, original: ?@import("antfly_runtime_abi").io_abi.Borrow) !std.Io {
+        // Do not initialize another pool, or replace an invalid explicit
+        // capability with ambient IO. The host runtime outlives owner calls.
+        const configured = if (original == null) if (self.context_runtime) |runtime| runtime.io() else null else null;
+        return receiver.bind(original, configured);
+    }
+
     fn ensureContextConfigured(self: *ProvisionedKernelOwnerSource) !void {
         // Cold hidden-owner reads can arrive concurrently with one another or
         // with an owner acquisition. Context creation and configuration must
         // publish as one operation before any caller uses the handle.
         lock(&self.context_init_mutex);
         defer self.context_init_mutex.unlock();
-        try self.context.ensure();
+        if (self.context_runtime) |runtime|
+            try self.context.ensureWithBackendRuntime(runtime, self.context_runtime_options)
+        else
+            try self.context.ensure();
         if (self.remote_content_configured) return;
         try self.context.configureRemoteContent(self.remote_content);
         try self.context.configureSecrets(self.secret_store);
@@ -804,13 +1126,21 @@ pub const ProvisionedKernelOwnerSource = struct {
             std.debug.assert(entry.active_users == 0 and !entry.closing);
             entry.retired = true;
         }
-        self.drainRetiredLocked(null, null);
+        while (self.entries.items.len != 0) {
+            self.drainRetiredLocked(null, null);
+            if (self.entries.items.len == 0) break;
+            self.mutex.unlock();
+            (self.apply_control_io orelse std.Options.debug_io).sleep(.fromMilliseconds(1), .awake) catch {};
+            lock(&self.mutex);
+        }
         std.debug.assert(self.publications.items.len == 0);
         self.publications.deinit(self.alloc);
         self.entries.deinit(self.alloc);
         self.entries = .empty;
         self.mutex.unlock();
         if (self.owns_context) self.context.deinit();
+        if (self.close_execution_owner) |*lease| lease.deinit();
+        self.close_execution_owner = null;
     }
 
     /// Close admission and join every DB-owned worker while its Raft,
@@ -845,6 +1175,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .scan = unsupportedTopLevelScan,
                 .open_relational_read_group_local_routed = openRelationalReadRouted,
                 .try_statement_read_fence_group_local_routed = tryStatementReadFenceRouted,
+                .try_statement_read_fence_with_admission = tryStatementReadFenceWithAdmission,
                 .open_relational_statement_snapshot_group_local_routed = openStatementSnapshotRouted,
                 .query = unsupportedTopLevelQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
@@ -861,6 +1192,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
                 .text_stats_group_local_routed = textStatsGroupLocalRouted,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
+                .text_stats_group_local_controlled_routed = textStatsGroupLocalControlledRouted,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
                 .graph_expand_group_local = graphExpandGroupLocal,
@@ -884,15 +1217,20 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
+                .batch_group_local_with_pre_decision_context = batchGroupLocalWithPreDecisionContext,
                 .replicated_batch_group_local = replicatedBatchGroupLocal,
                 .backup_table_group_local = backupTableGroupLocal,
                 .backup_pin_control = backupPinControl,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
+                .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
+                .txn_preparation_status_group_local = txnPreparationStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
                 .finish_bulk_ingest_group_local = finishBulkIngestGroupLocal,
@@ -913,6 +1251,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
                 .preflight_grouped_source_batch_group_local = preflightGroupedSourceBatchGroupLocal,
                 .prepare_hot_standby_seed_snapshot_group_local = prepareHotStandbySeedSnapshotGroupLocal,
+                .prepare_hot_standby_seed_snapshot_group_local_with_lifetime = prepareHotStandbySeedSnapshotGroupLocalWithLifetime,
                 .capture_hot_standby_seed_snapshot_group_local = captureHotStandbySeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
@@ -976,6 +1315,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .ptr = self,
             .vtable = &.{
                 .run_lsm_round = runLsmMaintenanceRound,
+                .run_lsm_round_with_lifetime = runLsmMaintenanceRoundWithLifetime,
                 .run_dense_posting_round = runDensePostingMaintenanceRound,
                 .publish_dense_checkpoints = publishDenseCheckpoints,
                 .run_vector_block_round = runVectorBlockRound,
@@ -1387,7 +1727,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (table_name) |name| if (!std.mem.eql(u8, entry.table_name, name)) continue;
                 break i;
             } else return;
-            self.destroyEntryAtIndexLocked(index);
+            if (!self.destroyEntryAtIndexLocked(index)) return;
         }
     }
 
@@ -1427,6 +1767,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    fn prepareHotStandbySeedSnapshotGroupLocalWithLifetime(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: u64,
+        lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
+        try original.checkpoint(lifetime);
+        // Retain CPU during the native owner/cache dependency graph. This
+        // fallible token preserves the original error in descriptor waits.
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .cancellation = original.cancellation(lifetime) });
+        defer lease.deinit();
+        try original.checkpoint(lifetime);
+        try lease.owner().prepareHotStandbySeedSnapshotWithLifetime(table_name, deadline_ns, lifetime);
+        try original.checkpoint(lifetime);
+        return {};
+    }
+
     /// Prevent new admissions to every resident generation for a dropped
     /// group, then wait for already-admitted work to release its leases before
     /// the caller moves or deletes the physical root.
@@ -1436,9 +1796,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
     ) !void {
         if (group_id == 0) return error.InvalidArgument;
-        var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer wait_io_impl.deinit();
-        const wait_io = wait_io_impl.io();
+        var legacy_wait_io: ?std.Io.Threaded = null;
+        defer if (legacy_wait_io) |*owned| owned.deinit();
+        const wait_io = if (self.context_runtime) |runtime|
+            runtime.io() orelse return error.BackendRuntimeIoUnavailable
+        else blk: {
+            legacy_wait_io = .init(self.alloc, .{});
+            break :blk legacy_wait_io.?.io();
+        };
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
         const name_filter: ?[]const u8 = if (table_name.len == 0) null else table_name;
         while (true) {
@@ -2140,6 +2505,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (request.operation != .artifact) try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{
             .execution_deadline_ns = context.deadline_ns,
             .execution_io = context.deadline_io,
+            .fanout_io = context.fanout_io,
             .cancellation = context.cancellation,
         }, .read_index);
         const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
@@ -2591,7 +2957,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         platform_sync.lockYielding(mutex);
     }
 
-    fn destroyEntryAtIndexLocked(self: *ProvisionedKernelOwnerSource, index: usize) void {
+    fn destroyEntryAtIndexLocked(self: *ProvisionedKernelOwnerSource, index: usize) bool {
         const entry = self.entries.items[index];
         std.debug.assert(entry.active_users == 0 and !entry.exclusive_active and !entry.closing);
         entry.retired = true;
@@ -2600,6 +2966,52 @@ pub const ProvisionedKernelOwnerSource = struct {
         // A concurrent open or cleanup must not mistake a removed pointer for
         // permission to reopen, move, or delete the same physical root.
         self.mutex.unlock();
+        var cleanup_handle: ?*anyopaque = null;
+        var close_deadline_ns: u64 = 0;
+        const close_owner = if (self.close_execution_owner) |lease| lease.owner else null;
+        if (close_owner) |owner| {
+            const close_io = self.apply_control_io orelse std.Options.debug_io;
+            const borrowed_io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&close_io);
+            const now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, close_io).nanoseconds));
+            close_deadline_ns = now +| 250 * std.time.ns_per_ms;
+            const status = owner.start(owner.context, &.{
+                .io = &borrowed_io,
+                .class = @backingInt(@import("antfly_runtime_abi").runnable_abi.Class.control),
+                .slots = 1,
+                .cleanup = 1,
+                .allow_wait = 0,
+                .has_deadline = 1,
+                .deadline_ns = close_deadline_ns,
+                .retained_bytes = @sizeOf(client.Owner),
+                .out_handle = &cleanup_handle,
+            });
+            if (!status.isOk() or cleanup_handle == null) {
+                lock(&self.mutex);
+                entry.closing = false;
+                return false;
+            }
+        }
+        defer if (close_owner) |owner| if (cleanup_handle) |handle| {
+            // Capsule/Io/allocator retirement belongs outside the registry lock.
+            self.mutex.unlock();
+            owner.finish(handle);
+            lock(&self.mutex);
+        };
+        if (close_owner) |owner| if (cleanup_handle) |handle| {
+            const rt = @import("antfly_runtime_abi");
+            const borrow = rt.runnable_abi.Borrowed.fromOwner(owner, handle, 1, .control) catch {
+                lock(&self.mutex);
+                entry.closing = false;
+                return false;
+            };
+            const close_io = self.apply_control_io orelse std.Options.debug_io;
+            const clock = rt.native_abi.IoBorrow.init(&close_io);
+            entry.owner.drainClose(.{ .deadline_ns = close_deadline_ns, .execution_runnable = &borrow, .clock_io = &clock }) catch {
+                lock(&self.mutex);
+                entry.closing = false;
+                return false;
+            };
+        };
         if (@import("builtin").is_test) if (self.test_apply_control_hooks) |hooks| {
             if (hooks.before_close) |before_close| before_close(hooks.ptr);
         };
@@ -2620,6 +3032,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (entry.restore) |*identity| identity.deinit(self.alloc);
         if (entry.repair_target) |target| self.alloc.free(target);
         self.alloc.destroy(entry);
+        return true;
     }
 
     fn release(self: *ProvisionedKernelOwnerSource, entry: *Entry, exclusive: bool, apply_only: bool) void {
@@ -2643,9 +3056,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (entry.active_users == 0 and entry.transient_retirement_pending and !entry.resident)
             entry.retired = true;
         if (!entry.retired or entry.active_users != 0) return;
+        if (self.apply_control_started.load(.acquire)) {
+            // A foreground release may have failed CPU reentry. Hand physical
+            // close to the published independent worker; keep this generation
+            // registered until its existing close/join protocol completes.
+            self.apply_control_wake.set(self.apply_control_io.?);
+            return;
+        }
         for (self.entries.items, 0..) |candidate, index| {
             if (candidate != entry) continue;
-            self.destroyEntryAtIndexLocked(index);
+            _ = self.destroyEntryAtIndexLocked(index);
             return;
         }
         unreachable;
@@ -2705,6 +3125,28 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.entries.items.len;
     }
 
+    fn lockMaintenanceRegistry(self: *ProvisionedKernelOwnerSource, best_effort: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
+        if (best_effort) {
+            if (!self.mutex.tryLock()) return false;
+        } else if (lifetime) |original| {
+            if (!self.mutex.tryLock()) {
+                // The existing context owns this Io through every owner join.
+                // Never create a pool or discard the original restriction.
+                try original.checkpoint();
+                const runtime = self.context_runtime orelse return error.BackendRuntimeIoUnavailable;
+                try @import("antfly_local_sources").common_seed_snapshot_lifetime.lockAtomic(
+                    runtime.io() orelse return error.BackendRuntimeIoUnavailable,
+                    &self.mutex,
+                    original,
+                );
+            }
+        } else lock(&self.mutex);
+        errdefer self.mutex.unlock();
+        if (lifetime) |original| try original.checkpoint();
+        return true;
+    }
+
     /// Maintenance must never pin unrelated owners across a slow storage step.
     /// The cursor may skip an entry removed during the round; the next round
     /// will see it if it is still resident. Newly appended entries wait too.
@@ -2715,11 +3157,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         best_effort: bool,
         skip_bulk_ingest: bool,
     ) ?Lease {
-        if (best_effort) {
-            if (!self.mutex.tryLock()) return null;
-        } else {
-            lock(&self.mutex);
-        }
+        return self.nextMaintenanceLeaseWithLifetime(cursor, limit, best_effort, skip_bulk_ingest, null) catch unreachable;
+    }
+
+    fn nextMaintenanceLeaseWithLifetime(self: *ProvisionedKernelOwnerSource, cursor: *usize, limit: usize, best_effort: bool, skip_bulk_ingest: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !?Lease {
+        if (!try self.lockMaintenanceRegistry(best_effort, lifetime)) return null;
         defer self.mutex.unlock();
         while (cursor.* < limit and cursor.* < self.entries.items.len) {
             const entry = self.entries.items[cursor.*];
@@ -2727,89 +3169,105 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or
                 entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             entry.active_users += 1;
-            return .{ .source = self, .entry = entry };
+            return .{ .source = self, .entry = entry, .maintenance_last_served = entry.lsm_last_served };
         }
         return null;
     }
 
-    fn selectedMaintenanceLease(
-        self: *ProvisionedKernelOwnerSource,
-        group_id: u64,
-        table_name: []const u8,
-        generation: u64,
-        best_effort: bool,
-    ) ?Lease {
-        if (best_effort) {
-            if (!self.mutex.tryLock()) return null;
-        } else {
-            lock(&self.mutex);
-        }
+    const LsmSelection = @import("maintenance_selection.zig").Scan.Window;
+
+    fn beginLsmSelection(self: *ProvisionedKernelOwnerSource, best_effort: bool) ?LsmSelection {
+        return self.beginLsmSelectionWithLifetime(best_effort, null) catch unreachable;
+    }
+
+    fn beginLsmSelectionWithLifetime(self: *ProvisionedKernelOwnerSource, best_effort: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !?LsmSelection {
+        if (!try self.lockMaintenanceRegistry(best_effort, lifetime)) return null;
         defer self.mutex.unlock();
-        for (self.entries.items) |entry| {
-            if (entry.group_id != group_id or entry.generation != generation or
-                !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or
-                entry.exclusive_active or entry.bulk_ingest_active.load(.acquire)) return null;
-            entry.active_users += 1;
-            return .{ .source = self, .entry = entry };
-        }
-        return null;
+        return self.lsm_scan.next(self.entries.items.len, self.lsm_selection);
+    }
+
+    /// An actual live lease pins the selected generation. No table-name copy
+    /// or registry search is needed, and every eligibility check is fixed work.
+    fn selectRetainedMaintenanceLease(self: *ProvisionedKernelOwnerSource, lease: *Lease, selection: LsmSelection, best_effort: bool) bool {
+        return self.selectRetainedMaintenanceLeaseWithLifetime(lease, selection, best_effort, null) catch unreachable;
+    }
+
+    fn selectRetainedMaintenanceLeaseWithLifetime(self: *ProvisionedKernelOwnerSource, lease: *Lease, selection: LsmSelection, best_effort: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (!try self.lockMaintenanceRegistry(best_effort, lifetime)) return false;
+        defer self.mutex.unlock();
+        std.debug.assert(lease.active and lease.source == self and lease.entry.active_users != 0);
+        const entry = lease.entry;
+        if (selection.policy.epoch != self.lsm_selection.epoch or entry.retired or
+            entry.transient_retirement_pending or entry.exclusive_pending or
+            entry.exclusive_active or entry.bulk_ingest_active.load(.acquire)) return false;
+        self.lsm_selection.selected(&entry.lsm_last_served);
+        return true;
     }
 
     fn runLsmMaintenanceRound(
         ptr: *anyopaque,
         best_effort: bool,
     ) !storage_maintenance_source.RoundResult {
+        return runLsmMaintenanceRoundWithLifetime(ptr, best_effort, null);
+    }
+
+    fn runLsmMaintenanceRoundWithLifetime(
+        ptr: *anyopaque,
+        best_effort: bool,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !storage_maintenance_source.RoundResult {
+        if (lifetime) |original| try original.checkpoint();
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const limit = self.maintenanceEntryLimit(best_effort) orelse return .{};
-        var cursor: usize = 0;
-        var selected_name: ?[]u8 = null;
-        defer if (selected_name) |name| self.alloc.free(name);
-        var selected_group_id: u64 = 0;
-        var selected_generation: u64 = 0;
-        var selected_score: u64 = 0;
-        var selected_due = false;
-        while (self.nextMaintenanceLease(&cursor, limit, best_effort, true)) |borrowed| {
+        // Serialize only inspection/selection. A slow storage step never owns
+        // this claim, so another round can select an unrelated owner.
+        if (self.lsm_selection_claim.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return .{ .selection_pending = true };
+        var selecting = true;
+        defer if (selecting) self.lsm_selection_claim.store(false, .release);
+        const selection = (try self.beginLsmSelectionWithLifetime(best_effort, lifetime)) orelse return .{ .selection_pending = true };
+        var cursor = selection.start;
+        var selected: ?Lease = null;
+        defer if (selected) |*lease| lease.deinit();
+        var selected_candidate: ?@import("maintenance_selection.zig").Policy.Candidate = null;
+        while (try self.nextMaintenanceLeaseWithLifetime(&cursor, selection.limit, best_effort, true, lifetime)) |borrowed| {
             var lease = borrowed;
-            const status = lease.owner().maintenance(
+            const status = lease.owner().maintenanceWithLifetime(
                 lease.entry.table_name,
                 if (best_effort) .inspect_best_effort else .inspect,
+                lifetime,
             ) catch |err| {
                 lease.deinit();
+                if (lifetime) |original| try original.checkpoint();
                 if (best_effort) continue;
                 return err;
             };
-            const due = status.has_next_wake_delay != 0 and status.next_wake_delay_ns == 0;
-            if (due or status.maintenance_score != 0) {
-                if (selected_name == null or
-                    (due and !selected_due) or
-                    (due == selected_due and status.maintenance_score > selected_score))
-                {
-                    const name = self.alloc.dupe(u8, lease.entry.table_name) catch |err| {
-                        lease.deinit();
-                        return err;
-                    };
-                    if (selected_name) |previous| self.alloc.free(previous);
-                    selected_name = name;
-                    selected_group_id = lease.entry.group_id;
-                    selected_generation = lease.entry.generation;
-                    selected_score = status.maintenance_score;
-                    selected_due = due;
-                }
-            }
-            lease.deinit();
+            const candidate: @import("maintenance_selection.zig").Policy.Candidate = .{
+                .last_served = lease.maintenance_last_served,
+                .score = status.maintenance_score,
+                .due = status.has_next_wake_delay != 0 and status.next_wake_delay_ns == 0,
+            };
+            if (selection.policy.prefers(candidate, selected_candidate)) {
+                if (selected) |*previous| previous.deinit();
+                selected = lease;
+                selected_candidate = candidate;
+            } else lease.deinit();
         }
-        const name = selected_name orelse return .{};
-        var selected = self.selectedMaintenanceLease(selected_group_id, name, selected_generation, best_effort) orelse return .{};
-        defer selected.deinit();
-        const lease = &selected;
-        const result = try lease.owner().maintenance(
+        if (lifetime) |original| try original.checkpoint();
+        if (selected == null) return .{ .selection_pending = selection.more or cursor < selection.limit };
+        if (!try self.selectRetainedMaintenanceLeaseWithLifetime(&selected.?, selection, best_effort, lifetime)) return .{ .selection_pending = true };
+        var lease = selected.?;
+        selected = null;
+        defer lease.deinit();
+        self.lsm_selection_claim.store(false, .release);
+        selecting = false;
+        const result = try lease.owner().maintenanceWithLifetime(
             lease.entry.table_name,
             if (best_effort) .lsm_step_best_effort else .lsm_step,
+            lifetime,
         );
         return .{
             .progressed = result.progressed != 0,
             .group_id = lease.entry.group_id,
+            .selection_pending = selection.more,
         };
     }
 
@@ -3053,14 +3511,19 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const ReadControls = struct {
+        execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+        retain_cpu: bool = false,
+        transition_wait: ?*@import("../storage/hot_standby/owner_preflight_admission.zig").OwnerTransition = null,
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
+        fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
+        online_preparation: bool = false,
         allow_deferred_catalog: bool = false,
 
         fn from(req: anytype) ReadControls {
-            return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
+            return .{ .fanout_io = if (@hasField(@TypeOf(req), "fanout_io")) req.fanout_io else null, .execution_runnable = if (@hasField(@TypeOf(req), "execution_runnable")) req.execution_runnable else null, .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
         }
 
         fn catalogBudget(self: ReadControls, catalog: table_catalog.CatalogSource) table_catalog.RoutingBudget {
@@ -3070,15 +3533,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
 
         fn check(self: ReadControls) !void {
+            if (self.execution_runnable) |borrow| {
+                try borrow.validate();
+                if (self.retain_cpu) try borrow.checkLifetime() else try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
+            }
             const context: request_operation.RequestContext = .{
                 .deadline_ns = self.execution_deadline_ns,
                 .deadline_io = self.execution_io,
                 .cancellation = self.cancellation orelse .none,
             };
-            context.ensureActive() catch |err| return switch (err) {
-                error.Canceled => error.Cancelled,
-                error.DeadlineExceeded => error.Timeout,
-                else => err,
+            @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(context, null) catch |err| {
+                if (context.cancellation.check_fn != null) return err;
+                return switch (err) {
+                    error.Canceled => error.Cancelled,
+                    error.DeadlineExceeded => error.Timeout,
+                    else => err,
+                };
             };
         }
     };
@@ -3453,14 +3923,27 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     pub const RestoreDescriptorUse = enum { read, mutate, resolve };
     pub const RestoreDescriptorRecovery = struct {
-        const VTable = struct { recover: @FieldType(RestoreDescriptorRecovery, "recover_fn") };
+        const VTable = struct {
+            recover: @FieldType(RestoreDescriptorRecovery, "recover_fn"),
+            recover_with_admission: @typeInfo(@FieldType(RestoreDescriptorRecovery, "recover_with_admission_fn")).optional.child,
+        };
         const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
         ptr: *anyopaque,
         recover_fn: *const fn (*anyopaque, std.mem.Allocator, u64, []const u8, [32]u8, [16]u8, RestoreDescriptorUse, @import("antfly_local_sources").api_operation.RequestContext) anyerror!OwnedRestoreDescriptor,
+        recover_with_admission_fn: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, [32]u8, [16]u8, RestoreDescriptorUse, request_operation.RequestContext, @import("antfly_local_sources").common_read_admission.Port) anyerror!OwnedRestoreDescriptor = null,
         boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
 
-        fn recover(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !OwnedRestoreDescriptor {
-            return Boundary.call("recover", self.boundary_dispatch, self.recover_fn, .{ self.ptr, alloc, group_id, table_name, scope, plan_id, use, context });
+        fn recover(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: RestoreDescriptorUse, context: request_operation.RequestContext, control: @import("antfly_local_sources").common_read_admission.Port, require_control: bool) !OwnedRestoreDescriptor {
+            try control.checkpoint();
+            var descriptor = if (self.recover_with_admission_fn) |callback|
+                try Boundary.call("recover_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, scope, plan_id, use, context, control })
+            else blk: {
+                if (require_control) return error.UnsupportedOperation;
+                break :blk try Boundary.call("recover", self.boundary_dispatch, self.recover_fn, .{ self.ptr, alloc, group_id, table_name, scope, plan_id, use, context });
+            };
+            errdefer descriptor.deinit(alloc);
+            try control.checkpoint();
+            return descriptor;
         }
     };
 
@@ -3473,17 +3956,27 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Only the host's authoritative restore-plan callback can supply a missing
     /// descriptor; ordinary named-table discovery is never an alternative.
     pub fn resolveRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: ?[16]u8, use: RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !OwnedRestoreDescriptor {
-        try context.ensureActive();
-        var descriptor = if (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) |cached| cached else blk: {
+        return self.resolveRestoreDescriptorWithRunnable(alloc, group_id, table_name, scope, plan_id, use, context, null);
+    }
+
+    fn resolveRestoreDescriptorWithRunnable(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: ?[16]u8, use: RestoreDescriptorUse, context: request_operation.RequestContext, runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed) !OwnedRestoreDescriptor {
+        const admission = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        try admission.checkOriginal(context, runnable);
+        var wait_io = std.Io.Threaded.init(alloc, .{});
+        defer wait_io.deinit();
+        var session: admission.Session = .{};
+        const control = try session.bindWithRunnable(context, wait_io.io(), runnable);
+        try admission.checkOriginal(context, runnable);
+        var descriptor = if (try self.cachedRestoreDescriptorWithAdmission(alloc, group_id, table_name, scope, control)) |cached| cached else blk: {
             const plan = plan_id orelse return error.RestoreStagingScopeChanged;
             if (std.mem.allEqual(u8, &plan, 0)) return error.RestoreStagingScopeChanged;
             const recovery = self.restore_descriptor_recovery orelse return error.RestoreStagingScopeChanged;
-            break :blk try recovery.recover(alloc, group_id, table_name, scope, plan, use, context);
+            break :blk try recovery.recover(alloc, group_id, table_name, scope, plan, use, context, control, runnable != null);
         };
         errdefer descriptor.deinit(alloc);
-        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
+        var parsed = try @import("../storage/restore_descriptor_admission.zig").parseBootstrap(alloc, descriptor.descriptor.restore_bootstrap_json, control);
         defer parsed.deinit();
-        try parsed.value.validate();
+        try @import("../storage/restore_descriptor_admission.zig").validateBootstrap(parsed.value, control);
         const namespace = parsed.value.scope.target_namespace;
         if (!std.mem.eql(u8, &scope, &parsed.value.scope.digest()) or
             !std.mem.eql(u8, table_name, parsed.value.table_name) or namespace.shard_id != group_id or
@@ -3493,45 +3986,40 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Re-resolve it on retry; this is not a changed restore scope.
         if (descriptor.descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         if (plan_id) |plan| if (!std.mem.eql(u8, &plan, &parsed.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
-        try context.ensureActive();
+        try admission.checkOriginal(context, runnable);
         return descriptor;
     }
 
     pub fn cachedRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8) !?OwnedRestoreDescriptor {
+        return self.cachedRestoreDescriptorWithAdmission(alloc, group_id, table_name, scope, null);
+    }
+
+    fn cachedRestoreDescriptorWithAdmission(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, control: ?@import("antfly_local_sources").common_read_admission.Port) !?OwnedRestoreDescriptor {
+        if (control) |original| try original.checkpoint();
         const generation = self.visibleRootGeneration(group_id);
-        var pinned: Lease = blk: {
-            lock(&self.mutex);
-            defer self.mutex.unlock();
-            for (self.entries.items) |entry| {
-                if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or entry.retired or entry.closing or entry.generation != generation or entry.restore_bootstrap_json.len == 0) continue;
-                if (!tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageReadTemporarilyUnavailable;
-                break :blk .{ .source = self, .entry = entry };
-            }
-            return null;
-        };
+        const found = try @import("../storage/restore_descriptor_admission.zig").pin(Entry, &self.mutex, self.entries.items, group_id, table_name, generation, tryReserveEntryLeaseLocked, control) orelse return null;
+        var pinned: Lease = .{ .source = self, .entry = found };
         defer pinned.deinit();
+        if (control) |original| try original.checkpoint();
         const entry = pinned.entry;
         {
-            var bootstrap = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, entry.restore_bootstrap_json, .{});
+            var bootstrap = try @import("../storage/restore_descriptor_admission.zig").parseBootstrap(alloc, entry.restore_bootstrap_json, control);
             defer bootstrap.deinit();
             if (!std.mem.eql(u8, &scope, &bootstrap.value.scope.digest())) return error.RestoreStagingScopeChanged;
-            const schema_json = try alloc.dupe(u8, entry.schema_json);
-            errdefer alloc.free(schema_json);
-            const indexes_json = try alloc.dupe(u8, entry.indexes_json);
-            errdefer alloc.free(indexes_json);
-            const restore_bootstrap_json = try alloc.dupe(u8, entry.restore_bootstrap_json);
-            errdefer alloc.free(restore_bootstrap_json);
-            const initial_range = try descriptor_contract.cloneInitialRange(alloc, entry.initial_range);
+            if (control) |original| try original.checkpoint();
+            var copied = try @import("../storage/restore_descriptor_admission.zig").cloneBuffers(alloc, entry.schema_json, entry.indexes_json, entry.restore_bootstrap_json, entry.initial_range, control);
+            errdefer copied.deinit(alloc);
+            if (control) |original| try original.checkpoint();
             return .{ .descriptor = .{
                 .lsm_root_generation = entry.generation,
                 .identity = entry.identity,
-                .schema_json = schema_json,
-                .indexes_json = indexes_json,
-                .restore_bootstrap_json = restore_bootstrap_json,
+                .schema_json = copied.schema_json,
+                .indexes_json = copied.indexes_json,
+                .restore_bootstrap_json = copied.restore_bootstrap_json,
                 .restore_cancel_recovery = entry.restore_cancel_recovery,
                 .restore_ha_replay = entry.restore_ha_replay,
                 .table_storage = entry.table_storage,
-                .initial_range = initial_range,
+                .initial_range = copied.initial_range,
             } };
         }
     }
@@ -3707,7 +4195,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (proposer) |replicated| {
             try replicated.submit(batch.req, request);
         } else {
-            _ = try self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, batch.req, descriptor);
+            _ = try self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, batch.req, descriptor, request, null);
         }
         const followup = if (input.action == .publish or input.action == .cancel or input.action == .install_generation_admissions) input else input.statusRead();
         var committed = try self.prepareRestoreOwnerControl(alloc, group_id, table_name, descriptor, followup, options, request);
@@ -3867,13 +4355,25 @@ pub const ProvisionedKernelOwnerSource = struct {
         controls: ReadControls,
     ) !Lease {
         errdefer if (exclusive) self.clearExclusivePending(group_id, table_name);
-        var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer wait_io_impl.deinit();
-        const wait_io = wait_io_impl.io();
+        var receiver: request_execution_io.Borrow = .{};
+        var legacy_wait_io: ?std.Io.Threaded = null;
+        defer if (legacy_wait_io) |*owned| owned.deinit();
+        const wait_io = if (controls.transition_wait) |scope|
+            scope.executionIo()
+        else if (controls.fanout_io != null or self.context_runtime != null)
+            try self.borrowRequestIo(&receiver, controls.fanout_io)
+        else blk: {
+            legacy_wait_io = .init(self.alloc, .{});
+            break :blk legacy_wait_io.?.io();
+        };
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
         while (true) {
             try controls.check();
-            try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            if (controls.transition_wait) |scope| {
+                try scope.wait(.fromMilliseconds(1), deadline_ns);
+            } else {
+                try @import("runnable_fanout_owner.zig").sleepForProgress(if (controls.retain_cpu) null else controls.execution_runnable, wait_io, .fromMilliseconds(1));
+            }
             try controls.check();
             return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
                 error.StorageKernelOwnerStaleDescriptor => return err,
@@ -3973,8 +4473,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.apply_control_pending.items.len + @as(usize, @intFromBool(self.apply_control_active != null)) >= apply_control_max_pending)
             return error.RaftApplyWriterUnavailable;
         self.apply_control_pending.appendAssumeCapacity(pending);
+        _ = self.apply_open_debt.fetchAdd(1, .acq_rel);
         pending_owned = false;
-        self.apply_control_wake.set(self.apply_control_io.?);
+        self.apply_open_wake.set(self.apply_control_io.?);
         return error.RaftApplyWriterUnavailable;
     }
 
@@ -4022,6 +4523,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         residency: Residency,
         controls: ReadControls,
     ) !Lease {
+        try controls.check();
         const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
@@ -4032,6 +4534,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         var stale_index: ?usize = null;
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            // Check under the same lock as acquisition: a public preparation
+            // cannot retire or inherit a racing privately admitted restore.
+            if (controls.online_preparation and entry.restore_bootstrap_json.len != 0)
+                return error.RestoreStagingScopeChanged;
             // A cached owner opened before restore intent must drain as well.
             // Compare the admitted binding in memory; warm hits need no marker I/O.
             // Ordinary descriptor acquisition may inherit an admitted restore
@@ -4082,7 +4588,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                     // Periodic inspection yields without retiring readers.
                     // Historical Raft apply may need the old schema after the
                     // current owner's leases drain.
-                    if (admission != .exclusive_if_idle and
+                    if (admission != .exclusive_if_idle and !controls.online_preparation and
                         (controls.historical_raft_apply or !schemaVersionRegresses(entry.schema_json, descriptor.schema_json))) entry.retired = true;
                     return error.StorageKernelOwnerTransitionRequired;
                 }
@@ -4099,7 +4605,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return .{ .source = self, .entry = entry, .exclusive = exclusive };
         }
         if (stale_index) |index| {
-            self.destroyEntryAtIndexLocked(index);
+            _ = self.destroyEntryAtIndexLocked(index);
             // Closing releases the registry mutex. Recheck the descriptor on
             // retry in case another caller installed its replacement.
             return error.StorageKernelOwnerTransitionRequired;
@@ -4129,6 +4635,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             .deadline_io = controls.execution_io,
             .cancellation = cancellation,
         });
+        var lifetime_controls = controls;
+        lifetime_controls.retain_cpu = true;
+        try lifetime_controls.check();
         var catalog_deferred: u8 = 0;
         var owner = client.Owner.open(.{
             .context = self.context.handle,
@@ -4183,6 +4692,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             return err;
         };
         errdefer owner.deinit();
+        // Register a physically completed open even if the caller expired
+        // during native I/O. Its caller observes that rejection after release;
+        // the retained owner lets durable replay retry without a cold-open loop.
         entry.* = .{
             .group_id = group_id,
             .table_name = owned_table_name,
@@ -4199,12 +4711,14 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore = owned_restore,
             .owner = owner,
             .opened_for_historical_apply = controls.historical_raft_apply,
+            .online_preparation_pending = controls.online_preparation,
             .catalog_deferred = catalog_deferred != 0,
             .active_users = 1,
             .resident = residency == .resident,
             .exclusive_pending = false,
             .exclusive_active = exclusive,
         };
+        entry.lsm_last_served = self.lsm_selection.epoch;
         self.entries.appendAssumeCapacity(entry);
         _ = self.owner_cache_misses.fetchAdd(1, .monotonic);
         return .{ .source = self, .entry = entry, .exclusive = exclusive };
@@ -4304,6 +4818,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
             .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+            .execution_runnable = if (req.execution_runnable) |*borrow| borrow else null,
             .execution = execution,
         });
         errdefer response.deinit();
@@ -4360,17 +4875,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !void {
+        return self.validateRoutedReadControlled(alloc, fence, group_id, table_name, null);
+    }
+    fn validateRoutedReadControlled(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+        if (control) |port| try port.checkpoint();
         try fence.validate();
         if (fence.route.group_id != group_id) return error.TopologyChanged;
         try fence.admission_cancellation.check();
-        try table_catalog.validateCatalogRouteFenceUntil(
-            alloc,
-            self.catalog,
-            table_name,
-            fence,
-            self.catalog.routeFenceDeadline(fence),
-        );
+        if (control) |port| try table_catalog.validateCatalogRouteFenceWithAdmission(alloc, self.catalog, table_name, fence, self.catalog.routeFenceDeadline(fence), port) else try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.routeFenceDeadline(fence));
         try fence.admission_cancellation.check();
+        if (control) |port| try port.checkpoint();
     }
 
     fn lookupGroupLocalRouted(
@@ -4429,6 +4943,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.next(alloc, limit);
         }
+        fn nextWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32, control: @import("antfly_local_sources").common_read_admission.Port) !table_read_source.RelationalReadView.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.view.nextWithAdmission(alloc, limit, control);
+        }
         fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_types.BatchWrite) ![]db_types.BatchWrite {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.normalize(alloc, writes);
@@ -4436,6 +4954,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.rangeProofs(alloc);
+        }
+        fn normalizeWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_types.BatchWrite, control: @import("antfly_local_sources").common_read_admission.Port) ![]db_types.BatchWrite {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.view.normalizeWithAdmission(alloc, writes, control);
+        }
+        fn rangeProofsWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, control: @import("antfly_local_sources").common_read_admission.Port) ![]@import("antfly_local_sources").storage_range_protection.Proof {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.view.rangeProofsWithAdmission(alloc, control);
         }
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -4457,17 +4983,30 @@ pub const ProvisionedKernelOwnerSource = struct {
         frozen_proof: ?read_gate.ReadSafetyBarrier.FrozenProof = null,
 
         pub fn validate(ptr: *anyopaque) !void {
+            return validateControlled(ptr, null);
+        }
+        fn validateWithAdmission(ptr: *anyopaque, control: @import("antfly_local_sources").common_read_admission.Port) !void {
+            return validateControlled(ptr, control);
+        }
+        fn validateControlled(ptr: *anyopaque, control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+            if (control) |borrow| try borrow.checkpoint();
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try validateLocal(self);
+            try validateLocalControlled(self, control);
             if (self.frozen_proof) |proof| {
                 const barrier = self.source.read_safety_barrier;
-                const validate_proof = barrier.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
-                try validate_proof(barrier.ptr, self.group, proof, self.route.admission_deadline_ns, self.route.admission_cancellation);
+                try barrier.validateFrozenWithAdmission(self.group, proof, self.route.admission_deadline_ns, self.route.admission_cancellation, control);
             }
+            if (control) |borrow| try borrow.checkpoint();
         }
         fn validateLocal(self: *@This()) !void {
-            try self.native.validate();
-            try self.source.validateRoutedRead(self.alloc, self.route, self.group, self.table);
+            return validateLocalControlled(self, null);
+        }
+        fn validateLocalControlled(self: *@This(), control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+            if (control) |borrow| try self.native.validateWithAdmission(borrow) else try self.native.validate();
+            // Route checks retain CPU until their physical providers expose a
+            // checked wait boundary. Never park the whole validation body.
+            try self.source.validateRoutedReadControlled(self.alloc, self.route, self.group, self.table, control);
+            if (control) |borrow| try borrow.checkpoint();
         }
         fn release(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -4477,25 +5016,39 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.alloc.destroy(self);
         }
         fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions) !table_read_source.RelationalReadView {
+            return openControlled(ptr, alloc, from, to, opts, null);
+        }
+        fn openWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions, control: @import("antfly_local_sources").common_read_admission.Port) !table_read_source.RelationalReadView {
+            return openControlled(ptr, alloc, from, to, opts, control);
+        }
+        fn openControlled(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions, control: ?@import("antfly_local_sources").common_read_admission.Port) !table_read_source.RelationalReadView {
+            if (control) |port| try port.checkpoint();
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try validateLocal(self);
+            try validateLocalControlled(self, control);
             var owner = self.owner.cloneRead();
             errdefer owner.deinit();
-            const view = try self.native.open(alloc, from, to, opts);
+            const view = if (control) |port| try self.native.openWithAdmission(alloc, from, to, opts, port) else try self.native.open(alloc, from, to, opts);
             errdefer view.deinit();
-            try validateLocal(self);
+            try validateLocalControlled(self, control);
             const retained = try alloc.create(RetainedRelationalRead);
             retained.* = .{ .alloc = alloc, .lease = owner, .view = view };
-            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
+            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .next_with_admission = RetainedRelationalRead.nextWithAdmission, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .normalize_with_admission = RetainedRelationalRead.normalizeWithAdmission, .range_proofs = RetainedRelationalRead.rangeProofs, .range_proofs_with_admission = RetainedRelationalRead.rangeProofsWithAdmission } };
         }
 
         fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
+            return captureSnapshotControlled(ptr, alloc, null);
+        }
+        fn captureSnapshotWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, control: @import("antfly_local_sources").common_read_admission.Port) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
+            return captureSnapshotControlled(ptr, alloc, control);
+        }
+        fn captureSnapshotControlled(ptr: *anyopaque, alloc: std.mem.Allocator, control: ?@import("antfly_local_sources").common_read_admission.Port) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
+            if (control) |port| try port.checkpoint();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const frozen_proof = self.frozen_proof orelse return error.SqlStatementSnapshotRequired;
-            try validate(self);
-            const native = try self.native.captureSnapshot(alloc);
+            try validateControlled(self, control);
+            const native = if (control) |port| try self.native.captureSnapshotWithAdmission(alloc, port) else try self.native.captureSnapshot(alloc);
             errdefer native.deinit();
-            try validate(self);
+            try validateControlled(self, control);
             var owner = self.owner.cloneRead();
             errdefer owner.deinit();
             const name = try alloc.dupe(u8, self.table);
@@ -4508,8 +5061,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             retained_route.admission_deadline_ns = null;
             retained_route.admission_deadline_io = null;
             const snapshot = try alloc.create(RoutedStatementSnapshot);
+            errdefer alloc.destroy(snapshot);
+            if (control) |port| try port.checkpoint();
             snapshot.* = .{ .alloc = alloc, .source = self.source, .owner = owner, .native = native, .route = retained_route, .group = self.group, .table = name, .cancellation = null, .deadline_ns = null, .frozen_proof = frozen_proof };
-            return .{ .ptr = snapshot, .vtable = &.{ .open = RoutedStatementSnapshot.openNative, .release = RoutedStatementSnapshot.close } };
+            return .{ .ptr = snapshot, .vtable = &.{ .open = RoutedStatementSnapshot.openNative, .open_with_admission = RoutedStatementSnapshot.openNativeWithAdmission, .release = RoutedStatementSnapshot.close } };
         }
     };
 
@@ -4526,15 +5081,25 @@ pub const ProvisionedKernelOwnerSource = struct {
         frozen_proof: read_gate.ReadSafetyBarrier.FrozenProof,
 
         fn check(self: *@This()) !void {
+            return self.checkControlled(null);
+        }
+        fn checkControlled(self: *@This(), control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+            if (control) |port| try port.checkpoint();
             if (self.cancellation) |token| try token.check();
             if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
-            try self.source.validateRoutedRead(self.alloc, self.route, self.group, self.table);
-            const validate = self.source.read_safety_barrier.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
-            try validate(self.source.read_safety_barrier.ptr, self.group, self.frozen_proof, self.deadline_ns, self.cancellation orelse .none);
+            try self.source.validateRoutedReadControlled(self.alloc, self.route, self.group, self.table, control);
+            try self.source.read_safety_barrier.validateRetainedSnapshotWithAdmission(self.group, self.frozen_proof, self.deadline_ns, self.cancellation orelse .none, control);
         }
         fn open(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan) !table_read_source.RelationalReadView {
+            return openControlled(ptr, alloc, input, null);
+        }
+        fn openWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan, control: @import("antfly_local_sources").common_read_admission.Port) !table_read_source.RelationalReadView {
+            return openControlled(ptr, alloc, input, control);
+        }
+        fn openControlled(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan, control: ?@import("antfly_local_sources").common_read_admission.Port) !table_read_source.RelationalReadView {
+            if (control) |port| try port.checkpoint();
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.check();
+            try self.checkControlled(control);
             if (!std.mem.eql(u8, input.table, self.table)) return error.SqlStatementSnapshotRequired;
             if (!input.opts.include_range_proofs) return error.SqlRangeTrackingRequired;
             var opts = input.opts;
@@ -4542,22 +5107,32 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (self.deadline_ns) |deadline| opts.execution_deadline_ns = if (opts.execution_deadline_ns) |prior| @min(prior, deadline) else deadline;
             var lease = self.owner.cloneRead();
             errdefer lease.deinit();
-            const view = try self.native.open(alloc, input.from, input.to, opts);
+            const view = if (control) |port| try self.native.openWithAdmission(alloc, input.from, input.to, opts, port) else try self.native.open(alloc, input.from, input.to, opts);
             errdefer view.deinit();
-            try self.check();
+            try self.checkControlled(control);
             const retained = try alloc.create(RetainedRelationalRead);
             retained.* = .{ .alloc = alloc, .lease = lease, .view = view };
-            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
+            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .next_with_admission = RetainedRelationalRead.nextWithAdmission, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .normalize_with_admission = RetainedRelationalRead.normalizeWithAdmission, .range_proofs = RetainedRelationalRead.rangeProofs, .range_proofs_with_admission = RetainedRelationalRead.rangeProofsWithAdmission } };
         }
         fn openNative(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions) !table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return open(ptr, alloc, .{ .table = self.table, .from = from, .to = to, .opts = opts });
         }
-        fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan) !table_read_source.RelationalStatementSnapshot.GuardedRead {
+        fn openNativeWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions, control: @import("antfly_local_sources").common_read_admission.Port) !table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const view = try open(ptr, alloc, input);
+            return openControlled(ptr, alloc, .{ .table = self.table, .from = from, .to = to, .opts = opts }, control);
+        }
+        fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan) !table_read_source.RelationalStatementSnapshot.GuardedRead {
+            return openGuardedControlled(ptr, alloc, input, null);
+        }
+        fn openGuardedWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan, control: @import("antfly_local_sources").common_read_admission.Port) !table_read_source.RelationalStatementSnapshot.GuardedRead {
+            return openGuardedControlled(ptr, alloc, input, control);
+        }
+        fn openGuardedControlled(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan, control: ?@import("antfly_local_sources").common_read_admission.Port) !table_read_source.RelationalStatementSnapshot.GuardedRead {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const view = try openControlled(ptr, alloc, input, control);
             errdefer view.deinit();
-            const proofs = try view.rangeProofs(alloc);
+            const proofs = if (control) |port| try view.rangeProofsWithAdmission(alloc, port) else try view.rangeProofs(alloc);
             errdefer alloc.free(proofs);
             if (proofs.len == 0) return error.SqlRangeTrackingRequired;
             const owners = try alloc.alloc(@import("antfly_local_sources").api_range_read_guards.OwnerRangeProof, 1);
@@ -4592,17 +5167,24 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer alloc.free(name);
         const snapshot = try alloc.create(RoutedStatementSnapshot);
         snapshot.* = .{ .alloc = alloc, .source = self, .owner = owner, .native = native, .route = scoped, .group = group, .table = name, .cancellation = cancellation, .deadline_ns = scoped.admission_deadline_ns, .frozen_proof = frozen_proof };
-        return .{ .ptr = snapshot, .vtable = &.{ .open = RoutedStatementSnapshot.open, .open_guarded = RoutedStatementSnapshot.openGuarded, .close = RoutedStatementSnapshot.close } };
+        return .{ .ptr = snapshot, .vtable = &.{ .open = RoutedStatementSnapshot.open, .open_with_admission = RoutedStatementSnapshot.openWithAdmission, .open_guarded = RoutedStatementSnapshot.openGuarded, .open_guarded_with_admission = RoutedStatementSnapshot.openGuardedWithAdmission, .close = RoutedStatementSnapshot.close } };
     }
 
     fn tryStatementReadFenceRouted(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, group: u64, table: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?table_read_source.StatementReadFence {
+        return tryStatementReadFenceControlled(ptr, alloc, route, group, table, opts, consistency, null);
+    }
+    fn tryStatementReadFenceWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, group: u64, table: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency, control: @import("antfly_local_sources").common_read_admission.Port) !?table_read_source.StatementReadFence {
+        return tryStatementReadFenceControlled(ptr, alloc, route, group, table, opts, consistency, control);
+    }
+    fn tryStatementReadFenceControlled(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, group: u64, table: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency, control: ?@import("antfly_local_sources").common_read_admission.Port) !?table_read_source.StatementReadFence {
+        if (control) |port| try port.checkpoint();
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        try self.validateRoutedRead(alloc, route, group, table);
+        try self.validateRoutedReadControlled(alloc, route, group, table, control);
         try self.prepareRetainedScanRead(group, "", "", opts, consistency);
         var owner = try self.acquireWithControls(group, table, .from(opts));
         errdefer owner.deinit();
         const provider = try @import("../storage/relational_read_provider.zig").acquire(owner.owner().handle);
-        const native = (try provider.tryFence(alloc, table, opts)) orelse {
+        const native = (if (control) |port| try provider.tryFenceWithAdmission(alloc, table, opts, port) else try provider.tryFence(alloc, table, opts)) orelse {
             owner.deinit();
             return null;
         };
@@ -4611,10 +5193,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer alloc.destroy(retained);
         retained.* = .{ .alloc = alloc, .source = self, .owner = owner, .native = native, .route = route, .group = group, .table = try alloc.dupe(u8, table) };
         errdefer alloc.free(retained.table);
-        if (self.read_safety_barrier.vtable.capture_frozen) |capture_proof|
-            retained.frozen_proof = try capture_proof(self.read_safety_barrier.ptr, group);
-        try RetainedStatementFence.validateLocal(retained);
-        return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .capture_snapshot = RetainedStatementFence.captureSnapshot, .release = RetainedStatementFence.release } };
+        if (self.read_safety_barrier.vtable.capture_frozen != null)
+            retained.frozen_proof = try self.read_safety_barrier.captureFrozen(group);
+        try RetainedStatementFence.validateLocalControlled(retained, control);
+        if (control) |port| try port.checkpoint();
+        return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .validate_with_admission = RetainedStatementFence.validateWithAdmission, .open = RetainedStatementFence.open, .open_with_admission = RetainedStatementFence.openWithAdmission, .capture_snapshot = RetainedStatementFence.captureSnapshot, .capture_snapshot_with_admission = RetainedStatementFence.captureSnapshotWithAdmission, .release = RetainedStatementFence.release } };
     }
 
     fn prepareRetainedScanRead(self: *ProvisionedKernelOwnerSource, group: u64, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !void {
@@ -4637,7 +5220,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.validateRoutedRead(alloc, fence, group, table);
         const retained = try alloc.create(RetainedRelationalRead);
         retained.* = .{ .alloc = alloc, .lease = lease, .view = view };
-        return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
+        return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .next_with_admission = RetainedRelationalRead.nextWithAdmission, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .normalize_with_admission = RetainedRelationalRead.normalizeWithAdmission, .range_proofs = RetainedRelationalRead.rangeProofs, .range_proofs_with_admission = RetainedRelationalRead.rangeProofsWithAdmission } };
     }
 
     fn scanGroupLocalRoutedStream(
@@ -4756,6 +5339,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         try self.validateRoutedRead(alloc, fence, group_id, table_name);
         return try textStatsGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn textStatsGroupLocalControlledRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_types.SearchRequest,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_reads.checkQueryDeadline(controls);
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try textStatsGroupLocalControlled(ptr, alloc, group_id, table_name, body, controls);
     }
 
     fn algebraicPartialsGroupLocalRouted(
@@ -5100,9 +5698,30 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (req.restore_staging_scope) |scope| {
             var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, req.restore_staging_plan_id, restoreDescriptorUseForBatch(req), .{});
             defer descriptor.deinit(alloc);
-            return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, descriptor.view());
+            return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, descriptor.view(), null, null);
         }
-        return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, null);
+        return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, null, null, null);
+    }
+
+    fn batchGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext) !?void {
+        const original: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
+        try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(original, context.execution_runnable);
+        if (req.transaction) |transaction| switch (transaction) {
+            .acknowledge, .acknowledge_many => return acknowledgeTransactionGroupLocalWithContext(ptr, alloc, group_id, table_name, req, context),
+            else => return error.UnsupportedOperation,
+        };
+        if (context.route_fence != null) return error.CatalogRouteFenceUnsupported;
+        if (context.restore_staging_scope) |scope| if (req.restore_staging_scope == null or !std.mem.eql(u8, &scope, &req.restore_staging_scope.?)) return error.RestoreStagingScopeChanged;
+        if (context.restore_staging_plan_id) |plan| if (req.restore_staging_plan_id == null or !std.mem.eql(u8, &plan, &req.restore_staging_plan_id.?)) return error.RestoreStagingScopeChanged;
+        // Transactions have distinct accepted decision/cleanup semantics.
+        if (req.transaction != null) return error.UnsupportedOperation;
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (req.restore_staging_scope) |scope| {
+            var descriptor = try self.resolveRestoreDescriptorWithRunnable(alloc, group_id, table_name, scope, req.restore_staging_plan_id, restoreDescriptorUseForBatch(req), original, context.execution_runnable);
+            defer descriptor.deinit(alloc);
+            return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, descriptor.view(), original, context.execution_runnable);
+        }
+        return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, null, original, context.execution_runnable);
     }
 
     fn batchGroupLocalWithDescriptor(
@@ -5112,20 +5731,49 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
         descriptor: ?descriptor_contract.Descriptor,
+        original_context: ?request_operation.RequestContext,
+        original_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
     ) !?void {
+        if (original_context) |original| try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(original, original_runnable);
+        var request_io: request_execution_io.Borrow = .{};
+        const admission_io: ?std.Io = if (original_context) |original| try self.borrowRequestIo(&request_io, original.fanout_io) else null;
+        const controlled = @import("../storage/hot_standby/owner_preflight_admission.zig");
         if (self.replication_write_gate) |gate| try gate.check();
-        var replication_mutation = if (self.hot_standby_async_mirror) |mirror|
+        const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+        var capture_root: ?Barrier.RootSharedLease = if (original_context != null and req.transaction == null) blk: {
+            const mirror = self.hot_standby_async_mirror orelse break :blk null;
+            const barrier = mirror.mutation_barrier orelse break :blk null;
+            break :blk Barrier.RootSharedLease.initRetired(barrier);
+        } else null;
+        defer if (capture_root) |*root| root.release();
+        var replication_mutation = if (original_context) |original|
+            if (capture_root) |*root|
+                try controlled.acquireMutationWithRoot(self.hot_standby_async_mirror, original, admission_io.?, original_runnable, root)
+            else
+                try controlled.acquireMutationWithRunnable(self.hot_standby_async_mirror, original, admission_io.?, original_runnable)
+        else if (self.hot_standby_async_mirror) |mirror|
             if (mirror.mutation_barrier) |barrier| barrier.acquireShared() else null
         else
             null;
         defer if (replication_mutation) |*lease| lease.release();
-        try self.preflightHotStandbyMirrorSyncCommit();
+        if (original_context) |original| {
+            try controlled.preflightWithRunnable(self.hot_standby_async_mirror, original, admission_io.?, original_runnable);
+        } else try self.preflightHotStandbyMirrorSyncCommit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
         const private_path = if (descriptor != null) try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id }) else null;
         defer if (private_path) |path| alloc.free(path);
-        var lease = if (descriptor) |owned| try self.acquireDescriptor(group_id, table_name, private_path.?, owned) else try self.acquire(group_id, table_name);
+        var transition: ?controlled.OwnerTransition = if (original_context != null and req.transaction == null)
+            controlled.OwnerTransition.init(original_context.?, original_runnable, admission_io.?, if (capture_root) |*root| root else null, &replication_mutation, self.replication_write_gate)
+        else
+            null;
+        const controls: ReadControls = if (original_context) |original| .{ .execution_deadline_ns = original.deadline_ns, .execution_io = original.deadline_io, .fanout_io = original.fanout_io, .cancellation = original.cancellation, .execution_runnable = original_runnable, .retain_cpu = true, .transition_wait = if (transition) |*scope| scope else null } else .{};
+        var lease = if (descriptor) |owned|
+            try self.acquireDescriptorWithMode(group_id, table_name, private_path.?, owned, false, .resident, controls)
+        else
+            try self.acquireWithControls(group_id, table_name, controls);
         defer lease.deinit();
+        if (original_context) |original| try controlled.checkOriginal(original, original_runnable);
         if (descriptor == null and (req.writes.len != 0 or req.transforms.len != 0)) _ = try lease.owner().preflightWriteAdmissionJson(table_name, request_json);
         if (req.transaction != null and req.restore_staging_scope != null) {
             // Private activation uses the batch route to retain exact Plan
@@ -5155,13 +5803,29 @@ pub const ProvisionedKernelOwnerSource = struct {
         else
             null;
         var response: client.Response = .{};
-        const callback_status = lease.owner().batchJsonWithCallbacksStatus(
+        var execution_admission: controlled.Session = .{};
+        const execution_port = if (original_context) |original| try execution_admission.bindWithRunnable(original, admission_io.?, original_runnable) else null;
+        const batch_admission = @import("antfly_local_sources").api_batch_execution_admission;
+        const producer_io: ?std.Io = if (original_context != null) admission_io.? else null;
+        const producer_deadline: ?u64 = if (original_context) |original| (try platformDeadlineContext(original)).deadline_ns else null;
+        var batch_payload: ?batch_admission.Payload = if (execution_port) |port| .{
+            .original = port,
+            .roots = .{
+                .root = if (capture_root) |*root| root else null,
+                .retirement = if (capture_root != null) &replication_mutation else null,
+                .committed_visibility = execution_admission.committedVisibilityBoundary(),
+                .producer = .{ .io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&producer_io.?), .deadline_ns = producer_deadline, .execution = original_runnable },
+            },
+        } else null;
+        var batch_port: ?batch_admission.Port = if (batch_payload) |*payload| batch_admission.Port.init(payload) else null;
+        const callback_status = lease.owner().batchJsonWithCallbacksAndAdmissionContextStatus(
             table_name,
             request_json,
             if (dispatch_context) |*context| context else null,
             if (dispatch_context != null) dispatchDocumentChildRange else null,
             &committed_effects_context,
             committedBatchEffects,
+            if (batch_port) |*port| port else null,
             &response,
         );
         defer response.deinit();
@@ -5659,7 +6323,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             defer descriptor.deinit(alloc);
             const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
             defer alloc.free(path);
-            return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+            return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation });
         }
         if (req.transaction) |txn| switch (txn) {
             .resolve, .acknowledge, .acknowledge_many => if (try self.acquireHiddenTransactionOwner(group_id, table_name)) |lease| return lease,
@@ -5693,6 +6357,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    const NativeTransactionControls = struct {
+        require_checked_reentry: bool = true,
+        context: request_operation.RequestContext,
+        route: ?metadata_api.CatalogRouteFence,
+        execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+        fn check(value: @This()) !void {
+            try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(value.context, value.execution_runnable);
+            if (value.route) |fence| try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+            if (value.execution_runnable) |borrow| {
+                const status = borrow.checkpoint(borrow.context);
+                if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+            }
+        }
+    };
+
     fn txnBeginGroupLocalWithPreDecisionContext(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5705,22 +6384,43 @@ pub const ProvisionedKernelOwnerSource = struct {
         participants: []const []const u8,
         context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext,
     ) !?void {
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
+        try original.checkOriginal(active, context.execution_runnable);
+        if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+        if (!context.requiresAwareCallback()) return txnBeginGroupLocal(ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
+        if ((context.restore_staging_scope == null) != (context.restore_staging_plan_id == null)) return error.RestoreStagingScopeChanged;
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
-        try active.ensureActive();
-        if (context.restore_staging_scope == null and context.restore_staging_plan_id != null) return error.RestoreStagingScopeChanged;
-        try self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, .{
-            .restore_staging_scope = context.restore_staging_scope,
-            .restore_staging_plan_id = context.restore_staging_plan_id,
-            .transaction = .{ .begin = .{
-                .txn_id = txn_id,
-                .begin_timestamp = begin_timestamp,
-                .created_at_ns = platform_time.realtimeNs(),
-                .topology_epoch = topology_epoch,
-                .retain_terminal = retain_terminal,
-                .participants = participants,
-            } },
-        }, active);
+        var receiver: request_execution_io.Borrow = .{};
+        const io = try self.borrowRequestIo(&receiver, context.fanout_io);
+        const Controls = NativeTransactionControls;
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        const admission = @import("antfly_local_sources").common_read_admission;
+        var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
+        var adapter: admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        if (context.route_fence) |fence| {
+            if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
+        }
+        const controls: ReadControls = .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true };
+        var lease = if (context.restore_staging_scope) |scope| block: {
+            var descriptor = try self.resolveRestoreDescriptorWithRunnable(alloc, group_id, table_name, scope, context.restore_staging_plan_id, .mutate, active, context.execution_runnable);
+            defer descriptor.deinit(alloc);
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :block try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, controls);
+        } else try self.acquireWithControls(group_id, table_name, controls);
+        defer lease.deinit();
+        if (context.route_fence) |fence| {
+            const identity = fence.route.identity_namespace;
+            if (identity.table_id != lease.entry.identity.table_id or identity.shard_id != lease.entry.identity.shard_id or identity.range_id != lease.entry.identity.range_id) return error.TopologyChanged;
+        }
+        try control.checkpoint();
+        try lease.owner().transactionBeginWithAdmission(alloc, table_name, txn_id, begin_timestamp, platform_time.realtimeNs(), participants, retain_terminal, context.restore_staging_scope, context.restore_staging_plan_id, &control);
+        // Durable BEGIN remains a successful contact even if the caller expires
+        // during its physical completion. Later phases retain their own checks.
         return {};
     }
 
@@ -5763,6 +6463,39 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    fn txnPrepareGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_types.TxnId, topology_epoch: u64, req: db_types.TransactionIntentRequest, context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext) !?void {
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
+        try original.checkOriginal(active, context.execution_runnable);
+        if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+        if (context.restore_staging_scope != null or context.restore_staging_plan_id != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.UnsupportedOperation;
+        if (!context.requiresAwareCallback()) return txnPrepareGroupLocal(ptr, alloc, group_id, table_name, txn_id, topology_epoch, req);
+        if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var receiver: request_execution_io.Borrow = .{};
+        const io = try self.borrowRequestIo(&receiver, context.fanout_io);
+        const Controls = NativeTransactionControls;
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        const admission = @import("antfly_local_sources").common_read_admission;
+        var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
+        var adapter: admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        if (context.route_fence) |fence| {
+            if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
+        }
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        defer lease.deinit();
+        if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
+        if (context.route_fence) |fence| {
+            const identity = fence.route.identity_namespace;
+            if (identity.table_id != lease.entry.identity.table_id or identity.shard_id != lease.entry.identity.shard_id or identity.range_id != lease.entry.identity.range_id) return error.TopologyChanged;
+        }
+        try lease.owner().transactionPrepareWithAdmission(table_name, txn_id, req, &control);
+        return {};
+    }
+
     fn txnResolveGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5783,6 +6516,46 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .commit_version = commit_version,
             } },
         });
+        return {};
+    }
+
+    fn txnResolveGroupLocalWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_types.TxnId, status: db_types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_types.SyncLevel, cancellation: db_types.CancellationToken) !?void {
+        return txnResolveGroupLocalWithExecution(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .{ .cancellation = cancellation });
+    }
+
+    fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_types.TxnId, status: db_types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_types.SyncLevel, context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext) !?void {
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
+        try original.checkOriginal(active, context.execution_runnable);
+        if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+        if (context.restore_staging_scope != null or context.restore_staging_plan_id != null) return error.UnsupportedOperation;
+        if (!context.requiresAwareCallback()) return txnResolveGroupLocal(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var receiver: request_execution_io.Borrow = .{};
+        const io = try self.borrowRequestIo(&receiver, context.fanout_io);
+        const Controls = NativeTransactionControls;
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        const admission = @import("antfly_local_sources").common_read_admission;
+        var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
+        var adapter: admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        if (context.route_fence) |fence| {
+            if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
+        }
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        defer lease.deinit();
+        if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
+        if (context.route_fence) |fence| {
+            const identity = fence.route.identity_namespace;
+            if (identity.table_id != lease.entry.identity.table_id or identity.shard_id != lease.entry.identity.shard_id or identity.range_id != lease.entry.identity.range_id) return error.TopologyChanged;
+        }
+        try lease.owner().transactionResolveWithAdmission(table_name, txn_id, switch (status) {
+            .pending => return error.InvalidBatchRequest,
+            .committed => .committed,
+            .aborted => .aborted,
+        }, commit_version, @fromBackingInt(@intCast(@backingInt(sync_level))), &control);
         return {};
     }
 
@@ -5824,7 +6597,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }, .read_index);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation });
         defer lease.deinit();
         try context.ensureActive();
         return switch (try lease.owner().transactionStatus(table_name, req.txn_id)) {
@@ -5832,6 +6605,173 @@ pub const ProvisionedKernelOwnerSource = struct {
             .committed => .committed,
             .aborted => .aborted,
         };
+    }
+
+    /// Control reads borrow existing residency only. They cannot open storage,
+    /// retire owners, join workers, or wait for the registry mutex. Release uses
+    /// the existing atomic release queue, so a concurrent cold open cannot
+    /// block completion of this read either.
+    fn borrowPreparationStatusResident(self: *ProvisionedKernelOwnerSource, group: u64, table: []const u8, generation: u64, identity: ?Identity, control: @import("antfly_local_sources").common_read_admission.Port) !Lease {
+        try control.checkpoint();
+        if (!self.mutex.tryLock()) return error.StorageReadTemporarilyUnavailable;
+        defer self.mutex.unlock();
+        if (self.quiescing) return error.Canceled;
+        if (self.apply_control_stopping) return error.StorageReadTemporarilyUnavailable;
+        if (self.publicationPendingLocked(group, table)) return error.StorageReadTemporarilyUnavailable;
+        for (self.entries.items, 0..) |entry, index| {
+            if (index % 64 == 0) try control.checkLifetime();
+            if (entry.group_id != group or !std.mem.eql(u8, entry.table_name, table)) continue;
+            if (entry.retired or entry.closing or !entry.resident or entry.catalog_deferred or
+                entry.opened_for_historical_apply or entry.online_preparation_pending or entry.generation != generation or
+                (if (identity) |expected| !entry.identity.eql(expected) else false)) return error.StorageReadTemporarilyUnavailable;
+            const released = entry.pending_apply_releases.swap(0, .acq_rel);
+            std.debug.assert(released <= entry.active_users);
+            entry.active_users -= released;
+            if (!tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageReadTemporarilyUnavailable;
+            _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
+            return .{ .source = self, .entry = entry, .apply_only = true };
+        }
+        return error.StorageReadTemporarilyUnavailable;
+    }
+
+    fn txnPreparationStatusGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest, context: request_operation.RequestContext, runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed) !?@import("antfly_local_sources").api_prepared_transaction_protocol.Observation {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        try original.checkOriginal(context, runnable);
+        if (context.deadline_ns == null or (req.restore_staging_scope == null) != (req.restore_staging_plan_id == null)) return error.InvalidTxnRequest;
+        const barrier = self.read_safety_barrier;
+        if (self.online_source_authority == .raft and (barrier.vtable.capture_frozen == null or barrier.vtable.validate_frozen_with_admission == null or barrier.vtable.validate_retained_snapshot == null)) return error.PreparedTransactionProtocolUnavailable;
+        // Deferred read pins need an independent drainer; a source without
+        // that control worker cannot safely advertise this status provider.
+        if (!self.apply_control_started.load(.acquire)) return error.PreparedTransactionProtocolUnavailable;
+        var receiver: request_execution_io.Borrow = .{};
+        const io = self.borrowRequestIo(&receiver, context.fanout_io) catch |err| switch (err) {
+            error.BackendRuntimeIoUnavailable => return error.PreparedTransactionProtocolUnavailable,
+            else => return err,
+        };
+        const Controls = struct {
+            require_checked_reentry: bool = true,
+            context: request_operation.RequestContext,
+            execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+            fn check(value: @This()) !void {
+                try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(value.context, value.execution_runnable);
+            }
+        };
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        var budget: Budget = .{ .controls = .{ .context = context, .execution_runnable = runnable }, .io = io };
+        const read = @import("antfly_local_sources").common_read_admission;
+        var adapter: read.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = read.Port.init(&payload);
+        const native = try platformDeadlineContext(context);
+        var owner = if (req.restore_staging_scope != null)
+            try self.borrowPreparationStatusResident(group, table, self.visibleRootGeneration(group), null, control)
+        else block: {
+            var catalog_budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
+            catalog_budget.cancellation = context.cancellation;
+            catalog_budget.admission = control;
+            var descriptor = try self.loadDescriptorWithBudget(alloc, group, table, catalog_budget);
+            defer descriptor.deinit(alloc);
+            // A failed observation is never absence. On a genuine resident
+            // miss, schedule only bounded metadata for a separately funded
+            // producer; no descriptor or foreground execution is retained.
+            var trace: read.RejectionTrace = .{};
+            const resident_control = trace.bind(control).?;
+            break :block self.borrowPreparationStatusResident(group, table, descriptor.generation, descriptor.identity, resident_control) catch |err| {
+                if (trace.failure) |cause| return cause;
+                if (err == error.StorageReadTemporarilyUnavailable) try self.scheduleOnlinePreparation(group, table, control);
+                return err;
+            };
+        };
+        defer owner.deinit();
+        if (req.restore_staging_scope) |scope| {
+            const registry = @import("../storage/restore_descriptor_admission.zig");
+            var bootstrap = try registry.parseBootstrap(alloc, owner.entry.restore_bootstrap_json, control);
+            defer bootstrap.deinit();
+            try registry.validateBootstrap(bootstrap.value, control);
+            const target = bootstrap.value.scope.target_namespace;
+            if (!std.mem.eql(u8, &scope, &bootstrap.value.scope.digest()) or
+                !std.mem.eql(u8, &req.restore_staging_plan_id.?, &bootstrap.value.scope.plan_id) or
+                !std.mem.eql(u8, table, bootstrap.value.table_name) or target.shard_id != group or
+                target.table_id != owner.entry.identity.table_id or target.shard_id != owner.entry.identity.shard_id or
+                target.range_id != owner.entry.identity.range_id) return error.RestoreStagingScopeChanged;
+        } else if (owner.entry.restore_bootstrap_json.len != 0) return error.RestoreStagingScopeChanged;
+        // Bounded, admission-aware quorum certification is required. An old
+        // unbounded wait_read_safe callback is never a substitute.
+        const proof = if (self.online_source_authority == .raft) block: {
+            if (barrier.vtable.validate_frozen_with_admission == null or barrier.vtable.validate_retained_snapshot == null) return error.PreparedTransactionProtocolUnavailable;
+            const frozen = try barrier.captureFrozen(group);
+            try barrier.validateFrozenWithAdmission(group, frozen, native.deadline_ns, native.cancellation, control);
+            break :block frozen;
+        } else null;
+        try control.checkpoint();
+        const result = try owner.owner().transactionPreparationStatus(table, req.txn_id, &control);
+        if (proof) |frozen| try barrier.validateRetainedSnapshotWithAdmission(group, frozen, native.deadline_ns, native.cancellation, control);
+        if (owner.entry.generation != self.visibleRootGeneration(group)) return error.StorageReadTemporarilyUnavailable;
+        var confirmation = try self.borrowPreparationStatusResident(group, table, owner.entry.generation, owner.entry.identity, control);
+        defer confirmation.deinit();
+        if (confirmation.entry != owner.entry) return error.StorageReadTemporarilyUnavailable;
+        try control.checkpoint();
+        return try @import("antfly_local_sources").api_prepared_transaction_protocol.observationFromOwner(result);
+    }
+
+    fn acknowledgeTransactionGroupLocalWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext) !?void {
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
+        try original.checkOriginal(active, context.execution_runnable);
+        if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+        if (context.restore_staging_scope != null or context.restore_staging_plan_id != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.UnsupportedOperation;
+
+        const transaction = req.transaction orelse return error.InvalidBatchRequest;
+        var single: [1][]const u8 = undefined;
+        const txn_id = switch (transaction) {
+            .acknowledge => |ack| ack.txn_id,
+            .acknowledge_many => |ack| ack.txn_id,
+            else => return error.InvalidBatchRequest,
+        };
+        const participants: []const []const u8 = switch (transaction) {
+            .acknowledge => |ack| blk: {
+                single[0] = ack.participant;
+                break :blk &single;
+            },
+            .acknowledge_many => |ack| ack.participants,
+            else => unreachable,
+        };
+        if (participants.len == 0 or participants.len > 64) return error.InvalidBatchRequest;
+        // A control acknowledgement cannot silently drop another mutation.
+        var remaining = req;
+        remaining.transaction = null;
+        remaining.sync_level = (db_types.BatchRequest{}).sync_level;
+        remaining.timestamp_ns = 0;
+        const empty: db_types.BatchRequest = .{};
+        inline for (@typeInfo(db_types.BatchRequest).@"struct".field_names) |name| {
+            const value = @field(remaining, name);
+            if (comptime @typeInfo(@TypeOf(value)) == .pointer and @typeInfo(@TypeOf(value)).pointer.size == .slice) {
+                if (value.len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(value, @field(empty, name))) return error.InvalidBatchRequest;
+        }
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var receiver: request_execution_io.Borrow = .{};
+        const io = try self.borrowRequestIo(&receiver, context.fanout_io);
+        const Controls = NativeTransactionControls;
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        const admission = @import("antfly_local_sources").common_read_admission;
+        var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
+        var adapter: admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        if (context.route_fence) |fence| {
+            try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
+        }
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        defer lease.deinit();
+        if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
+        if (context.route_fence) |fence| {
+            const identity = fence.route.identity_namespace;
+            if (identity.table_id != lease.entry.identity.table_id or identity.shard_id != lease.entry.identity.shard_id or identity.range_id != lease.entry.identity.range_id) return error.TopologyChanged;
+        }
+        try lease.owner().transactionAcknowledgeWithAdmission(table_name, txn_id, participants, &control);
+        return {};
     }
 
     fn txnAcknowledgeGroupLocal(
@@ -6190,6 +7130,32 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{ .json = try alloc.dupe(u8, response.bytes()) };
     }
 
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_types.SearchRequest,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_reads.checkQueryDeadline(controls);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(controls));
+        defer lease.deinit();
+        try table_reads.checkQueryDeadline(controls);
+        var cancellation = controls.cancellation;
+        var borrow = controls.execution_runnable;
+        var response = try lease.owner().textStatsJsonWithOptions(table_name, body, .{
+            .execution_deadline_ns = controls.execution_deadline_ns,
+            .cancellation_ctx = if (cancellation) |*token| token else null,
+            .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+            .execution_runnable = if (borrow) |*value| value else null,
+        });
+        defer response.deinit();
+        try table_reads.checkQueryDeadline(controls);
+        return .{ .json = try alloc.dupe(u8, response.bytes()) };
+    }
+
     fn algebraicPartialsGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6230,6 +7196,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphExpandResponse(alloc, response.bytes());
@@ -6260,6 +7227,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphHydrateResponse(alloc, response.bytes());
@@ -6290,6 +7258,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphEdgesResponse(alloc, response.bytes());
@@ -7686,6 +8655,730 @@ test "owner recovery bulk callback preserves bounded identities and uncertain st
     try std.testing.expectEqual(@as(usize, 4), recorder.calls);
 }
 
+test "controlled owner preflight acquisition controls preserve scoped causes and legacy timeout classification" {
+    const Probe = struct {
+        cause: anyerror,
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 1) return self.cause;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        var probe: Probe = .{ .cause = cause };
+        const controls: ProvisionedKernelOwnerSource.ReadControls = .{ .cancellation = .{ .ptr = &probe, .check_fn = Probe.check } };
+        try std.testing.expectError(cause, controls.check());
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    }
+    try std.testing.expectError(error.Timeout, (ProvisionedKernelOwnerSource.ReadControls{ .execution_deadline_ns = 0 }).check());
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, (ProvisionedKernelOwnerSource.ReadControls{ .cancellation = db_types.CancellationToken.fromAtomic(&canceled) }).check());
+}
+
+test "controlled owner lease retirement leaves close registered for independent drain after failed CPU reentry" {
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Source = ProvisionedKernelOwnerSource;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var close_owner: @import("runnable_owner_execution.zig").State = .{
+        .owner_alloc = alloc,
+        .owner = try native.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }),
+        .native_now_ns = platform_time.monotonicNs,
+    };
+    defer close_owner.owner.tryDeinit() catch @panic("close owner still retained");
+    const Probe = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        fn beforeClose(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.set(self.io);
+            self.released.waitUncancelable(self.io);
+        }
+        fn reject(_: *anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var probe: Probe = .{ .io = io };
+    var source = Source.init(alloc, "unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    source.owns_context = false;
+    _ = try source.withCloseExecutionOwner(close_owner.port());
+    defer source.close_execution_owner.?.deinit();
+    defer source.entries.deinit(alloc);
+    const entry = try alloc.create(Source.Entry);
+    entry.* = .{
+        .group_id = 1,
+        .table_name = try alloc.dupe(u8, "docs"),
+        .generation = 1,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = try alloc.dupe(u8, "{}"),
+        .indexes_json = try alloc.dupe(u8, "{}"),
+        .restore_bootstrap_json = try alloc.dupe(u8, ""),
+        .initial_child_bootstrap_json = try alloc.dupe(u8, ""),
+        .owner = .{ .handle = null },
+        .active_users = 1,
+        .retired = true,
+    };
+    try source.entries.append(alloc, entry);
+    source.apply_control_io = io;
+    source.apply_control_started.store(true, .release);
+    source.test_apply_control_hooks = .{ .ptr = &probe, .before_close = Probe.beforeClose };
+    const scheduler = &close_owner.owner.scheduler;
+    var execution: native.Execution = .{};
+    try execution.start(scheduler, .{ .io = io, .retained_bytes = 23 }, .query);
+    defer execution.finish();
+    try execution.park(.resource_blocked);
+    try std.testing.expectError(error.Canceled, execution.enterWithCheck(.query, .{ .context = &probe, .check = Probe.reject }));
+    var ordinary: native.Execution = .{};
+    try ordinary.start(scheduler, .{ .io = io, .retained_bytes = 17, .allow_wait = false }, .background);
+    defer ordinary.finish();
+    var health: native.Execution = .{};
+    try health.start(scheduler, .{ .io = io, .retained_bytes = 5, .allow_wait = false }, .control);
+    defer health.finish();
+    close_owner.owner.close();
+    var lease: Source.Lease = .{ .source = &source, .entry = entry };
+    lease.deinit();
+    try std.testing.expect(!lease.active and source.apply_control_wake.isSet());
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+    try std.testing.expect(entry.retired and !entry.closing and !probe.entered.isSet());
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 45), scheduler.stats().retained_bytes);
+    const port = close_owner.port();
+    const borrowed_io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io);
+    var busy_cleanup: ?*anyopaque = null;
+    const now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds));
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrowed_io, .class = @backingInt(@import("antfly_runtime_abi").runnable_abi.Class.control), .slots = 1, .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .deadline_ns = now +| 250 * std.time.ns_per_ms, .out_handle = &busy_cleanup }).isOk());
+    Source.lock(&source.mutex);
+    const refused = source.destroyEntryAtIndexLocked(0);
+    source.mutex.unlock();
+    try std.testing.expect(!refused and !entry.closing and source.entries.items.len == 1);
+    try std.testing.expect(!probe.entered.isSet());
+    port.finish(busy_cleanup.?);
+    const Drain = struct {
+        fn run(value: *Source) void {
+            Source.lock(&value.mutex);
+            defer value.mutex.unlock();
+            value.drainRetiredLocked(null, null);
+        }
+    };
+    var future = try io.concurrent(Drain.run, .{&source});
+    var joined = false;
+    defer {
+        probe.released.set(io);
+        if (!joined) future.await(io);
+    }
+    probe.entered.waitUncancelable(io);
+    // This is the same close primitive used by the independent control
+    // worker. The compiled DB close itself is a no-op in this test root.
+    try std.testing.expect(source.mutex.tryLock());
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    try std.testing.expect(entry.closing);
+    source.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_operations);
+    probe.released.set(io);
+    future.await(io);
+    joined = true;
+    try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
+    execution.finish();
+    ordinary.finish();
+    health.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "retained routed snapshot preserves certified cut across later writes and rejects lost authority" {
+    const Source = ProvisionedKernelOwnerSource;
+    const Admission = @import("antfly_local_sources").common_read_admission;
+    const Proof = read_gate.ReadSafetyBarrier.FrozenProof;
+    const Probe = struct {
+        route: metadata_api.CatalogRouteFence,
+        term: u64 = 3,
+        incarnation: u128 = 7,
+        leader: bool = true,
+        applied: u64 = 20,
+        quorum: u64 = 20,
+        unavailable: bool = false,
+        cause: ?anyerror = null,
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.cause) |cause| return cause;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedProgressWait;
+        }
+        fn waitSafe(_: *anyopaque, _: u64, _: []const u8) !void {}
+        fn frozen(_: *anyopaque, _: u64, _: Proof, _: ?u64, _: db_types.CancellationToken) !void {
+            return error.TestUnexpectedCaptureValidation;
+        }
+        fn retained(raw: *anyopaque, group: u64, proof: Proof, _: ?u64, token: db_types.CancellationToken, control: ?Admission.Port) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (control) |port| try port.checkpoint();
+            try token.check();
+            try std.testing.expectEqual(self.route.route.group_id, group);
+            self.calls += 1;
+            if (self.unavailable) return error.ReadUnavailable;
+            try proof.validateRetained(self.incarnation, self.term, self.leader, self.applied, self.quorum);
+        }
+        fn routeNow(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 1);
+            groups[0] = self.route.route;
+            return .{ .found = .{ .metadata_group_id = self.route.metadata_group_id, .metadata_incarnation = self.route.metadata_incarnation, .catalog_revision = self.route.catalog_revision, .table_id = self.route.table_id, .topology_epoch = self.route.topology_epoch, .groups = groups } };
+        }
+    };
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .catalog_revision = 1, .table_id = 2, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 9, .identity_namespace = .{ .table_id = 2, .shard_id = 8, .range_id = 9 } } };
+    var probe: Probe = .{ .route = fence };
+    var source: Source = undefined;
+    source.catalog = .{ .ptr = &probe, .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .validate_route = Probe.routeNow } };
+    source.read_safety_barrier = .{ .ptr = &probe, .vtable = &.{ .wait_read_safe = Probe.waitSafe, .validate_frozen = Probe.frozen, .validate_retained_snapshot = Probe.retained } };
+    // This invokes the actual delayed-open authority check. Deliberately no
+    // native handle exists: validation must neither recapture nor read live rows.
+    var snapshot: Source.RoutedStatementSnapshot = undefined;
+    snapshot.alloc = std.testing.allocator;
+    snapshot.source = &source;
+    snapshot.route = fence;
+    snapshot.group = 7;
+    snapshot.table = @constCast("rows");
+    snapshot.cancellation = null;
+    snapshot.deadline_ns = null;
+    snapshot.frozen_proof = .{ .incarnation = 7, .term = 3, .applied_index = 10 };
+    var bridge: Admission.Adapter(*Probe) = .{ .budget = &probe };
+    const payload = bridge.payload();
+    const port = Admission.Port.init(&payload);
+    try snapshot.checkControlled(port);
+    try snapshot.check();
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqual(@as(u64, 10), snapshot.frozen_proof.applied_index);
+    probe.term = 4;
+    try std.testing.expectError(error.NotLeader, snapshot.checkControlled(port));
+    probe.term = 3;
+    probe.incarnation = 8;
+    try std.testing.expectError(error.NotLeader, snapshot.checkControlled(port));
+    probe.incarnation = 7;
+    probe.leader = false;
+    try std.testing.expectError(error.NotLeader, snapshot.checkControlled(port));
+    probe.leader = true;
+    probe.applied = 9;
+    try std.testing.expectError(error.ReadUnavailable, snapshot.checkControlled(port));
+    probe.applied = 20;
+    probe.unavailable = true;
+    try std.testing.expectError(error.ReadUnavailable, snapshot.checkControlled(port));
+    probe.unavailable = false;
+    probe.route.table_id = 3;
+    try std.testing.expectError(error.TopologyChanged, snapshot.checkControlled(port));
+    probe.route = fence;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        probe.cause = cause;
+        try std.testing.expectError(cause, snapshot.checkControlled(port));
+    }
+    probe.cause = null;
+    var canceled = std.atomic.Value(bool).init(true);
+    snapshot.cancellation = db_types.CancellationToken.fromAtomic(&canceled);
+    try std.testing.expectError(error.Canceled, snapshot.checkControlled(port));
+}
+
+test "distributed txn typed native status refuses unbounded quorum before touching owners" {
+    const Barrier = struct {
+        fn legacy(_: *anyopaque, _: u64, _: []const u8) !void {
+            return error.UnexpectedLegacyRead;
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.online_source_authority = .raft;
+    source.read_safety_barrier = .{ .ptr = &marker, .vtable = &.{ .wait_read_safe = Barrier.legacy } };
+    const request: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest = .{ .txn_id = @splat(1) };
+    try std.testing.expectError(error.DeadlineExceeded, txnPreparationStatusGroupLocalForTest(&source, request, .{ .deadline_ns = 0 }));
+    try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, txnPreparationStatusGroupLocalForTest(&source, request, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }));
+}
+
+fn txnPreparationStatusGroupLocalForTest(source: *ProvisionedKernelOwnerSource, request: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest, context: request_operation.RequestContext) !void {
+    _ = try source.writeSource().txnPreparationStatusGroupLocal(std.testing.allocator, 7, "docs", request, context, null);
+}
+
+test "distributed txn typed native status borrows existing residency and releases without registry waits" {
+    const read = @import("antfly_local_sources").common_read_admission;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.TxnNotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ordinal = self.calls;
+            self.calls += 1;
+            if (ordinal == self.fail_at) return self.cause;
+        }
+    };
+    var control: Control = .{};
+    const payload: read.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    const port = read.Port.init(&payload);
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 1, null, port));
+    try std.testing.expect(source.context.handle == null and source.entries.items.len == 0);
+    var entry: ProvisionedKernelOwnerSource.Entry = .{
+        .group_id = 7,
+        .table_name = @constCast("docs"),
+        .generation = 1,
+        .identity = .{ .table_id = 4, .shard_id = 7, .range_id = 8 },
+        .schema_json = @constCast("{}"),
+        .indexes_json = @constCast("{}"),
+        .restore_bootstrap_json = @constCast(""),
+        .initial_child_bootstrap_json = @constCast(""),
+        .owner = .{ .handle = null },
+        .resident = true,
+    };
+    try source.entries.append(std.testing.allocator, &entry);
+    control = .{};
+    var first = try source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port);
+    const checks = control.calls;
+    try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    var confirmation = try source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port);
+    try std.testing.expect(confirmation.entry == first.entry);
+    try std.testing.expectEqual(@as(usize, 2), entry.active_users);
+    confirmation.deinit();
+    // Another request may hold the registry through a slow open. This read's
+    // release must still finish without joining it or creating an executor.
+    try std.testing.expect(source.mutex.tryLock());
+    first.deinit();
+    source.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 2), entry.pending_apply_releases.load(.acquire));
+    var second = try source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port);
+    try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    second.deinit();
+    try std.testing.expect(source.mutex.tryLock());
+    source.reconcileApplyReleasesLocked();
+    source.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+    for ([_]anyerror{ error.TxnNotFound, error.Canceled, error.Timeout, error.MemoryLimitExceeded }) |cause| for (0..checks) |index| {
+        control = .{ .fail_at = index, .cause = cause };
+        try std.testing.expectError(cause, source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port));
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+        try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+    };
+    control = .{};
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 2, entry.identity, port));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 1, .{ .table_id = 9, .shard_id = 7, .range_id = 8 }, port));
+    entry.retired = true;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port));
+    entry.retired = false;
+    entry.resident = false;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port));
+    try std.testing.expect(!entry.resident and source.context.handle == null);
+}
+
+test "distributed txn typed native status requires an independent release worker" {
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    source.online_source_authority = .native;
+    const io = std.testing.io;
+    const context: request_operation.RequestContext = .{
+        .deadline_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, io).nanoseconds)) + std.time.ns_per_s,
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+    };
+    try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, txnPreparationStatusGroupLocalForTest(&source, .{ .txn_id = @splat(1) }, context));
+    try std.testing.expect(source.context.handle == null and source.entries.items.len == 0);
+}
+
+test "funded owner control startup rolls back when its second bounded worker is unavailable" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    var source = ProvisionedKernelOwnerSource.init(a, "unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, source.startApplyControl(threaded.io()));
+    try std.testing.expect(source.apply_control_future == null and source.apply_open_future == null);
+    try std.testing.expect(source.apply_control_io == null);
+    try std.testing.expect(!source.apply_control_started.load(.acquire));
+    try std.testing.expectError(error.Canceled, source.startApplyControl(threaded.io()));
+}
+
+const OnlinePreparationTestControl = struct {
+    calls: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    cause: anyerror = error.TxnNotFound,
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const index = self.calls;
+        self.calls += 1;
+        if (index == self.fail_at) return self.cause;
+    }
+};
+
+test "online owner preparation source scheduling preserves original failures without opening or allocating" {
+    const read = @import("antfly_local_sources").common_read_admission;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var source = ProvisionedKernelOwnerSource.init(failing.allocator(), "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    source.apply_control_started.store(true, .release);
+    source.apply_control_io = std.testing.io;
+    var state: OnlinePreparationTestControl = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = OnlinePreparationTestControl.check } };
+    const control = read.Port.init(&payload);
+    try source.scheduleOnlinePreparation(7, "docs", control);
+    try std.testing.expectEqual(@as(usize, 1), source.online_open_queue.len);
+    const original_deadline = source.online_open_queue.items[0].deadline_ns;
+    try source.scheduleOnlinePreparation(7, "docs", control);
+    try std.testing.expectEqual(original_deadline, source.online_open_queue.items[0].deadline_ns);
+    try std.testing.expectEqual(@as(usize, 1), source.online_open_queue.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expect(source.context.handle == null and source.entries.items.len == 0);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| for (0..2) |index| {
+        source.online_open_queue = .{};
+        state = .{ .cause = cause, .fail_at = index };
+        try std.testing.expectError(cause, source.scheduleOnlinePreparation(7, "docs", control));
+        try std.testing.expectEqual(index, source.online_open_queue.len);
+        try std.testing.expect(source.context.handle == null);
+    };
+    state = .{};
+    ProvisionedKernelOwnerSource.lock(&source.mutex);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.scheduleOnlinePreparation(7, "docs", control));
+    source.mutex.unlock();
+    source.apply_control_started.store(false, .release);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.scheduleOnlinePreparation(7, "docs", control));
+}
+
+fn onlinePreparationTestEntry() ProvisionedKernelOwnerSource.Entry {
+    return .{
+        .group_id = 7,
+        .table_name = @constCast("docs"),
+        .generation = 2,
+        .identity = .{ .table_id = 4, .shard_id = 7, .range_id = 8 },
+        .schema_json = @constCast("{}"),
+        .indexes_json = @constCast("{}"),
+        .restore_bootstrap_json = @constCast(""),
+        .initial_child_bootstrap_json = @constCast(""),
+        .owner = .{ .handle = null },
+        .resident = true,
+    };
+}
+
+test "online owner preparation source rejects pending residency before native status access" {
+    const read = @import("antfly_local_sources").common_read_admission;
+    var state: OnlinePreparationTestControl = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = OnlinePreparationTestControl.check } };
+    const control = read.Port.init(&payload);
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var entry = onlinePreparationTestEntry();
+    entry.online_preparation_pending = true;
+    try source.entries.append(std.testing.allocator, &entry);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 2, entry.identity, control));
+    try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+    try std.testing.expect(source.context.handle == null);
+}
+
+test "online owner preparation source confirmation checks physical identity and original fences through large descriptors" {
+    const read = @import("antfly_local_sources").common_read_admission;
+    var state: OnlinePreparationTestControl = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = OnlinePreparationTestControl.check } };
+    const control = read.Port.init(&payload);
+    var entry = onlinePreparationTestEntry();
+    var large: [12000]u8 = @splat('x');
+    entry.schema_json = &large;
+    const descriptor: descriptor_contract.Descriptor = .{ .lsm_root_generation = 2, .identity = entry.identity, .schema_json = &large, .indexes_json = "{}" };
+    try std.testing.expect(try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, descriptor, control));
+    const checks = state.calls;
+    try std.testing.expect(checks > 6);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| for (0..checks) |index| {
+        state = .{ .cause = cause, .fail_at = index };
+        try std.testing.expectError(cause, ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, descriptor, control));
+    };
+    state = .{};
+    var changed = descriptor;
+    changed.lsm_root_generation = 3;
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+    changed = descriptor;
+    changed.identity.range_id = 9;
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+    changed = descriptor;
+    changed.indexes_json = "[]";
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+    changed = descriptor;
+    changed.restore_bootstrap_json = "private";
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+    changed = descriptor;
+    changed.initial_range = .{ .start = "a", .end = "z" };
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+}
+
+test "online owner preparation admission never retires a private restore owner" {
+    const a = std.testing.allocator;
+    var source = ProvisionedKernelOwnerSource.init(a, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(a);
+    var entry = onlinePreparationTestEntry();
+    entry.restore_bootstrap_json = @constCast("private authenticated scope");
+    try source.entries.append(a, &entry);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, source.acquireDescriptorOnce(7, "docs", "unused", .{
+        .lsm_root_generation = 2,
+        .identity = entry.identity,
+        .schema_json = "{\"version\":1}",
+    }, .shared, .resident, .{ .online_preparation = true }));
+    try std.testing.expect(!entry.retired and !entry.closing and entry.active_users == 0);
+    try std.testing.expect(source.context.handle == null);
+}
+
+test "online owner preparation source lifetime validation never reacquires CPU in the registry" {
+    const runtime = @import("antfly_runtime_abi");
+    const read = @import("antfly_local_sources").common_read_admission;
+    const Probe = struct {
+        cpu_calls: usize = 0,
+        lifetime_calls: usize = 0,
+        cause: ?anyerror = null,
+        fn cpu(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cpu_calls += 1;
+            return .ok;
+        }
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lifetime_calls += 1;
+            return .ok;
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("lifetime validation attempted CPU transition");
+        }
+        const Self = @This();
+        const Controls = struct {
+            probe: *Self,
+            execution_runnable: ?runtime.runnable_abi.Borrowed,
+        };
+        fn check(controls: Controls) !void {
+            if (controls.execution_runnable) |borrow| {
+                const status = borrow.checkpoint(borrow.context);
+                if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+            }
+            if (controls.probe.cause) |cause| return cause;
+        }
+    };
+    var probe: Probe = .{};
+    const borrow: runtime.runnable_abi.Borrowed = .{ .context = &probe, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Probe.cpu, .park = Probe.transition, .enter = Probe.transition, .check_lifetime = Probe.lifetime };
+    const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Probe.Controls, Probe.check);
+    var budget: Budget = .{ .controls = .{ .probe = &probe, .execution_runnable = borrow }, .io = std.testing.io };
+    var adapter: read.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = read.Port.init(&payload);
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var entry = onlinePreparationTestEntry();
+    entry.online_preparation_pending = true;
+    try source.entries.append(std.testing.allocator, &entry);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 2, entry.identity, control));
+    // One CPU checkpoint occurs before acquisition; the locked registry scan
+    // performs only lifetime validation of the original borrower.
+    try std.testing.expectEqual(@as(usize, 1), probe.cpu_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.lifetime_calls);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| {
+        budget.rejection = null;
+        probe.cause = cause;
+        try std.testing.expectError(cause, control.checkLifetime());
+        probe.cause = null;
+        try std.testing.expectError(cause, control.checkpoint());
+        try std.testing.expectEqual(@as(usize, 1), probe.cpu_calls);
+    }
+}
+
+test "online owner preparation source independent budget loans background CPU with original reentry checks" {
+    const runtime = @import("antfly_runtime_abi");
+    const read = @import("antfly_local_sources").common_read_admission;
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const execution = @import("runnable_status_refresh.zig");
+    const Cancel = struct {
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            const value: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(value.load(.acquire));
+        }
+    };
+    for ([_]bool{ false, true }) |cancel_during_wait| {
+        var state: @import("runnable_owner_execution.zig").State = .{
+            .owner_alloc = std.testing.allocator,
+            .owner = try native.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }),
+            .native_now_ns = platform_time.monotonicNs,
+        };
+        defer state.owner.deinit();
+        var canceled = std.atomic.Value(bool).init(false);
+        const io = std.testing.io;
+        const port = state.port();
+        var pass = try execution.Pass.initWithOptions(port, &io, platform_time.monotonicNs() + std.time.ns_per_s, .{ .context = &canceled, .is_cancelled = Cancel.requested }, .{ .retained_bytes = 4096 });
+        defer pass.deinit();
+        var budget: ProvisionedKernelOwnerSource.OnlinePreparationBudget = .{ .controls = .{ .pass = &pass, .execution_runnable = pass.borrow }, .io = io };
+        var adapter: read.Adapter(*@TypeOf(budget)) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = read.Port.init(&payload);
+        const boundary = (try control.executionWait()).?;
+        const retained = state.owner.scheduler.stats().retained_bytes;
+        try boundary.beginWait();
+        try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().runnable_slots);
+        try control.checkLifetime();
+        const borrowed_io = runtime.native_abi.IoBorrow.init(&io);
+        var foreground: ?*anyopaque = null;
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrowed_io, .class = @backingInt(runtime.runnable_abi.Class.query), .allow_wait = 0, .out_handle = &foreground }).isOk());
+        port.finish(foreground.?);
+        if (cancel_during_wait) {
+            canceled.store(true, .release);
+            try std.testing.expectError(error.Canceled, boundary.endWait());
+            try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().runnable_slots);
+        } else {
+            try boundary.endWait();
+            try std.testing.expectEqual(runtime.runnable_abi.Class.background, try pass.borrow.?.currentClass());
+            try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().runnable_slots);
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(retained, state.owner.scheduler.stats().retained_bytes);
+        pass.deinit();
+        try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), state.owner.scheduler.stats().retained_bytes);
+    }
+}
+
+test "online owner preparation source yields queued admission to committed apply without interrupting physical open" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    source.apply_control_started.store(true, .release);
+    var attempt: Source.OnlinePreparationAttempt = .{ .source = &source };
+    try std.testing.expectEqual(@as(u8, 0), Source.OnlinePreparationAttempt.canceled(&attempt));
+    source.apply_open_debt.store(1, .release);
+    try std.testing.expectEqual(@as(u8, 1), Source.OnlinePreparationAttempt.canceled(&attempt));
+    attempt.yield_to_apply.store(false, .release);
+    try std.testing.expectEqual(@as(u8, 0), Source.OnlinePreparationAttempt.canceled(&attempt));
+    source.apply_control_started.store(false, .release);
+    try std.testing.expectEqual(@as(u8, 1), Source.OnlinePreparationAttempt.canceled(&attempt));
+}
+
+test "online owner preparation admission yields to active historical apply without retiring its owner" {
+    const a = std.testing.allocator;
+    var source = ProvisionedKernelOwnerSource.init(a, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(a);
+    var entry = onlinePreparationTestEntry();
+    entry.opened_for_historical_apply = true;
+    entry.active_users = 1;
+    try source.entries.append(a, &entry);
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(7, "docs", "unused", .{
+        .lsm_root_generation = 2,
+        .identity = entry.identity,
+        .schema_json = "{}",
+        .indexes_json = "{}",
+    }, .shared, .resident, .{ .online_preparation = true }));
+    try std.testing.expect(!entry.retired and !entry.closing and entry.active_users == 1);
+    try std.testing.expect(source.context.handle == null);
+}
+
+test "controlled native BEGIN source rejects original execution before owner or allocator access" {
+    const runtime = @import("antfly_runtime_abi");
+    const Reject = struct {
+        fn stop(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.Canceled);
+        }
+        fn forbidden(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("rejected BEGIN cannot transfer CPU");
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    const borrow: runtime.runnable_abi.Borrowed = .{ .context = &marker, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .checkpoint = Reject.stop, .check_lifetime = Reject.stop, .park = Reject.forbidden, .enter = Reject.forbidden };
+    try std.testing.expectError(error.Canceled, source.writeSource().txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", @splat(1), 2, 3, false, &.{}, .{ .execution_runnable = borrow }));
+}
+
+test "controlled native BEGIN source carries real typed operation through production ownership" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    _ = source.writeSource().txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", @splat(1), 2, 3, false, &.{}, .{ .deadline_ns = 10 }) catch {};
+}
+
+test "controlled native completion source rejects original admission before source access" {
+    const Reject = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.MemoryLimitExceeded;
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.MemoryLimitExceeded, ProvisionedKernelOwnerSource.txnResolveGroupLocalWithExecution(&source, std.testing.allocator, 7, "docs", @splat(1), .aborted, 2, 3, .write, .{ .cancellation = .{ .ptr = &marker, .check_fn = Reject.check }, .restore_staging_scope = @splat(1) }));
+}
+
+test "controlled native completion source analyzes real owner acquisition" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    _ = source.writeSource().txnResolveGroupLocalWithExecution(std.testing.allocator, 7, "docs", @splat(1), .aborted, 2, 3, .write, .{ .deadline_ns = 10 }) catch {};
+}
+
+test "controlled native PREPARE source preserves original rejection before source access" {
+    const Reject = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.MemoryLimitExceeded;
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.MemoryLimitExceeded, ProvisionedKernelOwnerSource.txnPrepareGroupLocalWithPreDecisionContext(&source, std.testing.allocator, 7, "docs", @splat(1), 3, .{}, .{ .cancellation = .{ .ptr = &marker, .check_fn = Reject.check } }));
+}
+
+test "controlled native PREPARE source analyzes real typed intent preparation" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    _ = source.writeSource().txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", @splat(1), 3, .{}, .{ .deadline_ns = 10 }) catch {};
+}
+
+test "controlled native ACK source rejects original authority before source access" {
+    const Reject = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.MemoryLimitExceeded;
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.MemoryLimitExceeded, ProvisionedKernelOwnerSource.batchGroupLocalWithPreDecisionContext(&source, std.testing.allocator, 7, "docs", .{ .transaction = .{ .acknowledge = .{ .txn_id = @splat(1), .participant = "member" } } }, .{ .cancellation = .{ .ptr = &marker, .check_fn = Reject.check } }));
+}
+
+test "controlled native ACK source analyzes typed cohort acknowledgement" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    _ = source.writeSource().batchGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", .{ .transaction = .{ .acknowledge_many = .{ .txn_id = @splat(1), .participants = &.{"member"} } } }, .{ .deadline_ns = 10 }) catch {};
+}
+
+test "controlled native ACK source rejects silently discarded mutation fields" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.batchGroupLocalWithPreDecisionContext(&source, std.testing.allocator, 7, "docs", .{ .writes = &.{.{ .key = "drop", .value = "{}" }}, .transaction = .{ .acknowledge_many = .{ .txn_id = @splat(1), .participants = &.{"member"} } } }, .{}));
+}
+
+test "controlled owner lease retirement retains a physical owner when close preflight rejects" {
+    const root = @import("root");
+    if (comptime !@hasDecl(root, "drain_status")) return;
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const alloc = std.testing.allocator;
+    var close_owner: @import("runnable_owner_execution.zig").State = .{
+        .owner_alloc = alloc,
+        .owner = try native.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }),
+        .native_now_ns = platform_time.monotonicNs,
+    };
+    defer close_owner.owner.tryDeinit() catch @panic("close owner retained");
+    var source = ProvisionedKernelOwnerSource.init(alloc, "unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    source.owns_context = false;
+    _ = try source.withCloseExecutionOwner(close_owner.port());
+    defer source.deinit();
+    source.apply_control_io = std.testing.io;
+    const entry = try alloc.create(ProvisionedKernelOwnerSource.Entry);
+    entry.* = .{ .group_id = 1, .table_name = try alloc.dupe(u8, "docs"), .generation = 1, .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .schema_json = try alloc.dupe(u8, "{}"), .indexes_json = try alloc.dupe(u8, "{}"), .restore_bootstrap_json = try alloc.dupe(u8, ""), .initial_child_bootstrap_json = try alloc.dupe(u8, ""), .owner = .{ .handle = null }, .retired = true };
+    try source.entries.append(alloc, entry);
+    root.drain_calls = 0;
+    root.drain_status = .deadline_exceeded;
+    defer root.drain_status = .ok;
+    ProvisionedKernelOwnerSource.lock(&source.mutex);
+    const refused = source.destroyEntryAtIndexLocked(0);
+    source.mutex.unlock();
+    try std.testing.expect(!refused);
+    try std.testing.expectEqual(@as(usize, 1), root.drain_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    try std.testing.expect(entry.retired and !entry.closing);
+    try std.testing.expectEqual(@as(usize, 0), close_owner.owner.scheduler.stats().operations);
+    root.drain_status = .ok;
+    ProvisionedKernelOwnerSource.lock(&source.mutex);
+    const closed = source.destroyEntryAtIndexLocked(0);
+    source.mutex.unlock();
+    try std.testing.expect(closed);
+    try std.testing.expectEqual(@as(usize, 2), root.drain_calls);
+    try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), close_owner.owner.scheduler.stats().operations);
+}
+
 test "storage owner entity sink bridge preserves curation capability and missing-row policy" {
     const Fixture = struct {
         supported: bool = true,
@@ -7717,4 +9410,214 @@ test "storage owner entity sink bridge preserves curation capability and missing
     const entries = [_]abi.EntityUpsert{.{ .table = .fromSlice("entities"), .storage_table = .fromSlice("table:7"), .key = .fromSlice("entity/retired"), .doc_json = .fromSlice("{}"), .skip_if_missing = 1 }};
     try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.upsert_batch_fn.?(hooks.entity_sink.callback_ctx, &entries, entries.len));
     try std.testing.expect(fixture.seen);
+}
+
+test "maintenance selection production owner dispatch shares due turns and releases every pin" {
+    const root = @import("antfly_source_root");
+    if (comptime !@hasDecl(root, "MaintenanceSelectionProbe")) return error.SkipZigTest;
+    const Source = ProvisionedKernelOwnerSource;
+    for ([_]bool{ false, true }) |best_effort| {
+        var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.entries.deinit(std.testing.allocator);
+        var probes = [_]root.MaintenanceSelectionProbe{
+            .{ .score = std.math.maxInt(u64), .due = true },
+            .{ .score = 1 },
+            .{ .due = true },
+            .{ .score = std.math.maxInt(u64), .due = true },
+        };
+        var entries: [4]Source.Entry = undefined;
+        const names = [_][]const u8{ "hot", "cold", "due", "bulk" };
+        for (&entries, &probes, names, 0..) |*entry, *probe, name, i| {
+            entry.* = .{
+                .group_id = i + 1,
+                .table_name = @constCast(name),
+                .generation = 1,
+                .identity = .{ .table_id = i + 1, .shard_id = i + 1, .range_id = i + 1 },
+                .schema_json = @constCast("{}"),
+                .indexes_json = @constCast("{}"),
+                .restore_bootstrap_json = @constCast(""),
+                .initial_child_bootstrap_json = @constCast(""),
+                .owner = .{ .handle = @ptrCast(probe) },
+                .resident = true,
+                .bulk_ingest_active = .init(i == 3),
+            };
+            try source.entries.append(std.testing.allocator, entry);
+        }
+        var gaps: [3]usize = @splat(0);
+        for (0..48) |turn| {
+            const result = try Source.runLsmMaintenanceRound(&source, best_effort);
+            const chosen = result.group_id.? - 1;
+            try std.testing.expect(chosen < gaps.len);
+            if (turn % 2 == 0) try std.testing.expectEqual(@as(u64, 0), chosen);
+            for (&gaps, 0..) |*gap, i| {
+                gap.* = if (i == chosen) 0 else gap.* + 1;
+                try std.testing.expect(gap.* < 2 * gaps.len);
+            }
+            for (entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+        }
+        try std.testing.expectEqual(@as(usize, 0), probes[3].inspections);
+        try std.testing.expectEqual(@as(usize, 0), probes[3].steps);
+        probes[0].fail_step = true;
+        try std.testing.expectError(error.StorageBusy, Source.runLsmMaintenanceRound(&source, best_effort));
+        try std.testing.expect((try Source.runLsmMaintenanceRound(&source, best_effort)).group_id.? != 1);
+        for (entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+        const epoch = source.lsm_selection.epoch;
+        try std.testing.expect(source.mutex.tryLock());
+        const busy = try Source.runLsmMaintenanceRound(&source, true);
+        source.mutex.unlock();
+        try std.testing.expect(busy.group_id == null);
+        try std.testing.expectEqual(epoch, source.lsm_selection.epoch);
+
+        // A concurrent winner invalidates this scan's scheduling snapshot.
+        const snapshot = source.beginLsmSelection(false).?;
+        var cursor: usize = 1;
+        var first = source.nextMaintenanceLease(&cursor, snapshot.limit, false, true).?;
+        defer first.deinit();
+        try std.testing.expect(source.selectRetainedMaintenanceLease(&first, snapshot, false));
+        var second = source.nextMaintenanceLease(&cursor, snapshot.limit, false, true).?;
+        try std.testing.expect(!source.selectRetainedMaintenanceLease(&second, snapshot, false));
+        second.deinit();
+        try std.testing.expectEqual(epoch + 1, source.lsm_selection.epoch);
+        try std.testing.expectEqual(@as(usize, 1), entries[1].active_users);
+        try std.testing.expectEqual(@as(usize, 0), entries[2].active_users);
+    }
+}
+
+test "maintenance selection production owner bounds wide registry turns without allocation" {
+    const root = @import("antfly_source_root");
+    if (comptime !@hasDecl(root, "MaintenanceSelectionProbe")) return error.SkipZigTest;
+    const Source = ProvisionedKernelOwnerSource;
+    const width = @import("maintenance_selection.zig").Scan.inspection_limit;
+    inline for (.{ width + 3, 2 * width + 3 }) |count| {
+        for ([_]bool{ false, true }) |best_effort| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+            var source = Source.init(failing.allocator(), "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+            defer source.entries.deinit(std.testing.allocator);
+            var probes: [count]root.MaintenanceSelectionProbe = @splat(.{ .score = 1 });
+            var entries: [count]Source.Entry = undefined;
+            for (&entries, &probes, 0..) |*entry, *probe, i| {
+                // Permanent hot work in every window must not starve cold debt
+                // or due zero-debt work, with either even or odd window counts.
+                if (i % width == 0) probe.* = .{ .score = std.math.maxInt(u64), .due = true };
+                if (i % width == 1) probe.* = .{ .due = true };
+                entry.* = .{
+                    .group_id = i + 1,
+                    .table_name = @constCast("table"),
+                    .generation = 1,
+                    .identity = .{ .table_id = i + 1, .shard_id = i + 1, .range_id = i + 1 },
+                    .schema_json = @constCast("{}"),
+                    .indexes_json = @constCast("{}"),
+                    .restore_bootstrap_json = @constCast(""),
+                    .initial_child_bootstrap_json = @constCast(""),
+                    .owner = .{ .handle = @ptrCast(probe) },
+                    .resident = true,
+                };
+                try source.entries.append(std.testing.allocator, entry);
+            }
+            const windows = (count + width - 1) / width;
+            const bound = 2 * width * windows;
+            var gaps: [count]usize = @splat(0);
+            for (0..3 * bound) |_| {
+                var before: usize = 0;
+                for (probes) |probe| before += probe.inspections;
+                const result = try Source.runLsmMaintenanceRound(&source, best_effort);
+                const chosen = result.group_id.? - 1;
+                var after: usize = 0;
+                for (probes) |probe| after += probe.inspections;
+                try std.testing.expect(after - before <= width);
+                for (&gaps, 0..) |*gap, i| {
+                    gap.* = if (i == chosen) 0 else gap.* + 1;
+                    try std.testing.expect(gap.* < bound);
+                }
+                for (entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+            }
+            for (probes) |probe| try std.testing.expect(probe.steps > 0);
+            try std.testing.expect(!failing.has_induced_failure);
+        }
+    }
+}
+
+test "maintenance selection production owner resumes empty windows and revalidates retained winner" {
+    const root = @import("antfly_source_root");
+    if (comptime !@hasDecl(root, "MaintenanceSelectionProbe")) return error.SkipZigTest;
+    const Source = ProvisionedKernelOwnerSource;
+    const count = @import("maintenance_selection.zig").Scan.inspection_limit + 1;
+    var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var probes: [count]root.MaintenanceSelectionProbe = @splat(.{});
+    var entries: [count]Source.Entry = undefined;
+    for (&entries, &probes, 0..) |*entry, *probe, i| {
+        entry.* = .{
+            .group_id = i + 1,
+            .table_name = @constCast("table"),
+            .generation = 1,
+            .identity = .{ .table_id = i + 1, .shard_id = i + 1, .range_id = i + 1 },
+            .schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{}"),
+            .restore_bootstrap_json = @constCast(""),
+            .initial_child_bootstrap_json = @constCast(""),
+            .owner = .{ .handle = @ptrCast(probe) },
+            .resident = true,
+        };
+        try source.entries.append(std.testing.allocator, entry);
+    }
+    probes[count - 1].due = true;
+    const empty = try Source.runLsmMaintenanceRound(&source, true);
+    try std.testing.expect(empty.selection_pending and empty.group_id == null);
+    const due = try Source.runLsmMaintenanceRound(&source, true);
+    try std.testing.expectEqual(@as(?u64, count), due.group_id);
+    try std.testing.expect(!due.selection_pending);
+
+    const Hooks = struct {
+        source: *Source,
+        entry: *Source.Entry,
+        inspected: bool = false,
+        stepped: bool = false,
+        fn inspect(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.testing.expect(self.source.mutex.tryLock()) catch unreachable;
+            self.source.mutex.unlock();
+            const epoch = self.source.lsm_selection.epoch;
+            const nested = Source.runLsmMaintenanceRound(self.source, true) catch unreachable;
+            std.testing.expect(nested.selection_pending and nested.group_id == null) catch unreachable;
+            std.testing.expectEqual(epoch, self.source.lsm_selection.epoch) catch unreachable;
+            // Race an exclusive operation against inspection of the pinned
+            // winner. It must be fenced before dispatch, without losing pins.
+            Source.lock(&self.source.mutex);
+            self.entry.exclusive_pending = true;
+            self.source.mutex.unlock();
+            self.inspected = true;
+        }
+        fn step(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.testing.expect(!self.source.lsm_selection_claim.load(.acquire)) catch unreachable;
+            std.testing.expect(self.source.mutex.tryLock()) catch unreachable;
+            self.source.mutex.unlock();
+            for (self.source.entries.items) |entry| {
+                std.testing.expectEqual(@as(usize, @intFromBool(entry == self.entry)), entry.active_users) catch unreachable;
+            }
+            const nested = Source.runLsmMaintenanceRound(self.source, true) catch unreachable;
+            std.testing.expectEqual(@as(?u64, 2), nested.group_id) catch unreachable;
+            self.stepped = true;
+        }
+    };
+    // Shrink the registry between rounds: the saved scan cursor must wrap.
+    source.entries.items.len = 1;
+    var hooks: Hooks = .{ .source = &source, .entry = &entries[0] };
+    probes[0] = .{ .due = true, .hook_ctx = &hooks, .inspect_hook = Hooks.inspect };
+    const epoch = source.lsm_selection.epoch;
+    const raced = try Source.runLsmMaintenanceRound(&source, true);
+    try std.testing.expect(raced.selection_pending and raced.group_id == null);
+    try std.testing.expect(hooks.inspected);
+    try std.testing.expectEqual(epoch, source.lsm_selection.epoch);
+    try std.testing.expectEqual(@as(usize, 0), entries[0].active_users);
+    try std.testing.expect(!source.lsm_selection_claim.load(.acquire));
+    entries[0].exclusive_pending = false;
+    probes[0].inspect_hook = null;
+    probes[0].step_hook = Hooks.step;
+    source.entries.items.len = 2;
+    probes[1].due = true;
+    try std.testing.expectEqual(@as(?u64, 1), (try Source.runLsmMaintenanceRound(&source, true)).group_id);
+    try std.testing.expect(hooks.stepped);
+    try std.testing.expectEqual(@as(usize, 0), entries[0].active_users);
 }

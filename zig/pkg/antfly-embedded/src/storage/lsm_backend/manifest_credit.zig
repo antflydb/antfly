@@ -64,15 +64,101 @@ pub fn estimate(allocator: std.mem.Allocator, options: anytype, root_len: usize,
     var bytes: u64 = 128;
     var iterator = groups.valueIterator();
     while (iterator.next()) |group| {
-        const logical_limit = @max(@as(u64, 1), @min(options.max_run_file_bytes, @import("../lsm/table_file.zig").max_entry_data_len));
-        const physical_limit = @max(@as(u64, 1), @min(options.max_run_file_physical_bytes, @import("repository.zig").maxRunFileReadBytes()));
-        // Greedy packing has at most 1 + 2*sum/capacity outputs. Account for
-        // each independent splitting limit; tiny physical caps fall back to
-        // the one-row bound. No assumption about input insertion order.
-        var outputs = @min(group.rows, 1 +| (2 *| group.logical) / logical_limit);
-        outputs = @min(group.rows, outputs +| if (physical_limit <= 64 * 1024) group.rows else (2 *| group.physical) / (physical_limit - 64 * 1024));
-        if (options.max_run_file_entries != 0) outputs = @min(group.rows, outputs +| group.rows / options.max_run_file_entries);
-        bytes +|= outputs *| (192 +| root_len +| 2 *| group.bound_bytes);
+        bytes +|= groupWire(options, root_len, group.*);
     }
     return bytes;
 }
+
+fn groupWire(options: anytype, root_len: usize, group: Group) u64 {
+    const logical_limit = @max(@as(u64, 1), @min(options.max_run_file_bytes, @import("../lsm/table_file.zig").max_entry_data_len));
+    const physical_limit = @max(@as(u64, 1), @min(options.max_run_file_physical_bytes, @import("repository.zig").maxRunFileReadBytes()));
+    // Greedy packing has at most 1 + 2*sum/capacity outputs. Account for
+    // each independent splitting limit; tiny physical caps fall back to
+    // the one-row bound. No assumption about input insertion order.
+    var outputs = @min(group.rows, 1 +| (2 *| group.logical) / logical_limit);
+    outputs = @min(group.rows, outputs +| if (physical_limit <= 64 * 1024) group.rows else (2 *| group.physical) / (physical_limit - 64 * 1024));
+    if (options.max_run_file_entries != 0) outputs = @min(group.rows, outputs +| group.rows / options.max_run_file_entries);
+    return outputs *| (192 +| root_len +| 2 *| group.bound_bytes);
+}
+
+/// Allocation-free credit planning over a stable sorted generation. Partition
+/// identities must describe contiguous intervals, as required by Options.
+/// Borrowed labels remain pinned by the generation until this cursor finishes;
+/// no caller execution or allocator is retained.
+pub const SortedEstimate = struct {
+    index: usize = 0,
+    group: Group = .{},
+    key: ?Key = null,
+    pending: ?Key = null,
+    compare_part: usize = 0,
+    compared: usize = 0,
+    same: bool = true,
+    bytes: u64 = 128,
+    complete: bool = false,
+
+    pub fn resumeWithAdmission(self: *@This(), options: anytype, root_len: usize, state: anytype, original: @import("../../common/read_admission.zig").Port) !u64 {
+        try original.checkpoint();
+        if (self.complete) return self.bytes;
+        while (self.index < state.entryCount()) {
+            try original.checkpoint();
+            const entry = state.entryAt(self.index);
+            if (self.pending == null) {
+                const partitioned = options.run_partition_prefix_bytes != 0 or options.run_partition_key != null;
+                const domain = if (options.run_partition_key != null) blk: {
+                    const extract = options.run_partition_key_with_admission orelse return error.ExecutionWaitUnsupported;
+                    break :blk try extract(entry.key, original);
+                } else "";
+                self.pending = .{
+                    .namespace = if (partitioned) entry.namespace_name orelse "" else "",
+                    .namespace_present = partitioned and entry.namespace_name != null,
+                    .prefix = entry.key[0..@min(options.run_partition_prefix_bytes, entry.key.len)],
+                    .domain = domain,
+                };
+                self.same = if (self.key) |key| key.namespace_present == self.pending.?.namespace_present else false;
+                self.compare_part = 0;
+                self.compared = 0;
+            }
+            if (self.key) |key| {
+                const before = [_][]const u8{ key.namespace, key.prefix, key.domain };
+                const after = [_][]const u8{ self.pending.?.namespace, self.pending.?.prefix, self.pending.?.domain };
+                while (self.same and self.compare_part < 3) {
+                    try original.checkpoint();
+                    const a = before[self.compare_part];
+                    const b = after[self.compare_part];
+                    if (a.len != b.len) {
+                        self.same = false;
+                        break;
+                    }
+                    const end = self.compared + @min(a.len - self.compared, 16 * 1024);
+                    if (!std.mem.eql(u8, a[self.compared..end], b[self.compared..end])) {
+                        self.same = false;
+                        break;
+                    }
+                    self.compared = end;
+                    if (end == a.len) {
+                        self.compare_part += 1;
+                        self.compared = 0;
+                    }
+                }
+            }
+            try original.checkpoint();
+            if (!self.same) {
+                if (self.key != null) self.bytes +|= groupWire(options, root_len, self.group);
+                self.group = .{};
+                self.key = self.pending;
+            }
+            const names = @as(u64, entry.key.len) +| if (entry.namespace_name) |name| name.len else @as(usize, 0);
+            self.group.rows +|= 1;
+            self.group.logical +|= 32 +| names +| entry.value.len;
+            self.group.physical +|= 256 +| 8 *| names +| 2 *| entry.value.len;
+            self.group.bound_bytes = @max(self.group.bound_bytes, names);
+            self.pending = null;
+            self.index += 1;
+        }
+        try original.checkpoint();
+        self.bytes = if (self.key != null) self.bytes +| groupWire(options, root_len, self.group) else 0;
+        self.key = null;
+        self.complete = true;
+        return self.bytes;
+    }
+};

@@ -1492,21 +1492,42 @@ pub fn resolveWritesForSchemaValidation(
     transforms: []const db_mod.types.DocumentTransform,
 ) ![]db_mod.types.BatchWrite {
     if (comptime storage_engine.enabled) return storage_engine.call("writeResolveWritesForSchemaValidation", .{ alloc, db, base_writes, deletes, transforms });
+    return resolveWritesForSchemaValidationWithAdmission(alloc, db, base_writes, deletes, transforms, null);
+}
+
+/// These validation helpers retain immutable snapshots and preparation scratch.
+/// Borrow only lifetime checks; the caller checkpoints CPU after retirement.
+pub fn resolveWritesForSchemaValidationWithAdmission(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    base_writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
+    transforms: []const db_mod.types.DocumentTransform,
+    original: ?@import("../common/read_admission.zig").Port,
+) ![]db_mod.types.BatchWrite {
+    if (comptime storage_engine.enabled) return error.UnsupportedOperation;
+    if (original) |owner| try owner.checkLifetime();
     var state = SchemaValidationWriteState{};
     defer state.deinit(alloc);
 
     for (base_writes) |write| {
+        if (original) |owner| try owner.checkLifetime();
         try state.applyBorrowedWrite(alloc, write.key, write.value);
     }
 
     for (deletes) |key| {
+        if (original) |owner| try owner.checkLifetime();
         try state.applyDelete(alloc, key);
     }
 
     for (transforms) |transform| {
+        if (original) |owner| try owner.checkLifetime();
         const has_request_state = state.hasRequestState(transform.key);
         const existing_from_request = state.baseValue(transform.key);
-        const existing_from_db = if (!has_request_state) try db.get(alloc, transform.key) else null;
+        const existing_from_db = if (!has_request_state)
+            if (original) |owner| try db.getWithAdmission(alloc, transform.key, owner) else try db.get(alloc, transform.key)
+        else
+            null;
         defer if (existing_from_db) |body| alloc.free(body);
         const existing = existing_from_request orelse existing_from_db;
         const resolved = db_mod.transform.resolveDocumentTransform(alloc, existing, transform) catch |err| switch (err) {
@@ -1534,16 +1555,30 @@ pub fn validateGroupedSourceBatch(
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     if (comptime storage_engine.enabled) return storage_engine.call("writeValidateGroupedSourceBatch", .{ alloc, db, writes, deletes, transforms });
+    return validateGroupedSourceBatchWithAdmission(alloc, db, writes, deletes, transforms, null);
+}
+
+pub fn validateGroupedSourceBatchWithAdmission(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
+    transforms: []const db_mod.types.DocumentTransform,
+    original: ?@import("../common/read_admission.zig").Port,
+) !void {
+    if (comptime storage_engine.enabled) return error.UnsupportedOperation;
+    if (original) |owner| try owner.checkLifetime();
     if (writes.len == 0 and transforms.len == 0) return;
     var pinned = try db.core.index_manager.acquireWritePlanSnapshot();
     defer pinned.release();
     const plan = pinned.plan().group_sources orelse return;
     if (plan.entries.len == 0) return;
-    const effective = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
+    const effective = try resolveWritesForSchemaValidationWithAdmission(alloc, db, writes, deletes, transforms, original);
     defer freeOwnedBatchWrites(alloc, effective);
     var schema = db.core.acquireSchemaView();
     defer if (schema) |*view| view.release();
     for (effective) |write| {
+        if (original) |owner| try owner.checkLifetime();
         if (write.key.len > 0 and (write.key[0] == 0 or write.key[0] == 1)) continue;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -1574,25 +1609,50 @@ pub fn validateTableBatchAgainstLocalSchema(
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     if (comptime storage_engine.enabled) return storage_engine.call("writeValidateTableBatchAgainstLocalSchema", .{ alloc, db, writes, deletes, transforms });
+    return validateTableBatchAgainstLocalSchemaWithAdmission(alloc, db, writes, deletes, transforms, null);
+}
+
+pub fn validateTableBatchAgainstLocalSchemaWithAdmission(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
+    transforms: []const db_mod.types.DocumentTransform,
+    original: ?@import("../common/read_admission.zig").Port,
+) !void {
+    if (comptime storage_engine.enabled) return error.UnsupportedOperation;
+    if (original) |owner| try owner.checkLifetime();
     if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
-    try validateGroupedSourceBatch(alloc, db, writes, deletes, transforms);
+    try validateGroupedSourceBatchWithAdmission(alloc, db, writes, deletes, transforms, original);
     // Relational writes are validated authoritatively by DB.batch after its
     // final transform resolution and while holding the schema generation's
     // apply lock. Repeating the API-level load/parse/transform pass doubles
     // CPU and allocation cost without improving error timing: both paths are
     // synchronous and return InvalidBatchRequest before any durable mutation.
-    if (db.usesRelationalStorage()) return;
+    const relational = if (original == null) db.usesRelationalStorage() else blk: {
+        // Advisory validation must not wait on an uncontrolled apply lock.
+        // Final preparation fences the immutable schema under native apply.
+        var view = db.core.acquireSchemaView();
+        defer if (view) |*pinned| pinned.release();
+        break :blk if (view) |pinned| pinned.storageMode() == .relational else false;
+    };
+    if (relational) return;
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;
 
-    const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
+    const effective_writes = try resolveWritesForSchemaValidationWithAdmission(alloc, db, writes, deletes, transforms, original);
     defer freeOwnedBatchWrites(alloc, effective_writes);
     if (effective_writes.len == 0) return;
 
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
-    try tables_api.validateWritesAgainstTableSchema(alloc, parsed_schema, effective_writes);
+    var validator = try tables_api.schema_mod.CompiledTableValidator.initParsed(alloc, parsed_schema);
+    defer validator.deinit(alloc);
+    for (effective_writes) |write| {
+        if (original) |owner| try owner.checkLifetime();
+        try validator.validateWrites(alloc, &.{write});
+    }
 }
 
 pub fn applyLocalTableSchemaJson(

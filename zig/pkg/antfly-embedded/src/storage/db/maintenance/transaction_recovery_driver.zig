@@ -22,6 +22,9 @@ const transactions_mod = @import("../../transactions.zig");
 const types = @import("../types.zig");
 const ownership_mod = @import("../ownership.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
+const admission = @import("../../../common/read_admission.zig");
+const cleanup_wait = @import("../../../common/cleanup_wait.zig");
+const maintenance_stop = @import("../maintenance_stop.zig");
 
 pub const default_lease_key = "\x00\x00__metadata__:transaction_recovery_lease";
 
@@ -108,6 +111,16 @@ pub fn Driver(comptime Policy: type) type {
 
         pub fn beginTeardown(_: *@This()) void {}
 
+        pub fn stopWithAdmission(_: *@This(), original: admission.Port) !void {
+            const Ready = struct {
+                fn ready(_: *anyopaque) anyerror!bool {
+                    return true;
+                }
+            };
+            var unused: u8 = 0;
+            try cleanup_wait.until(null, original, &unused, Ready.ready, null);
+        }
+
         pub fn stop(_: *@This()) bool {
             return false;
         }
@@ -153,6 +166,14 @@ pub fn Driver(comptime Policy: type) type {
         future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
         backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
         scan_after: ?transactions_mod.TxnId = null,
+        // Final teardown is permanent; shutdown alone also supports pause/restart.
+        closing: std.atomic.Value(bool) = .init(false),
+        close_started: bool = false,
+        close_joined: Io.Event = .unset,
+        close_changed: Io.Event = .unset,
+        close_generation: std.atomic.Value(u64) = .init(0),
+        close_waiters: std.atomic.Value(u32) = .init(0),
+        active_runs: std.atomic.Value(u32) = .init(0),
 
         pub fn init(
             alloc: Allocator,
@@ -184,6 +205,7 @@ pub fn Driver(comptime Policy: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.beginTeardown();
             _ = self.stop();
             self.ownership.deinit(self.alloc);
             if (self.owns_store) self.store.deinit();
@@ -194,14 +216,20 @@ pub fn Driver(comptime Policy: type) type {
             if (!self.config.enabled) return;
             lockAtomicWithBackoff(&self.lifecycle_mutex);
             defer self.lifecycle_mutex.unlock();
+            if (self.closing.load(.acquire)) return error.Canceled;
             self.desired_running = true;
             self.paused = false;
             try self.startLocked();
         }
 
         pub fn stop(self: *Self) bool {
-            if (!self.config.enabled) return false;
             lockAtomicWithBackoff(&self.lifecycle_mutex);
+            if (self.closing.load(.acquire)) {
+                const started = self.future != null;
+                self.lifecycle_mutex.unlock();
+                self.finishTeardown();
+                return started;
+            }
             defer self.lifecycle_mutex.unlock();
             self.desired_running = false;
             self.paused = true;
@@ -211,6 +239,11 @@ pub fn Driver(comptime Policy: type) type {
         pub fn pause(self: *Self) bool {
             if (!self.config.enabled) return false;
             lockAtomicWithBackoff(&self.lifecycle_mutex);
+            if (self.closing.load(.acquire)) {
+                self.lifecycle_mutex.unlock();
+                self.finishTeardown();
+                return false;
+            }
             defer self.lifecycle_mutex.unlock();
             self.paused = true;
             const desired = self.desired_running;
@@ -222,6 +255,7 @@ pub fn Driver(comptime Policy: type) type {
             if (!self.config.enabled) return;
             lockAtomicWithBackoff(&self.lifecycle_mutex);
             defer self.lifecycle_mutex.unlock();
+            if (self.closing.load(.acquire)) return error.Canceled;
             self.paused = false;
             if (self.desired_running) try self.startLocked();
         }
@@ -230,6 +264,7 @@ pub fn Driver(comptime Policy: type) type {
             if (!self.config.enabled) return true;
             lockAtomicWithBackoff(&self.lifecycle_mutex);
             defer self.lifecycle_mutex.unlock();
+            if (self.closing.load(.acquire)) return false;
             if (!self.desired_running) return true;
             if (self.paused) return false;
             try self.startLocked();
@@ -241,6 +276,7 @@ pub fn Driver(comptime Policy: type) type {
         }
 
         fn startLocked(self: *Self) !void {
+            if (self.closing.load(.acquire)) return error.Canceled;
             if (self.future != null or self.paused or !self.desired_running) return;
             const io = self.io orelse return error.MissingBackendRuntimeIo;
             self.mutex.lockUncancelable(io);
@@ -265,7 +301,46 @@ pub fn Driver(comptime Policy: type) type {
         /// schedulers use this before draining fibers; ordinary owners continue to
         /// use `stop`, which publishes the same flag and joins the future.
         pub fn beginTeardown(self: *Self) void {
+            self.closing.store(true, .release);
             self.shutdown.store(true, .release);
+        }
+
+        fn closeHandle(self: *Self) maintenance_stop.Borrowed {
+            return .{
+                .mutex = &self.lifecycle_mutex,
+                .registration = &self.future,
+                .stopping = &self.closing,
+                .finisher = &self.close_started,
+                .joined = &self.close_joined,
+                .changed = &self.close_changed,
+                .generation = &self.close_generation,
+                .waiters = &self.close_waiters,
+            };
+        }
+
+        fn finishTeardown(self: *Self) void {
+            self.closeHandle().stop(self.io, true);
+            while (self.active_runs.load(.acquire) != 0) {
+                if (self.io) |io| io.sleep(.fromMilliseconds(1), .awake) catch {} else @import("antfly_platform").time.yieldNow();
+            }
+            if (self.io) |io| self.mutex.lockUncancelable(io);
+            defer if (self.io) |io| self.mutex.unlock(io);
+            self.ownership.release();
+        }
+
+        /// A failed original wait retains the registration, store and lease.
+        /// A later caller resumes final teardown under its own original control.
+        pub fn stopWithAdmission(self: *Self, original: admission.Port) !void {
+            try cleanup_wait.lockAtomic(&self.lifecycle_mutex, self.io, original);
+            self.beginTeardown();
+            self.desired_running = false;
+            self.paused = true;
+            self.lifecycle_mutex.unlock();
+            try self.closeHandle().stopWithAdmission(self.io, original);
+            try background_runtime_mod.waitForDirectAdmissionsWithAdmission(self.backend_runtime.?, &self.active_runs, original);
+            if (self.io) |io| try cleanup_wait.lockIo(&self.mutex, io, original);
+            defer if (self.io) |io| self.mutex.unlock(io);
+            self.ownership.release();
         }
 
         pub fn stats(self: *Self) types.TransactionRecoveryStats {
@@ -285,6 +360,18 @@ pub fn Driver(comptime Policy: type) type {
 
         pub fn runOnce(self: *Self) !void {
             if (!self.config.enabled) return;
+            lockAtomicWithBackoff(&self.lifecycle_mutex);
+            if (self.closing.load(.acquire)) {
+                self.lifecycle_mutex.unlock();
+                return error.Canceled;
+            }
+            if (self.active_runs.load(.monotonic) == std.math.maxInt(u32)) {
+                self.lifecycle_mutex.unlock();
+                return error.ExecutionWaitUnsupported;
+            }
+            _ = self.active_runs.fetchAdd(1, .acquire);
+            self.lifecycle_mutex.unlock();
+            defer _ = self.active_runs.fetchSub(1, .release);
             const now_ns = self.config.clock.nowRealtimeNs();
             if (!ensureLease(self, now_ns)) return;
             const summary = try runRecovery(self, now_ns);
@@ -329,7 +416,7 @@ pub fn Driver(comptime Policy: type) type {
         }
 
         fn isShutdown(runtime: *Self) bool {
-            return runtime.shutdown.load(.acquire);
+            return runtime.closing.load(.acquire) or runtime.shutdown.load(.acquire);
         }
 
         fn recordRun(runtime: *Self, now_ns: u64, summary: RunSummary, failed: bool) void {
@@ -355,4 +442,109 @@ pub fn Driver(comptime Policy: type) type {
             while (!mutex.tryLock()) @import("antfly_platform").time.yieldNow();
         }
     };
+}
+
+test "maintenance runtime transaction recovery final join retains scheduled and direct borrows across original failures" {
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        for ([_]bool{ false, true }) |direct| {
+            const F = struct {
+                io: Io,
+                entered: Io.Event = .unset,
+                release: Io.Event = .unset,
+                pub const Config = @import("../transaction_recovery_contract.zig").Config;
+                pub fn validate(_: Config) !void {}
+                pub fn runPage(_: Allocator, _: backend_erased.Store, config: Config, _: u64, _: ?transactions_mod.TxnId, _: usize) !RunSummary {
+                    const self: *@This() = @ptrCast(@alignCast(config.local_resolution_ctx.?));
+                    self.entered.set(self.io);
+                    self.release.waitUncancelable(self.io);
+                    return .{};
+                }
+            };
+            const Runtime = Driver(F);
+            const Work = struct {
+                fn run(runtime: *Runtime) void {
+                    runtime.runOnce() catch @panic("direct recovery failed");
+                }
+            };
+            const Control = struct {
+                fixture: *F,
+                case: Case,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn deadline(_: *anyopaque) !?u64 {
+                    return 1000;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    if (self.case == .begin_failure) return error.NotFound;
+                    if (self.case != .lifetime_in_wait) self.fixture.release.set(self.fixture.io);
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.fixture.release.set(self.fixture.io);
+                    if (self.case == .end_failure) return error.Canceled;
+                }
+            };
+            var background = try background_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+            defer background.deinit();
+            const io = background.ptr().io().?;
+            var backend = @import("../../mem_backend.zig").Backend.init(std.testing.allocator, .{});
+            defer backend.close();
+            var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "transaction-close" });
+            defer store.deinit();
+            var fixture: F = .{ .io = io };
+            var runtime = try Runtime.init(std.testing.allocator, &store, background.ptr(), .{
+                .enabled = true,
+                .lease_owned = true,
+                .local_resolution_ctx = &fixture,
+            });
+            defer runtime.deinit();
+            var work: ?Io.Future(void) = null;
+            defer {
+                fixture.release.set(io);
+                if (work) |*future| future.await(io);
+            }
+            if (direct) work = try io.concurrent(Work.run, .{&runtime}) else try runtime.start();
+            try fixture.entered.wait(io);
+            try std.testing.expect(runtime.stats().has_lease);
+            var control: Control = .{ .fixture = &fixture, .case = case };
+            var payload: admission.Payload = .{
+                .ptr = &control,
+                .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline },
+                .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end },
+            };
+            const result = runtime.stopWithAdmission(.init(&payload));
+            if (case == .success) try result else {
+                try std.testing.expectError(switch (case) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .lifetime_in_wait => error.DeadlineExceeded,
+                    .success => unreachable,
+                }, result);
+                try std.testing.expect(runtime.stats().has_lease);
+                try std.testing.expect(runtime.closing.load(.acquire));
+                if (!direct) try std.testing.expect(runtime.future != null);
+                // Resume using a fresh caller's original control, never a renewed
+                // deadline or an uncontrolled fallback from the failed caller.
+                fixture.release.set(io);
+                control.case = .success;
+                try runtime.stopWithAdmission(.init(&payload));
+            }
+            try std.testing.expect(!runtime.stats().has_lease);
+            try std.testing.expect(runtime.future == null);
+            try std.testing.expectEqual(@as(u32, 0), runtime.active_runs.load(.acquire));
+            try std.testing.expectError(error.Canceled, runtime.start());
+            try std.testing.expectError(error.Canceled, runtime.resumeAfterPause());
+            try std.testing.expectError(error.Canceled, runtime.runOnce());
+            try std.testing.expect(!try runtime.ensureRunning());
+            try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+        }
+    }
 }

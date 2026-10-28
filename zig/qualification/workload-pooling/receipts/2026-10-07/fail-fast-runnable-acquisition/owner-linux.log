@@ -1,0 +1,69 @@
+antfly-inference-worker-rpc-test
++- run test inference-worker-rpc-contract-tests w
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidResourceFrame
+[default] (warn): inference worker transport closed err=ResourceCallbackCapacity
+failed command: /cache/o/d276c6084cf4400ff71c8f912fd1586e/inference-worker-rpc-contract-tests --cache-dir=/cache --seed=0x4da75c7d --listen=-
+
+antfly-inference-worker-process-output-test
++- run test inference-worker-process-output-tests w
+PROCESS_SINK transport=h1 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=11 ends=11
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h1 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=11 ends=11
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=168 ends=168
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=164 ends=164
+PROCESS_SINK await peer EOF
+failed command: cd /cache/o/f58e72230be05982439eb8cfb48d2858 && ANTFLY_TEST_WORKER_OUTPUT_FIXTURE=./inference-worker-output-fixture /cache/o/04c7b1577cfe174dee175db0bdaf2bc4/inference-worker-process-output-tests --cache-dir=/cache --seed=0x4da75c7d --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=168 ends=168
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=164 ends=164
+REAL_SINK await peer EOF
+failed command: /cache/o/7f335d3139ba552fe234bb9f50bd0eb8/inference-worker-owner-handoff-tests --cache-dir=/cache --seed=0x4da75c7d --listen=-
+
+Build Summary: 15/15 steps succeeded; 49/49 tests passed
+antfly-inference-worker-rpc-test success
++- run test inference-worker-rpc-contract-tests 26 pass (26 total) 283ms MaxRSS:271M
+|  +- compile test inference-worker-rpc-contract-tests safe aarch64-linux-gnu success 8s MaxRSS:443M
++- run test 6 pass (6 total) 6ms MaxRSS:34M
+   +- compile test safe aarch64-linux-gnu success 9s MaxRSS:476M
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 14 pass (14 total) 4ms MaxRSS:34M
+   +- compile test inference-owner-handoff-tests safe aarch64-linux-gnu success 9s MaxRSS:662M
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:34M
+   +- compile test inference-worker-owner-handoff-tests safe aarch64-linux-gnu success 12s MaxRSS:954M
+antfly-inference-worker-process-output-test success
++- run test inference-worker-process-output-tests 1 pass (1 total) 1s MaxRSS:34M
+   +- compile test inference-worker-process-output-tests safe aarch64-linux-gnu success 10s MaxRSS:687M
+   +- compile exe inference-worker-output-fixture safe aarch64-linux-gnu success 8s MaxRSS:407M
+

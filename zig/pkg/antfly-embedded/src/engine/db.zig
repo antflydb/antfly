@@ -61,6 +61,33 @@ pub const Capabilities = support.lite.backend.Capabilities;
 pub const InferenceOpenOptions = support.lite.backend.InferenceOpenOptions;
 pub const InferenceStatus = support.lite.backend.InferenceStatus;
 
+pub const OperationContext = struct {
+    deadline_ns: ?u64 = null,
+    cancellation: types.CancellationToken = .none,
+
+    pub fn ensureActive(self: OperationContext) !void {
+        const clock: types.LookupOptions = .{};
+        if (self.deadline_ns) |deadline| if (clock.executionNowNs() >= deadline) return error.DeadlineExceeded;
+        try self.cancellation.check();
+    }
+    fn clamp(self: OperationContext, deadline: ?u64) ?u64 {
+        return if (self.deadline_ns) |outer| if (deadline) |inner| @min(inner, outer) else outer else deadline;
+    }
+};
+
+const CombinedCancellation = struct {
+    outer: types.CancellationToken,
+    inner: ?types.CancellationToken,
+    fn check(ptr: *const anyopaque) !void {
+        const self: *const CombinedCancellation = @ptrCast(@alignCast(ptr));
+        try self.outer.check();
+        if (self.inner) |inner| try inner.check();
+    }
+    fn token(self: *const CombinedCancellation) types.CancellationToken {
+        return .{ .ptr = self, .check_fn = check };
+    }
+};
+
 pub const DB = struct {
     allocator: Allocator,
     inner: *db_mod.DB,
@@ -225,6 +252,58 @@ pub const DB = struct {
 
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
         return try self.inner.search(alloc, req);
+    }
+
+    /// Writes check the original context before handoff. After DB apply owns
+    /// the mutation, its durable completion contract controls the result.
+    pub fn batchWithContext(self: *DB, req: types.BatchRequest, context: OperationContext) !void {
+        try context.ensureActive();
+        return self.batch(req);
+    }
+    pub fn lookupWithContext(self: *DB, alloc: Allocator, key: []const u8, options: types.LookupOptions, context: OperationContext) !?types.LookupResult {
+        try context.ensureActive();
+        var opts = options;
+        // Convert a borrowed I/O clock before combining it with the native
+        // monotonic deadline. Both deadlines retain their remaining duration.
+        if (context.deadline_ns != null and opts.execution_io != null) {
+            if (opts.execution_deadline_ns) |deadline| {
+                const remaining = deadline -| opts.executionNowNs();
+                opts.execution_deadline_ns = (types.LookupOptions{}).executionNowNs() +| remaining;
+            }
+            opts.execution_io = null;
+        }
+        opts.execution_deadline_ns = context.clamp(opts.execution_deadline_ns);
+        const cancel: CombinedCancellation = .{ .outer = context.cancellation, .inner = opts.cancellation };
+        opts.cancellation = cancel.token();
+        try cancel.token().check();
+        return self.lookup(alloc, key, opts) catch |err| {
+            try cancel.token().check();
+            return err;
+        };
+    }
+    pub fn scanWithContext(self: *DB, alloc: Allocator, from: []const u8, to: []const u8, options: types.ScanOptions, context: OperationContext) !types.ScanResult {
+        try context.ensureActive();
+        var opts = options;
+        opts.execution_deadline_ns = context.clamp(opts.execution_deadline_ns);
+        const cancel: CombinedCancellation = .{ .outer = context.cancellation, .inner = opts.cancellation };
+        opts.cancellation = cancel.token();
+        try cancel.token().check();
+        return self.scan(alloc, from, to, opts) catch |err| {
+            try cancel.token().check();
+            return err;
+        };
+    }
+    pub fn searchWithContext(self: *DB, alloc: Allocator, request: types.SearchRequest, context: OperationContext) !types.SearchResult {
+        try context.ensureActive();
+        var req = request;
+        req.execution_deadline_ns = context.clamp(req.execution_deadline_ns);
+        const cancel: CombinedCancellation = .{ .outer = context.cancellation, .inner = req.cancellation };
+        req.cancellation = cancel.token();
+        try cancel.token().check();
+        return self.search(alloc, req) catch |err| {
+            try cancel.token().check();
+            return err;
+        };
     }
 
     pub fn stats(self: *DB, alloc: Allocator) !types.DBStats {
@@ -1063,6 +1142,30 @@ test "embedded db createLite files are openable through the CLI's lite Connectio
         try std.testing.expectEqual(@as(usize, 1), indexes.len);
         try std.testing.expectEqualStrings(support.full_text_index_defaults.default_full_text_index_name, indexes[0].name);
     }
+}
+
+test "embedded workload deadline rejects work before DB handoff and preserves cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testLitePath(alloc, tmp, "embedded-deadline.aflite");
+    defer alloc.free(path);
+    var db = try DB.createLite(alloc, path, .{});
+    defer db.close();
+    const expired: OperationContext = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, db.batchWithContext(.{ .writes = &.{.{ .key = "late", .value = "{}" }} }, expired));
+    try std.testing.expect((try db.lookup(alloc, "late", .{})) == null);
+    try std.testing.expectError(error.DeadlineExceeded, db.lookupWithContext(alloc, "late", .{}, expired));
+    try std.testing.expectError(error.DeadlineExceeded, db.scanWithContext(alloc, "", "", .{}, expired));
+    try std.testing.expectError(error.DeadlineExceeded, db.searchWithContext(alloc, .{}, expired));
+    var signal = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, db.lookupWithContext(alloc, "late", .{ .cancellation = types.CancellationToken.fromAtomic(&signal) }, .{}));
+    const checkpoint = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.PublicationLeaseLost;
+        }
+    };
+    try std.testing.expectError(error.PublicationLeaseLost, db.lookupWithContext(alloc, "late", .{ .cancellation = .{ .ptr = &signal, .check_fn = checkpoint.check } }, .{}));
 }
 
 test "embedded db standalone catalog changes require the server after snapshot reopen" {

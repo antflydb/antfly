@@ -1,0 +1,23 @@
+{
+  "base_commit": "0d9f795459",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "05074412ab1214795923cc108f8e04614fe3b27e18d4f0592b42edb384aec77e",
+    "zig/pkg/antfly/src/api/kernel_abi.zig": "b66cbe90d56d362e206e8af650eee9f4533aabe1604e9304c55289abb5e8d522",
+    "zig/pkg/antfly/src/api/kernel_exports.zig": "a2a487051977496981eb3e6fc764bd397de5aaae81276bfe27405e2f89aadbae",
+    "zig/pkg/antfly/src/api/kernel_bridge.zig": "710898a270ea3eb487cd9b914a4cca9e54f52e916fadf45ffbf6a49c1b859fc6"
+  },
+  "native_core_tests": 14,
+  "native_layout_tests": 2,
+  "linux_layout_tests": 2,
+  "linux_compiler_image": "sha256:fb3236b6cc7411028d62f76eb418110a6c34e246b9437a9d093d58a53a3e2954",
+  "native_layout_command": "zig test -Osafe --test-filter 'API kernel' --dep antfly_runtime_abi --dep runtime_memory_abi -Mroot=zig/pkg/antfly/src/api/kernel_abi.zig -Mantfly_runtime_abi=zig/lib/runtime/src/root.zig -Mruntime_memory_abi=zig/pkg/antfly-embedded/src/runtime_memory_abi.zig --cache-dir /private/tmp/antfly-node-owner-abi-layout-cache",
+  "linux_layout_command": "zig test -Osafe -target aarch64-linux-gnu --test-filter 'API kernel' --dep antfly_runtime_abi --dep runtime_memory_abi -Mroot=zig/pkg/antfly/src/api/kernel_abi.zig -Mantfly_runtime_abi=zig/lib/runtime/src/root.zig -Mruntime_memory_abi=zig/pkg/antfly-embedded/src/runtime_memory_abi.zig --cache-dir /cache",
+  "scope": "layout/prefix checks and core refusal to destroy active owners only",
+  "not_tested": [
+    "new owner factory callbacks and opaque wrapper",
+    "separately compiled API-kernel caller/owner execution",
+    "standalone node ownership",
+    "inference/background consumers",
+    "default enablement"
+  ]
+}

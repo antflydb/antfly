@@ -124,7 +124,7 @@ pub fn credentialsFromEnvAlloc(
     const region = try firstValueOwned(alloc, region_override, "AWS_REGION", "us-east-1");
     errdefer alloc.free(region);
     const endpoint = try firstValueOwned(alloc, endpoint_override, "AWS_ENDPOINT_URL", null);
-    errdefer if (endpoint.len > 0) alloc.free(endpoint);
+    defer alloc.free(endpoint);
     const access_key_id = try firstValueOwned(alloc, access_key_id_override, "AWS_ACCESS_KEY_ID", null);
     errdefer alloc.free(access_key_id);
     const secret_access_key = try firstValueOwned(alloc, secret_access_key_override, "AWS_SECRET_ACCESS_KEY", null);
@@ -141,7 +141,6 @@ pub fn credentialsFromEnvAlloc(
     defer alloc.free(effective_endpoint);
     var resolved = try resolveEndpointAlloc(alloc, effective_endpoint, use_ssl);
     defer resolved.deinit(alloc);
-    alloc.free(endpoint);
 
     return .{
         .endpoint = try alloc.dupe(u8, resolved.endpoint),

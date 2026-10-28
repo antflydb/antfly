@@ -42,7 +42,7 @@ pub const Store = struct {
         var client = self.client;
         const path = try self.key(a, kind, snapshot);
         defer a.free(path);
-        return client.getObject(self.bucket, path, .{ .cancellation = catalog.types.contextCancellation(&self.context), .max_response_bytes = 1024 }) catch |err| switch (err) {
+        return self.context.objectCall(objectstore.Client.getObject, .{ &client, self.bucket, path, objectstore.GetOptions{ .cancellation = catalog.types.providerCancellation(&self.context), .max_response_bytes = 1024 } }, client.allocator) catch |err| switch (err) {
             error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
             else => return err,
         };
@@ -78,7 +78,7 @@ pub const Store = struct {
                 const path = try self.key(a, "pins", snapshot);
                 defer a.free(path);
                 var client = self.client;
-                var result = client.putObject(self.bucket, path, bytes, .{ .if_none_match = previous == null, .if_match_etag = if (previous) |value| value.metadata.etag orelse return error.MissingObjectEtag else null, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
+                var result = self.context.objectCall(objectstore.Client.putObject, .{ &client, self.bucket, path, bytes, objectstore.PutOptions{ .if_none_match = previous == null, .if_match_etag = if (previous) |value| value.metadata.etag orelse return error.MissingObjectEtag else null, .cancellation = catalog.types.providerCancellation(&self.context) } }, client.allocator) catch |err| switch (err) {
                     error.PreconditionFailed, error.ObjectAlreadyExists => continue,
                     else => return err,
                 };
@@ -101,7 +101,7 @@ pub const Store = struct {
         const path = try self.key(a, "retired", snapshot);
         defer a.free(path);
         var client = self.client;
-        var result = client.putObject(self.bucket, path, snapshot, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
+        var result = self.context.objectCall(objectstore.Client.putObject, .{ &client, self.bucket, path, snapshot, objectstore.PutOptions{ .if_none_match = true, .cancellation = catalog.types.providerCancellation(&self.context) } }, client.allocator) catch |err| switch (err) {
             error.PreconditionFailed, error.ObjectAlreadyExists => null,
             else => return err,
         };

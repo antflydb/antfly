@@ -1,0 +1,80 @@
+{
+  "passed": true,
+  "target": "aarch64-linux-gnu",
+  "source_sha256": {
+    "pkg/antfly-embedded/src/common/execution_wait.zig": "4e944e0d84bae83cb1bb84f18d33ac3e2a91c32f9e20bb55b6451624cf8895d4",
+    "pkg/antfly-embedded/src/execution_wait_archive_fixture.zig": "fdd7eba9d893efd81e8c092865ae82341e1c15c9d3dfbc89d6b3ccd7232179e0",
+    "pkg/antfly-embedded/src/execution_wait_test_root.zig": "bc30d303c5c0ffea881673ad5b55d8be1c795a70b932f7262ac81e02071f8d70",
+    "pkg/antfly-embedded/src/runtime_callback_abi.zig": "4d24732bb41b72278337b577c9690e73ce9b6b0bf9690c2bbb3a004e9bf4a8ba",
+    "pkg/antfly-embedded/src/source_catalog.zig": "e856e9c93b453f1aaf0a984cc72dfea7a8a507f20858adcf46186f49b9e40cb8",
+    "pkg/antfly-embedded/src/source_catalog_control.zig": "2f24faaa4edd577115c78ecf0fc626aa4157183083a3c3fb8bd1b0ec4a24a59c",
+    "lib/runtime/src/runtime_error_abi.zig": "fd7c1b6d4e4ddef4553b19f7ca42d389930eaf86ee286a0b84d6ebbb2cce1e83",
+    "lib/runtime/src/runtime_native_abi.zig": "c3e1a1ee797683f342cfa1b2de5fcb512df20bc5540da9ada4985fe4825bdd9f",
+    "qualification/workload-pooling/check_execution_wait.py": "a96d2f077308be996e6a470ae7386276e689f684cf2c8185951dc35b10cc25f0"
+  },
+  "stages": [
+    {
+      "name": "owner",
+      "command": [
+        "/opt/zig-nix/bin/zig",
+        "build-obj",
+        "-Osafe",
+        "--cache-dir",
+        "/cache",
+        "--global-cache-dir",
+        "/global-cache",
+        "-target",
+        "aarch64-linux-gnu",
+        "--dep",
+        "antfly_runtime_abi",
+        "-Mroot=pkg/antfly-embedded/src/execution_wait_archive_fixture.zig",
+        "-Mantfly_runtime_abi=lib/runtime/src/root.zig",
+        "-femit-bin=/evidence/antfly-read-index-integration-checked-linux/wait-owner.o"
+      ],
+      "exit_code": 0,
+      "passed": true
+    },
+    {
+      "name": "callbacks",
+      "command": [
+        "/opt/zig-nix/bin/zig",
+        "test",
+        "/evidence/antfly-read-index-integration-checked-linux/wait-owner.o",
+        "-Osafe",
+        "--cache-dir",
+        "/cache",
+        "--global-cache-dir",
+        "/global-cache",
+        "-target",
+        "aarch64-linux-gnu",
+        "--test-filter",
+        "execution wait",
+        "--dep",
+        "antfly_runtime_abi",
+        "-Mroot=pkg/antfly-embedded/src/execution_wait_test_root.zig",
+        "-Mantfly_runtime_abi=lib/runtime/src/root.zig"
+      ],
+      "exit_code": 0,
+      "passed": true
+    },
+    {
+      "name": "error-abi",
+      "command": [
+        "/opt/zig-nix/bin/zig",
+        "test",
+        "lib/runtime/src/runtime_error_abi.zig",
+        "-Osafe",
+        "--cache-dir",
+        "/cache",
+        "--global-cache-dir",
+        "/global-cache",
+        "-target",
+        "aarch64-linux-gnu"
+      ],
+      "exit_code": 0,
+      "passed": true
+    }
+  ],
+  "zig_version": "0.17.0",
+  "owner_sha256": "cb5e8d44aee3d1e6fda88b8e82b554da579b287d438708a87a8c37f63726267f"
+}

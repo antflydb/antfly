@@ -1,0 +1,32 @@
+1/28 runnable_scheduler.test.runnable scheduler weighted execution retains CPU demand across waits and class changes...OK
+2/28 runnable_scheduler.test.runnable scheduler node owner outlives independent borrowers and executions...OK
+3/28 runnable_scheduler.test.runnable scheduler preserves blocked ownership and protected capacity...OK
+4/28 runnable_scheduler.test.runnable scheduler bounds backfill and grants a large operation...OK
+5/28 runnable_scheduler.test.runnable scheduler weighted sharing charges slots across busy classes...OK
+6/28 runnable_scheduler.test.runnable scheduler cancellation after grant returns every reservation...OK
+7/28 runnable_scheduler.test.runnable scheduler deadline and shutdown retire blocked and queued owners...OK
+8/28 runnable_scheduler.test.runnable scheduler yield hands execution to another operation...OK
+9/28 runnable_scheduler.test.runnable scheduler queue bound starts at enqueue including grant race...OK
+10/28 runnable_scheduler.test.runnable scheduler real queue timeout releases count and bytes...OK
+11/28 runnable_scheduler.test.runnable scheduler rejects invalid policy and oversized demand atomically...OK
+12/28 runnable_scheduler.test.runnable scheduler shutdown racing a new block cannot strand an owner...OK
+13/28 runnable_scheduler.test.runnable scheduler execution quanta preserve deadline and parked ownership...OK
+14/28 runnable_scheduler.test.runnable scheduler checkpoint work budget and disabled execution...OK
+15/28 runnable_scheduler.test.runnable scheduler reserves control metadata at full ordinary outstanding limits...OK
+16/28 runnable_scheduler.test.runnable scheduler denied reentry retains borrowed reservations until owning finish...OK
+17/28 runnable_scheduler.test.runnable scheduler canceled yielded capsule retains ownership while peer computes...OK
+18/28 runnable_scheduler.test.runnable fail-fast initial control admission never waits or leaks a reservation...expected error.ResourceTemporarilyUnavailable, found error.RunnableWaitTimeout
+FAIL (TestUnexpectedError)
+19/28 runnable_scheduler.test.runnable fail-fast acquisition retains fair bounded published reentry...OK
+20/28 bounded_admission.test.bounded admission contextual leases measure ownership once under both policies...OK
+21/28 bounded_admission.test.bounded admission FIFO grant cancellation and close transfer one owner...OK
+22/28 bounded_admission.test.bounded admission rejects count bytes oversized and invalid policies...OK
+23/28 bounded_admission.test.bounded admission wait ceiling and expired fast path never execute...OK
+24/28 bounded_admission.test.bounded admission native queue leaves completion capacity and drains a burst...OK
+25/28 bounded_admission.test.bounded admission queued external cancellation retires without execution...OK
+26/28 bounded_admission.test.bounded admission unsupported executor remains fail fast without enqueue...OK
+27/28 bounded_admission.test.bounded admission live shrink preserves grants and retires newest waiters...OK
+28/28 bounded_admission.test.bounded admission suspension and terminal drain reconcile caller ownership...OK
+27 passed; 0 skipped; 1 failed.
+error: the following test command failed with exit code 1:
+/private/tmp/antfly-worker-phase-native-cache/o/7f34fadb30ee15d684302553582a85ff/root --seed=0x9d532bf9

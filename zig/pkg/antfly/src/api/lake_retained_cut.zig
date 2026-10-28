@@ -562,7 +562,9 @@ const CursorEnvelope = struct { version: u16 = 1, expires_ms: u64, payload: []co
 pub fn saveCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, io: std.Io, payload: []const u8, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
     if (payload.len > 1024 * 1024) return error.QueryCandidateBudgetExceeded;
     var expires = now +| max_ttl_ms;
-    const state = try std.json.parseFromSliceLeaky(std.json.Value, a, payload, .{});
+    var parsed_state = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer parsed_state.deinit();
+    const state = parsed_state.value;
     if (state != .object) return error.InvalidQueryRequest;
     const sources = state.object.get("sources") orelse return error.InvalidQueryRequest;
     if (sources != .array) return error.InvalidQueryRequest;
@@ -583,17 +585,25 @@ pub fn saveCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, 
     return @import("lake_generation_envelope.zig").encode(a, "source2:", metadata);
 }
 pub fn loadCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, token: []const u8, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
+    return loadCursorFor(a, store, identity, token, now, cancellation, .{});
+}
+
+/// Only provider reads relinquish CPU. Validation and decoding run under the
+/// original execution; failed resume discards the acquired provider buffer.
+pub fn loadCursorFor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, token: []const u8, now: u64, cancellation: @import("antfly_cancellation").CancellationToken, context: local.serverless_query_lake_read_context.Context) ![]const u8 {
+    try context.ensureActive();
     if (!std.mem.startsWith(u8, token, "source2:")) return error.InvalidQueryRequest;
     const selector = try @import("lake_generation_envelope.zig").decode(a, "source2:", token, 2 * 1024 * 1024);
     defer if (selector.generation) |value| a.free(value);
     const artifact = selector.id;
     const scope = (try stores.uploadScopeFromArtifactId(artifact)) orelse return error.InvalidQueryRequest;
     if (scope.fencingToken() <= now or !std.mem.eql(u8, &scope.domain, &domain(0, identity))) return error.CatalogGenerationChanged;
-    const bytes = try @import("lake_generation_envelope.zig").read(store, selector, cancellation);
+    const bytes = try @import("lake_generation_envelope.zig").readFor(store, selector, cancellation, context);
     defer store.allocator.free(bytes);
     const envelope = try std.json.parseFromSliceLeaky(CursorEnvelope, a, bytes, .{ .allocate = .alloc_always });
     if (envelope.version != 1 or envelope.expires_ms != scope.fencingToken() or envelope.expires_ms <= now or envelope.expires_ms > now +| max_ttl_ms or envelope.payload.len > 1024 * 1024) return error.CatalogGenerationChanged;
-    return envelope.payload;
+    try context.ensureActive();
+    return a.dupe(u8, envelope.payload);
 }
 
 test "external lake bounded WAL retained cuts survive reopening and fence expiration incarnation and recipe" {
@@ -879,6 +889,89 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     const cursor_scope = (try stores.uploadScopeFromArtifactId(cursor_token[8..cursor_split])).?;
     try std.testing.expectEqual(now + ttl_ms, cursor_scope.fencingToken());
     try std.testing.expectEqualStrings(cursor_payload, try loadCursor(scratch, &reads, identity, cursor_token, now + 21, .none));
+    const WaitProbe = struct {
+        running: bool = true,
+        reject_resume: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        checks: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+            self.running = false;
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.running);
+            self.ends += 1;
+            if (self.reject_resume) return error.DeadlineExceeded;
+            self.running = true;
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+            self.checks += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |reject| {
+        var probe: WaitProbe = .{ .reject_resume = reject };
+        const context: local.serverless_query_lake_read_context.Context = .{ .checkpoint = .{ .ptr = &probe, .check = WaitProbe.check }, .wait = .{ .ptr = &probe, .begin = WaitProbe.begin, .end = WaitProbe.end } };
+        // Use the leak-checking allocator, not the fixture arena: a successful
+        // provider read must also be freed when the original grant cannot resume.
+        const result = loadCursorFor(a, &reads, identity, cursor_token, now + 21, .none, context);
+        if (reject) {
+            try std.testing.expectError(error.DeadlineExceeded, result);
+        } else {
+            const payload = try result;
+            defer a.free(payload);
+            try std.testing.expectEqualStrings(cursor_payload, payload);
+            try std.testing.expect(probe.checks > 1);
+        }
+        try std.testing.expect(probe.begins > 0);
+        try std.testing.expectEqual(probe.begins, probe.ends);
+        probe = .{ .reject_resume = reject };
+        reopened.implementation.upload_context = context;
+        defer reopened.implementation.upload_context = .{};
+        const uploaded = saveCursor(a, &reads, identity, std.testing.io, cursor_payload, now + 22, .none);
+        if (reject) {
+            try std.testing.expectError(error.DeadlineExceeded, uploaded);
+        } else {
+            const uploaded_token = try uploaded;
+            defer a.free(uploaded_token);
+            // The filesystem provider registers durable discovery before put.
+            try std.testing.expect(probe.begins >= 2);
+            const restored = try loadCursor(a, &reads, identity, uploaded_token, now + 23, .none);
+            defer a.free(restored);
+            try std.testing.expectEqualStrings(cursor_payload, restored);
+        }
+        try std.testing.expectEqual(probe.begins, probe.ends);
+        probe = .{ .reject_resume = reject };
+        const opened = @import("lake_index_store.zig").Store.openNativeFor(a, &config, null, false, .standalone, null, context);
+        if (reject) {
+            try std.testing.expectError(error.DeadlineExceeded, opened);
+        } else {
+            var owned_store = try opened;
+            owned_store.deinit();
+            try std.testing.expect(probe.begins >= 3); // Filesystem opening and both bucket checks.
+        }
+        try std.testing.expectEqual(probe.begins, probe.ends);
+        probe = .{ .reject_resume = reject };
+        const Range = @typeInfo(@FieldType(local.storage_db_native_query_cut.Request, "cover")).pointer.child;
+        const cover = [_]Range{.{ .group_id = 9, .namespace = .{ .table_id = table.table_id, .shard_id = 2, .range_id = 3 }, .start_key = "" }};
+        const snapshot = @import("native_query_repository.zig").saveWithCover(a, &reopened, std.testing.io, table, now + 24, ttl_ms, &cover, .none);
+        if (reject) {
+            try std.testing.expectError(error.DeadlineExceeded, snapshot);
+        } else {
+            const native_token = try snapshot;
+            defer a.free(native_token);
+            try std.testing.expect(probe.begins >= 3); // Owner discovery, inventory, immutable descriptor.
+            const native_descriptor = try @import("native_retained_cut.zig").load(scratch, &reads, try @import("native_retained_cut.zig").storeIdentity(a, reopened.locator), native_token, table, now + 25, .none);
+            try std.testing.expectEqual(@as(usize, 1), native_descriptor.cover.len);
+            try std.testing.expect(cover[0].namespace.eql(native_descriptor.cover[0].namespace));
+        }
+        try std.testing.expectEqual(probe.begins, probe.ends);
+    }
     try std.testing.expectError(error.CatalogGenerationChanged, loadCursor(scratch, &reads, identity, cursor_token, now + ttl_ms, .none));
     const loaded = try load(scratch, &reads, identity, token, table, now + 1, .none);
     try std.testing.expectEqual(@as(u64, 8), loaded.pending.lsn);

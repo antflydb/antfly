@@ -1,0 +1,39 @@
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /cache/o/e767ff3b743a5b4bce2c9e48036b2c25/http-cleanup-owner-tests --cache-dir=/cache --seed=0xa1494d82 --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=168 ends=168
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=168 ends=168
+REAL_SINK await peer EOF
+failed command: /cache/o/6c22d2ab7eb47d88e2d946dc0eca8c61/inference-worker-owner-handoff-tests --cache-dir=/cache --seed=0xa1494d82 --listen=-
+
+Build Summary: 12/12 steps succeeded; 30/30 tests passed
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 256ms MaxRSS:34M
+   +- compile test http-cleanup-owner-tests safe aarch64-linux-gnu success 12s MaxRSS:740M
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 22 pass (22 total) 2ms MaxRSS:34M
+   +- compile test inference-owner-handoff-tests safe aarch64-linux-gnu success 11s MaxRSS:932M
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:34M
+   +- compile test inference-worker-owner-handoff-tests safe aarch64-linux-gnu success 11s MaxRSS:703M
+antfly-sql-write-team-test success
++- run test sql-write-team-tests 4 pass (4 total) 2ms MaxRSS:34M
+   +- compile test sql-write-team-tests safe aarch64-linux-gnu success 8s MaxRSS:586M
+

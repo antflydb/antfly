@@ -269,6 +269,10 @@ fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
     return .{ .value = self.activateResolverReplayRuntimes() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+const prepareTransactionAssemblyWithPolicyLease = @import("db/prepared_assembly_boundary.zig").invoke;
+const drainCloseDependenciesWithAdmission = @import("db/prepared_assembly_boundary.zig").drainClose;
+const drainPreparedAssembliesWithAdmission = @import("db/prepared_assembly_boundary.zig").drain;
+const refreshTransactionAssembly = @import("db/prepared_assembly_boundary.zig").refresh;
 fn deactivateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
     self.deactivateResolverReplayRuntimes();
     return .{ .value = {} };
@@ -583,6 +587,10 @@ fn applyDerivedBatchToIndexAsync(ctx: *@import("db/execution_resources.zig").Asy
 
 fn enrichmentStart(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) engine.Outcome(void) {
     return .{ .value = self.start() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn enrichmentStopWithAdmission(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, original: @import("../common/read_admission.zig").Port) engine.Outcome(void) {
+    return .{ .value = self.stopWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
 }
 
 fn enrichmentReloadDurableState(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) engine.Outcome(void) {
@@ -1039,6 +1047,10 @@ fn installPublishedChildSchema(self: *DB, alloc: std.mem.Allocator, schema_json:
     return .{ .value = self.installPublishedChildSchema(alloc, schema_json, publication) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn enablePreparedTransactionProtocol(self: *DB) engine.Outcome(void) {
+    return .{ .value = self.enablePreparedTransactionProtocol() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn beginTransactionWithIdAndParticipantsCreatedAtAndRole(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginTransactionWithIdAndParticipantsCreatedAtAndRole(txn_id, timestamp_ns, created_at_ns, participants, coordinator) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1047,8 +1059,8 @@ fn beginTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, 
     return .{ .value = self.beginTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn beginReplicatedTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) engine.Outcome(@import("transactions.zig").TxnId) {
-    return .{ .value = self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn beginReplicatedTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, requirement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeIntents(self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) engine.Outcome(void) {
@@ -1418,8 +1430,12 @@ fn beginTransactionWithParticipants(self: *DB, timestamp_ns: u64, participants: 
     return .{ .value = self.beginTransactionWithParticipants(timestamp_ns, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt) engine.Outcome(void) {
-    return .{ .value = self.writeReplicatedTransactionAtOrderedReceipt(txn_id, req, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeReplicatedTransactionWithRequirementAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement) engine.Outcome(void) {
+    return .{ .value = self.writeReplicatedTransactionWithRequirementAtOrderedReceipt(txn_id, req, identity, requirement) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn getTransactionPreparationDecision(self: *DB, txn_id: @import("transactions.zig").TxnId, original: ?@import("../common/read_admission.zig").Port) engine.Outcome(@import("transactions.zig").TxnManager.PreparationDecision) {
+    return .{ .value = self.getTransactionPreparationDecision(txn_id, original) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn getTransactionStatus(self: *DB, txn_id: @import("transactions.zig").TxnId) engine.Outcome(@import("transactions.zig").TxnStatus) {
@@ -2138,4 +2154,74 @@ comptime {
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
     @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v29", .visibility = .hidden });
     @export(&getCAllocator, .{ .name = "antfly_storage_engine_c_allocator_v1", .visibility = .hidden });
+}
+
+// Admission-aware operations execute in the archive that owns the physical
+// reader and translate compilation-local errors before returning to callers.
+fn openDocumentReadSessionWithAdmission(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, control: ?@import("../common/read_admission.zig").Port) engine.Outcome(*DB.DocumentReadSession) {
+    return .{ .value = self.openDocumentReadSessionWithAdmission(alloc, from_key, to_key, opts, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn openRelationalReadSessionAtSnapshotWithAdmission(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot, control: ?@import("../common/read_admission.zig").Port) engine.Outcome(*DB.RelationalReadSession) {
+    return .{ .value = self.openRelationalReadSessionAtSnapshotWithAdmission(alloc, from_key, to_key, opts, statement, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn tryStatementReadFenceWithAdmission(self: *DB, control: ?@import("../common/read_admission.zig").Port) engine.Outcome(?DB.StatementReadFence) {
+    return .{ .value = self.tryStatementReadFenceWithAdmission(control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn captureRelationalStatementSnapshotWithAdmission(self: *DB, original: ?@import("../common/read_admission.zig").Port) engine.Outcome(DB.RelationalStatementSnapshot) {
+    return .{ .value = self.captureRelationalStatementSnapshotWithAdmission(original) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn documentSessionNextWithAdmission(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, limit: u32, control: @import("../common/read_admission.zig").Port) engine.Outcome(@import("relational_read_view.zig").View.Page) {
+    return .{ .value = self.nextWithAdmission(alloc, limit, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn documentSessionRangeProofsWithAdmission(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, control: @import("../common/read_admission.zig").Port) engine.Outcome([]@import("range_protection.zig").Proof) {
+    return .{ .value = self.rangeProofsWithAdmission(alloc, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn documentSessionNormalizeRowsWithAdmission(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite, control: @import("../common/read_admission.zig").Port) engine.Outcome([]types.BatchWrite) {
+    return .{ .value = self.normalizeRowsWithAdmission(alloc, writes, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn relationalSessionNextTypedPageWithAdmission(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget, control: @import("../common/read_admission.zig").Port) engine.Outcome(@import("db/relational_rows.zig").Page) {
+    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
+    const received_io: ?std.Io = if (receiver) |*value| value.io() else null;
+    return .{ .value = session.nextTypedPageWithAdmission(alloc, received_io, budget, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn relationalSessionRangeProofsWithAdmission(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, control: @import("../common/read_admission.zig").Port) engine.Outcome([]@import("range_protection.zig").Proof) {
+    return .{ .value = session.rangeProofsWithAdmission(alloc, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn relationalSessionNormalizeRowsWithAdmission(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite, control: @import("../common/read_admission.zig").Port) engine.Outcome([]types.BatchWrite) {
+    return .{ .value = session.normalizeRowsWithAdmission(alloc, writes, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn sealReplicatedTransactionEffectsAtOrderedReceipt(self: *DB, txn_id: types.TxnId, frame: []const u8, mode: @import("db/prepared_transaction_effects.zig").Mode, identity: db.OrderedApplyReceipt, scope: ?[32]u8) engine.Outcome(void) {
+    return .{ .value = self.sealReplicatedTransactionEffectsAtOrderedReceipt(txn_id, frame, mode, identity, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn writeReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt) engine.Outcome(void) {
+    return .{ .value = self.writeReplicatedTransactionAtOrderedReceipt(txn_id, req, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn beginReplicatedTransactionScopedWithBinding(self: *DB, txn_id: types.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement, binding: ?@import("db/prepared_transaction_effects.zig").Binding) engine.Outcome(types.TxnId) {
+    return .{ .value = self.beginReplicatedTransactionScopedWithBinding(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, requirement, binding) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn writeReplicatedTransactionWithBindingAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement, binding: ?@import("db/prepared_transaction_effects.zig").Binding) engine.Outcome(void) {
+    return .{ .value = self.writeReplicatedTransactionWithBindingAtOrderedReceipt(txn_id, req, identity, requirement, binding) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(self: *DB, txn_id: types.TxnId, frame: []const u8, mode: @import("db/prepared_transaction_effects.zig").Mode, identity: db.OrderedApplyReceipt, scope: ?[32]u8, binding: ?@import("db/prepared_transaction_effects.zig").Binding) engine.Outcome(void) {
+    return .{ .value = self.sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(txn_id, frame, mode, identity, scope, binding) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn resolutionStopWithAdmission(self: *@import("db/resolution_runtime.zig").ResolutionRuntime, original: @import("../common/read_admission.zig").Port) engine.Outcome(void) {
+    return .{ .value = self.stopWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
+}
+
+fn promotionStopWithAdmission(self: *@import("db/promotion_runtime.zig").PromotionRuntime, original: @import("../common/read_admission.zig").Port) engine.Outcome(void) {
+    return .{ .value = self.stopWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
 }

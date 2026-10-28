@@ -60,7 +60,12 @@ pub const Coordinator = struct {
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.
     pub fn register(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        self.mutex.lockUncancelable(self.io);
+        return self.registerControlled(file, inode, sequence, tip, false);
+    }
+    pub fn registerControlled(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, nonblocking: bool) !*Fence {
+        if (nonblocking) {
+            if (!self.mutex.tryLock()) return error.Backpressured;
+        } else self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const fence = try self.allocator.create(Fence);
         errdefer self.allocator.destroy(fence);

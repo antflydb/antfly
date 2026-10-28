@@ -37,26 +37,35 @@ pub fn saveWithCover(a: A, store: *Store, io: std.Io, table: anytype, now: u64, 
     return retained.saveWithCover(a, &artifact_store, try retained.storeIdentity(a, store.locator), io, table, now, retention_ms, cover, cancellation);
 }
 fn registerOwner(a: A, store: *Store, namespace: Namespace, cancellation: Cancellation) !void {
+    try store.implementation.upload_context.ensureActive();
     try cancellation.check();
     const key = try std.fmt.allocPrint(a, "{s}{s}native-query-owners/{d}/{d}/{d}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", namespace.table_id, namespace.shard_id, namespace.range_id });
     defer a.free(key);
     const bytes = try std.json.Stringify.valueAlloc(a, namespace, .{});
     defer a.free(bytes);
-    const bridge: TokenBridge = .{ .token = cancellation };
-    var result = store.opened.client.putObject(store.opened.bucket, key, bytes, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
+    const bridge: TokenBridge = .{ .token = cancellation, .context = store.implementation.upload_context };
+    var result = @import("antfly_local_sources").sql_execution_wait.runOwned(store.implementation.upload_context.wait, objectstore.Client.putObject, .{ &store.opened.client, store.opened.bucket, key, bytes, objectstore.PutOptions{ .if_none_match = true, .cancellation = bridge.object() } }, discardOwnerPut, .{store.opened.client.allocator}) catch |err| {
+        try store.implementation.upload_context.checkLifetime();
         try cancellation.check();
         switch (err) {
-            error.PreconditionFailed, error.ConditionalCheckFailed => return,
+            error.PreconditionFailed, error.ConditionalCheckFailed => return store.implementation.upload_context.ensureActive(),
             else => return err,
         }
     };
     result.deinit(store.opened.client.allocator);
+    try store.implementation.upload_context.ensureActive();
     try cancellation.check();
+}
+fn discardOwnerPut(value: objectstore.PutResult, a: A) void {
+    var result = value;
+    result.deinit(a);
 }
 const TokenBridge = struct {
     token: Cancellation,
+    context: local.serverless_query_lake_read_context.Context = .{},
     fn cancelled(raw: *const anyopaque) bool {
         const self: *const TokenBridge = @ptrCast(@alignCast(raw));
+        self.context.checkLifetime() catch return true;
         self.token.check() catch return true;
         return false;
     }

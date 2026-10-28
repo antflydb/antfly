@@ -736,6 +736,7 @@ test "SQL joined RETURNING subqueries prune cold scope and scale by captured row
         defer result.deinit();
         try std.testing.expectEqual(@as(u64, count), result.output.rows_affected);
         try std.testing.expectEqual(3 * count, backend.rows_read);
+        std.debug.print("SQL correlation work: targets={} checkpoints={}\n", .{ count, backend.checkpoints });
         try std.testing.expect(backend.checkpoints < 100 * count);
         if (previous_count != 0) try std.testing.expect(backend.checkpoints <= previous_work * count / previous_count + 2 * count);
         previous_count = count;
@@ -1073,6 +1074,7 @@ test "SQL quantified Apply preserves keyed boundary work and one captured source
         defer result.deinit();
         try std.testing.expectEqual(@as(u64, count), result.output.rows_affected);
         try std.testing.expectEqual(@as(usize, 2 * count), backend.rows_read);
+        std.debug.print("SQL correlation work: targets={} checkpoints={}\n", .{ count, backend.checkpoints });
         try std.testing.expect(backend.checkpoints < 100 * count);
         try std.testing.expectEqual(@as(usize, 1), backend.captures);
         try std.testing.expectEqual(@as(usize, 1), backend.closes);
@@ -1272,6 +1274,7 @@ test "SQL bounded scalar producers retain one capture and reusable correlation b
         defer result.deinit();
         try std.testing.expectEqual(@as(u64, count), result.output.rows_affected);
         try std.testing.expectEqual(@as(usize, 2 * count), backend.rows_read);
+        std.debug.print("SQL correlation work: targets={} checkpoints={}\n", .{ count, backend.checkpoints });
         try std.testing.expect(backend.checkpoints < 60 * count);
         try std.testing.expectEqual(@as(usize, 1), backend.captures);
         try std.testing.expectEqual(@as(usize, 1), backend.closes);
@@ -1521,6 +1524,7 @@ test "SQL row subquery keyed correlation scales without source rescans or duplic
         try std.testing.expectEqual(@as(usize, 2), backend.last_scan_count);
         try std.testing.expectEqual(@as(usize, 1), backend.commits);
         try std.testing.expect(backend.rows_read <= count * 2);
+        std.debug.print("SQL correlation work: targets={} checkpoints={}\n", .{ count, backend.checkpoints });
         try std.testing.expect(backend.checkpoints <= count * 32);
         std.debug.print("SQL row producer: rows={} native_rows={} checkpoints={} peak_bytes={} elapsed_ns={}\n", .{ count, backend.rows_read, backend.checkpoints, result.peakMemoryBytes(), std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
     }

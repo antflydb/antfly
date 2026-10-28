@@ -1,0 +1,138 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A foreground commit borrows only the caller's explicit lendable execution.
+//! Backend metadata adoption occurs after the exact accepted IO is joined and
+//! its WAL gate released. The producer retains staged input through that call.
+const std = @import("std");
+const admission = @import("../../common/read_admission.zig");
+const io = @import("storage_io.zig");
+const wal = @import("wal.zig");
+const state = @import("state.zig");
+const Backend = @import("../lsm_backend.zig").Backend;
+pub var test_hook: ?*const fn (*Owner, admission.Port) anyerror!void = null;
+pub var test_abort_hook: ?*const fn (admission.Port) anyerror!void = null;
+pub const Publication = struct {
+    owner: *Owner,
+    lock: Backend.WalOperationLock,
+    pub fn publish(self: *@This(), result: wal.AppendResult) void {
+        self.owner.result = result;
+        self.owner.published = true;
+    }
+    pub fn requireRecovery(self: *@This()) void {
+        self.owner.recovery = true;
+    }
+    pub fn release(self: *@This()) void {
+        self.lock.release();
+    }
+};
+pub const Operation = wal.CurrentStateAppend(Publication);
+pub const Owner = struct {
+    cpu: state.ActiveMemTable.PublicationPreparation = undefined,
+    cpu_live: bool = false,
+    input_index: ?@FieldType(state.ActiveMemTable, "index") = null,
+    input_ordered: ?@FieldType(state.ActiveMemTable, "ordered") = null,
+    record: []u8 = &.{},
+    record_retired: usize = 0,
+    grant: ?io.DurabilityResources = null,
+    lock: ?Backend.WalOperationLock = null,
+    operation: ?Operation = null,
+    result: wal.AppendResult = .{},
+    published: bool = false,
+    recovery: bool = false,
+    retired: bool = false,
+    pub fn prepare(self: *@This(), backend: *Backend, incoming: *const state.ActiveMemTable, credit: anytype, original: admission.Port) !void {
+        self.cpu = .initBorrowed(&backend.mutable, incoming);
+        self.cpu_live = true;
+        const record_len = try wal.stateRecordLenWithAdmission(incoming, original);
+        if (backend.options.wal_hard_limit_bytes != 0 and record_len > backend.options.wal_hard_limit_bytes) return error.WalRecordTooLarge;
+        const bound = try std.math.add(u64, try self.cpu.memoryBoundWithAdmission(original), try std.math.add(u64, record_len, try backend.storage.?.appendResourceBytes(record_len)));
+        const boundary = (try original.executionWait()).?;
+        // Capacity growth may wait on its own ledger; service guards are gone.
+        try boundary.beginWait();
+        const funded = credit.growBoundedOversized(bound, 1);
+        try boundary.endWait();
+        try funded;
+        try self.cpu.resumeWithAdmission(backend.allocator, original);
+        self.record = try wal.prepareStateRecordWithAdmission(backend.allocator, incoming, original);
+        self.grant = (try backend.storage.?.tryPrepareAppendWithAdmission(self.record, original)) orelse return error.ResourceBudgetExceeded;
+        if (comptime @import("builtin").is_test) if (test_hook) |hook| try hook(self, original);
+    }
+    pub fn drive(self: *@This(), backend: *Backend, original: admission.Port) !void {
+        self.operation = try Operation.prepare(backend.root_dir.?, self.record.len, .{ .segment_bytes = backend.options.wal_segment_bytes });
+        self.operation.?.sync_on_commit = backend.options.wal_sync_on_commit;
+        self.operation.?.start(self.grant.?, .{ .owner = self, .lock = self.lock.? }, original) catch |cause| {
+            self.operation = null;
+            return cause;
+        };
+        self.grant = null;
+        self.lock = null;
+        if (comptime @import("builtin").is_test) if (test_hook) |hook| try hook(self, original);
+        _ = try self.operation.?.publishWithAdmission(original);
+    }
+    pub fn abortWithAdmission(self: *@This(), original: admission.Port) !void {
+        if (comptime @import("builtin").is_test) if (test_abort_hook) |hook| try hook(original);
+        if (self.operation) |*operation| try operation.abortWithAdmission(original);
+        if (self.lock) |*lock| {
+            lock.release();
+            self.lock = null;
+        }
+    }
+    pub fn join(self: *@This()) void {
+        if (self.operation) |*operation| operation.joinAndRelease();
+        if (self.lock) |*lock| {
+            lock.release();
+            self.lock = null;
+        }
+    }
+    pub fn retireWithAdmission(self: *@This(), a: std.mem.Allocator, original: ?admission.Port) !void {
+        if (self.retired) return;
+        if (self.operation) |*operation| {
+            if (original) |port| {
+                try operation.abortWithAdmission(port);
+                try operation.retireWithAdmission(port);
+            }
+            operation.deinit();
+            self.operation = null;
+        }
+        if (self.grant) |*grant| {
+            if (original) |port| try grant.retireWithAdmission(port) else grant.deinit();
+            self.grant = null;
+        }
+        if (self.input_ordered) |*index| {
+            if (original) |port| try port.checkpoint();
+            index.deinit(a);
+            self.input_ordered = null;
+        }
+        if (self.cpu_live) {
+            if (original) |port| try self.cpu.retireWithAdmission(a, port) else self.cpu.deinit(a);
+            self.cpu_live = false;
+        }
+        if (self.input_index) |*index| {
+            if (original) |port| try port.checkpoint();
+            index.deinit(a);
+            self.input_index = null;
+        }
+        while (self.record_retired < self.record.len) {
+            if (original) |port| try port.checkpoint();
+            const end = @min(self.record.len, self.record_retired + 16 * 1024);
+            @memset(self.record[self.record_retired..end], undefined);
+            self.record_retired = end;
+        }
+        if (self.record.len != 0) a.rawFree(self.record, .of(u8), @returnAddress());
+        self.record = &.{};
+        self.retired = true;
+    }
+};

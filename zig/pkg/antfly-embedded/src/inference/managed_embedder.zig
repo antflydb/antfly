@@ -514,6 +514,8 @@ pub const ProviderRuntime = struct {
         timeouts.request_ms = policy.request_timeout_ms;
         client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, self.io, .{
             .keep_alive = true,
+            .outbound = .{ .max_active = 20, .max_per_endpoint = 5, .max_waiters = 20 },
+            .cache_resolved_addresses = true,
             .cookies_enabled = false,
             .max_response_size = policy.response_limit,
             .timeouts = timeouts,
@@ -548,6 +550,9 @@ pub const InitOptions = struct {
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     progress: ?request_context.ProgressSink = null,
+    /// Invocation-local synchronous grant; never retain beyond this embedder
+    /// or pass it to parallel workers/watchdogs without an owned child.
+    runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -627,6 +632,9 @@ pub const ManagedEmbeddingEntry = struct {
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     progress: ?request_context.ProgressSink = null,
+    /// Invocation-local synchronous grant; never retain beyond this embedder
+    /// or pass it to parallel workers/watchdogs without an owned child.
+    runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     embedding_names: [][]u8 = &.{},
@@ -2288,6 +2296,7 @@ fn applyRequestContext(
     else
         context.deadline_ns;
     entry.cancellation = cancellation.token();
+    entry.runnable = context.runnable;
     if (context.progress) |progress| entry.progress = progress;
 }
 
@@ -2332,6 +2341,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: Embed
             .deadline_ns = embeddingOperationDeadline(entry),
             .cancellation = entry.cancellation,
             .progress = entry.progress,
+            .runnable = entry.runnable,
         },
         .task_type = task_type,
         .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
@@ -4946,6 +4956,7 @@ fn buildManagedEmbeddingEntry(
         .deadline_ns = options.deadline_ns,
         .cancellation = options.cancellation,
         .progress = options.progress,
+        .runnable = options.runnable,
         .index_name = owned_index_name,
         .embedding_name = owned_embedding_name,
         .embedding_names = owned_embedding_names,

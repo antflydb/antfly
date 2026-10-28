@@ -21,6 +21,21 @@ pub const Driver = struct {
     failure_streak: u32 = 0,
     next_attempt_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pub const Failure = enum { admission, delivery };
+    /// A changed generation with remaining runnable work permits queueing the
+    /// next bounded chunk. Unchanged/unknown progress retains delayed retry.
+    pub const WorkProgress = struct { generation: u64 = 0, runnable: bool = false };
+    pub const Progress = struct {
+        generation: u64 = 0,
+        runnable: bool = false,
+        provider: WorkProgress = .{},
+
+        pub fn advancedSince(self: @This(), before: @This()) bool {
+            // Readiness belongs to the source whose generation advanced. A
+            // completed capture cannot borrow an unchanged provider's readiness.
+            return (self.runnable and self.generation != before.generation) or
+                (self.provider.runnable and self.provider.generation != before.provider.generation);
+        }
+    };
     pub const Port = struct {
         ptr: *anyopaque,
         eligible: *const fn (*anyopaque) bool,
@@ -29,6 +44,7 @@ pub const Driver = struct {
         may_disarm: *const fn (*anyopaque) bool,
         now: *const fn (*anyopaque) u64,
         drain: *const fn (*anyopaque) anyerror!void,
+        progress: ?*const fn (*anyopaque) Progress = null,
         submit: *const fn (*anyopaque) anyerror!void,
         arm: *const fn (*anyopaque) void,
         disarm: *const fn (*anyopaque) void,
@@ -66,9 +82,28 @@ pub const Driver = struct {
         // A successful delivery retains the maybe-bit until a fenced empty
         // scan. A second pass proves emptiness without scanning on each clear.
         for (0..2) |_| {
+            const before = if (port.progress) |probe| probe(port.ptr) else Progress{};
             port.drain(port.ptr) catch |err| {
                 if (port.closing(port.ptr)) {
                     self.state.store(0, .release);
+                    return;
+                }
+                if (err == error.CommitCompletionPending) {
+                    const after = if (port.progress) |probe| probe(port.ptr) else Progress{};
+                    if (after.advancedSince(before)) {
+                        // Yield to the bounded queue after making progress.
+                        // Resubmission never invokes drain recursively; queue
+                        // refusal takes the existing admission backoff path.
+                        self.next_attempt_ns.store(0, .release);
+                        self.state.store(0, .release);
+                        self.schedule(port);
+                    } else {
+                        // Ack/fence waits and unchanged or contended probes
+                        // must not turn into a ready-job polling loop.
+                        self.next_attempt_ns.store(port.now(port.ptr) +| 250 * std.time.ns_per_ms, .release);
+                        self.state.store(0, .release);
+                        port.arm(port.ptr);
+                    }
                     return;
                 }
                 self.failure_streak +|= 1;
@@ -232,4 +267,244 @@ test "a previous recovery failure must retain its own diagnostic counter after r
     fixture.driver.schedule(fixture.port());
     fixture.driver.run(fixture.port());
     try std.testing.expectEqual(@as(?u32, 1), fixture.reported);
+}
+
+test "publication recovery step pending acknowledgement keeps short retry cadence without failure backoff" {
+    const F = struct {
+        now_ns: u64 = 1,
+        submissions: usize = 0,
+        failures: usize = 0,
+        arms: usize = 0,
+        fn cast(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn no(_: *anyopaque) bool {
+            return false;
+        }
+        fn now(ptr: *anyopaque) u64 {
+            return cast(ptr).now_ns;
+        }
+        fn drain(_: *anyopaque) !void {
+            return error.CommitCompletionPending;
+        }
+        fn submit(ptr: *anyopaque) !void {
+            cast(ptr).submissions += 1;
+        }
+        fn arm(ptr: *anyopaque) void {
+            cast(ptr).arms += 1;
+        }
+        fn disarm(_: *anyopaque) void {}
+        fn delay(_: *anyopaque, _: u32) u64 {
+            return 30 * std.time.ns_per_s;
+        }
+        fn report(ptr: *anyopaque, _: Driver.Failure, _: anyerror, _: u32, _: u64) void {
+            cast(ptr).failures += 1;
+        }
+    };
+    var fixture: F = .{};
+    var driver: Driver = .{};
+    const port: Driver.Port = .{ .ptr = &fixture, .eligible = F.yes, .closing = F.no, .pending = F.yes, .may_disarm = F.no, .now = F.now, .drain = F.drain, .submit = F.submit, .arm = F.arm, .disarm = F.disarm, .retry_delay = F.delay, .report = F.report };
+    for (0..3) |_| {
+        driver.schedule(port);
+        const submissions = fixture.submissions;
+        driver.run(port);
+        try std.testing.expectEqual(@as(u32, 0), driver.failure_streak);
+        try std.testing.expectEqual(@as(u8, 0), driver.state.load(.acquire));
+        try std.testing.expectEqual(fixture.now_ns + 250 * std.time.ns_per_ms, driver.next_attempt_ns.load(.acquire));
+        driver.schedule(port);
+        try std.testing.expectEqual(submissions, fixture.submissions);
+        fixture.now_ns = driver.next_attempt_ns.load(.acquire);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.submissions);
+    try std.testing.expectEqual(@as(usize, 0), fixture.failures);
+    try std.testing.expect(fixture.arms >= 3);
+}
+
+const RunnableRetryTest = struct {
+    generation: u64 = 0,
+    runnable: bool = false,
+    advance: bool = true,
+    remaining_work: bool = true,
+    provider: Driver.WorkProgress = .{},
+    advance_provider: bool = false,
+    provider_remaining_work: bool = true,
+    close_during_drain: bool = false,
+    closed: bool = false,
+    refuse_submit: bool = false,
+    now_ns: u64 = 1,
+    submissions: usize = 0,
+    drains: usize = 0,
+    arms: usize = 0,
+    admission_reports: usize = 0,
+    delivery_reports: usize = 0,
+    fn cast(ptr: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn yes(_: *anyopaque) bool {
+        return true;
+    }
+    fn no(_: *anyopaque) bool {
+        return false;
+    }
+    fn closing(ptr: *anyopaque) bool {
+        return cast(ptr).closed;
+    }
+    fn now(ptr: *anyopaque) u64 {
+        return cast(ptr).now_ns;
+    }
+    fn progress(ptr: *anyopaque) Driver.Progress {
+        const self = cast(ptr);
+        return .{ .generation = self.generation, .runnable = self.runnable, .provider = self.provider };
+    }
+    fn drain(ptr: *anyopaque) !void {
+        const self = cast(ptr);
+        self.drains += 1;
+        if (self.advance) {
+            self.generation +%= 1;
+            self.runnable = self.remaining_work;
+        }
+        if (self.advance_provider) {
+            self.provider.generation +%= 1;
+            self.provider.runnable = self.provider_remaining_work;
+        }
+        if (self.close_during_drain) self.closed = true;
+        return error.CommitCompletionPending;
+    }
+    fn submit(ptr: *anyopaque) !void {
+        const self = cast(ptr);
+        if (self.refuse_submit) return error.TestRunnableQueueFull;
+        self.submissions += 1;
+    }
+    fn arm(ptr: *anyopaque) void {
+        cast(ptr).arms += 1;
+    }
+    fn disarm(_: *anyopaque) void {}
+    fn delay(_: *anyopaque, _: u32) u64 {
+        return 30 * std.time.ns_per_s;
+    }
+    fn report(ptr: *anyopaque, failure: Driver.Failure, _: anyerror, _: u32, _: u64) void {
+        const self = cast(ptr);
+        switch (failure) {
+            .admission => self.admission_reports += 1,
+            .delivery => self.delivery_reports += 1,
+        }
+    }
+    fn port(self: *@This()) Driver.Port {
+        return .{ .ptr = self, .eligible = yes, .closing = closing, .pending = yes, .may_disarm = no, .now = now, .drain = drain, .progress = progress, .submit = submit, .arm = arm, .disarm = disarm, .retry_delay = delay, .report = report };
+    }
+};
+
+test "publication outbox recovery queues progressing chunks without sleeping and retains waits for unchanged progress" {
+    var fixture: RunnableRetryTest = .{};
+    var driver: Driver = .{};
+    const port = fixture.port();
+    driver.schedule(port);
+    for (0..8) |index| {
+        const submissions = fixture.submissions;
+        driver.run(port);
+        try std.testing.expectEqual(index + 1, fixture.drains);
+        try std.testing.expectEqual(submissions + 1, fixture.submissions);
+        try std.testing.expectEqual(@as(u8, 1), driver.state.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), driver.next_attempt_ns.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), fixture.arms);
+        // Another wakeup cannot enqueue a second flight or recurse into work.
+        driver.schedule(port);
+        try std.testing.expectEqual(submissions + 1, fixture.submissions);
+    }
+    fixture.advance = false;
+    const submissions = fixture.submissions;
+    driver.run(port);
+    try std.testing.expectEqual(submissions, fixture.submissions);
+    try std.testing.expectEqual(@as(u8, 0), driver.state.load(.acquire));
+    try std.testing.expectEqual(fixture.now_ns + 250 * std.time.ns_per_ms, driver.next_attempt_ns.load(.acquire));
+    driver.schedule(port);
+    try std.testing.expectEqual(submissions, fixture.submissions);
+    fixture.now_ns = driver.next_attempt_ns.load(.acquire);
+    fixture.runnable = false; // Acknowledgement/fence waiting remains delayed.
+    driver.schedule(port);
+    driver.run(port);
+    try std.testing.expectEqual(submissions + 1, fixture.submissions);
+    try std.testing.expectEqual(fixture.now_ns + 250 * std.time.ns_per_ms, driver.next_attempt_ns.load(.acquire));
+    // Finishing a CPU chunk before an external wait changes the generation,
+    // but must still back off when the remaining work is not runnable.
+    fixture.now_ns = driver.next_attempt_ns.load(.acquire);
+    fixture.advance = true;
+    fixture.remaining_work = false;
+    const before = fixture.generation;
+    driver.schedule(port);
+    driver.run(port);
+    try std.testing.expect(fixture.generation != before);
+    try std.testing.expectEqual(submissions + 2, fixture.submissions);
+    try std.testing.expectEqual(@as(u8, 0), driver.state.load(.acquire));
+    try std.testing.expectEqual(fixture.now_ns + 250 * std.time.ns_per_ms, driver.next_attempt_ns.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fixture.admission_reports + fixture.delivery_reports);
+    try std.testing.expectEqual(@as(u32, 0), driver.failure_streak);
+}
+
+test "publication outbox recovery runnable admission refusal and close retain bounded retry barriers" {
+    var fixture: RunnableRetryTest = .{};
+    var driver: Driver = .{};
+    const port = fixture.port();
+    driver.schedule(port);
+    fixture.refuse_submit = true;
+    driver.run(port);
+    try std.testing.expectEqual(@as(usize, 1), fixture.drains);
+    try std.testing.expectEqual(@as(usize, 1), fixture.submissions);
+    try std.testing.expectEqual(@as(usize, 1), fixture.admission_reports);
+    try std.testing.expectEqual(@as(usize, 0), fixture.delivery_reports);
+    try std.testing.expectEqual(@as(u32, 0), driver.failure_streak);
+    try std.testing.expectEqual(@as(u8, 0), driver.state.load(.acquire));
+    try std.testing.expectEqual(fixture.now_ns + 250 * std.time.ns_per_ms, driver.next_attempt_ns.load(.acquire));
+    fixture.now_ns = driver.next_attempt_ns.load(.acquire);
+    fixture.refuse_submit = false;
+    fixture.close_during_drain = true;
+    driver.schedule(port);
+    driver.run(port);
+    try std.testing.expectEqual(@as(usize, 2), fixture.submissions);
+    try std.testing.expectEqual(@as(usize, 2), fixture.drains);
+    try std.testing.expectEqual(@as(u8, 0), driver.state.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fixture.admission_reports);
+    try std.testing.expectEqual(@as(usize, 0), fixture.delivery_reports);
+}
+
+test "publication outbox recovery tracks provider progress independently without borrowing stale readiness" {
+    var fixture: RunnableRetryTest = .{ .advance = false, .advance_provider = true };
+    var driver: Driver = .{};
+    const port = fixture.port();
+    driver.schedule(port);
+    for (0..8) |index| {
+        driver.run(port);
+        try std.testing.expectEqual(@as(u64, 0), fixture.generation);
+        try std.testing.expectEqual(@as(u64, index + 1), fixture.provider.generation);
+        try std.testing.expectEqual(index + 2, fixture.submissions);
+        try std.testing.expectEqual(@as(u8, 1), driver.state.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), driver.next_attempt_ns.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), fixture.arms);
+    }
+    const submissions = fixture.submissions;
+    // Capture finishes work while the provider still advertises old readiness.
+    // Only the capture token changes, and it has no runnable work remaining.
+    fixture.advance_provider = false;
+    fixture.advance = true;
+    fixture.remaining_work = false;
+    driver.run(port);
+    try std.testing.expectEqual(submissions, fixture.submissions);
+    try std.testing.expectEqual(@as(u8, 0), driver.state.load(.acquire));
+    try std.testing.expectEqual(fixture.now_ns + 250 * std.time.ns_per_ms, driver.next_attempt_ns.load(.acquire));
+    // A finished provider now waits for acknowledgement, despite having moved
+    // its token. Capture's old readiness cannot make this provider runnable.
+    fixture.now_ns = driver.next_attempt_ns.load(.acquire);
+    fixture.advance = false;
+    fixture.runnable = true;
+    fixture.advance_provider = true;
+    fixture.provider_remaining_work = false;
+    driver.schedule(port);
+    driver.run(port);
+    try std.testing.expectEqual(submissions + 1, fixture.submissions);
+    try std.testing.expectEqual(@as(u8, 0), driver.state.load(.acquire));
+    try std.testing.expectEqual(fixture.now_ns + 250 * std.time.ns_per_ms, driver.next_attempt_ns.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fixture.admission_reports + fixture.delivery_reports);
 }

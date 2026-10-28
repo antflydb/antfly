@@ -19,6 +19,8 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
+const Work = @import("operator_work.zig");
+pub const ReadControl = Work.Control;
 /// A borrowed physical column plus its logical row mapping. The declaration
 /// proves scalar boundary coercion is an identity; unsupported coercions decline.
 pub const PhysicalColumn = struct {
@@ -234,11 +236,56 @@ pub const Batch = union(enum) {
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
-    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, free_owned: ?*const fn (*anyopaque, A) void = null, read_decimal_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?DecimalColumn = null, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_physical_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?PhysicalColumn = null, cohort: ?struct { source: *const Batch, positions: []const usize } = null, read_frozen: ?*const fn (*anyopaque, usize, usize) anyerror!?FrozenJson = null, read_json: ?*const fn (*anyopaque, usize, usize) anyerror!?[]const u8 = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
+    reader: struct {
+        ptr: *anyopaque,
+        /// Only built-in fixed routing adapters use this marker. Producers
+        /// keep their direct owner check, even when a parent shares metadata.
+        metadata_forwarder: bool = false,
+        /// Controls and their stack metadata counters are synchronous borrows.
+        /// No callback may retain them beyond its invocation.
+        read_controlled: ?*const fn (*anyopaque, A, usize, usize, ?Work.Control) anyerror!scalar.Datum = null,
+        read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum,
+        free_owned: ?*const fn (*anyopaque, A) void = null,
+        read_decimal_selected_controlled: ?*const fn (*anyopaque, A, usize, ?[]const usize, ?Work.Control) anyerror!?DecimalColumn = null,
+        read_decimal_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?DecimalColumn = null,
+        read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null,
+        read_physical_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?PhysicalColumn = null,
+        cohort: ?struct { source: *const Batch, positions: []const usize } = null,
+        read_frozen_controlled: ?*const fn (*anyopaque, usize, usize, ?Work.Control) anyerror!?FrozenJson = null,
+        read_frozen: ?*const fn (*anyopaque, usize, usize) anyerror!?FrozenJson = null,
+        read_json_controlled: ?*const fn (*anyopaque, usize, usize, ?Work.Control) anyerror!?[]const u8 = null,
+        read_json: ?*const fn (*anyopaque, usize, usize) anyerror!?[]const u8 = null,
+        read_dictionary_controlled: ?*const fn (*anyopaque, A, usize, ?Work.Control) anyerror!?Batch = null,
+        read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null,
+        read_identity_controlled: ?*const fn (*anyopaque, usize, usize, ?Work.Control) anyerror!?u64 = null,
+        read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null,
+        count: usize,
+        width: usize,
+    },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
     mapped: struct { source: *const Batch, ordinals: []const usize, types: []const scalar.Type, selection: []const usize },
+    // Built-in views route through fixed ordinals/positions and delegate data
+    // work to their source. Bind every supported controlled capability here
+    // so a legacy callback cannot silently reopen a per-cell owner boundary.
+    fn metadataView(comptime View: type, input: Batch) Batch {
+        var result = input;
+        result.reader.read_controlled = View.readControlled;
+        result.reader.metadata_forwarder = true;
+        inline for (.{
+            .{ "read_json_controlled", "jsonControlled" },
+            .{ "read_frozen_controlled", "frozenControlled" },
+            .{ "read_identity_controlled", "identityControlled" },
+            .{ "read_dictionary_controlled", "dictionaryControlled" },
+            .{ "read_decimal_selected_controlled", "decimalSelectedControlled" },
+        }) |entry| {
+            if (@hasDecl(View, entry[1])) @field(result.reader, entry[0]) = @field(View, entry[1]);
+            const legacy = entry[0][0 .. entry[0].len - "_controlled".len];
+            std.debug.assert(@field(input.reader, legacy) == null or @field(result.reader, entry[0]) != null);
+        }
+        return result;
+    }
     pub fn len(self: Batch) usize {
         return switch (self) {
             .dictionary => |v| v.indices.len,
@@ -264,22 +311,44 @@ pub const Batch = union(enum) {
     /// Canonical, validated JSON bytes with this batch's lifetime. Declining
     /// this capability leaves the ordinary parsed cell accessor unchanged.
     pub fn encodedJson(self: Batch, row_index: usize, column: usize) anyerror!?[]const u8 {
+        return self.encodedJsonControlled(row_index, column, null);
+    }
+    pub fn encodedJsonControlled(self: Batch, row_index: usize, column: usize, control: ?Work.Control) anyerror!?[]const u8 {
+        try Work.metadataPoll(control);
         if (row_index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
             .retained => |v| v.store.encodedJson(v.begin + row_index, column),
-            .reader => |v| if (v.read_json) |read| read(v.ptr, row_index, column) else null,
-            .mapped => |v| if (column < v.types.len and v.types[column].kind == .json and v.ordinals[column] != std.math.maxInt(usize)) v.source.encodedJson(v.selection[row_index], v.ordinals[column]) else null,
-            .columns => |v| if (v.definitions[column].type == .json) v.page.encodedJson(row_index, v.definitions[column].name) else null,
+            .reader => |v| blk: {
+                if (v.read_json_controlled) |read| break :blk try read(v.ptr, row_index, column, control);
+                const read = v.read_json orelse break :blk null;
+                try Work.poll(control);
+                const result = try read(v.ptr, row_index, column);
+                try Work.poll(control);
+                break :blk result;
+            },
+            .mapped => |v| if (column < v.types.len and v.types[column].kind == .json and v.ordinals[column] != std.math.maxInt(usize)) v.source.encodedJsonControlled(v.selection[row_index], v.ordinals[column], control) else null,
+            .columns => |v| if (v.definitions[column].type == .json) v.page.encodedJsonControlled(row_index, v.definitions[column].name, control) else null,
             else => null,
         };
     }
     pub fn frozenJson(self: Batch, row_index: usize, column: usize) anyerror!?FrozenJson {
+        return self.frozenJsonControlled(row_index, column, null);
+    }
+    pub fn frozenJsonControlled(self: Batch, row_index: usize, column: usize, control: ?Work.Control) anyerror!?FrozenJson {
+        try Work.metadataPoll(control);
         if (row_index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
             .retained => |v| v.store.frozenJson(v.begin + row_index, column),
-            .reader => |v| if (v.read_frozen) |read| read(v.ptr, row_index, column) else null,
-            .mapped => |v| if (column < v.types.len and v.types[column].kind == .json and v.ordinals[column] != std.math.maxInt(usize)) v.source.frozenJson(v.selection[row_index], v.ordinals[column]) else null,
-            .columns => |v| if (v.definitions[column].type == .json) v.page.frozenJson(row_index, v.definitions[column].name) else null,
+            .reader => |v| blk: {
+                if (v.read_frozen_controlled) |read| break :blk try read(v.ptr, row_index, column, control);
+                const read = v.read_frozen orelse break :blk null;
+                try Work.poll(control);
+                const result = try read(v.ptr, row_index, column);
+                try Work.poll(control);
+                break :blk result;
+            },
+            .mapped => |v| if (column < v.types.len and v.types[column].kind == .json and v.ordinals[column] != std.math.maxInt(usize)) v.source.frozenJsonControlled(v.selection[row_index], v.ordinals[column], control) else null,
+            .columns => |v| if (v.definitions[column].type == .json) v.page.frozenJsonControlled(row_index, v.definitions[column].name, control) else null,
             else => null,
         };
     }
@@ -310,6 +379,11 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.cell(alloc, row_index, view.column);
             }
+            pub fn readControlled(raw: *anyopaque, alloc: A, row_index: usize, _: usize, control: ?Work.Control) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.cellControlled(alloc, row_index, view.column, control);
+            }
+
             fn dictionary(raw: *anyopaque, alloc: A, _: usize) !?Batch {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.dictionaryColumn(alloc, view.column);
@@ -326,10 +400,30 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.dictionaryIdentity(row_index, view.column);
             }
+            pub fn jsonControlled(raw: *anyopaque, row_index: usize, _: usize, control: ?Work.Control) !?[]const u8 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.encodedJsonControlled(row_index, view.column, control);
+            }
+            pub fn frozenControlled(raw: *anyopaque, row_index: usize, _: usize, control: ?Work.Control) !?FrozenJson {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.frozenJsonControlled(row_index, view.column, control);
+            }
+            pub fn identityControlled(raw: *anyopaque, row_index: usize, _: usize, control: ?Work.Control) !?u64 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.dictionaryIdentityControlled(row_index, view.column, control);
+            }
+            pub fn dictionaryControlled(raw: *anyopaque, alloc: A, _: usize, control: ?Work.Control) !?Batch {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.dictionaryColumnControlled(alloc, view.column, control);
+            }
+            pub fn decimalSelectedControlled(raw: *anyopaque, alloc: A, _: usize, selection: ?[]const usize, control: ?Work.Control) !?DecimalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.decimalColumnSelectedControlled(alloc, view.column, selection, control);
+            }
         };
         const view = try a.create(View);
         view.* = .{ .source = self, .column = column };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen, .count = self.len(), .width = 1 } };
+        return metadataView(View, .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen, .count = self.len(), .width = 1 } });
     }
     /// Keep FILTER cohorts sparse. Aggregate consumers gather group IDs for
     /// accepted lanes directly; scalar fallback observes SQL NULL elsewhere.
@@ -349,10 +443,21 @@ pub const Batch = union(enum) {
                 }
                 return if (lo < view.positions.len and view.positions[lo] == row_index) view.source.cell(alloc, lo, 0) else .{};
             }
+            pub fn readControlled(raw: *anyopaque, alloc: A, row_index: usize, _: usize, control: ?Work.Control) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                var lo: usize = 0;
+                var hi = view.positions.len;
+                while (lo < hi) {
+                    try Work.metadataPoll(control);
+                    const mid = lo + (hi - lo) / 2;
+                    if (view.positions[mid] < row_index) lo = mid + 1 else hi = mid;
+                }
+                return if (lo < view.positions.len and view.positions[lo] == row_index) view.source.cellControlled(alloc, lo, 0, control) else .{};
+            }
         };
         const view = try a.create(View);
         view.* = .{ .source = self, .positions = positions };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .count = count, .width = 1, .cohort = .{ .source = self, .positions = positions } } };
+        return metadataView(View, .{ .reader = .{ .ptr = view, .read = View.read, .count = count, .width = 1, .cohort = .{ .source = self, .positions = positions } } });
     }
     /// Borrow independent expression columns without a Datum row matrix.
     pub fn combine(a: A, columns: []const Batch, count: usize) !Batch {
@@ -387,10 +492,34 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.columns[column].dictionaryIdentity(row_index, 0);
             }
+            pub fn readControlled(raw: *anyopaque, alloc: A, row_index: usize, column: usize, control: ?Work.Control) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].cellControlled(alloc, row_index, 0, control);
+            }
+            pub fn decimalSelectedControlled(raw: *anyopaque, alloc: A, column: usize, selection: ?[]const usize, control: ?Work.Control) !?DecimalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].decimalColumnSelectedControlled(alloc, 0, selection, control);
+            }
+            pub fn jsonControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?[]const u8 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].encodedJsonControlled(row_index, 0, control);
+            }
+            pub fn frozenControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?FrozenJson {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].frozenJsonControlled(row_index, 0, control);
+            }
+            pub fn identityControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?u64 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].dictionaryIdentityControlled(row_index, 0, control);
+            }
+            pub fn dictionaryControlled(raw: *anyopaque, alloc: A, column: usize, control: ?Work.Control) !?Batch {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].dictionaryColumnControlled(alloc, 0, control);
+            }
         };
         const view = try a.create(View);
         view.* = .{ .columns = columns };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physical, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen, .width = columns.len, .count = count } };
+        return metadataView(View, .{ .reader = .{ .ptr = view, .read = View.read, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physical, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen, .width = columns.len, .count = count } });
     }
     /// Normalize a stable reader once; borrowed views are reused by hashing,
     /// admission and reduction until the enclosing block/window is released.
@@ -423,18 +552,43 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return if (view.columns[column]) |native| native.dictionaryIdentity(row_index) else view.source.dictionaryIdentity(row_index, column);
             }
+            pub fn readControlled(raw: *anyopaque, alloc: A, row_index: usize, column: usize, control: ?Work.Control) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.cellControlled(alloc, row_index, column, control);
+            }
+            pub fn decimalSelectedControlled(raw: *anyopaque, alloc: A, column: usize, selection: ?[]const usize, control: ?Work.Control) !?DecimalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.decimalColumnSelectedControlled(alloc, column, selection, control);
+            }
+            pub fn jsonControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?[]const u8 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.encodedJsonControlled(row_index, column, control);
+            }
+            pub fn frozenControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?FrozenJson {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.frozenJsonControlled(row_index, column, control);
+            }
+            pub fn identityControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?u64 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                try Work.metadataPoll(control);
+                return if (view.columns[column]) |native| native.dictionaryIdentity(row_index) else view.source.dictionaryIdentityControlled(row_index, column, control);
+            }
         };
         const columns = try a.alloc(?PhysicalColumn, self.width());
         for (columns, 0..) |*column, index| column.* = try self.physicalColumn(a, index);
         const view = try a.create(View);
         view.* = .{ .source = self, .columns = columns };
-        return .{ .reader = .{ .ptr = view, .count = self.len(), .width = self.width(), .read = View.read, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physical, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen } };
+        return metadataView(View, .{ .reader = .{ .ptr = view, .count = self.len(), .width = self.width(), .read = View.read, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physical, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen } });
     }
     fn selectedRows(a: A, rows: []const usize, selection: ?[]const usize) ![]const usize {
+        return selectedRowsControlled(a, rows, selection, null);
+    }
+    fn selectedRowsControlled(a: A, rows: []const usize, selection: ?[]const usize, control: ?Work.Control) ![]const usize {
         const indices = selection orelse return rows;
         const selected = try a.alloc(usize, indices.len);
         errdefer a.free(selected);
         for (indices, selected) |index, *row_index| {
+            try Work.metadataPoll(control);
             if (index >= rows.len) return error.InvalidSqlBackendResponse;
             row_index.* = rows[index];
         }
@@ -515,6 +669,36 @@ pub const Batch = union(enum) {
         const view = try a.create(View);
         view.* = .{ .values = values, .nulls = nulls, .scale = scale, .scales = scales };
         return .{ .reader = .{ .ptr = view, .read = View.read, .read_decimal_selected = View.decimal, .free_owned = View.free, .count = values.len, .width = 1 } };
+    }
+    pub fn decimalColumnSelectedControlled(self: Batch, a: A, column: usize, selection: ?[]const usize, control: ?Work.Control) anyerror!?DecimalColumn {
+        try Work.metadataPoll(control);
+        if (column >= self.width()) return error.InvalidSqlBackendResponse;
+        if (selection) |rows| for (rows) |row_index| {
+            try Work.metadataPoll(control);
+            if (row_index >= self.len()) return error.InvalidSqlBackendResponse;
+        };
+        switch (self) {
+            .reader => |v| {
+                if (v.read_decimal_selected_controlled) |read| return read(v.ptr, a, column, selection, control);
+                if (v.read_decimal_selected == null) return null;
+            },
+            .mapped => |v| {
+                if (column >= v.types.len or v.types[column].kind != .number or v.types[column].element_type != .numeric or v.types[column].numeric_modifier != null or v.ordinals[column] == std.math.maxInt(usize)) return null;
+                return v.source.decimalColumnSelectedControlled(a, v.ordinals[column], try selectedRowsControlled(a, v.selection, selection, control), control);
+            },
+            .columns => |v| {
+                const definition = v.definitions[column];
+                if (definition.type != .number or definition.element_type != .numeric or definition.numeric_modifier != null) return null;
+            },
+            .retained => {},
+            else => return null,
+        }
+        // Existing physical/opaque providers own their representation work;
+        // retain their direct check instead of spending metadata credit on it.
+        try Work.poll(control);
+        const result = try self.decimalColumnSelected(a, column, selection);
+        try Work.poll(control);
+        return result;
     }
     pub fn decimalColumnSelected(self: Batch, a: A, column: usize, selection: ?[]const usize) anyerror!?DecimalColumn {
         if (column >= self.width()) return error.InvalidSqlBackendResponse;
@@ -602,34 +786,56 @@ pub const Batch = union(enum) {
     /// Optional physical representation, with the same cells and row order.
     /// Producers decline when normalization or effects require scalar access.
     pub fn dictionaryColumn(self: Batch, a: A, column: usize) !?Batch {
+        return self.dictionaryColumnControlled(a, column, null);
+    }
+    pub fn dictionaryColumnControlled(self: Batch, a: A, column: usize, control: ?Work.Control) !?Batch {
+        try Work.metadataPoll(control);
         if (column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
             .dictionary => self,
-            .retained => |v| v.store.dictionaryBatch(a, column, v.begin, v.count),
-            .reader => |v| if (v.read_dictionary) |read| read(v.ptr, a, column) else null,
-            .columns, .mapped => self.selectedDictionary(a, column),
+            .retained => |v| v.store.dictionaryBatchControlled(a, column, v.begin, v.count, control),
+            .reader => |v| blk: {
+                if (v.read_dictionary_controlled) |read| break :blk try read(v.ptr, a, column, control);
+                const read = v.read_dictionary orelse break :blk null;
+                try Work.poll(control);
+                const result = try read(v.ptr, a, column);
+                try Work.poll(control);
+                break :blk result;
+            },
+            .columns, .mapped => self.selectedDictionaryControlled(a, column, control),
             else => null,
         };
     }
     /// Physical identity only: tracing selections must not normalize or
     /// evaluate rows that an outer mapping will never consume.
     pub fn dictionaryIdentity(self: Batch, index: usize, column: usize) anyerror!?u64 {
+        return self.dictionaryIdentityControlled(index, column, null);
+    }
+    pub fn dictionaryIdentityControlled(self: Batch, index: usize, column: usize, control: ?Work.Control) anyerror!?u64 {
+        try Work.metadataPoll(control);
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
             .dictionary => |v| if (v.indices[index] < v.values.len) @as(u64, v.indices[index]) else error.InvalidSqlBackendResponse,
-            .reader => |v| if (v.read_identity) |read| read(v.ptr, index, column) else null,
+            .reader => |v| blk: {
+                if (v.read_identity_controlled) |read| break :blk try read(v.ptr, index, column, control);
+                const read = v.read_identity orelse break :blk null;
+                try Work.poll(control);
+                const result = try read(v.ptr, index, column);
+                try Work.poll(control);
+                break :blk result;
+            },
             .retained => |v| v.store.dictionaryId(v.begin + index, column),
-            .mapped => |v| if (v.ordinals[column] == std.math.maxInt(usize)) null else v.source.dictionaryIdentity(v.selection[index], v.ordinals[column]),
+            .mapped => |v| if (v.ordinals[column] == std.math.maxInt(usize)) null else v.source.dictionaryIdentityControlled(v.selection[index], v.ordinals[column], control),
             .columns => |v| blk: {
                 const physical = v.page.selection[index];
                 const name = v.definitions[column].name;
                 if (v.page.native) |native| {
                     const ordinal = for (native.names, 0..) |candidate, position| {
-                        if (std.mem.eql(u8, candidate, name)) break position;
+                        if (try Work.equalMetadataBytes(control, candidate, name)) break position;
                     } else return null;
-                    break :blk native.values.dictionaryIdentity(physical, ordinal);
+                    break :blk native.values.dictionaryIdentityControlled(physical, ordinal, control);
                 }
-                const source = v.page.batch.findColumn(name) orelse return null;
+                const source = (try v.page.findColumnControlled(name, control)) orelse return null;
                 switch (source.values) {
                     .dictionary_bytes, .dictionary_i64, .dictionary_f64 => {},
                     else => return null,
@@ -639,8 +845,8 @@ pub const Batch = union(enum) {
             else => null,
         };
     }
-    fn selectedDictionary(self: Batch, a: A, column: usize) !?Batch {
-        if (self.len() == 0 or try self.dictionaryIdentity(0, column) == null) return null;
+    fn selectedDictionaryControlled(self: Batch, a: A, column: usize, control: ?Work.Control) !?Batch {
+        if (self.len() == 0 or try self.dictionaryIdentityControlled(0, column, control) == null) return null;
         var ids: std.AutoHashMapUnmanaged(u64, u32) = .empty;
         defer ids.deinit(a);
         var values: std.ArrayList(scalar.Datum) = .empty;
@@ -648,11 +854,12 @@ pub const Batch = union(enum) {
         const indices = try a.alloc(u32, self.len());
         errdefer a.free(indices);
         for (indices, 0..) |*id, row_index| {
-            const identity = (try self.dictionaryIdentity(row_index, column)) orelse return error.InvalidSqlBackendResponse;
+            try Work.metadataPoll(control);
+            const identity = (try self.dictionaryIdentityControlled(row_index, column, control)) orelse return error.InvalidSqlBackendResponse;
             const entry = try ids.getOrPut(a, identity);
             if (!entry.found_existing) {
                 entry.value_ptr.* = @intCast(values.items.len);
-                try values.append(a, try self.cell(a, row_index, column));
+                try values.append(a, try self.cellControlled(a, row_index, column, control));
             }
             id.* = entry.value_ptr.*;
         }
@@ -668,6 +875,11 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.cell(alloc, view.selection[row_index], column);
             }
+            pub fn readControlled(raw: *anyopaque, alloc: A, row_index: usize, column: usize, control: ?Work.Control) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.cellControlled(alloc, view.selection[row_index], column, control);
+            }
+
             fn decimalSelected(raw: *anyopaque, alloc: A, column: usize, outer_selection: ?[]const usize) !?DecimalColumn {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.decimalColumnSelected(alloc, column, try selectedRows(alloc, view.selection, outer_selection));
@@ -680,6 +892,9 @@ pub const Batch = union(enum) {
                 return view.source.physicalColumnSelected(alloc, column, try selectedRows(alloc, view.selection, outer_selection));
             }
             fn dictionary(raw: *anyopaque, alloc: A, column: usize) !?Batch {
+                return dictionaryControlled(raw, alloc, column, null);
+            }
+            pub fn dictionaryControlled(raw: *anyopaque, alloc: A, column: usize, control: ?Work.Control) !?Batch {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 var ids: std.AutoHashMapUnmanaged(u64, u32) = .empty;
                 defer ids.deinit(alloc);
@@ -689,11 +904,12 @@ pub const Batch = union(enum) {
                 var transferred = false;
                 defer if (!transferred) alloc.free(indices);
                 for (view.selection, indices) |position, *id| {
-                    const identity_ = (try view.source.dictionaryIdentity(position, column)) orelse return null;
+                    try Work.metadataPoll(control);
+                    const identity_ = (try view.source.dictionaryIdentityControlled(position, column, control)) orelse return null;
                     const entry = try ids.getOrPut(alloc, identity_);
                     if (!entry.found_existing) {
                         entry.value_ptr.* = @intCast(values.items.len);
-                        try values.append(alloc, try view.source.cell(alloc, position, column));
+                        try values.append(alloc, try view.source.cellControlled(alloc, position, column, control));
                     }
                     id.* = entry.value_ptr.*;
                 }
@@ -714,39 +930,86 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.dictionaryIdentity(view.selection[row_index], column);
             }
+            pub fn jsonControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?[]const u8 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.encodedJsonControlled(view.selection[row_index], column, control);
+            }
+            pub fn frozenControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?FrozenJson {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.frozenJsonControlled(view.selection[row_index], column, control);
+            }
+            pub fn identityControlled(raw: *anyopaque, row_index: usize, column: usize, control: ?Work.Control) !?u64 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.dictionaryIdentityControlled(view.selection[row_index], column, control);
+            }
+            pub fn decimalSelectedControlled(raw: *anyopaque, alloc: A, column: usize, outer_selection: ?[]const usize, control: ?Work.Control) !?DecimalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.decimalColumnSelectedControlled(alloc, column, try selectedRowsControlled(alloc, view.selection, outer_selection, control), control);
+            }
         };
         for (selection) |index| if (index >= self.len()) return error.InvalidSqlBackendResponse;
         const view = try a.create(View);
         view.* = .{ .source = self, .selection = selection };
-        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_physical = View.physical, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen } };
+        return metadataView(View, .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_physical = View.physical, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen } });
     }
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
+        return self.cellControlled(a, index, column, null);
+    }
+    pub fn cellControlled(self: Batch, a: A, index: usize, column: usize, control: ?Work.Control) anyerror!scalar.Datum {
+        try Work.metadataPoll(control);
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
             .dictionary => |v| if (v.indices[index] < v.values.len) v.values[v.indices[index]] else error.InvalidSqlBackendResponse,
-            .retained => |v| v.store.cell(a, v.begin + index, column),
-            .reader => |v| v.read(v.ptr, a, index, column),
+            .retained => |v| v.store.cellControlled(a, v.begin + index, column, control),
+            .reader => |v| blk: {
+                if (v.read_controlled) |read| {
+                    // Only our fixed projection/selection adapters may defer
+                    // this check to the next bounded metadata visit. Unknown
+                    // readers retain their direct owner boundary.
+                    if (!v.metadata_forwarder) try Work.poll(control);
+                    break :blk try read(v.ptr, a, index, column, control);
+                }
+                // Representation capabilities cannot replace a reader's
+                // validation, policy checks or precise row errors.
+                try Work.poll(control);
+                const value = try v.read(v.ptr, a, index, column);
+                try Work.poll(control);
+                break :blk value;
+            },
             .rows => |v| v[index][column],
             .vectors => |v| v.values[column][index],
             .mapped => |v| blk: {
                 if (v.ordinals[column] == std.math.maxInt(usize)) break :blk .{};
-                const value = try v.source.cell(a, v.selection[index], v.ordinals[column]);
+                const value = try v.source.cellControlled(a, v.selection[index], v.ordinals[column], control);
                 if (column >= v.types.len) return error.InvalidSqlBackendResponse;
                 const type_ = v.types[column];
-                break :blk try @import("describe.zig").coerceDatum(a, value, type_.kind orelse return error.InvalidSqlBackendResponse, type_.element_type);
+                break :blk try coerceCell(a, value, type_.kind orelse return error.InvalidSqlBackendResponse, type_.element_type, control);
             },
             .columns => |v| blk: {
                 const definition = v.definitions[column];
-                const value = try v.page.typedCell(a, index, definition.name, definition.element_type == .numeric);
-                break :blk try @import("describe.zig").coerceDatum(a, value, definition.type, definition.element_type);
+                const value = try v.page.typedCellControlled(a, index, definition.name, definition.element_type == .numeric, control);
+                break :blk try coerceCell(a, value, definition.type, definition.element_type, control);
             },
         };
     }
+    fn coerceCell(a: A, value: scalar.Datum, kind: @import("ast.zig").ColumnType, element: ?@import("array_value.zig").ElementType, control: ?Work.Control) !scalar.Datum {
+        // Ordinary primitive coercions inspect a fixed-size header. Other
+        // domains retain the direct original-owner check before their work.
+        const primitive = value.numeric == null and value.array == null and
+            (value.sql_null or (value.value == .integer and (kind == .integer or (kind == .number and element != .numeric))) or
+                (value.value == .float and kind == .number and element != .numeric) or (value.value == .bool and kind == .boolean));
+        if (!primitive) try Work.poll(control);
+        return @import("describe.zig").coerceDatum(a, value, kind, element);
+    }
     pub fn row(self: Batch, a: A, index: usize) ![]const scalar.Datum {
+        return self.rowControlled(a, index, null);
+    }
+    pub fn rowControlled(self: Batch, a: A, index: usize, control: ?Work.Control) ![]const scalar.Datum {
+        try Work.poll(control);
         if (index >= self.len()) return error.InvalidSqlBackendResponse;
         if (self == .rows) return self.rows[index];
         const values = try a.alloc(scalar.Datum, self.width());
-        for (values, 0..) |*value, column| value.* = try self.cell(a, index, column);
+        for (values, 0..) |*value, column| value.* = try self.cellControlled(a, index, column, control);
         return values;
     }
 };

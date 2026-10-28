@@ -1151,7 +1151,9 @@ pub const MetadataHttpClient = struct {
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
         if (response.status != 200) return switch (response.status) {
-            400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+            400 => if (input == .remote_attempt_initialization and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
+                error.InvalidStoreRootEnrollment
+            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
@@ -1160,7 +1162,7 @@ pub const MetadataHttpClient = struct {
                 error.InvalidCatalogName,
             404 => error.CatalogNotFound,
             403 => error.Forbidden,
-            409 => if ((input == .store_root_enrollment_status or input == .fk_initial_retirement_signed_page) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
+            409 => if ((input == .store_root_enrollment_status or input == .fk_initial_retirement_signed_page or input == .remote_attempt_initialization) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
                 error.StoreRootEnrollmentChanged
             else if (input == .policy_publication_status and std.mem.eql(u8, response.body, "RowPolicyCatalogChanged"))
                 error.RowPolicyCatalogChanged
@@ -1225,7 +1227,7 @@ pub const MetadataHttpClient = struct {
         if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
         if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
         return switch (response.status) {
-            400 => if (input == .store_root_enroll and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
+            400 => if ((input == .store_root_enroll or input == .remote_attempt_initialization) and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
                 error.InvalidStoreRootEnrollment
             else
                 error.InvalidCatalogMutation,
@@ -1237,7 +1239,7 @@ pub const MetadataHttpClient = struct {
                 error.TableTopologyProtocolUpgradeRequired,
             409 => if (std.mem.eql(u8, response.body, "ResolverCurationConflict"))
                 error.ResolverCurationConflict
-            else if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
+            else if ((input == .store_root_enroll or input == .store_root_enrollment_status or input == .remote_attempt_initialization) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
                 error.StoreRootEnrollmentChanged
             else
                 error.CatalogGenerationChanged,
@@ -4742,4 +4744,45 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "remote initialization HTTP client separates signed service mutation status and unknown outcomes" {
+    const alloc = std.testing.allocator;
+    const wire = @import("remote_attempt_initialization.zig");
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        status: u16 = 409,
+        body: []const u8 = "StoreRootEnrollmentChanged",
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            try std.testing.expectEqualStrings("", request.header(authority.header_name).?);
+            const body = try allocator.dupe(u8, self.body);
+            errdefer allocator.free(body);
+            const headers = try allocator.alloc(http_common.Header, 1);
+            errdefer allocator.free(headers);
+            const name = try allocator.dupe(u8, routes.Routes.raft_mutation_outcome_header);
+            errdefer allocator.free(name);
+            headers[0] = .{ .name = name, .value = try allocator.dupe(u8, self.outcome) };
+            return .{ .status = self.status, .body = body, .headers = headers };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "cluster");
+    const seed: [32]u8 = @splat(7);
+    const identity: wire.Identity = .{ .metadata_incarnation = "11111111111111111111111111111111".*, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed)).public_key.toBytes() };
+    const prepare = try wire.Request.sign(identity, 4, .prepare, @splat(1), seed);
+    const status = try wire.Request.sign(identity, 4, .status, @splat(0), seed);
+    const call = @import("../system_catalog/server_call.zig").Call{ .remote_attempt_initialization = prepare };
+    try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, client.readSystemCatalog("http://metadata.invalid", .{ .remote_attempt_initialization = status }, 25, null));
+    const forwarding: raft_mutation_forwarding.Context = .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true };
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, false));
+    executor.status = 400;
+    executor.body = "InvalidStoreRootEnrollment";
+    try std.testing.expectError(error.InvalidStoreRootEnrollment, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, false));
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, false));
 }

@@ -28,9 +28,13 @@ pub const IoHttpExecutorConfig = struct {
     connect_timeout_ms: u64 = 30_000,
     read_timeout_ms: u64 = 30_000,
     write_timeout_ms: u64 = 30_000,
-    keep_alive: bool = false,
+    keep_alive: bool = true,
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
+    pool_max_waiters: u16 = 20,
+    pool_max_wait_bytes: usize = 64 << 20,
+    pool_max_wait_ms: u32 = 5000,
+    outbound_admission: ?*httpx.OutboundAdmission = null,
 };
 
 pub const IoHttpExecutor = struct {
@@ -58,6 +62,15 @@ pub const IoHttpExecutor = struct {
             .keep_alive = cfg.keep_alive,
             .pool_max_connections = cfg.pool_max_connections,
             .pool_max_per_host = cfg.pool_max_per_host,
+            .cookies_enabled = false,
+            .outbound_admission = cfg.outbound_admission,
+            .outbound = .{
+                .max_active = cfg.pool_max_connections,
+                .max_per_endpoint = cfg.pool_max_per_host,
+                .max_waiters = cfg.pool_max_waiters,
+                .max_wait_bytes = cfg.pool_max_wait_bytes,
+                .max_wait_ms = cfg.pool_max_wait_ms,
+            },
             .cache_resolved_addresses = true,
             .cancel_in_flight_on_shutdown = true,
         };

@@ -24,6 +24,7 @@ const helpers = @import("http_route_helpers.zig");
 const wire = @import("antfly_metadata_openapi").types;
 const db_types = @import("antfly_local_sources").storage_db_types;
 const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
+const read_fence = @import("antfly_local_sources").sql_read_fence;
 
 test {
     _ = @import("sql_memory_owner.zig");
@@ -114,6 +115,13 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 
 const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
 
+/// Synchronous setup borrow from the local query capsule. It never becomes
+/// a remote retention parent; setup publishes only independent node owners.
+pub const RemoteReadSetup = struct {
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque) anyerror!void,
+};
+
 pub const Adapter = struct {
     lake_visibility: enum { committed, accepted } = .committed,
     read_requirements: @import("antfly_local_sources").sql_read_requirements.Requirements = .{},
@@ -129,6 +137,28 @@ pub const Adapter = struct {
     server: *http_server.ApiHttpServer,
     identity: *?http_server.AuthenticatedIdentity,
     context: operation.RequestContext,
+    runnable: ?*http_server.RunnableScheduler.Execution = null,
+    read_remote_setup: ?RemoteReadSetup = null,
+    read_retirement: ?@import("retained_read_retirement.zig").Binding = null,
+    read_remote_executor: ?@import("antfly_local_sources").common_http_http_common.RequestExecutor = null,
+    /// Stable receivers for preauthorized physical read cleanup, retained by
+    /// this Adapter through every child join and the owning execution finish.
+    cleanup_phase: ?@import("runnable_local_cleanup.zig").Cleanup = null,
+    /// Write teams retain their grant through accepted durable completion;
+    /// they do not borrow read-only suspension hooks.
+    write_execution: ?*http_server.RunnableScheduler.Execution = null,
+    /// Ingress-owned stable receivers survive through the root owning finish.
+    write_completion: ?*@import("runnable_write_team.zig").Completion = null,
+    /// SQL preparation remains serial. Participant fanout separately reserves
+    /// its bounded team on the same retained execution.
+    serial_execution: bool = false,
+    read_guard: ?read_fence.Guard = null,
+    /// Preauthorized foreground storage for policy validation across CPU-stage
+    /// handoff. It outlives every policy callback and is retired with the fence.
+    read_policy_memory: ?@import("read_policy_memory.zig").Reservation = null,
+    /// The synchronous HTTP worker keeps this owned guard through response
+    /// serialization. That caller must end the fence before retiring its root.
+    retain_read_guard: bool = false,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     /// Borrowed from the pinned connection request, never retained by a plan.
@@ -178,8 +208,14 @@ pub const Adapter = struct {
                     .provider_runtime = &self.server.embedding_provider_runtime,
                     .limits = self.server.embedding_provider_runtime.limits,
                     .io = self.server.embedding_provider_runtime.io,
+                    .parallel_work = self.runnable == null and !self.serial_execution,
+                    .parent_execution = if (self.runnable != null) .{
+                        .ptr = self,
+                        .checkpoint = checkpoint,
+                        .resource_wait = .{ .begin = spillWaitBegin, .end = spillWaitEnd },
+                    } else null,
                     .http = try self.server.embedding_provider_runtime.assetHttpClient(),
-                    .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation },
+                    .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation, .runnable = self.providerRunnable() },
                     .secret_store = self.server.cfg.secret_store,
                     .antfly_provider = self.server.antfly_provider,
                     .antfly_url = config.inference.api_url,
@@ -200,6 +236,32 @@ pub const Adapter = struct {
         const previous_context = self.context;
         defer self.lake_visibility = previous_visibility;
         defer self.context = previous_context;
+        var write_team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
+        var read_team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
+        const previous_team = self.context.execution_team;
+        defer self.context.execution_team = previous_team;
+        const participates_in_commit = switch (compiled.statement) {
+            .insert, .update, .delete, .merge, .commit => true,
+            else => false,
+        };
+        if (previous_team == null and participates_in_commit) {
+            if (self.write_execution) |execution| {
+                write_team = try self.writeTeam(execution);
+                self.context.execution_team = &write_team.?;
+            }
+        }
+        if (previous_team == null and (compiled.statement == .select or compiled.statement == .explain)) {
+            if (self.providerRunnable()) |borrow| {
+                // Local retrieval callbacks borrow this same read owner. Its
+                // adapter revalidates the read fence on the coordinator, while
+                // child capsules retain independent worker state until joining.
+                read_team = .{ .borrow = borrow, .maximum_slots = borrow.cpu_slots, .allocator = self.server.alloc };
+                self.context.execution_team = &read_team.?;
+            }
+        }
+        if (self.runnable != null and (compiled.statement == .select or compiled.statement == .explain)) try self.beginReadFence();
+        defer if (!self.retain_read_guard) self.endReadFence();
+        const state_alloc = if (@import("sql_control.zig").isControl(compiled.statement)) self.server.controlAllocator() else self.server.alloc;
         var zig017_return_error: ?anyerror = null;
         var decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null;
         const previous_provider = self.decision_provider;
@@ -215,8 +277,8 @@ pub const Adapter = struct {
         defer {
             var proofs = &self.policy_proofs.?;
             var values = proofs.valueIterator();
-            while (values.next()) |value| if (value.*) |token| self.server.alloc.free(token);
-            proofs.deinit(self.server.alloc);
+            while (values.next()) |value| if (value.*) |token| state_alloc.free(token);
+            proofs.deinit(state_alloc);
             self.policy_proofs = null;
         }
         const session_api = @import("sql_session.zig");
@@ -229,21 +291,21 @@ pub const Adapter = struct {
             self.database = previous_database;
             self.namespace = previous_namespace;
             self.setting_overlay = previous_setting_overlay;
-            if (inherited) |*state| state.deinit(self.server.alloc);
+            if (inherited) |*state| state.deinit(state_alloc);
         }
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
-            if ((self.server.txn_sessions.principalAccess(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*)) catch |zig017_err| {
+            if ((self.server.txn_sessions.principalAccess(state_alloc, id, http_server.transactionPrincipal(self.identity.*)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             }) != .allowed) return zig017_failure: {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
-            inherited = ((self.server.txn_sessions.getSqlState(self.server.alloc, id) catch |zig017_err| {
+            inherited = ((self.server.txn_sessions.getSqlState(state_alloc, id) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             })) orelse return zig017_failure: {
@@ -263,7 +325,7 @@ pub const Adapter = struct {
             });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
-        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
+        var owner = session_api.Adapter{ .alloc = state_alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
@@ -416,9 +478,9 @@ pub const Adapter = struct {
                 // execution lease. Refresh the overlay while holding the
                 // same lease that serializes session setting mutations.
                 var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
-                defer if (leased_settings) |*state| state.deinit(self.server.alloc);
+                defer if (leased_settings) |*state| state.deinit(state_alloc);
                 if (self.session_id != null and compiled.uses_current_setting) {
-                    self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
+                    self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, state_alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     });
@@ -436,7 +498,7 @@ pub const Adapter = struct {
                 });
                 defer staged.deinit(alloc);
                 var read_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
-                defer read_guards.deinit(self.server.alloc);
+                defer read_guards.deinit(state_alloc);
                 self.range_reads = if (transaction.isolation != .read_committed) &read_guards else null;
                 self.ranges_staged = false;
                 self.active_transaction = id;
@@ -479,14 +541,11 @@ pub const Adapter = struct {
                     // The immutable cut is captured before INSERT-source and
                     // conflict-owner reads. Unsupported distributed ownership
                     // refuses this capability rather than mixing snapshots.
-                    dynamic = (reads.openRelationalStatementSnapshot(alloc, table.physical_name, table.schema_version, .read_index, self.context.cancellation, ((self.context.platformDeadline() catch |zig017_err| {
+                    dynamic = self.captureDynamicStatement(alloc, reads, table.physical_name, table.schema_version) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
-                    })).deadline_ns) catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
-                    });
-                    if (dynamic.?.vtable.open_guarded == null) return zig017_failure: {
+                    };
+                    if (dynamic.?.vtable.open_guarded == null and dynamic.?.vtable.open_guarded_with_admission == null) return zig017_failure: {
                         zig017_return_error = error.SqlRangeTrackingRequired;
                         break :zig017_failure error.SqlRangeTrackingRequired;
                     };
@@ -508,7 +567,7 @@ pub const Adapter = struct {
                 });
                 errdefer output.deinit();
                 if (!self.ranges_staged and read_guards.tables.len != 0) {
-                    _ = ((self.server.txn_sessions.stage(self.server.alloc, id, &read_guards) catch |zig017_err| {
+                    _ = ((self.server.txn_sessions.stage(state_alloc, id, &read_guards) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     })) orelse return zig017_failure: {
@@ -547,6 +606,10 @@ pub const Adapter = struct {
                     },
                 };
             }
+            self.validateReadFence(true) catch |err| {
+                zig017_return_error = err;
+                return err;
+            };
             return result;
         }
         var statement_backend = guarded_backend orelse self.backend();
@@ -555,20 +618,259 @@ pub const Adapter = struct {
         if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {
             if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits)) |stream| {
                 defer stream.close();
-                return delivery.deliver(delivery.ptr, alloc, stream);
+                var delivered = try delivery.deliver(delivery.ptr, alloc, stream);
+                errdefer delivered.deinit();
+                try self.validateReadFence(true);
+                return delivered;
             }
         };
-        return @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits) catch |zig017_err| {
+        var result = @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
         };
+        errdefer result.deinit();
+        self.validateReadFence(true) catch |err| {
+            zig017_return_error = err;
+            return err;
+        };
+        return result;
+    }
+
+    pub fn beginReadFence(self: *Adapter) !void {
+        if (self.read_guard != null) return error.InvalidReadFenceTransition;
+        self.read_guard = read_fence.Guard.init(self.server.alloc);
+    }
+
+    pub fn reserveReadValidationMemory(self: *Adapter, bytes: usize) !void {
+        if (self.read_policy_memory != null or self.read_guard == null or self.read_guard.?.validating) return error.InvalidReadFenceTransition;
+        const execution = self.runnable orelse return error.InvalidRunnableTransition;
+        try execution.checkLifetime();
+        try self.context.ensureActive();
+        const entry = execution.entry orelse return error.InvalidRunnableTransition;
+        if (entry.state != .running or entry.class != .query or entry.slots != 1 or entry.parent != null or entry.children != 0 or
+            entry.cpu_borrow_budget != null or entry.cleanup_active or entry.completion_active or entry.protected_cleanup_root or
+            entry.read_lane == .bounded or entry.read_transition_active or entry.completion_options != null)
+            return error.InvalidRunnableTransition;
+        const memory = self.server.request_memory orelse return error.ExecutionWaitUnsupported;
+        self.read_policy_memory = try @import("read_policy_memory.zig").Reservation.init(memory.allocator(false), bytes);
+        errdefer {
+            self.read_policy_memory.?.deinit();
+            self.read_policy_memory = null;
+        }
+        // Refuse insufficient storage before the stage can borrow CPU. This
+        // preflights the current policy shape, not every possible future schema.
+        try self.validateReadFence(true);
+        // Metadata validation may wait in another clock/cancellation domain.
+        // Publish the reservation only while the original execution is live.
+        try execution.checkLifetime();
+    }
+
+    pub fn endReadFence(self: *Adapter) void {
+        if (self.read_policy_memory) |*memory| memory.deinit();
+        self.read_policy_memory = null;
+        if (self.read_guard) |*guard| guard.deinit();
+        self.read_guard = null;
+    }
+
+    pub fn validateReadFence(self: *Adapter, force: bool) !void {
+        const guard = if (self.read_guard) |*value| value else return;
+        // A cached guard is authority only within its original live execution.
+        // Refusal must also discard a successful check from an earlier call.
+        errdefer guard.checked_generation = null;
+        const execution = self.runnable orelse return error.InvalidReadFenceTransition;
+        try execution.checkLifetime();
+        const entry = if (execution.entry) |*value| value else return error.InvalidReadFenceTransition;
+        const reserved = if (self.read_policy_memory) |*memory| memory else null;
+        const scratch = if (reserved) |memory| try memory.begin() else if (entry.class == .control) self.server.controlAllocator() else self.server.alloc;
+        defer if (reserved) |memory| memory.end();
+        try guard.check(scratch, execution.resume_generation, force, .{ .ptr = self, .check = validateReadPins });
+        try self.context.ensureActive();
+        // Catalog/policy IO may use another clock or cancellation domain. Its
+        // successful result cannot revive an owner stopped during that wait.
+        try execution.checkLifetime();
+    }
+
+    fn captureReadFence(self: *Adapter, table: catalog.Table) !void {
+        const guard = if (self.read_guard) |*value| value else return;
+        const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+        const filter = try http_server.resolveEffectiveRowFilterJson(guard.alloc, self.identity.*, table.physical_name);
+        defer if (filter) |value| guard.alloc.free(value);
+        const policy = try self.readPolicyGeneration(guard.alloc, table.id, table.schema_version);
+        try guard.capture(.{ .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical = table.physical_name, .id = table.id, .schema_version = table.schema_version, .catalog_revision = scope.revision, .filter = filter, .row_policy = policy });
+        try self.validateReadFence(false);
+    }
+
+    fn readPolicyGeneration(self: *Adapter, alloc: std.mem.Allocator, table_id: u64, schema_version: u32) !?read_fence.Table.Policy {
+        var context = self.context;
+        context.row_policy_install_authority = true;
+        const bytes = try self.server.source.systemCatalog(alloc, context, .{ .policy_publication_status = table_id });
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(?@import("antfly_local_sources").system_catalog_policies.PublicationStamp, alloc, bytes, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const publication = parsed.value orelse return null;
+        if (publication.table_id != table_id or publication.schema_version != schema_version) return error.RowPolicyCatalogChanged;
+        const serving = (try publication.servingAuthority()) orelse return null;
+        return .{ .generation = serving.generation, .catalog_epoch = serving.catalog_epoch };
+    }
+
+    fn validateReadPins(raw: *anyopaque, alloc: std.mem.Allocator, tables: []const read_fence.Table) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        // Only actual validation crosses the prepared-stage boundary. Cached
+        // checks perform no catalog IO and must not refresh an ordinary quantum.
+        const execution = self.runnable orelse return error.InvalidReadFenceTransition;
+        try execution.endCpuBorrowStage();
+        try self.context.ensureActive();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const targets = try scratch.alloc(system_catalog.Target, tables.len);
+        const revision = tables[0].catalog_revision;
+        for (tables, targets) |table, *target| {
+            if (table.catalog_revision != revision) return error.CatalogGenerationChanged;
+            target.* = .{ .database = table.database, .namespace = table.namespace, .table = table.name };
+        }
+        const bytes = try self.server.source.systemCatalog(scratch, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .expected_revision = revision } });
+        const current = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, scratch, bytes, .{});
+        if (current.revision != revision or current.tables.len != tables.len) return error.CatalogGenerationChanged;
+        for (tables, current.tables) |pinned, resolved| {
+            const table = resolved orelse return error.CatalogGenerationChanged;
+            if (table.table_id != pinned.id or !std.mem.eql(u8, table.name, pinned.physical)) return error.CatalogGenerationChanged;
+            const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
+            if (definition.table_id != pinned.id) return error.CatalogGenerationChanged;
+            const binding = if (self.read_policy_memory != null)
+                try @import("sql_schema_cache.zig").Cache.resolveUncached(self.server.sqlPlanCacheIo(), scratch, definition.schema_json, table.table_id, table.name)
+            else
+                try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), scratch, definition.schema_json, table.table_id, table.name);
+            if (binding.schema_version != pinned.schema_version) return error.CatalogGenerationChanged;
+            const policy = try self.readPolicyGeneration(scratch, pinned.id, pinned.schema_version);
+            if (!std.meta.eql(policy, pinned.row_policy)) return error.RowPolicyCatalogChanged;
+        }
+        // Catalog I/O may itself wait. Capture current user/key policy after
+        // that lookup so the policy preceding the wait cannot authorize it.
+        if (self.identity.*) |admitted| {
+            var fresh: http_server.AuthenticatedIdentity = undefined;
+            if (admitted.live_user_manager) |manager| {
+                if (!admitted.is_internal_service) {
+                    var snapshot = manager.snapshotCredentialPoliciesAlloc(scratch, admitted.credential_principal) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.Forbidden,
+                    };
+                    defer snapshot.deinit(scratch);
+                    if (!std.mem.eql(u8, admitted.username, snapshot.policy.username)) return error.Forbidden;
+                    if (admitted.user_instance_id) |instance| if (!std.mem.eql(u8, &instance, &snapshot.instance_id)) return error.Forbidden;
+                    // Native row-policy proofs can use roles and metadata
+                    // even when no user row filter exists. An already opened
+                    // cursor cannot reinterpret buffered rows with new values.
+                    const protected = for (tables) |table| {
+                        if (table.row_policy != null) break true;
+                    } else false;
+                    if (protected) {
+                        if (!std.mem.eql(u8, admitted.metadata_json, snapshot.policy.metadata_json) or
+                            admitted.roles.len != snapshot.policy.roles.len) return error.Forbidden;
+                        for (admitted.roles, snapshot.policy.roles) |old, current_role| {
+                            if (!std.mem.eql(u8, old, current_role)) return error.Forbidden;
+                        }
+                    }
+                    fresh = (try http_server.cloneCatalogIdentity(scratch, .{
+                        .user_instance_id = snapshot.instance_id,
+                        .username = snapshot.policy.username,
+                        .credential_principal = admitted.credential_principal,
+                        .permissions = snapshot.policy.permissions,
+                        .row_filter = snapshot.policy.row_filter,
+                        .metadata_json = snapshot.policy.metadata_json,
+                        .roles = snapshot.policy.roles,
+                        .live_user_manager = manager,
+                    })).?;
+                } else fresh = (try http_server.cloneCatalogIdentity(scratch, admitted)).?;
+            } else fresh = (try http_server.cloneCatalogIdentity(scratch, admitted)).?;
+            defer fresh.deinit(scratch);
+            for (tables, targets) |pinned, target| {
+                const logical = try target.resourceNameAlloc(scratch);
+                if (!http_server.permissionsAllow(admitted.permissions, .table, logical, .read) or
+                    !http_server.permissionsAllow(fresh.permissions, .table, logical, .read)) return error.Forbidden;
+                try http_server.projectCatalogIdentity(scratch, &fresh, logical, pinned.physical);
+                const filter = try http_server.resolveEffectiveRowFilterJson(scratch, fresh, pinned.physical);
+                if ((filter == null) != (pinned.filter == null) or
+                    (filter != null and !std.mem.eql(u8, filter.?, pinned.filter.?))) return error.Forbidden;
+            }
+        }
+        try self.context.ensureActive();
+    }
+
+    fn cpuScope(self: *Adapter) ?@import("antfly_local_sources").sql_parallel_scheduler.ExecutionScope {
+        if (self.serial_execution) return null;
+        const coordinator = self.coordinatorScope() orelse return null;
+        return .{ .execution = coordinator.execution, .allocator = coordinator.allocator, .io = self.server.embedding_provider_runtime.io, .wait = .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd }, .checkpoint = checkpoint, .scratch = coordinator.scratch };
+    }
+
+    fn coordinatorScope(self: *Adapter) ?@import("antfly_local_sources").sql_parallel_scheduler.CoordinatorScope {
+        if (self.read_guard == null) return null;
+        const execution = self.runnable orelse return null;
+        const entry = execution.entry orelse return null;
+        if (entry.class != .query or entry.slots != 1 or entry.cleanup_active or entry.completion_active) return null;
+        const memory = self.server.request_memory orelse return null;
+        return .{
+            .execution = execution,
+            .allocator = memory.allocator(false),
+            .check = .{ .context = self, .check = checkpoint },
+            .scratch = .{ .context = self, .acquire = acquireNumericScratch },
+        };
+    }
+
+    const NumericScratch = struct {
+        const Budget = @import("../common/allocation_budget.zig");
+        metadata: std.mem.Allocator,
+        fixed: Budget.Fixed,
+        chosen: bool = false,
+
+        fn probe(_: *anyopaque) callconv(.c) c_int {
+            // The serial alternative needs no incremental scratch. Both
+            // alternatives use the same paid original CPU continuation.
+            return @backingInt(http_server.RunnableScheduler.GrantResources.Probe.ready);
+        }
+        fn acquire(raw: *anyopaque) callconv(.c) c_int {
+            const self: *NumericScratch = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.chosen);
+            self.chosen = true;
+            _ = self.fixed.tryAcquire();
+            return @backingInt(http_server.RunnableScheduler.GrantResources.Acquire.acquired);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *NumericScratch = @ptrCast(@alignCast(raw));
+            self.fixed.deinit();
+            self.metadata.destroy(self);
+        }
+    };
+
+    fn acquireNumericScratch(raw: *anyopaque, bytes: usize) !?@import("antfly_local_sources").sql_parallel_scheduler.ScratchLease {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const scope = self.coordinatorScope() orelse return null;
+        const memory = self.server.request_memory orelse return null;
+        const ticket = scope.allocator.create(NumericScratch) catch return null;
+        ticket.* = .{ .metadata = scope.allocator, .fixed = .{ .budget = &memory.foreground, .bytes = bytes } };
+        var transferred = false;
+        defer if (!transferred) NumericScratch.release(ticket);
+        try scope.checkpointCurrent();
+        // Queue restrictions cannot run a CPU checkpoint while parked. The
+        // original lifetime is checked by enter; validate full read policy on
+        // the running coordinator immediately afterwards, before any math.
+        try scope.execution.enterWithResources(.{ .context = ticket, .probe = NumericScratch.probe, .acquire = NumericScratch.acquire }, .{ .context = self, .check = numericScratchQueueCheck });
+        try scope.checkpointCurrent();
+        if (!ticket.fixed.reserved) return null;
+        transferred = true;
+        return .{ .allocator = ticket.fixed.allocator(), .context = ticket, .release = NumericScratch.release };
+    }
+
+    fn numericScratchQueueCheck(raw: *anyopaque) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .cpu_scope = self.cpuScope(), .coordinator_scope = self.coordinatorScope(), .execution_io = if (self.runnable == null and !self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_io = if (self.runnable != null or self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_wait = if (self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -631,14 +933,188 @@ pub const Adapter = struct {
         return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path);
     }
 
+    fn activeCleanup(self: *Adapter) !?@import("antfly_runtime_abi").runnable_abi.Borrowed {
+        const execution = self.runnable orelse return null;
+        const entry = execution.entry orelse return null;
+        if (!entry.cleanup_active) return null;
+        const phase = if (self.cleanup_phase) |*value| value else return error.InvalidRunnableTransition;
+        return try phase.borrowed();
+    }
+
+    fn checkCleanupStatus(status: @import("antfly_runtime_abi").error_abi.Status) !void {
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
+
+    fn spillWaitBegin(ptr: *anyopaque) !void {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (try self.activeCleanup()) |borrow| {
+            try checkCleanupStatus(borrow.checkpoint(borrow.context));
+            try checkCleanupStatus(borrow.park(borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Wait.resource)));
+            return;
+        }
+        try self.context.ensureActive();
+        const execution = self.runnable orelse return error.InvalidRunnableTransition;
+        try execution.park(.resource_blocked);
+    }
+
+    fn writeTeam(self: *Adapter, execution: *http_server.RunnableScheduler.Execution) !@import("antfly_runtime_abi").runnable_abi.Team {
+        if (self.write_completion) |completion| {
+            if (completion.execution != execution) return error.InvalidRunnableTransition;
+            return completion.team();
+        }
+        const entry = execution.entry orelse return error.InvalidRunnableTransition;
+        // Concurrent children cannot borrow a request arena. This stable
+        // process-owned partition enforces the API request byte limit.
+        const memory = self.server.request_memory orelse return error.ExecutionWaitUnsupported;
+        return @import("runnable_write_team.zig").init(execution, memory.allocator(entry.class == .control));
+    }
+
+    pub fn providerRunnable(self: *Adapter) ?@import("antfly_runtime_abi").runnable_abi.Borrowed {
+        const execution = self.runnable orelse return null;
+        const entry = execution.entry orelse return null;
+        if (self.cleanup_phase == null) self.cleanup_phase = @import("runnable_local_cleanup.zig").Cleanup.init(execution) catch null;
+        const Callback = struct {
+            const runtime = @import("antfly_runtime_abi");
+            fn cpuBorrow(raw: *anyopaque, options: *const runtime.runnable_abi.CpuBorrow) callconv(.c) runtime.error_abi.Status {
+                options.validate() catch |err| return runtime.error_abi.statusFromError(err);
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                const active_execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                if (options.enabled != 0) {
+                    adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                    if (adapter.read_guard == null) return runtime.error_abi.statusFromError(error.InvalidReadFenceTransition);
+                    if (adapter.read_guard.?.tables.items.len != 0 and adapter.read_policy_memory == null)
+                        return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                    adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
+                    active_execution.enableCpuBorrow(.{ .max_non_yield_ns = options.max_non_yield_ns }) catch |err| return runtime.error_abi.statusFromError(err);
+                } else {
+                    active_execution.disableCpuBorrow() catch |err| return runtime.error_abi.statusFromError(err);
+                    adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                    adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
+                }
+                return .ok;
+            }
+            fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                const active_execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                out.* = @intCast(@backingInt(active_execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
+                return .ok;
+            }
+            fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                const active_execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                active_execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+                // Activated cleanup has its own finite fence. Polling the
+                // expired foreground context must not cancel that obligation.
+                if (!active_execution.entry.?.cleanup_active) adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                if (adapter.runnable.?.entry.?.cleanup_active) {
+                    const borrow = adapter.cleanup_phase.?.borrowed() catch |err| return runtime.error_abi.statusFromError(err);
+                    return borrow.checkpoint(borrow.context);
+                }
+                checkpoint(raw) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                if (adapter.runnable.?.entry.?.cleanup_active) {
+                    const borrow = adapter.cleanup_phase.?.borrowed() catch |err| return runtime.error_abi.statusFromError(err);
+                    return borrow.park(borrow.context, reason);
+                }
+                if (reason != @backingInt(runtime.runnable_abi.Wait.resource)) return runtime.error_abi.statusFromError(error.InvalidArgument);
+                spillWaitBegin(raw) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                if (adapter.runnable.?.entry.?.cleanup_active) {
+                    const borrow = adapter.cleanup_phase.?.borrowed() catch |err| return runtime.error_abi.statusFromError(err);
+                    return borrow.enter(borrow.context, class);
+                }
+                const next = std.enums.fromInt(@import("antfly_local_sources").common_request_admission.runnable_scheduler.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+                const current = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                current.enter(next) catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                if (adapter.runnable.?.entry.?.cleanup_active) {
+                    const borrow = adapter.cleanup_phase.?.borrowed() catch |err| return runtime.error_abi.statusFromError(err);
+                    const phase = std.enums.fromInt(runtime.runnable_abi.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+                    borrow.enterChecked(phase, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+                    return .ok;
+                }
+                const next = std.enums.fromInt(@import("antfly_local_sources").common_request_admission.runnable_scheduler.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+                const current = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                @import("runnable_reentry.zig").enter(current, next, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn reserveCleanup(raw: *anyopaque, options: *const runtime.runnable_abi.Cleanup) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.cleanup_phase.?.reserveChecked(options) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn activateCleanup(raw: *anyopaque, out_slots: *usize) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                adapter.cleanup_phase.?.execution.activateCleanup() catch |err| return runtime.error_abi.statusFromError(err);
+                out_slots.* = adapter.cleanup_phase.?.execution.entry.?.slots;
+                return .ok;
+            }
+            fn reserveChild(raw: *anyopaque, options: *const runtime.runnable_abi.ChildStart) callconv(.c) runtime.error_abi.Status {
+                options.validate() catch |err| return runtime.error_abi.statusFromError(err);
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                // Capture/revalidate on the coordinator before publication.
+                // Children receive independent execution/IO state, never this
+                // Adapter's mutable read guard. Operator fanout still requires
+                // independent child backend adapters and policy fences.
+                checkpoint(raw) catch |err| return runtime.error_abi.statusFromError(err);
+                const memory = adapter.server.request_memory orelse return runtime.error_abi.statusFromError(error.ExecutionWaitUnsupported);
+                const current = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                const parent = current.entry orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                @import("runnable_local_child.zig").reserve(current, memory.allocator(parent.class == .control), options) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+        };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .enter_checked = Callback.enterChecked, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild, .check_lifetime = Callback.lifetime, .current_class = Callback.currentClass, .cpu_borrow = Callback.cpuBorrow };
+    }
+
+    fn spillWaitEnd(ptr: *anyopaque) !void {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (try self.activeCleanup()) |borrow| {
+            try checkCleanupStatus(borrow.enter(borrow.context, borrow.parent_class));
+            return;
+        }
+        const execution = self.runnable orelse return error.InvalidRunnableTransition;
+        const class = if (execution.entry) |*entry| entry.class else return error.InvalidRunnableTransition;
+        try execution.enter(class);
+        try self.context.ensureActive();
+        try self.validateReadFence(false);
+    }
+
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (try self.activeCleanup()) |borrow| {
+            try checkCleanupStatus(borrow.checkpoint(borrow.context));
+            return;
+        }
         try self.context.ensureActive();
+        if (self.runnable) |execution| try execution.checkpoint();
+        try self.validateReadFence(false);
     }
 
     fn scalarCheckpoint(ptr: ?*anyopaque) !void {
-        // Explicitly non-suspending: only cancellation/deadline inspection.
-        try checkpoint(ptr.?);
+        // Native scalar frames cannot yield or perform catalog/policy IO.
+        // The coordinator owns full read validation at safe boundaries.
+        const self: *Adapter = @ptrCast(@alignCast(ptr.?));
+        var admission: ReadAdmission = .{ .adapter = self };
+        try admission.checkLifetime();
     }
 
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -697,6 +1173,7 @@ pub const Adapter = struct {
             }
         }
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);
+        if (action == .read) try self.captureReadFence(binding);
         return binding;
     }
 
@@ -735,16 +1212,16 @@ pub const Adapter = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var store = try @import("lake_index_store.zig").Store.openNative(scratch, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeFor(scratch, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null));
         defer store.deinit();
         var artifacts = store.artifactStore();
         const identity = try @import("native_retained_cut.zig").storeIdentity(scratch, store.locator);
         const normalized = try self.context.platformDeadline();
-        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = try self.lakeReadContext(normalized.deadline_ns);
         for (entries) |entry| {
             try self.context.ensureActive();
             const token = try std.json.parseFromSliceLeaky([]const u8, scratch, entry.document_json orelse return error.CatalogGenerationChanged, .{});
-            const cut = try @import("lake_sql_retained_cut.zig").loadDescriptor(scratch, &artifacts, identity, token, entry.version, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation);
+            const cut = try @import("lake_sql_retained_cut.zig").loadDescriptorFor(scratch, &artifacts, identity, token, entry.version, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation, context);
             const table = try resolve(self, scratch, cut.name orelse return error.CatalogGenerationChanged, .read);
             if (table.id != cut.table_id or table.schema_version != cut.schema_version or !std.mem.eql(u8, table.physical_name, entry.table_name) or (if (table.external_indexes) |indexes| indexes.object_generation else 0) != cut.object_generation) return error.SqlWriteConflict;
             const binding = (table.external_base_source orelse return error.SqlWriteConflict).binding;
@@ -759,8 +1236,9 @@ pub const Adapter = struct {
         if (self.policy_proofs) |*proofs| if (proofs.get(table.id)) |cached| return cached;
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const identity: ?*const http_server.AuthenticatedIdentity = if (self.identity.*) |*value| value else null;
+        const token_alloc = if (self.policy_proofs != null) self.server.alloc else alloc;
         const signed = try self.server.rowPolicyReadProof(
-            if (self.policy_proofs != null) self.server.alloc else alloc,
+            token_alloc,
             identity,
             self.context,
             table.id,
@@ -768,8 +1246,11 @@ pub const Adapter = struct {
             scope.database,
             table.schema_version,
         );
+        errdefer if (signed) |token| token_alloc.free(token);
+        // Publication can change while minting the proof. Reject the new
+        // generation before an existing binding opens a source with it.
+        if (self.read_guard != null) try self.validateReadFence(true);
         if (self.policy_proofs) |*proofs| {
-            errdefer if (signed) |token| self.server.alloc.free(token);
             try proofs.put(self.server.alloc, table.id, signed);
             return signed;
         }
@@ -821,6 +1302,7 @@ pub const Adapter = struct {
         };
         scan_request.opts.execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns;
         scan_request.opts.cancellation = self.context.cancellation;
+        if (self.read_guard != null and self.runnable != null) scan_request.opts.execution_wait = .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd };
         scan_request.opts.row_policy_principal_proof = (try self.rowPolicyProof(alloc, table)) orelse "";
         scan_request.opts.row_policy_database = (table.scope orelse return error.InvalidSqlBackendResponse).database;
         if (request.primary_key != null) {
@@ -839,7 +1321,69 @@ pub const Adapter = struct {
         return scan_request;
     }
 
+    fn lakeLifetime(raw: *anyopaque) !void {
+        var admission: ReadAdmission = .{ .adapter = @ptrCast(@alignCast(raw)) };
+        try admission.checkLifetime();
+    }
+    fn lakeReadContext(self: *Adapter, deadline: ?u64) !@import("antfly_local_sources").serverless_query_lake_read_context.Context {
+        const normalized = try self.context.platformDeadline();
+        const original = normalized.deadline_ns;
+        return .{
+            .io = self.server.embedding_provider_runtime.io,
+            .deadline_ns = if (deadline) |limit| @min(limit, original orelse limit) else original,
+            .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn),
+            .additional_checkpoint = .{ .ptr = self, .check = checkpoint },
+            .authority = .{ .ptr = self, .check = lakeLifetime },
+            .wait = if (self.read_guard != null and self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null,
+        };
+    }
+
+    fn prepareRemoteRead(self: *Adapter) !void {
+        if (self.read_remote_setup) |setup| try setup.prepare(setup.ptr);
+    }
+
+    const ReadAdmission = struct {
+        adapter: *Adapter,
+        pub fn remoteExecutor(self: *@This()) !?@import("antfly_local_sources").common_http_http_common.RequestExecutor {
+            try self.adapter.prepareRemoteRead();
+            return self.adapter.read_remote_executor;
+        }
+        pub fn retirementBinding(self: *@This()) !?@import("retained_read_retirement.zig").Binding {
+            try self.adapter.prepareRemoteRead();
+            return self.adapter.read_retirement;
+        }
+        pub fn checkpoint(self: *@This()) !void {
+            try Adapter.checkpoint(self.adapter);
+        }
+        pub fn checkLifetime(self: *@This()) !void {
+            if (try self.adapter.activeCleanup()) |borrow| return borrow.checkLifetime();
+            try self.adapter.context.ensureActive();
+            if (self.adapter.runnable) |execution| try execution.checkLifetime() else if (self.adapter.write_execution) |execution| try execution.checkLifetime();
+        }
+        pub fn deadlineNs(self: *@This()) !?u64 {
+            // Protected cleanup has independent finite execution authority.
+            if (try self.adapter.activeCleanup() != null) return null;
+            return (try self.adapter.context.platformDeadline()).deadline_ns;
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("antfly_local_sources").common_execution_wait.Boundary {
+            if (self.adapter.read_guard == null or self.adapter.runnable == null) return null;
+            return .{ .ptr = self.adapter, .begin = spillWaitBegin, .end = spillWaitEnd };
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            try self.checkpoint();
+            if (self.adapter.context.fanout_io) |borrow| {
+                var receiver = try borrow.receive();
+                try self.sleep(receiver.io());
+            } else try self.sleep(self.adapter.server.sharedApiIo() orelse return error.ExecutionWaitUnsupported);
+            try self.checkpoint();
+        }
+        fn sleep(self: *@This(), io: std.Io) !void {
+            if (self.executionBoundary()) |boundary| try boundary.run(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake }) else try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    };
+
     const ReadCursor = struct {
+        failed: bool = false,
         alloc: std.mem.Allocator,
         adapter: *Adapter,
         schema_version: u32,
@@ -892,17 +1436,25 @@ pub const Adapter = struct {
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
             self.retireColumns();
-            try self.adapter.context.ensureActive();
-            var page = try self.view.next(alloc, limit);
+            if (self.failed) return error.RetainedReadRestartRequired;
+            try checkpoint(self.adapter);
+            errdefer self.failed = true;
+            var budget: ReadAdmission = .{ .adapter = self.adapter };
+            var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+            const payload = bridge.payload();
+            var page = try self.view.nextWithAdmission(alloc, limit, @import("antfly_local_sources").common_read_admission.Port.init(&payload));
             errdefer page.deinit();
+            try checkpoint(self.adapter);
             if (page.rows.len > limit) return error.InvalidSqlBackendResponse;
             const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
             const layout = try self.projection.pageLayout(page.arena.allocator());
             for (page.rows, rows) |row, *out| {
+                try checkpoint(self.adapter);
                 if (row.schema_version != self.schema_version) return error.CatalogGenerationChanged;
                 if (self.require_primary_digest and row.expected_content_digest == null) return error.InvalidSqlBackendResponse;
                 out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, row.sqlRow());
             }
+            try checkpoint(self.adapter);
             return .{ .rows = rows, .after = page.after, .storage_page = page };
         }
 
@@ -918,7 +1470,11 @@ pub const Adapter = struct {
     fn openScan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         if (table.external_base_source != null) return try self.openLakeScan(alloc, table, request);
-        if (self.range_reads != null) {
+        // The admitted statement entry carries the original read port through
+        // snapshot creation, signed remote dispatch and physical retirement.
+        // The legacy single-read callback has no admission argument.
+        const admitted_statement = self.runnable != null and (if (self.server.table_reads) |source| source.vtable.open_relational_statement_with_admission != null else false);
+        if (self.range_reads != null or admitted_statement) {
             const statement = try openStatement(ptr, alloc, &.{.{ .table = table, .request = request }});
             errdefer statement.close(statement.ptr);
             const wrapper = try alloc.create(SingleStatementCursor);
@@ -960,6 +1516,7 @@ pub const Adapter = struct {
         recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe,
         read_context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
         child: catalog.AggregatePartialCursor,
+        execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution = null,
         fused: [256]bool = @splat(false),
         composition: ?*@import("lake_index_aggregate_composition.zig").Composition = null,
         transferred: bool = false,
@@ -976,12 +1533,22 @@ pub const Adapter = struct {
             self.adapter.context.ensureActive() catch return true;
             return false;
         }
+        fn bindExecution(raw: *anyopaque, execution: *@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution != null) return error.InvalidRunnableTransition;
+            try self.read_context.withExecution(execution).ensureActive();
+            self.execution = execution;
+        }
+        fn releaseExecution(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.execution = null;
+        }
         fn next(raw: *anyopaque, a: std.mem.Allocator, maximum: u32) !?[]const @import("antfly_local_sources").sql_operators.GroupResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.started = true;
             try self.adapter.verify(a, self.table);
             const cursor = self.child;
-            const result = cursor.next(cursor.ptr, a, maximum) catch |err| {
+            const result = cursor.nextFor(self.execution, a, maximum) catch |err| {
                 try self.adapter.context.ensureActive();
                 return err;
             };
@@ -995,7 +1562,19 @@ pub const Adapter = struct {
         fn adoptFinal(raw: *anyopaque, grouped: *@import("antfly_local_sources").sql_operators.Grouped, request: catalog.FinalGroupRequest) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.started or self.transferred) return error.InvalidSqlBackendResponse;
-            const first = if (self.composition) |composition| try composition.prime() else self.child;
+            const execution = if (self.adapter.cpuScope()) |scope| scope.execution else null;
+            if (execution) |owner| try bindExecution(raw, owner);
+            defer if (execution != null) releaseExecution(raw);
+            const first = if (self.composition) |composition| prime: {
+                const cursor = composition.cursor();
+                const capability = cursor.coordinator_execution;
+                if (execution != null and capability != null) try capability.?.bind(cursor.ptr, execution.?);
+                defer if (execution != null and capability != null) capability.?.release(cursor.ptr);
+                break :prime try composition.prime();
+            } else self.child;
+            const capability = first.coordinator_execution;
+            if (execution != null and capability != null) try capability.?.bind(first.ptr, execution.?);
+            defer if (execution != null and capability != null) capability.?.release(first.ptr);
             const proof = first.final_group_proof orelse return false;
             if (proof.slots.len != self.recipe.inputs.len or grouped.specs.len != self.recipe.inputs.len) return false;
             var covered: [256]bool = @splat(false);
@@ -1021,6 +1600,9 @@ pub const Adapter = struct {
         fn nextFinal(raw: *anyopaque, a: std.mem.Allocator, maximum: usize, exact: bool) anyerror!?@import("antfly_local_sources").sql_operators.GroupBatch {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const local = @import("antfly_local_sources");
+            const execution = if (self.adapter.cpuScope()) |scope| scope.execution else null;
+            if (execution) |owner| try bindExecution(raw, owner);
+            defer if (execution != null) releaseExecution(raw);
             const request = self.final_request.?;
             // Retain one bounded provider page while small result pulls consume it.
             // Scan credit counts logical batches, independent of result framing.
@@ -1084,11 +1666,16 @@ pub const Adapter = struct {
             self.arena.deinit();
             a.destroy(self);
         }
+        fn openMemberFor(raw: *anyopaque, slot: usize, execution: *@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !catalog.AggregatePartialCursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution != execution) return error.InvalidRunnableTransition;
+            return openMember(raw, slot);
+        }
         fn openMember(raw: *anyopaque, slot: usize) !catalog.AggregatePartialCursor {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.adapter.verify(self.a, self.table);
             const recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot .. slot + 1] };
-            const reader = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), self.artifacts[slot], recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+            const reader = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCacheFor(self.a, self.store.artifactStore(), self.artifacts[slot], recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context }, self.execution);
             errdefer reader.cursor().close(reader);
             if (self.recipe.inputs.len > 1) {
                 try reader.setOutputSlot(@intCast(slot));
@@ -1096,9 +1683,9 @@ pub const Adapter = struct {
                 for (self.artifacts[slot + 1 ..], slot + 1..) |artifact, index| {
                     if (self.fused[index]) continue;
                     const input_recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[index .. index + 1] };
-                    const candidate = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), artifact, input_recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+                    const candidate = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCacheFor(self.a, self.store.artifactStore(), artifact, input_recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context }, self.execution);
                     defer candidate.cursor().close(candidate);
-                    if (try reader.fuse(candidate, @intCast(index))) self.fused[index] = true;
+                    if (try reader.fuseFor(candidate, @intCast(index), self.execution)) self.fused[index] = true;
                 }
             }
             return reader.cursor();
@@ -1129,9 +1716,9 @@ pub const Adapter = struct {
         try self.checkLakeRead(sa, table);
         try self.server.prepareLakeCache();
         const normalized = try self.context.platformDeadline();
-        var context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        var context: local.serverless_query_lake_read_context.Context = try self.lakeReadContext(normalized.deadline_ns);
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
-        var source = try @import("lake_published_navigation.zig").open(a, self.server, table.id, if (table.external_indexes) |indexes| indexes.catalog_json else "", .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, self.context, null);
+        var source = try @import("lake_published_navigation.zig").openFor(a, self.server, table.id, if (table.external_indexes) |indexes| indexes.catalog_json else "", .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, self.context, null, if (self.cpuScope()) |scope| scope.execution else null);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
         owner.a = a;
@@ -1140,7 +1727,7 @@ pub const Adapter = struct {
         owner.final_page = .init(a);
         var keep_owner = false;
         defer if (!keep_owner) owner.destroyControl();
-        owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
+        owner.store = @import("lake_index_store.zig").Store.openNativeFor(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null)) catch |err| {
             try context.ensureActive();
             if (err == error.OutOfMemory) return err;
             return null;
@@ -1155,7 +1742,9 @@ pub const Adapter = struct {
             };
             context = owner.reader_lease.?.readContext();
         }
-        var selected = (try @import("lake_index_selection.zig").selectCachedWithLease(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache, owner.reader_lease)) orelse return null;
+        const opening_execution = if (self.cpuScope()) |scope| scope.execution else null;
+        const selection_context = if (opening_execution) |execution| context.withExecution(execution) else context;
+        var selected = (try @import("lake_index_selection.zig").selectCachedWithLease(sa, table, &source, &owner.store, selection_context, .automatic, &self.server.lake_read_cache, owner.reader_lease)) orelse return null;
         defer selected.deinit();
         const owned = owner.arena.allocator();
         const references = try owned.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, identities.len);
@@ -1187,17 +1776,21 @@ pub const Adapter = struct {
         owner.artifacts = references;
         owner.recipe = recipe;
         owner.read_context = context;
+        owner.execution = opening_execution;
+        defer owner.execution = null;
         owner.child = (if (recipe.inputs.len == 1) AggregateArtifactCursor.openMember(owner, 0) else composed: {
-            const composition = try @import("lake_index_aggregate_composition.zig").Composition.create(a, recipe, .{ .ptr = owner, .open = AggregateArtifactCursor.openMember });
+            const composition = try @import("lake_index_aggregate_composition.zig").Composition.create(a, recipe, .{ .ptr = owner, .open = AggregateArtifactCursor.openMember, .open_for = AggregateArtifactCursor.openMemberFor });
             owner.composition = composition;
             break :composed composition.cursor();
         }) catch |err| {
             try self.context.ensureActive();
             return err;
         };
+        errdefer owner.child.close(owner.child.ptr);
+        if (opening_execution) |execution| try execution.checkpoint();
         keep_store = true;
         keep_owner = true;
-        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.closeCursor, .adopt_final_groups = AggregateArtifactCursor.adoptFinal };
+        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.closeCursor, .adopt_final_groups = AggregateArtifactCursor.adoptFinal, .coordinator_execution = .{ .bind = AggregateArtifactCursor.bindExecution, .release = AggregateArtifactCursor.releaseExecution } };
     }
 
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
@@ -1267,10 +1860,10 @@ pub const Adapter = struct {
         defer held.deinit(self.server.alloc);
         if (held.version != table.id or held.document_json == null) return error.CatalogGenerationChanged;
         const token = try std.json.parseFromSliceLeaky([]const u8, a, held.document_json.?, .{ .allocate = .alloc_always });
-        var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeFor(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null));
         defer store.deinit();
         var artifacts = store.artifactStore();
-        const cut = try @import("lake_sql_retained_cut.zig").load(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation);
+        const cut = try @import("lake_sql_retained_cut.zig").loadFor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation, try self.lakeReadContext(null));
         var normalized = try self.context.platformDeadline();
         const time = @import("antfly_platform").time;
         const wall_now = time.realtimeNs() / std.time.ns_per_ms;
@@ -1279,27 +1872,30 @@ pub const Adapter = struct {
         normalized.deadline_ns = @min(normalized.deadline_ns orelse expiry_deadline, expiry_deadline);
         self.context = normalized;
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
-        var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, table.external_base_source.?.binding, options, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .load);
+        var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, table.external_base_source.?.binding, options, try self.lakeReadContext(normalized.deadline_ns), .load);
         defer current.deinit(a);
         const root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(a, current.table.metadata_json);
         const metadata = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata;
         if (!std.mem.eql(u8, try metadata.str(try metadata.get(root, "table-uuid")), cut.table_uuid)) return error.CatalogGenerationChanged;
+        try Adapter.checkpoint(self);
         return cut;
     }
     fn saveSqlLakeCut(self: *Adapter, a: std.mem.Allocator, table: catalog.Table, cut: @import("lake_sql_retained_cut.zig").Descriptor, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !void {
         const id = self.active_transaction orelse return error.SqlTransactionNotActive;
-        var opened = try @import("../serverless/lake_ingestion.zig").openQueue(a, table.external_base_source.?.binding, options);
+        var opened = try @import("../serverless/lake_ingestion.zig").openQueueFor(a, table.external_base_source.?.binding, options, context);
         defer opened.deinit();
         const pins = @import("../serverless/lake_snapshot_pins.zig");
         const pin: pins.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try pins.namespace(a, opened.prefix, table.external_base_source.?.binding, cut.table_uuid), .context = context };
         const now = @import("antfly_platform").time.realtimeNs();
         if (cut.expires_ms <= now / std.time.ns_per_ms) return error.CatalogGenerationChanged;
         _ = try pin.acquireFor(a, cut.snapshot_id, now, (cut.expires_ms - now / std.time.ns_per_ms) * std.time.ns_per_ms);
-        var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeFor(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null));
         defer store.deinit();
         var artifacts = store.artifactStore();
         const token = try @import("lake_sql_retained_cut.zig").save(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), self.server.embedding_provider_runtime.io, cut, self.context.cancellation);
-        try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, try std.json.Stringify.valueAlloc(a, token, .{}));
+        const encoded = try std.json.Stringify.valueAlloc(a, token, .{});
+        try Adapter.checkpoint(self);
+        try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, encoded);
     }
 
     /// Wait before opening or persisting a new snapshot. A retained transaction
@@ -1320,27 +1916,70 @@ pub const Adapter = struct {
         const deadline = @min(wait_deadline, normalized.deadline_ns orelse wait_deadline);
         // Zero permits one readiness check under the statement's I/O budget.
         // Positive budgets also bound catalog and WAL I/O, not just sleeps.
-        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = if (wait_ms == 0) normalized.deadline_ns else deadline, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = try self.lakeReadContext(if (wait_ms == 0) normalized.deadline_ns else deadline);
         var first = true;
         while (true) {
             try normalized.ensureActive();
             if (!first and time.monotonicNs() >= deadline) return error.ReadRequirementNotReady;
             first = false;
             context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
-            var attempt = std.heap.ArenaAllocator.init(polling_alloc);
-            defer attempt.deinit();
-            const scratch = attempt.allocator();
-            var current = @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load) catch |err| return receiptPollingError(normalized, deadline, err);
-            defer current.deinit(scratch);
-            const coverage = try @import("../serverless/lake_ingestion.zig").coverage(scratch, current.table);
-            const covered = if (self.lake_visibility == .accepted) (@import("../serverless/lake_ingestion.zig").pending(scratch, binding, options, context, coverage) catch |err| return receiptPollingError(normalized, deadline, err)).lsn else coverage;
-            context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
-            if (covered >= receipt.wal_lsn) return try std.json.parseFromSliceLeaky(@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table, a, try std.json.Stringify.valueAlloc(scratch, current.table, .{}), .{ .allocate = .alloc_always });
+            {
+                var attempt = std.heap.ArenaAllocator.init(polling_alloc);
+                defer attempt.deinit();
+                const scratch = attempt.allocator();
+                var current = @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load) catch |err| return receiptPollingError(normalized, deadline, err);
+                defer current.deinit(scratch);
+                const coverage = try @import("../serverless/lake_ingestion.zig").coverage(scratch, current.table);
+                const covered = if (self.lake_visibility == .accepted) (@import("../serverless/lake_ingestion.zig").pending(scratch, binding, options, context, coverage) catch |err| return receiptPollingError(normalized, deadline, err)).lsn else coverage;
+                context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
+                if (covered >= receipt.wal_lsn) return try std.json.parseFromSliceLeaky(@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table, a, try std.json.Stringify.valueAlloc(scratch, current.table, .{}), .{ .allocate = .alloc_always });
+            }
             const now = time.monotonicNs();
             if (now >= deadline) return error.ReadRequirementNotReady;
-            try context.io.?.sleep(.fromNanoseconds(@intCast(@min(deadline - now, 50 * std.time.ns_per_ms))), .awake);
+            // Retire the polling attempt before lending CPU. Keep the original
+            // receipt budget as an additional fence while reentering the queue.
+            var wait: ReceiptPollWait = .{ .adapter = self, .deadline_ns = deadline };
+            wait.sleep(context.io.?, .fromNanoseconds(@intCast(@min(deadline - now, 50 * std.time.ns_per_ms)))) catch |err|
+                return receiptPollingError(normalized, deadline, err);
         }
     }
+
+    const ReceiptPollWait = struct {
+        adapter: *Adapter,
+        deadline_ns: u64,
+
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.adapter.context.ensureActive();
+            if (@import("antfly_platform").time.monotonicNs() >= self.deadline_ns) return error.ReadRequirementNotReady;
+        }
+
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(self);
+            try Adapter.spillWaitBegin(self.adapter);
+        }
+
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const execution = self.adapter.runnable orelse return error.InvalidRunnableTransition;
+            const class = if (execution.entry) |*entry| entry.class else return error.InvalidRunnableTransition;
+            // This restriction expires the receipt wait while queued without
+            // replacing the operation, its deadline, or its retained charge.
+            try execution.enterWithCheck(class, .{ .context = self, .check = check });
+            try self.adapter.context.ensureActive();
+            try self.adapter.validateReadFence(false);
+        }
+
+        fn sleep(self: *@This(), io: std.Io, duration: std.Io.Duration) !void {
+            try check(self);
+            try @import("antfly_local_sources").sql_execution_wait.run(
+                if (self.adapter.runnable != null) .{ .ptr = self, .begin = begin, .end = end } else null,
+                std.Io.sleep,
+                .{ io, duration, std.Io.Clock.awake },
+            );
+        }
+    };
 
     fn receiptPollingError(request: operation.RequestContext, deadline: u64, err: anyerror) anyerror {
         // Caller cancellation and statement expiration retain their SQLSTATE.
@@ -1404,9 +2043,9 @@ pub const Adapter = struct {
                 const ready_metadata = if (retained == null) try self.awaitSqlReceipt(scratch.allocator(), alloc, request.table) else null;
                 const normalized = try self.context.platformDeadline();
                 const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
-                source.* = try @import("lake_published_navigation.zig").open(alloc, self.server, request.table.id, if (request.table.external_indexes) |indexes| indexes.catalog_json else "", schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, self.context, null);
+                source.* = try @import("lake_published_navigation.zig").openFor(alloc, self.server, request.table.id, if (request.table.external_indexes) |indexes| indexes.catalog_json else "", schema, lake_options.lakeOptions(), try self.lakeReadContext(normalized.deadline_ns), self.context, null, if (self.cpuScope()) |scope| scope.execution else null);
                 errdefer source.deinit();
-                try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+                try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, try self.lakeReadContext(normalized.deadline_ns));
                 if (retained) |cut| {
                     if (!std.mem.eql(u8, source.inventory.snapshot_id, cut.snapshot_id)) return error.CatalogGenerationChanged;
                     const oa = owner.overlay_arena.?.allocator();
@@ -1417,7 +2056,7 @@ pub const Adapter = struct {
                     if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
                     const oa = owner.overlay_arena.?.allocator();
                     const binding = schema.external_base_source.?.binding;
-                    const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+                    const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = try self.lakeReadContext(normalized.deadline_ns);
                     var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(alloc, binding, lake_options, context, .load);
                     defer current.deinit(alloc);
                     const pinned_metadata = source.catalog_metadata orelse return error.InvalidLakeMetadata;
@@ -1458,13 +2097,13 @@ pub const Adapter = struct {
             if (request.table.external_base_source != null) {
                 cursor.* = if (owner.overlays.get(request.table.id)) |cut| overlay: {
                     const physical = try @import("lake_sql_overlay.zig").physicalRequest(owner.overlay_arena.?.allocator(), request.request, cut.*);
-                    const child = (try @import("lake_index_sql_rows.zig").tryOpenAuto(alloc, self.server, request.table, physical, self.context, owner.sources.get(request.table.id).?)) orelse try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical, self.context, owner.sources.get(request.table.id).?);
+                    const child = (try @import("lake_index_sql_rows.zig").tryOpenAutoFor(alloc, self.server, request.table, physical, self.context, owner.sources.get(request.table.id).?, if (self.cpuScope()) |scope| scope.execution else null)) orelse try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical, self.context, owner.sources.get(request.table.id).?);
                     errdefer child.close(child.ptr);
                     break :overlay try @import("lake_sql_overlay.zig").wrap(alloc, child, request.table, request.request, cut, self.context);
                 } else if (request.request.index_range != null)
-                    try @import("lake_index_sql_rows.zig").openPinned(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)
+                    try @import("lake_index_sql_rows.zig").openPinnedFor(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?, if (self.cpuScope()) |scope| scope.execution else null)
                 else
-                    (try @import("lake_index_sql_rows.zig").tryOpenAuto(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)) orelse fallback: {
+                    (try @import("lake_index_sql_rows.zig").tryOpenAutoFor(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?, if (self.cpuScope()) |scope| scope.execution else null)) orelse fallback: {
                         var physical_scan = request.request;
                         physical_scan.index_equality = null;
                         break :fallback try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical_scan, self.context, owner.sources.get(request.table.id).?);
@@ -1505,7 +2144,24 @@ pub const Adapter = struct {
                 .estimated_rows = child.estimated_rows,
                 .estimated_bytes = child.estimated_bytes,
                 .ordered_split_bytes = child.ordered_split_bytes,
+                .bind_execution = if (child.bind_execution != null) bindExecution else null,
+                .coordinator_execution = if (child.coordinator_execution != null) .{ .bind = bindCoordinator, .release = releaseCoordinator } else null,
             };
+        }
+        fn bindCoordinator(raw: *anyopaque, execution: *http_server.RunnableScheduler.Execution) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            try child.coordinator_execution.?.bind(child.ptr, execution);
+        }
+        fn releaseCoordinator(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            child.coordinator_execution.?.release(child.ptr);
+        }
+        fn bindExecution(raw: *anyopaque, execution: *http_server.RunnableScheduler.Execution) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            try child.bind_execution.?(child.ptr, execution);
         }
         fn countRows(raw: *anyopaque) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1621,6 +2277,13 @@ pub const Adapter = struct {
         }
     };
 
+    fn captureDynamicStatement(self: *Adapter, alloc: std.mem.Allocator, reads: @import("antfly_local_sources").api_table_read_source.TableReadSource, table: []const u8, schema_version: u32) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot {
+        var budget: ReadAdmission = .{ .adapter = self };
+        var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+        const payload = bridge.payload();
+        return reads.openRelationalStatementSnapshotWithAdmission(alloc, table, schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns, .init(&payload));
+    }
+
     fn openDynamicStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
         const snapshot = self.dynamic_snapshot orelse return error.SqlStatementSnapshotRequired;
         const bound_table = self.dynamic_table orelse return error.SqlStatementSnapshotRequired;
@@ -1649,6 +2312,10 @@ pub const Adapter = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const temporary = scratch.allocator();
+        var budget: ReadAdmission = .{ .adapter = self };
+        var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+        const payload = bridge.payload();
+        const control = @import("antfly_local_sources").common_read_admission.Port.init(&payload);
         for (requests, views, wrappers, cursors) |request, *view, *wrapper, *cursor| {
             try self.context.ensureActive();
             if (!std.mem.eql(u8, request.table.physical_name, bound_table)) return error.SqlStatementSnapshotRequired;
@@ -1660,7 +2327,7 @@ pub const Adapter = struct {
             if (query.index_equality != null) return error.SqlStatementSnapshotRequired;
             query.primary_order = true;
             const scan_request = try self.prepareScan(temporary, request.table, query);
-            const guarded = snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }) catch |err| blk: {
+            const guarded = snapshot.openGuardedWithAdmission(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }, control) catch |err| blk: {
                 if (err != error.SqlRangeTrackingRequired or retained.view_count != 0 or observed.tables.len != 0) return err;
                 // Activate the capability before any row or absence has been
                 // observed, then replace the stale cut. Once a view exists we
@@ -1668,10 +2335,10 @@ pub const Adapter = struct {
                 const writes = self.server.table_writes orelse return err;
                 try writes.activateRangeTracking(temporary, bound_table, self.context);
                 const reads = self.server.table_reads orelse return error.SqlStatementSnapshotRequired;
-                const replacement = try reads.openRelationalStatementSnapshot(alloc, bound_table, request.table.schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns);
+                const replacement = try self.captureDynamicStatement(alloc, reads, bound_table, request.table.schema_version);
                 snapshot.deinit();
                 snapshot.* = replacement;
-                break :blk try snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts });
+                break :blk try snapshot.openGuardedWithAdmission(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }, control);
             };
             defer {
                 for (guarded.owner_proofs) |owner| alloc.free(owner.proofs);
@@ -1757,7 +2424,11 @@ pub const Adapter = struct {
         }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
-        const native = read_source.openRelationalStatement(alloc, scans, .read_index) catch |err| blk: {
+        var creation_budget: ReadAdmission = .{ .adapter = self };
+        var creation_bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &creation_budget };
+        const creation_payload = creation_bridge.payload();
+        const creation_control = @import("antfly_local_sources").common_read_admission.Port.init(&creation_payload);
+        const native = read_source.openRelationalStatementWithAdmission(alloc, scans, .read_index, creation_control) catch |err| blk: {
             if (err != error.SqlRangeTrackingRequired or self.range_reads == null) return err;
             const writes = self.server.table_writes orelse return error.SqlRangeTrackingRequired;
             // Activation is a replicated, idempotent capability transition.
@@ -1769,7 +2440,7 @@ pub const Adapter = struct {
                 try self.verify(temporary, request.table);
                 try writes.activateRangeTracking(temporary, request.table.physical_name, self.context);
             }
-            break :blk try read_source.openRelationalStatement(alloc, scans, .read_index);
+            break :blk try read_source.openRelationalStatementWithAdmission(alloc, scans, .read_index, creation_control);
         };
         errdefer native.deinit();
         if (native.views.len != requests.len) return error.InvalidSqlBackendResponse;
@@ -1778,7 +2449,7 @@ pub const Adapter = struct {
         for (requests, native.views, wrappers, cursors) |request, view, *wrapper, *cursor| {
             try self.verify(temporary, request.table);
             if (self.range_reads) |observed| {
-                const proofs = try native.rangeProofs(temporary, wrapped);
+                const proofs = try native.rangeProofsWithAdmission(temporary, wrapped, creation_control);
                 if (proofs.len == 0) return error.InvalidSqlBackendResponse;
                 if (request.request.index_equality != null) {
                     for (proofs) |owner| {
@@ -1840,7 +2511,10 @@ pub const Adapter = struct {
             .cancellation = self.context.cancellation,
         }, .read_index)) orelse return error.UnsupportedSqlExecution;
         defer view.deinit();
-        const normalized = try view.normalize(alloc, writes);
+        var budget: ReadAdmission = .{ .adapter = self };
+        var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+        const payload = bridge.payload();
+        const normalized = try view.normalizeWithAdmission(alloc, writes, @import("antfly_local_sources").common_read_admission.Port.init(&payload));
         const result = try images.merge(alloc, input, normalized);
         // RETURNING requires SELECT policy on the resulting row as well as
         // write authority. Do not publish postimages that an ordinary read hides.
@@ -1914,7 +2588,10 @@ pub const Adapter = struct {
                 }, .read_index)) orelse return error.UnsupportedSqlExecution;
                 defer view.deinit();
                 try self.verify(alloc, table);
-                break :blk try view.normalize(alloc, writes.items);
+                var budget: ReadAdmission = .{ .adapter = self };
+                var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+                const payload = bridge.payload();
+                break :blk try view.normalizeWithAdmission(alloc, writes.items, @import("antfly_local_sources").common_read_admission.Port.init(&payload));
             } else writes.items;
             const scope = table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
@@ -1939,8 +2616,7 @@ pub const Adapter = struct {
                 try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
             } else try deletes.append(alloc, mutation.key);
         }
-        var response = @import("public_table_http.zig").handleNativeTableBatch(scratch, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null }, self.server.tableApi(self.context)) catch
-            return error.SqlMutationOutcomeUnknown;
+        var response = try self.completeNativeBatch(scratch, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null });
         defer response.deinit(scratch);
         self.outcome_transaction_id = mutationTransactionId(response.body);
         if (response.status == 200 or response.status == 201) return .committed;
@@ -1951,6 +2627,60 @@ pub const Adapter = struct {
         self.outcome_transaction_id = failure.transaction_id;
         return failure.err;
     }
+
+    fn completeNativeBatch(self: *Adapter, alloc: std.mem.Allocator, table_name: []const u8, batch: db_types.BatchRequest) !@import("public_table_http.zig").OwnedResponse {
+        try self.context.ensureActive();
+        if (self.context.execution_team) |team| {
+            if (team.state == .active) return error.InvalidRunnableTransition;
+            // The durable executor is supplied by its owner across the kernel
+            // boundary. An unavailable imported capability is authoritative;
+            // never reconstruct its Threaded vtable from the raw runtime.
+            const io = http_server.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return error.SqlWriteCapacityUnavailable;
+            const runtime = @import("antfly_runtime_abi");
+            const borrowed_io = runtime.native_abi.IoBorrow.init(&io);
+            var completion = NativeBatchCompletion{ .adapter = self, .alloc = alloc, .table_name = table_name, .batch = batch };
+            // Reserve the actual task and finite completion before the batch
+            // handler can enter native storage. Admission errors remain definite
+            // no-write outcomes, with no synchronous fallback.
+            var task = try @import("runnable_completion_task.zig").Task.reserve(team.allocator, io, team.borrow, &.{
+                .io = &borrowed_io,
+                .deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds))) +| 30 * std.time.ns_per_s,
+            }, &completion, NativeBatchCompletion.run);
+            defer task.deinit();
+            try self.context.ensureActive();
+            task.runAndJoin() catch |err| {
+                // After entering the native handler, an allocation or task
+                // failure cannot prove that no durable write was accepted.
+                if (completion.entered) return error.SqlMutationOutcomeUnknown;
+                return err;
+            };
+            // The handler also consumes thread-local commit identity/error
+            // metadata in this child. Transfer its complete owned response only
+            // after the physical join, while the prepared inputs, allocator,
+            // request bridge, team and adapter remain alive.
+            return completion.response orelse error.InvalidRunnableTransition;
+        }
+        return @import("public_table_http.zig").handleNativeTableBatch(alloc, table_name, batch, self.server.tableApi(self.context)) catch
+            return error.SqlMutationOutcomeUnknown;
+    }
+
+    const NativeBatchCompletion = struct {
+        adapter: *Adapter,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        batch: db_types.BatchRequest,
+        entered: bool = false,
+        response: ?@import("public_table_http.zig").OwnedResponse = null,
+
+        fn run(raw: *anyopaque, _: @import("antfly_runtime_abi").runnable_abi.Borrowed, _: std.Io) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Completion never replaces the original proposal deadline or
+            // cancellation. Recheck that fence before native admission.
+            try self.adapter.context.ensureActive();
+            self.entered = true;
+            self.response = try @import("public_table_http.zig").handleNativeTableBatch(self.alloc, self.table_name, self.batch, self.adapter.server.tableApi(self.adapter.context));
+        }
+    };
 
     fn validateStaged(ptr: *anyopaque, alloc: std.mem.Allocator, previous: ?*const @import("transactions.zig").OwnedTransactionCommitRequest, candidate: *@import("transactions.zig").OwnedTransactionCommitRequest, statement: *const @import("transactions.zig").OwnedTransactionCommitRequest) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -2070,6 +2800,203 @@ pub fn httpStatus(err: anyerror) u16 {
 pub fn characterPosition(statement: []const u8, byte_offset: usize) ?i64 {
     const count = std.unicode.utf8CountCodepoints(statement[0..@min(byte_offset, statement.len)]) catch return null;
     return @intCast(count + 1);
+}
+
+test "SQL read resume fences validate live policy and catalog before continuing" {
+    const a = std.testing.allocator;
+    const users_api = @import("../usermgr/mod.zig");
+    const casbin = @import("antfly_casbin");
+    const metadata = @import("../metadata/api.zig");
+    const Case = enum { success, filter, permission, roles, roles_without_filter, metadata_without_filter, unprotected_roles_change, unprotected_metadata_change, account, replacement, schema, revision, physical, key_expiry, key_deletion, during_catalog, deadline, policy_enable, policy_generation, policy_disable, policy_pending, policy_transition };
+    const Source = struct {
+        const Stamp = @import("antfly_local_sources").system_catalog_policies.PublicationStamp;
+        const schema_one =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        const schema_two =
+            \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        manager: *users_api.UserManager,
+        calls: usize = 0,
+        id: u64 = 7,
+        revision: u64 = 19,
+        physical: []const u8 = "private-7",
+        schema: []const u8 = schema_one,
+        mutate: bool = false,
+        policy: ?Stamp = null,
+
+        fn status(_: *anyopaque) !metadata.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .policy_publication_status) {
+                try std.testing.expect(context.row_policy_install_authority);
+                return std.json.Stringify.valueAlloc(alloc, self.policy, .{});
+            }
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            self.calls += 1;
+            const request = call.resolve_many;
+            try std.testing.expectEqual(@as(usize, 1), request.targets.len);
+            try std.testing.expect(request.include_query_definitions);
+            if (self.mutate) {
+                self.mutate = false;
+                try self.manager.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"changed-during-catalog\"}}");
+            }
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = self.id, .name = self.physical, .query_definition = .{ .table_id = self.id, .schema_json = self.schema, .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = self.revision, .tables = &tables }, .{});
+        }
+    };
+    const Clock = struct {
+        fn now() u64 {
+            return value;
+        }
+        var value: u64 = 0;
+    };
+    for (std.enums.values(Case)) |case| {
+        var store = users_api.MemoryStore.init(a);
+        defer store.deinit();
+        var policies = casbin.MemoryAdapter.init(a);
+        defer policies.deinit();
+        var users = try users_api.UserManager.init(a, store.iface(), try users_api.initDefaultEnforcer(a, policies.iface()));
+        defer users.deinit();
+        var read = try users_api.Permission.initOwned(a, .table, "*", .read);
+        defer read.deinit(a);
+        var user = try users.createUserWithMetadata("alice", "secret", &.{read}, "{\"tenant\":\"initial\"}");
+        defer user.deinit(a);
+        try users.addRoleToUser("alice", "role:reader");
+        try users.setRowFilter("alice", "docs", "{\"conjuncts\":[{\"term\":{\"tenant\":{\"$auth\":\"metadata.tenant\"}}},{\"terms\":{\"roles\":{\"$auth\":\"roles\"}}}]}");
+        if (case == .roles_without_filter or case == .metadata_without_filter or case == .unprotected_roles_change or case == .unprotected_metadata_change) try users.setRowFilter("alice", "docs", "null");
+        var key: ?users_api.CreatedApiKey = null;
+        defer if (key) |*value| value.deinit(a);
+        const principal = if (case == .key_expiry or case == .key_deletion) blk: {
+            key = try users.createApiKey("alice", "read", &.{read}, &.{}, null);
+            break :blk try std.fmt.allocPrint(a, "api-key:{s}", .{key.?.key.key_id});
+        } else try a.dupe(u8, "basic:alice");
+        defer a.free(principal);
+        var snapshot = try users.snapshotCredentialPolicies(principal);
+        defer snapshot.deinit(a);
+        var identity = try http_server.cloneCatalogIdentity(a, .{
+            .user_instance_id = snapshot.instance_id,
+            .username = snapshot.policy.username,
+            .credential_principal = principal,
+            .permissions = snapshot.policy.permissions,
+            .row_filter = snapshot.policy.row_filter,
+            .metadata_json = snapshot.policy.metadata_json,
+            .roles = snapshot.policy.roles,
+            .live_user_manager = &users,
+        });
+        defer identity.?.deinit(a);
+        var source: Source = .{ .manager = &users };
+        switch (case) {
+            .policy_generation, .policy_disable, .policy_pending, .policy_transition, .roles_without_filter, .metadata_without_filter => source.policy = .{ .table_id = 7, .schema_version = 1, .generation = 2, .catalog_epoch = 3, .phase = .active },
+            else => {},
+        }
+        var server = http_server.ApiHttpServer.init(a, .{ .auth_enabled = true, .user_manager = &users }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.resolve, .supports_query_definitions = true } }, null, null);
+        defer server.deinit();
+        if (key) |created| {
+            const raw = try std.fmt.allocPrint(a, "{s}:{s}", .{ created.key.key_id, created.key_secret });
+            defer a.free(raw);
+            const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+            defer a.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, raw);
+            const header = try std.fmt.allocPrint(a, "ApiKey {s}", .{encoded});
+            defer a.free(header);
+            const authenticated = try server.authenticateRequest(.{ .authorization = header });
+            identity.?.deinit(a);
+            identity = authenticated;
+            try std.testing.expectEqual(user.instance_id, identity.?.user_instance_id.?);
+        }
+        var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2, .max_operations = 3, .max_bytes = 128, .control_bytes = 32, .checkpoint_budget = 1 });
+        defer scheduler.close();
+        var execution: http_server.RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        Clock.value = 0;
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = std.time.ns_per_s, .retained_bytes = 17 }, .query);
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        _ = try Adapter.resolve(&adapter, arena.allocator(), .{ .table = "docs" }, .read);
+        const captured_calls = source.calls;
+        try adapter.validateReadFence(false);
+        try std.testing.expectEqual(captured_calls, source.calls);
+        try Adapter.spillWaitBegin(&adapter);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        var other: http_server.RunnableScheduler.Execution = .{};
+        defer other.finish();
+        try other.start(&scheduler, .{ .io = std.testing.io }, .query);
+        var control: http_server.RunnableScheduler.Execution = .{};
+        defer control.finish();
+        try control.start(&scheduler, .{ .io = std.testing.io }, .control);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+        switch (case) {
+            .success => {},
+            .filter => try users.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"changed\"}}"),
+            .permission => try users.removePermissionFromUser("alice", "*", .table),
+            .roles, .roles_without_filter, .unprotected_roles_change => try users.addRoleToUser("alice", "role:added"),
+            .metadata_without_filter, .unprotected_metadata_change => {
+                // Represent a replicated metadata update; this fixture owns
+                // the manager exclusively and retains the old admitted copy.
+                const updated = try a.dupe(u8, "{\"tenant\":\"replicated-update\"}");
+                const metadata_slot = users.user_metadata.getPtr("alice").?;
+                a.free(metadata_slot.*);
+                metadata_slot.* = updated;
+            },
+            .account => {
+                try users.deleteUser("alice");
+                var replacement = try users.createUserWithMetadata("alice", "secret", &.{read}, "{\"tenant\":\"replacement\"}");
+                defer replacement.deinit(a);
+            },
+            .replacement => source.id = 8,
+            .schema => source.schema = Source.schema_two,
+            .revision => source.revision += 1,
+            .physical => source.physical = "renamed-7",
+            .key_expiry => users.api_keys.getPtr(key.?.key.key_id).?.key.expires_at_ns = 0,
+            .key_deletion => try users.deleteApiKey("alice", key.?.key.key_id),
+            .during_catalog => source.mutate = true,
+            .deadline => Clock.value = 2 * std.time.ns_per_s,
+            .policy_enable => source.policy = .{ .table_id = 7, .schema_version = 1, .generation = 2, .catalog_epoch = 3, .phase = .active },
+            .policy_generation => {
+                source.policy.?.generation = 3;
+                source.policy.?.catalog_epoch = 4;
+            },
+            .policy_disable => source.policy.?.phase = .disabled,
+            .policy_pending, .policy_transition => {
+                source.policy.?.generation = 3;
+                source.policy.?.catalog_epoch = 4;
+                source.policy.?.serving_generation = 2;
+                source.policy.?.serving_catalog_epoch = 3;
+                source.policy.?.phase = if (case == .policy_pending) .pending_install else .serving_install;
+            },
+        }
+        other.finish();
+        control.finish();
+        switch (case) {
+            .success, .policy_pending, .unprotected_roles_change, .unprotected_metadata_change => {
+                try Adapter.spillWaitEnd(&adapter);
+                try std.testing.expectEqual(captured_calls + 1, source.calls);
+                try Adapter.checkpoint(&adapter);
+                try std.testing.expectEqual(captured_calls + 2, source.calls);
+                // Output is fenced even when there was no new runnable grant.
+                try users.removePermissionFromUser("alice", "*", .table);
+                try std.testing.expectError(error.Forbidden, adapter.validateReadFence(true));
+            },
+            .replacement, .schema, .revision, .physical => try std.testing.expectError(error.CatalogGenerationChanged, Adapter.spillWaitEnd(&adapter)),
+            .deadline => try std.testing.expectError(error.DeadlineExceeded, Adapter.spillWaitEnd(&adapter)),
+            .policy_enable, .policy_generation, .policy_disable, .policy_transition => try std.testing.expectError(error.RowPolicyCatalogChanged, Adapter.spillWaitEnd(&adapter)),
+            else => try std.testing.expectError(error.Forbidden, Adapter.spillWaitEnd(&adapter)),
+        }
+        try std.testing.expectEqual(@as(?u64, std.time.ns_per_s), execution.entry.?.options.deadline_ns);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        std.debug.print("read fence case {s}: no runnable or metadata charges\n", .{@tagName(case)});
+    }
 }
 
 test "SQL diagnostics preserve SQLSTATE and Unicode character positions" {
@@ -3809,6 +4736,221 @@ test "SQL mutation classification preserves wrapped definite conflicts and const
     for (cases) |case| try std.testing.expectEqual(case.expected, classifyMutationFailure(case.status, case.body).err);
 }
 
+test "SQL stateless completion reserves before native entry and owns ambiguous response metadata" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const background = @import("antfly_local_sources").storage_background_runtime;
+    const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const runtime = @import("antfly_runtime_abi");
+    const distributed = @import("distributed_txn.zig");
+    const platform_time = @import("antfly_platform").time;
+    const public = @import("public_table_http.zig");
+    const Fake = struct {
+        expected: distributed.CommitControl = .{},
+        scheduling: *scheduler.Scheduler,
+        signal: *std.atomic.Value(bool),
+        scenario: usize,
+        calls: usize = 0,
+        records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 3, .name = "docs", .schema_json = "{\"version\":7}" }},
+        fn snapshot(raw: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .status = try status(raw), .tables = &self.records, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+        var completion_now: std.atomic.Value(u64) = .init(0);
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = completion_now.load(.acquire) };
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.BatchRequest) !?void {
+            return error.UnexpectedSynchronousBatch;
+        }
+        fn commit(raw: *anyopaque, _: std.mem.Allocator, tables: []const distributed.TableCommitRequest, _: db_types.SyncLevel, cancellation: db_types.CancellationToken, control: distributed.CommitControl) !?distributed.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualDeep(self.expected, control);
+            try std.testing.expectEqualDeep(self.expected.pre_decision.cancellation, cancellation);
+            try std.testing.expectEqualStrings("docs", tables[0].table_name);
+            try std.testing.expectEqualStrings("a", tables[0].writes[0].key);
+            try std.testing.expectEqualStrings("{\"id\":1}", tables[0].writes[0].value);
+            try std.testing.expectEqual(@as(?u32, 7), tables[0].schema_version);
+            const borrow = control.team.?.borrow;
+            const initial = borrow.checkpoint(borrow.context);
+            if (!initial.isOk()) return runtime.error_abi.errorFromStatus(initial);
+            self.calls += 1;
+            if (self.scenario == 2) {
+                self.signal.store(true, .release);
+                const parked = borrow.park(borrow.context, @backingInt(runtime.runnable_abi.Wait.resource));
+                if (!parked.isOk()) return runtime.error_abi.errorFromStatus(parked);
+                try std.testing.expectEqual(@as(usize, 0), self.scheduling.stats().runnable_slots);
+                var health: scheduler.Execution = .{};
+                try health.start(self.scheduling, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                health.finish();
+                self.scheduling.close();
+                const resumed = borrow.enter(borrow.context, @backingInt(runtime.runnable_abi.Class.write));
+                if (!resumed.isOk()) return runtime.error_abi.errorFromStatus(resumed);
+                const completed = borrow.checkpoint(borrow.context);
+                if (!completed.isOk()) return runtime.error_abi.errorFromStatus(completed);
+            }
+            if (self.scenario == 5) {
+                public.setLastAmbiguousBatchTxnId("00112233445566778899aabbccddeeff".*);
+                return error.CommitDecisionUnknown;
+            }
+            if (self.scenario == 6) {
+                completion_now.store(31 * std.time.ns_per_s, .release);
+                const expired = borrow.checkpoint(borrow.context);
+                if (!expired.isOk()) {
+                    public.setLastAmbiguousBatchTxnId("00112233445566778899aabbccddeeff".*);
+                    return error.CommitDecisionUnknown;
+                }
+                return error.ExpectedCompletionExpiry;
+            }
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+    const Forward = struct {
+        const Dispatch = @FieldType(runtime.native_abi.IoBorrow, "dispatch");
+        var owner_dispatch: Dispatch = undefined;
+        var calls: std.atomic.Value(usize) = .init(0);
+        const P = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".param_types;
+        fn dispatch(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?) callconv(.c) void {
+            _ = calls.fetchAdd(1, .monotonic);
+            owner_dispatch(a, b, c, d, e, f);
+        }
+    };
+    // Exercise the same admission, cancellation, expiry and ambiguous-outcome
+    // matrix with native IO, foreign C-dispatch IO, and unavailable durable IO.
+    for (0..3) |mode| {
+        for (0..8) |scenario| {
+            const alloc = std.testing.allocator;
+            var threaded = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(if (scenario == 4) 0 else 2) });
+            defer threaded.deinit();
+            Fake.completion_now.store(0, .release);
+            var io_vtable = threaded.io().vtable.*;
+            io_vtable.now = Fake.now;
+            const io: std.Io = .{ .userdata = threaded.io().userdata, .vtable = &io_vtable };
+            var imported_borrow = runtime.native_abi.IoBorrow.init(&io);
+            Forward.owner_dispatch = imported_borrow.dispatch;
+            Forward.calls.store(0, .release);
+            imported_borrow.dispatch = Forward.dispatch;
+            var receiver = try imported_borrow.receive();
+            const imported_io = receiver.io();
+            try std.testing.expect(imported_io.vtable != io.vtable);
+            var backend = try background.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = io } });
+            defer backend.deinit();
+            var scheduling = try scheduler.Scheduler.init(.{ .slots = 3 });
+            var execution: scheduler.Execution = .{};
+            defer execution.finish();
+            var signal = std.atomic.Value(bool).init(false);
+            const original_deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+            try execution.start(&scheduling, .{ .io = std.testing.io, .deadline_ns = original_deadline, .native_now_ns = platform_time.monotonicNs, .cancellation = .{ .ptr = &signal, .requested = Fake.canceled } }, .write);
+            var memory: @import("../common/allocation_budget.zig").Shared = .{ .child = alloc, .limit = if (scenario == 0) 0 else 16384 };
+            var bridge = try @import("runnable_write_team.zig").Completion.init(&execution, memory.allocator());
+            var team = try bridge.team();
+            var fake = Fake{ .scheduling = &scheduling, .signal = &signal, .scenario = scenario };
+            var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = &backend }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .commit_batch_with_control = Fake.commit } });
+            defer server.deinit();
+            var identity: ?http_server.AuthenticatedIdentity = null;
+            var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{ .execution_team = &team, .deadline_ns = original_deadline, .cancellation = .fromAtomic(&signal) } };
+            if (scenario == 7) adapter.context.deadline_ns = platform_time.monotonicNs() -| 1;
+            fake.expected = distributed.CommitControl.fromRequest(adapter.context);
+            if (scenario == 3) signal.store(true, .release);
+            if (mode != 0) {
+                server.cfg.imported_runtime_io = .{ .api = io, .api_network = io, .api_filesystem = io, .durable = if (mode == 1) imported_io else null };
+                // All setup and unrelated teardown retain their ordinary owner.
+                // Only completion executes with a deliberately inaccessible pointer.
+                server.cfg.backend_runtime = @ptrFromInt(0x1000);
+            }
+            const result = adapter.completeNativeBatch(alloc, "docs", .{ .schema_version = 7, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} });
+            server.cfg.backend_runtime = &backend;
+            if (mode == 2 and scenario != 3 and scenario != 7) {
+                try std.testing.expectError(error.SqlWriteCapacityUnavailable, result);
+            } else if (scenario == 0) {
+                try std.testing.expectError(error.OutOfMemory, result);
+            } else if (scenario == 3) {
+                try std.testing.expectError(error.Canceled, result);
+            } else if (scenario == 4) {
+                try std.testing.expectError(error.ConcurrencyUnavailable, result);
+            } else if (scenario == 7) {
+                try std.testing.expectError(error.DeadlineExceeded, result);
+            } else {
+                var response = try result;
+                defer response.deinit(alloc);
+                if (scenario == 5 or scenario == 6) {
+                    try std.testing.expectEqual(@as(u16, 409), response.status);
+                    const failure = classifyMutationFailure(response.status, response.body);
+                    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, failure.err);
+                    try std.testing.expectEqualDeep(@as(?[32]u8, "00112233445566778899aabbccddeeff".*), failure.transaction_id);
+                } else try std.testing.expectEqual(@as(u16, 201), response.status);
+            }
+            try std.testing.expectEqual(@as(usize, if (mode == 2 or scenario == 0 or scenario == 3 or scenario == 4 or scenario == 7) 0 else 1), fake.calls);
+            if (mode == 1 and scenario != 3 and scenario != 7) try std.testing.expect(Forward.calls.load(.acquire) != 0);
+            if (mode == 2) try std.testing.expectEqual(@as(usize, 0), Forward.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+            try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+        }
+    }
+}
+
+test "SQL read resume fences cleanup resource waits retain independent deadline and original class" {
+    const runtime = @import("antfly_runtime_abi");
+    const Clock = struct {
+        var current: u64 = 0;
+        fn now() u64 {
+            return current;
+        }
+    };
+    for ([_]http_server.RunnableScheduler.Class{ .query, .write }) |class| {
+        Clock.current = 0;
+        var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 3, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+        defer scheduler.close();
+        var execution: http_server.RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .retained_bytes = 17 }, class);
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var adapter: Adapter = .{ .server = undefined, .identity = undefined, .context = .{ .cancellation = operation.CancellationToken.fromAtomic(&canceled) }, .runnable = &execution };
+        const borrow = adapter.providerRunnable().?;
+        const io = std.testing.io;
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        try Adapter.checkCleanupStatus(borrow.reserve_cleanup.?(borrow.context, &.{ .io = &io_borrow, .native_deadline = 1, .activation_budget = 1, .deadline_ns = 10 }));
+        // Both original request cancellation and original scheduler deadline
+        // expire before cleanup activation. Cleanup has its own finite budget.
+        canceled.store(true, .release);
+        adapter.context.deadline_ns = 0;
+        Clock.current = 1000;
+        try std.testing.expectError(error.Canceled, adapter.context.ensureActive());
+        var cleanup_slots: usize = 0;
+        try Adapter.checkCleanupStatus(borrow.activate_cleanup.?(borrow.context, &cleanup_slots));
+        try std.testing.expectEqual(execution.entry.?.slots, cleanup_slots);
+        try std.testing.expectEqual(class, execution.entry.?.class);
+        try std.testing.expectEqual(@as(?u64, 1010), execution.entry.?.options.deadline_ns);
+        try Adapter.checkpoint(&adapter);
+        try Adapter.spillWaitBegin(&adapter);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        var control: http_server.RunnableScheduler.Execution = .{};
+        try control.start(&scheduler, .{ .io = std.testing.io }, .control);
+        control.finish();
+        Clock.current = 1009;
+        try Adapter.spillWaitEnd(&adapter);
+        try std.testing.expectEqual(class, execution.entry.?.class);
+        try Adapter.checkpoint(&adapter);
+        try std.testing.expectEqual(@as(?u64, 1010), execution.entry.?.options.deadline_ns);
+        Clock.current = 1010;
+        try std.testing.expectError(error.DeadlineExceeded, Adapter.checkpoint(&adapter));
+        try std.testing.expectError(error.DeadlineExceeded, Adapter.spillWaitBegin(&adapter));
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
 test "SQL lake statement wrapper preserves ordering counts estimates and split source lifetime" {
     const a = std.testing.allocator;
     const Fixture = struct {
@@ -3905,6 +5047,1336 @@ test "SQL receipt readiness shares one deadline across preflight and scan checks
     try std.testing.expectEqual(std.math.maxInt(u64), budget.deadline(std.math.maxInt(u64) - 1, 10));
 }
 
+test "SQL read resume fences receipt polling sleep lends CPU and retains the original owner" {
+    const Runnable = http_server.RunnableScheduler;
+    const Case = enum { success, io_canceled, request_canceled, receipt_expired, shutdown, canceled_before, expired_before };
+    const Fixture = struct {
+        scheduler: *Runnable.Scheduler,
+        wait: *Adapter.ReceiptPollWait,
+        canceled: *std.atomic.Value(bool),
+        scenario: Case,
+        calls: usize = 0,
+        parked: bool = false,
+        other_granted: bool = false,
+        control_granted: bool = false,
+        retained_operations: usize = 0,
+        retained_bytes: u64 = 0,
+
+        fn cancellation(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+
+        fn sleep(raw: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            const before = self.scheduler.stats();
+            self.parked = before.runnable_slots == 0 and before.resource_blocked == 1;
+            self.retained_operations = before.operations;
+            self.retained_bytes = before.retained_bytes;
+            // Submit without waiting: a regression must fail rather than hang
+            // behind the polling operation's unreleased ordinary CPU slot.
+            var other: Runnable.Entry = .{ .options = .{ .io = std.testing.io }, .class = .query };
+            self.scheduler.submit(&other) catch return error.Canceled;
+            self.other_granted = other.state == .running;
+            self.scheduler.finish(&other);
+            var control: Runnable.Entry = .{ .options = .{ .io = std.testing.io }, .class = .control };
+            self.scheduler.submit(&control) catch return error.Canceled;
+            self.control_granted = control.state == .running;
+            self.scheduler.finish(&control);
+            switch (self.scenario) {
+                .io_canceled => return error.Canceled,
+                .request_canceled => self.canceled.store(true, .release),
+                .receipt_expired => self.wait.deadline_ns = 0,
+                .shutdown => self.scheduler.close(),
+                else => {},
+            }
+        }
+    };
+    for (std.enums.values(Case)) |scenario| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s;
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = deadline, .native_now_ns = @import("antfly_platform").time.monotonicNs, .retained_bytes = 17, .cancellation = .{ .ptr = &canceled, .requested = Fixture.cancellation } }, .query);
+        const initial_generation = execution.resume_generation;
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        // A sleep with no captured read pins does not access the server.
+        var adapter: Adapter = .{ .server = undefined, .identity = &identity, .context = .{ .deadline_ns = deadline, .cancellation = .fromAtomic(&canceled) }, .runnable = &execution };
+        var wait: Adapter.ReceiptPollWait = .{ .adapter = &adapter, .deadline_ns = deadline };
+        var fixture: Fixture = .{ .scheduler = &scheduler, .wait = &wait, .canceled = &canceled, .scenario = scenario };
+        var vtable = std.testing.io.vtable.*;
+        vtable.sleep = Fixture.sleep;
+        const io: std.Io = .{ .userdata = &fixture, .vtable = &vtable };
+        if (scenario == .canceled_before) canceled.store(true, .release);
+        if (scenario == .expired_before) wait.deadline_ns = 0;
+        const result = wait.sleep(io, .fromMilliseconds(1));
+        switch (scenario) {
+            .success => try result,
+            .io_canceled, .request_canceled, .canceled_before => try std.testing.expectError(error.Canceled, result),
+            .receipt_expired, .expired_before => try std.testing.expectError(error.ReadRequirementNotReady, result),
+            .shutdown => try std.testing.expectError(error.SchedulerClosed, result),
+        }
+        const called = scenario != .canceled_before and scenario != .expired_before;
+        try std.testing.expectEqual(@as(usize, if (called) 1 else 0), fixture.calls);
+        if (called) {
+            try std.testing.expect(fixture.parked);
+            try std.testing.expect(fixture.other_granted);
+            try std.testing.expect(fixture.control_granted);
+            try std.testing.expectEqual(@as(usize, 1), fixture.retained_operations);
+            try std.testing.expectEqual(@as(u64, 17), fixture.retained_bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(Runnable.Class.query, execution.entry.?.class);
+        if (scenario == .success or scenario == .io_canceled) {
+            try std.testing.expectEqual(Runnable.State.running, execution.entry.?.state);
+            try std.testing.expectEqual(initial_generation + 1, execution.resume_generation);
+        }
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        std.debug.print("receipt polling sleep case {s}: original owner retired without runnable or metadata charges\n", .{@tagName(scenario)});
+    }
+}
+
+test "SQL retained cursor admission lends original CPU and prevents replay after rejected pages" {
+    const a = std.testing.allocator;
+    const scheduler = http_server.RunnableScheduler;
+    const clock = @import("antfly_platform").time;
+    const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+    const Mode = enum { success, canceled, expired, rejected_resume, late_cancel };
+    const Fixture = struct {
+        adapter: *Adapter,
+        scheduler: *scheduler.Scheduler,
+        signal: *std.atomic.Value(bool),
+        mode: Mode,
+        calls: usize = 0,
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn legacy(_: *anyopaque, _: std.mem.Allocator, _: u32) !View.Page {
+            return error.TestLegacyCursorEscape;
+        }
+        fn close(_: *anyopaque) void {}
+        fn next(raw: *anyopaque, alloc: std.mem.Allocator, _: u32, control: View.Admission) !View.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try control.checkpoint();
+            try std.testing.expectEqual(self.adapter.context.deadline_ns, try control.deadlineNs());
+            try control.waitForProgress();
+            const wait = (try control.executionWait()) orelse return error.TestMissingSqlExecution;
+            try wait.beginWait();
+            try control.checkLifetime();
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: scheduler.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            switch (self.mode) {
+                .canceled => self.signal.store(true, .release),
+                .expired => self.adapter.context.deadline_ns = 0,
+                .rejected_resume => self.scheduler.close(),
+                .success, .late_cancel => {},
+            }
+            try wait.endWait();
+            if (self.mode == .late_cancel) self.signal.store(true, .release);
+            return .{ .arena = .init(alloc), .rows = &.{}, .after = null };
+        }
+    };
+    for ([_]Mode{ .success, .canceled, .expired, .rejected_resume, .late_cancel }) |mode| {
+        var scheduling = try scheduler.Scheduler.init(.{ .slots = 2 });
+        var signal = std.atomic.Value(bool).init(false);
+        var execution: scheduler.Execution = .{};
+        const deadline = clock.monotonicNs() + std.time.ns_per_s;
+        try execution.start(&scheduling, .{ .io = std.testing.io, .allow_wait = false, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 17, .cancellation = .{ .ptr = &signal, .requested = Fixture.canceled } }, .query);
+        defer execution.finish();
+        // An empty guard deliberately needs no catalog callback, but the real
+        // guard/resume machinery and original execution remain active.
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = a;
+        var adapter: Adapter = .{ .server = &server, .identity = undefined, .runnable = &execution, .context = .{ .deadline_ns = deadline, .cancellation = .fromAtomic(&signal), .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io) } };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        var fixture: Fixture = .{ .adapter = &adapter, .scheduler = &scheduling, .signal = &signal, .mode = mode };
+        var projection = try @import("antfly_local_sources").sql_document_row.Projection.init(a, .{ .id = 1, .physical_name = "rows", .schema_version = 5, .storage_mode = .document, .columns = &.{} }, &.{"_id"});
+        defer projection.deinit(a);
+        var cursor: Adapter.ReadCursor = .{ .alloc = a, .adapter = &adapter, .schema_version = 5, .projection = projection, .view = .{ .ptr = &fixture, .vtable = &.{ .next = Fixture.legacy, .next_with_admission = Fixture.next, .close = Fixture.close } } };
+        const result = Adapter.ReadCursor.next(&cursor, a, 1);
+        if (mode == .success) {
+            (try result).deinit();
+            execution.finish();
+            var second: scheduler.Execution = .{};
+            try second.start(&scheduling, .{ .io = std.testing.io, .allow_wait = false, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 17 }, .query);
+            defer second.finish();
+            adapter.runnable = &second;
+            (try Adapter.ReadCursor.next(&cursor, a, 1)).deinit();
+            try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+        } else {
+            try std.testing.expectError(switch (mode) {
+                .canceled, .late_cancel => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                .rejected_resume => error.SchedulerClosed,
+                .success => unreachable,
+            }, result);
+            try std.testing.expect(cursor.failed);
+            try std.testing.expectError(error.RetainedReadRestartRequired, Adapter.ReadCursor.next(&cursor, a, 1));
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        }
+    }
+}
+
+test "SQL lake request admission lends CPU for artifact catalog WAL and pin providers" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const scheduling = http_server.RunnableScheduler;
+    const clock = @import("antfly_platform").time;
+    const Context = local.serverless_query_lake_read_context.Context;
+    const Mode = enum { success, canceled, expired, rejected_resume, forbidden };
+    const Stage = enum { artifact, catalog, wal, pin };
+    const Probe = struct {
+        adapter: *Adapter,
+        scheduler: *scheduling.Scheduler,
+        signal: *std.atomic.Value(bool),
+        context: Context = .{},
+        mode: Mode,
+        enabled: bool = false,
+        denied: bool = false,
+        ends: usize = 0,
+        reject_at: usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try Adapter.checkpoint(self.adapter);
+            if (self.denied) return error.Forbidden;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try Adapter.spillWaitBegin(self.adapter);
+            // The SQL-owned authority hook must remain valid without CPU.
+            try self.context.checkLifetime();
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: scheduling.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.enabled) {
+                self.ends += 1;
+                if (self.ends == self.reject_at) switch (self.mode) {
+                    .success => {},
+                    .canceled => self.signal.store(true, .release),
+                    .expired => self.adapter.context.deadline_ns = 0,
+                    .rejected_resume => self.scheduler.close(),
+                    .forbidden => self.denied = true,
+                };
+            }
+            try Adapter.spillWaitEnd(self.adapter);
+        }
+    };
+    const Operation = struct {
+        fn run(arena: std.mem.Allocator, stage: Stage, store: *@import("lake_index_store.zig").Store, context: Context, token: []const u8, identity: [32]u8) !void {
+            switch (stage) {
+                .artifact => {
+                    var artifacts = store.artifactStore();
+                    const cut = try @import("lake_sql_retained_cut.zig").loadFor(arena, &artifacts, identity, token, .{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{} }, 1001, .none, context);
+                    try std.testing.expectEqualStrings("42", cut.snapshot_id);
+                    try std.testing.expectEqual(@as(u64, 8), cut.pending.lsn);
+                },
+                .catalog => {
+                    var managed: local.serverless_external_source_mod.lake_catalog.managed.Managed = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "catalog", .source_uri = "file:///fixture", .context = context };
+                    var table = try managed.load(arena);
+                    defer table.deinit(arena);
+                    try std.testing.expect(table.metadata_json.len != 0);
+                },
+                .wal => {
+                    const wal: @import("../serverless/lake_wal.zig").Store = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "wal", .context = context };
+                    try std.testing.expectEqual(null, try wal.latest(arena));
+                },
+                .pin => {
+                    const pins: @import("../serverless/lake_snapshot_pins.zig").Store = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "pins", .context = context };
+                    const now = clock.realtimeNs();
+                    const deadline = try pins.acquireFor(arena, "42", now, std.time.ns_per_s);
+                    try std.testing.expect(deadline >= now);
+                },
+            }
+        }
+    };
+    for ([_]Stage{ .artifact, .catalog, .wal, .pin }) |stage| for ([_]Mode{ .success, .canceled, .expired, .rejected_resume, .forbidden }) |mode| {
+        if (mode == .forbidden and stage != .wal) continue;
+        var directory = try local.common_test_directory.TestDirectory.init("sql-lake-call-admission");
+        defer directory.cleanup();
+        var scheduler = try scheduling.Scheduler.init(.{ .slots = 2 });
+        var execution: scheduling.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+        defer execution.finish();
+        var signal = std.atomic.Value(bool).init(false);
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = a;
+        server.embedding_provider_runtime.io = std.testing.io;
+        var adapter: Adapter = .{ .server = &server, .identity = undefined, .runnable = &execution, .context = .{ .deadline_ns = clock.monotonicNs() + 10 * std.time.ns_per_s, .cancellation = .fromAtomic(&signal) } };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        var probe: Probe = .{ .adapter = &adapter, .scheduler = &scheduler, .signal = &signal, .mode = mode, .reject_at = if (stage == .pin) 3 else 1 };
+        probe.context = try adapter.lakeReadContext(null);
+        try std.testing.expect(probe.context.wait != null);
+        probe.context.wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end };
+        probe.context.additional_checkpoint = .{ .ptr = &probe, .check = Probe.check };
+        var store = try @import("lake_index_store.zig").Store.openNativeFor(a, null, null, false, .standalone, directory.path(), probe.context);
+        defer store.deinit();
+        const identity = try @import("native_retained_cut.zig").storeIdentity(a, store.locator);
+        var artifacts = store.artifactStore();
+        const token = try @import("lake_sql_retained_cut.zig").save(a, &artifacts, identity, std.testing.io, .{ .table_id = 7, .schema_version = 1, .object_generation = 0, .expires_ms = 1000 + @import("lake_sql_retained_cut.zig").ttl_ms, .metadata_location = "file:///fixture/metadata.json", .metadata_json = "{}", .table_uuid = "fixture", .snapshot_id = "42", .pending = .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{} } }, .none);
+        defer a.free(token);
+        if (stage == .catalog) {
+            // Seed a real filesystem catalog before testing its read boundary.
+            var managed: local.serverless_external_source_mod.lake_catalog.managed.Managed = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "catalog", .source_uri = "file:///fixture" };
+            var seeded = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+            seeded.deinit(a);
+        }
+        probe.enabled = true;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        // Selection/cursor CPU scopes may replace the primary checkpoint;
+        // SQL's additional authority check must survive that adaptation.
+        var call_context = probe.context.withExecution(&execution);
+        call_context.wait = probe.context.wait;
+        const result = Operation.run(arena.allocator(), stage, &store, call_context, token, identity);
+        if (mode == .success) try result else try std.testing.expectError(switch (mode) {
+            .canceled => error.Canceled,
+            .expired => error.DeadlineExceeded,
+            .rejected_resume => error.SchedulerClosed,
+            .forbidden => error.Forbidden,
+            .success => unreachable,
+        }, result);
+        try std.testing.expect(probe.ends >= probe.reject_at);
+        if (stage == .pin) {
+            // A rejected grant after PUT may leave an expiring retention pin;
+            // it must not turn into a published query result or lose the pin.
+            const persisted: @import("../serverless/lake_snapshot_pins.zig").Store = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "pins" };
+            try std.testing.expect((try persisted.deadline(a, "42")) != 0);
+        }
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "SQL prepared numeric serial owner publishes coordinator scope without parallel scope and charges foreground scratch" {
+    const a = std.testing.allocator;
+    const Prepared = @import("antfly_local_sources").sql_typed_kernel.PreparedNumeric;
+    const Partitioned = @import("../common/allocation_budget.zig").Partitioned;
+    const required = Prepared.scratch_bytes + Partitioned.overhead(.of(Prepared));
+    var memory: Partitioned = .{ .foreground = .{ .child = a, .limit = required }, .control = .{ .child = a, .limit = 64 } };
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = a;
+    server.request_memory = &memory;
+    server.embedding_provider_runtime.io = std.testing.io;
+    var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var execution: http_server.RunnableScheduler.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    defer execution.finish();
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution, .serial_execution = true };
+    try adapter.beginReadFence();
+    defer adapter.endReadFence();
+    try std.testing.expect(adapter.cpuScope() == null);
+    const scope = adapter.coordinatorScope().?;
+    try std.testing.expect(scope.execution == &execution);
+    try std.testing.expect(scope.check != null);
+    try std.testing.expect(scope.check.?.context == @as(*anyopaque, @ptrCast(&adapter)));
+    var compiled = try @import("antfly_local_sources").sql_compiler.compileScalar(a, "1 + 2", .{});
+    defer compiled.deinit();
+    var program = try @import("antfly_local_sources").sql_scalar.bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    const stage = (try Prepared.init(scope.allocator, &program)).?;
+    var stage_live = true;
+    defer if (stage_live) stage.deinit();
+    try std.testing.expectEqual(required, memory.foreground.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+    try std.testing.expectError(error.OutOfMemory, scope.allocator.alloc(u8, 1));
+    const control = try memory.allocator(true).alloc(u8, 1);
+    memory.allocator(true).free(control);
+    stage.deinit();
+    stage_live = false;
+    try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+    adapter.serial_execution = false;
+    try std.testing.expect(adapter.cpuScope().?.execution == scope.execution);
+}
+
+test "SQL scalar lifetime callbacks do not yield allocate or validate catalog inside native frames" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        calls: usize = 0,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedScalarStatus;
+        }
+        fn catalogRead(raw: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.ScalarFrameAttemptedCatalogIo;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    var source: Source = .{};
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = a;
+    server.source = .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalogRead, .supports_query_definitions = true } };
+    var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const clock = @import("antfly_platform").time.monotonicNs;
+    const deadline = clock() + 30 * std.time.ns_per_s;
+    var execution: http_server.RunnableScheduler.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock, .deadline_ns = deadline, .retained_bytes = 17, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query);
+    defer execution.finish();
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{ .deadline_ns = deadline, .cancellation = .fromAtomic(&canceled) }, .runnable = &execution };
+    try adapter.beginReadFence();
+    defer adapter.endReadFence();
+    try adapter.read_guard.?.capture(.{ .database = "main", .namespace = "public", .name = "docs", .physical = "physical", .id = 1, .schema_version = 1, .catalog_revision = 7, .filter = null });
+    const generation = execution.resume_generation;
+    for (0..16) |_| try Adapter.scalarCheckpoint(&adapter);
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    try std.testing.expect(adapter.read_guard.?.checked_generation == null);
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    server.alloc = unavailable.allocator();
+    try Adapter.scalarCheckpoint(&adapter);
+    try std.testing.expectEqual(@as(usize, 0), unavailable.allocations);
+    server.alloc = a;
+    // The ordinary coordinator boundary still performs full read validation.
+    try std.testing.expectError(error.ScalarFrameAttemptedCatalogIo, Adapter.checkpoint(&adapter));
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    const after_coordinator = execution.resume_generation;
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, Adapter.scalarCheckpoint(&adapter));
+    canceled.store(false, .release);
+    adapter.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, Adapter.scalarCheckpoint(&adapter));
+    try std.testing.expectEqual(after_coordinator, execution.resume_generation);
+    try std.testing.expectEqual(deadline, execution.entry.?.options.deadline_ns.?);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+}
+
+test "SQL scalar lifetime callbacks inspect write execution without a foreground runnable" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var execution: http_server.RunnableScheduler.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 19 }, .write);
+    defer execution.finish();
+    var adapter: Adapter = .{ .server = undefined, .identity = undefined, .context = .{}, .write_execution = &execution };
+    const generation = execution.resume_generation;
+    try Adapter.scalarCheckpoint(&adapter);
+    Clock.tick = 100;
+    try std.testing.expectError(error.DeadlineExceeded, Adapter.scalarCheckpoint(&adapter));
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+    try std.testing.expectEqual(@as(u64, 19), scheduler.stats().retained_bytes);
+}
+
+test "SQL scalar lifetime callbacks preserve preauthorized cleanup after foreground cancellation and close" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 3, .cleanup_slots = 1, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var execution: http_server.RunnableScheduler.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 50, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query);
+    defer execution.finish();
+    var adapter: Adapter = .{ .server = undefined, .identity = undefined, .context = .{ .deadline_ns = 0, .cancellation = .fromAtomic(&canceled) }, .runnable = &execution };
+    adapter.cleanup_phase = try @import("runnable_local_cleanup.zig").Cleanup.init(&execution);
+    try execution.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 100);
+    canceled.store(true, .release);
+    try execution.activateCleanup();
+    scheduler.close();
+    const generation = execution.resume_generation;
+    try Adapter.scalarCheckpoint(&adapter);
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+    Clock.tick = 100;
+    try std.testing.expectError(error.DeadlineExceeded, Adapter.scalarCheckpoint(&adapter));
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+}
+
+test "SQL CPU loan policy validation waits for ordinary CPU and retains original failures" {
+    const native = http_server.RunnableScheduler;
+    const io = std.testing.io;
+    const Clock = struct {
+        var tick: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return tick.load(.acquire);
+        }
+    };
+    const Source = struct {
+        execution: *native.Execution,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedSqlPolicyStatus;
+        }
+        fn catalogRead(raw: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            if (self.execution.entry.?.borrowed_read_cpu or self.execution.entry.?.cpu_borrow_budget != null) return error.InvalidRunnableTransition;
+            return error.Forbidden;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Worker = struct {
+        fn run(adapter: *Adapter) !void {
+            try Adapter.checkpoint(adapter);
+        }
+    };
+    const Mode = enum { catalog_refusal, canceled, expired, closed };
+    inline for (.{ Mode.catalog_refusal, Mode.canceled, Mode.expired, Mode.closed }) |mode| {
+        Clock.tick.store(0, .release);
+        var scheduler = try native.Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var base: native.Entry = .{ .options = .{ .io = io }, .class = .background, .bytes = 11 };
+        try scheduler.submit(&base);
+        defer scheduler.finish(&base);
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        var source: Source = .{ .execution = &execution };
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = std.testing.allocator;
+        server.source = .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalogRead, .supports_query_definitions = true } };
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{ .cancellation = .fromAtomic(&canceled) }, .runnable = &execution };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        try adapter.read_guard.?.capture(.{ .database = "main", .namespace = "public", .name = "docs", .physical = "physical", .id = 1, .schema_version = 1, .catalog_revision = 7, .filter = null });
+        try execution.startBorrowable(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query, .{ .max_non_yield_ns = 1000 });
+        try std.testing.expectEqual(@as(usize, 1), scheduler.cpuBorrowStats().active);
+        var floor: native.Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded, .bytes = 7 };
+        try scheduler.submit(&floor);
+        defer scheduler.finish(&floor);
+        try std.testing.expectEqual(native.State.running, scheduler.state(&floor));
+        var future = try io.concurrent(Worker.run, .{&adapter});
+        defer future.cancel(io) catch {};
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (scheduler.state(&execution.entry.?) != .queued) {
+            if (source.calls.load(.acquire) != 0) return future.await(io);
+            if (scheduler.state(&execution.entry.?) == .stopped) return future.await(io);
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.SqlPolicyDidNotReturnCpuLoan;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 0), source.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.cpuBorrowStats().active);
+        try std.testing.expectEqual(native.State.running, scheduler.state(&floor));
+        try std.testing.expectEqual(@as(u64, 41), scheduler.stats().retained_bytes);
+        switch (mode) {
+            .catalog_refusal => scheduler.finish(&base),
+            .canceled => canceled.store(true, .release),
+            .expired => Clock.tick.store(100, .release),
+            .closed => scheduler.close(),
+        }
+        const expected = switch (mode) {
+            .catalog_refusal => error.Forbidden,
+            .canceled => error.Canceled,
+            .expired => error.DeadlineExceeded,
+            .closed => error.SchedulerClosed,
+        };
+        try std.testing.expectError(expected, future.await(io));
+        try std.testing.expectEqual(@as(usize, if (mode == .catalog_refusal) 1 else 0), source.calls.load(.acquire));
+        try std.testing.expectEqual(@as(?u64, null), adapter.read_guard.?.checked_generation);
+        try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+        try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+        scheduler.finish(&base);
+        scheduler.finish(&floor);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "SQL CPU loan policy validation exposes checked stage transitions without retiring ingress" {
+    const runtime = @import("antfly_runtime_abi");
+    const native = http_server.RunnableScheduler;
+    const io = std.testing.io;
+    const Worker = struct {
+        fn run(borrow: runtime.runnable_abi.Borrowed) !void {
+            try borrow.setCpuBorrow(&.{ .enabled = 0 });
+        }
+    };
+    var owner = try native.Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 });
+    defer owner.close();
+    var execution: native.Execution = .{};
+    defer execution.finish();
+    const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    try execution.start(&owner, .{ .io = io, .native_now_ns = @import("antfly_platform").time.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23 }, .query);
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = std.testing.allocator;
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution };
+    const borrow = adapter.providerRunnable().?;
+    try std.testing.expectError(error.InvalidReadFenceTransition, borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 }));
+    try adapter.beginReadFence();
+    defer adapter.endReadFence();
+    var malformed: runtime.runnable_abi.CpuBorrow = .{ .enabled = 1, .max_non_yield_ns = 1000 };
+    malformed.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.setCpuBorrow(&malformed));
+    malformed = .{ .enabled = 2, .max_non_yield_ns = 1000 };
+    try std.testing.expectError(error.InvalidArgument, borrow.setCpuBorrow(&malformed));
+    try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+    const generation = execution.resume_generation;
+    try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    var peer: native.Entry = .{ .options = .{ .io = io }, .class = .background, .cpu_borrow_budget = .{ .max_non_yield_ns = 1000 } };
+    try owner.submit(&peer);
+    defer owner.finish(&peer);
+    try std.testing.expect(borrow.checkpoint(borrow.context).isOk());
+    try std.testing.expect(execution.entry.?.borrowed_read_cpu);
+    var floor: native.Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded };
+    try owner.submit(&floor);
+    defer owner.finish(&floor);
+    try std.testing.expectEqual(native.State.running, owner.state(&floor));
+    var future = try io.concurrent(Worker.run, .{borrow});
+    defer future.cancel(io) catch {};
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (owner.state(&execution.entry.?) != .queued) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.SqlCpuBorrowDisableDidNotWait;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(native.State.running, owner.state(&floor));
+    try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+    owner.finish(&peer);
+    try future.await(io);
+    try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+    try std.testing.expectEqual(deadline, execution.entry.?.options.deadline_ns.?);
+    owner.finish(&floor);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+    // Ending a stage must clear eligibility even when the foreground SQL
+    // context has expired independently of the retained execution deadline.
+    try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+    adapter.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, borrow.setCpuBorrow(&.{ .enabled = 0 }));
+    try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+    try std.testing.expectEqual(deadline, execution.entry.?.options.deadline_ns.?);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}
+
+test "SQL CPU loan policy validation resumes captured numeric work under unchanged and revoked authority" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const local = @import("antfly_local_sources");
+    const native = http_server.RunnableScheduler;
+    const Prepared = local.sql_typed_kernel.PreparedNumeric;
+    const Partitioned = @import("../common/allocation_budget.zig").Partitioned;
+    const users_api = @import("../usermgr/mod.zig");
+    const casbin = @import("antfly_casbin");
+    const Mode = enum { success, cache_busy, catalog_changed, policy_changed, credential_revoked, policy_expanded };
+    const Clock = struct {
+        fn now() u64 {
+            return 0;
+        }
+    };
+    const Source = struct {
+        execution: *native.Execution,
+        resolves: std.atomic.Value(usize) = .init(0),
+        policies: std.atomic.Value(usize) = .init(0),
+        revision: std.atomic.Value(u64) = .init(19),
+        generation: std.atomic.Value(u64) = .init(2),
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"tenant":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution.entry.?.borrowed_read_cpu or self.execution.entry.?.cpu_borrow_budget != null) return error.InvalidRunnableTransition;
+            if (call == .policy_publication_status) {
+                try std.testing.expect(context.row_policy_install_authority);
+                _ = self.policies.fetchAdd(1, .acq_rel);
+                const generation = self.generation.load(.acquire);
+                const stamp: local.system_catalog_policies.PublicationStamp = .{ .table_id = 7, .schema_version = 1, .generation = generation, .catalog_epoch = if (generation == 2) 3 else 4, .phase = .active };
+                return std.json.Stringify.valueAlloc(alloc, stamp, .{});
+            }
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            _ = self.resolves.fetchAdd(1, .acq_rel);
+            try std.testing.expectEqual(@as(usize, 1), call.resolve_many.targets.len);
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "private-7", .query_definition = .{ .table_id = 7, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = self.revision.load(.acquire), .tables = &tables }, .{});
+        }
+    };
+    const Input = struct {
+        count: usize = 64,
+        calls: *usize,
+        ordinal: u32,
+        pub fn cell(self: @This(), _: std.mem.Allocator, _: usize, ordinal: u32) !local.sql_scalar.Datum {
+            if (ordinal != self.ordinal) return error.InvalidSqlBackendResponse;
+            self.calls.* += 1;
+            return local.sql_scalar.Datum.json(.{ .integer = 41 });
+        }
+    };
+    const Worker = struct {
+        fn run(borrow: @import("antfly_runtime_abi").runnable_abi.Borrowed) !void {
+            try borrow.setCpuBorrow(&.{ .enabled = 0 });
+        }
+    };
+    inline for (.{ Mode.success, Mode.cache_busy, Mode.catalog_changed, Mode.policy_changed, Mode.credential_revoked, Mode.policy_expanded }) |mode| {
+        var store = users_api.MemoryStore.init(a);
+        defer store.deinit();
+        var policies = casbin.MemoryAdapter.init(a);
+        defer policies.deinit();
+        var users = try users_api.UserManager.init(a, store.iface(), try users_api.initDefaultEnforcer(a, policies.iface()));
+        defer users.deinit();
+        var permission = try users_api.Permission.initOwned(a, .table, "*", .read);
+        defer permission.deinit(a);
+        var user = try users.createUserWithMetadata("alice", "secret", &.{permission}, "{\"tenant\":\"initial\"}");
+        defer user.deinit(a);
+        try users.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"initial\"}}");
+        const principal = try a.dupe(u8, "basic:alice");
+        defer a.free(principal);
+        var snapshot = try users.snapshotCredentialPolicies(principal);
+        defer snapshot.deinit(a);
+        var identity = try http_server.cloneCatalogIdentity(a, .{ .user_instance_id = snapshot.instance_id, .username = snapshot.policy.username, .credential_principal = principal, .permissions = snapshot.policy.permissions, .row_filter = snapshot.policy.row_filter, .metadata_json = snapshot.policy.metadata_json, .roles = snapshot.policy.roles, .live_user_manager = &users });
+        defer identity.?.deinit(a);
+        var scheduler = try native.Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 1000000, .retained_bytes = 23 }, .query);
+        var source: Source = .{ .execution = &execution };
+        var server = http_server.ApiHttpServer.init(a, .{ .auth_enabled = true, .user_manager = &users, .imported_runtime_io = .{ .api = io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.resolve, .supports_query_definitions = true } }, null, null);
+        defer server.deinit();
+        var forced_cache_busy = false;
+        defer if (forced_cache_busy) {
+            server.sql_schema_cache.builds = 0;
+            for (server.sql_schema_cache.slots[0..4]) |*slot| slot.building = false;
+        };
+        try std.testing.expect(server.request_memory == null);
+        const memory = try a.create(Partitioned);
+        const scratch_bytes = Prepared.scratch_bytes + Partitioned.overhead(.of(Prepared));
+        const policy_bytes = 64 << 10;
+        const policy_charge = policy_bytes + Partitioned.overhead(.of(u8));
+        memory.* = .{ .foreground = .{ .child = a, .limit = scratch_bytes + policy_charge }, .control = .{ .child = a, .limit = 64 } };
+        server.request_memory = memory;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution, .serial_execution = true };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const table = try Adapter.resolve(&adapter, arena.allocator(), .{ .table = "docs" }, .read);
+        try std.testing.expectEqual(@as(u64, 7), table.id);
+        try std.testing.expectEqual(@as(u64, 2), adapter.read_guard.?.tables.items[0].row_policy.?.generation);
+        const scope = adapter.coordinatorScope().?;
+        try std.testing.expect(adapter.cpuScope() == null);
+        const scalar_columns = try arena.allocator().alloc(local.sql_scalar.Column, table.columns.len);
+        for (table.columns, scalar_columns) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type };
+        const ordinal: u32 = for (scalar_columns, 0..) |column, index| {
+            if (std.mem.eql(u8, column.name, "n")) break @intCast(index);
+        } else return error.MissingNumericColumn;
+        var compiled = try local.sql_compiler.compileScalar(a, "n + 1", .{});
+        defer compiled.deinit();
+        var program = try local.sql_scalar.bind(a, compiled.expression, scalar_columns, &.{}, .{});
+        defer program.deinit();
+        const stage = (try Prepared.init(scope.allocator, &program)).?;
+        var stage_live = true;
+        defer if (stage_live) stage.deinit();
+        var input_calls: usize = 0;
+        try stage.prepare(Input{ .calls = &input_calls, .ordinal = ordinal }, &.{});
+        while (stage.next_instruction < program.root) try std.testing.expect((try stage.step()) == null);
+        try std.testing.expectEqual(.binary, std.meta.activeTag(stage.instructions[program.root].operation));
+        try std.testing.expectEqual(scratch_bytes, memory.foreground.stats().used_bytes);
+        const borrow = adapter.providerRunnable().?;
+        try std.testing.expectError(error.InvalidRunnableTransition, borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 }));
+        // Actual validation must succeed from the reserved region even while
+        // its foreground parent is completely occupied. No separate catalog
+        // allocator may hide an allocation escape in this schedule.
+        server.alloc = memory.allocator(false);
+        defer server.alloc = a;
+        try std.testing.expectError(error.OutOfMemory, adapter.reserveReadValidationMemory(1));
+        try std.testing.expect(adapter.read_policy_memory == null);
+        try std.testing.expectEqual(scratch_bytes, memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+        try adapter.reserveReadValidationMemory(policy_bytes);
+        try std.testing.expectEqual(scratch_bytes + policy_charge, memory.foreground.stats().used_bytes);
+        try std.testing.expectError(error.OutOfMemory, scope.allocator.alloc(u8, 1));
+        // The former unreserved validation path cannot allocate at this heap
+        // pressure. The reservation must complete the same real validation.
+        try std.testing.expectError(error.OutOfMemory, adapter.read_guard.?.check(server.alloc, execution.resume_generation, true, .{ .ptr = &adapter, .check = Adapter.validateReadPins }));
+        try adapter.validateReadFence(true);
+        const control = try memory.allocator(true).alloc(u8, 1);
+        defer memory.allocator(true).free(control);
+        const resolves = source.resolves.load(.acquire);
+        const policy_calls = source.policies.load(.acquire);
+        const generation = execution.resume_generation;
+        var peer: native.Entry = .{ .options = .{ .io = io }, .class = .write, .bytes = 17 };
+        try scheduler.submit(&peer);
+        defer scheduler.finish(&peer);
+        try std.testing.expectEqual(native.State.queued, scheduler.state(&peer));
+        try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+        try std.testing.expect(execution.entry.?.borrowed_read_cpu);
+        try std.testing.expectEqual(native.State.running, scheduler.state(&peer));
+        try std.testing.expectEqual(generation, execution.resume_generation);
+        try std.testing.expectEqual(resolves, source.resolves.load(.acquire));
+        try std.testing.expectEqual(policy_calls, source.policies.load(.acquire));
+        var floor: native.Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded };
+        try scheduler.submit(&floor);
+        defer scheduler.finish(&floor);
+        try std.testing.expectEqual(native.State.running, scheduler.state(&floor));
+        // The actual addition computes private intermediate values on the same
+        // validated grant. It neither publishes output nor crosses an IO edge.
+        try std.testing.expect((try stage.step()) == null);
+        try std.testing.expectEqual(@as(usize, 64), input_calls);
+        try std.testing.expectEqual(scratch_bytes + policy_charge, memory.foreground.stats().used_bytes);
+        var future = try io.concurrent(Worker.run, .{borrow});
+        defer future.cancel(io) catch {};
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (scheduler.state(&execution.entry.?) != .queued) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CapturedStageDidNotReturnLoan;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(resolves, source.resolves.load(.acquire));
+        try std.testing.expectEqual(policy_calls, source.policies.load(.acquire));
+        try std.testing.expectEqual(native.State.running, scheduler.state(&floor));
+        switch (mode) {
+            .success => {},
+            .cache_busy => {
+                // Force the real uncached derivation path after warm preflight.
+                // These counters model four occupied builder slots; this is not
+                // an assertion about four independently running cache workers.
+                server.sql_schema_cache.deinit();
+                server.sql_schema_cache = .init(a);
+                server.sql_schema_cache.builds = 4;
+                for (server.sql_schema_cache.slots[0..4]) |*slot| slot.building = true;
+                forced_cache_busy = true;
+            },
+            .catalog_changed => source.revision.store(20, .release),
+            .policy_changed => source.generation.store(3, .release),
+            .credential_revoked => try users.removePermissionFromUser("alice", "*", .table),
+            .policy_expanded => {
+                // Live policy can grow after preflight. Its owned snapshot must
+                // refuse within the existing reservation, with no heap fallback.
+                const expanded = try a.alloc(u8, policy_bytes * 2);
+                defer a.free(expanded);
+                @memset(expanded, 'x');
+                const filter = try std.fmt.allocPrint(a, "{{\"term\":{{\"tenant\":\"{s}\"}}}}", .{expanded});
+                defer a.free(filter);
+                try users.setRowFilter("alice", "docs", filter);
+            },
+        }
+        scheduler.finish(&peer);
+        if (mode == .success or mode == .cache_busy) {
+            try future.await(io);
+            const output = (try stage.step()).?;
+            for (output) |value| try std.testing.expectEqual(@as(i64, 42), value.value.integer);
+            try std.testing.expectEqual(execution.resume_generation, adapter.read_guard.?.checked_generation.?);
+        } else try std.testing.expectError(switch (mode) {
+            .catalog_changed => error.CatalogGenerationChanged,
+            .policy_changed => error.RowPolicyCatalogChanged,
+            .credential_revoked => error.Forbidden,
+            .policy_expanded => error.OutOfMemory,
+            else => unreachable,
+        }, future.await(io));
+        if (mode == .policy_expanded) {
+            // A failed revalidation cannot cache authority or retain an active
+            // arena. The root and reservation stay owned until explicit finish.
+            try std.testing.expect(adapter.read_guard.?.checked_generation == null);
+            try std.testing.expect(!adapter.read_guard.?.validating);
+            try std.testing.expect(!adapter.read_policy_memory.?.active);
+            try std.testing.expectEqual(scratch_bytes + policy_charge, memory.foreground.stats().used_bytes);
+            const control_after_refusal = try memory.allocator(true).alloc(u8, 1);
+            memory.allocator(true).free(control_after_refusal);
+            try users.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"initial\"}}");
+            // This only checks bounded arena reuse after failure. The failed
+            // operation's private numeric result is never exposed.
+            try adapter.validateReadFence(true);
+            try std.testing.expect(!adapter.read_policy_memory.?.active);
+            try std.testing.expectEqual(scratch_bytes + policy_charge, memory.foreground.stats().used_bytes);
+        }
+        try std.testing.expect(source.resolves.load(.acquire) > resolves);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.cpuBorrowStats().active);
+        try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+        try std.testing.expectEqual(@as(u64, 1000000), execution.entry.?.options.deadline_ns.?);
+        scheduler.finish(&floor);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        stage.deinit();
+        stage_live = false;
+        try std.testing.expectEqual(policy_charge, memory.foreground.stats().used_bytes);
+        adapter.endReadFence();
+        try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    }
+}
+
+test "SQL CPU loan policy validation preflight never publishes reservations after original lifetime stops" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const native = http_server.RunnableScheduler;
+    const Partitioned = @import("../common/allocation_budget.zig").Partitioned;
+    const Mode = enum { expired, canceled, closed };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const Source = struct {
+        mode: Mode,
+        scheduler: *native.Scheduler,
+        canceled: *bool,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .policy_publication_status) {
+                const result = try alloc.dupe(u8, "null");
+                switch (self.mode) {
+                    .expired => Clock.tick = 100,
+                    .canceled => self.canceled.* = true,
+                    .closed => self.scheduler.close(),
+                }
+                return result;
+            }
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            const schema_json =
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+            ;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "private-7", .query_definition = .{ .table_id = 7, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 19, .tables = &tables }, .{});
+        }
+    };
+    inline for (.{ Mode.expired, Mode.canceled, Mode.closed }) |mode| {
+        Clock.tick = 0;
+        var canceled = false;
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query);
+        var source: Source = .{ .mode = mode, .scheduler = &scheduler, .canceled = &canceled };
+        var server = http_server.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.resolve } }, null, null);
+        defer server.deinit();
+        const memory = try a.create(Partitioned);
+        const bytes = 64 << 10;
+        memory.* = .{ .foreground = .{ .child = a, .limit = bytes + Partitioned.overhead(.of(u8)) }, .control = .{ .child = a, .limit = 64 } };
+        server.request_memory = memory;
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        // The SQL context intentionally has independent clocks/tokens. The
+        // original execution must still fence the post-validation handoff.
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        try adapter.read_guard.?.capture(.{ .database = "default", .namespace = "public", .name = "docs", .physical = "private-7", .id = 7, .schema_version = 1, .catalog_revision = 19, .filter = null });
+        const expected = switch (mode) {
+            .expired => error.DeadlineExceeded,
+            .canceled => error.Canceled,
+            .closed => error.SchedulerClosed,
+        };
+        try std.testing.expectError(expected, adapter.reserveReadValidationMemory(bytes));
+        try std.testing.expect(adapter.read_policy_memory == null);
+        try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    }
+}
+
+test "SQL CPU loan policy validation fences original lifetime after metadata and cached checks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const native = http_server.RunnableScheduler;
+    const Partitioned = @import("../common/allocation_budget.zig").Partitioned;
+    const Mode = enum { expired, canceled, closed };
+    const Phase = enum { forced, cached, cpu_return };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const Source = struct {
+        mode: Mode,
+        scheduler: *native.Scheduler,
+        canceled: *bool,
+        stop_on_policy: bool = false,
+        fn stop(self: *@This()) void {
+            switch (self.mode) {
+                .expired => Clock.tick = 100,
+                .canceled => self.canceled.* = true,
+                .closed => self.scheduler.close(),
+            }
+        }
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .policy_publication_status) {
+                const result = try alloc.dupe(u8, "null");
+                if (self.stop_on_policy) self.stop();
+                return result;
+            }
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            const schema_json =
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+            ;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "private-7", .query_definition = .{ .table_id = 7, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 19, .tables = &tables }, .{});
+        }
+    };
+    inline for (.{ Phase.forced, Phase.cached, Phase.cpu_return }) |phase| {
+        inline for (.{ Mode.expired, Mode.canceled, Mode.closed }) |mode| {
+            Clock.tick = 0;
+            var canceled = false;
+            var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+            defer scheduler.close();
+            var execution: native.Execution = .{};
+            defer execution.finish();
+            try execution.start(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query);
+            var source: Source = .{ .mode = mode, .scheduler = &scheduler, .canceled = &canceled };
+            var server = http_server.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.resolve } }, null, null);
+            defer server.deinit();
+            const memory = try a.create(Partitioned);
+            const bytes = 64 << 10;
+            memory.* = .{ .foreground = .{ .child = a, .limit = bytes + Partitioned.overhead(.of(u8)) }, .control = .{ .child = a, .limit = 64 } };
+            server.request_memory = memory;
+            var identity: ?http_server.AuthenticatedIdentity = null;
+            // The SQL context intentionally has independent clocks/tokens. The
+            // original execution must still fence the post-validation handoff.
+            var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution };
+            try adapter.beginReadFence();
+            defer adapter.endReadFence();
+            try adapter.read_guard.?.capture(.{ .database = "default", .namespace = "public", .name = "docs", .physical = "private-7", .id = 7, .schema_version = 1, .catalog_revision = 19, .filter = null });
+            const expected = switch (mode) {
+                .expired => error.DeadlineExceeded,
+                .canceled => error.Canceled,
+                .closed => error.SchedulerClosed,
+            };
+            try adapter.reserveReadValidationMemory(bytes);
+            const charge = bytes + Partitioned.overhead(.of(u8));
+            try std.testing.expectEqual(charge, memory.foreground.stats().used_bytes);
+            const borrow = adapter.providerRunnable().?;
+            if (phase == .cpu_return) try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+            if (phase == .cached) source.stop() else source.stop_on_policy = true;
+            const outcome = if (phase == .cpu_return)
+                borrow.setCpuBorrow(&.{ .enabled = 0 })
+            else
+                adapter.validateReadFence(phase == .forced);
+            try std.testing.expectError(expected, outcome);
+            try std.testing.expect(adapter.read_guard.?.checked_generation == null);
+            try std.testing.expect(!adapter.read_guard.?.validating);
+            try std.testing.expect(!adapter.read_policy_memory.?.active);
+            try std.testing.expect(execution.entry.?.cpu_borrow_budget == null);
+            try std.testing.expectEqual(charge, memory.foreground.stats().used_bytes);
+            adapter.endReadFence();
+            try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+            try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+            try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        }
+    }
+}
+
+test "SQL prepared numeric serial owner bundles scratch with original CPU and preserves fallback and cancellation" {
+    const a = std.testing.allocator;
+    const Budget = @import("../common/allocation_budget.zig");
+    const Prepared = @import("antfly_local_sources").sql_typed_kernel.PreparedNumeric;
+    const Mode = enum { success, busy, denied, unsupported, canceled, expired, metadata_oom, backing_oom, partition_denied, missing_cap };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Node = struct {
+        mode: Mode,
+        used: usize = 0,
+        peak: usize = 0,
+        attempts: usize = 0,
+        signal: *std.atomic.Value(bool),
+        fn reserve(raw: *anyopaque, bytes: usize) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.used += bytes;
+            self.peak = @max(self.peak, self.used);
+            return true;
+        }
+        fn attempt(raw: *anyopaque, bytes: usize) callconv(.c) Budget.Accounting.TryReserve {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            switch (self.mode) {
+                .busy => return .busy,
+                .denied => return .denied,
+                .unsupported => return .unsupported,
+                .canceled => self.signal.store(true, .release),
+                .expired => Clock.tick = 100,
+                .success, .metadata_oom, .backing_oom, .partition_denied, .missing_cap => {},
+            }
+            _ = reserve(raw, bytes);
+            return .reserved;
+        }
+        fn release(raw: *anyopaque, bytes: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.used -= bytes;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    var compiled = try @import("antfly_local_sources").sql_compiler.compileScalar(a, "n * 2 + 1", .{});
+    defer compiled.deinit();
+    const columns = [_]@import("antfly_local_sources").sql_scalar.Column{.{ .name = "n", .type = .integer }};
+    var program = try @import("antfly_local_sources").sql_scalar.bind(a, compiled.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    const page: catalog.ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "r" }}, .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{7} } }} }, .selection = &.{0} };
+    for (std.enums.values(Mode)) |mode| {
+        Clock.tick = 0;
+        var signal: std.atomic.Value(bool) = .init(false);
+        var node: Node = .{ .mode = mode, .signal = &signal };
+        var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = if (mode == .metadata_oom) 0 else if (mode == .backing_oom) 1 else std.math.maxInt(usize) });
+        const metadata = @sizeOf(Adapter.NumericScratch) + Budget.Partitioned.overhead(.of(Adapter.NumericScratch));
+        var memory: Budget.Partitioned = .{ .foreground = .{ .child = backing.allocator(), .limit = if (mode == .partition_denied) metadata else 1 << 20, .accounting = .{ .ptr = &node, .reserve_fn = Node.reserve, .try_reserve_fn = if (mode == .missing_cap) null else Node.attempt, .release_fn = Node.release } }, .control = .{ .child = a, .limit = 64 } };
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = a;
+        server.request_memory = &memory;
+        server.embedding_provider_runtime.io = std.testing.io;
+        var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: http_server.RunnableScheduler.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 72, .cancellation = .{ .ptr = &signal, .requested = Node.canceled } }, .query);
+        defer execution.finish();
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution, .serial_execution = true };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        const grants = scheduler.stats().grants[@backingInt(http_server.RunnableScheduler.Class.query)];
+        const evaluated = @import("antfly_local_sources").sql_vector_eval.evaluateColumnsWithScopes(a, &program, page, &columns, &.{}, null, null, adapter.coordinatorScope());
+        if (mode == .canceled or mode == .expired) {
+            try std.testing.expectError(if (mode == .canceled) error.Canceled else error.DeadlineExceeded, evaluated);
+        } else {
+            const values = (try evaluated).?;
+            defer a.free(values);
+            try std.testing.expectEqual(@as(i64, 15), values[0].value.integer);
+            try std.testing.expectEqual(grants + @as(u64, if (mode == .metadata_oom) 0 else 1), scheduler.stats().grants[@backingInt(http_server.RunnableScheduler.Class.query)]);
+        }
+        const attempted: usize = if (mode == .metadata_oom or mode == .partition_denied or mode == .missing_cap) 0 else 1;
+        const reserved = mode == .success or mode == .canceled or mode == .expired or mode == .backing_oom;
+        // Metadata accounting precedes the physical allocation attempt,
+        // including a backing OOM which rolls that charge back.
+        const expected_peak = metadata + @as(usize, if (reserved) Prepared.scratch_bytes else 0);
+        try std.testing.expectEqual(expected_peak, node.peak);
+        try std.testing.expectEqual(attempted, node.attempts);
+        try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+        try std.testing.expectEqual(@as(usize, 0), node.used);
+        try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 72), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(?u64, 100), execution.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+        try std.testing.expect(execution.entry.?.pending_resources == null);
+        // Dispatch after retirement must never call the temporary ticket again.
+        scheduler.notifyResourceProgress();
+        try std.testing.expectEqual(attempted, node.attempts);
+    }
+}
+
+test "SQL grouped coordinator scratch preserves exact batches and row fallback under original authority" {
+    const local = @import("antfly_local_sources");
+    const Budget = @import("../common/allocation_budget.zig");
+    const Groups = local.sql_operators.Grouped;
+    const Datum = local.sql_scalar.Datum;
+    const Mode = enum { success, denied, backing_oom, canceled, expired, hash_canceled, estimate_canceled };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const count = 64;
+    const scratch_bytes = comptime Groups.batchScratchBytes(count, false).?;
+    const metadata = @sizeOf(Adapter.NumericScratch) + Budget.Partitioned.overhead(.of(Adapter.NumericScratch));
+    const Node = struct {
+        mode: Mode,
+        signal: *std.atomic.Value(bool),
+        backing: *std.testing.FailingAllocator,
+        metadata_bytes: usize,
+        used: usize = 0,
+        peak: usize = 0,
+        attempts: usize = 0,
+        physical_retirement_checked: bool = false,
+        fn reserve(raw: *anyopaque, bytes: usize) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.used += bytes;
+            self.peak = @max(self.peak, self.used);
+            return true;
+        }
+        fn attempt(raw: *anyopaque, bytes: usize) callconv(.c) Budget.Accounting.TryReserve {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(bytes == scratch_bytes);
+            self.attempts += 1;
+            switch (self.mode) {
+                .denied => return .denied,
+                .canceled => self.signal.store(true, .release),
+                .expired => Clock.tick = 100,
+                else => {},
+            }
+            _ = reserve(raw, bytes);
+            return .reserved;
+        }
+        fn release(raw: *anyopaque, bytes: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes == scratch_bytes) {
+                // Only the ticket's metadata may remain physically allocated
+                // when the fixed vector reservation is returned to the node.
+                std.debug.assert(self.backing.allocated_bytes - self.backing.freed_bytes == self.metadata_bytes);
+                self.physical_retirement_checked = true;
+            }
+            self.used -= bytes;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const a = std.testing.allocator;
+    const specs = [_]local.sql_operators.AggregateSpec{ .{ .kind = .count, .input_type = .integer }, .{ .kind = .sum, .input_type = .integer } };
+    const key = Datum.json(.{ .integer = 7 });
+    const value = Datum.json(.{ .integer = 9007199254740993 });
+    const keys: [count]Datum = @splat(key);
+    const values: [count]Datum = @splat(value);
+    const indices: [count]u32 = @splat(0);
+    const Batch = local.sql_execution_batch.Batch;
+    const encoded_key: Batch = .{ .dictionary = .{ .values = &.{key}, .indices = &indices } };
+    const encoded_value: Batch = .{ .dictionary = .{ .values = &.{value}, .indices = &indices } };
+    for ([_]bool{ false, true }) |encoded| for (std.enums.values(Mode)) |mode| {
+        Clock.tick = 0;
+        var signal: std.atomic.Value(bool) = .init(false);
+        var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = if (mode == .backing_oom) 1 else std.math.maxInt(usize) });
+        var node: Node = .{ .mode = mode, .signal = &signal, .backing = &backing, .metadata_bytes = metadata };
+        var memory: Budget.Partitioned = .{ .foreground = .{ .child = backing.allocator(), .limit = 1 << 20, .accounting = .{ .ptr = &node, .reserve_fn = Node.reserve, .try_reserve_fn = Node.attempt, .release_fn = Node.release } }, .control = .{ .child = a, .limit = 64 } };
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = a;
+        server.request_memory = &memory;
+        server.embedding_provider_runtime.io = std.testing.io;
+        var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: http_server.RunnableScheduler.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 72, .cancellation = .{ .ptr = &signal, .requested = Node.canceled } }, .query);
+        defer execution.finish();
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution, .serial_execution = true };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        const HashCheck = struct {
+            adapter: *Adapter,
+            node: *Node,
+            signal: *std.atomic.Value(bool),
+            triggered: bool = false,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.node.mode == .estimate_canceled or (self.node.mode == .hash_canceled and self.node.backing.allocated_bytes - self.node.backing.freed_bytes == self.node.metadata_bytes + scratch_bytes)) {
+                    // Estimation stops before reservation; the later hash
+                    // mode stops only when the vector is physically live.
+                    std.debug.assert(self.node.backing.allocated_bytes - self.node.backing.freed_bytes == (if (self.node.mode == .estimate_canceled) @as(usize, 0) else self.node.metadata_bytes + scratch_bytes));
+                    self.triggered = true;
+                    self.signal.store(true, .release);
+                }
+                try Adapter.checkpoint(self.adapter);
+            }
+        };
+        var hash_check: HashCheck = .{ .adapter = &adapter, .node = &node, .signal = &signal };
+        var scope = adapter.coordinatorScope().?;
+        scope.check = .{ .context = &hash_check, .check = HashCheck.check };
+        const group = try Groups.create(a, &specs, .{ .coordinator_scope = scope });
+        defer group.deinit();
+        const result = if (encoded) group.addEncodedColumns(&.{encoded_key}, &.{ encoded_value, encoded_value }, count) else group.addColumns(&.{&keys}, &.{ &values, &values }, count);
+        if (mode == .canceled or mode == .expired or mode == .hash_canceled or mode == .estimate_canceled) {
+            try std.testing.expectError(if (mode == .expired) error.DeadlineExceeded else error.Canceled, result);
+            try std.testing.expectEqual(@as(u64, 0), group.rows_seen);
+            try std.testing.expectEqual(@as(usize, 0), group.groups.items.len);
+        } else {
+            try result;
+            const reference = try Groups.create(a, &specs, .{});
+            defer reference.deinit();
+            for (0..count) |_| try reference.add(&.{key}, &.{ value, value });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const actual = try group.resultAt(arena.allocator(), 0);
+            const expected = try reference.resultAt(arena.allocator(), 0);
+            try std.testing.expectEqualDeep(expected.keys, actual.keys);
+            try std.testing.expectEqualDeep(expected.aggregates, actual.aggregates);
+            try std.testing.expectEqual(@as(u64, count), group.rows_seen);
+        }
+        try std.testing.expectEqual(mode == .hash_canceled or mode == .estimate_canceled, hash_check.triggered);
+        try std.testing.expectEqual(@as(usize, if (mode == .estimate_canceled) 0 else 1), node.attempts);
+        try std.testing.expectEqual(if (mode == .estimate_canceled) @as(usize, 0) else metadata + @as(usize, if (mode == .denied) 0 else scratch_bytes), node.peak);
+        try std.testing.expectEqual(mode != .denied and mode != .estimate_canceled, node.physical_retirement_checked);
+        try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+        try std.testing.expectEqual(@as(usize, 0), node.used);
+        try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 72), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(?u64, 100), execution.entry.?.options.deadline_ns);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    };
+}
+
 test "SQL pgwire native read cursor keeps transported JSON encoded through column pages and retires cache owners" {
     const Sources = @import("antfly_local_sources");
     const View = Sources.storage_relational_read_view.View;
@@ -3928,8 +6400,9 @@ test "SQL pgwire native read cursor keeps transported JSON encoded through colum
     const layout = try catalog.Row.TypedLayout.init(sa, &.{"j"});
     const encoded_page = try Payload.encodeVersion(sa, 1, &.{.{ .id = "key", .version = 1, .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = &.{Sources.sql_scalar.Datum.json(json)} } }}, null, .v2);
     var fixture: Fixture = .{ .bytes = encoded_page };
-    var adapter: Adapter = undefined;
-    adapter.context = .{};
+    // Page delivery still crosses the normal checkpoint and admission path.
+    // This fixture has no server/catalog work and no retained read fence.
+    var adapter: Adapter = .{ .server = undefined, .identity = undefined, .context = .{} };
     const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 3, .columns = &.{.{ .name = "j", .path = "j", .type = .json }} };
     var projection = try Sources.sql_document_row.Projection.init(a, table, &.{"j"});
     defer projection.deinit(a);

@@ -1,0 +1,9 @@
+{
+  "exit_code": 0,
+  "terminal_session": 93489,
+  "compiler": "/Users/ajroetker/bin/zig-0.17.0/zig",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "35f5f7df8155af6276d1097dabae77482e1e0c2214ced266cf1e08e9ed43b306",
+    "zig/pkg/antfly-embedded/src/common/bounded_admission.zig": "de3752df68796efa72f122cc02ca56b030b367bacfc21fa314b853c21bbaa732"
+  }
+}

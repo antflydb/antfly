@@ -6912,6 +6912,7 @@ const CudaKvDeviceStorage = struct {
     allocator: std.mem.Allocator,
     compute: *CudaCompute,
     dtype: kv_pool_mod.KvDType,
+    device_memory_budget: ?@import("../../runtime/kv/device_memory.zig").Budget = null,
     layers: std.AutoHashMapUnmanaged(u64, CudaKvLayer) = .{},
     revision: u64 = 0,
     match_binding: ?*AttentionMatchBinding = null,
@@ -7015,7 +7016,7 @@ const CudaKvDeviceStorage = struct {
         }
         if (layer.block_table_capacity < upload_blocks) {
             try preparePersistentCudaBufferReallocation(self.compute);
-            var new_table = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, block_table_bytes);
+            var new_table = try buffer_mod.DeviceBuffer.allocAdmitted(&self.compute.ctx, block_table_bytes, self.device_memory_budget);
             errdefer new_table.free(&self.compute.ctx);
             self.compute.noteDeviceBytes(block_table_bytes);
             layer.block_table.free(&self.compute.ctx);
@@ -7118,9 +7119,9 @@ const CudaKvDeviceStorage = struct {
             const new_capacity = if (capacity_limit) |limit| @min(growth_capacity, limit) else growth_capacity;
             const k_bytes = try checkedMul(new_capacity, key_row_bytes);
             const v_bytes = try checkedMul(new_capacity, value_row_bytes);
-            var new_k = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, k_bytes);
+            var new_k = try buffer_mod.DeviceBuffer.allocAdmitted(&self.compute.ctx, k_bytes, self.device_memory_budget);
             errdefer new_k.free(&self.compute.ctx);
-            var new_v = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, v_bytes);
+            var new_v = try buffer_mod.DeviceBuffer.allocAdmitted(&self.compute.ctx, v_bytes, self.device_memory_budget);
             errdefer new_v.free(&self.compute.ctx);
             self.compute.noteDeviceBytes(try checkedAdd(k_bytes, v_bytes));
             if (layer.capacity_tokens != 0) {
@@ -7362,8 +7363,9 @@ const CudaKvDeviceStorage = struct {
         }
     }
 
-    fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    fn hookDeinit(ctx: *anyopaque, _: std.mem.Allocator) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        const allocator = self.allocator;
         self.deinit();
         allocator.destroy(self);
     }
@@ -8267,10 +8269,11 @@ fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvSt
     const config = storage.storage.config;
     if (config.dtype != .f32 and cudaPagedKvFormat(config.dtype) == null) return;
     if (config.num_kv_heads == 0 or config.head_dim == 0) return;
-    const device_storage = try CudaKvDeviceStorage.create(self.allocator, self, storage.storage.config.dtype);
+    const device_storage = try CudaKvDeviceStorage.create(storage.allocator, self, storage.storage.config.dtype);
+    device_storage.device_memory_budget = storage.device_memory_budget;
     errdefer {
         device_storage.deinit();
-        self.allocator.destroy(device_storage);
+        storage.allocator.destroy(device_storage);
     }
     storage.setDeviceWriteHook(device_storage.hook());
 }
@@ -12423,13 +12426,21 @@ fn retainPinnedTempSlot(self: *CudaCompute, buffer: buffer_mod.DeviceBuffer) boo
 fn drainDeferredDeviceFreesAfterSyncUnlocked(self: *CudaCompute) void {
     if (self.deferred_device_frees.items.len == 0) return;
     var reclaimed: usize = 0;
+    var retained: usize = 0;
+    var retained_bytes: usize = 0;
     for (self.deferred_device_frees.items) |*buffer| {
-        reclaimed += buffer.len;
+        const bytes = buffer.len;
         self.stats.device_free_calls += 1;
         buffer.free(&self.ctx);
+        if (buffer.ptr != 0) {
+            // Failed physical retirement stays queued and charged for retry.
+            self.deferred_device_frees.items[retained] = buffer.*;
+            retained += 1;
+            retained_bytes += bytes;
+        } else reclaimed += bytes;
     }
-    self.deferred_device_frees.clearRetainingCapacity();
-    self.deferred_device_free_bytes = 0;
+    self.deferred_device_frees.items.len = retained;
+    self.deferred_device_free_bytes = retained_bytes;
     self.stats.deferred_free_drains += 1;
     self.stats.deferred_free_reclaimed_bytes += reclaimed;
 }
@@ -12850,6 +12861,13 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
     if (lock_sample) |sample| self.temp_scan_profile.end(3, sample, 0);
     if (releasePinnedTempSlot(self, buffer)) return;
     if (buffer.allocation_bytes != 0) buffer.len = buffer.allocation_bytes;
+    if (buffer.device_credit != null) {
+        // Cache KV credits must not become indefinite generic scratch-cache
+        // residency. Retire after stream completion, keeping the credit with
+        // the descriptor until the driver confirms its physical free.
+        evictTempBufferUnlocked(self, buffer);
+        return;
+    }
     const cache_budget = cudaTempCacheBudgetBytes(self);
     const max_buffers = cudaTempCacheMaxBuffers(self);
     var cached_bytes: usize = 0;

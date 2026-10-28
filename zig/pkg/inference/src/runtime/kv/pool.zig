@@ -312,14 +312,14 @@ pub const KvPool = struct {
         self.target_max_blocks = target;
     }
 
-    /// Total number of blocks currently held by the pool, including blocks
-    /// sitting on the free list awaiting reuse.
+    /// Total number of stable slots held by the pool, including free slots
+    /// whose physical backing may have been trimmed.
     pub fn liveBlocks(self: *const KvPool) usize {
         return self.blocks.items.len;
     }
 
-    /// Number of blocks immediately available without growing the pool — i.e.
-    /// blocks already on the free list ready for reacquire.
+    /// Number of free slots ready for reacquire without growing metadata.
+    /// Trimmed slots still require physical backing admission.
     pub fn freeListBlocks(self: *const KvPool) usize {
         return self.free_list.items.len;
     }
@@ -329,8 +329,8 @@ pub const KvPool = struct {
     /// pushing total live blocks past the cap. Returns `null` when no cap is
     /// set, meaning admission should treat the pool as unbounded.
     ///
-    /// Free-list reuse counts toward headroom because it does not grow the
-    /// pool; only fresh allocations expand `liveBlocks`. So the answer is
+    /// Free-list reuse counts toward slot headroom because it does not grow
+    /// metadata; trimmed slots must still acquire backing. The answer is
     /// "free-list size + remaining grow room".
     pub fn availableBlocks(self: *const KvPool) ?usize {
         const cap = self.target_max_blocks orelse return null;
@@ -349,19 +349,26 @@ pub const KvPool = struct {
     }
 
     pub fn acquire(self: *KvPool, allocator: std.mem.Allocator) !block.KvBlockId {
-        if (self.free_list.pop()) |id| {
+        const recycled = if (self.free_list.items.len != 0) self.free_list.items[self.free_list.items.len - 1] else null;
+        if (recycled) |id| {
             const entry = self.storageMut(id) orelse return error.InvalidBlockId;
-            entry.meta.tokens_written = 0;
-            entry.meta.refcount = 1;
-            if (self.config.store_cpu_bytes) {
+            if (!self.config.store_cpu_bytes or entry.k_data.len != 0) {
+                entry.meta.tokens_written = 0;
+                entry.meta.refcount = 1;
                 @memset(entry.k_data, 0);
                 @memset(entry.v_data, 0);
+                _ = self.free_list.pop();
+                return id;
             }
-            return id;
+            // A reclaimed slot keeps its identity, but must reacquire physical
+            // backing before publishing a reference or removing its free ID.
         }
 
-        const id = self.next_block_id;
-        self.next_block_id += 1;
+        const id = recycled orelse self.next_block_id;
+        const next_id = if (recycled != null) self.next_block_id else std.math.add(block.KvBlockId, id, 1) catch return error.KvCapacityTooSmall;
+        // Reserve retirement metadata before publishing a block. Dropping its
+        // final reference must work even when data admission is exhausted.
+        if (recycled == null) try self.free_list.ensureTotalCapacity(allocator, self.blocks.items.len + 1);
 
         var k_data: []align(4) u8 = &.{};
         errdefer if (k_data.len != 0) allocator.free(k_data);
@@ -377,13 +384,18 @@ pub const KvPool = struct {
             @memset(v_data, 0);
         }
 
-        // Lazily allocate scratch buffers for dequantization on first block acquire.
+        // Stage both scratch buffers until every fallible allocation succeeds.
+        // A denied V scratch allocation must not leave a half-initialized pool.
+        var pending_scratch_k: ?[]f32 = null;
+        errdefer if (pending_scratch_k) |memory| allocator.free(memory);
+        var pending_scratch_v: ?[]f32 = null;
+        errdefer if (pending_scratch_v) |memory| allocator.free(memory);
         if (self.config.dtype != .f32 and self.read_scratch_k == null) {
-            self.read_scratch_k = try allocator.alloc(f32, self.keyValuesPerToken());
-            self.read_scratch_v = try allocator.alloc(f32, self.valueValuesPerToken());
+            pending_scratch_k = try allocator.alloc(f32, self.keyValuesPerToken());
+            pending_scratch_v = try allocator.alloc(f32, self.valueValuesPerToken());
         }
 
-        try self.blocks.append(allocator, .{
+        const entry: KvBlockStorage = .{
             .meta = .{
                 .pool_id = self.pool_id,
                 .block_id = id,
@@ -391,8 +403,52 @@ pub const KvPool = struct {
             },
             .k_data = k_data,
             .v_data = v_data,
-        });
+        };
+        if (recycled != null) {
+            self.blocks.items[id] = entry;
+            _ = self.free_list.pop();
+        } else {
+            try self.blocks.append(allocator, entry);
+        }
+        if (pending_scratch_k) |memory| self.read_scratch_k = memory;
+        if (pending_scratch_v) |memory| self.read_scratch_v = memory;
+        self.next_block_id = next_id;
         return id;
+    }
+
+    /// Free unused CPU backing down to a byte target, preserving every slot
+    /// identity and every referenced block. Caller must own the pool's lane.
+    /// Metadata remains available for allocation-free retirement. Reacquiring
+    /// a trimmed slot is fallible and publishes nothing until backing exists.
+    pub fn trimFreeBacking(self: *KvPool, allocator: std.mem.Allocator, target_bytes: usize) usize {
+        if (self.config.backend != .native or !self.config.store_cpu_bytes) return 0;
+        var resident: usize = 0;
+        for (self.blocks.items) |entry| resident += entry.k_data.len + entry.v_data.len;
+        var freed: usize = 0;
+        for (self.free_list.items) |id| {
+            if (resident <= target_bytes) break;
+            const entry = &self.blocks.items[id];
+            std.debug.assert(entry.meta.refcount == 0);
+            const bytes = entry.k_data.len + entry.v_data.len;
+            entry.deinit(allocator);
+            entry.k_data = &.{};
+            entry.v_data = &.{};
+            resident -= bytes;
+            freed += bytes;
+        }
+        if (resident == 0) {
+            if (self.read_scratch_k) |memory| {
+                freed += memory.len * @sizeOf(f32);
+                allocator.free(memory);
+                self.read_scratch_k = null;
+            }
+            if (self.read_scratch_v) |memory| {
+                freed += memory.len * @sizeOf(f32);
+                allocator.free(memory);
+                self.read_scratch_v = null;
+            }
+        }
+        return freed;
     }
 
     pub fn setPoolId(self: *KvPool, pool_id: block.KvPoolId) void {
@@ -402,9 +458,11 @@ pub const KvPool = struct {
 
     pub fn release(self: *KvPool, allocator: std.mem.Allocator, id: block.KvBlockId) !void {
         const entry = self.storageMut(id) orelse return error.InvalidBlockId;
+        if (entry.meta.refcount == 0) return error.InvalidBlockRefcount;
+        try self.free_list.ensureUnusedCapacity(allocator, 1);
         entry.meta.refcount = 0;
         entry.meta.tokens_written = 0;
-        try self.free_list.append(allocator, id);
+        self.free_list.appendAssumeCapacity(id);
     }
 
     pub fn retain(self: *KvPool, id: block.KvBlockId) !void {
@@ -415,10 +473,11 @@ pub const KvPool = struct {
     pub fn releaseRef(self: *KvPool, allocator: std.mem.Allocator, id: block.KvBlockId) !bool {
         const entry = self.storageMut(id) orelse return error.InvalidBlockId;
         if (entry.meta.refcount == 0) return error.InvalidBlockRefcount;
+        if (entry.meta.refcount == 1) try self.free_list.ensureUnusedCapacity(allocator, 1);
         entry.meta.refcount -= 1;
         if (entry.meta.refcount > 0) return false;
         entry.meta.tokens_written = 0;
-        try self.free_list.append(allocator, id);
+        self.free_list.appendAssumeCapacity(id);
         return true;
     }
 
@@ -1370,5 +1429,138 @@ test "checked token-pair sizes match runtime layouts and reject overflow" {
             error.Overflow,
             KvDType.f32.bytesForTokenPairChecked(std.math.maxInt(u32), std.math.maxInt(u32)),
         );
+    }
+}
+
+test "pool admission failure retries the same block identity and stages both scratch buffers" {
+    for ([_]KvDType{ .f32, .f16 }) |dtype| {
+        var failures: usize = 0;
+        for (0..16) |failure_index| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failure_index });
+            const allocator = failing.allocator();
+            var pool = KvPool.init(.{ .backend = .native, .dtype = dtype, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+            defer pool.deinit(allocator);
+            const first = pool.acquire(allocator) catch |err| blk: {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failures += 1;
+                try std.testing.expectEqual(@as(block.KvBlockId, 0), pool.next_block_id);
+                try std.testing.expectEqual(@as(usize, 0), pool.blocks.items.len);
+                try std.testing.expect(pool.read_scratch_k == null and pool.read_scratch_v == null);
+                failing.fail_index = std.math.maxInt(usize);
+                break :blk try pool.acquire(allocator);
+            };
+            try std.testing.expectEqual(@as(block.KvBlockId, 0), first);
+            try std.testing.expectEqual(@as(block.KvBlockId, 1), pool.next_block_id);
+            if (dtype != .f32) try std.testing.expect(pool.read_scratch_k != null and pool.read_scratch_v != null);
+            const before_release = failing.alloc_index;
+            failing.fail_index = before_release;
+            try std.testing.expect(try pool.releaseRef(allocator, first));
+            try std.testing.expectEqual(before_release, failing.alloc_index);
+            try std.testing.expectEqual(first, try pool.acquire(allocator));
+            try pool.writeToken(first, 0, 0, &.{ 1, 2 }, &.{ 3, 4 });
+            const row = try pool.readToken(first, 0, 0);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row.k);
+            try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, row.v);
+            if (!failing.has_induced_failure) break;
+        }
+        try std.testing.expect(failures >= 4);
+    }
+}
+
+test "pool final reference retires without allocation and duplicate release cannot republish a block" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var pool = KvPool.init(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+    defer pool.deinit(allocator);
+    const id = try pool.acquire(allocator);
+    try pool.retain(id);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expect(!try pool.releaseRef(allocator, id));
+    try std.testing.expect(try pool.releaseRef(allocator, id));
+    try std.testing.expectError(error.InvalidBlockRefcount, pool.release(allocator, id));
+    try std.testing.expectError(error.InvalidBlockRefcount, pool.releaseRef(allocator, id));
+    try std.testing.expectEqual(@as(usize, 1), pool.freeListBlocks());
+    try std.testing.expectEqual(id, try pool.acquire(allocator));
+}
+
+test "pool trims cold backing without moving pinned identities or allocating cleanup" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var pool = KvPool.init(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+    defer pool.deinit(allocator);
+    const pinned = try pool.acquire(allocator);
+    const cold = try pool.acquire(allocator);
+    try pool.writeToken(pinned, 0, 0, &.{ 1, 2 }, &.{ 3, 4 });
+    try pool.release(allocator, cold);
+    const allocations = failing.alloc_index;
+    failing.fail_index = allocations;
+    const before = failing.freed_bytes;
+    try std.testing.expectEqual(pool.bytesPerBlock(), pool.trimFreeBacking(allocator, 0));
+    try std.testing.expectEqual(before + pool.bytesPerBlock(), failing.freed_bytes);
+    try std.testing.expectEqual(allocations, failing.alloc_index);
+    try std.testing.expectEqual(@as(u32, 1), pool.storage(pinned).?.meta.refcount);
+    try std.testing.expectEqual(@as(usize, 0), pool.storage(cold).?.k_data.len);
+    const row = try pool.readToken(pinned, 0, 0);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row.k);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, row.v);
+    try std.testing.expectError(error.OutOfMemory, pool.acquire(allocator));
+    try std.testing.expectEqual(@as(usize, 1), pool.freeListBlocks());
+    try std.testing.expectEqual(@as(block.KvBlockId, 2), pool.next_block_id);
+    try pool.release(allocator, pinned);
+    const freed = pool.trimFreeBacking(allocator, 0);
+    try std.testing.expect(freed > pool.bytesPerBlock()); // Includes idle read scratch.
+    try std.testing.expect(pool.read_scratch_k == null and pool.read_scratch_v == null);
+    try std.testing.expectEqual(@as(usize, 0), pool.trimFreeBacking(allocator, 0));
+}
+
+test "pool trimmed reacquire allocation failures preserve free identity and scratch atomicity" {
+    for ([_]KvDType{ .f32, .f16 }) |dtype| {
+        const allocation_count: usize = if (dtype == .f32) 2 else 4;
+        for (0..allocation_count) |failure_offset| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            const allocator = failing.allocator();
+            var pool = KvPool.init(.{ .backend = .native, .dtype = dtype, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+            defer pool.deinit(allocator);
+            const id = try pool.acquire(allocator);
+            try pool.release(allocator, id);
+            _ = pool.trimFreeBacking(allocator, 0);
+            const live_bytes = failing.allocated_bytes - failing.freed_bytes;
+            failing.fail_index = failing.alloc_index + failure_offset;
+            try std.testing.expectError(error.OutOfMemory, pool.acquire(allocator));
+            try std.testing.expectEqual(live_bytes, failing.allocated_bytes - failing.freed_bytes);
+            try std.testing.expectEqual(@as(usize, 1), pool.freeListBlocks());
+            try std.testing.expectEqual(@as(u32, 0), pool.storage(id).?.meta.refcount);
+            try std.testing.expectEqual(@as(usize, 0), pool.storage(id).?.k_data.len);
+            try std.testing.expect(pool.read_scratch_k == null and pool.read_scratch_v == null);
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expectEqual(id, try pool.acquire(allocator));
+            try pool.writeToken(id, 0, 0, &.{ 5, 6 }, &.{ 7, 8 });
+            const row = try pool.readToken(id, 0, 0);
+            try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, row.k);
+            try std.testing.expectEqualSlices(f32, &.{ 7, 8 }, row.v);
+        }
+    }
+}
+
+test "pool backing trim respects retained target and leaves accelerator pools untouched" {
+    for ([_]BackendKind{ .native, .metal, .cuda }) |backend| {
+        var pool = KvPool.init(.{ .backend = backend, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+        const allocator = std.testing.allocator;
+        defer pool.deinit(allocator);
+        const pinned = try pool.acquire(allocator);
+        const cold_a = try pool.acquire(allocator);
+        const cold_b = try pool.acquire(allocator);
+        try pool.release(allocator, cold_a);
+        try pool.release(allocator, cold_b);
+        const bytes = pool.bytesPerBlock();
+        try std.testing.expectEqual(if (backend == .native) bytes else 0, pool.trimFreeBacking(allocator, 2 * bytes));
+        try std.testing.expectEqual(@as(usize, 0), pool.trimFreeBacking(allocator, 2 * bytes));
+        try std.testing.expectEqual(@as(u32, 1), pool.storage(pinned).?.meta.refcount);
+        try std.testing.expectEqual(@as(usize, 3), pool.liveBlocks());
+        try std.testing.expectEqual(@as(usize, 2), pool.freeListBlocks());
+        if (backend != .native) {
+            try std.testing.expect(pool.storage(cold_a).?.k_data.len != 0);
+            try std.testing.expectEqual(@as(usize, 0), pool.trimFreeBacking(allocator, 0));
+        }
     }
 }

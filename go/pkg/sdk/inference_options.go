@@ -157,10 +157,11 @@ func withInferenceResponseLimits() oapi.ClientOption {
 // client options such as WithHTTPClient and WithRequestEditorFn.
 func NewInferenceClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*InferenceClient, error) {
 	apiURL := normalizeInferenceBaseURL(baseURL)
-	opts = append(append([]oapi.ClientOption(nil), opts...), withInferenceResponseLimits())
+	var admission *BoundedHTTPClient
+	opts = append(append([]oapi.ClientOption(nil), opts...), withRequestAdmission(&admission), withInferenceResponseLimits())
 	client, err := oapi.NewClientWithResponses(apiURL, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &InferenceClient{client: client, baseURL: apiURL}, nil
+	return &InferenceClient{client: client, baseURL: apiURL, admission: admission}, nil
 }

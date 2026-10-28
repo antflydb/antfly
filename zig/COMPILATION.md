@@ -1045,6 +1045,38 @@ Debug tools and ownership fixtures use `std.heap.SafeAllocator`; its `deinit()`
 returns a leak count. Memory-bounded fixtures retain a requested-byte cap outside
 the allocator metadata.
 
+
+### ARM64 ReleaseSafe workload-pooling qualification build
+
+Linux qualification uses the repository-pinned `zig_0_17` Nix package from
+`scripts/ci/toolchain-policy.json`. Verify both the compiler version and dynamic
+linkage before building baseline and candidate with identical ReleaseSafe settings.
+An earlier official-archive compiler attempt exceeded several scheduling claims
+and failed to finish storage compilation. Those measurements do not establish
+compiler reservations for the glibc-linked Nix compiler.
+
+The subsequent pinned Nix glibc Zig 0.17.0 native ARM64 GNU ReleaseSafe CLI
+compile peaked at 3,645,767,680 bytes, exceeding its existing 3 GiB claim. This
+profile reserves 5 GiB, providing more than 25% measured headroom. The API
+archive subsequently peaked at 12,550,221,824 bytes, exceeding 10 GiB; this
+profile reserves 15 GiB with the same measured headroom. The distributed archive
+peaked at 13,191,520,256 bytes, exceeding 11 GiB; its reservation is 16 GiB.
+Other Linux profiles retain their existing claims. Baseline and candidate use
+the same build-only
+compiler scheduling adjustments.
+
+Native macOS ReleaseSafe distributed compilation exceeded 13 GiB at 14.01 decimal
+GB; its reservation is 17 GiB, with more than 25% headroom. This compiler admission
+claim is separate from runtime memory limits. Qualification's enforced 2/4 GiB
+runtime containers and release gates remain unchanged.
+
+The native unstripped Nix storage compilation subsequently exceeded the existing
+20 GiB compiler claim. That attempt was stopped and retained as an unqualified
+build, not a measured final peak. Linux workload qualification uses stripped
+ReleaseSafe for both variants, matching the existing measured release profile;
+stripping debug information preserves ReleaseSafe runtime checks. Both variants
+retain identical target/optimization/strip settings and unchanged workload gates.
+
 ### October 13 wolfspider experiment (opt-in)
 
 A paired cold-cache `antfly capi` build took **44m28s → 34m42s**, saving

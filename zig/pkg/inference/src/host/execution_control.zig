@@ -60,9 +60,34 @@ pub const RequestContext = struct {
     /// Notified immediately before request bytes may reach an upstream.
     /// A notification means the upstream outcome may be unknown on timeout.
     submission: ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } = null,
+    /// Synchronous provider phases may borrow this caller's execution grant.
+    /// Never forward its callbacks to watchdogs or parallel children.
+    runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+
+    /// A finite deadline, execution owner or fallible authority requires a
+    /// provider that accepts the actual controls. A transport-only atomic
+    /// cancellation token retains the legacy compatibility path.
+    pub fn requiresControlledProvider(self: RequestContext) bool {
+        return self.deadline_ns != null or self.runnable != null or
+            (if (self.cancellation) |token| token.check_fn != null else false);
+    }
 
     pub fn check(self: RequestContext) !void {
-        if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        if (self.cancellation) |value| value.check() catch |err| return switch (err) {
+            error.Canceled => error.Cancelled,
+            error.DeadlineExceeded => error.Timeout,
+            else => err,
+        };
+        // Physical borrowers may poll while the parent is parked. This
+        // optional owner capability observes retained lifetime without a CPU
+        // checkpoint or phase transition.
+        if (self.runnable) |borrow| if (borrow.check_lifetime != null) {
+            borrow.checkLifetime() catch |err| return switch (err) {
+                error.Canceled => error.Cancelled,
+                error.DeadlineExceeded => error.Timeout,
+                else => err,
+            };
+        };
         const deadline = self.deadline_ns orelse return;
         if (platform_time.monotonicNs() >= deadline) return error.Timeout;
     }
@@ -91,3 +116,32 @@ pub const RequestContext = struct {
         });
     }
 };
+
+test "provider request lifetime polling preserves parked owner without CPU checkpoints" {
+    const runtime = @import("antfly_runtime_abi");
+    const Fake = struct {
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (self.failure) |failure| runtime.error_abi.statusFromError(failure) else .ok;
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+        }
+    };
+    var fake: Fake = .{};
+    const request: RequestContext = .{ .io = std.testing.io, .deadline_ns = null, .runnable = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Fake.checkpoint, .park = Fake.phase, .enter = Fake.phase, .check_lifetime = Fake.lifetime } };
+    try request.check();
+    fake.failure = error.Canceled;
+    try std.testing.expectError(error.Cancelled, request.check());
+    fake.failure = error.DeadlineExceeded;
+    try std.testing.expectError(error.Timeout, request.check());
+    fake.failure = error.SchedulerClosed;
+    try std.testing.expectError(error.SchedulerClosed, request.check());
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+}

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const read_admission = @import("../../common/read_admission.zig");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const bloom = @import("bloom");
@@ -103,6 +104,13 @@ const BlockPin = union(enum) {
         }
         self.* = undefined;
     }
+    fn releaseForAdmittedRead(self: *@This(), deferred: bool) void {
+        switch (self.*) {
+            .cached => |*handle| if (deferred) handle.releaseToCache() else handle.release(),
+            .local => |payload| payload.release(),
+        }
+        self.* = undefined;
+    }
 };
 
 /// One owner-wide bound for cursor and point-result borrowing.
@@ -152,6 +160,16 @@ const SourceBlockLease = union(enum) {
             .none => {},
             .owned => |*owned| owned.release(),
             .cached => |*handle| handle.release(),
+            .local => |payload| payload.release(),
+        }
+        self.* = .none;
+    }
+
+    fn releaseForAdmittedRead(self: *@This(), deferred: bool) void {
+        switch (self.*) {
+            .none => {},
+            .owned => |*owned| owned.release(),
+            .cached => |*handle| if (deferred) handle.releaseToCache() else handle.release(),
             .local => |payload| payload.release(),
         }
         self.* = .none;
@@ -454,8 +472,11 @@ pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
-fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable) !void {
+fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port) !void {
     if (incoming.entryCount() == 0) return;
+    if (comptime @hasDecl(@TypeOf(backend.*), "publishMutableWithWalAdmission")) if (control) |original| {
+        if (try backend.publishMutableWithWalAdmission(incoming, original)) return;
+    };
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
         var candidate = if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
             try backend.prepareAndAppendWalForMutable(incoming)
@@ -556,6 +577,14 @@ fn invalidateSnapshot(snapshot: *?State, allocator: Allocator) void {
 }
 
 fn runtimeScratchAllocator(fallback: Allocator) Allocator {
+    // Preserve an explicitly supplied reclaimable root instead of escaping
+    // its process ceiling through libc. Unwrap result arenas so scratch frees
+    // remain independent, and never introduce reclaim callbacks under locks.
+    if (@import("../resource_manager.zig").BudgetedAllocator.fromAllocator(fallback)) |root| {
+        return root.threadSafeNoReclaimAllocator();
+    }
+    if (@import("runtime_memory_abi").Allocator.isStdAdapter(fallback)) return fallback;
+
     if (comptime builtin.os.tag == .freestanding) return fallback;
     if (comptime builtin.link_libc) return std.heap.c_allocator;
     if (comptime builtin.single_threaded) return fallback;
@@ -623,6 +652,17 @@ pub fn lockBackend(comptime BackendType: type, backend: *BackendType) bool {
     return false;
 }
 
+pub fn lockBackendWithAdmission(comptime BackendType: type, backend: *BackendType, control: read_admission.Port) !bool {
+    try control.checkpoint();
+    if (@hasField(BackendType, "mu")) {
+        const started_ns = if (@hasDecl(BackendType, "recordBackendLockWait")) platform_time.monotonicNs() else 0;
+        try @import("../../common/bounded_mutex.zig").lockAtomic(&backend.mu, control);
+        if (@hasDecl(BackendType, "recordBackendLockWait")) backend.recordBackendLockWait(platform_time.monotonicNs() -| started_ns);
+        return true;
+    }
+    return false;
+}
+
 pub fn unlockBackend(comptime BackendType: type, backend: *BackendType, locked: bool) void {
     if (locked) {
         if (@hasDecl(BackendType, "unlockWithReclamation")) backend.unlockWithReclamation() else backend.mu.unlock();
@@ -664,8 +704,14 @@ pub fn BoundStore(comptime BackendType: type) type {
         backend: *BackendType,
         namespace: backend_types.Namespace,
 
+        pub fn publicationGate(self: *@This()) ?*std.atomic.Mutex {
+            if (@hasField(BackendType, "publication_backlog_mutex")) return &self.backend.publication_backlog_mutex;
+            return null;
+        }
+
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{
+                .semantic_cursor_bounds = true,
                 .ordered_ranges = true,
                 .reverse_ranges = true,
                 .cursors = true,
@@ -678,8 +724,22 @@ pub fn BoundStore(comptime BackendType: type) type {
             };
         }
 
+        pub fn beginOwnedKeyCursor(self: *@This(), allocator: Allocator, control: read_admission.Port) !OwnedNamespaceKeyCursor(BackendType) {
+            return self.backend.beginOwnedKeyCursor(allocator, self.namespace, control);
+        }
+
+        pub fn beginOwnedValueRead(self: *@This(), allocator: Allocator, key: []const u8, control: read_admission.Port) !OwnedNamespaceValueRead(BackendType) {
+            return self.backend.beginOwnedValueRead(allocator, self.namespace, key, control);
+        }
+
         pub fn beginRead(self: *@This()) !LocalReadTxn {
             return try LocalReadTxn.open(self.backend, self.namespace);
+        }
+
+        pub fn beginReadWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !LocalReadTxn {
+            var namespace = self.namespace;
+            namespace.block_cache_admission = admission;
+            return try LocalReadTxn.openWithAdmission(self.backend, namespace, control);
         }
 
         pub fn beginReadWithBlockCacheAdmission(
@@ -689,6 +749,16 @@ pub fn BoundStore(comptime BackendType: type) type {
             var namespace = self.namespace;
             namespace.block_cache_admission = admission;
             return try LocalReadTxn.open(self.backend, namespace);
+        }
+
+        pub fn beginProbeWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !LocalProbeTxn {
+            var namespace = self.namespace;
+            namespace.block_cache_admission = admission;
+            return LocalProbeTxn.openWithAdmission(self.backend, namespace, control);
+        }
+
+        pub fn beginCurrentScanWithAdmission(self: *@This(), control: read_admission.Port) !LocalCurrentScanTxn {
+            return LocalCurrentScanTxn.openWithAdmission(self.backend, self.namespace, control);
         }
 
         pub fn beginProbe(self: *@This()) !LocalProbeTxn {
@@ -1034,6 +1104,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         const default_max_retained_mutable_source_entry_scratch: usize = 1 * 1024 * 1024;
         const min_retained_mutable_source_entry_scratch: usize = 4096;
 
+        admission: read_admission.Scope = .{},
+        // Ownership mode survives operation exit; no borrowed port survives.
+        defer_pin_returns: bool = false,
         allocator: Allocator,
         backend: *BackendType,
         mutable: *const MutableType,
@@ -1173,9 +1246,25 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             namespace: backend_types.Namespace,
             backend_locked: bool,
         ) !Self {
+            return initSequenceControlled(allocator, backend, mutable, immutable_memtables, sequence, l0_groups, namespace, backend_locked, null);
+        }
+
+        fn initSequenceControlled(
+            allocator: Allocator,
+            backend: *BackendType,
+            mutable: *const MutableType,
+            immutable_memtables: []const *const State,
+            sequence: RunSequence,
+            l0_groups: []const RunGroup,
+            namespace: backend_types.Namespace,
+            backend_locked: bool,
+            control: ?read_admission.Port,
+        ) !Self {
+            if (control) |budget| try budget.checkpoint();
             var source_count = 1 + immutable_memtables.len;
             var run_start: usize = 0;
             while (run_start < sequence.count()) {
+                if (control) |budget| try budget.checkpoint();
                 const end = sequence.end(run_start);
                 if (sequence.contains(run_start, end, namespace)) source_count += 1;
                 run_start = end;
@@ -1189,6 +1278,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     }
                 }
             }
+            if (control) |budget| try budget.checkpoint();
             const storage = try allocCursorStorage(allocator, source_count);
             errdefer allocator.free(storage);
 
@@ -1220,6 +1310,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             run_start = 0;
             var source_index = 1 + immutable_memtables.len;
             while (run_start < sequence.count()) {
+                if (control) |budget| try budget.checkpoint();
                 const end = sequence.end(run_start);
                 if (sequence.contains(run_start, end, namespace)) {
                     run_spans[source_index] = .{ .start = run_start, .end = end, .current = run_start };
@@ -1228,6 +1319,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 run_start = end;
             }
 
+            if (control) |budget| try budget.checkpoint();
             return .{
                 .allocator = allocator,
                 .backend = backend,
@@ -1257,6 +1349,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             };
         }
 
+        fn returnCachePin(self: *@This(), handle: *cache_mod.Handle) void {
+            if (self.defer_pin_returns) handle.releaseToCache() else handle.release();
+        }
+
         pub fn setKeysOnly(self: *@This()) void {
             self.keys_only = true;
             self.record_scan_value_stats = false;
@@ -1270,7 +1366,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             if (comptime @hasDecl(BackendType, "trimRunSources")) self.backend.trimRunSources();
             for (0..self.source_key_copies.len) |source_index| self.clearSourceKeyCopy(source_index);
             for (self.source_table_index_handles) |*maybe_handle| {
-                if (maybe_handle.*) |*handle| handle.release();
+                if (maybe_handle.*) |*handle| self.returnCachePin(handle);
                 maybe_handle.* = null;
             }
             self.clearVisibleEntryBytes();
@@ -1294,6 +1390,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn first(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             try self.initForwardPositions("", true);
             const entry = try self.selectVisibleForward();
             self.current_key = if (entry) |e| e.key else null;
@@ -1315,6 +1412,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn last(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             const entry = try self.findLast();
             if (entry) |e| {
                 try self.initForwardPositions(e.key, true);
@@ -1325,7 +1423,25 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             return entry;
         }
 
+        pub fn nextWithAdmission(self: *@This(), control: read_admission.Port) !?backend_adapter.Entry {
+            const guard = try self.admission.enter(control);
+            self.defer_pin_returns = true;
+            defer guard.deinit();
+            const result = try self.next();
+            try self.admission.checkpoint();
+            return result;
+        }
+        pub fn seekAtOrAfterWithAdmission(self: *@This(), key: []const u8, control: read_admission.Port) !?backend_adapter.Entry {
+            const guard = try self.admission.enter(control);
+            self.defer_pin_returns = true;
+            defer guard.deinit();
+            const result = try self.seekAtOrAfter(key);
+            try self.admission.checkpoint();
+            return result;
+        }
+
         pub fn next(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             if (self.current_key == null) return null;
             try self.advanceForwardSources();
             const entry = try self.selectVisibleForward();
@@ -1334,6 +1450,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn prev(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             const key = self.current_key orelse return null;
             const entry = try self.findAtOrBefore(key, false);
             if (entry) |e| {
@@ -1346,6 +1463,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             const restart = if (comptime builtin.is_test) self.test_full_forward_seek else false;
             if (!restart and self.current_key != null) {
                 const current = self.current_key.?;
@@ -1367,11 +1485,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         /// those sources retain their block, position, and heap membership.
         /// Stabilize the target because it may alias a source's borrowed key.
         fn skipForwardTo(self: *@This(), target: []const u8) !void {
+            try self.admission.checkpoint();
             if (self.source_heap_len == 0) return;
             if (std.mem.order(u8, self.source_entries[self.source_heap[0]].?.key, target) != .lt) return;
             const stable_target = try self.allocator.dupe(u8, target);
             defer self.allocator.free(stable_target);
             while (self.source_heap_len != 0) {
+                try self.admission.checkpoint();
                 const source = self.source_heap[0];
                 if (std.mem.order(u8, self.source_entries[source].?.key, stable_target) != .lt) break;
                 try self.setSourceAtOrAfter(source, stable_target, true);
@@ -1380,6 +1500,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             const entry = try self.findAtOrBefore(key, true);
             if (entry) |e| {
                 try self.initForwardPositions(e.key, true);
@@ -1391,19 +1512,23 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn initForwardPositions(self: *@This(), target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             // A public seek may reuse the previous entry's borrowed key. A
             // source switch can release its backing block before other spans
             // have sought, so stabilize nonempty seek keys across all sources.
             const stable_target = try self.allocator.dupe(u8, target);
             defer self.allocator.free(stable_target);
             for (0..self.positions.len) |source_index| {
+                try self.admission.checkpoint();
                 try self.setSourceAtOrAfter(source_index, stable_target, inclusive);
             }
             self.rebuildForwardHeap();
         }
 
         fn selectVisibleForward(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             while (true) {
+                try self.admission.checkpoint();
                 const winner_source = self.bestVisibleForwardSource() orelse {
                     self.current_visible_source = null;
                     return null;
@@ -1434,6 +1559,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn retainCurrentValueForTxn(self: *@This(), held_blocks: *std.ArrayListUnmanaged(BlockPin)) !bool {
+            try self.admission.checkpoint();
             const source_index = self.current_visible_source orelse return false;
             if (self.source_result_retention.len != 0) switch (self.source_result_retention[source_index]) {
                 .pinned => return true,
@@ -1450,7 +1576,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             }
             if (self.source_blocks[source_index].retainPin()) |retained_block| {
                 var retained = retained_block;
-                errdefer retained.release();
+                errdefer retained.releaseForAdmittedRead(self.defer_pin_returns);
                 try held_blocks.append(self.backend.allocator, retained);
                 if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .pinned;
                 return true;
@@ -1573,13 +1699,16 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceForwardSources(self: *@This()) !void {
+            try self.admission.checkpoint();
             const key = self.current_key orelse return;
             try self.advanceForwardSourcesAtKey(key);
         }
 
         fn advanceForwardSourcesAtKey(self: *@This(), key: []const u8) !void {
+            try self.admission.checkpoint();
             const match_count = self.collectForwardHeapSourcesAtKey(key);
             for (self.advance_sources[0..match_count]) |source_index| {
+                try self.admission.checkpoint();
                 const idx = self.positions[source_index] orelse continue;
                 try self.advanceSource(source_index, idx);
                 self.updateForwardHeapSource(source_index);
@@ -1634,6 +1763,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn runForSource(self: *@This(), source_index: usize) !*Run {
+            try self.admission.checkpoint();
             const offset = self.runSourceOffset();
             if (source_index < offset) return error.RunStateUnavailable;
             const span = &self.run_spans[source_index];
@@ -1650,7 +1780,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             if (span.current == run_index) return;
             self.clearSourceBlock(source_index);
             self.clearSourceRunLease(source_index);
-            if (self.source_table_index_handles[source_index]) |*handle| handle.release();
+            if (self.source_table_index_handles[source_index]) |*handle| self.returnCachePin(handle);
             self.source_table_index_handles[source_index] = null;
             self.source_table_indices[source_index] = null;
             self.source_entries[source_index] = null;
@@ -1665,6 +1795,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn seekRunSpan(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             const span = self.run_spans[source_index];
             var lo = span.start;
             var hi = span.end;
@@ -1679,6 +1810,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             self.positions[source_index] = null;
             self.source_entries[source_index] = null;
             while (lo < span.end) : (lo += 1) {
+                try self.admission.checkpoint();
                 if (self.runStartsPastUpper(self.sequence.at(lo))) break;
                 self.selectSpanRun(source_index, lo);
                 try self.setSingleRunAtOrAfter(source_index, target, inclusive);
@@ -1688,23 +1820,25 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn tableIndexForRunSource(self: *@This(), source_index: usize, run: *Run) !*const lsm_table_file.TableIndex {
+            try self.admission.checkpoint();
             if (self.source_table_indices[source_index]) |index| {
                 recordCursorTableIndexHit(self.backend);
                 return index;
             }
             const index = if (self.backend.options.cache != null) blk: {
-                var handle = try loadRunTableIndexHandle(self.backend, run);
-                errdefer handle.release();
+                var handle = try loadRunTableIndexHandleWithAdmission(self.backend, run, self.admission.control);
+                errdefer self.returnCachePin(&handle);
                 const retained_index = handle.runTableIndex();
                 self.source_table_index_handles[source_index] = handle;
                 break :blk retained_index;
-            } else try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+            } else try indexForRunNoCacheMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             self.source_table_indices[source_index] = index;
             recordCursorTableIndexMiss(self.backend);
             return index;
         }
 
         fn sourceEntryAt(self: *@This(), source_index: usize, idx: usize) !SourceEntry {
+            try self.admission.checkpoint();
             if (source_index == 0) {
                 if (comptime MutableType == ActiveMemTable) return try self.copyMutableSourceEntryAt(idx);
                 const entry = self.mutable_entry_cursor.at(self.mutable, idx);
@@ -1726,12 +1860,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return try self.sourceEntryAtFromLocalIndex(source_index, run, index, idx);
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             const entry = try table.entryAt(idx);
             return .{ .namespace_name = entry.namespace_name, .key = entry.key, .value = entry.value, .tombstone = entry.tombstone };
         }
 
         fn sourceLowerBound(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !?usize {
+            try self.admission.checkpoint();
             if (!self.keyBeforeUpper(target)) return null;
             if (source_index == 0) return nextStateIndex(self.mutable, self.namespace, target, inclusive);
             if (self.immutableForSource(source_index)) |state| return nextStateIndex(state, self.namespace, target, inclusive);
@@ -1745,9 +1880,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return try self.sourceLowerBoundFromLocalIndex(source_index, run, index, target, inclusive);
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             var idx = try table.lowerBound(self.namespace.name, target);
             while (idx < table.entryCount()) : (idx += 1) {
+                try self.admission.checkpoint();
                 const entry = try table.entryAt(idx);
                 if (compareNamespace(.{ .name = entry.namespace_name }, self.namespace) != .eq) return null;
                 if (!inclusive and std.mem.eql(u8, entry.key, target)) continue;
@@ -1757,6 +1893,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn setSourceAtOrAfter(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             if (comptime builtin.is_test) self.test_seek_sources += 1;
             if (source_index == 0 and comptime MutableType == ActiveMemTable) {
                 try self.setMutableSourceAtOrAfter(target, inclusive);
@@ -1767,6 +1904,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn setSingleRunAtOrAfter(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             if (source_index == 0 or self.immutableForSource(source_index) != null) {
                 self.positions[source_index] = try self.sourceLowerBound(source_index, target, inclusive);
                 self.source_entries[source_index] = if (self.positions[source_index]) |idx|
@@ -1809,7 +1947,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return;
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             if (try table.lowerBoundPosition(self.namespace.name, target, inclusive)) |positioned| {
                 self.positions[source_index] = positioned.index;
                 self.source_entries[source_index] = .{
@@ -1825,11 +1963,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceSource(self: *@This(), source_index: usize, current: usize) !void {
+            try self.admission.checkpoint();
             try self.advanceSingleSource(source_index, current);
             if (source_index < self.runSourceOffset() or self.positions[source_index] != null) return;
             const span = self.run_spans[source_index];
             var next_run = span.current + 1;
             while (next_run < span.end) : (next_run += 1) {
+                try self.admission.checkpoint();
                 if (self.runStartsPastUpper(self.sequence.at(next_run))) break;
                 self.selectSpanRun(source_index, next_run);
                 try self.setSingleRunAtOrAfter(source_index, "", true);
@@ -1838,6 +1978,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceSingleSource(self: *@This(), source_index: usize, current: usize) !void {
+            try self.admission.checkpoint();
             if (source_index == 0 and comptime MutableType == ActiveMemTable) {
                 try self.advanceMutableSource();
                 return;
@@ -1891,7 +2032,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return;
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             if (try table.nextPositionInNamespace(self.namespace.name, current)) |positioned| {
                 self.positions[source_index] = positioned.index;
                 self.source_entries[source_index] = .{
@@ -1907,6 +2048,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn nextSourceIndex(self: *@This(), source_index: usize, current: usize) !?usize {
+            try self.admission.checkpoint();
             if (source_index == 0) return nextIndexFrom(self.mutable, self.namespace, current);
             if (self.immutableForSource(source_index)) |state| return nextIndexFrom(state, self.namespace, current);
 
@@ -1917,9 +2059,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return try self.nextSourceIndexFromLocalIndex(source_index, run, current);
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             var idx = current + 1;
             while (idx < table.entryCount()) : (idx += 1) {
+                try self.admission.checkpoint();
                 const entry = try table.entryAt(idx);
                 const order = compareNamespace(.{ .name = entry.namespace_name }, self.namespace);
                 if (order == .eq) return idx;
@@ -1929,6 +2072,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn findAtOrBefore(self: *@This(), target: []const u8, inclusive: bool) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             var probe = target;
             var owned_probe: ?[]u8 = null;
             defer if (owned_probe) |bytes| self.allocator.free(bytes);
@@ -1938,6 +2082,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 include_probe = false;
             };
             while (true) {
+                try self.admission.checkpoint();
                 const maybe_candidate = blk: {
                     const stable_probe = try self.allocator.dupe(u8, probe);
                     defer self.allocator.free(stable_probe);
@@ -1945,7 +2090,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 };
                 const candidate = maybe_candidate orelse return null;
                 const stable_candidate = try self.allocator.dupe(u8, candidate);
-                if (try self.visibleEntryAtKey(stable_candidate)) |entry| {
+                const visible = self.visibleEntryAtKey(stable_candidate) catch |err| {
+                    self.allocator.free(stable_candidate);
+                    return err;
+                };
+                if (visible) |entry| {
                     self.allocator.free(stable_candidate);
                     return entry;
                 }
@@ -1957,13 +2106,16 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn findLast(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             if (self.upper_bound) |upper| return try self.findAtOrBefore(upper, false);
             var best: ?[]const u8 = try self.mutableLastKeyStable();
             for (self.immutable_memtables) |state| {
+                try self.admission.checkpoint();
                 const concrete = mutableLastKey(state, self.namespace) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
+                try self.admission.checkpoint();
                 const concrete = (try self.spanPrevKey(source_index, null, true)) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
@@ -1974,12 +2126,15 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn prevCandidateKey(self: *@This(), target: []const u8, inclusive: bool) !?[]const u8 {
+            try self.admission.checkpoint();
             var best: ?[]const u8 = try self.mutablePrevStateKeyStable(target, inclusive);
             for (self.immutable_memtables) |state| {
+                try self.admission.checkpoint();
                 const concrete = prevStateKey(state, self.namespace, target, inclusive) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
+                try self.admission.checkpoint();
                 const concrete = (try self.spanPrevKey(source_index, target, inclusive)) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
@@ -1987,6 +2142,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn spanPrevKey(self: *@This(), source_index: usize, target: ?[]const u8, inclusive: bool) !?[]const u8 {
+            try self.admission.checkpoint();
             const span = self.run_spans[source_index];
             var lo = span.start;
             var hi = span.end;
@@ -2002,6 +2158,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (order == .lt or (order == .eq and (target == null or inclusive))) lo = mid + 1 else hi = mid;
             }
             while (lo > span.start) {
+                try self.admission.checkpoint();
                 lo -= 1;
                 if (compareNamespace(.{ .name = self.sequence.at(lo).largest_namespace_name }, self.namespace) == .lt) break;
                 self.selectSpanRun(source_index, lo);
@@ -2018,6 +2175,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn visibleEntryAtKey(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             self.clearVisibleEntryBytes();
             if (comptime MutableType == ActiveMemTable) {
                 switch (try self.visibleMutableEntryAtKey(key)) {
@@ -2031,6 +2189,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
             }
             for (self.immutable_memtables) |state| {
+                try self.admission.checkpoint();
                 if (state.findIndex(self.namespace, key)) |idx| {
                     const entry = state.entryAt(idx);
                     if (entry.tombstone) return null;
@@ -2038,6 +2197,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 }
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
+                try self.admission.checkpoint();
                 try self.seekRunSpan(source_index, key, true);
                 const entry = self.source_entries[source_index] orelse continue;
                 if (!std.mem.eql(u8, entry.key, key)) continue;
@@ -2057,6 +2217,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn mutableSourceEntryScratch(self: *@This(), needed: usize) ![]u8 {
+            try self.admission.checkpoint();
             const retained_cap = self.maxRetainedMutableSourceEntryScratch();
             var current_capacity: usize = 0;
             if (self.mutable_source_entry_bytes) |bytes| {
@@ -2107,6 +2268,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn copyMutableSourceEntryAt(self: *@This(), idx: usize) !SourceEntry {
+            try self.admission.checkpoint();
             const entry = self.mutable.entryAt(idx);
             const namespace_name = namespaceOf(entry).name;
             const namespace_len = if (namespace_name) |name| name.len else 0;
@@ -2134,6 +2296,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn setMutableSourceAtOrAfter(self: *@This(), target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
             const idx = nextStateIndex(self.mutable, self.namespace, target, inclusive) orelse {
@@ -2147,6 +2310,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceMutableSource(self: *@This()) !void {
+            try self.admission.checkpoint();
             const current = self.source_entries[0] orelse {
                 self.positions[0] = null;
                 self.clearMutableSourceEntryBytes();
@@ -2165,6 +2329,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn copyKeyToVisibleBytes(self: *@This(), key: []const u8) ![]const u8 {
+            try self.admission.checkpoint();
             const bytes = try self.backend.allocator.dupe(u8, key);
             errdefer self.backend.allocator.free(bytes);
             self.visible_entry_bytes.setOwned(self.backend.allocator, bytes);
@@ -2172,6 +2337,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn mutableLastKeyStable(self: *@This()) !?[]const u8 {
+            try self.admission.checkpoint();
             if (comptime MutableType != ActiveMemTable) return mutableLastKey(self.mutable, self.namespace);
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
@@ -2180,6 +2346,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn mutablePrevStateKeyStable(self: *@This(), target: []const u8, inclusive: bool) !?[]const u8 {
+            try self.admission.checkpoint();
             if (comptime MutableType != ActiveMemTable) return prevStateKey(self.mutable, self.namespace, target, inclusive);
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
@@ -2188,6 +2355,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn visibleMutableEntryAtKey(self: *@This(), key: []const u8) !VisibleLookup {
+            try self.admission.checkpoint();
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
             const idx = self.mutable.findIndex(self.namespace, key) orelse return .absent;
@@ -2212,7 +2380,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn clearSourceBlock(self: *@This(), source_index: usize) void {
-            self.source_blocks[source_index].release();
+            self.source_blocks[source_index].releaseForAdmittedRead(self.defer_pin_returns);
             if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .unknown;
             self.source_block_indices[source_index] = null;
         }
@@ -2238,6 +2406,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn spillRunSource(self: *@This(), source_index: usize) !void {
+            try self.admission.checkpoint();
             if (!self.bounded_run_block_residency or !self.isPersistedRunSource(source_index)) return;
             const entry = self.source_entries[source_index] orelse {
                 self.resetRunSourceResidency(source_index);
@@ -2258,6 +2427,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn makeRunSourceResident(self: *@This(), source_index: usize) !void {
+            try self.admission.checkpoint();
             if (!self.bounded_run_block_residency) return;
             if (self.resident_run_source == source_index) return;
 
@@ -2315,31 +2485,39 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             self.clearSourceBlock(source_index);
             self.backend.recordCursorBlockLoad();
             const bytes = if (self.backend.options.cache != null) blk: {
-                var handle = try loadRunTableBlockHandle(self.backend, run, index, window, self.namespace.retainDataBlocks());
-                errdefer handle.release();
+                var handle = try loadRunTableBlockHandleWithAdmission(self.backend, run, index, window, self.namespace.retainDataBlocks(), self.admission.control);
+                errdefer self.returnCachePin(&handle);
                 const block = handle.runTableBlock();
                 self.source_blocks[source_index] = .{ .cached = handle };
                 break :blk block;
             } else if (localBlockCacheEnabled(self.backend)) blk: {
-                const payload = try loadLocalBlockLease(self.backend, run, index, window, self.backend_locked, self.namespace.retainDataBlocks());
+                const payload = try loadLocalBlockLeaseWithAdmission(self.backend, run, index, window, self.backend_locked, self.namespace.retainDataBlocks(), self.admission.control);
                 self.source_blocks[source_index] = .{ .local = payload };
                 break :blk payload.bytes;
             } else blk: {
-                const owned = try loadOwnedBlockForWindowAllocMaybeLocked(
-                    self.backend,
-                    self.backend.allocator,
-                    run,
-                    index,
-                    window,
-                    self.backend_locked,
-                );
+                const owned = if (self.admission.control) |control|
+                    try loadDecodedLocalBlockWithAdmission(self.backend, self.backend.allocator, run.path orelse return error.RunStateUnavailable, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window, control)
+                else
+                    try loadOwnedBlockForWindowAllocMaybeLocked(
+                        self.backend,
+                        self.backend.allocator,
+                        run,
+                        index,
+                        window,
+                        self.backend_locked,
+                    );
                 self.source_blocks[source_index] = .{ .owned = .{ .allocator = self.backend.allocator, .bytes = owned } };
                 break :blk owned;
             };
             // Retain only sources already opened by real I/O. A fully cached
             // scan needs no extra descriptor or catalog publication.
             if (comptime @hasDecl(BackendType, "retainCachedRunSource")) {
-                if (self.source_run_leases.len != 0 and self.source_run_leases[source_index] == null) self.source_run_leases[source_index] = self.backend.retainCachedRunSource(run.path.?);
+                if (self.source_run_leases.len != 0 and self.source_run_leases[source_index] == null) {
+                    self.source_run_leases[source_index] = if (comptime @hasDecl(BackendType, "retainCachedRunSourceWithAdmission"))
+                        try self.backend.retainCachedRunSourceWithAdmission(run.path.?, self.admission.control)
+                    else
+                        self.backend.retainCachedRunSource(run.path.?);
+                }
             }
             self.source_block_indices[source_index] = window.relative_offset;
             try self.prefetchNextSourceBlock(source_index, run, index, block_index);
@@ -2364,8 +2542,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             if (self.source_block_indices[source_index]) |loaded_index| {
                 if (loaded_index == next_window.relative_offset) return;
             }
-            var handle = try loadRunTableBlockHandle(self.backend, run, index, next_window, self.namespace.retainDataBlocks());
-            defer handle.release();
+            var handle = try loadRunTableBlockHandleWithAdmission(self.backend, run, index, next_window, self.namespace.retainDataBlocks(), self.admission.control);
+            defer self.returnCachePin(&handle);
             recordCursorBlockReadahead(self.backend);
         }
 
@@ -2689,6 +2867,11 @@ const PointResultLifetime = enum {
         first_owned: usize,
         value: []const u8,
     ) ![]const u8 {
+        return self.retainWithAdmission(backend, allocator, held, first_owned, value, null);
+    }
+
+    fn retainWithAdmission(self: PointResultLifetime, backend: anytype, allocator: Allocator, held: *PointResultValues, first_owned: usize, value: []const u8, control: ?read_admission.Port) ![]const u8 {
+        if (control) |budget| try budget.checkpoint();
         if (self == .snapshot_pinned) return value;
         const address = @intFromPtr(value.ptr);
         if (!(builtin.is_test and test_duplicate_owned_point_results)) {
@@ -2698,11 +2881,12 @@ const PointResultLifetime = enum {
         }
         const candidates = if (builtin.is_test and test_duplicate_owned_point_results) held.items[held.items.len..] else held.items[first_owned..];
         for (candidates) |owned| {
+            if (control) |budget| try budget.checkpoint();
             const base = @intFromPtr(owned.ptr);
             if (address >= base and address - base <= owned.len and value.len <= owned.len - (address - base)) return value;
         }
-        if (!(builtin.is_test and test_duplicate_owned_point_results)) return copyPointValue(backend, allocator, held, value);
-        const owned = try allocator.dupe(u8, value);
+        if (!(builtin.is_test and test_duplicate_owned_point_results)) return copyPointValueWithAdmission(backend, allocator, held, value, control);
+        const owned = try copyPointPromotionRows(allocator, value, control);
         errdefer allocator.free(owned);
         try held.append(allocator, owned);
         recordPointValueCopy(backend);
@@ -2724,14 +2908,16 @@ fn readManySortedPointFromSnapshot(
     keys: []const []const u8,
     values: []?[]const u8,
     backend_locked: bool,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     // Legacy/non-directory readers still charge transient index metadata.
     const resources = @import("../resource_manager.zig");
     var budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_in_memory_state, runtimeScratchAllocator(allocator), 1) else null;
     defer if (budget) |*admitted| admitted.deinit();
     if (budget) |*admitted| admitted.credit_quantum = 4096;
     const scratch = if (budget) |*admitted| admitted.allocator() else runtimeScratchAllocator(allocator);
-    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch) catch |err| {
+    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch, control) catch |err| {
         if (budget) |*admitted| if (admitted.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
@@ -2752,14 +2938,33 @@ fn readManySortedPointFromSnapshotWithScratch(
     values: []?[]const u8,
     backend_locked: bool,
     scratch: Allocator,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     @memset(values, null);
-    if (try readManySortedPointFromSnapshotAsync(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, backend_locked, PointResultLifetime.forBlockPins(held_blocks), held_blocks)) |result| return result;
+    if (try readManySortedPointFromSnapshotAsyncWithAdmission(
+        backend,
+        mutable,
+        immutable_memtables,
+        runs,
+        l0_groups,
+        levels,
+        allocator,
+        held_values,
+        namespace,
+        keys,
+        values,
+        backend_locked,
+        PointResultLifetime.forBlockPins(held_blocks),
+        held_blocks,
+        null,
+        control,
+    )) |result| return result;
 
     var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
-    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch };
+    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch, .control = control };
     defer batch_indexes.deinit();
 
     var result: BatchCursorReadResult = .{};
@@ -2767,6 +2972,7 @@ fn readManySortedPointFromSnapshotWithScratch(
     var read_hint: ?BorrowedReadHint = null;
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
+        if (control) |budget| try budget.checkpoint();
         const first_owned = held_values.items.len;
         const value = getFromSnapshotRuns(
             backend,
@@ -2791,7 +2997,7 @@ fn readManySortedPointFromSnapshotWithScratch(
             },
             else => return err,
         };
-        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retain(backend, allocator, held_values, first_owned, value);
+        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retainWithAdmission(backend, allocator, held_values, first_owned, value, control);
         result.hits += 1;
     }
     try batch_indexes.transferBlocks(backend.allocator, block_handles);
@@ -2799,6 +3005,7 @@ fn readManySortedPointFromSnapshotWithScratch(
 }
 
 const RunBatchIndexState = struct {
+    control: ?read_admission.Port = null,
     run_index: usize,
     handle: cache_mod.Handle,
     block_index: ?usize = null,
@@ -2833,6 +3040,7 @@ const RunBatchIndexState = struct {
 };
 
 const RunBatchIndexHandles = struct {
+    control: ?read_admission.Port = null,
     allocator: Allocator,
     items: std.ArrayListUnmanaged(RunBatchIndexState) = .empty,
     by_run: std.AutoHashMapUnmanaged(usize, usize) = .empty,
@@ -2849,13 +3057,14 @@ const RunBatchIndexHandles = struct {
     }
 
     fn state(self: *@This(), backend: anytype, run: *Run, run_index: usize) !*RunBatchIndexState {
+        if (self.control) |budget| try budget.checkpoint();
         if (self.by_run.get(run_index)) |i| return &self.items.items[i];
         try self.items.ensureUnusedCapacity(self.allocator, 1);
         try self.by_run.ensureUnusedCapacity(self.allocator, 1);
-        var handle = try loadRunTableIndexHandle(backend, run);
+        var handle = try loadRunTableIndexHandleWithAdmission(backend, run, self.control);
         errdefer handle.release();
         const i = self.items.items.len;
-        self.items.appendAssumeCapacity(.{ .run_index = run_index, .handle = handle });
+        self.items.appendAssumeCapacity(.{ .run_index = run_index, .handle = handle, .control = self.control });
         self.by_run.putAssumeCapacityNoClobber(run_index, i);
         return &self.items.items[i];
     }
@@ -2879,14 +3088,16 @@ fn readManySortedByRunFromSnapshot(
     keys: []const []const u8,
     values: []?[]const u8,
     backend_locked: bool,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     // Legacy/non-directory readers still charge transient index metadata.
     const resources = @import("../resource_manager.zig");
     var budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_in_memory_state, runtimeScratchAllocator(allocator), 1) else null;
     defer if (budget) |*admitted| admitted.deinit();
     if (budget) |*admitted| admitted.credit_quantum = 4096;
     const scratch = if (budget) |*admitted| admitted.allocator() else runtimeScratchAllocator(allocator);
-    return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch) catch |err| {
+    return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch, control) catch |err| {
         if (budget) |*admitted| if (admitted.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
@@ -2907,13 +3118,15 @@ fn readManySortedByRunFromSnapshotWithScratch(
     values: []?[]const u8,
     backend_locked: bool,
     scratch: Allocator,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     @memset(values, null);
     var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
 
-    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch };
+    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch, .control = control };
     defer batch_indexes.deinit();
 
     var result: BatchCursorReadResult = .{};
@@ -2921,6 +3134,7 @@ fn readManySortedByRunFromSnapshotWithScratch(
     var read_hint: ?BorrowedReadHint = null;
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
+        if (control) |budget| try budget.checkpoint();
         const first_owned = held_values.items.len;
         const value = getFromSnapshotRuns(
             backend,
@@ -2945,7 +3159,7 @@ fn readManySortedByRunFromSnapshotWithScratch(
             },
             else => return err,
         };
-        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retain(backend, allocator, held_values, first_owned, value);
+        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retainWithAdmission(backend, allocator, held_values, first_owned, value, control);
         result.hits += 1;
     }
     try batch_indexes.transferBlocks(backend.allocator, block_handles);
@@ -3297,12 +3511,18 @@ fn lowerBoundRunStart(keys: []const []const u8, namespace: backend_types.Namespa
 /// published LSM version. Mutable cache-index hints in Run are only accessed
 /// under the backend mutex; lazy Bloom ownership is disabled for these runs.
 pub const ReadVersion = struct {
-    build_mu: std.Io.Mutex = .init,
-    build_fallback_mu: std.atomic.Mutex = .unlocked,
+    pub const OwnedRetirement = struct {
+        context: *anyopaque,
+        retire: *const fn (*anyopaque) void,
+    };
+    owned_retirement: ?OwnedRetirement = null,
+    // Backend-mutex protected. No builder owns a service mutex while yielding.
+    preparing: bool = false,
     prepared: bool = true,
     references: std.atomic.Value(usize) = .init(1),
     retired_next: ?*ReadVersion = null,
     live_next: ?*ReadVersion = null,
+    live_previous: ?*ReadVersion = null,
     registered: bool = false,
     directory: ?*@import("run_directory.zig").Directory = null,
     projection_bytes: u64 = 0,
@@ -3343,17 +3563,66 @@ pub const ReadVersion = struct {
     /// owns metadata and file pins; the projection contains only borrowed data
     /// and per-version cache hints. All O(number-of-runs) work is off-lock.
     pub fn createFromDirectory(allocator: Allocator, directory: *@import("run_directory.zig").Directory) !*ReadVersion {
+        return createFromDirectoryWithAdmission(allocator, directory, null);
+    }
+
+    pub fn createFromDirectoryWithAdmission(allocator: Allocator, directory: *@import("run_directory.zig").Directory, control: ?read_admission.Port) !*ReadVersion {
+        if (control) |owner| try owner.checkpoint();
         const version = try allocator.create(ReadVersion);
         errdefer allocator.destroy(version);
-        const runs = try directory.project(allocator);
+        const runs = try directory.projectWithAdmission(allocator, control);
         errdefer allocator.free(runs);
-        const groups = try buildL0RunGroups(allocator, runs);
+        const groups = try buildL0RunGroupsControlled(allocator, runs, control);
         errdefer deinitRunGroups(allocator, groups);
-        const levels = try buildLowerLevels(allocator, runs);
+        const levels = try buildLowerLevelsControlled(allocator, runs, control);
+        errdefer allocator.free(levels);
         var projection_bytes: u64 = runs.len * @sizeOf(Run) + groups.len * @sizeOf(RunGroup) + levels.len * @sizeOf(RunLevel);
-        for (groups) |group| projection_bytes += group.run_indices.len * @sizeOf(usize);
+        for (groups) |group| {
+            if (control) |owner| try owner.checkpoint();
+            projection_bytes += group.run_indices.len * @sizeOf(usize);
+        }
+        if (control) |owner| try owner.checkpoint();
         version.* = .{ .allocator = allocator, .runs = runs, .l0_groups = groups, .levels = levels, .directory = directory, .projection_bytes = projection_bytes };
         return version;
+    }
+
+    /// Discard unpublished projection arrays. The pinned epoch still owns
+    /// the directory; this temporary header must never destroy that root.
+    pub fn discardProjection(self: *ReadVersion) void {
+        std.debug.assert(self.owned_retirement == null);
+        const allocator = self.allocator;
+        allocator.free(self.runs);
+        deinitRunGroups(allocator, self.l0_groups);
+        allocator.free(self.levels);
+        allocator.destroy(self);
+    }
+
+    /// Compare registered projection semantics against the existing builders.
+    /// This allocator is diagnostic-only and outside measured fault/OOM sweeps.
+    pub fn qualifyProjectionForTest(self: *const ReadVersion, allocator: Allocator) !void {
+        if (!@import("builtin").is_test) @compileError("projection oracle is test-only");
+        const expected_runs = try self.directory.?.projectWithAdmission(allocator, null);
+        defer allocator.free(expected_runs);
+        try std.testing.expectEqual(expected_runs.len, self.runs.len);
+        for (expected_runs, self.runs) |expected, actual| try std.testing.expect(std.meta.eql(expected, actual));
+        const expected_groups = try buildL0RunGroupsControlled(allocator, expected_runs, null);
+        defer deinitRunGroups(allocator, expected_groups);
+        try std.testing.expectEqual(expected_groups.len, self.l0_groups.len);
+        for (expected_groups, self.l0_groups) |expected, actual| {
+            inline for (.{ "smallest_namespace_name", "largest_namespace_name" }) |field| {
+                const e = @field(expected, field);
+                const a = @field(actual, field);
+                try std.testing.expectEqual(e == null, a == null);
+                if (e) |bytes| try std.testing.expectEqualStrings(bytes, a.?);
+            }
+            try std.testing.expectEqualStrings(expected.smallest_key, actual.smallest_key);
+            try std.testing.expectEqualStrings(expected.largest_key, actual.largest_key);
+            try std.testing.expectEqualSlices(usize, expected.run_indices, actual.run_indices);
+        }
+        const expected_levels = try buildLowerLevelsControlled(allocator, expected_runs, null);
+        defer allocator.free(expected_levels);
+        try std.testing.expectEqual(expected_levels.len, self.levels.len);
+        for (expected_levels, self.levels) |expected, actual| try std.testing.expectEqualDeep(expected, actual);
     }
 
     pub fn buildMemoryBound(run_count: usize) u64 {
@@ -3366,6 +3635,33 @@ pub const ReadVersion = struct {
 
     /// Caller holds the backend mutex when using backend-owned retirement.
     /// The last reference queues reclamation; it does not free metadata here.
+    /// An existing owned reference pins the epoch through acquisition. Closing
+    /// its creator does not invalidate that reference or its descendants.
+    pub fn retainOwnedWithAdmission(self: *ReadVersion, original: read_admission.Port) !*ReadVersion {
+        try original.checkpoint();
+        if (self.owned_retirement == null or self.references.load(.acquire) == 0) return error.InvalidArgument;
+        const previous = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != 0);
+        return self;
+    }
+    /// Standalone owned epochs need no Backend receiver after controller exit.
+    /// Backend-tracked epochs must release through release(backend) to unlink.
+    pub fn releaseOwned(self: *ReadVersion) void {
+        std.debug.assert(!self.registered);
+        const owner = self.owned_retirement.?;
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
+        if (previous == 1) owner.retire(owner.context);
+    }
+    /// Called only after the last reference and any Backend list handoff.
+    /// No epoch access may follow a successful return receipt.
+    pub fn retireOwned(self: *ReadVersion) bool {
+        const owner = self.owned_retirement orelse return false;
+        std.debug.assert(self.references.load(.acquire) == 0 and !self.registered);
+        owner.retire(owner.context);
+        return true;
+    }
+
     pub fn release(self: *ReadVersion, backend: anytype) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         if (comptime @hasDecl(@TypeOf(backend.*), "retireReadVersion")) return backend.retireReadVersion(self);
@@ -3373,6 +3669,7 @@ pub const ReadVersion = struct {
     }
 
     pub fn destroy(self: *ReadVersion, backend: anytype) void {
+        if (self.retireOwned()) return;
         self.destroyContents(backend);
         if (self.directory) |directory| self.allocator.destroy(directory);
         self.allocator.destroy(self);
@@ -3381,6 +3678,7 @@ pub const ReadVersion = struct {
     /// Directory-backed projections borrow run metadata. Retire the directory
     /// separately; reclaiming these buffers must not release individual runs.
     pub fn destroyProjectionHeader(self: *ReadVersion) void {
+        std.debug.assert(self.owned_retirement == null);
         std.debug.assert(self.directory != null);
         self.allocator.free(self.runs);
         deinitRunGroups(self.allocator, self.l0_groups);
@@ -3389,12 +3687,14 @@ pub const ReadVersion = struct {
     }
 
     pub fn accountedMemoryBytes(self: *const ReadVersion, pass: u64) u64 {
+        if (self.owned_retirement != null) return 0; // The registered fixed grant owns these headers.
         return @sizeOf(ReadVersion) + self.projection_bytes + (if (self.directory) |directory| directory.accountedMemoryBytes(pass) else 0);
     }
 
     /// Reclamation keeps these small headers immutable until the backend
     /// reacquires its lock, allowing concurrent memory-accounting passes.
     pub fn destroyContents(self: *ReadVersion, backend: anytype) void {
+        std.debug.assert(self.owned_retirement == null);
         const allocator = self.allocator;
         if (self.directory) |directory| {
             directory.destroyContents(allocator);
@@ -3407,6 +3707,14 @@ pub const ReadVersion = struct {
         allocator.free(self.levels);
     }
 };
+
+/// Must precede mutable/immutable snapshot capture: a canonical registered
+/// epoch may need off-lock funding and mandatory Backend reentry.
+fn prepareReadVersionCaptureWithAdmission(backend: anytype, original: ?read_admission.Port) !void {
+    if (comptime @hasDecl(@TypeOf(backend.*), "prepareReadVersionCaptureWithAdmission")) {
+        if (original) |scope| try backend.prepareReadVersionCaptureWithAdmission(scope);
+    }
+}
 
 const RunReadView = struct {
     allocator: Allocator,
@@ -3421,6 +3729,10 @@ const RunReadView = struct {
 
     fn prepareCursor(self: *RunReadView, backend: anytype) !void {
         if (self.directory() == null) try self.prepare(backend);
+    }
+
+    fn prepareCursorWithAdmission(self: *RunReadView, backend: anytype, control: read_admission.Port) !void {
+        if (self.directory() == null) try self.prepareWithAdmission(backend, control);
     }
 
     /// Caller holds the backend mutex. Publishing a new run set invalidates
@@ -3454,6 +3766,18 @@ const RunReadView = struct {
             self.l0_groups = version.l0_groups;
             self.levels = version.levels;
         };
+    }
+
+    fn prepareWithAdmission(self: *RunReadView, backend: anytype, control: read_admission.Port) !void {
+        try control.checkLifetime();
+        if (self.version) |version| {
+            if (comptime !@hasDecl(@TypeOf(backend.*), "prepareReadVersionWithAdmission")) return error.ExecutionWaitUnsupported;
+            try backend.prepareReadVersionWithAdmission(version, control);
+            self.runs = version.runs;
+            self.l0_groups = version.l0_groups;
+            self.levels = version.levels;
+        }
+        try control.checkLifetime();
     }
 
     fn release(self: RunReadView, backend: anytype) void {
@@ -3561,7 +3885,7 @@ fn readManySortedCurrentWithLayoutLocked(
             _ = lockBackend(BackendType, backend);
         };
         if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(backend);
-        return readManySortedDirectoryBatch(backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, directory, allocator, held_blocks, held_values, namespace, keys, values, false, false, null, allocator);
+        return readManySortedDirectoryBatch(backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, directory, allocator, held_blocks, held_values, namespace, keys, values, false, false, null, allocator, null);
     }
 
     switch (chooseMultiGetPlan(keys, .stable_probe)) {
@@ -3580,6 +3904,7 @@ fn readManySortedCurrentWithLayoutLocked(
             keys,
             values,
             true,
+            null,
         ),
         .point => return try readManySortedPointFromSnapshot(
             backend,
@@ -3595,6 +3920,7 @@ fn readManySortedCurrentWithLayoutLocked(
             keys,
             values,
             true,
+            null,
         ),
     }
 
@@ -3661,7 +3987,20 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 const p = self.parent;
                 p.backend.recordGetManySorted(keys.len);
                 p.backend.recordGetManySortedLocality(keys);
-                const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, &self.planning_scratch, self.allocator);
+                const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, &self.planning_scratch, self.allocator, null);
+                p.backend.recordGetManySortedResults(result.hits, result.misses);
+            }
+
+            pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+                if (keys.len != values.len) return error.InvalidBatch;
+                @memset(values, null);
+                errdefer @memset(values, null);
+                try control.checkpoint();
+                const p = self.parent;
+                p.backend.recordGetManySorted(keys.len);
+                p.backend.recordGetManySortedLocality(keys);
+                const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, &self.planning_scratch, self.allocator, control);
+                try control.checkpoint();
                 p.backend.recordGetManySortedResults(result.hits, result.misses);
             }
 
@@ -3696,17 +4035,39 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         }
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
-            const locked = lockBackend(BackendType, backend);
+            return try openControlled(backend, namespace, null);
+        }
+
+        pub fn openWithAdmission(backend: *BackendType, namespace: backend_types.Namespace, control: read_admission.Port) !@This() {
+            return try openControlled(backend, namespace, control);
+        }
+
+        fn openControlled(backend: *BackendType, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
+            var captured = try openCaptured(backend, namespace, control);
+            errdefer captured.abort();
+            // The backend mutex has been released. Rejection discards the
+            // complete capture before publishing it to the caller.
+            if (control) |owner| try owner.checkpoint();
+            return captured;
+        }
+
+        fn openCaptured(backend: *BackendType, namespace: backend_types.Namespace, original: ?read_admission.Port) !@This() {
+            const locked = if (original) |budget| try lockBackendWithAdmission(BackendType, backend, budget) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            var retained: read_admission.RetainedDependency = .{};
+            const control = retained.bind(original);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             try retainReadReader(BackendType, backend, .bound_read_txn);
             errdefer releaseReadReader(BackendType, backend, .bound_read_txn);
+            if (control) |budget| try budget.checkLifetime();
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
+            try prepareReadVersionCaptureWithAdmission(backend, original);
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
+            if (control) |budget| try budget.checkLifetime();
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .bound_read_txn);
             errdefer {
                 if (mutable_snapshot.owned) {
@@ -3717,9 +4078,11 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                     releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
                 }
             }
+            if (control) |budget| try budget.checkLifetime();
             var read_view = try RunReadView.pin(backend, metadata_allocator);
             errdefer read_view.release(backend);
-            try read_view.prepareCursor(backend);
+            if (control) |owner| try read_view.prepareCursorWithAdmission(backend, owner) else try read_view.prepareCursor(backend);
+            if (control) |budget| try budget.checkLifetime();
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -3791,8 +4154,27 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
-            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, &self.planning_scratch, self.metadata_allocator);
+            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, &self.planning_scratch, self.metadata_allocator, null);
             self.backend.recordGetManySortedResults(result.hits, result.misses);
+        }
+
+        pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+            if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
+            errdefer @memset(values, null);
+            try control.checkpoint();
+
+            self.backend.recordGetManySorted(keys.len);
+            self.backend.recordGetManySortedLocality(keys);
+            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, &self.planning_scratch, self.metadata_allocator, control);
+            try control.checkpoint();
+            self.backend.recordGetManySortedResults(result.hits, result.misses);
+        }
+
+        pub fn openCursorWithAdmission(self: *@This(), control: read_admission.Port) !LocalCursor {
+            const cursor_alloc = runtimeScratchAllocator(self.allocator);
+            const sequence: LocalCursor.RunSequence = if (self.read_view.directory()) |directory| .{ .directory = directory } else .{ .runs = self.read_view.runs, .levels = self.read_view.levels };
+            return try LocalCursor.initSequenceControlled(cursor_alloc, self.backend, self.mutable_snapshot, self.immutable_memtables, sequence, if (sequence.directory != null) &.{} else self.read_view.l0_groups, self.namespace, false, control);
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
@@ -3939,13 +4321,33 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         held_values: PointResultValues = .empty,
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
-            const locked = lockBackend(BackendType, backend);
+            return openControlled(backend, namespace, null);
+        }
+
+        pub fn openWithAdmission(backend: *BackendType, namespace: backend_types.Namespace, control: read_admission.Port) !@This() {
+            return openControlled(backend, namespace, control);
+        }
+
+        fn openControlled(backend: *BackendType, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
+            var captured = try openCaptured(backend, namespace, control);
+            errdefer captured.abort();
+            // The backend mutex has been released. Rejection discards the
+            // complete capture before publishing it to the caller.
+            if (control) |owner| try owner.checkpoint();
+            return captured;
+        }
+
+        fn openCaptured(backend: *BackendType, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
+            const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, backend, owner) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             try retainReadReader(BackendType, backend, .probe_txn);
             errdefer releaseReadReader(BackendType, backend, .probe_txn);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
+            try prepareReadVersionCaptureWithAdmission(backend, control);
             const stable_point_view = backend.mutable.entryCount() == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
             const read_view = if (stable_point_view) try RunReadView.pin(backend, metadata_allocator) else null;
+            errdefer if (read_view) |view| view.release(backend);
+            if (control) |owner| try owner.checkLifetime();
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
                 .metadata_allocator = metadata_allocator,
@@ -3977,11 +4379,11 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             return copyPointValue(self.backend, self.allocator, &self.held_values, value);
         }
 
-        fn ensureStablePointViewLoaded(self: *@This()) !void {
+        fn ensureStablePointViewLoaded(self: *@This(), control: ?read_admission.Port) !void {
             if (!self.stable_point_view or self.stable_point_view_loaded) return;
-            const locked = lockBackend(BackendType, self.backend);
+            const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, self.backend, owner) else lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
-            try self.read_view.?.prepare(self.backend);
+            if (control) |owner| try self.read_view.?.prepareWithAdmission(self.backend, owner) else try self.read_view.?.prepare(self.backend);
             const read_view = self.read_view.?;
             self.runs = read_view.runs;
             self.l0_groups = read_view.l0_groups;
@@ -3998,7 +4400,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         pub fn contains(self: *@This(), key: []const u8) !bool {
             self.backend.recordPointGet();
             if (self.stable_point_view) {
-                if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded();
+                if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded(null);
                 return try containsFromReadView(self.backend, &.{}, self.read_view.?, self.namespace, key);
             }
             var layout = blk: {
@@ -4042,7 +4444,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     recordPointValueBorrow(self.backend);
                     return value;
                 };
-                try self.ensureStablePointViewLoaded();
+                try self.ensureStablePointViewLoaded(null);
                 self.backend.recordPointGet();
                 if (!lease) switch (try getFromStableCachedPointView(self.backend, self.metadata_allocator, self.runs, self.l0_groups, self.levels, &self.last_l0_group_index, self.namespace, key)) {
                     .hit => |value| return try self.ownValue(value),
@@ -4133,12 +4535,18 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
-            return self.getManySortedWithStats(keys, values, true);
+            return self.getManySortedWithStats(keys, values, true, null);
         }
 
-        fn getManySortedWithStats(self: *@This(), keys: []const []const u8, values: []?[]const u8, record_batch: bool) !void {
+        pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+            return self.getManySortedWithStats(keys, values, true, control);
+        }
+
+        fn getManySortedWithStats(self: *@This(), keys: []const []const u8, values: []?[]const u8, record_batch: bool, control: ?read_admission.Port) !void {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
+            errdefer @memset(values, null);
+            if (control) |owner| try owner.checkpoint();
             if (record_batch) {
                 self.backend.recordGetManySorted(keys.len);
                 self.backend.recordGetManySortedLocality(keys);
@@ -4148,12 +4556,13 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             if (self.stable_point_view) {
                 var offset: usize = 0;
                 while (offset < keys.len) {
+                    if (control) |owner| try owner.checkpoint();
                     const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
                     const plan = chooseMultiGetPlan(keys[offset..end], .stable_probe);
                     recordMultiGetPlan(self.backend, plan);
-                    if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded();
+                    if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded(control);
                     const chunk_result = if (self.read_view.?.directory()) |directory|
-                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false, self.borrowed_batch_scratch orelse &self.batch_scratch, self.metadata_allocator)
+                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false, self.borrowed_batch_scratch orelse &self.batch_scratch, self.metadata_allocator, control)
                     else switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
@@ -4169,6 +4578,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             keys[offset..end],
                             values[offset..end],
                             false,
+                            control,
                         ),
                         .cursor, .point => try readManySortedPointFromSnapshot(
                             self.backend,
@@ -4184,6 +4594,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             keys[offset..end],
                             values[offset..end],
                             false,
+                            control,
                         ),
                     };
                     result.add(chunk_result);
@@ -4207,9 +4618,11 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 var unresolved_count: usize = keys.len;
                 var maybe_layout: ?CurrentReadLayout(BackendType) = null;
                 {
-                    const locked = lockBackend(BackendType, self.backend);
+                    if (control) |owner| try owner.checkpoint();
+                    const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, self.backend, owner) else lockBackend(BackendType, self.backend);
                     defer unlockBackend(BackendType, self.backend, locked);
                     for (keys, 0..) |key, i| {
+                        if (control) |owner| try owner.checkpoint();
                         const idx = self.backend.mutable.findIndex(self.namespace, key) orelse continue;
                         const entry = self.backend.mutable.entryAt(idx);
                         resolved[i] = true;
@@ -4218,7 +4631,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             result.misses += 1;
                             continue;
                         }
-                        values[i] = try self.ownValue(entry.value);
+                        values[i] = try copyPointValueWithAdmission(self.backend, self.allocator, &self.held_values, entry.value, control);
                         self.backend.recordMutableHit();
                         result.hits += 1;
                     }
@@ -4241,6 +4654,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     const unresolved_indexes = scratch.pending.indexes.items;
                     var unresolved_index: usize = 0;
                     for (keys, 0..) |key, i| {
+                        if (control) |owner| try owner.checkpoint();
                         if (resolved[i]) continue;
                         unresolved_keys[unresolved_index] = key;
                         unresolved_indexes[unresolved_index] = i;
@@ -4252,7 +4666,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     const plan = chooseMultiGetPlan(unresolved_keys, .stable_probe);
                     recordMultiGetPlan(self.backend, plan);
                     const unresolved_result = if (layout.read_view.directory()) |directory|
-                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, layout.immutable_memtables, directory, self.allocator, &self.held_blocks, &self.held_values, source_namespace, unresolved_keys, unresolved_values, plan == .sorted_by_run, false, scratch, self.metadata_allocator)
+                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, layout.immutable_memtables, directory, self.allocator, &self.held_blocks, &self.held_values, source_namespace, unresolved_keys, unresolved_values, plan == .sorted_by_run, false, scratch, self.metadata_allocator, control)
                     else switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
@@ -4268,6 +4682,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             unresolved_keys,
                             unresolved_values,
                             false,
+                            control,
                         ),
                         .cursor, .point => try readManySortedPointFromSnapshot(
                             self.backend,
@@ -4283,12 +4698,14 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             unresolved_keys,
                             unresolved_values,
                             false,
+                            control,
                         ),
                     };
                     for (unresolved_values, unresolved_indexes) |value, index| values[index] = value;
                     result.add(unresolved_result);
                 }
             }
+            if (control) |owner| try owner.checkpoint();
             if (record_batch) self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
@@ -4349,6 +4766,20 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             return switch (self.*) {
                 .active => |*cursor| try cursor.next(),
                 .snapshot => |*cursor| try cursor.next(),
+            };
+        }
+
+        pub fn nextWithAdmission(self: *@This(), control: read_admission.Port) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.nextWithAdmission(control),
+                .snapshot => |*cursor| try cursor.nextWithAdmission(control),
+            };
+        }
+
+        pub fn seekAtOrAfterWithAdmission(self: *@This(), key: []const u8, control: read_admission.Port) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.seekAtOrAfterWithAdmission(key, control),
+                .snapshot => |*cursor| try cursor.seekAtOrAfterWithAdmission(key, control),
             };
         }
 
@@ -4432,19 +4863,31 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
         const Purpose = enum { general, replay };
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
-            return try openWithPurpose(backend, namespace, .general);
+            return try openWithPurpose(backend, namespace, .general, null);
+        }
+
+        pub fn openWithAdmission(backend: *BackendType, namespace: backend_types.Namespace, control: read_admission.Port) !@This() {
+            return openWithPurpose(backend, namespace, .general, control);
         }
 
         pub fn openReplay(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
-            return try openWithPurpose(backend, namespace, .replay);
+            return try openWithPurpose(backend, namespace, .replay, null);
         }
 
-        fn openWithPurpose(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose) !@This() {
-            const locked = lockBackend(BackendType, backend);
+        fn openWithPurpose(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose, control: ?read_admission.Port) !@This() {
+            var captured = try openCaptured(backend, namespace, purpose, control);
+            errdefer captured.abort();
+            if (control) |owner| try owner.checkpoint();
+            return captured;
+        }
+
+        fn openCaptured(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose, control: ?read_admission.Port) !@This() {
+            const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, backend, owner) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             try retainReadReader(BackendType, backend, .current_scan);
             errdefer releaseReadReader(BackendType, backend, .current_scan);
+            try prepareReadVersionCaptureWithAdmission(backend, control);
             var mutable_snapshot: MutableSnapshot = .none;
             var mutable_snapshot_is_bulk_current_scan_clone = false;
             var bulk_current_scan_clone_denied = false;
@@ -4489,6 +4932,9 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 } else if (@hasDecl(BackendType, "prepareReadSnapshot")) {
                     try backend.prepareReadSnapshot();
                 }
+                // Rotation may run inline publication. Recheck before pinning
+                // mutable state; no retained source crosses a funding unlock.
+                try prepareReadVersionCaptureWithAdmission(backend, control);
                 const read_snapshot = try snapshotReadMutable(BackendType, backend, .current_scan);
                 mutable_snapshot = if (read_snapshot.owned)
                     .{ .owned = @constCast(read_snapshot.state) }
@@ -4502,7 +4948,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
             var read_view = try RunReadView.pin(backend, metadata_allocator);
             errdefer read_view.release(backend);
-            try read_view.prepareCursor(backend);
+            if (control) |owner| try read_view.prepareCursorWithAdmission(backend, owner) else try read_view.prepareCursor(backend);
+            if (control) |owner| try owner.checkLifetime();
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -4582,6 +5029,19 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 releaseReadReader(BackendType, backend, .current_scan);
             }
             self.* = undefined;
+        }
+
+        /// Admission is borrowed only while constructing this cursor. Every
+        /// admitted step supplies its own borrow; the cursor never retains it.
+        pub fn openCursorWithAdmission(self: *@This(), control: read_admission.Port) !LocalCursor {
+            const cursor_alloc = runtimeScratchAllocator(self.allocator);
+            const sequence: SnapshotCursor.RunSequence = if (self.read_view.directory()) |directory| .{ .directory = directory } else .{ .runs = self.read_view.runs, .levels = self.read_view.levels };
+            const groups = if (sequence.directory != null) &.{} else self.read_view.l0_groups;
+            if (self.mutable_snapshot.ptr()) |snapshot| {
+                return .{ .snapshot = try SnapshotCursor.initSequenceControlled(cursor_alloc, self.backend, snapshot, self.immutable_memtables, sequence, groups, self.namespace, false, control) };
+            }
+            const active_sequence: ActiveCursor.RunSequence = if (sequence.directory) |directory| .{ .directory = directory } else .{ .runs = self.read_view.runs, .levels = self.read_view.levels };
+            return .{ .active = try ActiveCursor.initSequenceControlled(cursor_alloc, self.backend, &self.backend.mutable, self.immutable_memtables, active_sequence, groups, self.namespace, false, control) };
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
@@ -4763,13 +5223,23 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn commit(self: *@This()) !void {
+            return self.commitControlled(null);
+        }
+        pub fn commitWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            return self.commitControlled(original);
+        }
+        fn commitControlled(self: *@This(), control: ?read_admission.Port) !void {
+            if (control) |original| try original.checkpoint();
             if (self.closed) return error.TransactionClosed;
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
             };
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
-            const locked = lockBackend(BackendType, self.backend);
+            const locked = if (control) |original|
+                if (try original.hasExecutionWait()) try lockBackendWithAdmission(BackendType, self.backend, original) else lockBackend(BackendType, self.backend)
+            else
+                lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
             var release_on_error = true;
             errdefer if (release_on_error) {
@@ -4803,7 +5273,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
+                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -5161,7 +5631,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 // Write reads select the current mutable and immutable view
                 // together, even if the backend was empty when probe opened.
                 probe.stable_point_view = false;
-                try probe.getManySortedWithStats(miss_keys[0..miss_count], miss_values, false);
+                try probe.getManySortedWithStats(miss_keys[0..miss_count], miss_values, false, null);
                 for (miss_values) |*value| {
                     const present = value.* orelse {
                         misses += 1;
@@ -5381,17 +5851,37 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         planning_scratch: BatchScratch.ProbeScratch = .{},
 
         pub fn open(backend: *BackendType) !@This() {
-            const locked = lockBackend(BackendType, backend);
+            return try openControlled(backend, null);
+        }
+
+        pub fn openWithAdmission(backend: *BackendType, control: read_admission.Port) !@This() {
+            return try openControlled(backend, control);
+        }
+
+        fn openControlled(backend: *BackendType, control: ?read_admission.Port) !@This() {
+            var captured = try openCaptured(backend, control);
+            errdefer captured.abort();
+            if (control) |owner| try owner.checkpoint();
+            return captured;
+        }
+
+        fn openCaptured(backend: *BackendType, original: ?read_admission.Port) !@This() {
+            const locked = if (original) |owner| try lockBackendWithAdmission(BackendType, backend, owner) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            var retained: read_admission.RetainedDependency = .{};
+            const control = retained.bind(original);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             try retainReadReader(BackendType, backend, .namespace_read_txn);
             errdefer releaseReadReader(BackendType, backend, .namespace_read_txn);
+            if (control) |owner| try owner.checkLifetime();
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
+            try prepareReadVersionCaptureWithAdmission(backend, original);
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
+            if (control) |owner| try owner.checkLifetime();
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .namespace_read_txn);
             errdefer {
                 if (mutable_snapshot.owned) {
@@ -5402,9 +5892,11 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
                     releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
                 }
             }
+            if (control) |owner| try owner.checkLifetime();
             var read_view = try RunReadView.pin(backend, metadata_allocator);
             errdefer read_view.release(backend);
-            try read_view.prepareCursor(backend);
+            if (control) |owner| try read_view.prepareCursorWithAdmission(backend, owner) else try read_view.prepareCursor(backend);
+            if (control) |owner| try owner.checkLifetime();
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -5444,18 +5936,740 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             return try getFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, &self.last_l0_group_index, &self.read_hint, &self.held_blocks, &self.held_values, self.allocator, namespace, key);
         }
 
+        pub fn getWithAdmission(self: *@This(), namespace: backend_types.Namespace, key: []const u8, control: read_admission.Port) ![]const u8 {
+            try control.checkpoint();
+            self.backend.recordPointGet();
+            const keys = [_][]const u8{key};
+            var values: [1]?[]const u8 = .{null};
+            _ = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, namespace, &keys, &values, &self.planning_scratch, self.metadata_allocator, control);
+            try control.checkpoint();
+            return values[0] orelse error.NotFound;
+        }
+
         pub fn getManySorted(self: *@This(), namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
-            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, namespace, keys, values, &self.planning_scratch, self.metadata_allocator);
+            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, namespace, keys, values, &self.planning_scratch, self.metadata_allocator, null);
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
         pub fn openCursor(self: *@This(), namespace: backend_types.Namespace) !LocalCursor {
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
             return try LocalCursor.initView(cursor_alloc, self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, namespace, false);
+        }
+    };
+}
+
+/// Detached data ownership. Value may be an interior slice of a verified table
+/// block; retain its original allocation until deinit, even after backend close.
+pub const OwnedNamespaceValue = struct {
+    allocator: Allocator,
+    allocation: []u8,
+    offset: usize = 0,
+    len: usize,
+    pub fn bytes(self: @This()) []const u8 {
+        return self.allocation[self.offset..][0..self.len];
+    }
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.allocation);
+        self.* = undefined;
+    }
+};
+
+/// A caller-funded immutable-run index continuation. Footer and metadata use
+/// one bound source, never a whole-file fallback or a reopened generation.
+/// Source open, allocator internals and snapshot acquisition remain separate
+/// resource/CPU work. Physical reads and metadata CRC use at most quantum;
+/// footer validation consumes its fixed 48-byte record.
+pub fn OwnedRunIndexRead(comptime BackendType: type) type {
+    const Source = BackendType.RunRangeReader;
+    return struct {
+        pub const Status = enum { pending, ready };
+        const Phase = enum { footer, allocate, metadata, decode, ready, taken, failed, closed };
+        backend: *BackendType,
+        allocator: Allocator,
+        path: ?[]u8,
+        source: ?Source,
+        file_size: usize,
+        footer_bytes: [lsm_table_file.footer_len]u8 = undefined,
+        footer: ?lsm_table_file.Footer = null,
+        position: usize = 0,
+        metadata: ?[]u8 = null,
+        decoder: ?lsm_table_file.IndexDecodeCursor = null,
+        phase: Phase = .footer,
+        failure: ?anyerror = null,
+        load_ns: u64 = 0,
+        decode_ns: u64 = 0,
+
+        pub fn init(backend: *BackendType, allocator: Allocator, path: []const u8, file_size: u64, control: ?read_admission.Port) !@This() {
+            if (control) |port| try port.checkpoint();
+            if (file_size > repository_mod.maxRunFileReadBytes()) return error.FileTooBig;
+            if (file_size < lsm_table_file.header_len + lsm_table_file.footer_len) return error.InvalidTableFile;
+            const owned_path = try allocator.dupe(u8, path);
+            errdefer allocator.free(owned_path);
+            var source = try backend.openRunRangeReaderWithAdmission(owned_path, 0, @intCast(file_size), control);
+            errdefer source.deinit();
+            if (control) |port| try port.checkpoint();
+            return .{ .backend = backend, .allocator = allocator, .path = owned_path, .source = source, .file_size = @intCast(file_size) };
+        }
+        pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (quantum == 0 or quantum > 65536) return error.InvalidArgument;
+            if (self.failure) |err| return err;
+            if (self.phase == .closed or self.phase == .taken) return error.TransactionClosed;
+            const decoding = self.phase == .decode;
+            const started = self.backend.readStatsNowNs();
+            defer {
+                const elapsed = self.backend.readStatsElapsedNs(started);
+                if (decoding) self.decode_ns +|= elapsed else self.load_ns +|= elapsed;
+            }
+            return self.advance(quantum, control) catch |err| {
+                const cause = if (control) |port| blk: {
+                    port.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                } else err;
+                self.deinit();
+                self.failure = cause;
+                self.phase = .failed;
+                return cause;
+            };
+        }
+        fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (control) |port| try port.checkpoint();
+            switch (self.phase) {
+                .ready => return .ready,
+                .footer => {
+                    const take = @min(quantum, self.footer_bytes.len - self.position);
+                    try self.source.?.readInto(self.file_size - self.footer_bytes.len + self.position, self.footer_bytes[self.position..][0..take], control);
+                    self.position += take;
+                    if (self.position == self.footer_bytes.len) {
+                        if (!lsm_table_file.hasFooterMagic(&self.footer_bytes)) return error.UnsupportedVersion;
+                        const footer = try lsm_table_file.decodeFooterBytes(&self.footer_bytes);
+                        const end = self.file_size - lsm_table_file.footer_len;
+                        if (footer.metadata_offset > end or footer.metadata_len != end - footer.metadata_offset) return error.InvalidTableFile;
+                        self.footer = footer;
+                        self.position = 0;
+                        self.phase = .allocate;
+                    }
+                },
+                .allocate => {
+                    self.metadata = try self.allocator.alloc(u8, self.footer.?.metadata_len);
+                    self.phase = .metadata;
+                },
+                .metadata => {
+                    const bytes = self.metadata.?;
+                    const take = @min(quantum, bytes.len - self.position);
+                    try self.source.?.readInto(self.footer.?.metadata_offset + self.position, bytes[self.position..][0..take], control);
+                    self.position += take;
+                    if (self.position == bytes.len) {
+                        self.decoder = lsm_table_file.IndexDecodeCursor.init(self.allocator, self.footer.?, bytes);
+                        self.metadata = null;
+                        self.retireSource();
+                        self.phase = .decode;
+                    }
+                },
+                .decode => if (try self.decoder.?.step(quantum, control) == .ready) {
+                    self.phase = .ready;
+                },
+                else => unreachable,
+            }
+            if (control) |port| try port.checkpoint();
+            return if (self.phase == .ready) .ready else .pending;
+        }
+        pub fn takeOutput(self: *@This()) !lsm_table_file.RetainedIndex {
+            if (self.failure) |err| return err;
+            if (self.phase != .ready) return error.InvalidArgument;
+            const index = try self.decoder.?.takeOutput();
+            self.decoder.?.deinit();
+            self.decoder = null;
+            self.backend.recordTableIndexLoad(self.load_ns +| self.decode_ns);
+            self.backend.recordTableIndexDecode(self.decode_ns);
+            self.phase = .taken;
+            return index;
+        }
+        fn retireSource(self: *@This()) void {
+            if (self.source) |*source| source.deinit();
+            self.source = null;
+            if (self.path) |path| self.allocator.free(path);
+            self.path = null;
+        }
+        pub fn deinit(self: *@This()) void {
+            if (self.decoder) |*decoder| decoder.deinit();
+            self.decoder = null;
+            if (self.metadata) |bytes| self.allocator.free(bytes);
+            self.metadata = null;
+            self.retireSource();
+            self.phase = .closed;
+        }
+    };
+}
+
+/// Owns the namespace snapshot as well as lookup/decode progress. No control,
+/// stack key or self-relative cursor escapes a step. Pending owners must join
+/// retirement before backend close; backend reader pins prevent early teardown.
+/// Snapshot capture and allocation remain separate metadata work,
+/// not yet byte-bounded physical continuations for every provider/codec.
+pub fn OwnedNamespaceValueRead(comptime BackendType: type) type {
+    const Txn = NamespaceReadTxn(BackendType);
+    const Block = OwnedRunBlockRead(BackendType);
+    const Directory = @import("run_directory.zig").Directory;
+    return struct {
+        pub const Status = enum { pending, ready };
+        const Phase = enum { mutable, immutable, runs, run_state, index, block_init, block_decode, block_search, copy_allocate, copy, ready, taken, failed, closed };
+        backend: *BackendType,
+        allocator: Allocator,
+        txn: ?Txn,
+        namespace: backend_types.Namespace,
+        key: []u8,
+        directory_cursor: ?Directory.ReadPointCursor = null,
+        immutable_index: usize = 0,
+        run_index: usize = 0,
+        current_run: ?Run = null,
+        index: ?lsm_table_file.RetainedIndex = null,
+        index_read: ?OwnedRunIndexRead(BackendType) = null,
+        block_index: usize = 0,
+        block: ?Block = null,
+        decoded: ?[]u8 = null,
+        copy_source: ?[]const u8 = null,
+        copy_offset: usize = 0,
+        result: ?OwnedNamespaceValue = null,
+        phase: Phase = .mutable,
+        failure: ?anyerror = null,
+
+        pub fn init(backend: *BackendType, allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, control: ?read_admission.Port) !@This() {
+            if (control) |port| try port.checkpoint();
+            const owned_key = try allocator.dupe(u8, key);
+            errdefer allocator.free(owned_key);
+            var owned_namespace = namespace;
+            owned_namespace.name = if (namespace.name) |name| try allocator.dupe(u8, name) else null;
+            errdefer if (owned_namespace.name) |name| allocator.free(name);
+            var txn = if (control) |port| try Txn.openWithAdmission(backend, port) else try Txn.open(backend);
+            errdefer txn.abort();
+            if (control) |port| try port.checkpoint();
+            backend.recordPointGet();
+            return .{ .backend = backend, .allocator = allocator, .txn = txn, .namespace = owned_namespace, .key = owned_key, .directory_cursor = if (txn.read_view.directory()) |directory| directory.readPoint(owned_namespace.name, owned_key) else null };
+        }
+
+        pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (quantum == 0 or quantum > Block.max_step_bytes) return error.InvalidArgument;
+            switch (self.phase) {
+                .failed => return self.failure.?,
+                .closed, .taken => return error.InvalidArgument,
+                else => {},
+            }
+            return self.advance(quantum, control) catch |err| {
+                const cause = if (control) |port| blk: {
+                    port.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                } else err;
+                self.discardResult();
+                self.retireWorking();
+                self.phase = .failed;
+                self.failure = cause;
+                return cause;
+            };
+        }
+
+        fn selectEntry(self: *@This(), entry: anytype) !void {
+            if (entry.tombstone) return error.NotFound;
+            self.copy_source = entry.value;
+            self.phase = .copy_allocate;
+        }
+
+        fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (control) |port| try port.checkpoint();
+            switch (self.phase) {
+                .ready => return .ready,
+                .mutable => {
+                    const state = self.txn.?.mutable_snapshot;
+                    if (state.findIndex(self.namespace, self.key)) |index| {
+                        self.backend.recordMutableHit();
+                        try self.selectEntry(state.entryAt(index));
+                    } else self.phase = .immutable;
+                },
+                .immutable => {
+                    const states = self.txn.?.immutable_memtables;
+                    if (self.immutable_index < states.len) {
+                        const state = states[self.immutable_index];
+                        self.immutable_index += 1;
+                        if (state.findIndex(self.namespace, self.key)) |index| {
+                            self.backend.recordMutableHit();
+                            try self.selectEntry(state.entryAt(index));
+                        }
+                    } else self.phase = .runs;
+                },
+                .runs => {
+                    const run = if (self.directory_cursor) |*cursor| blk: {
+                        var credits: usize = 64;
+                        if (cursor.nextWithBudget(&credits)) |handle| break :blk handle.run.*;
+                        if (cursor.done()) return error.NotFound;
+                        return .pending;
+                    } else blk: {
+                        const runs = self.txn.?.read_view.runs;
+                        if (self.run_index == runs.len) return error.NotFound;
+                        const candidate = runs[self.run_index];
+                        self.run_index += 1;
+                        break :blk candidate;
+                    };
+                    if (runMayContain(run, self.namespace, self.key)) {
+                        self.current_run = run;
+                        self.current_run.?.shared_read_version = true;
+                        self.backend.recordRunProbe();
+                        self.phase = if (run.state != null) .run_state else .index;
+                    }
+                },
+                .run_state => {
+                    const state = &self.current_run.?.state.?;
+                    if (state.findIndex(self.namespace, self.key)) |index| try self.selectEntry(state.entryAt(index)) else {
+                        self.current_run = null;
+                        self.phase = .runs;
+                    }
+                },
+                .index => {
+                    const path = self.current_run.?.path orelse return error.RunStateUnavailable;
+                    if (self.index_read == null) {
+                        self.index_read = try OwnedRunIndexRead(BackendType).init(self.backend, self.allocator, path, self.current_run.?.size_bytes, control);
+                        return .pending;
+                    }
+                    if (try self.index_read.?.step(quantum, control) != .ready) return .pending;
+                    self.index = try self.index_read.?.takeOutput();
+                    self.index_read.?.deinit();
+                    self.index_read = null;
+                    try requireTableBlocks(self.index.?.view());
+                    if (self.index.?.view().findBlockIndex(self.namespace.name, self.key)) |block_index| {
+                        const block = self.index.?.view().blocks[block_index];
+                        if (block.mayContainKeyByBounds(self.namespace.name, self.key) and block.maybeContains(self.namespace.name, self.key)) {
+                            self.block_index = block_index;
+                            self.phase = .block_init;
+                        } else self.nextRun();
+                    } else self.nextRun();
+                },
+                .block_init => {
+                    const window = self.index.?.view().blockWindow(self.block_index);
+                    const offset = std.math.add(u64, self.index.?.view().entry_data_start, window.physicalRelativeOffset()) catch return error.InvalidTableFile;
+                    self.block = try Block.init(self.backend, self.allocator, self.current_run.?.path.?, offset, window, control);
+                    self.phase = .block_decode;
+                },
+                .block_decode => if (try self.block.?.step(quantum, control) == .ready) {
+                    self.decoded = try self.block.?.takeOutput();
+                    self.block.?.deinit();
+                    self.block = null;
+                    self.phase = .block_search;
+                },
+                .block_search => {
+                    if (try lsm_table_file.findExactEntryInBlock(self.index.?.view(), self.decoded.?, self.block_index, self.namespace.name, self.key)) |positioned| {
+                        const entry = positioned.entry;
+                        if (entry.tombstone) return error.NotFound;
+                        const offset = @intFromPtr(entry.value.ptr) - @intFromPtr(self.decoded.?.ptr);
+                        self.result = .{ .allocator = self.allocator, .allocation = self.decoded.?, .offset = offset, .len = entry.value.len };
+                        self.decoded = null;
+                        if (self.current_run.?.level == 0) self.backend.recordL0Hit() else self.backend.recordLevelHit();
+                        if (control) |port| try port.checkpoint();
+                        self.retireWorking();
+                        self.phase = .ready;
+                        return .ready;
+                    }
+                    self.nextRun();
+                },
+                .copy_allocate => {
+                    self.result = .{ .allocator = self.allocator, .allocation = try self.allocator.alloc(u8, self.copy_source.?.len), .len = self.copy_source.?.len };
+                    self.phase = .copy;
+                },
+                .copy => {
+                    const source = self.copy_source.?;
+                    const take = @min(quantum, source.len - self.copy_offset);
+                    @memcpy(self.result.?.allocation[self.copy_offset..][0..take], source[self.copy_offset..][0..take]);
+                    self.copy_offset += take;
+                    if (self.copy_offset == source.len) {
+                        if (control) |port| try port.checkpoint();
+                        self.retireWorking();
+                        self.phase = .ready;
+                        return .ready;
+                    }
+                },
+                else => unreachable,
+            }
+            if (control) |port| try port.checkpoint();
+            return .pending;
+        }
+
+        fn nextRun(self: *@This()) void {
+            if (self.decoded) |bytes| self.allocator.free(bytes);
+            self.decoded = null;
+            if (self.index_read) |*read| read.deinit();
+            self.index_read = null;
+            if (self.index) |*index| index.deinit();
+            self.index = null;
+            self.current_run = null;
+            self.phase = .runs;
+        }
+
+        pub fn takeOutput(self: *@This()) !OwnedNamespaceValue {
+            if (self.phase != .ready) return error.InvalidArgument;
+            const result = self.result.?;
+            self.result = null;
+            self.phase = .taken;
+            return result;
+        }
+
+        fn discardResult(self: *@This()) void {
+            if (self.result) |*result| result.deinit();
+            self.result = null;
+        }
+
+        fn retireWorking(self: *@This()) void {
+            if (self.block) |*block| block.deinit();
+            self.block = null;
+            self.nextRun();
+            self.copy_source = null;
+            self.directory_cursor = null;
+            self.allocator.free(self.key);
+            self.key = &.{};
+            if (self.namespace.name) |name| self.allocator.free(name);
+            self.namespace.name = null;
+            // Last backend-dependent action: close can proceed as soon as this
+            // snapshot reader pin retires. Do not touch backend afterward.
+            if (self.txn) |*txn| txn.abort();
+            self.txn = null;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.discardResult();
+            self.retireWorking();
+            self.phase = .closed;
+        }
+    };
+}
+
+/// Reusable snapshot key cursor. Each step decodes at most one block quantum,
+/// probes one row, advances one source, or copies one key quantum. Index loads,
+/// snapshot capture and allocations remain separate metadata work. Key views
+/// borrow this owner until seek/handoff/deinit; no control borrow is retained.
+pub fn OwnedNamespaceKeyCursor(comptime BackendType: type) type {
+    const Txn = NamespaceReadTxn(BackendType);
+    const Block = OwnedRunBlockRead(BackendType);
+    const Directory = @import("run_directory.zig").Directory;
+    return struct {
+        pub const Status = enum { pending, ready };
+        const Phase = enum { idle, mutable, immutable, runs, run_state, index, block_init, block_decode, search, candidate, copy_allocate, copy, finish, ready, transferred, failed, closed };
+        backend: *BackendType,
+        allocator: Allocator,
+        txn: ?Txn,
+        namespace: backend_types.Namespace,
+        lower: []u8 = &.{},
+        upper: ?[]u8 = null,
+        exclusive: bool = false,
+        directory_cursor: ?Directory.Cursor = null,
+        immutable_index: usize = 0,
+        run_index: usize = 0,
+        current_run: ?Run = null,
+        index: ?lsm_table_file.RetainedIndex = null,
+        index_read: ?OwnedRunIndexRead(BackendType) = null,
+        block_index: usize = 0,
+        block: ?Block = null,
+        decoded: ?[]u8 = null,
+        lo: usize = 0,
+        hi: usize = 0,
+        best: ?OwnedNamespaceValue = null,
+        best_tombstone: bool = false,
+        candidate_tombstone: bool = false,
+        candidate: ?OwnedNamespaceValue = null,
+        copy_source: ?[]const u8 = null,
+        copy_offset: usize = 0,
+        next_phase: Phase = .runs,
+        phase: Phase = .idle,
+        failure: ?anyerror = null,
+
+        pub fn init(backend: *BackendType, allocator: Allocator, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
+            if (control) |port| try port.checkpoint();
+            var owned_namespace = namespace;
+            owned_namespace.name = if (namespace.name) |name| try allocator.dupe(u8, name) else null;
+            errdefer if (owned_namespace.name) |name| allocator.free(name);
+            var txn = if (control) |port| try Txn.openWithAdmission(backend, port) else try Txn.open(backend);
+            errdefer txn.abort();
+            if (control) |port| try port.checkpoint();
+            return .{ .backend = backend, .allocator = allocator, .txn = txn, .namespace = owned_namespace };
+        }
+        fn checkOpen(self: *const @This()) !void {
+            if (self.failure) |err| return err;
+            if (self.phase == .closed or self.phase == .transferred) return error.TransactionClosed;
+        }
+        pub fn seek(self: *@This(), lower: []const u8, upper: ?[]const u8, exclusive: bool, control: ?read_admission.Port) !void {
+            try self.checkOpen();
+            if (control) |port| try port.checkpoint();
+            const owned_lower = try self.allocator.dupe(u8, lower);
+            errdefer self.allocator.free(owned_lower);
+            const owned_upper = if (upper) |limit| try self.allocator.dupe(u8, limit) else null;
+            errdefer if (owned_upper) |limit| self.allocator.free(limit);
+            if (control) |port| try port.checkpoint();
+            self.clearQuery();
+            self.lower = owned_lower;
+            self.upper = owned_upper;
+            self.exclusive = exclusive;
+            self.restartSources();
+            // Callers may pass key() or previous bounds back into seek.
+            // clearQuery retired those borrows; compare the owned copies.
+            if (self.upper) |limit| {
+                if (std.mem.order(u8, self.lower, limit) != .lt) self.phase = .ready;
+            }
+        }
+        fn restartSources(self: *@This()) void {
+            self.immutable_index = 0;
+            self.run_index = 0;
+            self.directory_cursor = if (self.txn.?.read_view.directory()) |directory| directory.readCursor() else null;
+            self.phase = .mutable;
+        }
+        pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (quantum == 0 or quantum > Block.max_step_bytes) return error.InvalidArgument;
+            try self.checkOpen();
+            if (self.phase == .idle) return error.InvalidArgument;
+            return self.advance(quantum, control) catch |err| {
+                const cause = if (control) |port| blk: {
+                    port.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                } else err;
+                self.deinit();
+                self.failure = cause;
+                self.phase = .failed;
+                return cause;
+            };
+        }
+        fn consider(self: *@This(), entry: anytype, next_phase: Phase) void {
+            self.next_phase = next_phase;
+            if (self.upper) |upper| if (std.mem.order(u8, entry.key, upper) != .lt) {
+                self.endSource();
+                return;
+            };
+            // Sources are visited newest first; equal keys retain the newer
+            // value or tombstone already selected.
+            if (self.best) |best| if (std.mem.order(u8, entry.key, best.bytes()) != .lt) {
+                self.endSource();
+                return;
+            };
+            self.copy_source = entry.key;
+            self.candidate_tombstone = entry.tombstone;
+            self.copy_offset = 0;
+            self.phase = .copy_allocate;
+        }
+        fn stateCandidate(self: *@This(), state: *const State, next_phase: Phase) void {
+            if (nextStateIndex(state, self.namespace, self.lower, !self.exclusive)) |row|
+                self.consider(state.entryAt(row), next_phase)
+            else {
+                self.next_phase = next_phase;
+                self.endSource();
+            }
+        }
+        fn blockEntry(self: *@This(), row: usize) !lsm_table_file.Entry {
+            const index = self.index.?.view();
+            const start = index.entryStartInBlock(row, self.block_index);
+            const base = index.blocks[self.block_index].relative_offset;
+            if (start < base) return error.InvalidTableFile;
+            return lsm_table_file.parseEntryAt(self.decoded.?, start - base);
+        }
+        fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (control) |port| try port.checkpoint();
+            switch (self.phase) {
+                .ready => return .ready,
+                .mutable => self.stateCandidate(self.txn.?.mutable_snapshot, .immutable),
+                .immutable => {
+                    const states = self.txn.?.immutable_memtables;
+                    if (self.immutable_index == states.len) self.phase = .runs else {
+                        const state = states[self.immutable_index];
+                        self.immutable_index += 1;
+                        self.stateCandidate(state, .immutable);
+                    }
+                },
+                .runs => {
+                    const run = if (self.directory_cursor) |*cursor| blk: {
+                        const handle = cursor.next() orelse {
+                            self.phase = .finish;
+                            break :blk null;
+                        };
+                        break :blk @as(?Run, handle.run.*);
+                    } else blk: {
+                        const runs = self.txn.?.read_view.runs;
+                        if (self.run_index == runs.len) {
+                            self.phase = .finish;
+                            break :blk null;
+                        }
+                        const next = runs[self.run_index];
+                        self.run_index += 1;
+                        break :blk @as(?Run, next);
+                    };
+                    if (run) |candidate| if (runMayContainAtOrAfter(candidate, self.namespace, self.lower) and
+                        compareNamespace(self.namespace, .{ .name = candidate.smallest_namespace_name }) != .lt and
+                        (self.upper == null or compareRunBound(candidate.smallest_namespace_name, candidate.smallest_key, self.namespace.name, self.upper.?) == .lt))
+                    {
+                        self.current_run = candidate;
+                        self.current_run.?.shared_read_version = true;
+                        self.phase = if (candidate.state != null) .run_state else .index;
+                    };
+                },
+                .run_state => self.stateCandidate(&self.current_run.?.state.?, .runs),
+                .index => {
+                    if (self.index_read == null) {
+                        self.index_read = try OwnedRunIndexRead(BackendType).init(self.backend, self.allocator, self.current_run.?.path orelse return error.RunStateUnavailable, self.current_run.?.size_bytes, control);
+                        return .pending;
+                    }
+                    if (try self.index_read.?.step(quantum, control) != .ready) return .pending;
+                    self.index = try self.index_read.?.takeOutput();
+                    self.index_read.?.deinit();
+                    self.index_read = null;
+                    try requireTableBlocks(self.index.?.view());
+                    if (self.index.?.view().findBlockLowerBound(self.namespace.name, self.lower)) |block_index| {
+                        self.block_index = block_index;
+                        self.phase = .block_init;
+                    } else self.endRun();
+                },
+                .block_init => {
+                    if (self.block_index == self.index.?.view().blockCount()) self.endRun() else {
+                        const meta = self.index.?.view().blocks[self.block_index];
+                        const past_upper = if (self.upper) |upper| if (meta.smallest_key) |smallest| compareRunBound(meta.smallest_namespace_name, smallest, self.namespace.name, upper) != .lt else false else false;
+                        const lower_order = compareRunBound(meta.largest_namespace_name, meta.largest_key, self.namespace.name, self.lower);
+                        if (past_upper or compareNamespace(self.namespace, .{ .name = meta.smallest_namespace_name }) == .lt) {
+                            self.endRun();
+                        } else if (lower_order == .lt or (lower_order == .eq and self.exclusive)) {
+                            self.block_index += 1;
+                        } else {
+                            const window = self.index.?.view().blockWindow(self.block_index);
+                            const offset = std.math.add(u64, self.index.?.view().entry_data_start, window.physicalRelativeOffset()) catch return error.InvalidTableFile;
+                            self.block = try Block.init(self.backend, self.allocator, self.current_run.?.path.?, offset, window, control);
+                            self.phase = .block_decode;
+                        }
+                    }
+                },
+                .block_decode => if (try self.block.?.step(quantum, control) == .ready) {
+                    self.decoded = try self.block.?.takeOutput();
+                    self.block.?.deinit();
+                    self.block = null;
+                    const meta = self.index.?.view().blocks[self.block_index];
+                    self.lo = meta.first_entry_index;
+                    self.hi = self.lo + meta.entry_count;
+                    self.phase = .search;
+                },
+                .search => {
+                    if (self.lo < self.hi) {
+                        const mid = self.lo + (self.hi - self.lo) / 2;
+                        const entry = try self.blockEntry(mid);
+                        const order = compareRunBound(entry.namespace_name, entry.key, self.namespace.name, self.lower);
+                        if (order == .lt or (order == .eq and self.exclusive)) self.lo = mid + 1 else self.hi = mid;
+                    } else self.phase = .candidate;
+                },
+                .candidate => {
+                    const meta = self.index.?.view().blocks[self.block_index];
+                    if (self.lo == meta.first_entry_index + meta.entry_count) {
+                        self.clearBlock();
+                        self.block_index += 1;
+                        self.phase = .block_init;
+                    } else {
+                        const entry = try self.blockEntry(self.lo);
+                        const order = compareNamespace(.{ .name = entry.namespace_name }, self.namespace);
+                        if (order == .eq) self.consider(entry, .runs) else if (order == .gt) self.endRun() else return error.InvalidTableFile;
+                    }
+                },
+                .copy_allocate => {
+                    self.candidate = .{ .allocator = self.allocator, .allocation = try self.allocator.alloc(u8, self.copy_source.?.len), .len = self.copy_source.?.len };
+                    self.phase = .copy;
+                },
+                .copy => {
+                    const take = @min(quantum, self.copy_source.?.len - self.copy_offset);
+                    @memcpy(self.candidate.?.allocation[self.copy_offset..][0..take], self.copy_source.?[self.copy_offset..][0..take]);
+                    self.copy_offset += take;
+                    if (self.copy_offset == self.copy_source.?.len) {
+                        if (self.best) |*best| best.deinit();
+                        self.best = self.candidate;
+                        self.candidate = null;
+                        self.best_tombstone = self.candidate_tombstone;
+                        self.endSource();
+                    }
+                },
+                .finish => {
+                    if (self.best_tombstone and self.best != null) {
+                        // A newest tombstone hides every older copy. Seek the
+                        // next key in the same pinned snapshot, never live tip.
+                        self.allocator.free(self.lower);
+                        self.lower = self.best.?.allocation;
+                        self.best = null;
+                        self.best_tombstone = false;
+                        self.exclusive = true;
+                        self.restartSources();
+                    } else self.phase = .ready;
+                },
+                else => unreachable,
+            }
+            if (control) |port| try port.checkpoint();
+            return if (self.phase == .ready) .ready else .pending;
+        }
+        pub fn key(self: *const @This()) !?[]const u8 {
+            try self.checkOpen();
+            if (self.phase != .ready) return error.InvalidArgument;
+            return if (self.best) |best| best.bytes() else null;
+        }
+        /// Transfer the very same snapshot into point-value capture. No key or
+        /// namespace is borrowed, no allocator bridge is replaced, no new read
+        /// observes an intervening mutation. This cursor becomes inert.
+        pub fn intoValueRead(self: *@This(), control: ?read_admission.Port) !OwnedNamespaceValueRead(BackendType) {
+            try self.checkOpen();
+            if (self.phase != .ready) return error.InvalidArgument;
+            if (control) |port| try port.checkpoint();
+            const best = self.best orelse return error.NotFound;
+            const txn = self.txn.?;
+            const result: OwnedNamespaceValueRead(BackendType) = .{
+                .backend = self.backend,
+                .allocator = self.allocator,
+                .txn = txn,
+                .namespace = self.namespace,
+                .key = best.allocation,
+                .directory_cursor = if (txn.read_view.directory()) |directory| directory.readPoint(self.namespace.name, best.bytes()) else null,
+            };
+            self.txn = null;
+            self.namespace.name = null;
+            self.best = null;
+            self.clearQuery();
+            self.phase = .transferred;
+            return result;
+        }
+        fn clearBlock(self: *@This()) void {
+            if (self.block) |*block| block.deinit();
+            self.block = null;
+            if (self.decoded) |bytes| self.allocator.free(bytes);
+            self.decoded = null;
+        }
+        fn endRun(self: *@This()) void {
+            self.clearBlock();
+            if (self.index_read) |*read| read.deinit();
+            self.index_read = null;
+            if (self.index) |*index| index.deinit();
+            self.index = null;
+            self.current_run = null;
+            self.phase = .runs;
+        }
+        fn endSource(self: *@This()) void {
+            self.copy_source = null;
+            if (self.next_phase == .runs) self.endRun() else self.phase = self.next_phase;
+        }
+        fn clearQuery(self: *@This()) void {
+            self.endRun();
+            if (self.candidate) |*candidate| candidate.deinit();
+            self.candidate = null;
+            if (self.best) |*best| best.deinit();
+            self.best = null;
+            self.best_tombstone = false;
+            self.copy_source = null;
+            self.allocator.free(self.lower);
+            self.lower = &.{};
+            if (self.upper) |upper| self.allocator.free(upper);
+            self.upper = null;
+            self.directory_cursor = null;
+        }
+        pub fn deinit(self: *@This()) void {
+            self.clearQuery();
+            if (self.namespace.name) |name| self.allocator.free(name);
+            self.namespace.name = null;
+            if (self.txn) |*txn| txn.abort(); // Final backend-dependent action.
+            self.txn = null;
+            self.phase = .closed;
         }
     };
 }
@@ -5795,17 +7009,26 @@ fn readManySortedFromReadView(
     values: []?[]const u8,
     reuse: *BatchScratch.ProbeScratch,
     metadata_allocator: Allocator,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     const plan = chooseMultiGetPlan(keys, .snapshot);
     recordMultiGetPlan(backend, plan);
     if (view.directory() == null) switch (plan) {
-        .point => return readManySortedPointFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false),
-        .sorted_by_run => return readManySortedByRunFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false),
+        .point => return readManySortedPointFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false, control),
+        .sorted_by_run => return readManySortedByRunFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false, control),
         .cursor => {},
     };
-    if (plan != .cursor) return readManySortedDirectoryBatch(backend, mutable, immutable_memtables, view.directory().?, allocator, held_blocks, held_values, namespace, keys, values, plan == .sorted_by_run, false, reuse, metadata_allocator);
-    var cursor = try MergeCursor(@TypeOf(backend.*), State).initView(runtimeScratchAllocator(allocator), backend, mutable, immutable_memtables, view, namespace, false);
+    if (plan != .cursor) return readManySortedDirectoryBatch(backend, mutable, immutable_memtables, view.directory().?, allocator, held_blocks, held_values, namespace, keys, values, plan == .sorted_by_run, false, reuse, metadata_allocator, control);
+    const CursorType = MergeCursor(@TypeOf(backend.*), State);
+    const sequence: CursorType.RunSequence = if (view.directory()) |directory| .{ .directory = directory } else .{ .runs = view.runs, .levels = view.levels };
+    var cursor = if (control) |budget|
+        try CursorType.initSequenceControlled(runtimeScratchAllocator(allocator), backend, mutable, immutable_memtables, sequence, if (sequence.directory != null) &.{} else view.l0_groups, namespace, false, budget)
+    else
+        try CursorType.initView(runtimeScratchAllocator(allocator), backend, mutable, immutable_memtables, view, namespace, false);
     defer cursor.close();
+    const guard = if (control) |budget| try cursor.admission.enter(budget) else null;
+    defer if (guard) |scope| scope.deinit();
     return readManySortedFromCursor(backend, allocator, held_blocks, held_values, &cursor, keys, values);
 }
 
@@ -5827,15 +7050,17 @@ fn readManySortedDirectoryBatch(
     backend_locked: bool,
     reuse: ?*BatchScratch.ProbeScratch,
     metadata_allocator: Allocator,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     if (!sorted_by_run) {
         @memset(values, null);
-        if (try readManySortedPointFromSourceAsync(backend, mutable, immutable_memtables, &.{}, &.{}, &.{}, allocator, held_values, namespace, keys, values, backend_locked, PointResultLifetime.forBlockPins(held_blocks), held_blocks, directory)) |result| return result;
+        if (try readManySortedPointFromSnapshotAsyncWithAdmission(backend, mutable, immutable_memtables, &.{}, &.{}, &.{}, allocator, held_values, namespace, keys, values, backend_locked, PointResultLifetime.forBlockPins(held_blocks), held_blocks, directory, control)) |result| return result;
     }
     if (reuse) |owner| {
         const planner = try owner.planning(metadata_allocator, runtimeScratchAllocator(allocator), backend.options.resource_manager);
         defer planner.finish();
-        return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, planner.arena.allocator(), allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked) catch |err| {
+        return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, planner.arena.allocator(), allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked, control) catch |err| {
             if (planner.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
@@ -5847,7 +7072,7 @@ fn readManySortedDirectoryBatch(
     };
     defer if (admitted) |*budget| budget.deinit();
     const scratch = if (admitted) |*budget| budget.allocator() else runtimeScratchAllocator(allocator);
-    return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, scratch, allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked) catch |err| {
+    return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, scratch, allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked, control) catch |err| {
         if (admitted) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
@@ -5867,7 +7092,9 @@ fn readManySortedDirectoryCandidates(
     values: []?[]const u8,
     sorted_by_run: bool,
     backend_locked: bool,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     const Directory = @import("run_directory.zig").Directory;
     var selected = std.ArrayListUnmanaged(Directory.Handle).empty;
     defer selected.deinit(scratch);
@@ -5875,17 +7102,22 @@ fn readManySortedDirectoryCandidates(
     // rather than revisiting every memtable hit for every overlapping run.
     var unresolved = std.ArrayListUnmanaged([]const u8).empty;
     defer unresolved.deinit(scratch);
-    const planning_keys = try directoryUnresolvedKeys(scratch, mutable, immutable_memtables, namespace, keys, &unresolved);
+    const planning_keys = try directoryUnresolvedKeys(scratch, mutable, immutable_memtables, namespace, keys, &unresolved, control);
     var cursor = directory.sortedPoints(namespace.name, planning_keys);
     while (!cursor.done()) {
-        var budget: usize = 16384;
-        while (cursor.next(&budget)) |handle| try selected.append(scratch, handle);
+        if (control) |authority| try authority.checkpoint();
+        var budget: usize = if (control != null) 64 else 16384;
+        while (cursor.next(&budget)) |handle| {
+            if (control) |authority| try authority.checkpoint();
+            try selected.append(scratch, handle);
+        }
     }
     const handles = selected.items;
     std.mem.sort(Directory.Handle, handles, {}, Directory.readLess);
     const runs = try scratch.alloc(Run, handles.len);
     defer scratch.free(runs);
     for (runs, handles) |*run, handle| {
+        if (control) |authority| try authority.checkpoint();
         run.* = handle.run.*;
         run.shared_read_version = true;
     }
@@ -5893,8 +7125,8 @@ fn readManySortedDirectoryCandidates(
     defer deinitRunGroups(scratch, groups);
     const levels = try buildLowerLevels(scratch, runs);
     defer scratch.free(levels);
-    if (sorted_by_run) return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch);
-    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch);
+    if (sorted_by_run) return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch, control);
+    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch, control);
 }
 
 fn directoryUnresolvedKeys(
@@ -5904,10 +7136,13 @@ fn directoryUnresolvedKeys(
     namespace: backend_types.Namespace,
     keys: []const []const u8,
     unresolved: *std.ArrayListUnmanaged([]const u8),
+    control: ?read_admission.Port,
 ) ![]const []const u8 {
+    if (control) |budget| try budget.checkpoint();
     if (mutable.entryCount() == 0 and immutable_memtables.len == 0) return keys;
     var first_resolved: ?usize = null;
     for (keys, 0..) |key, i| {
+        if (control) |budget| try budget.checkpoint();
         const resolved = found: {
             if (mutable.findIndex(namespace, key) != null) break :found true;
             for (immutable_memtables) |state| if (state.findIndex(namespace, key) != null) break :found true;
@@ -5924,9 +7159,9 @@ fn directoryUnresolvedKeys(
     return if (first_resolved != null) unresolved.items else keys;
 }
 
-fn retainSourcePointValue(backend: anytype, allocator: Allocator, held: *PointResultValues, namespace: backend_types.Namespace, value: []const u8) ![]const u8 {
+fn retainSourcePointValueWithAdmission(backend: anytype, allocator: Allocator, held: *PointResultValues, namespace: backend_types.Namespace, value: []const u8, control: ?read_admission.Port) ![]const u8 {
     if (!namespace.own_source_point_results) return value;
-    return PointResultLifetime.transaction_owned.retain(backend, allocator, held, held.items.len, value);
+    return PointResultLifetime.transaction_owned.retainWithAdmission(backend, allocator, held, held.items.len, value, control);
 }
 
 fn getFromSnapshotRuns(
@@ -5946,12 +7181,14 @@ fn getFromSnapshotRuns(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) ![]const u8 {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     if (mutable.findIndex(namespace, key)) |idx| {
         const entry = mutable.entryAt(idx);
         if (entry.tombstone) return error.NotFound;
         read_hint.* = null;
         backend.recordMutableHit();
-        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+        return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
     }
     for (immutable_memtables) |state| {
         if (state.findIndex(namespace, key)) |idx| {
@@ -5959,7 +7196,7 @@ fn getFromSnapshotRuns(
             if (entry.tombstone) return error.NotFound;
             read_hint.* = null;
             backend.recordMutableHit();
-            return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+            return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
         }
     }
     var candidate_group_index = if (last_l0_group_index.*) |hinted_index|
@@ -5989,9 +7226,16 @@ fn getFromSnapshotRuns(
 }
 
 fn buildL0RunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
+    return buildL0RunGroupsControlled(allocator, runs, null);
+}
+
+fn buildL0RunGroupsControlled(allocator: Allocator, runs: []const Run, control: ?read_admission.Port) ![]RunGroup {
+    if (control) |owner| try owner.checkpoint();
     var l0_count: usize = 0;
-    while (l0_count < runs.len and runs[l0_count].level == 0) : (l0_count += 1) {}
-    return try buildRunGroups(allocator, runs[0..l0_count]);
+    while (l0_count < runs.len and runs[l0_count].level == 0) : (l0_count += 1) {
+        if (control) |owner| try owner.checkpoint();
+    }
+    return try buildRunGroupsControlled(allocator, runs[0..l0_count], control);
 }
 
 fn buildL0RunGroupsWithStats(backend: anytype, allocator: Allocator, runs: []const Run) ![]RunGroup {
@@ -6008,8 +7252,15 @@ fn buildL0RunGroupsWithStats(backend: anytype, allocator: Allocator, runs: []con
 }
 
 fn buildLowerLevels(allocator: Allocator, runs: []const Run) ![]RunLevel {
+    return buildLowerLevelsControlled(allocator, runs, null);
+}
+
+fn buildLowerLevelsControlled(allocator: Allocator, runs: []const Run, control: ?read_admission.Port) ![]RunLevel {
+    if (control) |owner| try owner.checkpoint();
     var start: usize = 0;
-    while (start < runs.len and runs[start].level == 0) : (start += 1) {}
+    while (start < runs.len and runs[start].level == 0) : (start += 1) {
+        if (control) |owner| try owner.checkpoint();
+    }
     if (start >= runs.len) return try allocator.alloc(RunLevel, 0);
 
     var levels = std.ArrayListUnmanaged(RunLevel).empty;
@@ -6017,19 +7268,28 @@ fn buildLowerLevels(allocator: Allocator, runs: []const Run) ![]RunLevel {
 
     var i = start;
     while (i < runs.len) {
+        if (control) |owner| try owner.checkpoint();
         const level = runs[i].level;
         const level_start = i;
-        while (i < runs.len and runs[i].level == level) : (i += 1) {}
+        while (i < runs.len and runs[i].level == level) : (i += 1) {
+            if (control) |owner| try owner.checkpoint();
+        }
         try levels.append(allocator, .{
             .level = level,
             .start_index = level_start,
             .len = i - level_start,
         });
     }
+    if (control) |owner| try owner.checkpoint();
     return try levels.toOwnedSlice(allocator);
 }
 
 fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
+    return buildRunGroupsControlled(allocator, runs, null);
+}
+
+fn buildRunGroupsControlled(allocator: Allocator, runs: []const Run, control: ?read_admission.Port) ![]RunGroup {
+    if (control) |owner| try owner.checkpoint();
     const IndexedRun = struct {
         run_index: usize,
         smallest_namespace_name: ?[]const u8,
@@ -6043,6 +7303,7 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
     var indexed = try allocator.alloc(IndexedRun, runs.len);
     defer allocator.free(indexed);
     for (runs, 0..) |run, i| {
+        if (control) |owner| try owner.checkpoint();
         indexed[i] = .{
             .run_index = i,
             .smallest_namespace_name = run.smallest_namespace_name,
@@ -6051,11 +7312,11 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
             .largest_key = run.largest_key,
         };
     }
-    std.mem.sort(IndexedRun, indexed, {}, struct {
+    try read_admission.sort(IndexedRun, indexed, {}, struct {
         fn lessThan(_: void, lhs: IndexedRun, rhs: IndexedRun) bool {
             return compareRunBound(lhs.smallest_namespace_name, lhs.smallest_key, rhs.smallest_namespace_name, rhs.smallest_key) == .lt;
         }
-    }.lessThan);
+    }.lessThan, control);
 
     var groups = std.ArrayListUnmanaged(RunGroup).empty;
     errdefer {
@@ -6073,6 +7334,7 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
     try current.append(allocator, indexed[0].run_index);
 
     for (indexed[1..]) |run| {
+        if (control) |owner| try owner.checkpoint();
         if (!rangesOverlap(
             run.smallest_namespace_name,
             run.smallest_key,
@@ -6083,8 +7345,9 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
             group_largest_namespace_name,
             group_largest_key,
         )) {
-            std.mem.sort(usize, current.items, {}, std.sort.asc(usize));
-            try groups.append(allocator, .{
+            try read_admission.sort(usize, current.items, {}, std.sort.asc(usize), control);
+            try groups.ensureUnusedCapacity(allocator, 1);
+            groups.appendAssumeCapacity(.{
                 .smallest_namespace_name = group_smallest_namespace_name,
                 .smallest_key = group_smallest_key,
                 .largest_namespace_name = group_largest_namespace_name,
@@ -6109,8 +7372,9 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
         try current.append(allocator, run.run_index);
     }
 
-    std.mem.sort(usize, current.items, {}, std.sort.asc(usize));
-    try groups.append(allocator, .{
+    try read_admission.sort(usize, current.items, {}, std.sort.asc(usize), control);
+    try groups.ensureUnusedCapacity(allocator, 1);
+    groups.appendAssumeCapacity(.{
         .smallest_namespace_name = group_smallest_namespace_name,
         .smallest_key = group_smallest_key,
         .largest_namespace_name = group_largest_namespace_name,
@@ -6118,6 +7382,7 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
         .run_indices = try current.toOwnedSlice(allocator),
     });
 
+    if (control) |owner| try owner.checkpoint();
     return try groups.toOwnedSlice(allocator);
 }
 
@@ -6236,9 +7501,11 @@ fn pathRunSurvivesPointPrecheck(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !bool {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     if (!runMayContain(run.*, namespace, key)) return false;
 
-    const filter = try ensureRunBloomFilterForReadMaybeLocked(backend, run, backend_locked);
+    const filter = try ensureRunBloomFilterForReadMaybeLockedWithAdmission(backend, run, backend_locked, control);
     if (filter) |present_filter| {
         const present = lsm_table_file.maybeContains(present_filter, namespace.name, key);
         if (!present) {
@@ -6252,11 +7519,11 @@ fn pathRunSurvivesPointPrecheck(
             const state = try indexes.state(backend, run, run_index);
             break :blk lsm_table_file.maybeContains(state.handle.runTableIndex().borrowFilter(), namespace.name, key);
         }
-        var handle = try loadRunTableIndexHandle(backend, run);
+        var handle = try loadRunTableIndexHandleWithAdmission(backend, run, control);
         defer handle.release();
         break :blk lsm_table_file.maybeContains(handle.runTableIndex().borrowFilter(), namespace.name, key);
     } else blk: {
-        const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+        const index = try indexForRunNoCacheMaybeLockedWithAdmission(backend, run, backend_locked, control);
         break :blk lsm_table_file.maybeContains(index.borrowFilter(), namespace.name, key);
     };
     if (!present) backend.recordBloomNegative();
@@ -6276,6 +7543,8 @@ fn readPointRunCandidate(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !?[]const u8 {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     const run = &runs[candidate.run_index];
     if (backend.options.cache != null) {
         const located = if (batch_run_indexes) |indexes|
@@ -6291,7 +7560,7 @@ fn readPointRunCandidate(
         };
         return located.entry.value;
     }
-    if (try getFromRunWithLocalIndex(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked)) |value| {
+    if (try getFromRunWithLocalIndexWithAdmission(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked, control)) |value| {
         read_hint.* = null;
         return value;
     }
@@ -6311,12 +7580,15 @@ fn getFromPathRunIndicesPrechecked(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !?[]const u8 {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     var stack_candidates: [max_stack_point_run_candidates]PointRunCandidate = undefined;
     var stack_candidate_len: usize = 0;
     var overflow_candidates = std.ArrayListUnmanaged(PointRunCandidate).empty;
     defer overflow_candidates.deinit(value_allocator);
 
     for (run_indices) |run_index| {
+        if (control) |budget| try budget.checkpoint();
         backend.recordRunProbe();
         recordPointRunPrecheck(backend);
         if (!try pathRunSurvivesPointPrecheck(backend, &runs[run_index], run_index, namespace, key, backend_locked, batch_run_indexes)) continue;
@@ -6470,7 +7742,11 @@ const AsyncPointResultPins = struct {
 // buffer; oversized values keep their exact-size allocation. Every buffer is
 // registered with the caller before use and survives pool eviction/errors.
 fn copyPointValue(backend: anytype, allocator: Allocator, held: *PointResultValues, value: []const u8) ![]const u8 {
-    const copied = try held.copies.copy(allocator, held, value);
+    return copyPointValueWithAdmission(backend, allocator, held, value, null);
+}
+
+fn copyPointValueWithAdmission(backend: anytype, allocator: Allocator, held: *PointResultValues, value: []const u8, control: ?read_admission.Port) ![]const u8 {
+    const copied = try held.copies.copyWithAdmission(allocator, held, value, control);
     recordPointValueCopy(backend);
     return copied;
 }
@@ -6483,12 +7759,17 @@ const AsyncPointResultCopies = struct {
     next_capacity: usize = 256,
 
     fn copy(self: *@This(), allocator: Allocator, held: *PointResultValues, value: []const u8) ![]const u8 {
+        return self.copyWithAdmission(allocator, held, value, null);
+    }
+
+    fn copyWithAdmission(self: *@This(), allocator: Allocator, held: *PointResultValues, value: []const u8, control: ?read_admission.Port) ![]const u8 {
+        if (control) |budget| try budget.checkpoint();
         if (value.len == 0) return "";
         // Keep the small buffer across larger results. A mixed-size batch
         // cannot strand a nearly empty slab for every large value.
         if (value.len > max_packed_value_bytes) {
             try held.ensureUnusedCapacity(allocator, 1);
-            const owned = try allocator.dupe(u8, value);
+            const owned = try copyPointPromotionRows(allocator, value, control);
             held.appendAssumeCapacity(owned);
             return owned;
         }
@@ -6507,7 +7788,8 @@ const AsyncPointResultCopies = struct {
             self.next_capacity = @min(max_buffer_bytes, owned.len *| 2);
         }
         const result = self.buffer[self.used..][0..value.len];
-        @memcpy(result, value);
+        try copyPointResultBytes(result, value, control);
+        if (control) |budget| try budget.checkpoint();
         self.used += value.len;
         return result;
     }
@@ -6538,6 +7820,8 @@ const AsyncPointBlockRead = struct {
     decoded_handle: ?cache_mod.Handle = null,
     future: ?storage_io.RangeReadFuture = null,
     shared_block: ?*BatchAsyncBlock = null,
+    // Borrowed only within the synchronous batch; physical futures never retain it.
+    control: ?read_admission.Port = null,
     result_pins: ?*AsyncPointResultPins = null,
     result_retention: ResultBlockRetention = .unknown,
     selected_result_bytes: usize = 0,
@@ -6610,6 +7894,7 @@ const BatchAsyncBlocks = struct {
         limit: usize,
     } = null,
     limit: usize = max_point_async_stack_reads,
+    control: ?read_admission.Port = null,
     decoded_bytes: usize = 0,
     prefix_key_bytes: usize = 0,
 
@@ -6621,8 +7906,12 @@ const BatchAsyncBlocks = struct {
     // Physical scratch is bounded and arbitrary-order frees are reusable.
     // Idle storage and spare credit are reclaimed before mandatory fallback.
     fn reusableAllocator(self: *@This()) Allocator {
+        return self.reusableAllocatorWithAdmission(null) catch unreachable;
+    }
+
+    fn reusableAllocatorWithAdmission(self: *@This(), control: ?read_admission.Port) !Allocator {
         if (self.workspace_config) |config| {
-            if (self.workspace == null) self.workspace = config.pool.acquireRecycled(config.backing, config.manager, config.io, 3 * max_decoded_bytes, config.limit);
+            if (self.workspace == null) self.workspace = try config.pool.acquireRecycledWithAdmission(config.backing, config.manager, config.io, 3 * max_decoded_bytes, config.limit, control);
             return self.workspace.?.allocator();
         }
         return self.allocator;
@@ -6657,7 +7946,7 @@ const BatchAsyncBlocks = struct {
 
     fn prefixReader(self: *@This(), entry: *BatchAsyncBlock, payload: []const u8, first_entry_index: usize, entry_count: usize) !*lsm_table_file.PrefixPointReader {
         if (entry.prefix_reader == null) {
-            entry.prefix_allocator = if (entry.read.logical_len <= max_decoded_block_bytes and self.workspace_config != null) self.reusableAllocator() else self.scratchAllocator();
+            entry.prefix_allocator = if (entry.read.logical_len <= max_decoded_block_bytes and self.workspace_config != null) try self.reusableAllocatorWithAdmission(self.control) else self.scratchAllocator();
             const reader = try lsm_table_file.PrefixPointReader.init(payload, first_entry_index, entry.read.logical_len);
             if (reader.entryCount() != entry_count) return error.InvalidTableFile;
             entry.prefix_reader = reader;
@@ -6746,7 +8035,7 @@ const BatchAsyncBlocks = struct {
     fn decodedPayload(self: *@This(), entry: *BatchAsyncBlock, payload: []const u8) !?[]const u8 {
         if (entry.decoded) |bytes| return bytes;
         if (!entry.checksum_validated) {
-            try lsm_table_file.validateBlockPayload(payload, entry.read.checksum);
+            try lsm_table_file.validateBlockPayloadWithAdmission(payload, entry.read.checksum, self.control);
             entry.checksum_validated = true;
         }
         if (entry.read.compression == .none) {
@@ -6767,7 +8056,7 @@ const BatchAsyncBlocks = struct {
             for (self.entries[0..self.limit]) |*idle| if (idle != entry and idle.users == 0) self.clear(idle);
         }
         if (self.decoded_bytes + decoded_len > max_decoded_bytes) return null;
-        const bytes = snappy.decode(self.reusableAllocator(), payload) catch |err| switch (err) {
+        const bytes = snappy.decodeWithAdmission(try self.reusableAllocatorWithAdmission(self.control), payload, self.control) catch |err| switch (err) {
             error.OutOfMemory => {
                 // Optional cache admission must not fail an otherwise readable
                 // point or repeatedly ask the allocator for the same block.
@@ -6798,6 +8087,35 @@ fn prepareAsyncPointBlockRead(
     key: []const u8,
     shared: ?*BatchAsyncBlocks,
 ) !?AsyncPointBlockRead {
+    return prepareAsyncPointBlockReadWithAdmission(backend, runs, candidate, namespace, key, shared, null);
+}
+
+fn prepareAsyncPointBlockReadWithAdmission(
+    backend: anytype,
+    runs: []Run,
+    candidate: PointRunCandidate,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    shared: ?*BatchAsyncBlocks,
+    control: ?read_admission.Port,
+) !?AsyncPointBlockRead {
+    if (control) |budget| try budget.checkpoint();
+    var read = (try prepareAsyncPointBlockReadControlled(backend, runs, candidate, namespace, key, shared, control)) orelse return null;
+    errdefer read.release();
+    read.control = control;
+    if (control) |budget| try budget.checkpoint();
+    return read;
+}
+
+fn prepareAsyncPointBlockReadControlled(
+    backend: anytype,
+    runs: []Run,
+    candidate: PointRunCandidate,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    shared: ?*BatchAsyncBlocks,
+    control: ?read_admission.Port,
+) !?AsyncPointBlockRead {
     const cache = backend.options.cache orelse return null;
     var directory_run: Run = undefined;
     const run = if (candidate.directory_run) |source| blk: {
@@ -6807,7 +8125,7 @@ fn prepareAsyncPointBlockRead(
     } else &runs[candidate.run_index];
     const path = run.path orelse return null;
     const resident = if (shared) |pool| pool.indexHandle(path, run.id, backend.root_generation) else null;
-    var index_handle: ?cache_mod.Handle = if (resident == null) try loadRunTableIndexHandle(backend, run) else null;
+    var index_handle: ?cache_mod.Handle = if (resident == null) try loadRunTableIndexHandleWithAdmission(backend, run, control) else null;
     errdefer if (index_handle) |*handle| handle.release();
     const index = if (resident) |handle| handle.runTableIndex() else index_handle.?.runTableIndex();
     const block_index = index.findBlockIndex(namespace.name, key) orelse {
@@ -6857,7 +8175,7 @@ fn prepareAsyncPointBlockRead(
     // Retain before evicting the resident block that lent this index.
     if (index_handle == null) index_handle = resident.?.retain();
     if (shared) |pool| pool.prepareInsert();
-    if (cache.retainRunTableBlock(path, run.id, backend.root_generation, absolute_offset, physical_len)) |handle| {
+    if (try cache.retainRunTableBlockWithAdmission(path, run.id, backend.root_generation, absolute_offset, physical_len, control)) |handle| {
         backend.recordSharedBlockCacheHit();
         return .{
             .candidate = candidate,
@@ -6875,7 +8193,7 @@ fn prepareAsyncPointBlockRead(
             .decoded_handle = handle,
         };
     }
-    if (cache.retainRunTablePhysicalBlock(path, run.id, backend.root_generation, absolute_offset, physical_len)) |handle| {
+    if (try cache.retainRunTablePhysicalBlockWithAdmission(path, run.id, backend.root_generation, absolute_offset, physical_len, control)) |handle| {
         backend.recordSharedBlockCacheHit();
         return .{
             .candidate = candidate,
@@ -6895,7 +8213,10 @@ fn prepareAsyncPointBlockRead(
     }
 
     backend.recordSharedBlockCacheMiss();
-    var future = try backend.storage.?.beginReadFileRangeAllocWithRuntime(backend.options.read_runtime, cache.valueAllocator(), path, absolute_offset, physical_len);
+    var future = if (control) |budget|
+        try backend.storage.?.beginReadFileRangeAllocWithAdmission(backend.options.read_runtime, cache.valueAllocator(), path, absolute_offset, physical_len, budget)
+    else
+        try backend.storage.?.beginReadFileRangeAllocWithRuntime(backend.options.read_runtime, cache.valueAllocator(), path, absolute_offset, physical_len);
     errdefer future.cancel();
     return .{
         .candidate = candidate,
@@ -6925,21 +8246,21 @@ fn payloadForAsyncPointRead(
     var future = read.future orelse return error.RunStateUnavailable;
     read.future = null;
     const start_ns = backend.readStatsNowNs();
-    const bytes = future.wait() catch |err| {
+    const bytes = (if (read.control) |control| future.waitWithAdmission(cache.valueAllocator(), control) else future.wait()) catch |err| {
         backend.recordPointRunAsyncWait(backend.readStatsElapsedNs(start_ns));
         return err;
     };
     const elapsed_ns = backend.readStatsElapsedNs(start_ns);
     backend.recordPointRunAsyncWait(elapsed_ns);
     backend.recordTableBlockLoad(bytes.len, elapsed_ns);
-    lsm_table_file.validateBlockPayload(bytes, read.checksum) catch |err| {
+    lsm_table_file.validateBlockPayloadWithAdmission(bytes, read.checksum, read.control) catch |err| {
         cache.valueAllocator().free(bytes);
         return err;
     };
     read.physical_handle = if (read.retain_block)
-        try cache.putRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes)
+        try cache.putRunTablePhysicalBlockWithAdmission(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes, read.control)
     else
-        try cache.putTransientRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes);
+        try cache.putTransientRunTablePhysicalBlockWithAdmission(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes, read.control);
     return read.physical_handle.?.runTablePhysicalBlock();
 }
 
@@ -6999,13 +8320,13 @@ fn retainAsyncPointEntry(
     // A single-point caller may keep a key hint. Batch slots never consume
     // hints and retain only values, independent of cache/decoder lifetimes.
     const value = if (read_hint) |hint| blk: {
-        const owned = try copyTableEntry(value_allocator, positioned.entry);
+        const owned = try copyTableEntryWithAdmission(value_allocator, positioned.entry, read.control);
         errdefer value_allocator.free(owned.bytes);
         try held_values.append(value_allocator, owned.bytes);
         hint.* = .{ .run_index = read.candidate.run_index, .namespace_name = namespace.name, .key = owned.entry.key, .entry_index = positioned.index };
         break :blk owned.entry.value;
-    } else if (read.result_copies) |copies| try copies.copy(value_allocator, held_values, positioned.entry.value) else blk: {
-        const owned = try value_allocator.dupe(u8, positioned.entry.value);
+    } else if (read.result_copies) |copies| try copies.copyWithAdmission(value_allocator, held_values, positioned.entry.value, read.control) else blk: {
+        const owned = try copyPointPromotionRows(value_allocator, positioned.entry.value, read.control);
         errdefer value_allocator.free(owned);
         try held_values.append(value_allocator, owned);
         break :blk owned;
@@ -7020,11 +8341,12 @@ fn retainAsyncPointEntry(
 // promotion lease or cancel the owner's physical handle.
 fn retainAsyncDecodedPointEntry(backend: anytype, read: *AsyncPointBlockRead, read_hint: ?*?BorrowedReadHint, held_values: *PointResultValues, value_allocator: Allocator, namespace: backend_types.Namespace, positioned: lsm_table_file.BorrowedDecoded.PositionedEntry, decoded: DecodedPointBlock) !AsyncPointLookupResult {
     const result = try retainAsyncPointEntry(backend, read, read_hint, held_values, value_allocator, namespace, positioned);
+    if (read.control) |budget| try budget.checkpoint();
     const owner = if (read.shared_block) |shared_owner| &shared_owner.read else read;
-    if (namespace.retainDataBlocks()) if (owner.physical_handle) |*handle| if (handle.claimPointBlockPromotion(read.logical_len)) {
+    if (namespace.retainDataBlocks()) if (owner.physical_handle) |*handle| if (try handle.claimPointBlockPromotionWithAdmission(read.logical_len, read.control)) {
         defer handle.finishPointBlockPromotion();
         const index = try read.index();
-        try promoteCachedPointBlock(backend, read.path, read.run_id, read.generation, index.blockWindow(read.block_index), read.absolute_offset, handle.runTablePhysicalBlock(), decoded);
+        try promoteCachedPointBlockWithAdmission(backend, read.path, read.run_id, read.generation, index.blockWindow(read.block_index), read.absolute_offset, handle.runTablePhysicalBlock(), decoded, read.control);
     };
     return result;
 }
@@ -7068,7 +8390,7 @@ fn retainLargeSingletonSnappy(
     try held_values.ensureUnusedCapacity(value_allocator, 1);
     const owned = try value_allocator.alloc(u8, read.logical_len);
     errdefer value_allocator.free(owned);
-    try snappy.decodeInto(payload, owned);
+    try snappy.decodeIntoWithAdmission(payload, owned, read.control);
     const found = (try lsm_table_file.findExactEntryInBlock(index, owned, read.block_index, namespace.name, key)) orelse return error.InvalidTableFile;
     held_values.appendAssumeCapacity(owned);
     if (read_hint) |hint| hint.* = .{ .run_index = read.candidate.run_index, .namespace_name = namespace.name, .key = found.entry.key, .entry_index = found.index };
@@ -7087,6 +8409,7 @@ fn consumeAsyncPointReadWithScratch(
     shared: ?*BatchAsyncBlocks,
     scratch: Allocator,
 ) !?AsyncPointLookupResult {
+    if (read.control) |budget| try budget.checkpoint();
     backend.recordPointRunSurvivorRead();
     if (read.status == .known_miss) {
         backend.recordPointRunSurvivorMiss();
@@ -7113,13 +8436,13 @@ fn consumeAsyncPointReadWithScratch(
                 const recycled = workspace.allocator();
                 if (prefix_allocator.ptr != recycled.ptr or prefix_allocator.vtable != recycled.vtable) pool.reclaimIdleScratch();
             }
-            const found = (reader.find(pool.prefixAllocator(owner), namespace.name, key) catch |err| fallback: {
+            const found = (reader.findWithAdmission(pool.prefixAllocator(owner), namespace.name, key, read.control) catch |err| fallback: {
                 if (err != error.OutOfMemory or pool.workspace == null or owner.prefix_allocator.?.ptr != pool.workspace.?.allocator().ptr) return err;
                 pool.clearPrefixReader(owner);
                 reader = try pool.prefixReader(owner, decoded, block.first_entry_index, block.entry_count);
                 owner.prefix_allocator = scratch;
                 pool.reclaimIdleScratch();
-                break :fallback try reader.find(scratch, namespace.name, key);
+                break :fallback try reader.findWithAdmission(scratch, namespace.name, key, read.control);
             }) orelse {
                 backend.recordPointRunSurvivorMiss();
                 return null;
@@ -7138,18 +8461,18 @@ fn consumeAsyncPointReadWithScratch(
     // The fallback decoder is mandatory scratch, never optional cache memory.
     // None borrows its pinned payload. Snappy scratch is freed before returning.
     const validated = if (read.shared_block) |owner| owner.checksum_validated else false;
-    if (!validated) try lsm_table_file.validateBlockPayload(payload, read.checksum);
+    if (!validated) try lsm_table_file.validateBlockPayloadWithAdmission(payload, read.checksum, read.control);
     if (try retainLargeSingletonSnappy(backend, read, index, payload, read_hint, held_values, value_allocator, namespace, key)) |result| return result;
     const snappy = @import("../../encoding/snappy.zig");
     const decoded = switch (read.compression) {
         .none, .prefix => payload,
         .snappy => blk: {
             if (try snappy.decodedLen(payload) != read.logical_len) return error.InvalidTableFile;
-            break :blk try snappy.decode(scratch, payload);
+            break :blk try snappy.decodeWithAdmission(scratch, payload, read.control);
         },
         .prefix_snappy => blk: {
             try lsm_table_file.validatePrefixDecodedSize(payload, read.logical_len);
-            break :blk try snappy.decode(scratch, payload);
+            break :blk try snappy.decodeWithAdmission(scratch, payload, read.control);
         },
     };
     defer if (read.compression == .snappy or read.compression == .prefix_snappy) scratch.free(decoded);
@@ -7158,7 +8481,7 @@ fn consumeAsyncPointReadWithScratch(
             var reader = try lsm_table_file.PrefixPointReader.init(decoded, block.first_entry_index, read.logical_len);
             defer reader.deinit(scratch);
             if (reader.entryCount() != block.entry_count) return error.InvalidTableFile;
-            const found = try reader.find(scratch, namespace.name, key) orelse {
+            const found = try reader.findWithAdmission(scratch, namespace.name, key, read.control) orelse {
                 backend.recordPointRunSurvivorMiss();
                 return null;
             };
@@ -7355,7 +8678,7 @@ fn startBatchAsyncPointSlot(
     const candidate = slot.candidates.next(runs, levels, namespace, keys[slot.key_index]) orelse return false;
     backend.recordRunProbe();
     recordPointRunPrecheck(backend);
-    var prepared = (try prepareAsyncPointBlockRead(backend, runs, candidate, namespace, keys[slot.key_index], shared)) orelse return error.RunStateUnavailable;
+    var prepared = (try prepareAsyncPointBlockReadWithAdmission(backend, runs, candidate, namespace, keys[slot.key_index], shared, shared.control)) orelse return error.RunStateUnavailable;
     if (prepared.status != .known_miss) recordPointRunPrecheckSurvivor(backend);
     if (prepared.status == .future) issued_count.* += 1;
     if (prepared.status != .known_miss and prepared.shared_block == null) {
@@ -7395,6 +8718,7 @@ fn fillBatchAsyncPointSlot(
     copies: *AsyncPointResultCopies,
 ) !bool {
     while (next_key.* < keys.len) {
+        if (shared.control) |budget| try budget.checkpoint();
         const i = next_key.*;
         next_key.* += 1;
         const key = keys[i];
@@ -7408,7 +8732,7 @@ fn fillBatchAsyncPointSlot(
                 result.misses += 1;
             } else {
                 values[i] = if (namespace.own_source_point_results or lifetime == .transaction_owned) owned: {
-                    const value = try copies.copy(allocator, held_values, present.value);
+                    const value = try copies.copyWithAdmission(allocator, held_values, present.value, shared.control);
                     recordPointValueCopy(backend);
                     break :owned value;
                 } else present.value;
@@ -7463,6 +8787,28 @@ fn readManySortedPointFromSourceAsync(
     held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     directory: ?*const @import("run_directory.zig").Directory,
 ) !?BatchCursorReadResult {
+    return readManySortedPointFromSnapshotAsyncWithAdmission(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, backend_locked, result_lifetime, held_blocks, directory, null);
+}
+
+fn readManySortedPointFromSnapshotAsyncWithAdmission(
+    backend: anytype,
+    mutable: anytype,
+    immutable_memtables: []const *const State,
+    runs: []Run,
+    l0_groups: []const RunGroup,
+    levels: []const RunLevel,
+    allocator: Allocator,
+    held_values: *PointResultValues,
+    namespace: backend_types.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+    backend_locked: bool,
+    result_lifetime: PointResultLifetime,
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
+    directory: ?*const @import("run_directory.zig").Directory,
+    control: ?read_admission.Port,
+) !?BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     if (backend_locked or keys.len < 2 or backend.storage == null or backend.options.cache == null) return null;
     const async_lease = acquirePointAsyncBatchLease(backend);
     defer releasePointAsyncBatchLease(backend, async_lease);
@@ -7478,7 +8824,7 @@ fn readManySortedPointFromSourceAsync(
     defer if (decode_budget) |*budget| budget.deinit();
     var scratch = PointReadScratch.init(backend);
     defer scratch.deinit();
-    var shared: BatchAsyncBlocks = .{ .allocator = if (decode_budget) |*budget| budget.allocator() else runtimeScratchAllocator(allocator), .scratch_allocator = scratch.allocator(), .limit = configured_limit };
+    var shared: BatchAsyncBlocks = .{ .allocator = if (decode_budget) |*budget| budget.allocator() else runtimeScratchAllocator(allocator), .scratch_allocator = scratch.allocator(), .limit = configured_limit, .control = control };
     if (comptime @hasField(@TypeOf(backend.*), "point_reader")) shared.workspace_config = .{
         .pool = &backend.point_reader,
         .backing = backend.allocator,
@@ -7505,6 +8851,7 @@ fn readManySortedPointFromSourceAsync(
         const slot = &slots[cursor];
         cursor = (cursor + 1) % configured_limit;
         if (!slot.active) continue;
+        if (control) |budget| try budget.checkpoint();
         const key_index = slot.key_index;
         const deciding_level = if (slot.read.candidate.directory_run) |run| run.level else runs[slot.read.candidate.run_index].level;
         scratch.resetDenial();
@@ -7532,6 +8879,7 @@ fn readManySortedPointFromSourceAsync(
         if (!try fillBatchAsyncPointSlot(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, result_lifetime, &next_key, &result, slot, &issued_count, &shared, directory, result_copies)) active_slots -= 1;
     }
     backend.recordPointRunAsyncBatch(issued_count);
+    if (control) |budget| try budget.checkpoint();
     return result;
 }
 
@@ -7548,11 +8896,14 @@ fn getFromRunIndices(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !?[]const u8 {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     if (runIndicesUsePathBackedPointPrecheck(backend, runs, run_indices)) {
         return try getFromPathRunIndicesPrechecked(backend, runs, run_indices, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes);
     }
 
     for (run_indices) |run_index| {
+        if (control) |budget| try budget.checkpoint();
         backend.recordRunProbe();
         const run = &runs[run_index];
         if (run.state) |*state| {
@@ -7560,7 +8911,7 @@ fn getFromRunIndices(
                 const entry = state.entryAt(idx);
                 if (entry.tombstone) return error.NotFound;
                 read_hint.* = null;
-                return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+                return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
             }
             continue;
         }
@@ -7573,13 +8924,13 @@ fn getFromRunIndices(
                         const entry = state.entryAt(idx);
                         if (entry.tombstone) return error.NotFound;
                         read_hint.* = null;
-                        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+                        return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
                     }
                     continue;
                 }
             }
             const run_filter_checked = run.bloom_filter != null or run.path != null;
-            if (run_filter_checked and !try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
+            if (run_filter_checked and !try runMayContainWithFilterMaybeLockedWithAdmission(backend, run, namespace, key, backend_locked, control)) continue;
             if (backend.options.cache != null) {
                 const located = if (batch_run_indexes) |indexes|
                     try getFromRunWithBlockCacheBatch(backend, run, run_index, read_hint, held_blocks, held_values, value_allocator, namespace, key, run_filter_checked, indexes) orelse continue
@@ -7594,16 +8945,16 @@ fn getFromRunIndices(
                 };
                 return located.entry.value;
             }
-            if (try getFromRunWithLocalIndex(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked)) |value| {
+            if (try getFromRunWithLocalIndexWithAdmission(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked, control)) |value| {
                 read_hint.* = null;
                 return value;
             }
             continue;
         }
 
-        if (!try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
+        if (!try runMayContainWithFilterMaybeLockedWithAdmission(backend, run, namespace, key, backend_locked, control)) continue;
 
-        const table = try tableForRunMaybeLocked(backend, run, backend_locked);
+        const table = try tableForRunMaybeLockedWithAdmission(backend, run, backend_locked, control);
         var read_hint_attempted = false;
         const positioned = if (read_hint.*) |hint|
             if (hint.run_index == run_index and
@@ -7638,7 +8989,7 @@ fn getFromRunIndices(
             .key = entry.key,
             .entry_index = entry_index,
         };
-        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+        return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
     }
     return null;
 }
@@ -7741,23 +9092,33 @@ fn requireTableBlocks(index: *const lsm_table_file.TableIndex) !void {
     if (index.entryCount() > 0 and index.blockCount() == 0) return error.InvalidTableFile;
 }
 
-fn decodeRunTableIndexWithStats(backend: anytype, allocator: Allocator, bytes: []const u8) !lsm_table_file.TableIndex {
+fn decodeRunTableIndexWithStats(backend: anytype, allocator: Allocator, bytes: []const u8, control: ?read_admission.Port) !lsm_table_file.TableIndex {
     const start_ns = backend.readStatsNowNs();
-    const decoded = lsm_table_file.decodeIndexAlloc(allocator, bytes);
+    const decoded = lsm_table_file.decodeIndexAllocWithAdmission(allocator, bytes, control);
     backend.recordTableIndexDecode(backend.readStatsElapsedNs(start_ns));
     return try decoded;
 }
 
-fn loadRunTableIndexWithStats(backend: anytype, allocator: Allocator, path: []const u8) !lsm_table_file.TableIndex {
+fn loadRunTableIndexWithStats(backend: anytype, allocator: Allocator, path: []const u8, control: ?read_admission.Port) !lsm_table_file.TableIndex {
     const start_ns = backend.readStatsNowNs();
-    const loaded = repository_mod.loadRunTableIndexAllocWithStorage(backend.storage.?, allocator, path);
+    const loaded = repository_mod.loadRunTableIndexAllocWithStorageAndAdmission(backend.storage.?, allocator, path, control);
     backend.recordTableIndexLoad(backend.readStatsElapsedNs(start_ns));
     return try loaded;
 }
 
 fn loadRunTableBlockWithStats(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, len: usize) ![]u8 {
+    return loadRunTableBlockWithStatsAndAdmission(backend, allocator, path, absolute_offset, len, null);
+}
+
+fn loadRunTableBlockWithStatsAndAdmission(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, len: usize, control: ?read_admission.Port) ![]u8 {
     const start_ns = backend.readStatsNowNs();
-    const loaded = if (@hasDecl(@TypeOf(backend.*), "readRunRangeAlloc")) backend.readRunRangeAlloc(allocator, path, absolute_offset, len) else backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len);
+    const loaded = if (@hasDecl(@TypeOf(backend.*), "readRunRangeAllocWithAdmission")) backend.readRunRangeAllocWithAdmission(allocator, path, absolute_offset, len, control) else blk: {
+        if (control) |budget| try budget.checkpoint();
+        const bytes = try (if (@hasDecl(@TypeOf(backend.*), "readRunRangeAlloc")) backend.readRunRangeAlloc(allocator, path, absolute_offset, len) else backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len));
+        errdefer allocator.free(bytes);
+        if (control) |budget| try budget.checkpoint();
+        break :blk bytes;
+    };
     const elapsed_ns = backend.readStatsElapsedNs(start_ns);
     if (loaded) |bytes| backend.recordTableBlockLoad(bytes.len, elapsed_ns) else |_| backend.recordTableBlockLoad(len, elapsed_ns);
     return try loaded;
@@ -7890,23 +9251,43 @@ fn getFromRunWithBlockCacheBatchState(
     return located;
 }
 
+fn checkedCacheHandle(handle: cache_mod.Handle, control: ?read_admission.Port) !cache_mod.Handle {
+    var owned = handle;
+    errdefer owned.releaseForAdmissionFailure();
+    if (control) |budget| try budget.checkpoint();
+    return owned;
+}
+
 fn loadRunTableIndexHandle(backend: anytype, run: *Run) !cache_mod.Handle {
+    return loadRunTableIndexHandleWithAdmission(backend, run, null);
+}
+
+fn loadRunTableIndexHandleWithAdmission(backend: anytype, run: *Run, control: ?read_admission.Port) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
     const generation = backend.root_generation;
     while (true) {
-        if (cache.retainRunTableIndex(path, run.id, generation)) |retained| return retained;
-        try cache.beginLoad(path, run.id, generation, .run_table_index);
-        defer cache.finishLoad(path, run.id, generation, .run_table_index);
-        if (cache.retainRunTableIndex(path, run.id, generation)) |retained| return retained;
-        if (cache.retainRunTableRaw(path, run.id, generation)) |retained_raw| {
+        if (try cache.retainRunTableIndexWithAdmission(path, run.id, generation, control)) |retained| return checkedCacheHandle(retained, control);
+        var load_claim = try cache.beginLoadClaim(path, run.id, generation, .run_table_index, 0, 0, control);
+        defer load_claim.transferToCache();
+        if (control) |budget| try budget.checkpoint();
+        if (try cache.retainRunTableIndexWithAdmission(path, run.id, generation, control)) |retained| return checkedCacheHandle(retained, control);
+        if (try cache.retainRunTableRawWithAdmission(path, run.id, generation, control)) |retained_raw| {
             var raw_handle = retained_raw;
-            defer raw_handle.release();
-            const index = try decodeRunTableIndexWithStats(backend, cache.valueAllocator(), raw_handle.runTableRaw());
-            return try cache.putRunTableIndex(path, run.id, generation, index);
+            defer raw_handle.releaseWithAdmission(control);
+            const start_ns = backend.readStatsNowNs();
+            const result = cache.decodeRunTableIndexWithAdmission(path, raw_handle.runTableRaw(), control);
+            backend.recordTableIndexDecode(backend.readStatsElapsedNs(start_ns));
+            var decoded = try result;
+            defer decoded.deinit();
+            return checkedCacheHandle(try decoded.publish(run.id, generation, control), control);
         }
-        const index = try loadRunTableIndexWithStats(backend, cache.valueAllocator(), path);
-        return try cache.putRunTableIndex(path, run.id, generation, index);
+        const start_ns = backend.readStatsNowNs();
+        const result = cache.loadRunTableIndexWithAdmission(backend.storage.?, path, control);
+        backend.recordTableIndexLoad(backend.readStatsElapsedNs(start_ns));
+        var loaded = try result;
+        defer loaded.deinit();
+        return checkedCacheHandle(try loaded.publish(run.id, generation, control), control);
     }
 }
 
@@ -7930,6 +9311,11 @@ fn loadRunTableBlockHandle(
     );
 }
 
+fn loadRunTableBlockHandleWithAdmission(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, retain_block: bool, control: ?read_admission.Port) !cache_mod.Handle {
+    const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    return loadRunTableBlockHandleAtOffsetControlled(backend, run, absolute_offset, window.physicalLen(), window.compression, window.len, window.checksum, retain_block, control);
+}
+
 fn loadRunTableBlockHandleAtOffset(
     backend: anytype,
     run: *Run,
@@ -7940,35 +9326,47 @@ fn loadRunTableBlockHandleAtOffset(
     checksum: u32,
     retain_block: bool,
 ) !cache_mod.Handle {
+    return loadRunTableBlockHandleAtOffsetControlled(backend, run, absolute_offset, physical_len, compression, logical_len, checksum, retain_block, null);
+}
+
+fn loadRunTableBlockHandleAtOffsetControlled(
+    backend: anytype,
+    run: *Run,
+    absolute_offset: u64,
+    physical_len: u32,
+    compression: lsm_table_file.BlockCompression,
+    logical_len: u32,
+    checksum: u32,
+    retain_block: bool,
+    control: ?read_admission.Port,
+) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
     const generation = backend.root_generation;
     while (true) {
-        if (cache.retainRunTableBlock(path, run.id, generation, absolute_offset, physical_len)) |retained| {
+        if (control) |budget| try budget.checkpoint();
+        if (try cache.retainRunTableBlockWithAdmission(path, run.id, generation, absolute_offset, physical_len, control)) |retained| {
             backend.recordSharedBlockCacheHit();
-            return retained;
+            return checkedCacheHandle(retained, control);
         }
-        try cache.beginLoadWithBlock(path, run.id, generation, .run_table_block, absolute_offset, physical_len);
-        defer cache.finishLoadWithBlock(path, run.id, generation, .run_table_block, absolute_offset, physical_len);
-        if (cache.retainRunTableBlock(path, run.id, generation, absolute_offset, physical_len)) |retained| {
+        var load_claim = try cache.beginLoadClaim(path, run.id, generation, .run_table_block, absolute_offset, physical_len, control);
+        defer load_claim.transferToCache();
+        if (control) |budget| try budget.checkpoint();
+        if (try cache.retainRunTableBlockWithAdmission(path, run.id, generation, absolute_offset, physical_len, control)) |retained| {
             backend.recordSharedBlockCacheHit();
-            return retained;
+            return checkedCacheHandle(retained, control);
         }
         backend.recordSharedBlockCacheMiss();
-        const block = try loadRunTableDecodedBlockWithStats(
-            backend,
-            cache.valueAllocator(),
-            path,
-            absolute_offset,
-            physical_len,
-            compression,
-            logical_len,
-            checksum,
-        );
-        return if (retain_block)
-            try cache.putRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block)
-        else
-            try cache.putTransientRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block);
+        const Reader = struct {
+            backend: @TypeOf(backend),
+            control: ?read_admission.Port,
+            pub fn readFileRangeAlloc(self: @This(), allocator: Allocator, block_path: []const u8, offset: u64, len: usize) ![]u8 {
+                return loadRunTableBlockWithStatsAndAdmission(self.backend, allocator, block_path, offset, len, self.control);
+            }
+        };
+        var decoded = try cache.loadRunTableBlockWithAdmission(Reader{ .backend = backend, .control = control }, path, absolute_offset, physical_len, compression, logical_len, checksum, control);
+        defer decoded.deinit();
+        return checkedCacheHandle(try decoded.publish(run.id, generation, retain_block, control), control);
     }
 }
 
@@ -7988,8 +9386,8 @@ fn loadRunTablePhysicalBlockHandleAtOffset(
             backend.recordSharedBlockCacheHit();
             return retained;
         }
-        try cache.beginLoadWithBlock(path, run.id, generation, .run_table_physical_block, absolute_offset, physical_len);
-        defer cache.finishLoadWithBlock(path, run.id, generation, .run_table_physical_block, absolute_offset, physical_len);
+        var load_claim = try cache.beginLoadClaim(path, run.id, generation, .run_table_physical_block, absolute_offset, physical_len, null);
+        defer load_claim.transferToCache();
         if (cache.retainRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len)) |retained| {
             backend.recordSharedBlockCacheHit();
             return retained;
@@ -8050,41 +9448,94 @@ fn findExactEntryInCachedCompressedPrefixBlock(
 const DecodedPointBlock = union(enum) { prefix_records: []const u8, raw_rows: []const u8 };
 
 fn promoteCachedPointBlock(backend: anytype, path: []const u8, run_id: u64, generation: u64, window: lsm_table_file.EntryDataWindow, offset: u64, payload: []const u8, prepared: ?DecodedPointBlock) !void {
+    return promoteCachedPointBlockWithAdmission(backend, path, run_id, generation, window, offset, payload, prepared, null);
+}
+
+fn promoteCachedPointBlockWithAdmission(backend: anytype, path: []const u8, run_id: u64, generation: u64, window: lsm_table_file.EntryDataWindow, offset: u64, payload: []const u8, prepared: ?DecodedPointBlock, control: ?read_admission.Port) !void {
     const cache = backend.options.cache orelse return;
-    if (!(cache.tryBeginLoadWithBlock(path, run_id, generation, .run_table_block, offset, window.physicalLen()) catch return)) return;
-    defer cache.finishLoadWithBlock(path, run_id, generation, .run_table_block, offset, window.physicalLen());
-    if (cache.retainRunTableBlock(path, run_id, generation, offset, window.physicalLen())) |retained| {
+    if (control) |budget| {
+        try budget.checkpoint();
+        // A managed read cannot publish promotion into an uncharged cache.
+        // This optional optimization leaves its already-owned result intact.
+        if (backend.options.resource_manager != null and cache.resource_manager == null) return;
+    }
+    var claim = (cache.tryBeginLoadClaim(path, run_id, generation, .run_table_block, offset, window.physicalLen(), control) catch |err| {
+        if (control == null) return;
+        switch (err) {
+            error.OutOfMemory, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable => return,
+            else => return err,
+        }
+    }) orelse return;
+    defer claim.transferToCache();
+    const winner_handle = if (control) |budget| try cache.retainRunTableBlockWithAdmission(path, run_id, generation, offset, window.physicalLen(), budget) else cache.retainRunTableBlock(path, run_id, generation, offset, window.physicalLen());
+    if (winner_handle) |retained| {
         var winner = retained;
-        winner.release();
+        winner.releaseWithAdmission(control);
         return;
     }
     const resources = @import("../resource_manager.zig");
-    var output_credit: ?resources.Reservation = if (backend.options.resource_manager) |manager|
-        manager.reserveWithoutReclaim(.lsm_read_working_set, window.len) catch |err| switch (err) {
+    // Unprepared prefix-Snappy decoding owns a temporary prefix buffer as well
+    // as the final rows. Admit both before allocation and keep their credit in
+    // the claim until buffers retire or cache retention adopts it.
+    const scratch_bytes = if (prepared == null and window.compression == .prefix_snappy) try @import("../../encoding/snappy.zig").decodedLen(payload) else 0;
+    const construction_bytes = std.math.add(u64, window.len, scratch_bytes) catch return error.ResourceBudgetExceeded;
+    // Decoded rows belong to the shared cache. Charge its manager even when
+    // the requesting backend has a different working-set accounting owner.
+    const promotion_manager = cache.resource_manager orelse backend.options.resource_manager;
+    const output_credit: ?*resources.Reservation = if (promotion_manager) |manager|
+        claim.reserveConstructionCredit(manager, construction_bytes, control) catch |err| switch (err) {
             error.ResourceBudgetExceeded => return,
             else => return err,
         }
     else
         null;
-    defer if (output_credit) |*credit| credit.release();
-    var scratch = PointReadScratch.init(backend);
-    defer scratch.deinit();
+    const scratch = runtimeScratchAllocator(backend.allocator);
     const decoded = (if (prepared) |ready| blk: {
-        try lsm_table_file.validateBlockPayload(payload, window.checksum);
+        try lsm_table_file.validateBlockPayloadWithAdmission(payload, window.checksum, control);
         break :blk switch (ready) {
-            .prefix_records => |records| lsm_table_file.expandValidatedPrefixRecordsAlloc(cache.valueAllocator(), records, window.len),
+            .prefix_records => |records| lsm_table_file.expandValidatedPrefixRecordsAllocWithAdmission(cache.valueAllocator(), records, window.len, control),
             .raw_rows => |rows| copy: {
                 if (rows.len != window.len) return error.InvalidTableFile;
-                break :copy cache.valueAllocator().dupe(u8, rows);
+                break :copy copyPointPromotionRows(cache.valueAllocator(), rows, control);
             },
         };
-    } else lsm_table_file.decodeBlockPayloadWithScratchAlloc(cache.valueAllocator(), scratch.allocator(), window.compression, payload, window.len, window.checksum)) catch |err| switch (err) {
+    } else lsm_table_file.decodeBlockPayloadWithScratchAllocWithAdmission(cache.valueAllocator(), scratch, window.compression, payload, window.len, window.checksum, control)) catch |err| switch (err) {
         error.OutOfMemory => return,
         else => return err,
     };
     // put consumes decoded on every exit, including allocation failure.
-    var promoted = cache.putRunTableBlockWithCredit(path, run_id, generation, offset, window.physicalLen(), decoded, if (output_credit) |*credit| credit else null) catch return;
-    promoted.release();
+    var promoted = (if (control) |budget| cache.putRunTableBlockWithCreditAdmission(path, run_id, generation, offset, window.physicalLen(), decoded, output_credit, budget) else cache.putRunTableBlockWithCredit(path, run_id, generation, offset, window.physicalLen(), decoded, output_credit)) catch |err| {
+        if (control == null) return;
+        switch (err) {
+            error.OutOfMemory, error.ResourceBudgetExceeded => return,
+            else => return err,
+        }
+    };
+    promoted.releaseWithAdmission(control);
+}
+
+fn copyPointPromotionRows(allocator: Allocator, rows: []const u8, control: ?read_admission.Port) ![]u8 {
+    if (control) |budget| try budget.checkpoint();
+    const owned = try allocator.alloc(u8, rows.len);
+    errdefer allocator.free(owned);
+    try copyPointResultBytes(owned, rows, control);
+    if (control) |budget| try budget.checkpoint();
+    return owned;
+}
+
+fn copyPointResultBytes(dst: []u8, src: []const u8, control: ?read_admission.Port) !void {
+    std.debug.assert(dst.len == src.len);
+    if (control == null) {
+        @memcpy(dst, src);
+        return;
+    }
+    var cursor: usize = 0;
+    while (cursor < src.len) {
+        try control.?.checkpoint();
+        const end = cursor + @min(src.len - cursor, 64 * 1024);
+        @memcpy(dst[cursor..end], src[cursor..end]);
+        cursor = end;
+    }
 }
 
 fn findExactEntryInCachedPrefixWithScratch(
@@ -8099,25 +9550,42 @@ fn findExactEntryInCachedPrefixWithScratch(
     key: []const u8,
     lifetime: PointResultLifetime,
 ) !?LocatedTableEntry {
-    try lsm_table_file.validateBlockPayload(payload, window.checksum);
+    return findExactEntryInCachedPrefixWithScratchWithAdmission(backend, payload, block, window, held_values, value_allocator, scratch, namespace, key, lifetime, null);
+}
+
+fn findExactEntryInCachedPrefixWithScratchWithAdmission(
+    backend: anytype,
+    payload: []const u8,
+    block: lsm_table_file.TableIndex.BlockMeta,
+    window: lsm_table_file.EntryDataWindow,
+    held_values: *PointResultValues,
+    value_allocator: Allocator,
+    scratch: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    lifetime: PointResultLifetime,
+    control: ?read_admission.Port,
+) !?LocatedTableEntry {
+    try lsm_table_file.validateBlockPayloadWithAdmission(payload, window.checksum, control);
     const snappy = @import("../../encoding/snappy.zig");
     const decoded = if (window.compression == .prefix_snappy) blk: {
         try lsm_table_file.validatePrefixDecodedSize(payload, window.len);
-        break :blk try snappy.decode(scratch, payload);
+        break :blk try snappy.decodeWithAdmission(scratch, payload, control);
     } else payload;
     defer if (window.compression == .prefix_snappy) scratch.free(decoded);
     var reader = try lsm_table_file.PrefixPointReader.init(decoded, block.first_entry_index, window.len);
     defer reader.deinit(scratch);
     if (reader.entryCount() != block.entry_count) return error.InvalidTableFile;
-    const found = try reader.find(scratch, namespace.name, key) orelse return null;
+    const found = try reader.findWithAdmission(scratch, namespace.name, key, control) orelse return null;
+    if (control) |budget| try budget.checkpoint();
     if (lifetime == .transaction_owned) {
         var entry = found.entry;
-        entry.value = if (entry.tombstone) "" else try copyPointValue(backend, value_allocator, held_values, entry.value);
+        entry.value = if (entry.tombstone) "" else try copyPointValueWithAdmission(backend, value_allocator, held_values, entry.value, control);
         entry.key = key;
         entry.namespace_name = namespace.name;
         return .{ .entry_index = found.index, .entry = entry };
     }
-    const owned = try copyTableEntry(value_allocator, found.entry);
+    const owned = try copyTableEntryWithAdmission(value_allocator, found.entry, control);
     errdefer value_allocator.free(owned.bytes);
     try held_values.append(value_allocator, owned.bytes);
     recordPointValueCopy(backend);
@@ -8200,7 +9668,7 @@ fn loadBatchBlock(
     if (state.block_index == null or state.block_index.? != block_index) {
         try state.transferBlock(backend.allocator, held_blocks);
         const window = index.blockWindow(block_index);
-        state.block_handle = try loadRunTableBlockHandle(backend, run, index, window, retain_block);
+        state.block_handle = try loadRunTableBlockHandleWithAdmission(backend, run, index, window, retain_block, state.control);
         state.block_index = block_index;
         state.block_has_values = false;
     }
@@ -8218,6 +9686,7 @@ fn findExactEntryInBatchBlocks(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !?LocatedTableEntry {
+    if (state.control) |budget| try budget.checkpoint();
     try requireTableBlocks(index);
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
     const block = index.blocks[block_index];
@@ -8323,6 +9792,10 @@ fn stateForRun(backend: anytype, run: *Run) !*const State {
 }
 
 fn tableForRunLocked(backend: anytype, run: *Run) !*const lsm_table_file.BorrowedDecoded {
+    return tableForRunLockedWithAdmission(backend, run, null);
+}
+
+fn tableForRunLockedWithAdmission(backend: anytype, run: *Run, control: ?read_admission.Port) !*const lsm_table_file.BorrowedDecoded {
     const path = run.path orelse return error.RunStateUnavailable;
     if (run.cached_table_index) |index| {
         if (!(index < backend.run_table_cache.items.len and
@@ -8333,7 +9806,7 @@ fn tableForRunLocked(backend: anytype, run: *Run) !*const lsm_table_file.Borrowe
         }
     }
     if (run.cached_table_index == null) {
-        run.cached_table_index = try backend.getCachedRunTableIndex(path, run.id);
+        run.cached_table_index = try backend.getCachedRunTableIndexWithAdmission(path, run.id, control);
     }
     return backend.getCachedRunTableByIndex(run.cached_table_index.?);
 }
@@ -8349,7 +9822,21 @@ fn tableForRunMaybeLocked(backend: anytype, run: *Run, backend_locked: bool) !*c
     return try tableForRun(backend, run);
 }
 
+fn tableForRunMaybeLockedWithAdmission(backend: anytype, run: *Run, backend_locked: bool, control: ?read_admission.Port) !*const lsm_table_file.BorrowedDecoded {
+    const budget = control orelse return tableForRunMaybeLocked(backend, run, backend_locked);
+    try budget.checkpoint();
+    const locked = if (!backend_locked) try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else false;
+    defer unlockBackend(@TypeOf(backend.*), backend, locked);
+    const result = try tableForRunLockedWithAdmission(backend, run, budget);
+    try budget.checkpoint();
+    return result;
+}
+
 fn indexForRunNoCacheLocked(backend: anytype, run: *Run) !*const lsm_table_file.TableIndex {
+    return indexForRunNoCacheLockedWithAdmission(backend, run, null);
+}
+
+fn indexForRunNoCacheLockedWithAdmission(backend: anytype, run: *Run, control: ?read_admission.Port) !*const lsm_table_file.TableIndex {
     const path = run.path orelse return error.RunStateUnavailable;
     if (run.cached_index_index) |index| {
         if (!(index < backend.run_index_cache.items.len and
@@ -8360,7 +9847,7 @@ fn indexForRunNoCacheLocked(backend: anytype, run: *Run) !*const lsm_table_file.
         }
     }
     if (run.cached_index_index == null) {
-        run.cached_index_index = try backend.getCachedRunIndexIndex(path, run.id);
+        run.cached_index_index = try backend.getCachedRunIndexIndexWithAdmission(path, run.id, control);
     }
     return backend.getCachedRunIndexByIndex(run.cached_index_index.?);
 }
@@ -8374,6 +9861,16 @@ fn indexForRunNoCache(backend: anytype, run: *Run) !*const lsm_table_file.TableI
 fn indexForRunNoCacheMaybeLocked(backend: anytype, run: *Run, backend_locked: bool) !*const lsm_table_file.TableIndex {
     if (backend_locked) return try indexForRunNoCacheLocked(backend, run);
     return try indexForRunNoCache(backend, run);
+}
+
+fn indexForRunNoCacheMaybeLockedWithAdmission(backend: anytype, run: *Run, backend_locked: bool, control: ?read_admission.Port) !*const lsm_table_file.TableIndex {
+    const budget = control orelse return indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+    try budget.checkpoint();
+    const locked = if (!backend_locked) try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else false;
+    defer unlockBackend(@TypeOf(backend.*), backend, locked);
+    const result = try indexForRunNoCacheLockedWithAdmission(backend, run, budget);
+    try budget.checkpoint();
+    return result;
 }
 
 const OwnedTableEntry = struct {
@@ -8390,22 +9887,45 @@ const OwnedTableEntry = struct {
 // Point-result ownership needs the selected row, never a duplicate of the
 // entire decoded block. Large rows can still transfer this compact buffer.
 fn copyTableEntry(allocator: Allocator, entry: lsm_table_file.Entry) !OwnedTableEntry {
+    return copyTableEntryWithAdmission(allocator, entry, null);
+}
+
+fn copyTableEntryWithAdmission(allocator: Allocator, entry: lsm_table_file.Entry, control: ?read_admission.Port) !OwnedTableEntry {
+    if (control) |budget| try budget.checkpoint();
     const namespace_len = if (entry.namespace_name) |name| name.len else 0;
-    const bytes = try allocator.alloc(u8, namespace_len + entry.key.len + entry.value.len);
+    const prefix_len = std.math.add(usize, namespace_len, entry.key.len) catch return error.OutOfMemory;
+    const total_len = std.math.add(usize, prefix_len, entry.value.len) catch return error.OutOfMemory;
+    const bytes = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(bytes);
     var copied = entry;
     if (entry.namespace_name) |name| {
-        @memcpy(bytes[0..namespace_len], name);
+        try copyPointResultBytes(bytes[0..namespace_len], name, control);
         copied.namespace_name = bytes[0..namespace_len];
     }
     copied.key = bytes[namespace_len..][0..entry.key.len];
-    @memcpy(@constCast(copied.key), entry.key);
-    copied.value = bytes[namespace_len + entry.key.len ..];
-    @memcpy(@constCast(copied.value), entry.value);
+    try copyPointResultBytes(@constCast(copied.key), entry.key, control);
+    copied.value = bytes[prefix_len..];
+    try copyPointResultBytes(@constCast(copied.value), entry.value, control);
+    if (control) |budget| try budget.checkpoint();
     return .{ .entry = copied, .bytes = bytes };
 }
 
 fn findExactEntryInLocalLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, block_index: usize, namespace: backend_types.Namespace, key: []const u8, locked: bool) !?OwnedTableEntry {
-    const lease = try loadLocalBlockLease(backend, run, index, window, locked, namespace.retainDataBlocks());
+    return findExactEntryInLocalLeaseWithAdmission(backend, run, index, window, block_index, namespace, key, locked, null);
+}
+
+fn findExactEntryInLocalLeaseWithAdmission(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    window: lsm_table_file.EntryDataWindow,
+    block_index: usize,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    locked: bool,
+    control: ?read_admission.Port,
+) !?OwnedTableEntry {
+    const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, locked, namespace.retainDataBlocks(), control);
     return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
 }
 
@@ -8435,27 +9955,46 @@ fn localBlockCacheEligible(backend: anytype, bytes: usize) bool {
     return localBlockCacheEnabled(backend);
 }
 
-fn beginLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool) bool {
-    if (comptime !@hasDecl(@TypeOf(backend.*), "beginLocalBlockPromotion")) return false;
-    if (window.compression != .prefix and window.compression != .prefix_snappy) return false;
-    const path = run.path orelse return false;
-    const held = if (locked) false else lockBackend(@TypeOf(backend.*), backend);
-    defer unlockBackend(@TypeOf(backend.*), backend, held);
-    return backend.beginLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), window.len);
-}
+/// One elected attempt in backend-owned fixed metadata. The backend and its
+/// read pin outlive this token. Finish only after physical decoder work joins.
+/// Completion stores no borrowed path, scope, allocator or callback.
+pub const LocalBlockPromotion = struct {
+    pub const State = enum(u8) { idle, active, admitted, denied };
+    completion: ?*std.atomic.Value(@This().State),
 
-fn finishLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool, admitted: bool) void {
-    if (comptime !@hasDecl(@TypeOf(backend.*), "finishLocalBlockPromotion")) return;
-    const path = run.path orelse return;
-    const held = if (locked) false else lockBackend(@TypeOf(backend.*), backend);
+    pub fn finish(self: *@This(), admitted: bool) void {
+        const completion = self.completion orelse return;
+        self.completion = null;
+        // Final access: a cache pass can immediately reconcile/reuse the slot.
+        completion.store(if (admitted) .admitted else .denied, .release);
+    }
+};
+
+fn beginLocalBlockPromotionWithAdmission(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    window: lsm_table_file.EntryDataWindow,
+    locked: bool,
+    control: ?read_admission.Port,
+) !?LocalBlockPromotion {
+    if (comptime !@hasDecl(@TypeOf(backend.*), "beginLocalBlockPromotionClaim")) return null;
+    if (window.compression != .prefix and window.compression != .prefix_snappy) return null;
+    const path = run.path orelse return null;
+    const held = if (locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, held);
-    backend.finishLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), admitted);
+    return backend.beginLocalBlockPromotionClaim(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), window.len);
 }
 
 fn retainLocalCachedBlock(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool) ?*SharedBytes {
+    return retainLocalCachedBlockWithAdmission(backend, run, index, window, backend_locked, null) catch unreachable;
+}
+
+fn retainLocalCachedBlockWithAdmission(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, control: ?read_admission.Port) !?*SharedBytes {
+    if (control) |budget| try budget.checkpoint();
     const path = run.path orelse return null;
     const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+    const locked = if (backend_locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, locked);
     if (backend.retainCachedRunBlock(path, run.id, offset, window.physicalLen())) |lease| {
         backend.recordLocalBlockCacheHit();
@@ -8487,87 +10026,473 @@ fn localDecodeWorkingBytesFor(window: lsm_table_file.EntryDataWindow, point: boo
 }
 
 fn localWorkspace(backend: anytype, window: lsm_table_file.EntryDataWindow, point: bool) !LocalReader.Workspace {
-    return backend.local_reader.acquire(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), try localDecodeWorkingBytesFor(window, point), backend.options.local_decode_working_bytes, window.len + @sizeOf(SharedBytes));
+    return localWorkspaceWithAdmission(backend, window, point, null);
+}
+
+fn localWorkspaceWithAdmission(backend: anytype, window: lsm_table_file.EntryDataWindow, point: bool, control: ?read_admission.Port) !LocalReader.Workspace {
+    return backend.local_reader.acquireWithAdmission(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), try localDecodeWorkingBytesFor(window, point), backend.options.local_decode_working_bytes, window.len + @sizeOf(SharedBytes), control);
 }
 
 fn loadDecodedLocalBlock(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow) ![]u8 {
+    return loadDecodedLocalBlockWithAdmission(backend, allocator, path, offset, window, null);
+}
+
+/// The source binding and input window belong to the enclosing read operation.
+/// Per-step adapters borrow controls; no control is retained by this owner.
+fn BufferedRunBlock(comptime Source: type) type {
+    return struct {
+        source: Source,
+        bytes: []u8,
+        length: usize,
+        start: usize = 0,
+        valid: usize = 0,
+        physical_bytes: usize = 0,
+        decode_pass: bool = false,
+        decode_crc: @import("antfly_hash").Crc32 = .init(),
+        verified_bytes: usize = 0,
+
+        fn beginDecode(self: *@This()) void {
+            self.valid = 0;
+            self.decode_pass = true;
+        }
+
+        fn window(self: *@This(), offset: usize, max_len: usize, control: ?read_admission.Port) ![]const u8 {
+            if (offset > self.length) return error.InvalidArgument;
+            if (max_len == 0 or offset == self.length) return &.{};
+            if (self.bytes.len == 0) return error.InvalidArgument;
+            if (self.valid == 0 or offset < self.start or offset - self.start >= self.valid) {
+                const start = offset / self.bytes.len * self.bytes.len;
+                const take = @min(self.bytes.len, self.length - start);
+                // A failed provider may partially overwrite bytes. Never leave
+                // stale cache metadata pointing at that partial refill.
+                self.valid = 0;
+                self.physical_bytes += take;
+                try self.source.readInto(@intCast(start), self.bytes[0..take], control);
+                self.start = start;
+                self.valid = take;
+                if (self.decode_pass) {
+                    if (start != self.verified_bytes) return error.CorruptInput;
+                    self.decode_crc.update(self.bytes[0..take]);
+                    self.verified_bytes += take;
+                }
+            }
+            const local = offset - self.start;
+            return self.bytes[local..][0..@min(max_len, self.valid - local)];
+        }
+
+        const Borrow = struct {
+            owner: *BufferedRunBlock(Source),
+            length: usize,
+            control: ?read_admission.Port,
+            pub fn window(self: @This(), offset: usize, max_len: usize) ![]const u8 {
+                return self.owner.window(offset, max_len, self.control);
+            }
+            pub fn readInto(self: @This(), offset: u64, out: []u8) !void {
+                var copied: usize = 0;
+                const start = std.math.cast(usize, offset) orelse return error.InvalidArgument;
+                if (start > self.length or out.len > self.length - start) return error.InvalidArgument;
+                while (copied < out.len) {
+                    const bytes = try self.window(start + copied, out.len - copied);
+                    @memcpy(out[copied..][0..bytes.len], bytes);
+                    copied += bytes.len;
+                }
+            }
+        };
+    };
+}
+
+/// Movable ownership of a funded raw, Snappy or prefix block materialization. Pending
+/// callers pin the immutable run version and backend until retirement. The
+/// input path, source use, workspace and partial output belong to this owner;
+/// prefix variants also own their funded encoded/intermediate buffers.
+/// Controls and self-relative adapters exist only within each step. Output's
+/// allocator must outlive its eventual transfer or destruction.
+pub fn OwnedRunBlockRead(comptime BackendType: type) type {
+    const Source = BackendType.RunRangeReader;
+    const Reader = BufferedRunBlock(Source);
+    return struct {
+        pub const max_step_bytes: usize = 64 * 1024;
+        pub const Status = enum { pending, ready };
+        const Phase = enum { allocate_output, raw, compressed, prefix_input_allocate, prefix_input, prefix_prepare, prefix_snappy_allocate, prefix_snappy, prefix_expand, ready, taken, failed, closed };
+        backend: *BackendType,
+        allocator: Allocator,
+        work: ?LocalReader.Workspace,
+        reader: ?Reader,
+        window: lsm_table_file.EntryDataWindow,
+        cursor: lsm_table_file.BlockDecodeCursor,
+        output: ?[]u8 = null,
+        prefix_input: ?[]u8 = null,
+        prefix_intermediate: ?[]u8 = null,
+        prefix_offset: usize = 0,
+        prefix_crc: @import("antfly_hash").Crc32 = .init(),
+        prefix_decoder: @import("../../encoding/snappy.zig").DecodeCursor = .init(0, 0),
+        prefix_expander: lsm_table_file.PrefixDecodeCursor = .init(0, 0),
+        raw_offset: usize = 0,
+        raw_crc: @import("antfly_hash").Crc32 = .init(),
+        phase: Phase,
+        failure: ?anyerror = null,
+        started_ns: u64,
+
+        pub fn init(backend: *BackendType, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow, control: ?read_admission.Port) !@This() {
+            if (control) |port| try port.checkpoint();
+            const prefix = window.compression == .prefix or window.compression == .prefix_snappy;
+            const input_len: usize = window.physicalLen();
+            if (window.compression == .none and input_len != window.len) return error.InvalidTableFile;
+            const window_len: usize = if (window.compression == .none or prefix) 0 else @min(input_len, max_step_bytes);
+            const result_bytes = std.math.add(usize, window.len, @sizeOf(SharedBytes)) catch return error.InvalidTableFile;
+            const prefix_ceiling = if (window.compression == .prefix_snappy)
+                std.math.add(usize, std.math.mul(usize, window.len, 2) catch return error.InvalidTableFile, 32) catch return error.InvalidTableFile
+            else
+                0;
+            const encoded_bytes = if (prefix) input_len else 0;
+            const encoded_work = std.math.add(usize, encoded_bytes, prefix_ceiling) catch return error.InvalidTableFile;
+            const arena_bytes = try LocalReader.streamingScratchBound(path.len, window_len);
+            const retained = std.math.add(usize, encoded_work, arena_bytes) catch return error.InvalidTableFile;
+            const working = std.math.add(usize, result_bytes, retained) catch return error.InvalidTableFile;
+            var work = try backend.local_reader.acquireWithAdmission(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), working, backend.options.local_decode_working_bytes, result_bytes, control);
+            errdefer work.release();
+            const scratch = work.allocator();
+            const owned_path = try scratch.dupe(u8, path);
+            var source = try backend.openRunRangeReaderWithAdmission(owned_path, offset, input_len, control);
+            errdefer source.deinit();
+            const bytes = try scratch.alloc(u8, window_len);
+            if (control) |port| try port.checkpoint();
+            return .{
+                .backend = backend,
+                .allocator = allocator,
+                .work = work,
+                .reader = .{ .source = source, .bytes = bytes, .length = input_len },
+                .window = window,
+                .cursor = try lsm_table_file.BlockDecodeCursor.init(if (prefix) .none else window.compression, if (prefix) window.len else input_len, window.len, window.checksum),
+                .phase = if (prefix) .prefix_input_allocate else if (window.compression == .none) .allocate_output else .compressed,
+                .started_ns = backend.readStatsNowNs(),
+            };
+        }
+
+        /// Returns after one finite decode/checksum/copy step or one funded
+        /// output allocation. Allocator work is separate from byte quanta.
+        /// Source refills remain at most 64 KiB each (up to two per step).
+        pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (quantum == 0 or quantum > max_step_bytes) return error.InvalidArgument;
+            switch (self.phase) {
+                .failed => return self.failure.?,
+                .taken, .closed => return error.InvalidArgument,
+                else => {},
+            }
+            return self.advance(quantum, control) catch |err| {
+                // Original authority takes precedence over a simultaneous
+                // provider/codec failure, before unconditional retirement.
+                const cause = if (control) |port| blk: {
+                    port.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                } else err;
+                self.discardOutput();
+                self.retireWorking();
+                self.phase = .failed;
+                self.failure = cause;
+                return cause;
+            };
+        }
+
+        fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (control) |port| try port.checkpoint();
+            switch (self.phase) {
+                .ready => return .ready,
+                .allocate_output => {
+                    self.output = try self.allocator.alloc(u8, self.window.len);
+                    if (control) |port| try port.checkpoint();
+                    self.phase = if (self.window.compression == .prefix or self.window.compression == .prefix_snappy) .prefix_expand else if (self.window.compression == .none) .raw else .compressed;
+                    return .pending;
+                },
+                .prefix_input_allocate => {
+                    // Prefix variants currently retain a whole encoded buffer,
+                    // admitted up front. Physical reads and expansion resume;
+                    // there is no synchronous full-block get or decode fallback.
+                    self.prefix_input = try self.allocator.alloc(u8, self.window.physicalLen());
+                    self.phase = .prefix_input;
+                    if (control) |port| try port.checkpoint();
+                    return .pending;
+                },
+                .prefix_input => {
+                    const bytes = self.prefix_input.?;
+                    const take = @min(quantum, bytes.len - self.prefix_offset);
+                    const reader = &self.reader.?;
+                    if (take != 0) {
+                        try reader.source.readInto(@intCast(self.prefix_offset), bytes[self.prefix_offset..][0..take], control);
+                        reader.physical_bytes += take;
+                        self.prefix_crc.update(bytes[self.prefix_offset..][0..take]);
+                        self.prefix_offset += take;
+                    }
+                    if (control) |port| try port.checkpoint();
+                    if (self.prefix_offset == bytes.len) {
+                        if (self.prefix_crc.final() != self.window.checksum) return error.TableBlockChecksumMismatch;
+                        self.phase = .prefix_prepare;
+                    }
+                    return .pending;
+                },
+                .prefix_prepare => {
+                    if (self.window.compression == .prefix_snappy) {
+                        try lsm_table_file.validatePrefixDecodedSize(self.prefix_input.?, self.window.len);
+                        const len = try @import("../../encoding/snappy.zig").decodedLen(self.prefix_input.?);
+                        self.prefix_decoder = .init(self.prefix_input.?.len, len);
+                        self.phase = .prefix_snappy_allocate;
+                    } else {
+                        self.prefix_expander = .init(self.prefix_input.?.len, self.window.len);
+                        self.phase = .prefix_expand;
+                    }
+                    if (control) |port| try port.checkpoint();
+                    return .pending;
+                },
+                .prefix_snappy_allocate => {
+                    self.prefix_intermediate = try self.allocator.alloc(u8, self.prefix_decoder.output_len);
+                    self.phase = .prefix_snappy;
+                    if (control) |port| try port.checkpoint();
+                    return .pending;
+                },
+                .prefix_snappy => {
+                    const progress = try self.prefix_decoder.step(self.prefix_input.?, self.prefix_intermediate.?, quantum);
+                    if (control) |port| try port.checkpoint();
+                    if (progress.done) {
+                        self.prefix_expander = .init(self.prefix_intermediate.?.len, self.window.len);
+                        self.phase = .prefix_expand;
+                    }
+                    return .pending;
+                },
+                .prefix_expand => {
+                    const input = self.prefix_intermediate orelse self.prefix_input.?;
+                    const progress = try self.prefix_expander.step(input, self.output, quantum);
+                    if (control) |port| try port.checkpoint();
+                    switch (progress.status) {
+                        .pending => return .pending,
+                        .needs_output => {
+                            self.phase = .allocate_output;
+                            return .pending;
+                        },
+                        .done => {},
+                    }
+                },
+                .raw => {
+                    const out = self.output.?;
+                    const take = @min(out.len - self.raw_offset, quantum);
+                    const reader = &self.reader.?;
+                    reader.physical_bytes += take;
+                    if (take != 0) try reader.source.readInto(@intCast(self.raw_offset), out[self.raw_offset..][0..take], control);
+                    self.raw_crc.update(out[self.raw_offset..][0..take]);
+                    self.raw_offset += take;
+                    if (control) |port| try port.checkpoint();
+                    if (self.raw_offset != out.len) return .pending;
+                    if (self.raw_crc.final() != self.window.checksum) return error.TableBlockChecksumMismatch;
+                },
+                .compressed => {
+                    const reader = &self.reader.?;
+                    const borrow: Reader.Borrow = .{ .owner = reader, .length = reader.length, .control = control };
+                    const progress = try self.cursor.stepFromReader(borrow, self.output, quantum);
+                    if (control) |port| try port.checkpoint();
+                    if (!reader.decode_pass and self.cursor.phase == .header) reader.beginDecode();
+                    switch (progress.status) {
+                        .pending => return .pending,
+                        .needs_output => {
+                            std.debug.assert(self.output == null);
+                            self.phase = .allocate_output;
+                            return .pending;
+                        },
+                        .done => if (reader.verified_bytes != reader.length or reader.decode_crc.final() != self.window.checksum)
+                            return error.TableBlockChecksumMismatch,
+                    }
+                },
+                else => unreachable,
+            }
+            self.retireWorking();
+            self.phase = .ready;
+            return .ready;
+        }
+
+        /// Transfer bytes exactly once, only after complete verification. This
+        /// moves data ownership; publication still needs the caller's authority.
+        pub fn takeOutput(self: *@This()) ![]u8 {
+            if (self.phase != .ready) return error.InvalidArgument;
+            const bytes = self.output.?;
+            self.output = null;
+            self.phase = .taken;
+            return bytes;
+        }
+
+        fn discardOutput(self: *@This()) void {
+            if (self.output) |bytes| self.allocator.free(bytes);
+            self.output = null;
+        }
+
+        fn retireWorking(self: *@This()) void {
+            if (self.prefix_input) |bytes| self.allocator.free(bytes);
+            self.prefix_input = null;
+            if (self.prefix_intermediate) |bytes| self.allocator.free(bytes);
+            self.prefix_intermediate = null;
+            if (self.reader) |*reader| {
+                self.backend.recordTableBlockLoad(reader.physical_bytes, self.backend.readStatsElapsedNs(self.started_ns));
+                reader.source.deinit();
+                self.reader = null;
+            }
+            if (self.work) |*work| {
+                work.release();
+                self.work = null;
+            }
+        }
+
+        /// Pending, ready and failed states all retire without a port or a new
+        /// execution grant. Ready/failure already released backend dependencies.
+        pub fn deinit(self: *@This()) void {
+            self.discardOutput();
+            self.retireWorking();
+            self.phase = .closed;
+        }
+    };
+}
+
+fn loadStreamingLocalBlock(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow, control: ?read_admission.Port) ![]u8 {
+    var operation = try OwnedRunBlockRead(@TypeOf(backend.*)).init(backend, allocator, path, offset, window, control);
+    defer operation.deinit();
+    while (try operation.step(64 * 1024, control) == .pending) {}
+    return operation.takeOutput();
+}
+
+fn loadDecodedLocalBlockWithAdmission(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow, control: ?read_admission.Port) ![]u8 {
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
-        var work = try localWorkspace(backend, window, false);
+        if (comptime @hasDecl(@TypeOf(backend.*), "openRunRangeReaderWithAdmission")) {
+            if ((window.compression == .none or window.compression == .snappy) and backend.supportsRunRangeReader(control))
+                return loadStreamingLocalBlock(backend, allocator, path, offset, window, control);
+        }
+        var work = try localWorkspaceWithAdmission(backend, window, false, control);
         defer work.release();
         if (window.compression == .none) {
             if (window.physicalLen() != window.len) return error.InvalidTableFile;
-            const payload = try loadRunTableBlockWithStats(backend, allocator, path, offset, window.physicalLen());
+            const payload = try loadRunTableBlockWithStatsAndAdmission(backend, allocator, path, offset, window.physicalLen(), control);
             errdefer allocator.free(payload);
             if (payload.len != window.len) return error.InvalidTableFile;
-            try lsm_table_file.validateBlockPayload(payload, window.checksum);
+            try lsm_table_file.validateBlockPayloadWithAdmission(payload, window.checksum, control);
             return payload;
         }
         const scratch = work.allocator();
-        const payload = try loadRunTableBlockWithStats(backend, scratch, path, offset, window.physicalLen());
-        return lsm_table_file.decodeBlockPayloadWithScratchAlloc(allocator, scratch, window.compression, payload, window.len, window.checksum);
+        const payload = try loadRunTableBlockWithStatsAndAdmission(backend, scratch, path, offset, window.physicalLen(), control);
+        return lsm_table_file.decodeBlockPayloadWithScratchAllocWithAdmission(allocator, scratch, window.compression, payload, window.len, window.checksum, control);
     }
-    return loadRunTableDecodedBlockWithStats(backend, allocator, path, offset, window.physicalLen(), window.compression, window.len, window.checksum);
+    const payload = try loadRunTableBlockWithStatsAndAdmission(backend, allocator, path, offset, window.physicalLen(), control);
+    defer allocator.free(payload);
+    return lsm_table_file.decodeBlockPayloadAllocWithAdmission(allocator, window.compression, payload, window.len, window.checksum, control);
 }
 
-fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool) !*SharedBytes {
+fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool, control: ?read_admission.Port) !*SharedBytes {
+    if (control) |budget| try budget.checkpoint();
     const path = run.path orelse return error.RunStateUnavailable;
     const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
     const len = window.physicalLen();
-    if (retainLocalCachedBlock(backend, run, index, window, backend_locked)) |lease| return lease;
+    if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, backend_locked, control)) |lease| return lease;
     backend.recordLocalBlockCacheMiss();
     // Release decoder admission before taking the writer mutex to publish.
     // A writer may wait for a workspace, but never for a cache publisher.
-    var read_credit: ?@import("../resource_manager.zig").Reservation = if (backend.options.resource_manager) |manager|
-        try manager.reserveWithoutReclaim(.lsm_read_working_set, @as(usize, window.len) + @sizeOf(SharedBytes))
-    else
-        null;
+    const resources = @import("../resource_manager.zig");
+    var construction: ?resources.ConstructionCredit = null;
+    // Declared before decoded allocations: failure destroys physical bytes
+    // before accounting retirement, independently of a rejected read scope.
+    defer if (construction) |*credit| credit.retire();
+    var read_credit: ?resources.Reservation = if (backend.options.resource_manager) |manager| blk: {
+        const bytes = @as(usize, window.len) + @sizeOf(SharedBytes);
+        if (control) |budget| {
+            construction = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, bytes, budget);
+            break :blk null;
+        }
+        break :blk try manager.reserveWithoutReclaim(.lsm_read_working_set, bytes);
+    } else null;
     defer if (read_credit) |*credit| credit.release();
-    const bytes = try loadDecodedLocalBlock(backend, backend.allocator, path, offset, window);
-    errdefer backend.allocator.free(bytes);
-    const lease = try SharedBytes.create(backend.allocator, bytes);
-    lease.reservation = read_credit;
-    read_credit = null;
+    const lease = blk: {
+        const bytes = try loadDecodedLocalBlockWithAdmission(backend, backend.allocator, path, offset, window, control);
+        errdefer backend.allocator.free(bytes);
+        break :blk try SharedBytes.create(backend.allocator, bytes);
+    };
     lease.result_pins_allowed = backend.options.resource_manager == null;
-    const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+    errdefer lease.release();
+    if (construction) |*credit| try lease.registerRetirementWithAdmission(credit, control.?);
+    const locked = if (backend_locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, locked);
     if (backend.retainCachedRunBlock(path, run.id, offset, len)) |winner| {
         lease.release();
         return winner;
     }
-    if (admit) _ = backend.cacheRunBlockLease(path, run.id, offset, len, lease);
+    // Legacy credit transfers after the final scope check. Controlled credit
+    // already belongs to the registered physical owner; rejection or a losing
+    // duplicate only publishes readiness for independent admitted cleanup.
+    if (construction == null) lease.reservation = read_credit;
+    read_credit = null;
+    if (admit) {
+        if (control) |budget| _ = try backend.cacheRunBlockLeaseWithAdmission(path, run.id, offset, len, lease, budget) else _ = backend.cacheRunBlockLease(path, run.id, offset, len, lease);
+    }
     return lease;
 }
 
+fn localDecodeKey(run: *const Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, admit: bool) !LocalReader.Key {
+    return .{
+        .path = run.path orelse return error.RunStateUnavailable,
+        .generation = run.read_identity,
+        .run_id = run.id,
+        .offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(),
+        .physical_len = window.physicalLen(),
+        .logical_len = window.len,
+        .compression = window.compression,
+        .checksum = window.checksum,
+        .admit = admit,
+    };
+}
+
+/// Retire the peer reference before any retry. Never restart flight election:
+/// a failed producer allows one independent physical attempt, with the same scope.
+fn waitLocalBlockOrDecode(backend: anytype, flight: *LocalReader.Flight, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, admit: bool, control: ?read_admission.Port) !*SharedBytes {
+    const result = backend.local_reader.waitWithAdmission(flight, control);
+    backend.local_reader.releaseFlight(flight);
+    return result catch |cause| {
+        if (cause != error.LocalDecodeProducerFailed) return cause;
+        if (control) |budget| try budget.checkpoint();
+        return loadLocalBlockCandidate(backend, run, index, window, false, admit, control);
+    };
+}
+
 fn joinLocalBlockDecode(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow) !?*SharedBytes {
+    return joinLocalBlockDecodeWithAdmission(backend, run, index, window, null);
+}
+
+fn joinLocalBlockDecodeWithAdmission(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    window: lsm_table_file.EntryDataWindow,
+    control: ?read_admission.Port,
+) !?*SharedBytes {
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
-        const path = run.path orelse return null;
-        const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-        const flight = backend.local_reader.join(path, run.id, offset, window.physicalLen(), true) orelse return null;
-        defer backend.local_reader.releaseFlight(flight);
-        return try backend.local_reader.wait(flight);
+        const flight = try backend.local_reader.joinWithAdmission(try localDecodeKey(run, index, window, true), control) orelse return null;
+        return waitLocalBlockOrDecode(backend, flight, run, index, window, true, control);
     }
     return null;
 }
 
 fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool) !*SharedBytes {
-    if (retainLocalCachedBlock(backend, run, index, window, backend_locked)) |lease| return lease;
+    return loadLocalBlockLeaseWithAdmission(backend, run, index, window, backend_locked, admit, null);
+}
+
+fn loadLocalBlockLeaseWithAdmission(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool, control: ?read_admission.Port) !*SharedBytes {
+    if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, backend_locked, control)) |lease| return lease;
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
         // Joining a publisher while holding the writer mutex would deadlock.
         // Locked callers decode independently through the same bounded pool.
         if (!backend_locked) {
-            const path = run.path orelse return error.RunStateUnavailable;
-            const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-            const ticket = backend.local_reader.begin(backend.allocator, backend.manifestCoordinationIo(), path, run.id, offset, window.physicalLen(), admit) catch null;
+            const ticket = try backend.local_reader.beginWithAdmission(backend.allocator, backend.manifestCoordinationIo(), try localDecodeKey(run, index, window, admit), control);
             if (ticket) |owned| {
+                if (!owned.leader) return waitLocalBlockOrDecode(backend, owned.flight, run, index, window, admit, control);
                 defer backend.local_reader.releaseFlight(owned.flight);
-                if (!owned.leader) return backend.local_reader.wait(owned.flight);
-                const payload = loadLocalBlockCandidate(backend, run, index, window, false, admit);
+                const payload = loadLocalBlockCandidate(backend, run, index, window, false, admit, control);
                 backend.local_reader.finish(owned.flight, payload);
                 return payload;
             }
         }
     }
-    return loadLocalBlockCandidate(backend, run, index, window, backend_locked, admit);
+    return loadLocalBlockCandidate(backend, run, index, window, backend_locked, admit, control);
 }
 
 fn loadOwnedBlockForWindowAlloc(
@@ -8686,7 +10611,7 @@ fn loadOwnedBlockForWindowMaybeLocked(
     return try loadOwnedBlockForWindowAllocMaybeLocked(backend, backend.allocator, run, index, window, backend_locked);
 }
 
-const PointValueOutput = struct { allocator: Allocator, held: *PointResultValues };
+const PointValueOutput = struct { allocator: Allocator, held: *PointResultValues, control: ?read_admission.Port = null };
 
 fn findExactEntryInCompressedPrefixBlock(
     backend: anytype,
@@ -8697,6 +10622,8 @@ fn findExactEntryInCompressedPrefixBlock(
     key: []const u8,
     output: ?PointValueOutput,
 ) !?OwnedTableEntry {
+    const control = if (output) |target| target.control else null;
+    if (control) |budget| try budget.checkpoint();
     const block = index.blocks[block_index];
     const window = index.blockWindow(block_index);
     switch (window.compression) {
@@ -8705,13 +10632,13 @@ fn findExactEntryInCompressedPrefixBlock(
     }
     const path = run.path orelse return error.RunStateUnavailable;
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspace(backend, window, true) else null;
+    var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspaceWithAdmission(backend, window, true, control) else null;
     defer if (workspace) |*work| work.release();
     const scratch = if (workspace) |*work| work.allocator() else backend.allocator;
-    const payload = try loadRunTableBlockWithStats(backend, scratch, path, absolute_offset, window.physicalLen());
+    const payload = try loadRunTableBlockWithStatsAndAdmission(backend, scratch, path, absolute_offset, window.physicalLen(), control);
     defer scratch.free(payload);
     if (output) |target| {
-        const found = try findExactEntryInCachedPrefixWithScratch(backend, payload, block, window, target.held, target.allocator, scratch, namespace, key, .transaction_owned) orelse return null;
+        const found = try findExactEntryInCachedPrefixWithScratchWithAdmission(backend, payload, block, window, target.held, target.allocator, scratch, namespace, key, .transaction_owned, control) orelse return null;
         return .{ .entry = found.entry, .final_point_value = true };
     }
     const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadWithScratchAlloc(
@@ -8749,6 +10676,8 @@ fn findExactEntryWithLocalIndexBlockMetaWithOutput(
     key: []const u8,
     output: ?PointValueOutput,
 ) !?OwnedTableEntry {
+    const control = if (output) |target| target.control else null;
+    if (control) |budget| try budget.checkpoint();
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
     const block = index.blocks[block_index];
     if (!block.mayContainKeyByBounds(namespace.name, key)) return null;
@@ -8760,24 +10689,27 @@ fn findExactEntryWithLocalIndexBlockMetaWithOutput(
     // Borrow a warm decoded block before allocating compressed lookup scratch.
     // A miss preserves the compact direct-prefix lookup for cold point reads.
     if (localBlockCacheEnabled(backend)) {
-        if (retainLocalCachedBlock(backend, run, index, window, false)) |lease| {
+        if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, false, control)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
-        if (namespace.retainDataBlocks()) if (try joinLocalBlockDecode(backend, run, index, window)) |lease| {
+        if (namespace.retainDataBlocks()) if (try joinLocalBlockDecodeWithAdmission(backend, run, index, window, control)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         };
-        if (namespace.retainDataBlocks() and beginLocalBlockPromotion(backend, run, index, window, false)) {
-            var admitted = false;
-            defer finishLocalBlockPromotion(backend, run, index, window, false, admitted);
-            const lease = try loadLocalBlockLease(backend, run, index, window, false, namespace.retainDataBlocks());
-            admitted = lease.cache_admitted;
-            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        if (namespace.retainDataBlocks()) {
+            if (try beginLocalBlockPromotionWithAdmission(backend, run, index, window, false, control)) |claim| {
+                var promotion = claim;
+                var admitted = false;
+                defer promotion.finish(admitted);
+                const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, false, namespace.retainDataBlocks(), control);
+                admitted = lease.cache_admitted;
+                return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+            }
         }
     }
     if (window.compression == .prefix or window.compression == .prefix_snappy)
         return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key, output);
-    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, false);
-    const bytes = try loadOwnedBlockForWindow(
+    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLeaseWithAdmission(backend, run, index, window, block_index, namespace, key, false, control);
+    const bytes = if (control != null) try loadDecodedLocalBlockWithAdmission(backend, backend.allocator, run.path orelse return error.RunStateUnavailable, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window, control) else try loadOwnedBlockForWindow(
         backend,
         run,
         index,
@@ -8820,6 +10752,8 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(
     backend_locked: bool,
     output: ?PointValueOutput,
 ) !?OwnedTableEntry {
+    const control = if (output) |target| target.control else null;
+    if (control) |budget| try budget.checkpoint();
     if (!backend_locked) return try findExactEntryWithLocalIndexBlockMetaWithOutput(backend, run, index, namespace, key, output);
 
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
@@ -8833,21 +10767,24 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(
     // Borrow a warm decoded block before allocating compressed lookup scratch.
     // A miss preserves the compact direct-prefix lookup for cold point reads.
     if (localBlockCacheEnabled(backend)) {
-        if (retainLocalCachedBlock(backend, run, index, window, true)) |lease| {
+        if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, true, control)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
-        if (namespace.retainDataBlocks() and beginLocalBlockPromotion(backend, run, index, window, true)) {
-            var admitted = false;
-            defer finishLocalBlockPromotion(backend, run, index, window, true, admitted);
-            const lease = try loadLocalBlockLease(backend, run, index, window, true, namespace.retainDataBlocks());
-            admitted = lease.cache_admitted;
-            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        if (namespace.retainDataBlocks()) {
+            if (try beginLocalBlockPromotionWithAdmission(backend, run, index, window, true, control)) |claim| {
+                var promotion = claim;
+                var admitted = false;
+                defer promotion.finish(admitted);
+                const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, true, namespace.retainDataBlocks(), control);
+                admitted = lease.cache_admitted;
+                return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+            }
         }
     }
     if (window.compression == .prefix or window.compression == .prefix_snappy)
         return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key, output);
-    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, true);
-    const bytes = try loadOwnedBlockForWindowMaybeLocked(
+    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLeaseWithAdmission(backend, run, index, window, block_index, namespace, key, true, control);
+    const bytes = if (control != null) try loadDecodedLocalBlockWithAdmission(backend, backend.allocator, run.path orelse return error.RunStateUnavailable, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window, control) else try loadOwnedBlockForWindowMaybeLocked(
         backend,
         run,
         index,
@@ -8914,11 +10851,27 @@ fn getFromRunWithLocalIndex(
     key: []const u8,
     backend_locked: bool,
 ) !?[]const u8 {
-    const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+    return getFromRunWithLocalIndexWithAdmission(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked, null);
+}
+
+fn getFromRunWithLocalIndexWithAdmission(
+    backend: anytype,
+    run: *Run,
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
+    held_values: *PointResultValues,
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !?[]const u8 {
+    if (control) |budget| try budget.checkpoint();
+    const index = try indexForRunNoCacheMaybeLockedWithAdmission(backend, run, backend_locked, control);
     try requireTableBlocks(index);
-    const loaded = try findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(backend, run, index, namespace, key, backend_locked, .{ .allocator = value_allocator, .held = held_values }) orelse return null;
+    const loaded = try findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(backend, run, index, namespace, key, backend_locked, .{ .allocator = value_allocator, .held = held_values, .control = control }) orelse return null;
     var transferred = false;
     defer if (!transferred) loaded.deinit(backend.allocator);
+    if (control) |budget| try budget.checkpoint();
     if (loaded.entry.tombstone) return error.NotFound;
     if (loaded.final_point_value) return loaded.entry.value;
     if (namespace.borrow_local_point_results) if (held_blocks) |pins| if (loaded.local) |payload| {
@@ -8937,7 +10890,7 @@ fn getFromRunWithLocalIndex(
         return loaded.entry.value;
     }
 
-    return try copyPointValue(backend, value_allocator, held_values, loaded.entry.value);
+    return try copyPointValueWithAdmission(backend, value_allocator, held_values, loaded.entry.value, control);
 }
 
 fn runMayContainWithFilter(backend: anytype, run: *Run, namespace: backend_types.Namespace, key: []const u8) !bool {
@@ -8970,10 +10923,21 @@ fn runMayContainWithFilterMaybeLocked(
     key: []const u8,
     backend_locked: bool,
 ) !bool {
-    if (!backend_locked) return try runMayContainWithFilter(backend, run, namespace, key);
+    return runMayContainWithFilterMaybeLockedWithAdmission(backend, run, namespace, key, backend_locked, null);
+}
+
+fn runMayContainWithFilterMaybeLockedWithAdmission(
+    backend: anytype,
+    run: *Run,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !bool {
+    if (control) |budget| try budget.checkpoint();
 
     if (!runMayContain(run.*, namespace, key)) return false;
-    const filter = try ensureRunBloomFilterForReadMaybeLocked(backend, run, true);
+    const filter = try ensureRunBloomFilterForReadMaybeLockedWithAdmission(backend, run, backend_locked, control);
     if (filter) |present_filter| {
         const present = lsm_table_file.maybeContains(present_filter, namespace.name, key);
         if (!present) backend.recordBloomNegative();
@@ -8981,11 +10945,11 @@ fn runMayContainWithFilterMaybeLocked(
     }
     if (run.path != null) {
         const present = if (backend.options.cache != null) blk: {
-            var handle = try loadRunTableIndexHandle(backend, run);
+            var handle = try loadRunTableIndexHandleWithAdmission(backend, run, control);
             defer handle.release();
             break :blk lsm_table_file.maybeContains(handle.runTableIndex().borrowFilter(), namespace.name, key);
         } else blk: {
-            const index = try indexForRunNoCacheMaybeLocked(backend, run, true);
+            const index = try indexForRunNoCacheMaybeLockedWithAdmission(backend, run, backend_locked, control);
             break :blk lsm_table_file.maybeContains(index.borrowFilter(), namespace.name, key);
         };
         if (!present) backend.recordBloomNegative();
@@ -9009,21 +10973,50 @@ fn ensureRunBloomFilterForRead(backend: anytype, run: *Run) !?bloom.OwnedFilter 
 }
 
 fn ensureRunBloomFilterForReadMaybeLocked(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
-    if (!backend_locked) return try ensureRunBloomFilterForRead(backend, run);
-    return try ensureRunBloomFilterForReadLocked(backend, run, true);
+    return ensureRunBloomFilterForReadMaybeLockedWithAdmission(backend, run, backend_locked, null);
+}
+
+fn ensureRunBloomFilterForReadMaybeLockedWithAdmission(
+    backend: anytype,
+    run: *Run,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !?bloom.OwnedFilter {
+    const budget = control orelse {
+        if (!backend_locked) return ensureRunBloomFilterForRead(backend, run);
+        return ensureRunBloomFilterForReadLocked(backend, run, true);
+    };
+    try budget.checkpoint();
+    if (run.shared_read_version) return null;
+    if (run.bloom_filter) |filter| return filter;
+    if (backend.options.cache != null or run.path == null) return null;
+    const held = if (backend_locked) false else try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget);
+    defer unlockBackend(@TypeOf(backend.*), backend, held);
+    return ensureRunBloomFilterForReadLockedWithAdmission(backend, run, true, budget);
 }
 
 fn ensureRunBloomFilterForReadLocked(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
+    return ensureRunBloomFilterForReadLockedWithAdmission(backend, run, backend_locked, null);
+}
+
+fn ensureRunBloomFilterForReadLockedWithAdmission(
+    backend: anytype,
+    run: *Run,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !?bloom.OwnedFilter {
+    if (control) |budget| try budget.checkpoint();
     if (run.shared_read_version) return null;
     if (run.bloom_filter) |filter| return filter;
 
     if (@hasField(@TypeOf(backend.*), "runs")) {
         for (0..run_store.count(backend)) |rank| {
+            if (control) |budget| try budget.checkpoint();
             const source_run = run_store.at(backend, rank);
             if (source_run.id != run.id) continue;
             if (!sameRunPath(source_run.path, run.path)) continue;
 
-            const filter = try materializeRunBloomFilterForRead(backend, source_run, backend_locked);
+            const filter = try materializeRunBloomFilterForReadWithAdmission(backend, source_run, backend_locked, control);
             if (source_run != run) {
                 run.bloom_filter = filter;
                 run.owns_bloom_filter = false;
@@ -9032,10 +11025,19 @@ fn ensureRunBloomFilterForReadLocked(backend: anytype, run: *Run, backend_locked
         }
     }
 
-    return try materializeRunBloomFilterForRead(backend, run, backend_locked);
+    return try materializeRunBloomFilterForReadWithAdmission(backend, run, backend_locked, control);
 }
 
 fn materializeRunBloomFilterForRead(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
+    return materializeRunBloomFilterForReadWithAdmission(backend, run, backend_locked, null);
+}
+
+fn materializeRunBloomFilterForReadWithAdmission(
+    backend: anytype,
+    run: *Run,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !?bloom.OwnedFilter {
     if (run.bloom_filter) |filter| return filter;
     if (run.path == null) return null;
 
@@ -9046,8 +11048,10 @@ fn materializeRunBloomFilterForRead(backend: anytype, run: *Run, backend_locked:
     // may safely proceed without the optional Bloom precheck.
     if (backend.options.cache != null) return null;
 
-    const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
-    const filter = try index.borrowFilter().clone(backend.allocator);
+    const index = try indexForRunNoCacheMaybeLockedWithAdmission(backend, run, backend_locked, control);
+    var filter = try index.borrowFilter().clone(backend.allocator);
+    errdefer filter.deinit(backend.allocator);
+    if (control) |budget| try budget.checkpoint();
     run.bloom_filter = filter;
     run.owns_bloom_filter = true;
     return run.bloom_filter.?;
@@ -9258,6 +11262,13 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn commit(self: *@This()) !void {
+            return self.commitControlled(null);
+        }
+        pub fn commitWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            return self.commitControlled(original);
+        }
+        fn commitControlled(self: *@This(), control: ?read_admission.Port) !void {
+            if (control) |original| try original.checkpoint();
             if (self.closed) return error.TransactionClosed;
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
@@ -9266,7 +11277,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.probe_scratch.deinit(self.metadata_allocator);
             };
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
-            const locked = lockBackend(BackendType, self.backend);
+            const locked = if (control) |original|
+                if (try original.hasExecutionWait()) try lockBackendWithAdmission(BackendType, self.backend, original) else lockBackend(BackendType, self.backend)
+            else
+                lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
             var release_on_error = true;
             errdefer if (release_on_error) {
@@ -9301,7 +11315,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
+                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -10818,7 +12832,7 @@ test "lsm shared directory classification visits keys once and includes mutable 
     var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
     defer unresolved.deinit(std.testing.allocator);
     const keys = [_][]const u8{ "hit", "missing", "tombstone" };
-    const planned = try directoryUnresolvedKeys(std.testing.allocator, &mutable, &.{}, .{}, &keys, &unresolved);
+    const planned = try directoryUnresolvedKeys(std.testing.allocator, &mutable, &.{}, .{}, &keys, &unresolved, null);
     try std.testing.expectEqual(@as(usize, 3), mutable.calls);
     try std.testing.expectEqual(@as(usize, 1), planned.len);
     try std.testing.expectEqualStrings("missing", planned[0]);
@@ -11388,11 +13402,11 @@ test "lsm shared directory classification excludes immutable values and tombston
     const keys = [_][]const u8{ "deleted", "missing", "new", "old" };
     var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
     defer unresolved.deinit(a);
-    const planned = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "docs" }, &keys, &unresolved);
+    const planned = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "docs" }, &keys, &unresolved, null);
     try std.testing.expectEqual(@as(usize, 1), planned.len);
     try std.testing.expectEqualStrings("missing", planned[0]);
     unresolved.clearRetainingCapacity();
-    const other = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "other" }, &keys, &unresolved);
+    const other = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "other" }, &keys, &unresolved, null);
     try std.testing.expectEqual(@intFromPtr(&keys), @intFromPtr(other.ptr));
 }
 
@@ -11436,7 +13450,7 @@ test "lsm shared immutable classification eliminates overlapping directory selec
     const keys = [_][]const u8{ "deleted", "new", "old" };
     var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
     defer unresolved.deinit(a);
-    const planned = try directoryUnresolvedKeys(a, &empty, &.{&immutable}, .{ .name = "docs" }, &keys, &unresolved);
+    const planned = try directoryUnresolvedKeys(a, &empty, &.{&immutable}, .{ .name = "docs" }, &keys, &unresolved, null);
     var before = directory.sortedPoints("docs", &keys);
     var before_count: usize = 0;
     while (!before.done()) {
@@ -13060,6 +15074,350 @@ test "lsm point followup mandatory reclamation preserves active decoded owners" 
     std.debug.print("INACTIVE_SCRATCH_ADMISSION idle_owner_users=0 retained_charge={d} mandatory_bytes=98304 mandatory=success inactive_owner_preserved=true\n", .{charged});
 }
 
+/// Exercises the real fixed-size shared pipeline without exporting an authority
+/// borrow into a persistent read handle. Runtime callers still need forwarding.
+pub fn qualifyControlledAsyncBatch(control: read_admission.Port) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/controlled-async-batch", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = 1, .max_concurrent_point_block_reads = 16 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var key_bytes: [16][64]u8 = undefined;
+    var keys: [16][]const u8 = undefined;
+    var write = try store.beginWrite();
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_bytes[i], "document:long-shared-prefix-for-compression:{d:0>4}", .{i});
+        try write.put(key.*, key.*);
+    }
+    try write.commit();
+    var runs = [_]Run{backend.runs.at(0).*};
+    var handle = try loadRunTableIndexHandle(&backend, &runs[0]);
+    try std.testing.expectEqual(@as(usize, 1), handle.runTableIndex().blocks.len);
+    handle.release();
+    const groups = try buildL0RunGroups(a, &runs);
+    defer deinitRunGroups(a, groups);
+    const levels = try buildLowerLevels(a, &runs);
+    defer a.free(levels);
+    const empty: State = .{};
+    var values: [16]?[]const u8 = @splat(null);
+    var held: PointResultValues = .empty;
+    defer releaseHeldValues(&held, a);
+    const before = backend.snapshotReadStats().table_block_loads;
+    const result = (try readManySortedPointFromSnapshotAsyncWithAdmission(&backend, &empty, &.{}, &runs, groups, levels, a, &held, .{ .name = "docs" }, &keys, &values, false, .snapshot_pinned, null, null, control)).?;
+    try std.testing.expectEqual(keys.len, result.hits);
+    try std.testing.expectEqual(@as(usize, 0), result.misses);
+    try std.testing.expectEqual(@as(u64, 1), backend.snapshotReadStats().table_block_loads - before);
+    cache.invalidatePrefix("/controlled-async-batch");
+    for (values, keys) |value, key| try std.testing.expectEqualStrings(key, value.?);
+}
+
+pub fn qualifyControlledNativeReadBatch(control: read_admission.Port, use_scope: bool) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/controlled-native-read-batch", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = 1, .max_concurrent_point_block_reads = 16 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var key_bytes: [128][64]u8 = undefined;
+    var keys: [128][]const u8 = undefined;
+    var write = try store.beginWrite();
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_bytes[i], "document:long-shared-prefix-for-compression:{d:0>4}", .{i});
+        try write.put(key.*, key.*);
+    }
+    try write.commit();
+    var runs = [_]Run{backend.runs.at(0).*};
+    var handle = try loadRunTableIndexHandle(&backend, &runs[0]);
+    try std.testing.expectEqual(@as(usize, 1), handle.runTableIndex().blocks.len);
+    handle.release();
+    var handle_owner = try BoundReadTxn(B).open(&backend, .{ .name = "docs" });
+    var read = backend_erased.readTxnFrom(a, handle_owner) catch |err| {
+        handle_owner.abort();
+        return err;
+    };
+    defer read.abort();
+    var scope = try read.openReadScope(a);
+    defer scope.close();
+    var values: [128]?[]const u8 = @splat(null);
+    const sparse = [_][]const u8{ keys[0], keys[keys.len - 1] };
+    // Preserve all three existing planner choices: cursor, grouped synchronous
+    // reads, and sparse asynchronous points, including reusable-scope results.
+    for ([_][]const []const u8{ keys[0..16], &keys, &sparse }) |batch| {
+        cache.invalidatePrefix("/controlled-native-read-batch");
+        const result = if (use_scope) scope.getManySortedWithAdmission(batch, values[0..batch.len], control) else read.getManySortedWithAdmission(batch, values[0..batch.len], control);
+        result catch |err| {
+            for (values[0..batch.len]) |value| try std.testing.expect(value == null);
+            return err;
+        };
+        cache.invalidatePrefix("/controlled-native-read-batch");
+        for (values[0..batch.len], batch) |value, key| try std.testing.expectEqualStrings(key, value.?);
+    }
+}
+
+pub fn qualifyControlledUncachedReadBatch(control: read_admission.Port, local_cache: bool, use_scope: bool) !void {
+    return qualifyUncachedReadBatch(control, local_cache, use_scope, false);
+}
+
+pub fn qualifyControlledManagedUncachedReadBatch(control: read_admission.Port, local_cache: bool, use_scope: bool) !void {
+    return qualifyUncachedReadBatch(control, local_cache, use_scope, true);
+}
+
+fn qualifyUncachedReadBatch(control: read_admission.Port, local_cache: bool, use_scope: bool, managed: bool) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/uncached-batch", .{tmp.sub_path});
+    defer a.free(path);
+    var storage = try storage_io.NativeStorage.init(a, .threaded);
+    defer storage.deinit();
+    var resources = @import("../resource_manager.zig").ResourceManager.init(.{ .identity_allocator = a });
+    defer resources.deinit(a);
+    var backend = try B.open(a, path, .{ .resource_manager = if (managed) &resources else null, .storage = storage.storage(), .flush_threshold = 1, .local_block_cache_enabled = local_cache });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var key_bytes: [128][64]u8 = undefined;
+    var keys: [128][]const u8 = undefined;
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        for (&keys, 0..) |*key, i| {
+            key.* = try std.fmt.bufPrint(&key_bytes[i], "document:long-shared-prefix-for-compression:{d:0>4}", .{i});
+            try write.put(key.*, key.*);
+        }
+        try write.commit();
+    }
+    var handle_owner = try BoundReadTxn(B).open(&backend, .{ .name = "docs" });
+    var read = backend_erased.readTxnFrom(a, handle_owner) catch |err| {
+        handle_owner.abort();
+        return err;
+    };
+    defer read.abort();
+    var scope = try read.openReadScope(a);
+    defer scope.close();
+    var values: [128]?[]const u8 = @splat(null);
+    const sparse = [_][]const u8{ keys[0], keys[keys.len - 1] };
+    // Cursor, grouped and sparse plans, then warm repeat without changing the
+    // snapshot. No shared Cache: local-index and local-block paths are real.
+    for ([_][]const []const u8{ &sparse, &keys, keys[0..16], &sparse }) |batch| {
+        const result = if (use_scope) scope.getManySortedWithAdmission(batch, values[0..batch.len], control) else read.getManySortedWithAdmission(batch, values[0..batch.len], control);
+        result catch |err| {
+            for (values[0..batch.len]) |value| try std.testing.expect(value == null);
+            return err;
+        };
+        for (values[0..batch.len], batch) |value, key| try std.testing.expectEqualStrings(key, value.?);
+    }
+}
+
+pub fn qualifyControlledLargeSnappyBatch(control: read_admission.Port) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/controlled-large-snappy", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = 1, .max_concurrent_point_block_reads = 16 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    const bytes: [128 * 1024]u8 = @splat('x');
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("huge", &bytes);
+        try write.commit();
+    }
+    var runs = [_]Run{backend.runs.at(0).*};
+    var handle = try loadRunTableIndexHandle(&backend, &runs[0]);
+    try std.testing.expectEqual(@as(usize, 1), handle.runTableIndex().blocks.len);
+    try std.testing.expectEqual(lsm_table_file.BlockCompression.snappy, handle.runTableIndex().blocks[0].compression);
+    handle.release();
+    const groups = try buildL0RunGroups(a, &runs);
+    defer deinitRunGroups(a, groups);
+    const levels = try buildLowerLevels(a, &runs);
+    defer a.free(levels);
+    const empty: State = .{};
+    var held: PointResultValues = .empty;
+    defer releaseHeldValues(&held, a);
+    var values: [2]?[]const u8 = @splat(null);
+    const result = (try readManySortedPointFromSnapshotAsyncWithAdmission(&backend, &empty, &.{}, &runs, groups, levels, a, &held, .{ .name = "docs" }, &.{ "huge", "missing" }, &values, false, .transaction_owned, null, null, control)).?;
+    try std.testing.expectEqual(@as(usize, 1), result.hits);
+    try std.testing.expectEqual(@as(usize, 1), result.misses);
+    try std.testing.expectEqualSlices(u8, &bytes, values[0].?);
+    try std.testing.expect(values[1] == null);
+}
+
+pub fn qualifyControlledPointPromotion(control: read_admission.Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 2 * 1024 * 1024 } });
+    defer parent.deinit(a);
+    var child = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer child.deinit(a);
+    try child.installMemoryParent(parent.memoryParentPort());
+    var peer = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer peer.deinit(a);
+    try peer.installMemoryParent(parent.memoryParentPort());
+    defer {
+        resources.metadata_fixture.expectUsage(0, &parent, &.{ &parent, &child, &peer }) catch unreachable;
+        resources.metadata_fixture.expectUsage(0, &child, &.{&child}) catch unreachable;
+        std.debug.assert(parent.snapshot().memory.accounting_errors == 0);
+        std.debug.assert(child.snapshot().memory.accounting_errors == 0);
+    }
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    if (fixture != 4) cache.attachResourceManager(&child);
+    const Backend = struct {
+        allocator: Allocator,
+        options: struct { cache: ?*cache_mod.Cache, resource_manager: ?*resources.ResourceManager },
+    };
+    var backend = Backend{ .allocator = a, .options = .{ .cache = &cache, .resource_manager = if (fixture == 5) &peer else &child } };
+    var entries: [192]lsm_table_file.Entry = undefined;
+    var keys: [192][80]u8 = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .namespace_name = "docs", .key = try std.fmt.bufPrint(&keys[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "a selected document's exact value" };
+    var filter = try lsm_table_file.buildFilterAlloc(a, &entries, lsm_table_file.default_filter_config);
+    defer filter.deinit(a);
+    const encoded = try lsm_table_file.encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = if (fixture == 3) .none else .snappy_adaptive });
+    defer a.free(encoded);
+    var index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+    defer index.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), index.blocks.len);
+    const window = index.blockWindow(0);
+    if (fixture != 3) try std.testing.expectEqual(lsm_table_file.BlockCompression.prefix_snappy, window.compression);
+    const offset = index.entry_data_start + window.physicalRelativeOffset();
+    const payload = encoded[offset..][0..window.physicalLen()];
+    const expected = try lsm_table_file.decodeBlockPayloadAlloc(a, window.compression, payload, window.len, window.checksum);
+    defer a.free(expected);
+    const prefix = if (fixture == 1) try @import("../../encoding/snappy.zig").decode(a, payload) else null;
+    defer if (prefix) |owned| a.free(owned);
+    const prepared: ?DecodedPointBlock = switch (fixture) {
+        0 => null,
+        1 => .{ .prefix_records = prefix.? },
+        else => .{ .raw_rows = expected },
+    };
+    const path = "/controlled-point-promotion";
+    try promoteCachedPointBlockWithAdmission(&backend, path, 1, 1, window, offset, payload, prepared, control);
+    if (fixture == 4) {
+        try std.testing.expect(cache.retainRunTableBlock(path, 1, 1, offset, window.physicalLen()) == null);
+        try resources.metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &child, &peer });
+        return;
+    }
+    var retained = cache.retainRunTableBlock(path, 1, 1, offset, window.physicalLen()) orelse return error.TestUnexpectedResult;
+    defer retained.release();
+    try std.testing.expectEqualSlices(u8, expected, retained.runTableBlock());
+    try cache.drainLoadCleanupWithAdmission(control);
+    try std.testing.expectEqual(@as(u64, 0), child.sliceStats(.lsm_read_working_set).used_bytes);
+    try resources.metadata_fixture.expectUsage(@as(u64, 0), &peer, &.{&peer});
+    try std.testing.expectEqual(child.snapshot().memory.used_bytes, parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(child.snapshot().memory.peak_bytes, parent.snapshot().memory.peak_bytes);
+    try std.testing.expect(parent.snapshot().memory.peak_bytes < @as(u64, window.len) * 2);
+}
+
+pub fn qualifyControlledPointResultCopies(control: read_admission.Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    var held: PointResultValues = .empty;
+    defer releaseHeldValues(&held, a);
+    const seed = try held.copies.copy(a, &held, "seed");
+    const previous_buffer = held.copies.buffer;
+    const previous_used = held.copies.used;
+    const previous_count = held.items.len;
+    const large: [192 * 1024]u8 = @splat('v');
+    const key: [128 * 1024]u8 = @splat('k');
+    const name: [65 * 1024]u8 = @splat('n');
+    if (fixture == 3) {
+        const entry: lsm_table_file.Entry = .{ .namespace_name = &name, .key = &key, .value = &large };
+        const owned = copyTableEntryWithAdmission(a, entry, control) catch |err| {
+            const retry = try copyTableEntry(a, entry);
+            defer a.free(retry.bytes);
+            try std.testing.expectEqualSlices(u8, &name, retry.entry.namespace_name.?);
+            try std.testing.expectEqualSlices(u8, &key, retry.entry.key);
+            try std.testing.expectEqualSlices(u8, &large, retry.entry.value);
+            try std.testing.expectEqualStrings("seed", seed);
+            return err;
+        };
+        defer a.free(owned.bytes);
+        try std.testing.expectEqualSlices(u8, &name, owned.entry.namespace_name.?);
+        try std.testing.expectEqualSlices(u8, &key, owned.entry.key);
+        try std.testing.expectEqualSlices(u8, &large, owned.entry.value);
+    } else {
+        const value = large[0..switch (fixture) {
+            0 => @as(usize, 32),
+            1 => 512,
+            else => large.len,
+        }];
+        const copied = held.copies.copyWithAdmission(a, &held, value, control) catch |err| {
+            try std.testing.expectEqualStrings("seed", seed);
+            if (held.copies.buffer.ptr == previous_buffer.ptr) try std.testing.expectEqual(previous_used, held.copies.used) else try std.testing.expectEqual(@as(usize, 0), held.copies.used);
+            if (fixture == 2) try std.testing.expectEqual(previous_count, held.items.len);
+            const retry = try held.copies.copy(a, &held, value);
+            try std.testing.expectEqualSlices(u8, value, retry);
+            try std.testing.expectEqualStrings("seed", seed);
+            return err;
+        };
+        try std.testing.expectEqualSlices(u8, value, copied);
+    }
+    try std.testing.expectEqualStrings("seed", seed);
+}
+
+pub fn qualifyControlledOwnedPointBatch(control: read_admission.Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    const persisted = fixture % 2 == 1;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/controlled-owned-point-copy", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = if (persisted) 1 else 1024 * 1024, .table_block_compression = .none, .max_concurrent_point_block_reads = if (fixture >= 2) 1 else 16 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    const large: [192 * 1024]u8 = @splat('v');
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("a:small", "seed");
+        try write.put("b:large", &large);
+        try write.commit();
+    }
+    const runs = try a.alloc(Run, backend.runs.count());
+    defer a.free(runs);
+    for (runs, 0..) |*run, i| run.* = backend.runs.at(i).*;
+    if (persisted) try std.testing.expect(runs.len > 0) else try std.testing.expectEqual(@as(usize, 0), runs.len);
+    const groups = try buildL0RunGroups(a, runs);
+    defer deinitRunGroups(a, groups);
+    const levels = try buildLowerLevels(a, runs);
+    defer a.free(levels);
+    var held: PointResultValues = .empty;
+    defer releaseHeldValues(&held, a);
+    var values: [4]?[]const u8 = @splat(null);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const result = try readManySortedPointFromSnapshotWithScratch(&backend, &backend.mutable, &.{}, runs, groups, levels, a, null, &held, .{ .name = "docs", .own_source_point_results = true }, &.{ "a:small", "b:large", "b:large", "z:missing" }, &values, false, scratch.allocator(), control);
+    try std.testing.expectEqual(@as(usize, 3), result.hits);
+    try std.testing.expectEqual(@as(usize, 1), result.misses);
+    cache.invalidatePrefix("/controlled-owned-point-copy");
+    try std.testing.expectEqualStrings("seed", values[0].?);
+    try std.testing.expectEqualSlices(u8, &large, values[1].?);
+    try std.testing.expectEqualSlices(u8, &large, values[2].?);
+    try std.testing.expect(values[3] == null);
+}
 test "lsm presence probes avoid value copies across source tiers (#1095)" {
     const Backend = @import("../lsm_backend.zig").Backend;
     const a = std.testing.allocator;
@@ -13209,4 +15567,971 @@ test "public graph metric borrowed wire LSM write presence and key cursor preser
     try Check.entry(try cursor.prev(), "a");
     try Check.entry(try cursor.seekAtOrBefore("b"), "a");
     try std.testing.expectEqualStrings("old", try pinned.get("a"));
+}
+
+test "WAL allocator owner point scratch preserves budget and ABI roots outside result arenas" {
+    const resources = @import("../resource_manager.zig");
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 }, .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var budget = resources.BudgetedAllocator.initReclaiming(&manager, .lsm_in_memory_state, std.testing.allocator, 1);
+    defer budget.deinit();
+    budget.credit_quantum = 1;
+    var arena = std.heap.ArenaAllocator.init(budget.threadSafeAllocator());
+    defer arena.deinit();
+    const scratch = runtimeScratchAllocator(arena.allocator());
+    const bytes = try scratch.alloc(u8, 64);
+    try std.testing.expectEqual(@as(u64, 64), budget.liveBytesThreadSafe());
+    try std.testing.expect(arena.state.used_list == null and arena.state.free_list == null);
+    scratch.free(bytes);
+    try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
+    try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 2 * 1024 * 1024));
+    var root = budget.threadSafeNoReclaimAllocator();
+    const descriptor = @import("runtime_memory_abi").Allocator.fromStd(&root);
+    const bridged = runtimeScratchAllocator(descriptor.asStd());
+    try std.testing.expectError(error.OutOfMemory, bridged.alloc(u8, 2 * 1024 * 1024));
+    try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
+}
+
+test "LSM streaming block keeps one source lease and bounded physical windows across verification passes" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        bytes: []const u8,
+        opens: usize = 0,
+        closes: usize = 0,
+        uses: usize = 0,
+        largest: usize = 0,
+        total: usize = 0,
+        reads: usize = 0,
+        fail_at: ?usize = null,
+        mutate_second_pass: bool = false,
+        var current: *@This() = undefined;
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../../segment_source.zig").Source {
+            const self = current;
+            self.opens += 1;
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn direct(_: *anyopaque, _: []const u8, offset: u64, out: []u8) !void {
+            return read(current, offset, out);
+        }
+        fn controlled(_: *anyopaque, _: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            try control.checkpoint();
+            try read(current, offset, out);
+            try control.checkpoint();
+        }
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses -= 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.uses == 0);
+            self.closes += 1;
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            self.largest = @max(self.largest, out.len);
+            if (self.fail_at == self.reads) {
+                @memset(out, 0xff);
+                return error.TestWindowFault;
+            }
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+            if (self.mutate_second_pass and self.total >= self.bytes.len and offset + out.len == self.bytes.len)
+                out[out.len - 1] ^= 1;
+            self.total += out.len;
+        }
+    };
+    const plain = try a.alloc(u8, 256 * 1024 + 31);
+    defer a.free(plain);
+    var random = std.Random.DefaultPrng.init(92814);
+    random.random().bytes(plain);
+    const encoded = try @import("../../encoding/snappy.zig").encode(a, plain);
+    defer a.free(encoded);
+    for ([_]lsm_table_file.BlockCompression{ .none, .snappy }) |compression| {
+        const bytes = if (compression == .none) plain else encoded;
+        for ([_]bool{ false, true }) |leased| {
+            for (0..5) |mode| {
+                var memory = storage_io.MemoryStorage.init(a);
+                defer memory.deinit();
+                var fixture: Fixture = .{ .bytes = bytes, .fail_at = if (mode == 1) 2 else null, .mutate_second_pass = mode == 2 and compression == .snappy };
+                var storage = memory.storage();
+                var vtable = storage.vtable.*;
+                vtable.open_leased_immutable_source = if (leased) Fixture.open else null;
+                vtable.read_file_range_into = Fixture.direct;
+                vtable.read_file_range_into_with_admission = Fixture.controlled;
+                storage.vtable = &vtable;
+                Fixture.current = &fixture;
+                var backend = @import("../lsm_backend.zig").Backend.init(a, .{ .storage = storage, .local_decode_working_bytes = plain.len + 140 * 1024 });
+                var backend_live = true;
+                defer if (backend_live) backend.close();
+                const Budget = struct {
+                    checks: usize = 0,
+                    pub fn waitForProgress(_: *@This()) !void {
+                        return error.TestUnexpectedWindowWait;
+                    }
+                    pub fn checkpoint(self: *@This()) !void {
+                        self.checks += 1;
+                        if (self.checks >= 12) return error.TestOriginalWindowRejection;
+                    }
+                };
+                var budget: Budget = .{};
+                var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+                const authority = adapter.payload();
+                var refused = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                // The test calls the exact production loader on an immutable source;
+                // no filesystem paths are opened by this initialized backend.
+                const result = loadDecodedLocalBlockWithAdmission(&backend, if (mode == 4) refused.allocator() else a, "immutable-run", 0, .{ .relative_offset = 0, .len = @intCast(plain.len), .physical_len = @intCast(bytes.len), .compression = compression, .checksum = @import("antfly_hash").Crc32.hash(bytes) }, if (mode == 3) .init(&authority) else null);
+                if (mode == 3) {
+                    try std.testing.expectError(error.TestOriginalWindowRejection, result);
+                } else if (mode == 4) {
+                    try std.testing.expectError(error.OutOfMemory, result);
+                } else if (mode == 1) {
+                    try std.testing.expectError(error.TestWindowFault, result);
+                } else if (mode == 2 and compression == .snappy) {
+                    try std.testing.expectError(error.TableBlockChecksumMismatch, result);
+                } else {
+                    const output = try result;
+                    defer a.free(output);
+                    try std.testing.expectEqualSlices(u8, plain, output);
+                    try std.testing.expectEqual(bytes.len * @as(usize, if (compression == .none) 1 else 2), fixture.total);
+                    try std.testing.expectEqual(fixture.total, backend.snapshotReadStats().table_block_bytes);
+                }
+                try std.testing.expect(fixture.largest <= 64 * 1024);
+                if (mode == 3) {
+                    try std.testing.expect(fixture.opens <= @as(usize, if (leased) 1 else 0));
+                } else try std.testing.expectEqual(@as(usize, if (leased) 1 else 0), fixture.opens);
+                try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+                try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+                backend.close();
+                backend_live = false;
+                try std.testing.expectEqual(fixture.opens, fixture.closes);
+            }
+        }
+    }
+}
+
+fn qualifyOwnedRunBlock(comptime fail: bool) !void {
+    const a = std.testing.allocator;
+    const scheduling = @import("../../common/runnable_scheduler.zig");
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Owner = OwnedRunBlockRead(Backend);
+    try std.testing.expect(@sizeOf(Owner) < 2048);
+    const Scope = struct {
+        execution: scheduling.Execution = .{},
+        valid: bool = true,
+        reject: bool = false,
+        pub fn checkLifetime(self: *@This()) !void {
+            if (!self.valid) return error.TestExpiredStepBorrow;
+            if (self.reject) return error.TestOwnedReadOriginalRejection;
+            try self.execution.checkLifetime();
+        }
+        pub fn checkpoint(self: *@This()) !void {
+            try self.checkLifetime();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedOwnerWait;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkLifetime();
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkLifetime();
+            try self.execution.enter(.query);
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+    };
+    const Fixture = struct {
+        bytes: []const u8,
+        total: usize = 0,
+        uses: usize = 0,
+        closes: usize = 0,
+        reads: usize = 0,
+        fail_after: ?usize = null,
+        reject_original: bool = false,
+        scope: ?*Scope = null,
+        var current: *@This() = undefined;
+        fn open(_: *anyopaque, _: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
+            try std.testing.expectEqualStrings("immutable-owned-run", path);
+            return .{ .ranges = .{ .ptr = current, .length = current.bytes.len, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            try std.testing.expect(out.len <= 64 * 1024);
+            if (self.fail_after) |limit| if (self.total >= limit) {
+                @memset(out, 0xaa);
+                if (self.reject_original) self.scope.?.reject = true;
+                return error.TestOwnedReadFault;
+            };
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+            self.total += out.len;
+        }
+        fn direct(_: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+            try std.testing.expectEqualStrings("immutable-owned-run", path);
+            return read(current, offset, out);
+        }
+        fn controlled(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            try control.checkpoint();
+            try direct(ptr, path, offset, out);
+            try control.checkpoint();
+        }
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses -= 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.uses == 0);
+            self.closes += 1;
+        }
+    };
+    const plain = try a.alloc(u8, 128 * 1024 + 53);
+    defer a.free(plain);
+    var random = std.Random.DefaultPrng.init(293061);
+    random.random().bytes(plain);
+    const encoded = try @import("../../encoding/snappy.zig").encode(a, plain);
+    defer a.free(encoded);
+    // One valid prefix record with a long value, used in both prefix variants.
+    const prefix_raw = try a.alloc(u8, 16 + plain.len);
+    defer a.free(prefix_raw);
+    prefix_raw[0] = 0;
+    std.mem.writeInt(u32, prefix_raw[1..5], 0, .little);
+    std.mem.writeInt(u32, prefix_raw[5..9], 3, .little);
+    std.mem.writeInt(u32, prefix_raw[9..13], @intCast(plain.len), .little);
+    @memcpy(prefix_raw[13..16], "key");
+    @memcpy(prefix_raw[16..], plain);
+    const prefix = try a.alloc(u8, 24 + 20 + plain.len + 4);
+    defer a.free(prefix);
+    @memcpy(prefix[0..8], "ALSMPFX1");
+    std.mem.writeInt(u32, prefix[8..12], 1, .little);
+    std.mem.writeInt(u32, prefix[12..16], 16, .little);
+    std.mem.writeInt(u32, prefix[16..20], 1, .little);
+    std.mem.writeInt(u32, prefix[20..24], @intCast(20 + plain.len), .little);
+    prefix[24] = 0;
+    std.mem.writeInt(u32, prefix[25..29], 0, .little);
+    std.mem.writeInt(u32, prefix[29..33], 0, .little);
+    std.mem.writeInt(u32, prefix[33..37], 3, .little);
+    std.mem.writeInt(u32, prefix[37..41], @intCast(plain.len), .little);
+    @memcpy(prefix[41..44], "key");
+    @memcpy(prefix[44..][0..plain.len], plain);
+    std.mem.writeInt(u32, prefix[44 + plain.len ..][0..4], 0, .little);
+    const prefix_snappy = try @import("../../encoding/snappy.zig").encode(a, prefix);
+    defer a.free(prefix_snappy);
+    for ([_]lsm_table_file.BlockCompression{ .none, .snappy, .prefix, .prefix_snappy }) |compression| {
+        const bytes = switch (compression) {
+            .none => plain,
+            .snappy => encoded,
+            .prefix => prefix,
+            .prefix_snappy => prefix_snappy,
+        };
+        const expected = if (compression == .prefix or compression == .prefix_snappy) prefix_raw else plain;
+        for ([_]bool{ false, true }) |leased| {
+            for (0..@as(usize, if (fail) 3 else 1)) |mode| {
+                var scheduler = try scheduling.Scheduler.init(.{ .slots = 2 });
+                defer scheduler.close();
+                var fixture: Fixture = .{ .bytes = bytes, .fail_after = if (!fail or mode == 2) null else if (compression == .snappy) bytes.len + 64 * 1024 else 4093, .reject_original = mode == 1 };
+                Fixture.current = &fixture;
+                var memory = storage_io.MemoryStorage.init(a);
+                defer memory.deinit();
+                var storage = memory.storage();
+                var table = storage.vtable.*;
+                table.open_leased_immutable_source = if (leased) Fixture.open else null;
+                table.read_file_range_into = Fixture.direct;
+                table.read_file_range_into_with_admission = Fixture.controlled;
+                storage.vtable = &table;
+                var backend = Backend.init(a, .{ .storage = storage, .local_decode_working_bytes = expected.len * 4 + 256 * 1024 });
+                var backend_live = true;
+                defer if (backend_live) backend.close();
+                var path = "immutable-owned-run".*;
+                var owners: [2]?Owner = .{ try Owner.init(&backend, a, &path, 0, .{ .relative_offset = 0, .len = @intCast(expected.len), .physical_len = @intCast(bytes.len), .compression = compression, .checksum = @import("antfly_hash").Crc32.hash(bytes) }, null), null };
+                @memset(&path, 0xaa);
+                var active: usize = 0;
+                defer if (owners[active]) |*owner| owner.deinit();
+                try std.testing.expectError(error.InvalidArgument, owners[active].?.takeOutput());
+                try std.testing.expectError(error.InvalidArgument, owners[active].?.step(0, null));
+                try std.testing.expectError(error.InvalidArgument, owners[active].?.step(64 * 1024 + 1, null));
+                var steps: usize = 0;
+                while (true) {
+                    steps += 1;
+                    try std.testing.expect(steps < 1024);
+                    var scope: Scope = .{};
+                    try scope.execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+                    var adapter: read_admission.Adapter(*Scope) = .{ .budget = &scope };
+                    const payload = adapter.payload();
+                    fixture.scope = &scope;
+                    const before = fixture.total;
+                    const allocated_before = owners[active].?.output != null;
+                    const input_before = owners[active].?.cursor.decoder.input_offset;
+                    const raw_before = owners[active].?.raw_offset;
+                    const result = owners[active].?.step(4093, .init(&payload));
+                    if (!allocated_before and owners[active].?.output != null) {
+                        // Allocation is a distinct schedulable step, with no
+                        // physical input or codec progress folded into it.
+                        try std.testing.expectEqual(before, fixture.total);
+                        try std.testing.expectEqual(input_before, owners[active].?.cursor.decoder.input_offset);
+                        try std.testing.expectEqual(raw_before, owners[active].?.raw_offset);
+                    }
+                    scope.execution.finish();
+                    scope.valid = false;
+                    fixture.scope = null;
+                    try std.testing.expect(fixture.total - before <= 128 * 1024);
+                    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+                    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                    var health: scheduling.Execution = .{};
+                    try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                    health.finish();
+                    // Move progress out of the stack slot used by this step.
+                    // The old slot is destroyed without retiring the moved owner.
+                    owners[1 - active] = owners[active];
+                    owners[active] = null;
+                    active = 1 - active;
+                    if (fail and mode == 2 and owners[active].?.output != null and
+                        (owners[active].?.raw_offset != 0 or owners[active].?.cursor.decoder.output_offset != 0 or owners[active].?.prefix_expander.output_offset != 0))
+                    {
+                        owners[active].?.deinit();
+                        try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+                        try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+                        break;
+                    }
+                    if (result) |status| {
+                        if (status == .pending) continue;
+                        try std.testing.expect(!fail);
+                        try std.testing.expectEqual(bytes.len * @as(usize, if (compression == .snappy) 2 else 1), fixture.total);
+                        try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+                        try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+                        backend.close();
+                        backend_live = false;
+                        backend = undefined;
+                        try std.testing.expectEqual(Owner.Status.ready, try owners[active].?.step(1, null));
+                        const output = try owners[active].?.takeOutput();
+                        defer a.free(output);
+                        try std.testing.expectEqualSlices(u8, expected, output);
+                        try std.testing.expectError(error.InvalidArgument, owners[active].?.takeOutput());
+                        break;
+                    } else |err| {
+                        try std.testing.expect(fail and mode != 2);
+                        const cause = if (mode == 1) error.TestOwnedReadOriginalRejection else error.TestOwnedReadFault;
+                        try std.testing.expectEqual(cause, err);
+                        try std.testing.expect(owners[active].?.output == null and owners[active].?.reader == null and owners[active].?.work == null);
+                        try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+                        try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+                        backend.close();
+                        backend_live = false;
+                        backend = undefined;
+                        try std.testing.expectError(cause, owners[active].?.step(1, null));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "LSM owned block read moves between finite worker steps with fresh borrows and detached verified output" {
+    try qualifyOwnedRunBlock(false);
+}
+
+test "LSM owned block read retires partial state on failure rejection and abandonment without a live grant" {
+    try qualifyOwnedRunBlock(true);
+}
+
+const OwnedValueTestStorage = struct {
+    fn read(raw: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+        const memory: *storage_io.MemoryStorage = @ptrCast(@alignCast(raw));
+        const platform = @import("antfly_platform");
+        platform.sync.lockYielding(&memory.mutex);
+        defer memory.mutex.unlock();
+        const bytes = memory.files.get(path) orelse return error.FileNotFound;
+        if (offset > bytes.len or out.len > bytes.len - offset) return error.EndOfStream;
+        @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+    }
+    fn controlled(raw: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+        try control.checkpoint();
+        try read(raw, path, offset, out);
+        try control.checkpoint();
+    }
+};
+
+fn drainOwnedValueForTest(owner: anytype) !OwnedNamespaceValue {
+    const Budget = struct {
+        valid: bool = true,
+        pub fn checkpoint(self: *@This()) !void {
+            if (!self.valid) return error.TestExpiredNamespaceBorrow;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedNamespaceWait;
+        }
+    };
+    var steps: usize = 0;
+    while (true) {
+        steps += 1;
+        try std.testing.expect(steps < 4096);
+        var budget: Budget = .{};
+        var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const state = try owner.step(4093, .init(&payload));
+        budget.valid = false;
+        if (state == .ready) return owner.takeOutput();
+    }
+}
+
+test "LSM owned namespace read preserves captured versions namespace isolation and detached values across source families" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const plain = try a.alloc(u8, 128 * 1024 + 53);
+    defer a.free(plain);
+    @memset(plain, 'v');
+    for ([_]bool{ false, true }) |private| {
+        test_private_read_versions = private;
+        defer test_private_read_versions = false;
+        for (0..5) |mode| {
+            var memory = storage_io.MemoryStorage.init(a);
+            defer memory.deinit();
+            var storage = memory.storage();
+            var table = storage.vtable.*;
+            table.read_file_range_into = OwnedValueTestStorage.read;
+            table.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+            storage.vtable = &table;
+            var backend = if (mode == 3) Backend.init(a, .{ .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 }) else try Backend.open(a, "/owned-value", .{ .storage = storage, .wal_enabled = false, .flush_threshold = if (mode == 0 or mode == 4) std.math.maxInt(usize) else 1, .compact_threshold_runs = 10000, .table_block_compression = if (mode == 1) .none else .snappy_adaptive, .read_snapshot_rotate_mutable_bytes = if (mode == 4) 1 else 0 });
+            var backend_live = true;
+            defer if (backend_live) backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{ .name = "docs" }, "key", plain);
+                try write.put(.{ .name = "other" }, "key", "isolated");
+                try write.commit();
+            }
+            var name = "docs".*;
+            var key = "key".*;
+            var owner = try backend.beginOwnedValueRead(a, .{ .name = &name }, &key, null);
+            defer owner.deinit();
+            if (mode == 3) {
+                try std.testing.expect(backend.runs.count() > 0);
+                try std.testing.expect(backend.runs.at(0).state != null);
+            }
+            if (mode == 4) {
+                try std.testing.expect(owner.txn.?.immutable_memtables.len > 0);
+                try std.testing.expectEqual(@as(usize, 0), owner.txn.?.mutable_snapshot.entryCount());
+            }
+            @memset(&name, 0xaa);
+            @memset(&key, 0xaa);
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{ .name = "docs" }, "key", "newer");
+                try write.commit();
+            }
+            // Move the operation, including its snapshot and directory cursor.
+            var moved = owner;
+            owner = undefined;
+            defer moved.deinit();
+            // Prevent the original deferred cleanup from touching moved state.
+            owner = .{ .backend = undefined, .allocator = a, .txn = null, .namespace = .{}, .key = &.{}, .phase = .closed };
+            var value = try drainOwnedValueForTest(&moved);
+            defer value.deinit();
+            try std.testing.expectEqualSlices(u8, plain, value.bytes());
+            try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+            try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+            var other = try backend.beginOwnedValueRead(a, .{ .name = "other" }, "key", null);
+            defer other.deinit();
+            var isolated = try drainOwnedValueForTest(&other);
+            defer isolated.deinit();
+            try std.testing.expectEqualStrings("isolated", isolated.bytes());
+            backend.close();
+            backend_live = false;
+            backend = undefined;
+            try std.testing.expectEqualSlices(u8, plain, value.bytes());
+            try std.testing.expectError(error.InvalidArgument, moved.takeOutput());
+        }
+    }
+}
+
+test "LSM owned namespace read honors newest tombstones and retires snapshot and partial result on rejection" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    var storage = memory.storage();
+    var table = storage.vtable.*;
+    table.read_file_range_into = OwnedValueTestStorage.read;
+    table.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+    storage.vtable = &table;
+    var backend = try Backend.open(a, "/owned-value-retire", .{ .storage = storage, .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 });
+    defer backend.close();
+    const value: [128 * 1024]u8 = @splat('x');
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "removed", "old");
+        try write.put(.{}, "large", &value);
+        try write.commit();
+    }
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.delete(.{}, "removed");
+        try write.commit();
+    }
+    for ([_][]const u8{ "removed", "missing" }) |key| {
+        var owner = try backend.beginOwnedValueRead(a, .{}, key, null);
+        defer owner.deinit();
+        try std.testing.expectError(error.NotFound, drainOwnedValueForTest(&owner));
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+        try std.testing.expectError(error.NotFound, owner.step(1, null));
+    }
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            return error.TestOwnedNamespaceRejection;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedNamespaceWait;
+        }
+    };
+    var owner = try backend.beginOwnedValueRead(a, .{}, "large", null);
+    defer owner.deinit();
+    var steps: usize = 0;
+    while (owner.block == null or owner.block.?.output == null) {
+        steps += 1;
+        try std.testing.expect(steps < 256);
+        try std.testing.expectEqual(@TypeOf(owner).Status.pending, try owner.step(4093, null));
+    }
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    try std.testing.expectError(error.TestOwnedNamespaceRejection, owner.step(4093, .init(&payload)));
+    try std.testing.expect(owner.txn == null and owner.block == null and owner.result == null);
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+}
+
+test "LSM owned namespace read pending cleanup joins backend close without a current execution grant" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    for ([_]bool{ false, true }) |flushed| {
+        var memory = storage_io.MemoryStorage.init(a);
+        defer memory.deinit();
+        var storage = memory.storage();
+        var table = storage.vtable.*;
+        table.read_file_range_into = OwnedValueTestStorage.read;
+        table.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+        storage.vtable = &table;
+        var backend = try Backend.open(a, "/owned-close", .{ .storage = storage, .wal_enabled = false, .flush_threshold = if (flushed) 1 else std.math.maxInt(usize), .compact_threshold_runs = 10000 });
+        var backend_live = true;
+        defer if (backend_live) backend.close();
+        const value: [128 * 1024]u8 = @splat('z');
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "large", &value);
+            try write.commit();
+        }
+        var owner = try backend.beginOwnedValueRead(a, .{}, "large", null);
+        defer owner.deinit();
+        while (if (flushed) owner.block == null or owner.block.?.output == null else owner.copy_offset == 0)
+            try std.testing.expectEqual(@TypeOf(owner).Status.pending, try owner.step(4093, null));
+        if (flushed) {
+            try std.testing.expectEqual(@TypeOf(owner).Status.pending, try owner.step(4093, null));
+            try std.testing.expectEqual(@as(usize, 1), backend.local_reader.active);
+        }
+        const Closing = struct {
+            backend: *Backend,
+            started: std.Io.Event = .unset,
+            done: std.atomic.Value(bool) = .init(false),
+            fn run(self: *@This()) void {
+                self.started.set(std.testing.io);
+                self.backend.close();
+                self.done.store(true, .release);
+            }
+        };
+        var closing: Closing = .{ .backend = &backend };
+        const thread = try std.Thread.spawn(.{}, Closing.run, .{&closing});
+        backend_live = false;
+        var joined = false;
+        defer if (!joined) {
+            owner.deinit();
+            thread.join();
+        };
+        closing.started.waitUncancelable(std.testing.io);
+        const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+        while (!backend.closing.load(.acquire)) {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestBackendCloseDidNotStart;
+            platform_time.yieldBriefly();
+        }
+        try std.testing.expect(!closing.done.load(.acquire));
+        try std.testing.expectError(error.BackendClosing, backend.beginOwnedValueRead(a, .{}, "another", null));
+        owner.deinit();
+        thread.join();
+        joined = true;
+        try std.testing.expect(closing.done.load(.acquire));
+    }
+}
+
+fn drainOwnedKeyForTest(cursor: anytype, quantum: usize) !?[]const u8 {
+    var steps: usize = 0;
+    while (try cursor.step(quantum, null) != .ready) : (steps += 1) try std.testing.expect(steps < 100000);
+    return cursor.key();
+}
+
+test "LSM owned namespace key cursor preserves snapshot tombstones bounds moves and same-snapshot value handoff" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const value = try a.alloc(u8, 128 * 1024 + 17);
+    defer a.free(value);
+    @memset(value, 'v');
+    for ([_]bool{ false, true }) |private| {
+        test_private_read_versions = private;
+        defer test_private_read_versions = false;
+        for (0..4) |mode| {
+            var memory = storage_io.MemoryStorage.init(a);
+            defer memory.deinit();
+            var storage = memory.storage();
+            var table = storage.vtable.*;
+            table.read_file_range_into = OwnedValueTestStorage.read;
+            table.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+            storage.vtable = &table;
+            var backend = if (mode == 3) Backend.init(a, .{ .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 }) else try Backend.open(a, "/owned-key", .{ .storage = storage, .wal_enabled = false, .flush_threshold = if (mode == 0) std.math.maxInt(usize) else 1, .compact_threshold_runs = 10000, .table_block_compression = if (mode == 1) .none else .snappy_adaptive });
+            defer backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{ .name = "docs" }, "a", "removed");
+                try write.put(.{ .name = "docs" }, "b", value);
+                try write.put(.{ .name = "docs" }, "c", "tail");
+                try write.put(.{ .name = "other" }, "a", "isolated");
+                try write.commit();
+            }
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.delete(.{ .name = "docs" }, "a");
+                try write.put(.{ .name = "docs" }, "c", "new tail");
+                try write.commit();
+            }
+            var cursor = try backend.beginOwnedKeyCursor(a, .{ .name = "docs" }, null);
+            defer cursor.deinit();
+            var lower = "a".*;
+            var upper = "d".*;
+            try cursor.seek(&lower, &upper, false, null);
+            @memset(&lower, 0xdd);
+            @memset(&upper, 0xdd);
+            // Later writes cannot change any query or the value handoff.
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{ .name = "docs" }, "a", "revived after snapshot");
+                try write.put(.{ .name = "docs" }, "b", "replaced after snapshot");
+                try write.commit();
+            }
+            try std.testing.expectEqualStrings("b", (try drainOwnedKeyForTest(&cursor, 4093)).?);
+            const borrowed_lower = (try cursor.key()).?;
+            try cursor.seek(borrowed_lower, "d", true, null);
+            try std.testing.expectEqualStrings("c", (try drainOwnedKeyForTest(&cursor, 4093)).?);
+            const borrowed_both = (try cursor.key()).?;
+            try cursor.seek(borrowed_both, borrowed_both, false, null);
+            try std.testing.expect((try drainOwnedKeyForTest(&cursor, 1)) == null);
+            try cursor.seek("b", "c", false, null);
+            try std.testing.expectEqualStrings("b", (try drainOwnedKeyForTest(&cursor, 4093)).?);
+            var moved = cursor;
+            cursor = .{ .backend = undefined, .allocator = a, .txn = null, .namespace = .{}, .phase = .closed };
+            defer moved.deinit();
+            var point = try moved.intoValueRead(null);
+            defer point.deinit();
+            try std.testing.expectError(error.TransactionClosed, moved.step(1, null));
+            try std.testing.expectEqual(@as(usize, 1), backend.active_readers);
+            var result = try drainOwnedValueForTest(&point);
+            defer result.deinit();
+            try std.testing.expectEqualSlices(u8, value, result.bytes());
+            try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+            try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+        }
+    }
+}
+
+test "LSM owned namespace key cursor rejects original cancellation and unwinds caller allocation refusal" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var backend = Backend.init(a, .{ .wal_enabled = false });
+    defer backend.close();
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "key", "value");
+        try write.commit();
+    }
+    const Probe = struct {
+        fn run(root: Allocator, source: *Backend) !void {
+            var cursor = try source.beginOwnedKeyCursor(root, .{}, null);
+            defer cursor.deinit();
+            try cursor.seek("", "z", false, null);
+            try std.testing.expectEqualStrings("key", (try drainOwnedKeyForTest(&cursor, 1)).?);
+            var point = try cursor.intoValueRead(null);
+            defer point.deinit();
+            var result = try drainOwnedValueForTest(&point);
+            defer result.deinit();
+            try std.testing.expectEqualStrings("value", result.bytes());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{&backend});
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            return error.TestOwnedKeyOriginalRejection;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedKeyWait;
+        }
+    };
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    var cursor = try backend.beginOwnedKeyCursor(a, .{}, null);
+    defer cursor.deinit();
+    try cursor.seek("", "z", false, null);
+    _ = try cursor.step(1, null);
+    try std.testing.expectError(error.TestOwnedKeyOriginalRejection, cursor.step(1, .init(&payload)));
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectError(error.TestOwnedKeyOriginalRejection, cursor.step(1, null));
+}
+
+test "LSM owned namespace cold index reads only bounded metadata windows and detaches before backend close" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Fixture = struct {
+        var current: *@This() = undefined;
+        limit: usize = 0,
+        calls: usize = 0,
+        total: usize = 0,
+        fn read(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+            try std.testing.expect(out.len <= current.limit);
+            current.calls += 1;
+            current.total += out.len;
+            try OwnedValueTestStorage.read(ptr, path, offset, out);
+        }
+        fn controlled(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            try control.checkpoint();
+            try read(ptr, path, offset, out);
+            try control.checkpoint();
+        }
+    };
+    var fixture: Fixture = .{};
+    Fixture.current = &fixture;
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    var storage = memory.storage();
+    var vtable = storage.vtable.*;
+    vtable.read_file_range_into = Fixture.read;
+    vtable.read_file_range_into_with_admission = Fixture.controlled;
+    storage.vtable = &vtable;
+    const keys = try a.alloc(u8, 32 * 4096);
+    defer a.free(keys);
+    const value: [lsm_table_file.default_block_size]u8 = @splat('v');
+    var entries: [32]lsm_table_file.Entry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        const key = keys[i * 4096 ..][0..4096];
+        @memset(key, 'k');
+        key[key.len - 1] = @intCast(i);
+        entry.* = .{ .namespace_name = "docs", .key = key, .value = &value };
+    }
+    const encoded = try lsm_table_file.encodeAlloc(a, &entries);
+    defer a.free(encoded);
+    try storage.writeFileAbsolute("owned-index-file", encoded);
+    const footer = try lsm_table_file.decodeFooter(encoded);
+    try std.testing.expect(footer.metadata_len > 65536);
+    var backend = Backend.init(a, .{ .storage = storage });
+    var backend_live = true;
+    defer if (backend_live) backend.close();
+    const Owner = OwnedRunIndexRead(Backend);
+    var path = "owned-index-file".*;
+    var owner = try Owner.init(&backend, a, &path, encoded.len, null);
+    defer owner.deinit();
+    @memset(&path, 0xdd);
+    fixture.limit = 7;
+    _ = try owner.step(7, null);
+    var moved = owner;
+    owner = .{ .backend = &backend, .allocator = a, .path = null, .source = null, .file_size = encoded.len, .phase = .closed };
+    defer moved.deinit();
+    var polls: usize = 0;
+    while (true) : (polls += 1) {
+        try std.testing.expect(polls < 100000);
+        fixture.limit = if (polls % 2 == 0) 127 else 4093;
+        fixture.calls = 0;
+        const state = try moved.step(fixture.limit, null);
+        try std.testing.expect(fixture.calls <= 1);
+        if (state == .ready) break;
+    }
+    try std.testing.expectEqual(lsm_table_file.footer_len + footer.metadata_len, fixture.total);
+    var index = try moved.takeOutput();
+    defer index.deinit();
+    try std.testing.expect(moved.source == null and moved.path == null);
+    backend.close();
+    backend_live = false;
+    try std.testing.expectEqual(@as(usize, entries.len), index.view().entryCount());
+    try std.testing.expectEqualSlices(u8, entries[0].key, index.view().blocks[0].smallest_key.?);
+}
+
+test "LSM owned namespace cold index unwinds allocator refusal and original cancellation during partial physical read" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    var storage = memory.storage();
+    var vtable = storage.vtable.*;
+    vtable.read_file_range_into = OwnedValueTestStorage.read;
+    vtable.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+    storage.vtable = &vtable;
+    const entries = [_]lsm_table_file.Entry{.{ .key = "key", .value = "value" }};
+    const encoded = try lsm_table_file.encodeAlloc(a, &entries);
+    defer a.free(encoded);
+    try storage.writeFileAbsolute("owned-index-file", encoded);
+    var backend = Backend.init(a, .{ .storage = storage });
+    defer backend.close();
+    const Probe = struct {
+        fn run(root: Allocator, source: *Backend, size: usize) !void {
+            var owner = try OwnedRunIndexRead(Backend).init(source, root, "owned-index-file", size, null);
+            defer owner.deinit();
+            var polls: usize = 0;
+            while (try owner.step(7, null) != .ready) : (polls += 1) try std.testing.expect(polls < 10000);
+            var index = try owner.takeOutput();
+            defer index.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{ &backend, encoded.len });
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            return error.TestColdIndexOriginal;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedColdIndexWait;
+        }
+    };
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    var owner = try OwnedRunIndexRead(Backend).init(&backend, a, "owned-index-file", encoded.len, null);
+    defer owner.deinit();
+    _ = try owner.step(7, null);
+    try std.testing.expectError(error.TestColdIndexOriginal, owner.step(7, .init(&payload)));
+    try std.testing.expect(owner.source == null and owner.path == null and owner.metadata == null);
+    try std.testing.expectError(error.TestColdIndexOriginal, owner.step(7, null));
+}
+
+test "LSM owned namespace cold index pins one leased generation and preserves mid-read original refusal" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Budget = struct {
+        reject: bool = false,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.reject) return error.TestIndexLeasedOriginal;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedIndexLeasedWait;
+        }
+    };
+    const Generation = struct {
+        var current: *@This() = undefined;
+        bytes: []const u8,
+        opens: usize = 0,
+        closes: usize = 0,
+        uses: usize = 0,
+        fail: bool = false,
+        original: ?*Budget = null,
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../../segment_source.zig").Source {
+            current.opens += 1;
+            return .{ .ranges = .{ .ptr = current, .length = current.bytes.len, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn read(ptr: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(out.len <= 7);
+            if (self.fail) {
+                if (self.original) |budget| budget.reject = true;
+                @memset(out, 0xaa);
+                return error.TestIndexLeasedProviderFault;
+            }
+            if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.EndOfStream;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn acquire(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.uses += 1;
+            return true;
+        }
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.uses > 0);
+            self.uses -= 1;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.uses == 0);
+            self.closes += 1;
+        }
+    };
+    const first = [_]lsm_table_file.Entry{.{ .key = "first-key", .value = "first-value" }};
+    const second = [_]lsm_table_file.Entry{.{ .key = "other-key", .value = "other-value" }};
+    const bytes1 = try lsm_table_file.encodeAlloc(a, &first);
+    defer a.free(bytes1);
+    const bytes2 = try lsm_table_file.encodeAlloc(a, &second);
+    defer a.free(bytes2);
+    try std.testing.expectEqual(bytes1.len, bytes2.len);
+    for (0..3) |mode| {
+        var memory = storage_io.MemoryStorage.init(a);
+        defer memory.deinit();
+        var storage = memory.storage();
+        var vtable = storage.vtable.*;
+        vtable.open_leased_immutable_source = Generation.open;
+        storage.vtable = &vtable;
+        var old: Generation = .{ .bytes = bytes1 };
+        var replacement: Generation = .{ .bytes = bytes2 };
+        Generation.current = &old;
+        var backend = Backend.init(a, .{ .storage = storage });
+        var backend_live = true;
+        defer if (backend_live) backend.close();
+        var owner = try OwnedRunIndexRead(Backend).init(&backend, a, "leased-index", bytes1.len, null);
+        defer owner.deinit();
+        var polls: usize = 0;
+        while (owner.phase == .footer) : (polls += 1) {
+            try std.testing.expect(polls < 100);
+            _ = try owner.step(7, null);
+        }
+        Generation.current = &replacement;
+        if (mode != 0) {
+            // The footer has been validated; fail during its metadata read.
+            _ = try owner.step(7, null);
+            var budget: Budget = .{};
+            var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+            const payload = adapter.payload();
+            old.fail = true;
+            old.original = if (mode == 2) &budget else null;
+            if (mode == 2) try std.testing.expectError(error.TestIndexLeasedOriginal, owner.step(7, .init(&payload))) else try std.testing.expectError(error.TestIndexLeasedProviderFault, owner.step(7, null));
+            try std.testing.expect(owner.source == null and owner.metadata == null and owner.decoder == null);
+        } else {
+            while (try owner.step(7, null) != .ready) : (polls += 1) try std.testing.expect(polls < 10000);
+            var index = try owner.takeOutput();
+            defer index.deinit();
+            try std.testing.expectEqualStrings("first-key", index.view().blocks[0].largest_key);
+        }
+        try std.testing.expectEqual(@as(usize, 1), old.opens);
+        try std.testing.expectEqual(@as(usize, 0), old.uses);
+        try std.testing.expectEqual(@as(usize, 0), replacement.opens);
+        backend.close();
+        backend_live = false;
+        try std.testing.expectEqual(@as(usize, 1), old.closes);
+        try std.testing.expectEqual(@as(usize, 0), replacement.closes);
+    }
 }

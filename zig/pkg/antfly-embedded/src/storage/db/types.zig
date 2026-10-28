@@ -101,6 +101,19 @@ pub const BatchWrite = struct {
     json_null_fields: []const []const u8 = &.{},
 };
 
+/// Only for normalization results whose keys, values and null names were
+/// independently allocated by the supplied allocator.
+pub fn freeNormalizedWrite(alloc: std.mem.Allocator, write: BatchWrite) void {
+    alloc.free(write.key);
+    alloc.free(write.value);
+    for (write.json_null_fields) |name| alloc.free(name);
+    if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
+}
+pub fn freeNormalizedWrites(alloc: std.mem.Allocator, writes: []const BatchWrite) void {
+    for (writes) |write| freeNormalizedWrite(alloc, write);
+    alloc.free(writes);
+}
+
 pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
     if (fields.len == 0) return &.{};
     const copy = try alloc.alloc([]const u8, fields.len);
@@ -303,10 +316,16 @@ pub const TransactionMutation = union(enum) {
         /// use the shorter ordinary recovery retention.
         retain_terminal: bool = false,
         participants: []const []const u8,
+        preparation_requirement: ?@import("prepared_transaction_effects.zig").Requirement = null,
+        preparation_binding: ?@import("prepared_transaction_effects.zig").Binding = null,
     },
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
+        preparation_requirement: ?@import("prepared_transaction_effects.zig").Requirement = null,
+        preparation_binding: ?@import("prepared_transaction_effects.zig").Binding = null,
+        /// Final seal command carries immutable precomputed output, no rows.
+        sealed_effects: ?[]const u8 = null,
     },
     resolve: struct {
         txn_id: TxnId,
@@ -1550,6 +1569,9 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Request-local, single-worker execution owner. Never serialize or forward
+    /// this callback to another process or concurrently executing child.
+    execution_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
     /// Retain the full document only for a version-fenced SQL mutation.
     sql_document_preimage: bool = false,
     /// Collect durable logical range guards only for explicitly guarded SQL.
@@ -1935,6 +1957,11 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Trusted local coordinator authority. Never serialized or reconstructed
+    /// from public JSON. Independent graph fanout tasks reserve owned children.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+    execution_remote_query: ?@import("../../common/http/http_common.zig").RequestExecutor = null,
+
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
@@ -2165,6 +2192,8 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "resolved_doc_filter_wire_context",
     "identity_read_generation",
     "execution_deadline_ns",
+    "execution_runnable",
+    "execution_remote_query",
     "cancellation",
     "graph_query_diagnostic_sink",
     "graph_execution_limits",

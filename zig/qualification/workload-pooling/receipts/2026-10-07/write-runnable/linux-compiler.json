@@ -1,0 +1,7 @@
+{
+  "image_id": "sha256:fb3236b6cc7411028d62f76eb418110a6c34e246b9437a9d093d58a53a3e2954",
+  "docker_vm_memory_bytes": 25159036928,
+  "compiler_path": "/nix/store/ms802lv410k52rd15fxpg4qllfw57baw-zig-0.17.0/bin/zig",
+  "compiler_sha256": "4818e9e28e752456421034db9229035c165c0e3392bf534421016e79de33d022",
+  "version": "0.17.0"
+}

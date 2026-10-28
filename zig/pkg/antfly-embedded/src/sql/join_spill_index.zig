@@ -27,21 +27,24 @@ pub const Index = struct {
     slots: paging.Array(Slot),
     splits: u64 = 0,
     pub fn init(manager: *spill.Manager) !Index {
-        const pager = try manager.pager();
+        return Index.initFor(manager, .{});
+    }
+    pub fn initFor(manager: *spill.Manager, access: paging.Access) !Index {
+        const pager = try manager.pagerFor(access);
         var self: Index = .{ .nodes = .{ .pager = pager }, .slots = .{ .pager = pager } };
         errdefer self.deinit();
-        try self.slots.appendRepeated(.{}, width);
-        try self.nodes.append(.{ .table = 0 });
+        try self.slots.appendRepeatedFor(.{}, width, access);
+        try self.nodes.appendFor(.{ .table = 0 }, access);
         return self;
     }
     pub fn deinit(self: *Index) void {
         self.slots.deinit();
         self.nodes.deinit();
     }
-    fn leaf(self: *const Index, hash: u64) !usize {
+    fn leafFor(self: *const Index, hash: u64, access: paging.Access) !usize {
         var id: usize = 0;
         while (true) {
-            const node = try self.nodes.get(id);
+            const node = try self.nodes.getFor(id, access);
             if (node.table != spill.none) return id;
             if (node.depth >= 64) return error.InvalidSqlSpill;
             id = @intCast(if (hash & (@as(u64, 1) << @as(u6, @intCast(63 - node.depth))) == 0) node.left else node.right);
@@ -52,27 +55,33 @@ pub const Index = struct {
         while (values[i].head != spill.none and values[i].hash != hash) i = (i + 1) % width;
         return i;
     }
-    fn window(self: *const Index, table: u64, write: bool) !paging.Array(Slot).Window {
-        return self.slots.pinPage(@as(usize, @intCast(table)) * width, write);
+    fn windowFor(self: *const Index, table: u64, write: bool, access: paging.Access) !paging.Array(Slot).Window {
+        return self.slots.pinPageFor(@as(usize, @intCast(table)) * width, write, access);
     }
     fn tableOffset(table: u64, begin: usize) usize {
         return @as(usize, @intCast(table)) * width - begin;
     }
     pub fn get(self: *const Index, hash: u64) !u64 {
-        const node = try self.nodes.get(try self.leaf(hash));
-        const held = try self.window(node.table, false);
+        return self.getFor(hash, .{});
+    }
+    pub fn getFor(self: *const Index, hash: u64, access: paging.Access) !u64 {
+        const node = try self.nodes.getFor(try self.leafFor(hash, access), access);
+        const held = try self.windowFor(node.table, false, access);
         defer held.lease.release();
         const values = held.values[tableOffset(node.table, held.begin)..][0..width];
         return values[position(values, hash)].head;
     }
     pub fn set(self: *Index, hash: u64, head: u64) !void {
+        return self.setFor(hash, head, .{});
+    }
+    pub fn setFor(self: *Index, hash: u64, head: u64, access: paging.Access) !void {
         if (head == spill.none) return error.InvalidSqlSpill;
         while (true) {
-            const id = try self.leaf(hash);
-            var node = try self.nodes.get(id);
+            const id = try self.leafFor(hash, access);
+            var node = try self.nodes.getFor(id, access);
             var inserted = false;
             {
-                const held = try self.window(node.table, true);
+                const held = try self.windowFor(node.table, true, access);
                 defer held.lease.release();
                 const values = held.values[tableOffset(node.table, held.begin)..][0..width];
                 const at = position(values, hash);
@@ -90,24 +99,24 @@ pub const Index = struct {
             }
             if (inserted) {
                 node.used += 1;
-                try self.nodes.set(id, node);
+                try self.nodes.setFor(id, node, access);
                 return;
             }
-            try self.split(id, node);
+            try self.splitFor(id, node, access);
         }
     }
-    fn writeTable(self: *Index, table: u64, values: *const [width]Slot) !void {
-        const held = try self.window(table, true);
+    fn writeTableFor(self: *Index, table: u64, values: *const [width]Slot, access: paging.Access) !void {
+        const held = try self.windowFor(table, true, access);
         defer held.lease.release();
         @memcpy(held.values[tableOffset(table, held.begin)..][0..width], values);
     }
-    fn split(self: *Index, id: usize, node: Node) !void {
+    fn splitFor(self: *Index, id: usize, node: Node, access: paging.Access) !void {
         if (node.depth >= 64) return error.InvalidSqlSpill;
         var left: [width]Slot = @splat(.{});
         var right: [width]Slot = @splat(.{});
         var right_count: u32 = 0;
         {
-            const held = try self.window(node.table, false);
+            const held = try self.windowFor(node.table, false, access);
             defer held.lease.release();
             for (held.values[tableOffset(node.table, held.begin)..][0..width]) |slot| {
                 if (slot.head == spill.none) continue;
@@ -118,16 +127,19 @@ pub const Index = struct {
             }
         }
         const table = self.slots.len / width;
-        try self.slots.appendRepeated(.{}, width);
-        try self.writeTable(node.table, &left);
-        try self.writeTable(table, &right);
+        try self.slots.appendRepeatedFor(.{}, width, access);
+        try self.writeTableFor(node.table, &left, access);
+        try self.writeTableFor(table, &right, access);
         const child = self.nodes.len;
-        try self.nodes.append(.{ .table = node.table, .used = node.used - right_count, .depth = node.depth + 1 });
-        try self.nodes.append(.{ .table = table, .used = right_count, .depth = node.depth + 1 });
-        try self.nodes.set(id, .{ .table = spill.none, .left = child, .right = child + 1, .depth = node.depth });
+        try self.nodes.appendFor(.{ .table = node.table, .used = node.used - right_count, .depth = node.depth + 1 }, access);
+        try self.nodes.appendFor(.{ .table = table, .used = right_count, .depth = node.depth + 1 }, access);
+        try self.nodes.setFor(id, .{ .table = spill.none, .left = child, .right = child + 1, .depth = node.depth }, access);
         self.splits += 1;
     }
     pub fn getMany(self: *const Index, hashes: []const ?u64, output: []u64) !void {
+        return self.getManyFor(hashes, output, .{});
+    }
+    pub fn getManyFor(self: *const Index, hashes: []const ?u64, output: []u64, access: paging.Access) !void {
         if (hashes.len != output.len) return error.InvalidSqlSpill;
         var begin: usize = 0;
         while (begin < hashes.len) {
@@ -156,7 +168,7 @@ pub const Index = struct {
                     }
                 }.less);
                 for (lanes[0..pending], selected[0..pending]) |lane, *value| value.* = ids[lane];
-                try self.nodes.getMany(selected[0..pending], nodes[0..pending]);
+                try self.nodes.getManyFor(selected[0..pending], nodes[0..pending], access);
                 for (nodes[0..pending], lanes[0..pending]) |node, i| {
                     if (node.table != spill.none) {
                         tables[i] = node.table;
@@ -181,7 +193,7 @@ pub const Index = struct {
             }.less);
             var at: usize = 0;
             while (at < size) {
-                const held = try self.window(tables[order[at]], false);
+                const held = try self.windowFor(tables[order[at]], false, access);
                 defer held.lease.release();
                 while (at < size and self.slots.pageStart(@as(usize, @intCast(tables[order[at]])) * width) == held.begin) : (at += 1) {
                     const lane = order[at];

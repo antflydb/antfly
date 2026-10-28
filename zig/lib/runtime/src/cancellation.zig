@@ -66,6 +66,23 @@ pub const CancellationToken = struct {
     }
 };
 
+/// Invocation-local first rejection, shared with transport-only pollers. A
+/// boolean probe must not consume a one-shot fallible authority and revive work.
+/// Stores only owner-local error integers; it never crosses a callback boundary.
+pub const Rejection = struct {
+    code: std.atomic.Value(u32) = .init(0),
+
+    pub fn remember(self: *@This(), cause: anyerror) anyerror {
+        _ = self.code.cmpxchgStrong(0, @intFromError(cause), .acq_rel, .acquire);
+        return @errorFromInt(@as(u16, @intCast(self.code.load(.acquire))));
+    }
+
+    pub fn check(self: *const @This()) !void {
+        const code = self.code.load(.acquire);
+        if (code != 0) return @errorFromInt(@as(u16, @intCast(code)));
+    }
+};
+
 test "semantic cancellation token adapts an atomic source" {
     var signal = std.atomic.Value(bool).init(false);
     const token = CancellationToken.fromAtomic(&signal);

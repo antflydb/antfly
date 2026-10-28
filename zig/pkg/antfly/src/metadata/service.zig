@@ -25,6 +25,7 @@ const common_group_ids = @import("antfly_local_sources").common_group_ids;
 const common_secrets = @import("antfly_local_sources").common_secrets;
 const relation_catalog = @import("antfly_local_sources").system_catalog_domain;
 const metadata_mod = @import("domain.zig");
+const runtime_resources = @import("runtime_resources.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
 const metadata_authority = @import("authority.zig");
@@ -1744,6 +1745,32 @@ pub fn coherentLinearizableAdminSnapshot(
     return error.MetadataLinearizableReadTimeout;
 }
 
+/// Original admission is borrowed synchronously, never kept by a read waiter.
+pub fn metadataReadCheckpoint(request: api_operation.RequestContext, control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+    if (control) |port| try port.checkpoint();
+    try request.ensureActive();
+}
+
+pub fn waitMetadataReadProgress(request: api_operation.RequestContext, control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+    try metadataReadCheckpoint(request, control);
+    const wait = if (control) |port| try port.executionWait() else null;
+    if (wait) |boundary| try boundary.beginWait();
+    platform_clock.Clock.real().sleepMs(1);
+    if (wait) |boundary| try boundary.endWait();
+    try metadataReadCheckpoint(request, control);
+}
+
+pub fn lockMetadataReadRuntime(comptime Service: type, svc: *Service, request: api_operation.RequestContext, control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+    if (control == null) {
+        svc.lockRuntime();
+        return;
+    }
+    try metadataReadCheckpoint(request, control);
+    while (!svc.runtime_mutex.tryLock()) try waitMetadataReadProgress(request, control);
+    errdefer svc.unlockRuntime();
+    try metadataReadCheckpoint(request, control);
+}
+
 /// Return a compact catalog projection captured after a linearizable read
 /// barrier. This is used to confirm negative routing results without paying
 /// the cost of an administrative snapshot.
@@ -2394,6 +2421,7 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     // Embedded services may cohost data; dedicated metadata runtimes opt out.
     local_data_owner: bool = true,
+    runtime_memory: runtime_resources.Config = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
@@ -3498,6 +3526,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
     };
     if (has_lake_catalog) return metadata_topology_protocol.lake_index_catalog_version;
     const requires_v11 = switch (command) {
+        .apply_remote_attempt_initialization => return metadata_topology_protocol.remote_attempt_initialization_version,
         .apply_store_root_enrollment, .ack_initial_fk_retirement => return metadata_topology_protocol.store_root_enrollment_version,
         .apply_fk_generation_publication => return metadata_topology_protocol.fk_generation_publication_version,
         // Initial CREATE carries the v2 reservation and retirement scope in
@@ -5829,8 +5858,9 @@ pub const MetadataService = struct {
     runtime_mutex: std.Io.Mutex = .init,
     transition_mutex: std.Io.Mutex = .init,
     backend_runtime_mutex: std.Io.Mutex = .init,
+    runtime_memory: runtime_resources.Config = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
-    owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
+    owned_backend_runtime: ?runtime_resources.Owner = null,
     linearizable_read_tracker: *LinearizableMetadataReadTracker,
     raft: raft_service.ManagedHostService,
 
@@ -5874,6 +5904,7 @@ pub const MetadataService = struct {
             .last_local_schema_progress_refresh_at_ms = 0,
             .reconcile_lease = metadata_reconcile_lease.State.init(host_cfg.host.local_node_id, cfg.reconcile_lease),
             .lifecycle_signal = LifecycleSignal.init(alloc),
+            .runtime_memory = cfg.runtime_memory,
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
             .internal_service_secret = cfg.internal_service_secret,
@@ -5918,7 +5949,7 @@ pub const MetadataService = struct {
         self.backend_runtime_mutex.lockUncancelable(std.Options.debug_io);
         defer self.backend_runtime_mutex.unlock(std.Options.debug_io);
         if (self.backend_runtime == null) {
-            self.owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(self.alloc, .{});
+            self.owned_backend_runtime = try runtime_resources.Owner.init(self.alloc, self.runtime_memory);
             self.backend_runtime = self.owned_backend_runtime.?.ptr();
         }
         if (self.backend_runtime) |runtime| return runtime;
@@ -5970,7 +6001,11 @@ pub const MetadataService = struct {
         self: *MetadataService,
         request: api_operation.RequestContext,
     ) !void {
-        try request.ensureActive();
+        return self.ensureLinearizableReadWithAdmission(request, null);
+    }
+    pub fn ensureLinearizableReadWithAdmission(self: *MetadataService, input: api_operation.RequestContext, control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+        const request = if (control != null) try input.platformDeadline() else input;
+        try metadataReadCheckpoint(request, control);
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -5987,11 +6022,11 @@ pub const MetadataService = struct {
             local_deadline_ns;
         var next_request_ns: u64 = 0;
         while (platform_time.monotonicNs() < deadline_ns) {
-            try request.ensureActive();
+            try metadataReadCheckpoint(request, control);
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             const now_ns = platform_time.monotonicNs();
             if (now_ns >= next_request_ns) {
-                self.lockRuntime();
+                try lockMetadataReadRuntime(@This(), self, request, control);
                 {
                     defer self.unlockRuntime();
                     self.raft.requestReadIndex(self.metadata_group_id, request_ctx) catch |err| switch (err) {
@@ -6001,16 +6036,16 @@ pub const MetadataService = struct {
                 }
                 next_request_ns = now_ns + linearizable_metadata_read_retry_ns;
             }
-            self.lockRuntime();
+            try lockMetadataReadRuntime(@This(), self, request, control);
             {
                 defer self.unlockRuntime();
                 try self.raft.runRaftProgressOnly();
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
-            try request.ensureActive();
-            platform_clock.Clock.real().sleepMs(1);
+            try metadataReadCheckpoint(request, control);
+            try waitMetadataReadProgress(request, control);
         }
-        try request.ensureActive();
+        try metadataReadCheckpoint(request, control);
         return error.MetadataLinearizableReadTimeout;
     }
 
@@ -7547,6 +7582,12 @@ pub const MetadataService = struct {
         return current_status;
     }
 
+    pub fn transactionRoutingProjection(self: *MetadataService, alloc: std.mem.Allocator, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget) !metadata_storage.raft_apply_store.TransactionRoutingProjectionSnapshot {
+        try budget.checkpoint();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.captureTransactionRoutingProjection(alloc, self.metadata_group_id, budget);
+    }
+
     pub fn adminSnapshot(self: *MetadataService) !metadata_api.AdminSnapshot {
         return try metadata_api.captureSnapshot(self.alloc, self);
     }
@@ -8568,8 +8609,9 @@ pub const MetadataHttpService = struct {
     setting_authority_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
+    runtime_memory: runtime_resources.Config = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
-    owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
+    owned_backend_runtime: ?runtime_resources.Owner = null,
     linearizable_read_tracker: *LinearizableMetadataReadTracker,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
@@ -8583,10 +8625,10 @@ pub const MetadataHttpService = struct {
         cfg: MetadataServiceConfig,
     ) !MetadataHttpService {
         const metadata_group_id = host_cfg.http.host.metadata_group_id orelse return error.MissingMetadataGroupId;
-        var owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null;
+        var owned_backend_runtime: ?runtime_resources.Owner = null;
         errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
         const backend_runtime = cfg.backend_runtime orelse blk: {
-            owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            owned_backend_runtime = try runtime_resources.Owner.init(alloc, cfg.runtime_memory);
             break :blk owned_backend_runtime.?.ptr();
         };
         var http_deps = deps.http;
@@ -8624,6 +8666,7 @@ pub const MetadataHttpService = struct {
             .last_local_schema_progress_refresh_at_ms = 0,
             .reconcile_lease = metadata_reconcile_lease.State.init(host_cfg.http.host.local_node_id, cfg.reconcile_lease),
             .lifecycle_signal = LifecycleSignal.init(alloc),
+            .runtime_memory = cfg.runtime_memory,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
@@ -8681,7 +8724,7 @@ pub const MetadataHttpService = struct {
         self.backend_runtime_mutex.lockUncancelable(std.Options.debug_io);
         defer self.backend_runtime_mutex.unlock(std.Options.debug_io);
         if (self.backend_runtime == null) {
-            self.owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(self.alloc, .{});
+            self.owned_backend_runtime = try runtime_resources.Owner.init(self.alloc, self.runtime_memory);
             self.backend_runtime = self.owned_backend_runtime.?.ptr();
         }
         if (self.backend_runtime) |runtime| return runtime;
@@ -11396,7 +11439,11 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
     ) !void {
-        try request.ensureActive();
+        return self.ensureLinearizableReadWithAdmission(request, null);
+    }
+    pub fn ensureLinearizableReadWithAdmission(self: *MetadataHttpService, input: api_operation.RequestContext, control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+        const request = if (control != null) try input.platformDeadline() else input;
+        try metadataReadCheckpoint(request, control);
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -11418,11 +11465,11 @@ pub const MetadataHttpService = struct {
         var slowest_round: raft_engine.runtime.multi_raft.HostRound = .{};
         var latest_raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
         while (platform_time.monotonicNs() < deadline_ns) {
-            try request.ensureActive();
+            try metadataReadCheckpoint(request, control);
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             const now_ns = platform_time.monotonicNs();
             if (now_ns >= next_request_ns) {
-                self.lockRuntime();
+                try lockMetadataReadRuntime(@This(), self, request, control);
                 {
                     defer self.unlockRuntime();
                     request_attempts += 1;
@@ -11441,7 +11488,7 @@ pub const MetadataHttpService = struct {
             }
             var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
             var drove_progress = false;
-            self.lockRuntime();
+            try lockMetadataReadRuntime(@This(), self, request, control);
             {
                 defer self.unlockRuntime();
                 // Registered runtimes coalesce a wake instead of persisting
@@ -11459,11 +11506,11 @@ pub const MetadataHttpService = struct {
                 }
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
-            try request.ensureActive();
-            platform_clock.Clock.real().sleepMs(1);
+            try metadataReadCheckpoint(request, control);
+            try waitMetadataReadProgress(request, control);
         }
         if (self.linearizable_read_tracker.isComplete(request_id)) return;
-        try request.ensureActive();
+        try metadataReadCheckpoint(request, control);
         self.logLinearizableReadTimeout(request_id, request_attempts, not_leader_count, raft_rounds, slowest_round, latest_raft_diagnostics_snapshot);
         return error.MetadataLinearizableReadTimeout;
     }
@@ -11578,6 +11625,12 @@ pub const MetadataHttpService = struct {
                 ready.has_more_ready,
             },
         );
+    }
+
+    pub fn transactionRoutingProjection(self: *MetadataHttpService, alloc: std.mem.Allocator, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget) !metadata_storage.raft_apply_store.TransactionRoutingProjectionSnapshot {
+        try budget.checkpoint();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.captureTransactionRoutingProjection(alloc, self.metadata_group_id, budget);
     }
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
@@ -13525,6 +13578,21 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .create_restore_job = .{ .key = "1", .value = "{}" } }));
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } }));
+    const remote_initialization_command: metadata_storage.TransitionCommand = .{ .apply_remote_attempt_initialization = "{}" };
+    const remote_version = metadata_topology_protocol.remote_attempt_initialization_version;
+    try std.testing.expectEqual(remote_version, transitionRequiredCoordinatedDecoderVersion(remote_initialization_command));
+    var mixed_remote: Fake = .{ .member_versions = &.{ remote_version, remote_version - 1, remote_version } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&mixed_remote, remote_initialization_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_remote.propose(&.{remote_initialization_command}));
+    try std.testing.expectEqual(@as(usize, 0), mixed_remote.appended);
+    mixed_remote.member_versions = &.{ remote_version, remote_version, remote_version };
+    try ensureCoordinatedDecoderWithContext(&mixed_remote, remote_initialization_command, .{});
+    mixed_remote.cache.cached.?.readiness.term += 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_remote.propose(&.{remote_initialization_command}));
+    try std.testing.expectEqual(@as(usize, 0), mixed_remote.appended);
+    try ensureCoordinatedDecoderWithContext(&mixed_remote, remote_initialization_command, .{});
+    try mixed_remote.propose(&.{remote_initialization_command});
+    try std.testing.expectEqual(@as(usize, 1), mixed_remote.appended);
     const root_bound_store: metadata_table_manager.StoreRecord = .{
         .store_id = 17,
         .node_id = 1,

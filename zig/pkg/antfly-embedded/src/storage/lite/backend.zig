@@ -255,8 +255,7 @@ pub const Handle = struct {
                     self.native_docstore = null;
                 }
                 if (self.owned_resource_manager) |manager| {
-                    manager.deinit(self.allocator);
-                    self.allocator.destroy(manager);
+                    manager.releaseOwned(self.allocator);
                     self.owned_resource_manager = null;
                 }
             },
@@ -682,6 +681,7 @@ fn openBridgeLsmContainer(allocator: Allocator, path: []const u8, opts: OpenOpti
     errdefer allocator.destroy(storage);
 
     storage.* = try bridge.ContainerStorage.openWithOptions(allocator, path, .{
+        .resource_manager = opts.resource_manager,
         .read_only = opts.read_only,
     });
     errdefer storage.deinit();
@@ -696,14 +696,12 @@ fn openBridgeLsmContainer(allocator: Allocator, path: []const u8, opts: OpenOpti
 fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
     var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
     const resource_manager = opts.resource_manager orelse blk: {
-        const manager = try allocator.create(resource_manager_mod.ResourceManager);
-        manager.* = resource_manager_mod.ResourceManager.init(.{});
+        const manager = try db_mod.DB.createStandaloneResourceManager(allocator);
         owned_resource_manager = manager;
         break :blk manager;
     };
     errdefer if (owned_resource_manager) |manager| {
-        manager.deinit(allocator);
-        allocator.destroy(manager);
+        manager.releaseOwned(allocator);
     };
 
     const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
@@ -720,14 +718,12 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
 fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOptions) !Handle {
     var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
     const resource_manager = opts.resource_manager orelse blk: {
-        const manager = try allocator.create(resource_manager_mod.ResourceManager);
-        manager.* = resource_manager_mod.ResourceManager.init(.{});
+        const manager = try db_mod.DB.createStandaloneResourceManager(allocator);
         owned_resource_manager = manager;
         break :blk manager;
     };
     errdefer if (owned_resource_manager) |manager| {
-        manager.deinit(allocator);
-        allocator.destroy(manager);
+        manager.releaseOwned(allocator);
     };
 
     const initial_store = try docstore.Store.createWithOptions(allocator, path, .{

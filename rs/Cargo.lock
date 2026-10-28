@@ -83,12 +83,15 @@ dependencies = [
 name = "antfly-sdk"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "http",
+ "http-body",
  "openapiv3",
  "prettyplease",
  "progenitor",
  "progenitor-client",
+ "quote",
  "regress",
  "reqwest 0.13.2",
  "serde",

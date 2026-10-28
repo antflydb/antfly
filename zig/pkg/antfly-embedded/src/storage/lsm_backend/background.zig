@@ -22,12 +22,16 @@ pub const JobDeinitFn = *const fn (ptr: *anyopaque) void;
 
 pub const Executor = struct {
     jobs: ?background_runtime.DurableJobLane = null,
+    /// Borrowed from the same stable runtime as jobs. Backend close joins its
+    /// accepted jobs before the embedding runtime/owner can retire.
+    runtime: ?*background_runtime.BackendRuntime = null,
     owner_id: u64,
     detached: bool = false,
 
     pub fn init(runtime: *background_runtime.BackendRuntime, owner_id: u64) Executor {
         return .{
             .jobs = runtime.durable_jobs,
+            .runtime = runtime,
             .owner_id = owner_id,
             .detached = runtime.backend != .manual,
         };

@@ -674,11 +674,30 @@ const StandaloneHealthSource = struct {
         try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
+        try antfly.common.request_admission.runnable_metrics.appendPrometheusMetrics(writer, handler.runnable);
+        try antfly.common.request_admission.runnable_metrics.appendReadMemoryMetrics(writer, handler.read_memory);
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
             .capacity = handler.query_capacity,
             .in_flight = handler.query_in_flight,
             .peak_in_flight = handler.query_peak_in_flight,
             .rejected_total = handler.query_rejected_total,
+            .configured_capacity = handler.query_configured_capacity,
+            .queued = handler.query_queued,
+            .queued_bytes = handler.query_queued_bytes,
+            .waited_total = handler.query_waited_total,
+            .wait_ns_total = handler.query_wait_ns_total,
+            .wait_completed_total = handler.query_wait_completed_total,
+            .wait_buckets = handler.query_wait_buckets,
+            .expired_total = handler.query_expired_total,
+            .cancelled_total = handler.query_cancelled_total,
+            .waiting = .{ .max_queued_requests = handler.query_queue_capacity, .max_queued_bytes = handler.query_queue_bytes, .max_wait_ms = handler.query_wait_ms },
+            .policy_version = handler.query_policy_version,
+            .policy_retired_total = handler.query_policy_retired_total,
+            .retiring_waiters = handler.query_retiring_waiters,
+            .draining = handler.query_draining,
+            .suspended = handler.query_suspended,
+            .quiescent = handler.query_quiescent,
+            .sql_waiting_enabled = handler.query_sql_waiting_enabled,
         });
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
             .capacity = handler.write_capacity,
@@ -692,6 +711,15 @@ const StandaloneHealthSource = struct {
             .peak_in_flight = handler.inference_peak_in_flight,
             .rejected_total = handler.inference_rejected_total,
         });
+        inline for (.{ "foreground", "control", "retained" }, 0..) |name, index| {
+            const memory = handler.memory[index];
+            const prefix = "antfly_api_memory_" ++ name;
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_enabled", "gauge", "API allocation envelope installed", @intFromBool(memory.enabled));
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_limit_bytes", "gauge", "API allocation envelope ceiling", memory.limit_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_used_bytes", "gauge", "Currently reserved API allocation bytes", memory.used_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_peak_bytes", "gauge", "Peak API allocation reservations", memory.peak_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_rejected_total", "counter", "API allocation reservations rejected by ceiling", memory.rejected_total);
+        }
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
@@ -1315,9 +1343,9 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn getBackupCohort(ptr: *anyopaque, alloc: std.mem.Allocator, id: u64, request: LifecycleRequest) !?[]u8 {
-        try request.ensureActive();
+        try request.ensureExecutionActive();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.mutex);
+        try @import("../storage/metadata_read_admission.zig").lock(&self.mutex, request);
         defer self.mutex.unlock();
         return (self.lifecycle_store orelse return error.UnsupportedOperation).getBackupCohort(alloc, group_ids.main_metadata_group_id, id);
     }
@@ -1513,37 +1541,47 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn getRestoreStaging(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: LifecycleRequest) !?[]u8 {
-        try request.ensureActive();
+        try request.ensureExecutionActive();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        var loaded = (try (self.lifecycle_store orelse return error.UnsupportedOperation).loadRestoreStaging(alloc, group_ids.main_metadata_group_id, id)) orelse return null;
+        var loaded = blk: {
+            try @import("../storage/metadata_read_admission.zig").lock(&self.mutex, request);
+            defer self.mutex.unlock();
+            break :blk (try (self.lifecycle_store orelse return error.UnsupportedOperation).loadRestoreStaging(alloc, group_ids.main_metadata_group_id, id)) orelse return null;
+        };
         defer loaded.deinit();
-        return try std.json.Stringify.valueAlloc(alloc, loaded.value, .{});
+        // loadRestoreStaging owns its parsed arena after the store read txn
+        // closes. Caller checkpoints may reacquire metadata, so encode unlocked.
+        return try @import("../storage/metadata_read_admission.zig").encode(alloc, loaded.value, request);
     }
 
     fn getRestoreStagingProgress(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: LifecycleRequest) !?Staging.Progress {
-        try request.ensureActive();
+        try request.ensureExecutionActive();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.mutex);
+        try @import("../storage/metadata_read_admission.zig").lock(&self.mutex, request);
         defer self.mutex.unlock();
         return (self.lifecycle_store orelse return error.UnsupportedOperation).loadRestoreStagingProgress(alloc, group_ids.main_metadata_group_id, id);
     }
 
     fn getRestoreStagingAuthority(ptr: *anyopaque, alloc: std.mem.Allocator, input: Staging.AuthorityRequest, request: LifecycleRequest) !Staging.AuthorityResponse {
-        try request.ensureActive();
+        try request.ensureExecutionActive();
         try input.validate();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        var result = try self.getRestoreStagingAuthorityLocked(alloc, input);
-        errdefer result.deinit(alloc);
+        var snapshot = try self.getRestoreStagingAuthorityLocked(alloc, input, request);
+        defer snapshot.job.deinit();
+        errdefer snapshot.response.deinit(alloc);
         // Cancellation may check the current metadata term, acquiring mutex.
         // Never invoke a caller callback while holding that same mutex.
-        try request.ensureActive();
-        return result;
+        try @import("../storage/metadata_read_admission.zig").finishAuthority(alloc, &snapshot.response, snapshot.job.value, input, request);
+        return snapshot.response;
     }
 
-    fn getRestoreStagingAuthorityLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, input: Staging.AuthorityRequest) !Staging.AuthorityResponse {
-        lockAtomic(&self.mutex);
+    const RestoreAuthoritySnapshot = struct {
+        job: std.json.Parsed(Staging.Job),
+        response: Staging.AuthorityResponse,
+    };
+
+    fn getRestoreStagingAuthorityLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, input: Staging.AuthorityRequest, request: LifecycleRequest) !RestoreAuthoritySnapshot {
+        try @import("../storage/metadata_read_admission.zig").lock(&self.mutex, request);
         defer self.mutex.unlock();
         // Native metadata owns a single local placement projection. This is
         // a direct synchronized authority read, not a forwarded bearer proof.
@@ -1552,7 +1590,7 @@ const LocalStandaloneMetadata = struct {
         const group = input.owner_group orelse return error.RestoreStagingScopeChanged;
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         var job = (try store.loadRestoreStaging(alloc, group_ids.main_metadata_group_id, input.plan_id)) orelse return error.RestoreStagingScopeChanged;
-        defer job.deinit();
+        errdefer job.deinit();
         var authorized = false;
         for (job.value.plan.external_fk_parents) |parent| for (parent.ranges) |range| {
             if (range.group_id != group) continue;
@@ -1575,20 +1613,20 @@ const LocalStandaloneMetadata = struct {
             .progress = try store.loadRestoreStagingProgress(alloc, group_ids.main_metadata_group_id, input.plan_id),
         };
         errdefer result.deinit(alloc);
-        if (input.include_plan) result.job_json = try std.json.Stringify.valueAlloc(alloc, job.value, .{});
         if (input.receipt) |receipt| if (try store.loadRestoreStagingReceipt(alloc, group_ids.main_metadata_group_id, input.plan_id, receipt.state, receipt.owner_group)) |bytes| {
             defer alloc.free(bytes);
             if (bytes.len != 32) return error.InvalidRestoreStaging;
             result.receipt = bytes[0..32].*;
         };
-        try result.validate(input);
-        return result;
+        // Capture authorization, job, progress and receipt under one lock.
+        // The job owns its arena; encoding and caller callbacks run unlocked.
+        return .{ .job = job, .response = result };
     }
 
     fn getRestoreStagingReceipt(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, state: Staging.State, owner: u64, request: LifecycleRequest) !?[]u8 {
-        try request.ensureActive();
+        try request.ensureExecutionActive();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.mutex);
+        try @import("../storage/metadata_read_admission.zig").lock(&self.mutex, request);
         defer self.mutex.unlock();
         return (self.lifecycle_store orelse return error.UnsupportedOperation).loadRestoreStagingReceipt(alloc, group_ids.main_metadata_group_id, id, state, owner);
     }
@@ -2717,6 +2755,7 @@ const LocalStandaloneMetadata = struct {
             .fk_initial_retirement_ack,
             .store_root_enroll,
             .store_root_enrollment_status,
+            .remote_attempt_initialization,
             => return error.UnsupportedOperation,
             .fk_generation_publication_status,
             .fk_generation_publication_work,
@@ -4973,6 +5012,32 @@ pub fn runFromIterator(
         return err;
     };
     const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
+    const effective_admission = try (if (loaded_config) |*cfg| cfg.admission else antfly.common.config.Config.AdmissionConfig{}).resolveForStartup(process_memory_limit_bytes);
+    var runnable_node_owner: ?antfly.public_api.kernel_bridge.NodeRunnableOwner = if (effective_admission.runnable) |policy|
+        try antfly.public_api.kernel_bridge.NodeRunnableOwner.init(alloc, policy)
+    else
+        null;
+    defer if (runnable_node_owner) |*owner| {
+        owner.close() catch @panic("runnable node owner close failed");
+        owner.deinit() catch @panic("runnable node owner still in use after consumer joins");
+    };
+    const storage_runnable_port = if (runnable_node_owner) |*owner| try owner.executionPort() else null;
+    // This root outlives both host runtime and independently compiled storage.
+    // Neither child creates a second process ceiling or lends the root's life.
+    var node_memory_root = antfly.resource_manager.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = process_memory_limit_bytes },
+        .identity_allocator = alloc,
+    });
+    defer node_memory_root.deinit(alloc);
+    var process_memory_parent = node_memory_root.memoryParentPort();
+    var bootstrap_memory_parent = process_memory_parent;
+    var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .runnable_owner = storage_runnable_port,
+        .shared_sql_memory_parent = process_memory_parent,
+        .memory_parent = process_memory_parent,
+    });
+    defer node_backend_runtime.deinit();
+    const storage_execution_offer = @import("antfly_local_sources").storage_execution_services.Offer.init(node_backend_runtime.ptr());
     var storage_kernel_context = kernel_owner_client.Context{};
     defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
@@ -4984,6 +5049,9 @@ pub fn runFromIterator(
                 .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
             },
             .memory_limit_bytes = process_memory_limit_bytes,
+            .memory_parent = &process_memory_parent,
+            .execution_services = &storage_execution_offer,
+            .runnable_owner = if (storage_runnable_port) |*port| port else null,
         });
         try storage_kernel_context.configureRemoteContent(remote_content);
         try storage_kernel_context.configureSecrets(&secret_store);
@@ -4992,8 +5060,9 @@ pub fn runFromIterator(
         try storage_kernel_context.configureNativeQueries(retained_setup);
     }
 
-    var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
-    defer node_backend_runtime.deinit();
+    // Inference keeps the storage child's cache reclamation hooks. Accounting
+    // still reaches the common root, while this child outlives inference.
+    bootstrap_memory_parent = try inferenceBootstrapMemoryParent(control_only_storage_sources, &storage_kernel_context, &node_memory_root);
     var native_query_repository: ?@import("../api/native_query_repository.zig").Repository = null;
     defer if (native_query_repository) |*repository| {
         node_backend_runtime.ptr().query_cut_repository = null;
@@ -5213,6 +5282,7 @@ pub fn runFromIterator(
         .runtime_config_json = inference_bridge.String.init(inference_runtime_config_json),
         .executor = .init(&inference_io),
         .out_handle = &handle,
+        .bootstrap_memory_parent = @ptrCast(&bootstrap_memory_parent),
     };
     const antfly_node = if (comptime inline_inference_codegen) blk: {
         break :blk try inference_host.linkedInferenceCreate(&inference_create_context);
@@ -5519,13 +5589,17 @@ pub fn runFromIterator(
     var hot_standby_sync_policy = try hotStandbySyncPolicyFromCli(alloc, cli);
     defer hot_standby_sync_policy.deinit(alloc);
     const hot_standby_retention_policy = try hotStandbyRetentionPolicyFromCli(cli);
-    var hot_standby_primary = openHotStandbyPrimaryFromCli(alloc, setup_io.io(), cli) catch |err| {
+    // The primary and slot store retire before this allocator and the shared
+    // node root. Callback-free admission is safe inside WAL/store locks.
+    var hot_standby_memory = antfly.resource_manager.BudgetedAllocator.init(&node_memory_root, .lsm_in_memory_state, alloc, 1);
+    defer hot_standby_memory.deinit();
+    var hot_standby_primary = openHotStandbyPrimaryFromCli(hot_standby_memory.threadSafeAllocator(), setup_io.io(), cli) catch |err| {
         std.log.err("standalone startup failed step=open_ha_primary err={}", .{err});
         return err;
     };
     defer if (hot_standby_primary) |*primary| primary.close();
     if (hot_standby_primary) |*primary| try local_metadata.replayHotStandbyCatalog(primary);
-    var hot_standby_standby = openHotStandbyStandbyFromCli(alloc, setup_io.io(), cli) catch |err| {
+    var hot_standby_standby = openHotStandbyStandbyFromCli(hot_standby_memory.threadSafeAllocator(), setup_io.io(), cli) catch |err| {
         std.log.err("standalone startup failed step=open_ha_standby err={}", .{err});
         return err;
     };
@@ -5545,12 +5619,12 @@ pub fn runFromIterator(
             };
         }
     }
-    var hot_standby_fence_store = openHotStandbyFenceStoreFromCli(alloc, setup_io.io(), cli) catch |err| {
+    var hot_standby_fence_store = openHotStandbyFenceStoreFromCli(hot_standby_memory.threadSafeAllocator(), setup_io.io(), cli) catch |err| {
         std.log.err("standalone startup failed step=open_ha_fence err={}", .{err});
         return err;
     };
     defer if (hot_standby_fence_store) |*store| store.close();
-    var hot_standby_former_primary_log = openHotStandbyFormerPrimaryLogFromCli(alloc, setup_io.io(), cli) catch |err| {
+    var hot_standby_former_primary_log = openHotStandbyFormerPrimaryLogFromCli(hot_standby_memory.threadSafeAllocator(), setup_io.io(), cli) catch |err| {
         std.log.err("standalone startup failed step=open_ha_former_primary err={}", .{err});
         return err;
     };
@@ -5599,6 +5673,7 @@ pub fn runFromIterator(
         .storage_kernel_context_handle = if (control_only_storage_sources) storage_kernel_context.handle else null,
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
+        .process_memory_root = &node_memory_root,
         .store_registration = .{
             .node_id = local_node_id,
             .store_id = 1,
@@ -5615,6 +5690,10 @@ pub fn runFromIterator(
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .query_waiting = effective_admission.query.waiting,
+            .runnable_owner_handle = if (runnable_node_owner) |owner| owner.handle else null,
+            .request_memory_bytes = @intCast(effective_admission.max_request_memory_bytes),
+            .retained_memory_bytes = @intCast(effective_admission.max_retained_memory_bytes),
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
@@ -5694,6 +5773,8 @@ pub fn runFromIterator(
         data_server.provisioned_storage.setDenseNativeAuthorityPermitted(true);
     }
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    if (comptime !control_only_storage_sources)
+        try data_server.provisioned_storage.resource_manager.installMemoryParent(bootstrap_memory_parent);
     const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
     std.log.info(
         "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
@@ -5718,6 +5799,7 @@ pub fn runFromIterator(
         // embedded provider. Drain them while the node is valid, then release
         // tokenizer reservations while DataServer's ResourceManager is valid.
         // The earlier data_server.deinit defer performs final storage teardown.
+        if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
         data_server.quiesceExternalProviderUsersWithDeadline(supervisor.deadline()) catch |err| {
             std.log.err("standalone provider shutdown barrier failed err={s}", .{@errorName(err)});
             @panic("standalone provider shutdown barrier failed");
@@ -5771,14 +5853,21 @@ pub fn runFromIterator(
         .release_context = releaseInferenceResourceOwner,
         .reserve_admission = reserveInferenceResources,
         .retain_admission = retainInferenceResources,
+        .transfer_admission = transferInferenceResources,
         .release_admission = releaseInferenceResources,
         .observe_prompt_cache = observeInferencePromptCache,
         .observe_tokenizer_cache = observeInferenceTokenizerCache,
+        .adjust_transient_host = adjustInferenceTransientHost,
     };
+    var inference_runnable_port = if (runnable_node_owner) |*owner|
+        try owner.executionPort()
+    else
+        null;
     const configure_context = inference_bridge.ConfigureContext{
         .abi_version = inference_bridge.abi_version,
         .handle = antfly_node,
         .resource_budget = &inference_resource_budget,
+        .runnable_owner = if (inference_runnable_port) |*port| port else null,
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceConfigure(&configure_context);
@@ -5855,7 +5944,7 @@ pub fn runFromIterator(
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
     var unified_lifecycle = UnifiedServerLifecycle.init(control_io);
-    const public_http_config = publicHttpServerConfig(bind_host, bind_port);
+    const public_http_config = api_server.configurePublicHttpTransport(publicHttpServerConfig(bind_host, bind_port));
     var http_observer_lease = try node_backend_runtime.ptr().acquireWorkers(.{});
     defer http_observer_lease.release();
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
@@ -5910,6 +5999,7 @@ pub fn runFromIterator(
             &unified_api_ready,
             &unified_lifecycle,
             &http_runtime,
+            inference_runnable_port,
         })
     else
         control_io.concurrent(serveUnifiedWithLinkedInference, .{
@@ -5925,12 +6015,14 @@ pub fn runFromIterator(
             &unified_api_ready,
             &unified_lifecycle,
             &http_runtime,
+            inference_runnable_port,
         })) catch |err| {
         std.log.err("standalone startup failed step=schedule_unified_http err={}", .{err});
         return err;
     };
     var future_awaited = false;
     defer if (!future_awaited) {
+        if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
         unified_lifecycle.stop();
         _ = unified_future.await(control_io);
     };
@@ -5978,6 +6070,7 @@ pub fn runFromIterator(
     }
 
     const process_shutdown_deadline = supervisor.deadline();
+    if (runnable_node_owner) |*owner| try owner.close();
     unified_lifecycle.shutdown(process_shutdown_deadline);
     _ = unified_future.await(control_io);
     future_awaited = true;
@@ -6068,8 +6161,9 @@ fn serveUnifiedWithInference(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
+    runnable_owner: ?inference_bridge.runnable_abi.Owner,
 ) void {
-    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime, runnable_owner) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -6092,8 +6186,9 @@ fn serveUnifiedWithLinkedInference(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
+    runnable_owner: ?inference_bridge.runnable_abi.Owner,
 ) void {
-    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime, runnable_owner) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -6117,9 +6212,13 @@ fn serveUnifiedInner(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
+    runnable_owner: ?inference_bridge.runnable_abi.Owner,
 ) !void {
+    var cleanup_owner = if (runnable_owner) |port| try @import("antfly_runtime_abi").http_cleanup.Owner.init(port) else null;
+    defer if (cleanup_owner) |*owner| owner.deinit();
     var server_config = public_http_config;
     server_config.http_runtime = http_runtime;
+    if (cleanup_owner) |*owner| server_config.cleanup_execution = owner.view();
     var server = httpx.Server.initWithConfig(alloc, io, server_config);
     defer server.deinit();
     var route_context = StandaloneHttpContext{
@@ -6150,6 +6249,7 @@ fn serveUnifiedInner(
                 antfly_node,
                 functions,
                 &linked_inference_routes,
+                runnable_owner,
             );
         }
     }
@@ -6219,6 +6319,7 @@ const LinkedInferenceRoute = struct {
     kernel_route_handle: *anyopaque,
     request_body: runtime_http_abi.RequestBodyMode,
     streaming_response: bool,
+    runnable_owner: ?inference_bridge.runnable_abi.Owner = null,
 };
 
 fn registerLinkedInferenceManifest(
@@ -6227,6 +6328,7 @@ fn registerLinkedInferenceManifest(
     inference_handle: *anyopaque,
     functions: *const inference_bridge.FunctionTable,
     owned_routes: *std.ArrayListUnmanaged(*LinkedInferenceRoute),
+    runnable_owner: ?inference_bridge.runnable_abi.Owner,
 ) !void {
     var entries_ptr: ?[*]const inference_bridge.RouteManifestEntry = null;
     var entries_len: usize = 0;
@@ -6247,6 +6349,7 @@ fn registerLinkedInferenceManifest(
             .kernel_route_handle = entry.route_handle,
             .request_body = entry.request_body,
             .streaming_response = entry.streaming_response != 0,
+            .runnable_owner = runnable_owner,
         };
         try owned_routes.append(alloc, route);
         errdefer _ = owned_routes.pop();
@@ -6265,9 +6368,91 @@ fn registerLinkedInferenceManifest(
     }
 }
 
+const LinkedInferenceHttpOutputControl = struct {
+    fn now(context: *const httpx.Context) u64 {
+        if (context.application_deadline_io) |clock_io| return @intCast(@max(0, std.Io.Clock.now(.awake, clock_io).nanoseconds));
+        return platform_time.monotonicNs();
+    }
+    fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+        const context: *const httpx.Context = @ptrCast(@alignCast(raw.?));
+        if (context.isCancellationRequested()) return error.Canceled;
+        if (context.application_deadline_ns) |deadline| if (now(context) >= deadline) return error.Timeout;
+    }
+    fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
+        const context: *const httpx.Context = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        const deadline = context.application_deadline_ns orelse return null;
+        const ns = deadline -| now(context);
+        return @divTrunc(ns, std.time.ns_per_ms) + @intFromBool(ns % std.time.ns_per_ms != 0);
+    }
+    fn view(context: *httpx.Context) httpx.socket.WriteControl {
+        return .{ .ptr = context, .check_fn = check, .remaining_ms_fn = remaining };
+    }
+};
+
+fn linkedInferenceHttpNativeDeadline(context: *const httpx.Context) ?u64 {
+    const deadline = context.application_deadline_ns orelse return null;
+    const clock_io = context.application_deadline_io orelse return deadline;
+    const now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, clock_io).nanoseconds));
+    // Convert the remaining original budget once at the native ABI boundary.
+    // Keep the original clock on the owner; never refresh its absolute fence.
+    return platform_time.monotonicNs() +| (deadline -| now);
+}
+
 fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const route: *const LinkedInferenceRoute = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRuntimeUnavailable));
     const source_headers = context.request.headers.iterator();
+    var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = context, .write_control = LinkedInferenceHttpOutputControl.view(context) };
+    const native_deadline_ns = linkedInferenceHttpNativeDeadline(context);
+    var execution_handle: ?*anyopaque = null;
+    const io_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&context.io);
+    const clock_borrow = if (context.application_deadline_io) |clock_io| @import("antfly_runtime_abi").native_abi.IoBorrow.init(&clock_io) else null;
+    if (route.runnable_owner) |owner| {
+        var retained_bytes: u64 = @sizeOf(LinkedInferenceRoute);
+        retained_bytes +|= context.request.uri.path.len;
+        if (context.request.uri.query) |query| retained_bytes +|= query.len;
+        if (context.request.body) |body| retained_bytes +|= body.len;
+        for (source_headers) |header| {
+            retained_bytes +|= header.name.len;
+            retained_bytes +|= header.value.len;
+            retained_bytes +|= @sizeOf(runtime_http_abi.HeaderView);
+        }
+        for (context.params) |param| {
+            retained_bytes +|= param.name.len;
+            retained_bytes +|= param.value.len;
+            retained_bytes +|= @sizeOf(runtime_http_abi.RouteParamView);
+        }
+        const status = owner.start(owner.context, &.{
+            .io = &io_borrow,
+            .clock_io = if (clock_borrow) |*clock| clock else null,
+            .class = @backingInt(inference_bridge.runnable_abi.Class.inference),
+            .slots = 1,
+            .deadline_ns = context.application_deadline_ns orelse 0,
+            .has_deadline = @intFromBool(context.application_deadline_ns != null),
+            .native_deadline = @intFromBool(context.application_deadline_io == null),
+            .cancellation = transport.cancellation(),
+            .retained_bytes = retained_bytes,
+            .out_handle = &execution_handle,
+        });
+        if (!status.isOk()) {
+            const err = inference_bridge.errorFromStatus(status);
+            if (err == error.QueueFull or err == error.ResourceTemporarilyUnavailable) {
+                var overloaded = httpx.Response.init(context.allocator, 503);
+                errdefer overloaded.deinit();
+                try overloaded.headers.append("Content-Type", "application/json");
+                try overloaded.headers.append("Retry-After", "1");
+                overloaded.body = "{\"error\":\"inference execution capacity exceeded\"}";
+                return overloaded;
+            }
+            return err;
+        }
+        if (execution_handle == null) return error.RuntimeBoundaryFailure;
+    }
+    defer if (execution_handle) |handle| route.runnable_owner.?.finish(handle);
+    var runnable = if (execution_handle) |handle|
+        try inference_bridge.runnable_abi.Borrowed.fromOwner(route.runnable_owner.?, handle, 1, .inference)
+    else
+        null;
     const headers = try context.allocator.alloc(runtime_http_abi.HeaderView, source_headers.len);
     defer context.allocator.free(headers);
     for (source_headers, 0..) |header, i| {
@@ -6304,7 +6489,6 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .authorization = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
         .content_type = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
-    var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = context };
     const body_source = if (route.request_body == .buffered) transport.bodySource() else runtime_http_abi.RequestBodySource{};
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
@@ -6317,6 +6501,9 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .stream = if (route.streaming_response) transport.stream() else .{},
         .out_response_handle = &response_handle,
         .out_response = &response_view,
+        .deadline_ns = native_deadline_ns orelse 0,
+        .has_deadline = @intFromBool(native_deadline_ns != null),
+        .runnable = if (runnable) |*borrow| borrow else null,
     });
     if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
@@ -6334,6 +6521,10 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     }
     response.body = try context.allocator.dupe(u8, response_view.body.slice());
     response.body_owned = true;
+    if (execution_handle) |handle| {
+        const completion = route.runnable_owner.?.checkpoint(handle);
+        if (!completion.isOk()) return inference_bridge.errorFromStatus(completion);
+    }
     return response;
 }
 
@@ -8233,7 +8424,7 @@ fn openHotStandbyFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, c
     const former_primary_log_z = try alloc.dupeSentinel(u8, former_primary_log_path, 0);
     defer alloc.free(former_primary_log_z);
 
-    return try antfly.hot_standby.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
+    return try antfly.hot_standby.replication_log.ReplicationLog.openWithAllocator(alloc, former_primary_log_z.ptr, .{});
 }
 
 fn resolveAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]u8 {
@@ -8597,12 +8788,17 @@ const InferenceResourceBudgetOwner = struct {
     manager: *antfly.resource_manager.ResourceManager,
     lease_pool_mutex: std.atomic.Mutex = .unlocked,
     free_leases: ?*InferenceAdmissionLease = null,
+    free_lease_count: usize = 0,
+    // The shared byte cap bounds all active/provisional/cached storage. Retain
+    // only a small spare pool so a concurrency burst returns idle capacity.
+    max_cached_leases: usize = 64,
     active_leases: std.AutoHashMapUnmanaged(usize, *InferenceAdmissionLease) = .empty,
     next_lease_token: usize = 1,
     observer_mutex: std.atomic.Mutex = .unlocked,
     prompt_cache_observers: std.AutoHashMapUnmanaged(usize, u64) = .empty,
     tokenizer_mutex: std.atomic.Mutex = .unlocked,
     tokenizer_cache_observers: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    transient_bytes: std.atomic.Value(u64) = .init(0),
     outstanding_admission_leases: std.atomic.Value(usize) = .init(0),
     references: std.atomic.Value(usize) = .init(1),
     closing: std.atomic.Value(bool) = .init(false),
@@ -8615,61 +8811,81 @@ const InferenceResourceBudgetOwner = struct {
             @panic("inference resource owner closed twice");
         if (self.references.load(.acquire) != 1)
             @panic("inference resource owner closed with retained capability contexts");
+        if (self.transient_bytes.load(.acquire) != 0) @panic("inference resource owner closed with transient bytes");
         if (self.outstanding_admission_leases.load(.acquire) != 0 or
             self.active_leases.count() != 0)
             @panic("inference resource owner closed with active admission leases");
-        self.active_leases.deinit(self.alloc);
+        var metadata = self.manager.controlMetadataAllocation(self.alloc);
+        const metadata_alloc = metadata.allocator();
+        self.active_leases.deinit(metadata_alloc);
         self.active_leases = .empty;
         var current = self.free_leases;
         while (current) |lease| {
             current = lease.next_free;
-            self.alloc.destroy(lease);
+            metadata_alloc.destroy(lease);
         }
         self.free_leases = null;
+        self.free_lease_count = 0;
         if (self.prompt_cache_observers.count() != 0)
             @panic("inference resource owner closed with prompt cache observers");
-        self.prompt_cache_observers.deinit(self.alloc);
+        self.prompt_cache_observers.deinit(metadata_alloc);
         self.prompt_cache_observers = .empty;
         if (self.tokenizer_cache_observers.count() != 0)
             @panic("inference resource owner closed with tokenizer cache observers");
-        self.tokenizer_cache_observers.deinit(self.alloc);
+        self.tokenizer_cache_observers.deinit(metadata_alloc);
         self.tokenizer_cache_observers = .empty;
+    }
+
+    fn controlMetadataError(err: anyerror) anyerror {
+        return switch (err) {
+            error.ResourceBudgetExceeded, error.ParentMemoryBusy => error.ResourceTemporarilyUnavailable,
+            else => err,
+        };
     }
 
     fn acquireLease(self: *@This()) !*InferenceAdmissionLease {
         lockAtomic(&self.lease_pool_mutex);
         if (self.free_leases) |lease| {
             self.free_leases = lease.next_free;
+            self.free_lease_count -= 1;
             self.lease_pool_mutex.unlock();
             lease.next_free = null;
             return lease;
         }
         self.lease_pool_mutex.unlock();
-        return try self.alloc.create(InferenceAdmissionLease);
+        var metadata = self.manager.controlMetadataAllocation(self.alloc);
+        return metadata.allocator().create(InferenceAdmissionLease) catch |err|
+            return controlMetadataError(metadata.allocationError(err));
     }
 
     fn recycleLease(self: *@This(), lease: *InferenceAdmissionLease) void {
         lockAtomic(&self.lease_pool_mutex);
-        defer self.lease_pool_mutex.unlock();
-        lease.next_free = self.free_leases;
-        self.free_leases = lease;
+        if (self.free_lease_count < self.max_cached_leases) {
+            lease.next_free = self.free_leases;
+            self.free_leases = lease;
+            self.free_lease_count += 1;
+            self.lease_pool_mutex.unlock();
+            return;
+        }
+        self.lease_pool_mutex.unlock();
+        // Physical destruction and accounting callbacks run outside the pool
+        // lock. The record remains charged until its backing allocator frees it.
+        var metadata = self.manager.controlMetadataAllocation(self.alloc);
+        metadata.allocator().destroy(lease);
     }
 
     fn registerLease(self: *@This(), lease: *InferenceAdmissionLease) !usize {
         lockAtomic(&self.lease_pool_mutex);
         defer self.lease_pool_mutex.unlock();
 
-        // Tokens are monotonically advanced and never expose the recycled
-        // pointer. On integer wrap, skip zero and any token still active.
-        // This prevents a delayed duplicate release from targeting a newer
-        // reservation that happens to reuse the same pool slot.
-        var token = self.next_lease_token;
-        while (token == 0 or self.active_leases.contains(token)) {
-            token +%= 1;
-        }
+        // Never reuse any token, including retired identities. A delayed
+        // worker release/transfer must not target a successor after wrap.
+        const token = self.next_lease_token;
+        if (token == 0) return error.ResourceTemporarilyUnavailable;
+        var metadata = self.manager.controlMetadataAllocation(self.alloc);
+        self.active_leases.put(metadata.allocator(), token, lease) catch |err|
+            return controlMetadataError(metadata.allocationError(err));
         self.next_lease_token = token +% 1;
-        if (self.next_lease_token == 0) self.next_lease_token = 1;
-        try self.active_leases.put(self.alloc, token, lease);
         return token;
     }
 
@@ -8686,6 +8902,21 @@ const InferenceResourceBudgetOwner = struct {
             return error.InvalidArguments;
         };
         try lease.reservation.retain(retained, retained_host_charge_bytes);
+    }
+
+    fn transferLease(
+        self: *@This(),
+        source: usize,
+        destination: usize,
+        amounts: []const antfly.resource_manager.SliceAmount,
+        host_charge_bytes: u64,
+    ) !void {
+        if (source == 0 or destination == 0 or source == destination) return error.InvalidArguments;
+        if (!self.lease_pool_mutex.tryLock()) return error.ResourceTemporarilyUnavailable;
+        defer self.lease_pool_mutex.unlock();
+        const from = self.active_leases.get(source) orelse return error.InvalidArguments;
+        const to = self.active_leases.get(destination) orelse return error.InvalidArguments;
+        try from.reservation.transferCreditTo(&to.reservation, amounts, host_charge_bytes);
     }
 
     fn takeLease(self: *@This(), token: usize) ?*InferenceAdmissionLease {
@@ -8753,13 +8984,8 @@ const InferenceResourceBudgetOwner = struct {
                 return false;
             }
             if (next == 0) return true;
-            const entry = observers.getOrPut(
-                self.alloc,
-                observer_id,
-            ) catch {
-                self.manager.recordAccountingError();
-                return false;
-            };
+            var metadata = self.manager.controlMetadataAllocation(self.alloc);
+            const entry = observers.getOrPut(metadata.allocator(), observer_id) catch return false;
             entry.value_ptr.* = 0;
             inserted = true;
             break :blk entry.value_ptr;
@@ -8810,6 +9036,11 @@ fn releaseInferenceResourceOwner(context: *anyopaque) callconv(.c) void {
     owner.references.store(current - 1, .release);
 }
 
+fn adjustInferenceTransientHost(context: *anyopaque, identity: usize, previous: u64, next: u64) callconv(.c) u8 {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    return @intFromBool(@import("inference_transient_memory.zig").adjust(owner, identity, previous, next));
+}
+
 fn reserveInferenceResources(
     context: *anyopaque,
     amounts: *const inference_bridge.AdmissionAmounts,
@@ -8822,7 +9053,7 @@ fn reserveInferenceResources(
     const lease = owner.acquireLease() catch |err|
         return inference_bridge.statusFromError(err);
     lease.* = .{
-        .reservation = owner.manager.reserveBatchClassifiedWithHostCharge(
+        .reservation = owner.manager.reserveBatchCheckedWithHostCharge(
             &slices,
             host_charge,
         ) catch |err| {
@@ -8851,6 +9082,14 @@ fn retainInferenceResources(
     const host_charge = inferenceHostCharge(retained) catch |err| return inference_bridge.statusFromError(err);
     owner.retainLease(lease_token, &slices, host_charge) catch |err|
         return inference_bridge.statusFromError(err);
+    return .ok;
+}
+
+fn transferInferenceResources(context: *anyopaque, source: usize, destination: usize, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    const slices = inferenceResourceSlices(amounts) catch |err| return inference_bridge.statusFromError(err);
+    const host_charge = inferenceHostCharge(amounts) catch |err| return inference_bridge.statusFromError(err);
+    owner.transferLease(source, destination, &slices, host_charge) catch |err| return inference_bridge.statusFromError(err);
     return .ok;
 }
 
@@ -15251,6 +15490,365 @@ test "system catalog offline migration publishes rows and fences server startup"
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "preserved") != null);
 }
 
+test "standalone inference response cancellation retires host ownership" {
+    const Consumer = struct {
+        fn invoke(handle: *anyopaque, cancellation: runtime_http_abi.CancellationView) !void {
+            var lifetime = EmbeddedInferenceProviderLifetime{ .handle = handle };
+            defer std.debug.assert(lifetime.activeCallCount() == 0);
+            const response = try inference_provider.invokeEmbeddedInferenceRoute(&lifetime, std.testing.allocator, .post, "generate", "{}", 0, cancellation, .{});
+            defer std.testing.allocator.free(response.body);
+        }
+    };
+    try inference_host.testCanceledHttpResponseConsumer(Consumer.invoke);
+}
+
+test "runnable execution context adapters preserve parent authority" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var handle: ?*anyopaque = null;
+    const create = inference_bridge.CreateContext{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = ".".ptr,
+        .data_dir_len = 1,
+        .models_dir = .init("."),
+        .ml_dir = .init("."),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = std.math.maxInt(usize),
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{\"embedded_enabled\":false}"),
+        .executor = .init(&io),
+        .out_handle = &handle,
+    };
+    handle = try inference_host.linkedInferenceCreate(&create);
+    defer inference_host.linkedInferenceDestroy(handle.?);
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = handle.? };
+    const Parent = struct {
+        checks: usize = 0,
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return @import("antfly_runtime_abi").error_abi.statusFromError(error.Forbidden);
+        }
+        fn park(_: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
+            @panic("denied parent must not park");
+        }
+        fn enter(_: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
+            @panic("denied parent must not transfer");
+        }
+    };
+    var parent = Parent{};
+    const context = antfly.inference.RequestContext{
+        .io = io,
+        .deadline_ns = null,
+        .runnable = .{ .context = &parent, .cpu_slots = 1, .parent_class = @backingInt(inference_bridge.runnable_abi.Class.query), .checkpoint = Parent.check, .park = Parent.park, .enter = Parent.enter },
+    };
+    const embedding = antfly.inference.managed_embedder.EmbeddingRequestContext{ .request = context };
+    const parts = [_]antfly.template.ContentPart{.{ .binary = .{ .mime_type = "image/png", .data = &.{1} } }};
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDenseTextsWithContext(&lifetime, alloc, "unused", &.{"text"}, embedding));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDensePartsWithContext(&lifetime, alloc, "unused", &parts, embedding));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderRerankTextsWithContext(&lifetime, alloc, "unused", "query", &.{"text"}, context));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderRerankDocumentsWithContext(&lifetime, alloc, "unused", "query", &.{&parts}, context));
+    const config = chunking_types.Config{ .provider = .antfly };
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderChunkInputWithContext(&lifetime, alloc, "unused", .{ .text = "text" }, config, context));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderChunkInputWithContext(&lifetime, alloc, "unused", .{ .binary = .{ .mime_type = "audio/wav", .data = &.{1} } }, config, context));
+    const rasters = [_]antfly.readers.RasterImage{.{ .bytes = &.{ 0, 0, 0, 255 }, .width = 1, .height = 1, .stride_bytes = 4 }};
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDenseRasters(&lifetime, alloc, "unused", &rasters, embedding));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderGenerateJson(&lifetime, alloc, "{}", context));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderDecideJson(&lifetime, alloc, "{}", context));
+    try std.testing.expectEqual(@as(usize, 9), parent.checks);
+    const AllowedParent = struct {
+        class: c_int = @backingInt(inference_bridge.runnable_abi.Class.query),
+        parked: bool = false,
+        checks: usize = 0,
+        parks: usize = 0,
+        enters: usize = 0,
+        reject_return: bool = false,
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            self.checks += 1;
+            return .{};
+        }
+        fn park(raw: *anyopaque, wait: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked and wait == @backingInt(inference_bridge.runnable_abi.Wait.resource));
+            self.parked = true;
+            self.parks += 1;
+            return .{};
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.parked);
+            self.enters += 1;
+            if (class == @backingInt(inference_bridge.runnable_abi.Class.query) and self.reject_return)
+                return @import("antfly_runtime_abi").error_abi.statusFromError(error.Forbidden);
+            self.parked = false;
+            self.class = class;
+            return .{};
+        }
+    };
+    for ([_]bool{ false, true }) |reject_return| {
+        for ([_]bool{ false, true }) |decide| {
+            var allowed = AllowedParent{ .reject_return = reject_return };
+            const granted = antfly.inference.RequestContext{
+                .io = io,
+                .deadline_ns = null,
+                .runnable = .{ .context = &allowed, .cpu_slots = 1, .parent_class = @backingInt(inference_bridge.runnable_abi.Class.query), .checkpoint = AllowedParent.check, .park = AllowedParent.park, .enter = AllowedParent.enter },
+            };
+            // Malformed requests reach the real HTTP handler through the new
+            // provider operation. Preserve its status mapping, then require
+            // parent authority before publishing even this error response.
+            if (decide) {
+                try std.testing.expectError(if (reject_return) error.Forbidden else error.DecisionUpstreamFailure, inference_provider.inferenceProviderDecideJson(&lifetime, alloc, "{", granted));
+            } else {
+                try std.testing.expectError(if (reject_return) error.Forbidden else error.GenerateRequestFailed, inference_provider.inferenceProviderGenerateJson(&lifetime, alloc, "{", granted));
+            }
+            try std.testing.expectEqual(@as(usize, 2), allowed.parks);
+            try std.testing.expectEqual(@as(usize, 2), allowed.enters);
+            try std.testing.expectEqual(reject_return, allowed.parked);
+            try std.testing.expect(allowed.checks >= 2);
+            try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
+}
+
+test "runnable execution context adapters install immutable production broker admission" {
+    const Ports = struct {
+        refs: usize = 0,
+        starts: usize = 0,
+        finishes: usize = 0,
+        active: bool = false,
+        parked: bool = false,
+        reject_start: bool = false,
+        reject_return: bool = false,
+        parks: usize = 0,
+        enters: usize = 0,
+        deadline_ns: ?u64 = null,
+        native_deadline: bool = false,
+        has_clock_io: bool = false,
+        fn retain(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+            return .ok;
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+        fn budgetRetain(raw: *anyopaque) callconv(.c) u8 {
+            _ = retain(raw);
+            return 1;
+        }
+        fn start(raw: *anyopaque, options: *const inference_bridge.runnable_abi.Start) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            options.validate() catch |err| return inference_bridge.statusFromError(err);
+            std.debug.assert(!self.active and options.slots == 1 and options.class == @backingInt(inference_bridge.runnable_abi.Class.inference));
+            self.deadline_ns = if (options.has_deadline != 0) options.deadline_ns else null;
+            self.native_deadline = options.native_deadline != 0;
+            self.has_clock_io = options.clock_io != null;
+            if (options.clock_io) |clock| _ = clock.receive() catch |err| return inference_bridge.statusFromError(err);
+            if (self.reject_start) return inference_bridge.statusFromError(error.QueueFull);
+            self.active = true;
+            self.starts += 1;
+            options.out_handle.* = self;
+            return .ok;
+        }
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active);
+            return .ok;
+        }
+        fn park(raw: *anyopaque, kind: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active and !self.parked and kind == @backingInt(inference_bridge.runnable_abi.Wait.resource));
+            self.parked = true;
+            self.parks += 1;
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active and self.parked and class == @backingInt(inference_bridge.runnable_abi.Class.inference));
+            self.enters += 1;
+            if (self.reject_return and self.enters == 2)
+                return inference_bridge.statusFromError(error.Forbidden);
+            self.parked = false;
+            return .ok;
+        }
+        fn finish(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active);
+            self.active = false;
+            self.parked = false;
+            self.finishes += 1;
+        }
+        fn reserve(_: *anyopaque, _: *const inference_bridge.AdmissionAmounts, out: *usize) callconv(.c) inference_bridge.Status {
+            out.* = 1;
+            return .ok;
+        }
+        fn retainAdmission(_: *anyopaque, _: usize, _: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
+            return .ok;
+        }
+        fn releaseAdmission(_: *anyopaque, _: usize) callconv(.c) void {}
+        fn observe(_: *anyopaque, _: usize, _: u64, _: u64) callconv(.c) u8 {
+            return 1;
+        }
+    };
+    var ports = Ports{};
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var handle: ?*anyopaque = null;
+    const create = inference_bridge.CreateContext{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = ".".ptr,
+        .data_dir_len = 1,
+        .models_dir = .init("."),
+        .ml_dir = .init("."),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = std.math.maxInt(usize),
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{\"embedded_enabled\":false}"),
+        .executor = .init(&io),
+        .out_handle = &handle,
+    };
+    handle = try inference_host.linkedInferenceCreate(&create);
+    var destroyed = false;
+    defer if (!destroyed) inference_host.linkedInferenceDestroy(handle.?);
+    var budget = inference_bridge.ResourceBudget{ .abi_version = inference_bridge.abi_version, .context = &ports, .retain_context = Ports.budgetRetain, .release_context = Ports.release, .reserve_admission = Ports.reserve, .retain_admission = Ports.retainAdmission, .release_admission = Ports.releaseAdmission, .observe_prompt_cache = Ports.observe, .observe_tokenizer_cache = Ports.observe };
+    var owner = inference_bridge.runnable_abi.Owner{ .context = &ports, .retain = Ports.retain, .release = Ports.release, .start = Ports.start, .checkpoint = Ports.check, .park = Ports.park, .enter = Ports.enter, .finish = Ports.finish };
+    const context = inference_bridge.ConfigureContext{ .abi_version = inference_bridge.abi_version, .handle = handle.?, .resource_budget = &budget, .runnable_owner = &owner };
+    try inference_host.linkedInferenceConfigure(&context);
+    const state: *inference_host.LinkedInferenceState = @ptrCast(@alignCast(handle.?));
+    try std.testing.expect(state.executor_admission_provider != null and state.runnable_owner != null);
+    try state.node.testExecutorAdmission();
+    try std.testing.expectEqual(@as(usize, 2), ports.starts);
+    try std.testing.expectEqual(@as(usize, 2), ports.finishes);
+    try std.testing.expect(!ports.active);
+    try std.testing.expectError(error.InvalidRunnableTransition, state.node.configureExecutorAdmission(state.executor_admission_provider.?.admission()));
+    try std.testing.expectError(error.ExternalResourceBudgetsAlreadyConfigured, inference_host.linkedInferenceConfigure(&context));
+    // Exercise the actual public frontend and linked archive handler, including
+    // root admission before marshalling and authority before response copying.
+    const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
+    // Opaque handles belong to the module which created them. The inline
+    // broker fixture above has a different concrete Node layout from the
+    // production archive, so create the frontend handle through that archive.
+    var frontend_handle: ?*anyopaque = null;
+    var frontend_create = create;
+    frontend_create.out_handle = &frontend_handle;
+    const frontend_create_status = functions.create(&frontend_create);
+    if (!frontend_create_status.isOk()) return inference_bridge.errorFromStatus(frontend_create_status);
+    var frontend_destroyed = false;
+    defer if (!frontend_destroyed) functions.destroy(frontend_handle.?);
+    var frontend_configure = context;
+    frontend_configure.handle = frontend_handle.?;
+    const frontend_configure_status = functions.configure(&frontend_configure);
+    if (!frontend_configure_status.isOk()) return inference_bridge.errorFromStatus(frontend_configure_status);
+    var entries: ?[*]const inference_bridge.RouteManifestEntry = null;
+    var entries_len: usize = 0;
+    const manifest_status = functions.route_manifest(&.{ .abi_version = inference_bridge.abi_version, .handle = frontend_handle.?, .out_entries = &entries, .out_len = &entries_len });
+    if (!manifest_status.isOk()) return inference_bridge.errorFromStatus(manifest_status);
+    const generate = found: {
+        for (entries.?[0..entries_len]) |entry| {
+            if (entry.method == .post and std.mem.eql(u8, entry.path.slice(), "/ai/v1/generate")) break :found entry;
+        }
+        return error.MissingGenerateRoute;
+    };
+    var route = LinkedInferenceRoute{ .functions = functions, .kernel_route_handle = generate.route_handle, .request_body = generate.request_body, .streaming_response = generate.streaming_response != 0, .runnable_owner = owner };
+    var request = try httpx.Request.init(alloc, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    try request.headers.append("Content-Type", "application/json");
+    request.body = "{";
+    var http_context = httpx.Context.init(alloc, io, &request);
+    defer http_context.deinit();
+    http_context.route_data = &route;
+    http_context.application_deadline_ns = platform_time.monotonicNs() +| 60 * std.time.ns_per_s;
+    ports.reject_start = true;
+    var overloaded = try linkedInferenceHttpHandler(&http_context);
+    defer overloaded.deinit();
+    try std.testing.expectEqual(@as(u16, 503), overloaded.status.code);
+    try std.testing.expectEqualStrings("1", overloaded.headers.get("Retry-After").?);
+    try std.testing.expectEqual(@as(usize, 2), ports.starts);
+    try std.testing.expect(!ports.active);
+    ports.reject_start = false;
+    for ([_]bool{ false, true }) |reject_return| {
+        ports.reject_return = reject_return;
+        ports.parks = 0;
+        ports.enters = 0;
+        if (reject_return) {
+            try std.testing.expectError(error.Forbidden, linkedInferenceHttpHandler(&http_context));
+        } else {
+            var response = try linkedInferenceHttpHandler(&http_context);
+            defer response.deinit();
+            try std.testing.expect(response.status.code >= 400);
+            try std.testing.expect(response.body != null and response.body.?.len > 0);
+        }
+        try std.testing.expectEqual(http_context.application_deadline_ns, ports.deadline_ns);
+        try std.testing.expect(ports.native_deadline and !ports.has_clock_io);
+        try std.testing.expectEqual(@as(usize, 2), ports.parks);
+        try std.testing.expectEqual(@as(usize, 2), ports.enters);
+        try std.testing.expectEqual(ports.starts, ports.finishes);
+        try std.testing.expect(!ports.active);
+    }
+    ports.reject_return = false;
+    ports.parks = 0;
+    ports.enters = 0;
+    http_context.application_deadline_ns = 1;
+    try std.testing.expectError(error.Timeout, linkedInferenceHttpHandler(&http_context));
+    try std.testing.expectEqual(ports.starts, ports.finishes);
+    try std.testing.expect(!ports.active);
+    // An executor-clock deadline has its original authority on the owner,
+    // while the native provider ABI receives only the remaining budget.
+    http_context.application_deadline_io = io;
+    http_context.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds))) +| 60 * std.time.ns_per_s;
+    ports.parks = 0;
+    ports.enters = 0;
+    const before_native = platform_time.monotonicNs();
+    const converted = linkedInferenceHttpNativeDeadline(&http_context).?;
+    try std.testing.expect(converted > before_native);
+    try std.testing.expect(converted <= platform_time.monotonicNs() +| 60 * std.time.ns_per_s);
+    var clock_response = try linkedInferenceHttpHandler(&http_context);
+    defer clock_response.deinit();
+    try std.testing.expect(clock_response.status.code >= 400);
+    try std.testing.expectEqual(http_context.application_deadline_ns, ports.deadline_ns);
+    try std.testing.expect(!ports.native_deadline and ports.has_clock_io);
+    try std.testing.expectEqual(@as(usize, 2), ports.parks);
+    try std.testing.expectEqual(@as(usize, 2), ports.enters);
+    try std.testing.expectEqual(ports.starts, ports.finishes);
+    http_context.application_deadline_ns = 1;
+    ports.parks = 0;
+    ports.enters = 0;
+    try std.testing.expect(linkedInferenceHttpNativeDeadline(&http_context).? <= platform_time.monotonicNs());
+    try std.testing.expectError(error.Timeout, linkedInferenceHttpHandler(&http_context));
+    try std.testing.expect(!ports.native_deadline and ports.has_clock_io);
+    try std.testing.expectEqual(ports.starts, ports.finishes);
+    try std.testing.expect(!ports.active);
+    functions.destroy(frontend_handle.?);
+    frontend_destroyed = true;
+    inference_host.linkedInferenceDestroy(handle.?);
+    destroyed = true;
+    try std.testing.expectEqual(@as(usize, 0), ports.refs);
+}
+
 test "standalone table storage defaults persist for object tables across reopen and recreate" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -15484,6 +16082,412 @@ test "system catalog standalone relation coordinator startup surfaces terminal s
     const work = try store.relationReconciliationWork(group_ids.main_metadata_group_id);
     try std.testing.expect(work.published_epoch == null);
     try std.testing.expectEqual(.name_conflict, work.current.?.failure);
+}
+
+test "controlled metadata read provider rejects expiry before standalone state access" {
+    var metadata: LocalStandaloneMetadata = undefined;
+    const request: LocalStandaloneMetadata.LifecycleRequest = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, LocalStandaloneMetadata.getBackupCohort(&metadata, std.testing.allocator, 1, request));
+    try std.testing.expectError(error.DeadlineExceeded, LocalStandaloneMetadata.getRestoreStaging(&metadata, std.testing.allocator, @splat(1), request));
+    try std.testing.expectError(error.DeadlineExceeded, LocalStandaloneMetadata.getRestoreStagingProgress(&metadata, std.testing.allocator, @splat(1), request));
+    try std.testing.expectError(error.DeadlineExceeded, LocalStandaloneMetadata.getRestoreStagingReceipt(&metadata, std.testing.allocator, @splat(1), .importing, 7001, request));
+    try std.testing.expectError(error.DeadlineExceeded, LocalStandaloneMetadata.getRestoreStagingAuthority(&metadata, std.testing.allocator, .{ .node_id = 1, .plan_id = @splat(1) }, request));
+}
+
+fn inferenceBootstrapMemoryParent(comptime compiled: bool, storage: anytype, root: anytype) !antfly.resource_manager.ResourceManager.MemoryParent {
+    return if (compiled) try storage.memoryParent() else root.memoryParentPort();
+}
+
+pub fn qualifyWorkerBootstrapMemoryParent() !void {
+    if (!builtin.is_test) @compileError("bootstrap qualification is test-only");
+    var root = antfly.resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    defer root.deinit(std.testing.allocator);
+    var storage_child = antfly.resource_manager.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer storage_child.deinit(std.testing.allocator);
+    try storage_child.installMemoryParent(root.memoryParentPort());
+    const Storage = struct {
+        parent: antfly.resource_manager.ResourceManager.MemoryParent,
+        calls: usize = 0,
+        fn memoryParent(self: *@This()) !antfly.resource_manager.ResourceManager.MemoryParent {
+            self.calls += 1;
+            return self.parent;
+        }
+    };
+    var storage: Storage = .{ .parent = storage_child.memoryParentPort() };
+    const compiled = try inferenceBootstrapMemoryParent(true, &storage, undefined);
+    const legacy = try inferenceBootstrapMemoryParent(false, undefined, &root);
+    try std.testing.expectEqual(@as(usize, 1), storage.calls);
+    // Distinct callback contexts preserve local cache reclamation, but both
+    // paths spend the same ancestor budget and publish on its pressure event.
+    try std.testing.expect(compiled.ptr == @as(*anyopaque, @ptrCast(&storage_child)));
+    try std.testing.expect(legacy.ptr == @as(*anyopaque, @ptrCast(&root)));
+    try std.testing.expectEqual(antfly.resource_manager.ResourceManager.MemoryParent.ReserveResult.reserved, compiled.try_reserve_fn.?(compiled.ptr, 100));
+    try std.testing.expectEqual(@as(u64, 100), root.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(antfly.resource_manager.ResourceManager.MemoryParent.ReserveResult.denied, legacy.try_reserve_fn.?(legacy.ptr, 1));
+    compiled.release_fn(compiled.ptr, 100);
+    try std.testing.expectEqual(@as(u64, 0), storage_child.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), root.snapshot().memory.used_bytes);
+    try std.testing.expect(inference_bridge.validContext(inference_bridge.CreateContext, inference_bridge.abi_version, @sizeOf(inference_bridge.CreateContext)));
+    try std.testing.expect(!inference_bridge.validContext(inference_bridge.CreateContext, 38, @sizeOf(inference_bridge.CreateContext)));
+    try std.testing.expect(!inference_bridge.validContext(inference_bridge.CreateContext, inference_bridge.abi_version, @offsetOf(inference_bridge.CreateContext, "bootstrap_memory_parent")));
+}
+
+pub fn qualifyWorkerTransientMemoryBridge() !void {
+    if (!builtin.is_test) @compileError("worker transient bridge qualification is test-only");
+    const rpc = @import("antfly_inference_worker_rpc");
+    var manager = try antfly.resource_manager.metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var owner = InferenceResourceBudgetOwner{ .alloc = std.testing.allocator, .manager = &manager };
+    defer owner.deinit();
+    const port = inference_bridge.ResourceBudget{
+        .abi_version = inference_bridge.abi_version,
+        .context = &owner,
+        .retain_context = retainInferenceResourceOwner,
+        .release_context = releaseInferenceResourceOwner,
+        .reserve_admission = reserveInferenceResources,
+        .retain_admission = retainInferenceResources,
+        .transfer_admission = transferInferenceResources,
+        .release_admission = releaseInferenceResources,
+        .observe_prompt_cache = observeInferencePromptCache,
+        .observe_tokenizer_cache = observeInferenceTokenizerCache,
+        .adjust_transient_host = adjustInferenceTransientHost,
+    };
+    const budget = try rpc.PayloadBudget.create(std.testing.allocator, .{});
+    var anchored = true;
+    defer if (anchored) budget.releaseOwner();
+    try budget.configureExternal(.{ .context = port.context, .retain = port.retain_context, .release = port.release_context, .adjust = port.adjust_transient_host.? });
+    const alloc = budget.retainedAllocator();
+    const bytes = try alloc.dupe(u8, "owned after client");
+    var live = true;
+    defer if (live) alloc.free(bytes);
+    try std.testing.expectEqual(@as(u64, bytes.len), antfly.resource_manager.metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(u64, bytes.len), owner.transient_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), owner.outstanding_admission_leases.load(.acquire));
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 100));
+    budget.releaseOwner();
+    anchored = false;
+    try std.testing.expectEqual(@as(usize, 2), owner.references.load(.acquire));
+    try std.testing.expectEqualStrings("owned after client", bytes);
+    alloc.free(bytes);
+    live = false;
+    try std.testing.expectEqual(@as(u64, 0), antfly.resource_manager.metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(u64, 0), owner.transient_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+fn provisionInferenceControlTestMetadata(owner: *InferenceResourceBudgetOwner, payload_bytes: u64) !void {
+    if (!builtin.is_test) @compileError("control metadata fixture is test-only");
+    owner.manager.memory.budget.hard_limit_bytes = 0;
+    const empty: inference_bridge.AdmissionAmounts = .{ .host_weight_bytes = 0, .backend_weight_bytes = 0, .host_kv_bytes = 0, .backend_kv_bytes = 0, .host_scratch_bytes = 0, .backend_scratch_bytes = 0 };
+    var tokens: [2]usize = @splat(0);
+    defer for (tokens) |token| releaseInferenceResources(owner, token);
+    for (&tokens) |*token| {
+        const status = reserveInferenceResources(owner, &empty, token);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    }
+    try std.testing.expect(owner.observeTokenizerCache(999, 0, 1));
+    try std.testing.expect(owner.observeTokenizerCache(999, 1, 0));
+    try std.testing.expect(owner.observePromptCache(999, 0, 1));
+    try std.testing.expect(owner.observePromptCache(999, 1, 0));
+    // Publish an envelope containing all actually retained metadata plus the
+    // tiny payload allowance used by this fixture. No metadata is exempted.
+    owner.manager.memory.budget.hard_limit_bytes = owner.manager.snapshot().memory.used_bytes + payload_bytes;
+}
+
+test "standalone worker transient bridge batch transfer and exhausted namespace preserve exact owners" {
+    const alloc = std.testing.allocator;
+    var manager = try antfly.resource_manager.metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var owner: InferenceResourceBudgetOwner = .{ .alloc = alloc, .manager = &manager };
+    defer owner.deinit();
+    try provisionInferenceControlTestMetadata(&owner, 100);
+    const Values = struct {
+        fn amounts(kv: usize, scratch: usize) inference_bridge.AdmissionAmounts {
+            return .{ .host_weight_bytes = 0, .backend_weight_bytes = 0, .host_kv_bytes = kv, .backend_kv_bytes = 0, .host_scratch_bytes = scratch, .backend_scratch_bytes = 0 };
+        }
+    };
+    var source: usize = 0;
+    var destination: usize = 0;
+    try std.testing.expect(reserveInferenceResources(&owner, &Values.amounts(60, 40), &source).isOk());
+    defer releaseInferenceResources(&owner, source);
+    try std.testing.expect(reserveInferenceResources(&owner, &Values.amounts(0, 0), &destination).isOk());
+    defer releaseInferenceResources(&owner, destination);
+    const epoch_port = manager.memoryParentPort();
+    const epoch = epoch_port.epoch_fn(epoch_port.ptr);
+    const before = manager.snapshot();
+    try std.testing.expect(owner.lease_pool_mutex.tryLock());
+    const busy = transferInferenceResources(&owner, source, destination, &Values.amounts(20, 10));
+    owner.lease_pool_mutex.unlock();
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, inference_bridge.errorFromStatus(busy));
+    try std.testing.expect(!transferInferenceResources(&owner, source, destination, &Values.amounts(61, 0)).isOk());
+    try std.testing.expect(!transferInferenceResources(&owner, source, source, &Values.amounts(0, 0)).isOk());
+    try std.testing.expect(transferInferenceResources(&owner, source, destination, &Values.amounts(20, 10)).isOk());
+    try std.testing.expectEqualDeep(before, manager.snapshot());
+    try std.testing.expectEqual(epoch, epoch_port.epoch_fn(epoch_port.ptr));
+    try std.testing.expectEqual(@as(usize, 2), owner.outstanding_admission_leases.load(.acquire));
+    releaseInferenceResources(&owner, source);
+    const stale = source;
+    source = 0;
+    try std.testing.expectEqual(@as(u64, 30), antfly.resource_manager.metadata_fixture.payloadUsage(&manager));
+    try std.testing.expect(!transferInferenceResources(&owner, stale, destination, &Values.amounts(0, 0)).isOk());
+    releaseInferenceResources(&owner, destination);
+    destination = 0;
+    try std.testing.expectEqual(@as(u64, 0), antfly.resource_manager.metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(usize, 0), owner.outstanding_admission_leases.load(.acquire));
+    owner.next_lease_token = std.math.maxInt(usize);
+    var last: usize = 0;
+    try std.testing.expect(reserveInferenceResources(&owner, &Values.amounts(0, 0), &last).isOk());
+    try std.testing.expectEqual(std.math.maxInt(usize), last);
+    releaseInferenceResources(&owner, last);
+    var unpublished: usize = 999;
+    const exhausted = reserveInferenceResources(&owner, &Values.amounts(0, 0), &unpublished);
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, inference_bridge.errorFromStatus(exhausted));
+    try std.testing.expectEqual(@as(usize, 0), unpublished);
+    try std.testing.expectEqual(@as(u64, 0), antfly.resource_manager.metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(usize, 0), owner.active_leases.count());
+}
+
+test "standalone control metadata charges provisional and cached lease records until physical free" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var parent = antfly.resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 } });
+    defer parent.deinit(a);
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var owner: InferenceResourceBudgetOwner = .{ .alloc = backing.allocator(), .manager = &manager };
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    const lease = try owner.acquireLease();
+    owner.recycleLease(lease);
+    const physical = backing.allocated_bytes - backing.freed_bytes;
+    try std.testing.expect(physical >= @sizeOf(InferenceAdmissionLease));
+    try std.testing.expectEqual(physical, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(physical, parent.snapshot().memory.used_bytes);
+    const allocations = backing.alloc_index;
+    const reused = try owner.acquireLease();
+    owner.recycleLease(reused);
+    try std.testing.expectEqual(allocations, backing.alloc_index);
+    try std.testing.expectEqual(physical, manager.snapshot().memory.used_bytes);
+    owner.deinit();
+    owner_live = false;
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+test "standalone control metadata refuses provisional records at the common cap before backing allocation" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .identity_allocator = a, .identity_metadata_limit_bytes = 64 });
+    defer manager.deinit(a);
+    var owner: InferenceResourceBudgetOwner = .{ .alloc = backing.allocator(), .manager = &manager };
+    defer owner.deinit();
+    try std.testing.expect(@sizeOf(InferenceAdmissionLease) > 64);
+    if (owner.acquireLease()) |lease| {
+        owner.recycleLease(lease);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), backing.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.active_leases.count());
+    try std.testing.expect(owner.free_leases == null);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "standalone control metadata wrapper and common observer tables share physical ownership" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var parent = antfly.resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 } });
+    defer parent.deinit(a);
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .identity_allocator = backing.allocator() });
+    var manager_live = true;
+    defer if (manager_live) manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var owner: InferenceResourceBudgetOwner = .{ .alloc = backing.allocator(), .manager = &manager };
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    try std.testing.expect(owner.observeTokenizerCache(11, 0, 7));
+    var observed = true;
+    defer if (observed) std.debug.assert(owner.observeTokenizerCache(11, 7, 0));
+    const physical = backing.allocated_bytes - backing.freed_bytes;
+    try std.testing.expectEqual(physical + 7, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(physical + 7, parent.snapshot().memory.used_bytes);
+    try std.testing.expect(owner.observeTokenizerCache(11, 7, 0));
+    observed = false;
+    try std.testing.expectEqual(physical, manager.snapshot().memory.used_bytes);
+    owner.deinit();
+    owner_live = false;
+    const retained = backing.allocated_bytes - backing.freed_bytes;
+    try std.testing.expectEqual(retained, manager.snapshot().memory.used_bytes);
+    manager.deinit(a);
+    manager_live = false;
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+test "standalone control metadata concurrent provisional and cached records cannot oversubscribe the shared cap" {
+    const a = std.testing.allocator;
+    const Gate = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        proceed: std.atomic.Value(bool) = .init(false),
+        fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.proceed.load(.acquire)) std.atomic.spinLoopHint();
+            return std.testing.allocator.rawAlloc(len, alignment, ra);
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+    };
+    const Worker = struct {
+        owner: *InferenceResourceBudgetOwner,
+        lease: ?*InferenceAdmissionLease = null,
+        failure: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.lease = self.owner.acquireLease() catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .identity_allocator = a, .identity_metadata_limit_bytes = @sizeOf(InferenceAdmissionLease) });
+    defer manager.deinit(a);
+    var gate: Gate = .{};
+    var first: InferenceResourceBudgetOwner = .{ .alloc = gate.allocator(), .manager = &manager };
+    var first_live = true;
+    defer if (first_live) first.deinit();
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var second: InferenceResourceBudgetOwner = .{ .alloc = backing.allocator(), .manager = &manager };
+    defer second.deinit();
+    var worker = Worker{ .owner = &first };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer {
+        gate.proceed.store(true, .release);
+        if (!joined) thread.join();
+        if (worker.lease) |lease| first.recycleLease(lease);
+    }
+    while (!gate.entered.load(.acquire)) {
+        if (worker.done.load(.acquire)) return worker.failure orelse error.TestUnexpectedResult;
+        std.atomic.spinLoopHint();
+    }
+    // The accounting mutex must be available while backing allocation waits.
+    const unlocked = manager.mutex.tryLock();
+    if (unlocked) manager.mutex.unlock();
+    try std.testing.expect(unlocked);
+    try std.testing.expectEqual(@as(u64, @sizeOf(InferenceAdmissionLease)), manager.snapshot().memory.used_bytes);
+    if (second.acquireLease()) |lease| {
+        second.recycleLease(lease);
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, err);
+    try std.testing.expectEqual(@as(usize, 0), backing.allocated_bytes);
+    gate.proceed.store(true, .release);
+    thread.join();
+    joined = true;
+    const lease = worker.lease orelse return worker.failure orelse error.TestUnexpectedResult;
+    first.recycleLease(lease);
+    worker.lease = null;
+    // A cached record remains a physical owner even with no published token.
+    try std.testing.expectEqual(@as(u64, @sizeOf(InferenceAdmissionLease)), manager.snapshot().memory.used_bytes);
+    first.deinit();
+    first_live = false;
+    const successor = try second.acquireLease();
+    second.recycleLease(successor);
+    try std.testing.expectEqual(@as(u64, @sizeOf(InferenceAdmissionLease)), manager.snapshot().memory.used_bytes);
+}
+
+test "standalone control metadata identity table backing failure preserves public OOM without publication" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .identity_allocator = backing.allocator() });
+    defer manager.deinit(a);
+    var owner: InferenceResourceBudgetOwner = .{ .alloc = a, .manager = &manager };
+    defer owner.deinit();
+    const amounts: inference_bridge.AdmissionAmounts = .{ .host_weight_bytes = 1, .backend_weight_bytes = 0, .host_kv_bytes = 0, .backend_kv_bytes = 0, .host_scratch_bytes = 0, .backend_scratch_bytes = 0 };
+    var token: usize = 999;
+    try std.testing.expectEqual(error.OutOfMemory, inference_bridge.errorFromStatus(reserveInferenceResources(&owner, &amounts, &token)));
+    try std.testing.expectEqual(@as(usize, 0), token);
+    try std.testing.expectEqual(@as(usize, 0), owner.active_leases.count());
+    try std.testing.expectEqual(@as(u32, 0), manager.batch_reservation_identities.map.count());
+    try std.testing.expect(owner.free_leases != null);
+    try std.testing.expectEqual(@as(u64, @sizeOf(InferenceAdmissionLease)), manager.snapshot().memory.used_bytes);
+}
+
+test "standalone control metadata concurrency burst returns idle capacity for subsequent work" {
+    const a = std.testing.allocator;
+    const burst = 80;
+    const bytes = burst * @sizeOf(InferenceAdmissionLease);
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = bytes }, .identity_allocator = a });
+    defer manager.deinit(a);
+    var owner: InferenceResourceBudgetOwner = .{ .alloc = backing.allocator(), .manager = &manager };
+    defer owner.deinit();
+    var records: [burst]?*InferenceAdmissionLease = @splat(null);
+    defer for (records) |record| if (record) |lease| owner.recycleLease(lease);
+    for (&records) |*record| record.* = try owner.acquireLease();
+    try std.testing.expectEqual(@as(u64, bytes), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(!manager.reserveExternal(1));
+    for (&records) |*record| {
+        owner.recycleLease(record.*.?);
+        record.* = null;
+    }
+    const retained = backing.allocated_bytes - backing.freed_bytes;
+    try std.testing.expect(retained < bytes);
+    try std.testing.expectEqual(retained, manager.snapshot().memory.used_bytes);
+    const admitted = manager.reserveExternal(1);
+    defer if (admitted) manager.releaseExternal(1);
+    try std.testing.expect(admitted);
+}
+
+test "standalone control metadata wrapper growth admits overlap before allocation and preserves old observers on refusal" {
+    const a = std.testing.allocator;
+    var grown_wrapper_bytes: u64 = 0;
+    for ([_]bool{ false, true }) |limited| {
+        var backing = std.testing.FailingAllocator.init(a, .{});
+        var manager = antfly.resource_manager.ResourceManager.init(.{ .identity_allocator = backing.allocator() });
+        defer manager.deinit(a);
+        var owner: InferenceResourceBudgetOwner = .{ .alloc = backing.allocator(), .manager = &manager };
+        defer owner.deinit();
+        var count: usize = 0;
+        defer while (count > 0) {
+            std.debug.assert(owner.observeTokenizerCache(count, 1, 0));
+            count -= 1;
+        };
+        try std.testing.expect(owner.observeTokenizerCache(1, 0, 1));
+        count = 1;
+        while (owner.tokenizer_cache_observers.available > 0) {
+            try std.testing.expect(owner.observeTokenizerCache(count + 1, 0, 1));
+            count += 1;
+        }
+        if (limited) {
+            // The final wrapper would fit with the current root table, but
+            // both wrapper allocations must coexist until copying completes.
+            manager.identity_metadata_limit_bytes = manager.identity_metadata_bytes + grown_wrapper_bytes;
+            const before = manager.snapshot().memory.used_bytes;
+            const allocations = backing.alloc_index;
+            try std.testing.expect(!owner.observeTokenizerCache(count + 1, 0, 1));
+            try std.testing.expectEqual(allocations, backing.alloc_index);
+            try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(count, owner.tokenizer_cache_observers.count());
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+            manager.identity_metadata_limit_bytes = 64 * 1024 * 1024;
+        }
+        try std.testing.expect(owner.observeTokenizerCache(count + 1, 0, 1));
+        count += 1;
+        if (!limited) grown_wrapper_bytes = manager.control_object_bytes;
+        const physical = backing.allocated_bytes - backing.freed_bytes;
+        try std.testing.expectEqual(physical + count, manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(grown_wrapper_bytes, manager.control_object_bytes);
+    }
 }
 
 test "system catalog native memory ownership provisions privately and survives standalone restart" {

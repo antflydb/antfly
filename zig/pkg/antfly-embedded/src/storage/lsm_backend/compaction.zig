@@ -1266,6 +1266,7 @@ fn pureDomain(run: Run, partition: *const fn ([]const u8) []const u8) bool {
 /// the active version; callers hold the backend mutex, and publication drops
 /// this index before another planner can observe the new run set.
 pub const DomainIndex = struct {
+    retired_next: ?*DomainIndex = null,
     order: []usize,
     runs: []Run,
     ends: []usize,
@@ -5111,6 +5112,38 @@ fn installOwnedTreeRuns(backend: anytype, plan: CompactionPlan, selected_len: us
     try job.publishLocked(backend, input_bytes, start_ns);
 }
 
+/// The normal detached flush owns its captured immutable inputs until this
+/// coupled handoff completes. Preparation/rebase and output retirement release
+/// Backend.mu; only the final candidate validation/swap runs under that guard.
+/// This does not yet authorize CPU admission around legacy metadata operators.
+pub fn publishFlushRuns(backend: anytype, outputs: *std.ArrayListUnmanaged(Run)) !void {
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    var job = try Publication.initAppend(backend, outputs.items.len);
+    job.next = backend.active_compaction_publications;
+    backend.active_compaction_publications = &job;
+    defer {
+        job.finishLocked(backend, outputs);
+        var link = &backend.active_compaction_publications;
+        while (link.*.? != &job) link = &link.*.?.next;
+        link.* = job.next;
+    }
+    try job.prepareAppendRetirementLocked(backend);
+    job.controlled_append = true;
+    while (true) {
+        const ready = try job.advanceLocked(backend, outputs.items);
+        backend.directory_planning_slices +|= 1;
+        if (ready) break;
+        if (backend.manifestCoordinationIo()) |io| {
+            runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+            const yielded = io.sleep(.fromNanoseconds(1), .awake);
+            _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+            try yielded;
+        }
+    }
+    try job.publishLocked(backend, 0, backend.writeStatsNowNs());
+}
+
 /// Caller holds Backend.mu; large metadata destruction yields off-lock.
 pub fn discardOutputRunsLocked(comptime BackendType: type, backend: *BackendType, runs: *std.ArrayListUnmanaged(Run)) void {
     if (comptime @hasDecl(BackendType, "initOutputCleanup")) {
@@ -7269,122 +7302,7 @@ const PersistedRunCursor = struct {
     }
 };
 
-const StateMergeHeap = struct {
-    allocator: std.mem.Allocator,
-    states: []const *const State,
-    positions: []usize,
-    sources: []usize,
-    advanced_sources: []usize,
-    cursors: []State.EntryCursor,
-    len: usize = 0,
-
-    fn init(allocator: std.mem.Allocator, states: []const *const State) !StateMergeHeap {
-        const positions = try allocator.alloc(usize, states.len);
-        errdefer allocator.free(positions);
-        @memset(positions, 0);
-        const sources = try allocator.alloc(usize, states.len);
-        errdefer allocator.free(sources);
-        const advanced_sources = try allocator.alloc(usize, states.len);
-        errdefer allocator.free(advanced_sources);
-        const cursors = try allocator.alloc(State.EntryCursor, states.len);
-        errdefer allocator.free(cursors);
-        @memset(cursors, .{});
-        var heap = StateMergeHeap{
-            .allocator = allocator,
-            .states = states,
-            .positions = positions,
-            .sources = sources,
-            .advanced_sources = advanced_sources,
-            .cursors = cursors,
-        };
-        // The allocation errdefers own cleanup until the heap is returned.
-        for (states, 0..) |state, source| {
-            if (state.entryCount() != 0) try heap.pushSource(source);
-        }
-        return heap;
-    }
-
-    pub fn deinit(self: *StateMergeHeap) void {
-        self.allocator.free(self.positions);
-        self.allocator.free(self.sources);
-        self.allocator.free(self.advanced_sources);
-        self.allocator.free(self.cursors);
-        self.* = undefined;
-    }
-
-    fn peekSource(self: *const StateMergeHeap) ?usize {
-        return if (self.len == 0) null else self.sources[0];
-    }
-
-    fn currentEntry(self: *const StateMergeHeap, source: usize) lsm_table_file.Entry {
-        return tableEntryFromOwnedEntry(self.cursors[source].at(self.states[source], self.positions[source]));
-    }
-
-    fn advanceTopSourcesAtKey(self: *StateMergeHeap, key_entry: lsm_table_file.Entry) !usize {
-        var advanced_len: usize = 0;
-        while (self.peekSource()) |source| {
-            if (compareTableEntry(self.currentEntry(source), key_entry) != .eq) break;
-            _ = self.popSource();
-            self.positions[source] += 1;
-            self.advanced_sources[advanced_len] = source;
-            advanced_len += 1;
-        }
-        for (self.advanced_sources[0..advanced_len]) |source| {
-            if (self.positions[source] < self.states[source].entryCount()) try self.pushSource(source);
-        }
-        return advanced_len;
-    }
-
-    fn pushSource(self: *StateMergeHeap, source: usize) !void {
-        std.debug.assert(self.len < self.sources.len);
-        self.sources[self.len] = source;
-        self.len += 1;
-        try self.siftUp(self.len - 1);
-    }
-
-    fn popSource(self: *StateMergeHeap) usize {
-        std.debug.assert(self.len != 0);
-        const source = self.sources[0];
-        self.len -= 1;
-        if (self.len > 0) {
-            self.sources[0] = self.sources[self.len];
-            self.siftDown(0) catch unreachable;
-        }
-        return source;
-    }
-
-    fn siftUp(self: *StateMergeHeap, start_index: usize) !void {
-        var index = start_index;
-        while (index > 0) {
-            const parent = (index - 1) / 2;
-            if (!self.sourceLess(self.sources[index], self.sources[parent])) break;
-            std.mem.swap(usize, &self.sources[index], &self.sources[parent]);
-            index = parent;
-        }
-    }
-
-    fn siftDown(self: *StateMergeHeap, start_index: usize) !void {
-        var index = start_index;
-        while (true) {
-            const left = index * 2 + 1;
-            if (left >= self.len) break;
-            const right = left + 1;
-            var child = left;
-            if (right < self.len and self.sourceLess(self.sources[right], self.sources[left])) child = right;
-            if (!self.sourceLess(self.sources[child], self.sources[index])) break;
-            std.mem.swap(usize, &self.sources[child], &self.sources[index]);
-            index = child;
-        }
-    }
-
-    fn sourceLess(self: *const StateMergeHeap, lhs_source: usize, rhs_source: usize) bool {
-        const order = compareTableEntry(self.currentEntry(lhs_source), self.currentEntry(rhs_source));
-        if (order != .eq) return order == .lt;
-        // Callers pass newest to oldest, so the lower source index wins a
-        // duplicate key and is emitted before all older copies are advanced.
-        return lhs_source < rhs_source;
-    }
-};
+pub const StateMergeHeap = @import("state_merge.zig").Heap;
 
 const PersistedRunMergeHeap = struct {
     allocator: std.mem.Allocator,

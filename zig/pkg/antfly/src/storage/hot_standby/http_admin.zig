@@ -141,6 +141,17 @@ pub const Server = struct {
             binding: seed_artifact.LifecycleBinding,
         ) anyerror!SeedCaptureResult,
 
+        run_controlled_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, seed_artifact.LifecycleBinding, @import("operation_admission.zig").Control) anyerror!SeedCaptureResult = null,
+
+        pub fn runWithAdmission(self: SeedCaptureHook, alloc: Allocator, slot_name: []const u8, generation: []const u8, binding: seed_artifact.LifecycleBinding, control: ?@import("operation_admission.zig").Control) !SeedCaptureResult {
+            if (control) |original| {
+                try original.execution.checkLifetime();
+                const callback = self.run_controlled_fn orelse return error.ExecutionWaitUnsupported;
+                return callback(self.ptr, alloc, slot_name, generation, binding, original);
+            }
+            return self.run(alloc, slot_name, generation, binding);
+        }
+
         pub fn run(
             self: SeedCaptureHook,
             alloc: Allocator,
@@ -323,7 +334,11 @@ pub const Server = struct {
         var primary_fence_lease: ?mutation_barrier.MutationBarrier.ExclusiveLease = null;
         if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.hot_standby_fence)) {
             if (self.auth.primary_fence_barrier) |barrier| {
-                primary_fence_lease = barrier.acquireExclusive();
+                primary_fence_lease = if (req.admission) |control| blk: {
+                    var admission: @import("operation_admission.zig").Session = .{};
+                    try admission.bind(control);
+                    break :blk try admission.acquireExclusive(barrier);
+                } else barrier.acquireExclusive();
             }
         }
         defer if (primary_fence_lease) |*lease| lease.release();
@@ -896,11 +911,12 @@ pub const Server = struct {
             .target_pvc_uid = parsed.value.target_pvc_uid,
         };
 
-        var result = hook.run(
+        var result = hook.runWithAdmission(
             self.alloc,
             parsed.value.slot_name,
             parsed.value.generation,
             binding,
+            req.admission,
         ) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
@@ -2596,6 +2612,9 @@ fn standbyUpstreamErrorStatus(err: anyerror) u16 {
 
 fn commandErrorStatus(err: anyerror) u16 {
     return switch (err) {
+        error.Canceled => 499,
+        error.Timeout, error.DeadlineExceeded => 504,
+        error.ExecutionWaitUnsupported, error.ResourceTemporarilyUnavailable, error.SchedulerFull, error.SchedulerClosed => 503,
         error.PrimaryUnavailable,
         error.StandbyUnavailable,
         error.FenceStoreUnavailable,

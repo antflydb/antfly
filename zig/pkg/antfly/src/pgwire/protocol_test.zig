@@ -53,7 +53,15 @@ const Mock = struct {
     saw_statement_unchanged: bool = false,
     entered: ?*std.Io.Event = null,
     blocked: bool = false,
+    consumer_active: bool = false,
+    consumer_deliveries: usize = 0,
+    consumer_polls: usize = 0,
+    consumer_cancel_at: usize = std.math.maxInt(usize),
     stream_rows: usize = 0,
+    retain_stream_allocator: bool = false,
+    retained_stream_allocator: ?std.mem.Allocator = null,
+    retained_stream_bytes: ?[]u8 = null,
+    retained_limit_after_pull: ?*@import("budget.zig").Shared = null,
     stream_cells: bool = false,
     stream_page_begin: usize = 0,
     expected_stream_statement: ?[]const u8 = null,
@@ -136,7 +144,7 @@ const Mock = struct {
         }
         return result;
     }
-    fn openStream(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !?backend.ReadStream {
+    fn openStream(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !?backend.ReadStream {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (std.mem.indexOf(u8, request.statement, "application_name") != null or std.mem.indexOf(u8, request.statement, "client_encoding") != null) self.setting_stream_opens += 1;
         if (self.receipt_budget_fallback and std.mem.startsWith(u8, request.statement, "SELECT")) {
@@ -156,6 +164,10 @@ const Mock = struct {
         try request.check();
         if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, if (self.catalog_rebind) "current-catalog-binding" else "immutable-catalog-binding") else false;
+        if (self.retain_stream_allocator) {
+            self.retained_stream_bytes = try alloc.dupe(u8, "stable-snapshot");
+            self.retained_stream_allocator = alloc;
+        }
         return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream, .detach = detachStream, .validate = validateStream };
     }
     fn detachStream(raw: *anyopaque) void {
@@ -174,6 +186,13 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         try request.check();
         self.stream_pulls += 1;
+        if (self.retained_stream_allocator) |owner| {
+            // This allocation uses the OPEN-time arena, after portal-map growth.
+            const scratch = try owner.dupe(u8, "reader-resume");
+            owner.free(scratch);
+            try std.testing.expectEqualStrings("stable-snapshot", self.retained_stream_bytes.?);
+        }
+        if (self.retained_limit_after_pull) |budget| budget.limit = budget.used.load(.acquire);
         if (self.stream_fail_at) |at| if (self.stream_offset >= at) return error.QueryCanceled;
         const count = @min(wanted, self.stream_rows - self.stream_offset);
         if (self.stream_cells) {
@@ -191,7 +210,7 @@ const Mock = struct {
     }
     fn releaseStreamPage(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
-        std.debug.assert(self.stream_live_pages > 0);
+        std.debug.assert(self.stream_live_pages > 0 and !self.consumer_active);
         self.stream_live_pages -= 1;
     }
     fn streamCell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !backend.Cell {
@@ -204,6 +223,11 @@ const Mock = struct {
         std.debug.assert(self.releases == 0);
         std.debug.assert(self.stream_live_pages == 0);
         self.stream_closes += 1;
+        if (self.retained_stream_allocator) |owner| {
+            owner.free(self.retained_stream_bytes.?);
+            self.retained_stream_bytes = null;
+            self.retained_stream_allocator = null;
+        }
     }
     fn authenticate(raw: *anyopaque, _: std.mem.Allocator, user: []const u8, password: []const u8) !backend.Identity {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -2190,6 +2214,133 @@ test "pgwire separate cancel authenticates secret and works at connection capaci
     try std.testing.expect(mock.canceled.load(.acquire));
 }
 
+test "pgwire retained quota rejects prepare before execution and keeps connection usable" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "too-large", "SELECT n FROM t", false);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{ .retained_bytes = 16 });
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    try std.testing.expectEqual(@as(usize, 1), mock.disconnects);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "SELECT") != null);
+}
+
+test "pgwire retained aggregate exhaustion permits Close Sync and reclaims portal snapshot" {
+    const alloc = std.testing.allocator;
+    var retained: @import("budget.zig").Shared = .{ .child = alloc, .limit = 1 << 20 };
+    var mock: Mock = .{ .stream_rows = 20, .retained_limit_after_pull = &retained };
+    var input = std.Io.Writer.Allocating.init(alloc);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "SELECT n FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 1);
+    // The first pull tightens the aggregate cap to current usage before the next Parse.
+    try parse(&input.writer, "q2", "SELECT n FROM t", false);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'C', "Pp\x00");
+    try frame(&input.writer, 'C', "Sq\x00");
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(alloc);
+    defer output.deinit();
+    var session: protocol.Session = .{ .alloc = alloc, .io = std.testing.io, .source = mock.source(), .reader = &reader, .writer = &output.writer, .retained_shared = &retained };
+    var closed = false;
+    defer if (!closed) session.deinit();
+    try session.run();
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_pulls);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expect(retained.used.load(.acquire) < retained.limit);
+    const messages = try tags(alloc, output.written());
+    defer alloc.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "3"));
+    session.deinit();
+    closed = true;
+    try std.testing.expectEqual(@as(usize, 0), retained.used.load(.acquire));
+}
+
+test "pgwire idle transaction expiry disconnects and joins normal session cleanup" {
+    var mock: Mock = .{};
+    var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = .{ .idle_timeout_ms = 5000, .idle_transaction_timeout_ms = 30 } });
+    defer listener.deinit();
+    const stream = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+    defer stream.close(std.testing.io);
+    var buffer: [1024]u8 = undefined;
+    var reader = stream.reader(std.testing.io, &buffer);
+    _ = try clientStartup(stream, &reader.interface);
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    var writer = stream.writer(std.testing.io, &.{});
+    try writer.interface.writeAll(input.written());
+    try writer.interface.flush();
+    while (true) {
+        const tag = try reader.interface.takeByte();
+        const len = try reader.interface.takeInt(u32, .big);
+        const body = try reader.interface.readAlloc(std.testing.allocator, len - 4);
+        defer std.testing.allocator.free(body);
+        if (tag == 'Z') {
+            try std.testing.expectEqualStrings("T", body);
+            break;
+        }
+    }
+    // The listener closes the idle transaction well before the 5s connection deadline.
+    const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    try std.testing.expectError(error.EndOfStream, reader.interface.takeByte());
+    try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).nanoseconds - start < std.time.ns_per_s);
+    listener.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.disconnects);
+    try std.testing.expectEqual(@as(usize, 1), mock.releases);
+}
+
+test "pgwire retained arena address survives portal map growth and cursor declaration return" {
+    for ([_]bool{ false, true }) |cursor| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (cursor) {
+            try frame(&input.writer, 'Q', "BEGIN\x00");
+            try frame(&input.writer, 'Q', "DECLARE c CURSOR FOR SELECT n FROM t\x00");
+            try frame(&input.writer, 'Q', "FETCH 1 FROM c\x00");
+            try frame(&input.writer, 'Q', "FETCH ALL FROM c\x00");
+            try frame(&input.writer, 'Q', "CLOSE c\x00");
+            try frame(&input.writer, 'Q', "ROLLBACK\x00");
+        } else {
+            try parse(&input.writer, "q", "SELECT n FROM t", false);
+            try bind(&input.writer, "p", "q", null);
+            try execute(&input.writer, "p", 1);
+            // Grow/reallocate the portal map while p owns a suspended reader.
+            for (0..12) |index| {
+                var name: [16]u8 = undefined;
+                const named = try std.fmt.bufPrint(&name, "extra-{d}", .{index});
+                try bind(&input.writer, named, "q", null);
+            }
+            try execute(&input.writer, "p", 0);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 10, .retain_stream_allocator = true };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, messages, "D"));
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expect(mock.retained_stream_allocator == null);
+    }
+}
 test "pgwire accepted lake visibility follows transaction savepoint and prepared execution scope" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -2514,5 +2665,53 @@ test "pgwire typed cells match column-aware materialized text and binary frames"
         defer a.free(failures);
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, failures, "D"));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, failures, "E"));
+    }
+}
+
+test "pgwire consumer held cursor materialization retires before page release and commit" {
+    const Delivery = struct {
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const mock: *Mock = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(mock.consumer_active and mock.stream_live_pages == 1);
+            mock.consumer_polls += 1;
+            if (mock.consumer_polls == mock.consumer_cancel_at) return error.Cancelled;
+        }
+        fn run(raw: *anyopaque, _: backend.Identity, request: backend.Request, work: backend.DeliveryWork) !void {
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            try std.testing.expect(request.completion_drain);
+            try std.testing.expectEqualStrings("SELECT n FROM t", request.statement);
+            mock.consumer_deliveries += 1;
+            mock.consumer_active = true;
+            defer mock.consumer_active = false;
+            try work.run(work.context, .{ .ptr = mock, .checkpoint = checkpoint });
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{ "BEGIN\x00", "DECLARE rows SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00", "COMMIT\x00" }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    for ([_]bool{ false, true }) |cancel| {
+        var mock: Mock = .{ .stream_rows = 2, .stream_cells = true, .consumer_cancel_at = if (cancel) 12 else std.math.maxInt(usize) };
+        var source = mock.source();
+        var vtable = source.vtable.*;
+        vtable.deliver_row = Delivery.run;
+        source.vtable = &vtable;
+        var reader = std.Io.Reader.fixed(input.written());
+        var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer output.deinit();
+        {
+            var session: protocol.Session = .{ .alloc = std.testing.allocator, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+            defer session.deinit();
+            try session.run();
+        }
+        try std.testing.expectEqual(@as(usize, 1), mock.consumer_deliveries);
+        try std.testing.expect(!mock.consumer_active);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, if (cancel) 1 else 2), mock.executions);
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, @intFromBool(cancel)), std.mem.count(u8, messages, "E"));
     }
 }

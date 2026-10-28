@@ -1,0 +1,21 @@
+{
+  "state": "terminal",
+  "exit_code": 0,
+  "selected_tests": 45,
+  "passed": 35,
+  "skipped": 10,
+  "failed": 0,
+  "source_sha256": {
+    "zig/lib/httpx/src/net/socket.zig": "4b8e0872368dca58a86d354aa573f2f42f2b15532c03d5c28b4d4c9cd4116286",
+    "zig/lib/httpx/src/util/common.zig": "5baac932275002d819ae55d201f0ec9dff1b28b7f684f6c7df0824dac059b76a",
+    "zig/lib/httpx/src/server/server.zig": "a7a97d72e84b275d45015e9bc52cbfcb74eaffad80d6031ea9cc90063ac360a0",
+    "zig/lib/httpx/src/protocol/h2_connection.zig": "8767de4bb41297f24401df4d33cfc319c63c54f2a60144d7c831db0fae470c1d",
+    "zig/lib/runtime/src/runtime_http_bridge.zig": "301065a831d30b9bce6616bd448c424a354786d52abf7e319c5e64b7d054d7c7",
+    "zig/build.zig": "23aec190effb2c1a352a2c0074ae8e64557ed6807702f5dc4112c30cc9400612",
+    "zig/lib/httpx/src/httpx.zig": "277ffdac9b9aaf0c5da757496dd5566ceae613e40b3ab57fd2a3ec43033d4600",
+    "zig/lib/json/src/mod.zig": "63867c1f746b5dbb6dcf0945bd938fd8f5d5b4a5548b578d31ad422b40ac20d3",
+    "zig/pkg/antfly/src/standalone/runtime.zig": "e86148922e4600767f7ace19b9ef8e12ad7bc96c86cd3abbc0bb8c2f3720591a"
+  },
+  "hash_capture": "After native completion; matches GNU launch source hashes. Runtime bridge and standalone recorded for provenance, not compiled by this library gate.",
+  "command": "Native ReleaseSafe zig test with the same filters, root and dependencies as linux-result.json."
+}

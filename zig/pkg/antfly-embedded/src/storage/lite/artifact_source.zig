@@ -21,7 +21,7 @@ const std = @import("std");
 const native = @import("native.zig");
 const docs = @import("docstore.zig");
 const Source = @import("../../segment_source.zig").Source;
-const limits = @import("antfly_runtime_fs").threaded_io_limits;
+const OwnedIo = @import("../owned_io.zig").Owner;
 const Allocator = std.mem.Allocator;
 
 const key_prefix = native.NativeFile.artifact_lease_key_prefix;
@@ -29,7 +29,7 @@ const marker_prefix = ".aflite-lease-";
 
 pub const Registry = struct {
     allocator: Allocator,
-    io_impl: std.Io.Threaded,
+    io_owner: *OwnedIo,
     path: []u8,
     store: ?*docs.Store,
     publication_guard: ?std.Io.File = null,
@@ -46,8 +46,9 @@ pub const Registry = struct {
         errdefer allocator.destroy(self);
         const path = try allocator.dupe(u8, store.file.path);
         errdefer allocator.free(path);
-        self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .store = store };
-        errdefer self.io_impl.deinit();
+        const owner = try OwnedIo.create(allocator, store.resource_manager);
+        errdefer owner.destroy();
+        self.* = .{ .allocator = allocator, .io_owner = owner, .path = path, .store = store };
         if (!store.read_only) self.publication_guard = try openPublicationGuard(allocator, self.io(), path);
         return self;
     }
@@ -61,7 +62,7 @@ pub const Registry = struct {
     }
 
     fn io(self: *Registry) std.Io {
-        return self.io_impl.io();
+        return self.io_owner.io();
     }
 
     fn release(self: *Registry) void {
@@ -69,14 +70,15 @@ pub const Registry = struct {
         std.debug.assert(self.first == null);
         std.debug.assert(self.callbacks == 0);
         std.debug.assert(self.retired_bytes.load(.acquire) == 0);
-        if (self.publication_guard) |guard| guard.close(self.io());
-        self.io_impl.deinit();
-        if (self.owned_resources) |owner| {
-            owner.manager.deinit(owner.allocator);
-            owner.allocator.destroy(owner.manager);
-        }
-        self.allocator.free(self.path);
-        self.allocator.destroy(self);
+        const owner = self.io_owner;
+        owner.join();
+        if (self.publication_guard) |guard| guard.close(std.Io.Threaded.global_single_threaded.io());
+        const resources = self.owned_resources;
+        const allocator = self.allocator;
+        allocator.free(self.path);
+        allocator.destroy(self);
+        owner.destroy();
+        if (resources) |value| value.manager.releaseOwned(value.allocator);
     }
 
     // Store close detaches before acquiring any Store lock. A callback uses

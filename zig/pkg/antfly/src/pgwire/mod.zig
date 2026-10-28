@@ -21,6 +21,9 @@ pub const Server = server.Server;
 pub const start = server.start;
 
 test {
+    // Keep protocol-owned tests discoverable even when a compile filter skips
+    // protocol_test fixtures that would otherwise instantiate Session.
+    _ = protocol;
     _ = @import("budget.zig");
     _ = @import("values.zig");
     _ = @import("protocol_test.zig");

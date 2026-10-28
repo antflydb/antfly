@@ -17,14 +17,16 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 6;
+pub const version: u32 = 16;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
 pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
-pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache, document_store };
+pub const Operation = enum { initialize, configure, provider, http, reserve, retain, transfer, release, prompt_cache, tokenizer_cache, transient_host, document_store };
 pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };
 pub const Event = struct {
+    /// Absolute process-monotonic ceiling projected before the child callback.
+    deadline_ns: ?u64 = null,
     kind: enum { progress, stream_start, stream_write, stream_close },
     status: u16 = 200,
     headers: []const Header = &.{},
@@ -180,7 +182,71 @@ pub const Provider = struct {
     deadline_ns: ?u64,
     numeric: bool,
     attachment_refs: []const AttachmentRef,
+    admitted_cpu_slots: u32 = 0,
+    phase_handoff: bool = false,
+
+    pub fn validate(self: Provider) !void {
+        if (self.admitted_cpu_slots > 65535 or (self.phase_handoff and self.admitted_cpu_slots == 0)) return error.InvalidRunnableDemand;
+    }
 };
+
+pub fn admittedCpuSlots(context: anytype) !u32 {
+    if (context.runnable) |borrow| {
+        try borrow.validate();
+        if (context.admitted_cpu_slots != 0) return error.InvalidArgument;
+        if (borrow.cpu_slots > 65535) return error.InvalidRunnableDemand;
+        return @intCast(borrow.cpu_slots);
+    }
+    if (context.admitted_cpu_slots > 65535) return error.InvalidRunnableDemand;
+    return context.admitted_cpu_slots;
+}
+
+test "inference worker CPU budget serializes demand without parent callback pointers" {
+    const Trap = struct {
+        fn check(_: *anyopaque) callconv(.c) bridge.Status {
+            @panic("must not call borrowed checkpoint while encoding");
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) bridge.Status {
+            @panic("must not call borrowed transition while encoding");
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var borrowed = bridge.runnable_abi.Borrowed{ .context = @ptrFromInt(8), .cpu_slots = 2, .parent_class = @backingInt(bridge.runnable_abi.Class.query), .checkpoint = Trap.check, .park = Trap.transition, .enter = Trap.transition };
+    var response: ?*anyopaque = null;
+    var json = bridge.String.init("");
+    var context = bridge.ProviderInvokeContext{ .abi_version = bridge.abi_version, .handle = @ptrFromInt(16), .operation = @backingInt(bridge.ProviderOperation.embed_dense_texts), .request_json = .init("{}"), .deadline_ns = 1234, .has_deadline = 1, .out_response_handle = &response, .out_response_json = &json, .runnable = &borrowed };
+    const input = try ProviderInput.init(arena.allocator(), &context);
+    const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), input.options, .{});
+    const decoded = try std.json.parseFromSliceLeaky(Provider, arena.allocator(), encoded, .{});
+    try decoded.validate();
+    try std.testing.expectEqual(@as(u32, 2), decoded.admitted_cpu_slots);
+    try std.testing.expect(decoded.phase_handoff);
+    try std.testing.expectEqual(@as(?u64, 1234), decoded.deadline_ns);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "checkpoint") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "context") == null);
+    context.admitted_cpu_slots = 1;
+    try std.testing.expectError(error.InvalidArgument, admittedCpuSlots(&context));
+    context.admitted_cpu_slots = 0;
+    borrowed.cpu_slots = 0;
+    try std.testing.expectError(error.InvalidRunnableDemand, ProviderInput.init(std.testing.allocator, &context));
+    borrowed.cpu_slots = 65536;
+    try std.testing.expectError(error.InvalidRunnableDemand, admittedCpuSlots(&context));
+    context.runnable = null;
+    context.admitted_cpu_slots = 65536;
+    try std.testing.expectError(error.InvalidRunnableDemand, admittedCpuSlots(&context));
+    var invalid = decoded;
+    invalid.admitted_cpu_slots = 65536;
+    try std.testing.expectError(error.InvalidRunnableDemand, invalid.validate());
+    invalid = decoded;
+    invalid.admitted_cpu_slots = 0;
+    try std.testing.expectError(error.InvalidRunnableDemand, invalid.validate());
+    context.admitted_cpu_slots = 1;
+    const scalar = try ProviderInput.init(arena.allocator(), &context);
+    try std.testing.expect(!scalar.options.phase_handoff);
+    context.admitted_cpu_slots = 0;
+    try std.testing.expectEqual(@as(u32, 0), try admittedCpuSlots(&context));
+}
 
 /// Only descriptors enter JSON; image/raster bytes remain borrowed segments.
 pub const ProviderInput = struct {
@@ -188,6 +254,7 @@ pub const ProviderInput = struct {
     body: attachments.EncodedSegments,
 
     pub fn init(arena: std.mem.Allocator, context: *const bridge.ProviderInvokeContext) !ProviderInput {
+        const cpu_slots = try admittedCpuSlots(context);
         if ((context.binary_payloads == null and context.binary_payloads_len != 0) or
             (context.attachment_refs == null and context.attachment_refs_len != 0)) return error.InvalidInput;
         if (context.binary_payloads_len > provider_attachment_limits.max_attachments) return error.BodyTooLarge;
@@ -209,7 +276,7 @@ pub const ProviderInput = struct {
         }
         if (try attachments.encodedSize(context.request_json.slice(), payloads) > @import("antfly_inference_worker_rpc").max_body_bytes) return error.BodyTooLarge;
         return .{
-            .options = .{ .operation = context.operation, .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null, .numeric = context.out_numeric_result != null, .attachment_refs = refs },
+            .options = .{ .operation = context.operation, .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null, .numeric = context.out_numeric_result != null, .attachment_refs = refs, .admitted_cpu_slots = cpu_slots, .phase_handoff = context.runnable != null },
             .body = try attachments.encodeSegmentsAlloc(arena, context.request_json.slice(), payloads),
         };
     }
@@ -277,6 +344,15 @@ pub const Http = struct {
     params: []const Header,
     has_body: bool,
     stream_body: bool = false,
+    deadline_ns: ?u64 = null,
+    admitted_cpu_slots: u32 = 0,
+    phase_handoff: bool = false,
+
+    pub fn validate(self: Http) !void {
+        if (self.admitted_cpu_slots > 65535 or
+            (self.phase_handoff and self.admitted_cpu_slots == 0))
+            return error.InvalidRunnableDemand;
+    }
 };
 
 pub const native_checkpoint_upload_limit: usize = 2 * 1024 * 1024 * 1024 + 2 * 1024 * 1024 + 128;
@@ -288,6 +364,7 @@ pub fn nativeCheckpointResume(method: http.HttpMethod, path: []const u8) bool {
 
 pub const HttpResponse = struct { status: u16, headers: []const Header };
 pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmounts };
+pub const Transfer = struct { source: usize, destination: usize, amounts: bridge.AdmissionAmounts };
 pub const Observation = struct { key: usize, previous: u64, next: u64 };
 
 test "inference worker logical body limit matches the public HTTP contract" {
@@ -404,6 +481,35 @@ fn checkNumericRoundTrip(alloc: std.mem.Allocator) !void {
 
 test "inference worker typed numeric responses preserve ownership under allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkNumericRoundTrip, .{});
+}
+
+test "inference worker HTTP requires valid scalar demand for acknowledged phases" {
+    var input = Http{
+        .route = "/ai/v1/generate",
+        .method = .post,
+        .path = "/ai/v1/generate",
+        .query = null,
+        .headers = &.{},
+        .params = &.{},
+        .has_body = false,
+        .deadline_ns = 1234,
+        .phase_handoff = true,
+    };
+    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
+    input.admitted_cpu_slots = 2;
+    try input.validate();
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, input, .{});
+    defer std.testing.allocator.free(encoded);
+    const decoded = try std.json.parseFromSlice(Http, std.testing.allocator, encoded, .{});
+    defer decoded.deinit();
+    try decoded.value.validate();
+    try std.testing.expectEqual(@as(?u64, 1234), decoded.value.deadline_ns);
+    try std.testing.expectEqual(@as(u32, 2), decoded.value.admitted_cpu_slots);
+    try std.testing.expect(decoded.value.phase_handoff);
+    input.admitted_cpu_slots = 65536;
+    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
+    input.phase_handoff = false;
+    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
 }
 
 pub const DocumentStoreRequest = struct { capability: [16]u8, metadata: []const u8 };

@@ -1719,7 +1719,77 @@ pub fn handleNativeTableBatch(alloc: std.mem.Allocator, table_name: []const u8, 
     return executeOwnedTableBatch(alloc, table_name, .{ .req = req, .writes = @constCast(req.writes), .deletes = @constCast(req.deletes) }, api);
 }
 
+/// Reserve every mandatory post-acceptance response before invoking storage.
+/// Counts are fixed by the request; all other fields have a bounded vocabulary.
+/// Each body keeps its exact allocation length so existing response ownership
+/// and HTTP adapters need no alternate allocator or capacity convention.
+const MandatoryBatchResponses = struct {
+    const Kind = enum { committed, pending, repair, ambiguous, ambiguous_with_id, graph_repair, ha_pending, write_unknown, internal_failure };
+    bodies: [@typeInfo(Kind).@"enum".field_names.len]?[]u8 = @splat(null),
+
+    fn init(alloc: std.mem.Allocator, request: batch_api.OwnedBatchRequest) !MandatoryBatchResponses {
+        var self: MandatoryBatchResponses = .{};
+        errdefer self.deinit(alloc);
+        self.bodies[@backingInt(Kind.committed)] = try batch_api.encodeBatchResponse(alloc, request.result());
+        self.bodies[@backingInt(Kind.pending)] = try batch_api.encodeBatchResponse(alloc, request.resultWithStatus("committed_pending"));
+        self.bodies[@backingInt(Kind.repair)] = try batch_api.encodeBatchResponse(alloc, request.resultWithStatus("committed_repair_required"));
+        self.bodies[@backingInt(Kind.ambiguous)] = try std.json.Stringify.valueAlloc(alloc, .{
+            .code = "transaction_outcome_unknown",
+            .message = "transaction outcome is unknown; do not replay this stateless batch because it may already have committed",
+            .retryable = false,
+            .recovery = "use an explicit transaction session for client-retryable commits",
+        }, .{});
+        self.bodies[@backingInt(Kind.ambiguous_with_id)] = try std.json.Stringify.valueAlloc(alloc, .{
+            .code = "transaction_outcome_unknown",
+            .message = "transaction outcome is unknown; do not replay this stateless batch because it may already have committed",
+            .retryable = false,
+            .transaction_id = "00000000000000000000000000000000",
+            .recovery = "use an explicit transaction session for client-retryable commits",
+        }, .{});
+        self.bodies[@backingInt(Kind.graph_repair)] = try batch_api.encodeBatchResponse(alloc, request.resultWithFailure(.{
+            .code = "graph_metric_materialization_rejected",
+            .message = "graph metric materialization exceeded the serverless work budget; narrow the graph or metric edge filter, then update the metric configuration to rebuild",
+            .reason = "build_budget_exceeded",
+            .retryable = false,
+        }));
+        self.bodies[@backingInt(Kind.ha_pending)] = try alloc.dupe(u8, "write committed locally; standby durability acknowledgment pending");
+        self.bodies[@backingInt(Kind.write_unknown)] = try alloc.dupe(u8, "write outcome unknown");
+        self.bodies[@backingInt(Kind.internal_failure)] = try alloc.dupe(u8, "{\"error\":\"InternalFailure\",\"message\":\"batch failed\"}");
+        return self;
+    }
+
+    fn take(self: *MandatoryBatchResponses, kind: Kind) []u8 {
+        const index = @backingInt(kind);
+        const body = self.bodies[index] orelse unreachable;
+        self.bodies[index] = null;
+        return body;
+    }
+
+    fn ambiguous(self: *MandatoryBatchResponses, id: ?[32]u8) []u8 {
+        const txn_id = id orelse return self.take(.ambiguous);
+        // This private metadata is an encoded 16-byte transaction identity,
+        // not arbitrary JSON text. Patching its fixed hexadecimal slot keeps
+        // serialization allocation-free after the commit outcome is known.
+        for (txn_id) |byte| std.debug.assert(std.ascii.isHex(byte));
+        const body = self.take(.ambiguous_with_id);
+        const marker = "\"transaction_id\":\"";
+        const offset = (std.mem.indexOf(u8, body, marker) orelse unreachable) + marker.len;
+        @memcpy(body[offset..][0..32], &txn_id);
+        return body;
+    }
+
+    fn deinit(self: *MandatoryBatchResponses, alloc: std.mem.Allocator) void {
+        for (&self.bodies) |*body| {
+            if (body.*) |bytes| alloc.free(bytes);
+            body.* = null;
+        }
+    }
+};
+
 fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batch_req: batch_api.OwnedBatchRequest, api: TableApi) !OwnedResponse {
+    try api.request.ensureActive();
+    var mandatory = try MandatoryBatchResponses.init(alloc, batch_req);
+    defer mandatory.deinit(alloc);
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
         error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },
@@ -1783,50 +1853,34 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         },
         error.HAWriteDurabilityPending => return .{
             .status = 503,
-            .body = try alloc.dupe(u8, "write committed locally; standby durability acknowledgment pending"),
+            .body = mandatory.take(.ha_pending),
         },
         error.OutcomeUnknown => return .{
             // An ambiguous commit is a stable, non-retryable application
             // outcome, not an internal server failure. Include the immutable
             // transaction identity for logs/support and reconciliation.
             .status = 409,
-            .body = if (takeLastAmbiguousBatchTxnId()) |txn_id| try std.json.Stringify.valueAlloc(alloc, .{
-                .code = "transaction_outcome_unknown",
-                .message = "transaction outcome is unknown; do not replay this stateless batch because it may already have committed",
-                .retryable = false,
-                .transaction_id = txn_id[0..],
-                .recovery = "use an explicit transaction session for client-retryable commits",
-            }, .{}) else try std.json.Stringify.valueAlloc(alloc, .{
-                .code = "transaction_outcome_unknown",
-                .message = "transaction outcome is unknown; do not replay this stateless batch because it may already have committed",
-                .retryable = false,
-                .recovery = "use an explicit transaction session for client-retryable commits",
-            }, .{}),
+            .body = mandatory.ambiguous(takeLastAmbiguousBatchTxnId()),
             .json = true,
         },
         error.CommittedPending => return .{
             .status = 202,
-            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_pending")),
+            .body = mandatory.take(.pending),
             .json = true,
         },
         error.CommittedRepairRequired => return .{
             .status = 202,
-            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_repair_required")),
+            .body = mandatory.take(.repair),
             .json = true,
         },
         error.CommittedGraphMetricMaterializationRejected => return .{
             .status = 202,
-            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithFailure(.{
-                .code = "graph_metric_materialization_rejected",
-                .message = "graph metric materialization exceeded the serverless work budget; narrow the graph or metric edge filter, then update the metric configuration to rebuild",
-                .reason = "build_budget_exceeded",
-                .retryable = false,
-            })),
+            .body = mandatory.take(.graph_repair),
             .json = true,
         },
         // Do not use a retryable 5xx: clients must reconcile an ambiguous
         // commit result instead of blindly replaying non-idempotent transforms.
-        error.WriteOutcomeUnknown => return .{ .status = 409, .body = try alloc.dupe(u8, "write outcome unknown") },
+        error.WriteOutcomeUnknown => return .{ .status = 409, .body = mandatory.take(.write_unknown) },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ExternalLakeReadOnly => return .{ .status = 400, .body = try alloc.dupe(u8, "external lake tables are read-only") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
@@ -1838,10 +1892,10 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             const error_name = takeLastBatchFailureName() orelse @errorName(error.InternalFailure);
             return .{
                 .status = 500,
-                .body = try std.json.Stringify.valueAlloc(alloc, .{
+                .body = std.json.Stringify.valueAlloc(alloc, .{
                     .@"error" = error_name,
                     .message = "batch failed",
-                }, .{}),
+                }, .{}) catch mandatory.take(.internal_failure),
                 .json = true,
             };
         },
@@ -1849,7 +1903,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
 
     return .{
         .status = 201,
-        .body = try batch_api.encodeBatchResponse(alloc, batch_req.result()),
+        .body = mandatory.take(.committed),
         .json = true,
     };
 }
@@ -6711,6 +6765,143 @@ test "public table graph metric action handler returns status response" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(backend.called);
     try std.testing.expectEqualStrings("{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}", resp.body);
+}
+
+test "public table batch mandatory responses reserve before native acceptance and survive allocator exhaustion" {
+    const Attempts = struct {
+        child: std.mem.Allocator,
+        allocations: usize = 0,
+        resizes: usize = 0,
+        remaps: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocations += 1;
+            return self.child.rawAlloc(len, alignment, ra);
+        }
+        fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.resizes += 1;
+            return self.child.rawResize(memory, alignment, len, ra);
+        }
+        fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.remaps += 1;
+            return self.child.rawRemap(memory, alignment, len, ra);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.child.rawFree(memory, alignment, ra);
+        }
+    };
+    const Backend = struct {
+        failing: *std.testing.FailingAllocator,
+        attempts: *Attempts,
+        internal_diagnostic: bool = false,
+        attempts_at_acceptance: [3]usize = @splat(0),
+        err: ?TableApi.ExecuteBatchError,
+        with_id: bool,
+        calls: usize = 0,
+        allocations_at_acceptance: usize = 0,
+        resizes_at_acceptance: usize = 0,
+        retained_at_acceptance: usize = 0,
+
+        fn iface(self: *@This()) TableApi {
+            return .{ .ptr = self, .request = .{}, .vtable = &.{
+                .execute_table_batch = execute,
+                .execute_table_query_request = unsupportedQueryRequest,
+                .execute_table_query_view = unsupportedQueryView,
+                .execute_table_backup = unsupportedBackup,
+                .execute_table_restore = unsupportedRestore,
+                .execute_table_list_indexes = unsupportedListIndexes,
+                .execute_table_get_index = unsupportedGetIndex,
+                .execute_table_create_index = unsupportedCreateIndex,
+                .execute_table_delete_index = unsupportedDeleteIndex,
+            } };
+        }
+
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, table: []const u8, request: db_mod.types.BatchRequest, _: operation.RequestContext) TableApi.ExecuteBatchError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(std.mem.eql(u8, table, "docs"));
+            std.debug.assert(request.writes.len == 1);
+            self.calls += 1;
+            self.attempts_at_acceptance = .{ self.attempts.allocations, self.attempts.resizes, self.attempts.remaps };
+            self.allocations_at_acceptance = self.failing.alloc_index;
+            self.resizes_at_acceptance = self.failing.resize_index;
+            self.retained_at_acceptance = self.failing.allocated_bytes - self.failing.freed_bytes;
+            // Exhaust every allocation/grow path at the acceptance boundary.
+            // Returning any mandatory response must use only admitted bytes.
+            self.failing.fail_index = self.failing.alloc_index;
+            self.failing.resize_fail_index = self.failing.resize_index;
+            if (self.internal_diagnostic) setLastBatchFailureName(error.InferenceProviderFailure);
+            if (self.with_id) setLastAmbiguousBatchTxnId("00112233445566778899aabbccddeeff".*);
+            if (self.err) |err| return err;
+        }
+    };
+    const cases = [_]struct { err: ?TableApi.ExecuteBatchError, status: u16, with_id: bool = false, internal_diagnostic: bool = false, marker: []const u8 }{
+        .{ .err = null, .status = 201, .marker = "\"status\":\"committed\"" },
+        .{ .err = error.CommittedPending, .status = 202, .marker = "committed_pending" },
+        .{ .err = error.CommittedRepairRequired, .status = 202, .marker = "committed_repair_required" },
+        .{ .err = error.OutcomeUnknown, .status = 409, .with_id = true, .marker = "00112233445566778899aabbccddeeff" },
+        .{ .err = error.OutcomeUnknown, .status = 409, .marker = "transaction_outcome_unknown" },
+        .{ .err = error.CommittedGraphMetricMaterializationRejected, .status = 202, .marker = "graph_metric_materialization_rejected" },
+        .{ .err = error.HAWriteDurabilityPending, .status = 503, .marker = "write committed locally" },
+        .{ .err = error.WriteOutcomeUnknown, .status = 409, .marker = "write outcome unknown" },
+        .{ .err = error.InternalFailure, .status = 500, .marker = "InternalFailure" },
+        .{ .err = error.InternalFailure, .status = 500, .internal_diagnostic = true, .marker = "InternalFailure" },
+    };
+    for (cases) |case| {
+        var reached_acceptance = false;
+        // Fail each successive reservation allocation, then reach native
+        // entry with an allocator that becomes exhausted inside the callback.
+        for (0..256) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+            var attempts: Attempts = .{ .child = failing.allocator() };
+            var backend = Backend{ .failing = &failing, .attempts = &attempts, .err = case.err, .with_id = case.with_id, .internal_diagnostic = case.internal_diagnostic };
+            const result = handleNativeTableBatch(attempts.allocator(), "docs", .{ .writes = &.{.{ .key = "a", .value = "{}" }} }, backend.iface());
+            if (result) |owned| {
+                var response = owned;
+                try std.testing.expectEqual(@as(usize, 1), backend.calls);
+                try std.testing.expectEqual(case.status, response.status);
+                try std.testing.expect(std.mem.indexOf(u8, response.body, case.marker) != null);
+                const is_internal = if (case.err) |err| err == error.InternalFailure else false;
+                if (is_internal) {
+                    // Detailed diagnostic serialization may fail; mandatory
+                    // error reporting must still succeed from reserved bytes.
+                    try std.testing.expect(attempts.allocations > backend.attempts_at_acceptance[0]);
+                    try std.testing.expect(takeLastBatchFailureName() == null);
+                    try std.testing.expectEqualStrings("{\"error\":\"InternalFailure\",\"message\":\"batch failed\"}", response.body);
+                } else {
+                    // Count every call, including failed attempts. The failing
+                    // allocator's indices count only successful operations.
+                    try std.testing.expectEqual(backend.attempts_at_acceptance, [3]usize{ attempts.allocations, attempts.resizes, attempts.remaps });
+                }
+                try std.testing.expectEqual(backend.allocations_at_acceptance, failing.alloc_index);
+                try std.testing.expectEqual(backend.resizes_at_acceptance, failing.resize_index);
+                try std.testing.expect(backend.retained_at_acceptance <= 2048);
+                const is_ambiguous = if (case.err) |err| err == error.OutcomeUnknown else false;
+                if (is_ambiguous) {
+                    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+                    defer parsed.deinit();
+                    try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+                    if (case.with_id) {
+                        try std.testing.expectEqualStrings("00112233445566778899aabbccddeeff", parsed.value.object.get("transaction_id").?.string);
+                    } else try std.testing.expect(parsed.value.object.get("transaction_id") == null);
+                }
+                response.deinit(attempts.allocator());
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                reached_acceptance = true;
+                break;
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expectEqual(@as(usize, 0), backend.calls);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            }
+        }
+        try std.testing.expect(reached_acceptance);
+    }
 }
 
 test "public table create index explains embedding endpoint access rejection" {

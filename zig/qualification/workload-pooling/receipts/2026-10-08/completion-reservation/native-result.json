@@ -1,0 +1,9 @@
+{
+  "exit_code": 0,
+  "tool_session_id": 56460,
+  "tests_passed": 38,
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "44d9d3f2cd2660c2936504aab3b712b959efd4d55b8f0090f0c5dcdda1bf7a34",
+    "zig/pkg/antfly-embedded/src/common/bounded_admission.zig": "de3752df68796efa72f122cc02ca56b030b367bacfc21fa314b853c21bbaa732"
+  }
+}

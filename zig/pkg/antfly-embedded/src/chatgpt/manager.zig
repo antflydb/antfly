@@ -918,6 +918,10 @@ test "chatgpt manager persists host identity and partitions personal registratio
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     var instance = try Manager.init(a, io, root);
+    if (@import("builtin").os.tag != .windows) {
+        const stat = try tmp.dir.stat(io);
+        try std.testing.expectEqual(@as(u32, 0o700), @backingInt(stat.permissions) & 0o777);
+    }
     var initial = try instance.load(a);
     const host = try a.dupe(u8, initial.value.host_id);
     defer a.free(host);

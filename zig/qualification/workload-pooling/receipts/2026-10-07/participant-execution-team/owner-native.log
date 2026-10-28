@@ -1,0 +1,76 @@
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=4 ends=4
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=34 ends=34
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=37 ends=37
+REAL_SINK await peer EOF
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/2f5fc5f3b6a49d1d734d3e5f47d137da/inference-worker-owner-handoff-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x3597133c --listen=-
+
+antfly-inference-worker-process-output-test
++- run test inference-worker-process-output-tests w
+PROCESS_SINK transport=h1 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=5 ends=5
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h1 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=7 ends=7
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=70 ends=70
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=34 ends=34
+PROCESS_SINK await peer EOF
+failed command: cd /private/tmp/antfly-parent-phase-focused-cache/o/1d4b4ebd9927d5e903a50f4bbb2a4935 && ANTFLY_TEST_WORKER_OUTPUT_FIXTURE=./inference-worker-output-fixture /private/tmp/antfly-parent-phase-focused-cache/o/0113a32c3bf1b04c236c080b532e86fb/inference-worker-process-output-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x3597133c --listen=-
+
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/6729a0d5a8dfcc397737e97d4bb22ef0/http-cleanup-owner-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x3597133c --listen=-
+
+Build Summary: 19/19 steps succeeded; 33/33 tests passed
+antfly-inference-worker-rpc-test success
++- run test inference-worker-rpc-contract-tests cached
+|  +- compile test inference-worker-rpc-contract-tests safe native cached 61ms MaxRSS:31M
+|     +- WriteFile macos-sdk-libc.txt cached
++- run test 6 pass (6 total) 119ms MaxRSS:5M
+   +- compile test safe native success 12s MaxRSS:313M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 22 pass (22 total) 116ms MaxRSS:2M
+   +- compile test inference-owner-handoff-tests safe native success 10s MaxRSS:441M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:7M
+   +- compile test inference-worker-owner-handoff-tests safe native success 14s MaxRSS:393M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-worker-process-output-test success
++- run test inference-worker-process-output-tests 1 pass (1 total) 1s MaxRSS:4M
+   +- compile test inference-worker-process-output-tests safe native success 12s MaxRSS:409M
+   |  +- WriteFile macos-sdk-libc.txt (reused)
+   +- compile exe inference-worker-output-fixture safe native cached 48ms MaxRSS:31M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 361ms MaxRSS:2M
+   +- compile test http-cleanup-owner-tests safe native success 15s MaxRSS:431M
+      +- WriteFile macos-sdk-libc.txt (reused)
+

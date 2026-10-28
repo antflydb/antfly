@@ -622,7 +622,7 @@ fn decodeNamespace(raw: []const u8) !Namespace {
     };
 }
 
-fn encodeVisibilitySummary(summary: VisibilitySummary) [40]u8 {
+pub fn encodeVisibilitySummary(summary: VisibilitySummary) [40]u8 {
     var buf: [40]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], summary.live_ordinals, .big);
     std.mem.writeInt(u64, buf[8..16], summary.tombstone_ordinals, .big);
@@ -658,7 +658,7 @@ fn readVisibilitySummaryTxn(txn: anytype) !?VisibilitySummary {
 /// prefix probes and the ordinal head, once, when its summary is absent.
 /// Existing rows or identities keep an unknown summary unknown; never invent
 /// zero coverage for an upgrade/corrupt populated root.
-fn initialVisibilitySummaryTxn(store: *docstore_mod.DocStore) !?VisibilitySummary {
+fn initialVisibilitySummaryTxn(store: anytype) !?VisibilitySummary {
     // The mutation fast path uses a point-probe transaction, which deliberately
     // does not support cursors. Open a transient snapshot only for this rare
     // missing-summary proof; callers retain the mutation/apply fence.
@@ -667,7 +667,7 @@ fn initialVisibilitySummaryTxn(store: *docstore_mod.DocStore) !?VisibilitySummar
     return try pristineVisibilitySummaryTxn(&txn);
 }
 
-fn pristineVisibilitySummaryTxn(txn: *docstore_mod.DocStore.Txn) !?VisibilitySummary {
+fn pristineVisibilitySummaryTxn(txn: anytype) !?VisibilitySummary {
     if (try readNextOrdinalTxn(txn) != 1) return null;
     // This is a key-only emptiness proof, not an artifact payload read.
     var cursor = try txn.openPhysicalCursorAdapter();
@@ -968,7 +968,7 @@ pub fn resolvedDocSetForIdsAtGenerationWithPolicyTxn(
     return try doc_set.fromOrdinalsWithPolicyAlloc(alloc, ordinals.items, policy);
 }
 
-pub fn fastStatsFromStore(store: *docstore_mod.DocStore) !Stats {
+pub fn fastStatsFromStore(store: anytype) !Stats {
     var txn = try store.beginProbeTxn();
     defer txn.abort();
     const next = try readNextOrdinalTxn(&txn);
@@ -1086,10 +1086,7 @@ fn writeVisibilityChunkTxn(alloc: Allocator, txn: anytype, chunk_id: u32, chunk:
 }
 
 fn appendVisibilityManifestWrite(alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair)) !void {
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, internal_keys.identity_visibility_manifest_key[0..]),
-        .value = try alloc.dupe(u8, visibility_manifest_value[0..]),
-    });
+    try appendIdentityWriteWithOwnedKey(alloc, writes, try alloc.dupe(u8, internal_keys.identity_visibility_manifest_key[0..]), visibility_manifest_value[0..]);
 }
 
 fn appendVisibilityChunkWrite(
@@ -1099,27 +1096,30 @@ fn appendVisibilityChunkWrite(
     chunk_id: u32,
     chunk: *const VisibilityChunk,
 ) !void {
-    const key = internal_keys.identityVisibilityChunkKey(chunk_id);
-    const encoded = try chunk.encodeAlloc(alloc);
-    errdefer alloc.free(encoded);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, key[0..]),
-        .value = encoded,
-    });
-
+    // Each block ends at transfer: later failures must not free values which
+    // already belong to the caller's partial output list.
+    {
+        const key = internal_keys.identityVisibilityChunkKey(chunk_id);
+        const encoded = try chunk.encodeAlloc(alloc);
+        errdefer alloc.free(encoded);
+        const owned_key = try alloc.dupe(u8, &key);
+        errdefer alloc.free(owned_key);
+        try writes.append(alloc, .{ .key = owned_key, .value = encoded });
+    }
     const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(chunk_id);
     if (chunk.deletedCount() == 0) {
         if (deletes) |delete_keys| {
-            try delete_keys.append(alloc, try alloc.dupe(u8, deleted_key[0..]));
+            const owned_key = try alloc.dupe(u8, &deleted_key);
+            errdefer alloc.free(owned_key);
+            try delete_keys.append(alloc, owned_key);
         }
         return;
     }
-    const deleted_encoded = try chunk.encodeDeletedOffsetsAlloc(alloc);
-    errdefer alloc.free(deleted_encoded);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, deleted_key[0..]),
-        .value = deleted_encoded,
-    });
+    const encoded = try chunk.encodeDeletedOffsetsAlloc(alloc);
+    errdefer alloc.free(encoded);
+    const owned_key = try alloc.dupe(u8, &deleted_key);
+    errdefer alloc.free(owned_key);
+    try writes.append(alloc, .{ .key = owned_key, .value = encoded });
 }
 
 fn ensurePendingVisibilityChunkAlloc(
@@ -1130,6 +1130,9 @@ fn ensurePendingVisibilityChunkAlloc(
 ) !*VisibilityChunk {
     const gop = try chunks.getOrPut(alloc, chunk_id);
     if (!gop.found_existing) {
+        // The map is unwound even if observation/decoding rejects this read.
+        // Never expose an uninitialized value to that cleanup.
+        gop.value_ptr.* = .{};
         gop.value_ptr.* = (try readVisibilityChunkTxn(alloc, txn, chunk_id)) orelse .{};
     }
     return gop.value_ptr;
@@ -1231,6 +1234,69 @@ pub fn visibilitySummaryFromWrites(writes: []const docstore_mod.KVPair) !?Visibi
         return try decodeVisibilitySummary(write.value);
     }
     return null;
+}
+
+/// The caller holds apply admission. Capture at most five small metadata roots;
+/// any mapping, state, chunk or unknown identity key is non-pristine. Reuse the
+/// existing validator/statistics on this bounded projection rather than cloning
+/// and traversing the source's entire mutable or historical generation.
+pub fn pristinePortableIdentityFromRead(alloc: Allocator, read: *docstore_mod.DocStore.Txn, control: ?@import("../../common/read_admission.zig").Port) !bool {
+    const keys = [_][]const u8{ &internal_keys.identity_namespace_key, &internal_keys.identity_next_ordinal_key, &internal_keys.identity_visibility_summary_key, &internal_keys.identity_visibility_manifest_key, &internal_keys.identity_live_directory_manifest_key };
+    var values: [keys.len][40]u8 = undefined;
+    var lengths: [keys.len]?usize = @splat(null);
+    var copied: usize = 0;
+    var cursor = if (control) |port| try read.openPhysicalCursorWithAdmission(port) else try read.openPhysicalCursorAdapter();
+    defer cursor.close();
+    const prefix = [_]u8{internal_keys.identity_namespace};
+    var entry = if (control) |port| try cursor.seekAtOrAfterWithAdmission(&prefix, port) else try cursor.seekAtOrAfter(&prefix);
+    while (entry) |row| {
+        if (control) |port| try port.checkpoint();
+        if (!std.mem.startsWith(u8, row.key, &prefix)) break;
+        if (copied == keys.len) return false;
+        var slot: ?usize = null;
+        for (keys, 0..) |key, i| if (std.mem.eql(u8, key, row.key)) {
+            slot = i;
+            break;
+        };
+        const i = slot orelse return false;
+        if (lengths[i] != null) return error.InvalidDocIdentity;
+        // Oversized roots are not a pristine supported identity image. Never
+        // copy an unbounded/corrupt value into the validation projection.
+        if (row.value.len > values[i].len) return false;
+        @memcpy(values[i][0..row.value.len], row.value);
+        lengths[i] = row.value.len;
+        copied += 1;
+        entry = if (control) |port| try cursor.nextWithAdmission(port) else try cursor.next();
+    }
+    if (control) |port| try port.checkpoint();
+    if (copied == 0) return true;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var projection = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer projection.close();
+    // This private image must preserve even malformed source bytes for the
+    // identity validator. Normal DocStore writes also maintain retained-effect
+    // metadata and may reject a damaged namespace before validation can run.
+    {
+        var write = try projection.runtime_store.beginWrite();
+        errdefer write.abort();
+        for (keys, lengths, 0..) |key, length, i| if (length) |len| {
+            if (control) |port| try port.checkpoint();
+            try write.put(key, values[i][0..len]);
+        };
+        try write.commit();
+    }
+    validateStoreAlloc(alloc, &projection) catch |err| switch (err) {
+        error.InvalidDocIdentity => return false,
+        else => return err,
+    };
+    if (control) |port| try port.checkpoint();
+    const stats = try fullStatsFromStore(&projection);
+    if (control) |port| try port.checkpoint();
+    return stats.next_ordinal == 1 and stats.allocated_ordinals == 0 and
+        stats.state_rows == 0 and stats.live_ordinals == 0 and stats.tombstone_ordinals == 0 and
+        stats.visibility_chunks == 0 and stats.visibility_deleted_ordinals == 0 and
+        stats.visibility_mask_bytes == 0 and stats.visibility_repair_count == 0;
 }
 
 pub fn fullStatsFromStore(store: *docstore_mod.DocStore) !Stats {
@@ -2220,7 +2286,7 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
 
 pub fn appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
+    store: anytype,
     namespace: Namespace,
     generation: u64,
     out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -2529,7 +2595,7 @@ fn identityLookupLessThan(_: void, lhs: IdentityLookup, rhs: IdentityLookup) boo
 
 fn appendBatchIdentityMetadataBatchedFastPath(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
+    store: anytype,
     namespace: Namespace,
     generation: u64,
     out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -2954,6 +3020,15 @@ pub fn freeIdentityDeleteKeys(alloc: Allocator, deletes: *std.ArrayListUnmanaged
     deletes.deinit(alloc);
 }
 
+// Takes the key immediately; the caller/output list never share ownership
+// across a fallible value allocation or list growth.
+fn appendIdentityWriteWithOwnedKey(alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair), key: []u8, value: []const u8) !void {
+    errdefer alloc.free(key);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try writes.append(alloc, .{ .key = key, .value = owned_value });
+}
+
 fn appendIdentityWritesForDoc(
     alloc: Allocator,
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -2963,15 +3038,12 @@ fn appendIdentityWritesForDoc(
     live: bool,
 ) !void {
     const doc_to_ordinal = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id);
-    var ordinal_buf = try alloc.alloc(u8, @sizeOf(u32));
-    std.mem.writeInt(u32, ordinal_buf[0..4], ordinal, .big);
-    try writes.append(alloc, .{ .key = doc_to_ordinal, .value = ordinal_buf });
+    var ordinal_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ordinal_buf, ordinal, .big);
+    try appendIdentityWriteWithOwnedKey(alloc, writes, doc_to_ordinal, &ordinal_buf);
 
     const ordinal_to_doc_key = internal_keys.identityOrdinalToDocKey(ordinal);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, ordinal_to_doc_key[0..]),
-        .value = try alloc.dupe(u8, doc_id),
-    });
+    try appendIdentityWriteWithOwnedKey(alloc, writes, try alloc.dupe(u8, &ordinal_to_doc_key), doc_id);
 
     if (live) try appendLiveDocOrdinalWrite(alloc, writes, doc_id, ordinal);
     try appendOrdinalStateWrite(alloc, writes, ordinal, state);
@@ -3005,10 +3077,7 @@ fn appendOrdinalStateWrite(
 ) !void {
     const state_key = internal_keys.identityOrdinalStateKey(ordinal);
     const encoded_state = encodeOrdinalState(state);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, state_key[0..]),
-        .value = try alloc.dupe(u8, encoded_state[0..]),
-    });
+    try appendIdentityWriteWithOwnedKey(alloc, writes, try alloc.dupe(u8, state_key[0..]), encoded_state[0..]);
 }
 
 fn appendCanonicalOrdinalWrite(
@@ -3018,12 +3087,9 @@ fn appendCanonicalOrdinalWrite(
     ordinal: DocOrdinal,
 ) !void {
     const canonical_key = internal_keys.identityCanonicalToOrdinalKey(canonical_doc_id);
-    var value = try alloc.alloc(u8, @sizeOf(u32));
+    var value: [4]u8 = undefined;
     std.mem.writeInt(u32, value[0..4], ordinal, .big);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, canonical_key[0..]),
-        .value = value,
-    });
+    try appendIdentityWriteWithOwnedKey(alloc, writes, try alloc.dupe(u8, canonical_key[0..]), &value);
 }
 
 fn appendVisibilitySummaryWrite(
@@ -3032,10 +3098,7 @@ fn appendVisibilitySummaryWrite(
     summary: VisibilitySummary,
 ) !void {
     const encoded_summary = encodeVisibilitySummary(summary);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, internal_keys.identity_visibility_summary_key[0..]),
-        .value = try alloc.dupe(u8, encoded_summary[0..]),
-    });
+    try appendIdentityWriteWithOwnedKey(alloc, writes, try alloc.dupe(u8, internal_keys.identity_visibility_summary_key[0..]), encoded_summary[0..]);
 }
 
 fn writeVisibilitySummaryTxn(txn: anytype, summary: VisibilitySummary) !void {
@@ -3049,12 +3112,9 @@ fn appendNextOrdinalWrite(
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     next_ordinal: DocOrdinal,
 ) !void {
-    var value = try alloc.alloc(u8, @sizeOf(u32));
+    var value: [4]u8 = undefined;
     std.mem.writeInt(u32, value[0..4], next_ordinal, .big);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, internal_keys.identity_next_ordinal_key[0..]),
-        .value = value,
-    });
+    try appendIdentityWriteWithOwnedKey(alloc, writes, try alloc.dupe(u8, internal_keys.identity_next_ordinal_key[0..]), &value);
 }
 
 fn appendNamespaceWrite(
@@ -3075,6 +3135,39 @@ fn appendNamespaceWrite(
     const value = try alloc.dupe(u8, internal_keys.identity_live_directory_manifest_value);
     errdefer alloc.free(value);
     try writes.append(alloc, .{ .key = key, .value = value });
+}
+
+/// Visit only codec-owned replay generation fields. Canonical IDs, counts,
+/// ordinal offsets and unrelated metadata never become sequence references.
+pub fn visitReplayGenerations(key: []const u8, raw: []const u8, visitor: anytype) !bool {
+    comptime {
+        if (visibility_chunk_header_len != 8 or visibility_chunk_entry_len != 20) @compileError("review identity generation binding after codec layout changes");
+        if (@typeInfo(OrdinalState).@"struct".field_names.len != 3 or @typeInfo(VisibilitySummary).@"struct".field_names.len != 5) @compileError("review identity generation fields");
+    }
+    if (std.mem.eql(u8, key, &internal_keys.identity_visibility_summary_key)) {
+        _ = try decodeVisibilitySummary(raw);
+        try visitor.big(16);
+        try visitor.big(24);
+        try visitor.big(32);
+        return true;
+    }
+    if (key.len == 6 and key[0] == internal_keys.identity_namespace and key[1] == internal_keys.identity_ordinal_state_kind) {
+        const state = try decodeOrdinalState(raw);
+        try visitor.big(8);
+        if (state.deleted_generation != null) try visitor.big(17);
+        return true;
+    }
+    if (internal_keys.parseIdentityVisibilityChunkKey(key) != null) {
+        _ = try VisibilityChunk.encodedStats(raw);
+        const count = std.mem.readInt(u32, raw[4..8], .big);
+        for (0..count) |index| {
+            const offset = visibility_chunk_header_len + index * visibility_chunk_entry_len;
+            try visitor.big(offset + 4);
+            if (raw[offset + 2] == 1) try visitor.big(offset + 12);
+        }
+        return true;
+    }
+    return false;
 }
 
 fn encodeOrdinalState(state: OrdinalState) [25]u8 {
@@ -4576,6 +4669,229 @@ test "namespace reassignment initializes an empty owner's live directory atomica
     try reassignNamespaceAlloc(alloc, &store, replacement);
     try std.testing.expectEqualDeep(replacement, (try loadNamespaceFromStore(&store)).?);
     try validateStoreAlloc(alloc, &store);
+}
+
+const ObservedIdentityFixture = struct {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    backend: Backend = undefined,
+    store: docstore_mod.DocStore = undefined,
+    fn init(self: *@This()) !void {
+        const a = std.testing.allocator;
+        self.backend = Backend.init(a, .{});
+        errdefer self.backend.close();
+        self.store = try docstore_mod.DocStore.openRuntime(a, try self.backend.runtimeStore(a, .{}));
+    }
+    fn deinit(self: *@This()) void {
+        self.store.close();
+        self.backend.close();
+    }
+};
+
+test "prepared transaction effects identity planning owns allocation mapping state and pristine witnesses" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    for (0..3) |mode| {
+        var fixture: ObservedIdentityFixture = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        if (mode == 0) {
+            // An installed namespace without a summary needs an observed
+            // pristine-root proof before inventing zero prior coverage.
+            try writeNamespaceToStore(&fixture.store, default_namespace);
+        } else {
+            var seed: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+            defer freeIdentityWrites(a, &seed);
+            try appendBatchIdentityMetadataForNamespaceAlloc(a, &fixture.store, default_namespace, 1, &seed, &.{"existing"}, &.{}, null);
+            try fixture.store.putBatch(seed.items, &.{});
+        }
+        var captured = reads.Owned.init(a, null);
+        defer captured.deinit();
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            const reader = reads.observe(&fixture.store, &captured);
+            const stats = try fastStatsFromStore(reader);
+            try std.testing.expectEqual(@as(u64, if (mode == 0) 0 else 1), stats.live_ordinals);
+            var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+            var deletes: std.ArrayListUnmanaged([]u8) = .empty;
+            try appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(allocator, reader, default_namespace, 17, &writes, &deletes, if (mode == 0) &.{ "new-a", "new-b" } else if (mode == 1) &.{"new"} else &.{"existing"}, if (mode == 1) &.{"existing"} else &.{});
+            if (mode == 2) try std.testing.expectEqual(@as(usize, 0), writes.items.len) else try std.testing.expect(writes.items.len > 0);
+            try captured.finish();
+        }
+        var owned = try captured.take();
+        defer owned.deinit();
+        try std.testing.expect(owned.points.items.len >= 4);
+        if (mode == 0) try std.testing.expect(owned.cursors.items.len > 0);
+        try owned.validate(&fixture.store, null);
+        // These are the actual branch inputs, including absent canonical/live
+        // mappings, not postimages from the retired preparation arena.
+        for (owned.points.items) |point| {
+            const old = fixture.store.get(a, point.key) catch |err| if (err == error.NotFound) null else return err;
+            defer if (old) |value| a.free(value);
+            try fixture.store.put(point.key, "changed");
+            try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+            if (old) |value| try fixture.store.put(point.key, value) else try fixture.store.delete(point.key);
+            try owned.validate(&fixture.store, null);
+        }
+        if (mode == 0) {
+            const key = try internal_keys.documentKeyAlloc(a, "unexpected");
+            defer a.free(key);
+            try fixture.store.put(key, "{}");
+            try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+        }
+    }
+}
+
+test "prepared transaction effects observed range counting retains legacy rows bounds and counter absence" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    const counts = @import("range_cardinality.zig");
+    for (0..3) |mode| {
+        var fixture: ObservedIdentityFixture = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        if (mode != 0) for ([_][]const u8{ "a", "z" }) |document| {
+            const key = try internal_keys.documentKeyAlloc(a, document);
+            defer a.free(key);
+            try fixture.store.put(key, "{}");
+        };
+        var captured = reads.Owned.init(a, null);
+        defer captured.deinit();
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const reader = reads.observe(&fixture.store, &captured);
+            const range: @import("types.zig").ByteRange = if (mode == 2) .{ .start = "m", .end = "t" } else .{ .start = "", .end = "" };
+            const expected: u64 = if (mode == 1) 2 else 0;
+            if (mode == 0) try std.testing.expectEqual(@as(?u64, 0), try counts.loadOrProveEmpty(arena.allocator(), reader));
+            try std.testing.expectEqual(expected, try counts.loadOrCount(arena.allocator(), reader, range));
+            var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+            try counts.appendIdentityTransitionAlloc(arena.allocator(), reader, range, expected, expected + 1, &writes);
+            try std.testing.expectEqual(expected + 1, try counts.afterIdentityTransition(arena.allocator(), reader, writes.items));
+            try captured.finish();
+        }
+        var owned = try captured.take();
+        defer owned.deinit();
+        try owned.validate(&fixture.store, null);
+        const count: [8]u8 = @splat(0);
+        try fixture.store.put(&internal_keys.range_document_count_key, &count);
+        try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+        try fixture.store.delete(&internal_keys.range_document_count_key);
+        try owned.validate(&fixture.store, null);
+        if (mode == 2) {
+            const outside = try internal_keys.documentKeyAlloc(a, "b");
+            defer a.free(outside);
+            try fixture.store.put(outside, "{}");
+            try owned.validate(&fixture.store, null);
+        }
+        const new_row = try internal_keys.documentKeyAlloc(a, if (mode == 2) "n" else "new");
+        defer a.free(new_row);
+        try fixture.store.put(new_row, "{}");
+        try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+    }
+}
+
+test "prepared transaction effects observed merge planning retains receiver counts state and identity inputs" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    const merge = @import("merge_state.zig");
+    const counts = @import("range_cardinality.zig");
+    const merging = @import("merge_cardinality.zig");
+    var fixture: ObservedIdentityFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var seed: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+    defer freeIdentityWrites(a, &seed);
+    try appendBatchIdentityMetadataForNamespaceAlloc(a, &fixture.store, default_namespace, 1, &seed, &.{"base"}, &.{}, null);
+    try fixture.store.putBatch(seed.items, &.{});
+    var state: std.ArrayListUnmanaged(u8) = .empty;
+    defer state.deinit(a);
+    try merge.encode(&state, a, .{ .transition_id = 7, .donor_group_id = 1, .receiver_group_id = 2, .phase = .accepting, .receiver_base_range = .{ .start = "a", .end = "m" }, .merged_range = .{ .start = "a", .end = "z" } });
+    try fixture.store.put(merge.key, state.items);
+    var record: [17]u8 = @splat(0);
+    std.mem.writeInt(u64, record[0..8], 7, .little);
+    std.mem.writeInt(u64, record[8..16], 1, .little);
+    record[16] = 1;
+    try fixture.store.put(merging.key, &record);
+    try fixture.store.put(&internal_keys.range_document_count_key, record[8..16]);
+    var captured = reads.Owned.init(a, null);
+    defer captured.deinit();
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const reader = reads.observe(&fixture.store, &captured);
+        var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+        try std.testing.expect(try merging.prepare(arena.allocator(), reader, .{}, false, &.{ "base", "donor" }, &.{}, 1, 2, &writes));
+        try std.testing.expectEqual(@as(u64, 2), try counts.afterIdentityTransition(arena.allocator(), reader, writes.items));
+        const raw = (try merge.loadRawAlloc(arena.allocator(), reader)).?;
+        try std.testing.expectEqualSlices(u8, state.items, raw);
+        try captured.finish();
+    }
+    var owned = try captured.take();
+    defer owned.deinit();
+    try owned.validate(&fixture.store, null);
+    for (owned.points.items) |point| {
+        const old = fixture.store.get(a, point.key) catch |err| if (err == error.NotFound) null else return err;
+        defer if (old) |value| a.free(value);
+        try fixture.store.put(point.key, "changed");
+        try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+        if (old) |value| try fixture.store.put(point.key, value) else try fixture.store.delete(point.key);
+        try owned.validate(&fixture.store, null);
+    }
+}
+
+test "prepared transaction effects observed identity scopes unwind every allocation and original rejection" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    const admission = @import("../../common/read_admission.zig");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(allocator: Allocator, store: *docstore_mod.DocStore, checks: ?*@This(), remove_existing: bool) !void {
+            var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var captured = reads.Owned.init(allocator, if (checks != null) admission.Port.init(&payload) else null);
+            defer captured.deinit();
+            var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+            defer freeIdentityWrites(allocator, &writes);
+            var deletes: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (deletes.items) |key| allocator.free(key);
+                deletes.deinit(allocator);
+            }
+            appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(allocator, reads.observe(store, &captured), default_namespace, 17, &writes, &deletes, &.{ "new-a", "new-b" }, if (remove_existing) &.{"existing"} else &.{}) catch |err| return captured.failure orelse err;
+            captured.finish() catch |err| return captured.failure orelse err;
+            var owned = try captured.take();
+            defer owned.deinit();
+        }
+    };
+    for (0..3) |mode| {
+        var fixture: ObservedIdentityFixture = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        try writeNamespaceToStore(&fixture.store, default_namespace);
+        if (mode != 0) {
+            var seed: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+            defer freeIdentityWrites(a, &seed);
+            try appendBatchIdentityMetadataForNamespaceAlloc(a, &fixture.store, default_namespace, 1, &seed, &.{"existing"}, &.{}, null);
+            try fixture.store.putBatch(seed.items, &.{});
+        }
+        const remove_existing = mode == 2;
+        try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &fixture.store, @as(?*Checks, null), remove_existing });
+        var baseline: Checks = .{};
+        try Checks.run(a, &fixture.store, &baseline, remove_existing);
+        try std.testing.expect(baseline.calls > 10);
+        for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+            var checks: Checks = .{ .stop = stop, .cause = cause };
+            try std.testing.expectError(cause, Checks.run(a, &fixture.store, &checks, remove_existing));
+        };
+    }
 }
 
 test "controlled live primary scans cancel within each phase and recover without leaks" {

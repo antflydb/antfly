@@ -221,13 +221,33 @@ pub fn scanPrefixCurrent(alloc: std.mem.Allocator, store: *backend_erased.Store,
 }
 
 pub fn scanPrefix(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix: []const u8) ![]OwnedKVPair {
-    var txn = try store.beginRead();
+    return scanPrefixWithAdmission(alloc, store, prefix, null);
+}
+
+pub fn scanPrefixWithAdmission(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix: []const u8, control: ?@import("../common/read_admission.zig").Port) ![]OwnedKVPair {
+    if (control) |owner| try owner.checkpoint();
+    var txn = if (control) |owner| try store.beginReadWithAdmission(.retain, owner) else try store.beginRead();
     defer txn.abort();
-
-    var cur = try txn.openCursor();
+    var cur = if (control) |owner| try txn.openCursorWithAdmission(owner) else try txn.openCursor();
     defer cur.close();
+    return scanPrefixCursorWithAdmission(alloc, &cur, prefix, control);
+}
 
-    return try scanPrefixCursor(alloc, &cur, prefix);
+/// Original non-yielding admission bounds large copies while a read is pinned.
+pub fn dupeWithAdmission(alloc: std.mem.Allocator, bytes: []const u8, control: ?@import("../common/read_admission.zig").Port) ![]u8 {
+    if (control == null) return alloc.dupe(u8, bytes);
+    try control.?.checkpoint();
+    const owned = try alloc.alloc(u8, bytes.len);
+    errdefer alloc.free(owned);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        try control.?.checkpoint();
+        const end = offset + @min(bytes.len - offset, 64 * 1024);
+        @memcpy(owned[offset..end], bytes[offset..end]);
+        offset = end;
+    }
+    try control.?.checkpoint();
+    return owned;
 }
 
 pub const PrefixKeyPage = struct {
@@ -297,6 +317,10 @@ pub fn scanPrefixKeysLimited(
 }
 
 fn scanPrefixCursor(alloc: std.mem.Allocator, cur: *backend_erased.Cursor, prefix: []const u8) ![]OwnedKVPair {
+    return scanPrefixCursorWithAdmission(alloc, cur, prefix, null);
+}
+
+fn scanPrefixCursorWithAdmission(alloc: std.mem.Allocator, cur: *backend_erased.Cursor, prefix: []const u8, control: ?@import("../common/read_admission.zig").Port) ![]OwnedKVPair {
     var results = std.ArrayListUnmanaged(OwnedKVPair).empty;
     errdefer {
         for (results.items) |item| {
@@ -306,14 +330,19 @@ fn scanPrefixCursor(alloc: std.mem.Allocator, cur: *backend_erased.Cursor, prefi
         results.deinit(alloc);
     }
 
-    var entry = try cur.seekAtOrAfter(prefix);
+    if (control) |owner| try owner.checkpoint();
+    var entry = if (control != null and cur.vtable.seek_at_or_after_with_admission != null) try cur.seekAtOrAfterWithAdmission(prefix, control.?) else try cur.seekAtOrAfter(prefix);
     while (entry) |kv| {
         if (!std.mem.startsWith(u8, kv.key, prefix)) break;
-        try results.append(alloc, .{
-            .key = try alloc.dupe(u8, kv.key),
-            .value = try alloc.dupe(u8, kv.value),
-        });
-        entry = try cur.next();
+        if (control) |owner| try owner.checkpoint();
+        {
+            const key = try dupeWithAdmission(alloc, kv.key, control);
+            errdefer alloc.free(key);
+            const value = try dupeWithAdmission(alloc, kv.value, control);
+            errdefer alloc.free(value);
+            try results.append(alloc, .{ .key = key, .value = value });
+        }
+        entry = if (control != null and cur.vtable.next_with_admission != null) try cur.nextWithAdmission(control.?) else try cur.next();
     }
 
     return try results.toOwnedSlice(alloc);

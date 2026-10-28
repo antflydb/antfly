@@ -725,6 +725,20 @@ fn Engine(comptime Context: type) type {
         outer_values: [32]?[]const Datum = @splat(null),
         outer_replays: [32]std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = @splat(.empty),
 
+        fn workControl(self: *Self) @import("operator_work.zig").Control {
+            return .{
+                .ptr = self,
+                .checkpoint = struct {
+                    fn check(raw: ?*anyopaque) !void {
+                        const engine: *Self = @ptrCast(@alignCast(raw.?));
+                        // Byte polls preserve the statement's CPU/cancellation
+                        // identity without counting each chunk as a logical row.
+                        try engine.context.checkpoint();
+                    }
+                }.check,
+            };
+        }
+
         pub fn checkpoint(self: *Self) !void {
             try self.context.checkpoint();
             self.work += 1;
@@ -1168,14 +1182,14 @@ fn Engine(comptime Context: type) type {
                 if (self.cached_reader == null and self.node.operation == .scan) {
                     const scan = self.node.operation.scan;
                     const cursor = self.engine.cursors[scan.index];
-                    if (cursor.next_columns) |pull| {
+                    if (cursor.next_columns != null) {
                         if (self.eof) return .{ .rows = &.{} };
                         // Never advance a producer while a consumer borrows its page.
                         self.column_page = null;
                         _ = self.arena.reset(.free_all);
                         self.pages += 1;
                         if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                        const page = try pull(cursor.ptr, self.arena.allocator(), @intCast(maximum));
+                        const page = try cursor.columnsFor(if (self.engine.context.backend.cpu_scope) |scope| scope.execution else null, self.arena.allocator(), @intCast(maximum));
                         try page.validate();
                         if (page.selection.len > maximum or page.selection.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.SqlProgramLimitExceeded;
                         self.engine.visited += page.selection.len;
@@ -1340,7 +1354,7 @@ fn Engine(comptime Context: type) type {
                     },
                     .scan => |scan| blk: {
                         const cursor = self.engine.cursors[scan.index];
-                        if (cursor.next_columns) |pull| {
+                        if (cursor.next_columns != null) {
                             while (self.column_page == null or self.page_index == self.column_page.?.selection.len) {
                                 if (self.eof) break :blk null;
                                 self.column_page = null;
@@ -1348,7 +1362,7 @@ fn Engine(comptime Context: type) type {
                                 self.pages += 1;
                                 if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
                                 const wanted: u32 = @intCast(@min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
-                                self.column_page = try pull(cursor.ptr, self.arena.allocator(), wanted);
+                                self.column_page = try cursor.columnsFor(if (self.engine.context.backend.cpu_scope) |scope| scope.execution else null, self.arena.allocator(), wanted);
                                 try self.column_page.?.validate();
                                 if (self.column_page.?.selection.len > wanted) return error.InvalidSqlBackendResponse;
                                 self.page_index = 0;
@@ -1376,7 +1390,7 @@ fn Engine(comptime Context: type) type {
                             self.pages += 1;
                             if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
                             const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
-                            self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(wanted));
+                            self.page = try cursor.nextFor(if (self.engine.context.backend.cpu_scope) |scope| scope.execution else null, self.arena.allocator(), @intCast(wanted));
                             if (self.page.?.rows.len > wanted) return error.InvalidSqlBackendResponse;
                             self.page_index = 0;
                             self.eof = self.page.?.after == null;
@@ -2075,7 +2089,7 @@ fn Engine(comptime Context: type) type {
                 const native_values = if (batch == .columns) blk: {
                     const pointers = try a.alloc(*const scalar.Program, programs.len);
                     for (programs, pointers) |*program, *pointer| pointer.* = program;
-                    break :blk @import("vector_eval.zig").evaluateColumnsManyScheduled(a, pointers, batch.columns.page, batch.columns.definitions, self.engine.context.parameters, self.engine.context.backend.execution_io) catch |err| {
+                    break :blk @import("vector_eval.zig").evaluateColumnsManyWithScopes(a, pointers, batch.columns.page, batch.columns.definitions, self.engine.context.parameters, self.engine.context.backend.execution_io, self.engine.context.backend.cpu_scope, self.engine.context.backend.coordinator_scope) catch |err| {
                         if (errors == null) return err;
                         break :blk null;
                     };
@@ -2467,13 +2481,12 @@ fn Engine(comptime Context: type) type {
                 };
                 if (self.partition_join != null) return;
                 if (self.hash_join == null) {
-                    // A full build table must still be exportable: partition metadata,
-                    // encoded spill buffers and the borrowed input batch coexist
-                    // until its last retained row has been transferred. Reserve
-                    // that lane before admitting build payloads, not after OOM.
-                    const retained = self.engine.context.limits.retained_bytes;
+                    // Planning and enclosing iterators already spend statement
+                    // capacity. Keep decoding and spill export headroom within
+                    // both the configured limit and the actual parent budget.
+                    const retained = @min(self.engine.context.limits.retained_bytes, @import("memory_budget.zig").headroom(self.engine.context.alloc) orelse self.engine.context.limits.retained_bytes);
                     const build_bytes = if (!shared and self.engine.context.spill != null) retained - retained / 4 else retained;
-                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = build_bytes, .spill = self.engine.context.spill });
+                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = build_bytes, .spill = self.engine.context.spill, .control = self.engine.workControl() });
                     if (!shared and kind != .left and kind != .full) try self.prepareScanFilter(if (self.flipped_join) join.right_keys else join.left_keys);
                     var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                     defer scratch.deinit();
@@ -2615,7 +2628,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .cpu_scope = self.engine.context.backend.cpu_scope, .coordinator_scope = self.engine.context.backend.coordinator_scope, .spill_io = self.engine.context.backend.spill_io, .spill_wait = self.engine.context.backend.spill_wait, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

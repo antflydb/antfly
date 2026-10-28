@@ -65,23 +65,29 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
 }
 
 /// Monotonic feature epoch, published with catalog mutations and checked before parsing.
-pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
-pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
-pub const graph_expiration_namespace_reader_version: u32 = 4;
-pub const adjudication_reader_version: u32 = 5;
-pub const curation_reader_version: u32 = 6;
-pub const generated_producers_reader_version: u32 = 7;
-pub const grouped_sources_reader_version: u32 = 8;
-pub const namespace_curation_reader_version: u32 = 9;
-pub const curation_provenance_reader_version: u32 = 10;
-pub const scoped_curation_reader_version: u32 = 11;
+pub const minimum_reader_key = reader_versions.minimum_reader_key;
+pub const replacement_reader_base_key = reader_versions.replacement_reader_base_key;
+const reader_versions = @import("reader_versions.zig");
+pub const graph_expiration_namespace_reader_version = reader_versions.graph_expiration_namespace_reader_version;
+pub const adjudication_reader_version = reader_versions.adjudication_reader_version;
+pub const curation_reader_version = reader_versions.curation_reader_version;
+pub const generated_producers_reader_version = reader_versions.generated_producers_reader_version;
+pub const grouped_sources_reader_version = reader_versions.grouped_sources_reader_version;
+pub const namespace_curation_reader_version = reader_versions.namespace_curation_reader_version;
+pub const prepared_transaction_reader_version = reader_versions.prepared_transaction_reader_version;
+pub const read_observations_reader_version = reader_versions.read_observations_reader_version;
+pub const read_ranges_reader_version = reader_versions.read_ranges_reader_version;
+pub const prepared_read_guards_reader_version = reader_versions.prepared_read_guards_reader_version;
+pub const supported_reader_version = reader_versions.supported_reader_version;
+pub const curation_provenance_reader_version = reader_versions.curation_provenance_reader_version;
+pub const scoped_curation_reader_version = reader_versions.scoped_curation_reader_version;
+
 pub const native_resolver_records_reader_version: u32 = 12;
 pub const resolver_projection_bindings_reader_version: u32 = 13;
 pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
 pub const resolver_static_profiles_reader_version: u32 = 19;
 pub const resolver_pin_index_reader_version: u32 = 23;
-pub const supported_reader_version: u32 = resolver_pin_index_reader_version;
 
 const reader_version_encodings = blk: {
     @setEvalBranchQuota(10000);
@@ -1422,6 +1428,20 @@ test "resolver curation state requires the current receipt decoder" {
     try std.testing.expectEqualStrings("11", try readerVersionBytes(scoped_curation_reader_version));
 }
 
+test "resolver read observation reader floors reject earlier database readers" {
+    try std.testing.expectEqualStrings("26", try readerVersionBytes(read_observations_reader_version));
+    const Floor = struct {
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return "26";
+        }
+    };
+    var floor: Floor = .{};
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&floor, 13));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readAuthoritativeReaderVersion(&floor, 13));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&floor, resolver_pin_index_reader_version));
+    try std.testing.expectEqual(@as(u32, 26), try readAuthoritativeReaderVersion(&floor, supported_reader_version));
+}
+
 test "resolver catalog native projection clock follows its physical namespace" {
     const base: ResolverConfig = .{ .name = "concepts", .table = "old", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .curation_revision = 100, .namespace_curation_generation = 100, .namespace_curation_table_id = 7, .resolution_generation = 200 };
     var next = base;
@@ -1492,6 +1512,14 @@ test "resolver catalog shares immutable native policy in memory and after reopen
     }
     // No JSON input can manufacture a runtime ownership reference.
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(ResolverConfig, a, "{\"name\":\"r\",\"table\":\"t\",\"source_artifact\":\"s\",\"resolution_artifact\":\"o\",\"key_template\":\"{{_key}}\",\"shared_projection\":{}}", .{}));
+}
+
+test "merged prepared reader epochs follow native resolver epochs" {
+    try std.testing.expect(prepared_transaction_reader_version > resolver_pin_index_reader_version);
+    try std.testing.expect(reader_versions.replay_credit_reader_version > prepared_transaction_reader_version);
+    try std.testing.expect(read_observations_reader_version > reader_versions.replay_credit_reader_version);
+    try std.testing.expect(read_ranges_reader_version > read_observations_reader_version);
+    try std.testing.expect(prepared_read_guards_reader_version > read_ranges_reader_version);
 }
 
 test "resolver curation reader floors encode every supported version" {

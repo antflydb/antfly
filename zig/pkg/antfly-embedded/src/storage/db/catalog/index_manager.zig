@@ -1361,6 +1361,12 @@ pub const IndexManager = struct {
     /// Exact persisted envelope requirement, independent of temporary reader
     /// reservations and parent/child feature-epoch aggregation.
     resolver_catalog_format_version: std.atomic.Value(u32) = .init(1),
+    /// Witness of the catalog snapshot validated by load or durable publication.
+    /// Unvalidated/ambiguous DocStore commits invalidate it without JSON work at
+    /// required BEGIN. A missing primary owner cannot attest DB eligibility.
+    resolver_catalog_attested_revision: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    resolver_catalog_attested_import: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    resolver_catalog_attested_store: std.atomic.Value(?*const docstore_mod.DocStore) = .init(null),
     resolver_catalog_projection_dictionary: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     base_path: []u8,
@@ -1502,6 +1508,9 @@ pub const IndexManager = struct {
     /// page quanta, while unrelated catalog readers and writers no longer wait
     /// for an entire maintenance drain.
     graph_metric_schedule_pins: std.atomic.Value(usize) = .init(0),
+    /// Permanent close fence for detached worker snapshots. Structural
+    /// rebuild/retirement admission remains independently restartable.
+    graph_metric_snapshot_closing: std.atomic.Value(bool) = .init(false),
     /// Workers acquire shared before catalog/index apply; primary publishers
     /// acquire exclusive under DB apply, without retaining a catalog lease. This fences
     /// primary contributor reads through commit while preserving worker
@@ -3321,36 +3330,57 @@ pub const IndexManager = struct {
         }
     }
 
-    pub fn lockManagedIndexApply(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyGuard {
-        self.catalog_mutex.lockShared();
-        errdefer self.catalog_mutex.unlockShared();
-        const mutex = switch (index_ref.kind) {
+    const ApplyTarget = struct { name: []const u8, kind: ?types.IndexKind };
+
+    fn applyMutexAssumeCatalog(self: *IndexManager, target: ApplyTarget) !*std.atomic.Mutex {
+        const kind = target.kind orelse {
+            if (self.denseIndex(target.name)) |entry| return entry.apply_mutex;
+            if (self.sparseIndex(target.name)) |entry| return entry.apply_mutex;
+            return error.IndexNotFound;
+        };
+        return switch (kind) {
             .full_text => blk: {
-                const entry = self.textIndexEntry(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.textIndexEntry(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
             .dense_vector => blk: {
-                const entry = self.denseIndex(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.denseIndex(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
             .sparse_vector => blk: {
-                const entry = self.sparseIndex(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.sparseIndex(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
             .graph => blk: {
-                const entry = self.graphIndex(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.graphIndex(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
             .algebraic => blk: {
-                const entry = self.algebraicIndex(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.algebraicIndex(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
         };
-        self.lockAtomicWithBackoff(mutex);
-        return .{
-            .manager = self,
-            .mutex = mutex,
-        };
+    }
+
+    fn lockIndexApply(self: *IndexManager, target: ApplyTarget) !ManagedIndexApplyGuard {
+        while (true) {
+            self.catalog_mutex.lockShared();
+            const mutex = self.applyMutexAssumeCatalog(target) catch |cause| {
+                self.catalog_mutex.unlockShared();
+                return cause;
+            };
+            if (mutex.tryLock()) return .{ .manager = self, .mutex = mutex };
+            // A waiter must not pin the catalog generation needed by a
+            // structural writer. Never retain the mutex pointer across unlock.
+            self.catalog_mutex.unlockShared();
+            self.checkpointIo().sleep(.fromNanoseconds(1), .awake) catch {};
+        }
+    }
+
+    /// The caller keeps the name alive through acquisition. Both the catalog
+    /// entry and apply mutex are resolved anew after each physical wait.
+    pub fn lockManagedIndexApply(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyGuard {
+        return self.lockIndexApply(.{ .name = index_ref.name, .kind = index_ref.kind });
     }
 
     pub const ManagedIndexApplyPlan = struct {
@@ -3379,19 +3409,49 @@ pub const IndexManager = struct {
     }
 
     pub fn lockVectorIndexApply(self: *IndexManager, index_name: []const u8) !ManagedIndexApplyGuard {
-        self.catalog_mutex.lockShared();
-        errdefer self.catalog_mutex.unlockShared();
-        const mutex = if (self.denseIndex(index_name)) |entry|
-            entry.apply_mutex
-        else if (self.sparseIndex(index_name)) |entry|
-            entry.apply_mutex
-        else
-            return error.IndexNotFound;
-        self.lockAtomicWithBackoff(mutex);
-        return .{
-            .manager = self,
-            .mutex = mutex,
+        return self.lockIndexApply(.{ .name = index_name, .kind = null });
+    }
+
+    fn lockIndexApplyWithAdmission(self: *IndexManager, target: ApplyTarget, original: @import("../../../common/read_admission.zig").Port) !ManagedIndexApplyGuard {
+        const control = original;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        const Lifetime = struct {
+            fn check(raw: *const anyopaque) !void {
+                const port: *const @import("../../../common/read_admission.zig").Port = @ptrCast(@alignCast(raw));
+                try port.checkLifetime();
+            }
         };
+        const acquisition: apply_rw_lock_mod.ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &control, .check_fn = Lifetime.check }, .execution_wait = boundary };
+        const io = self.checkpointIo();
+        while (true) {
+            try control.checkpoint();
+            try self.catalog_mutex.lockSharedControlledIo(io, acquisition);
+            const mutex = self.applyMutexAssumeCatalog(target) catch |cause| {
+                self.catalog_mutex.unlockShared();
+                return cause;
+            };
+            if (mutex.tryLock()) {
+                errdefer {
+                    mutex.unlock();
+                    self.catalog_mutex.unlockShared();
+                }
+                try control.checkLifetime();
+                return .{ .manager = self, .mutex = mutex };
+            }
+            self.catalog_mutex.unlockShared();
+            try @import("../../../common/cleanup_wait.zig").waitForRetry(io, control);
+        }
+    }
+
+    /// Original finite lifetime and CPU wait authority; no service guard may
+    /// be held by the caller while acquisition lends execution capacity.
+    pub fn lockManagedIndexApplyWithAdmission(self: *IndexManager, index_ref: ManagedIndexRef, original: @import("../../../common/read_admission.zig").Port) !ManagedIndexApplyGuard {
+        return self.lockIndexApplyWithAdmission(.{ .name = index_ref.name, .kind = index_ref.kind }, original);
+    }
+
+    pub fn lockVectorIndexApplyWithAdmission(self: *IndexManager, index_name: []const u8, original: @import("../../../common/read_admission.zig").Port) !ManagedIndexApplyGuard {
+        return self.lockIndexApplyWithAdmission(.{ .name = index_name, .kind = null }, original);
     }
 
     // Keep publication, cleanup, and pointer validation on the same adapter
@@ -5892,6 +5952,7 @@ pub const IndexManager = struct {
     pub const GraphFieldWritePlan = struct {
         index_name: []u8,
         coverage_generation: u64,
+        ttl_duration_ns: u64 = 0,
         edges: []GraphFieldEdgeWritePlan,
     };
 
@@ -5957,10 +6018,15 @@ pub const IndexManager = struct {
             self.* = undefined;
         }
 
-        pub fn graphCoverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
-            for (self.graph_fields) |graph|
-                if (std.mem.eql(u8, graph.index_name, index_name)) return graph.coverage_generation;
+        /// Borrowed from this immutable snapshot, never the live catalog.
+        pub fn graphField(self: *const WritePlanSnapshot, index_name: []const u8) ?*const GraphFieldWritePlan {
+            for (self.graph_fields) |*graph|
+                if (std.mem.eql(u8, graph.index_name, index_name)) return graph;
             return null;
+        }
+
+        pub fn graphCoverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
+            return if (self.graphField(index_name)) |graph| graph.coverage_generation else null;
         }
 
         pub fn coverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
@@ -6038,6 +6104,7 @@ pub const IndexManager = struct {
             return .{
                 .index_name = try alloc.dupe(u8, entry.config.name),
                 .coverage_generation = entry.config.coverage_generation,
+                .ttl_duration_ns = entry.ttl_duration_ns,
                 .edges = edges,
             };
         }
@@ -6512,6 +6579,11 @@ pub const IndexManager = struct {
 
     pub const WritePlanSnapshotView = struct {
         epoch: *WritePlanSnapshotEpoch,
+
+        pub fn clone(self: @This()) @This() {
+            self.epoch.retain();
+            return self;
+        }
 
         pub fn plan(self: @This()) *const WritePlanSnapshot {
             return &self.epoch.value;
@@ -7071,6 +7143,50 @@ pub const IndexManager = struct {
         entry.config.deinit(self.alloc);
     }
 
+    /// Serving and recurring producers must already be fenced. Close detached
+    /// snapshot admission under the catalog barrier, then drain the accepted
+    /// pins with the caller's original finite cleanup execution. Neither the
+    /// catalog nor pin-retirement mutex may remain held while CPU is parked.
+    pub fn drainGraphMetricSnapshotsWithAdmission(self: *IndexManager, original: @import("../../../common/read_admission.zig").Port) !void {
+        const admission = @import("../../../common/read_admission.zig");
+        const cleanup = @import("../../../common/cleanup_wait.zig");
+        self.graph_metric_snapshot_closing.store(true, .release);
+        var trace: admission.RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        const Lifetime = struct {
+            fn check(raw: *const anyopaque) !void {
+                const port: *const admission.Port = @ptrCast(@alignCast(raw));
+                try port.checkLifetime();
+            }
+        };
+        const io = self.checkpointIo();
+        try control.checkpoint();
+        self.catalog_mutex.lockExclusiveControlledIo(io, .{
+            .lifetime = .{ .context = &control, .check_fn = Lifetime.check },
+            .execution_wait = boundary,
+        }) catch |cause| return trace.failure orelse cause;
+        // Every earlier snapshot installer has now published its pin. Future
+        // installers observe the permanent fence before borrowing index arrays.
+        self.catalog_mutex.unlockExclusive();
+        const Ready = struct {
+            fn get(raw: *anyopaque) anyerror!bool {
+                const manager: *IndexManager = @ptrCast(@alignCast(raw));
+                return manager.graph_metric_schedule_pins.load(.acquire) == 0;
+            }
+        };
+        while (true) {
+            try cleanup.until(io, control, self, Ready.get, null);
+            // A last releaser decrements under this guard, then broadcasts and
+            // unlocks. Counter zero alone does not authorize destroying it.
+            try cleanup.lockIo(&self.graph_metric_schedule_pin_mutex, io, control);
+            const drained = self.graph_metric_schedule_pins.load(.acquire) == 0;
+            self.graph_metric_schedule_pin_mutex.unlock(io);
+            if (drained) return;
+        }
+    }
+
     fn waitForGraphMetricSchedulePins(self: *IndexManager) void {
         if (self.io) |io| {
             self.graph_metric_schedule_pin_mutex.lockUncancelable(io);
@@ -7120,6 +7236,11 @@ pub const IndexManager = struct {
     }
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
+        self.graph_metric_snapshot_closing.store(true, .release);
+        // Compatibility destruction owns quiesced cleanup. Serialize with an
+        // installer that passed admission before the close flag was published.
+        self.catalog_mutex.lockExclusive();
+        self.catalog_mutex.unlockExclusive();
         self.waitForGraphMetricSchedulePins();
         if (self.write_plan_cache) |cached| {
             self.write_plan_cache = null;
@@ -8171,8 +8292,11 @@ pub const IndexManager = struct {
     /// Quarantine an index whose persisted artifacts could not be opened:
     /// keep its config visible (catalog persistence, status, drop/recreate)
     /// while the runtime index stays absent, and record the load error.
-    /// Errors from an index open that indicate a transient read race rather
-    /// than persistent artifact damage: a read-only replica open can race
+    /// Errors from an index open that indicate transient read conditions or
+    /// admission pressure rather than persistent artifact damage. Memory
+    /// refusal must leave a read replica unpublished so a later request can
+    /// open it after pressure clears; it must not quarantine a healthy index.
+    /// A read-only replica open can race
     /// the writer's obsolete-run reclaim (FileNotFound after the manifest
     /// load), or table churn can invalidate the open mid-flight. On
     /// read-only opens these must propagate instead of quarantining — the
@@ -8187,7 +8311,12 @@ pub const IndexManager = struct {
     /// FileNotFound separately from UnsupportedVersion.
     fn indexOpenErrorIsTransientRead(err: anyerror) bool {
         return switch (err) {
-            error.FileNotFound, error.EndOfStream, error.TableReadChurn => true,
+            error.FileNotFound,
+            error.EndOfStream,
+            error.TableReadChurn,
+            error.OutOfMemory,
+            error.ResourceBudgetExceeded,
+            => true,
             else => false,
         };
     }
@@ -9199,6 +9328,26 @@ pub const IndexManager = struct {
         return score;
     }
 
+    pub fn lsmMaintenanceScoreWithLifetime(self: *const IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        const original = lifetime orelse return self.lsmMaintenanceScore();
+        const mutable: *IndexManager = @constCast(self);
+        try mutable.catalog_mutex.lockSharedControlledIo(self.checkpointIo(), .{
+            .lifetime = @import("../../../common/seed_snapshot_lifetime.zig").authority(original),
+        });
+        defer mutable.catalog_mutex.unlockShared();
+        var score: u64 = 0;
+        for (self.text_indexes.items) |*entry| {
+            try original.checkpoint();
+            score = @max(score, try entry.persistent.lsmMaintenanceScoreWithLifetime(lifetime));
+        }
+        for (self.dense_indexes.items) |*entry| {
+            try original.checkpoint();
+            score = @max(score, try entry.index.lsmMaintenanceScoreWithLifetime(lifetime));
+        }
+        try original.checkpoint();
+        return score;
+    }
+
     pub fn lsmMaintenanceScore(self: *const IndexManager) u64 {
         const mutable: *IndexManager = @constCast(self);
         mutable.catalog_mutex.lockShared();
@@ -9976,25 +10125,27 @@ pub const IndexManager = struct {
         );
     }
 
-    fn runLsmObsoleteReclaimDueUnlocked(self: *IndexManager, comptime best_effort: bool) !bool {
+    fn runLsmObsoleteReclaimDueUnlocked(self: *IndexManager, comptime best_effort: bool, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         for (self.text_indexes.items) |*entry| {
+            if (lifetime) |original| try original.checkpoint();
             if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                 if (delay_ns == 0) {
                     const progressed = if (best_effort)
-                        try entry.persistent.runLsmMaintenanceStepBestEffort()
+                        try entry.persistent.runLsmMaintenanceStepBestEffortWithLifetime(lifetime)
                     else
-                        try entry.persistent.runLsmMaintenanceStep();
+                        try entry.persistent.runLsmMaintenanceStepWithLifetime(lifetime);
                     if (progressed) return true;
                 }
             }
         }
         for (self.dense_indexes.items) |*entry| {
+            if (lifetime) |original| try original.checkpoint();
             if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                 if (delay_ns == 0) {
                     const progressed = if (best_effort)
-                        try entry.index.runLsmMaintenanceStepBestEffort()
+                        try entry.index.runLsmMaintenanceStepBestEffortWithLifetime(lifetime)
                     else
-                        try entry.index.runLsmMaintenanceStep();
+                        try entry.index.runLsmMaintenanceStepWithLifetime(lifetime);
                     if (progressed) return true;
                 }
             }
@@ -10003,19 +10154,42 @@ pub const IndexManager = struct {
     }
 
     pub fn runLsmObsoleteReclaimDue(self: *IndexManager) !bool {
-        self.catalog_mutex.lockShared();
+        return self.runLsmObsoleteReclaimDueWithLifetime(null);
+    }
+
+    pub fn runLsmObsoleteReclaimDueWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
+        if (lifetime) |original| {
+            try self.catalog_mutex.lockSharedControlledIo(self.checkpointIo(), .{
+                .lifetime = @import("../../../common/seed_snapshot_lifetime.zig").authority(original),
+            });
+        } else self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return try self.runLsmObsoleteReclaimDueUnlocked(false);
+        return try self.runLsmObsoleteReclaimDueUnlocked(false, lifetime);
     }
 
     pub fn runLsmObsoleteReclaimDueBestEffort(self: *IndexManager) !bool {
+        return self.runLsmObsoleteReclaimDueBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmObsoleteReclaimDueBestEffortWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         if (!self.catalog_mutex.tryLockShared()) return false;
         defer self.catalog_mutex.unlockShared();
-        return try self.runLsmObsoleteReclaimDueUnlocked(true);
+        return try self.runLsmObsoleteReclaimDueUnlocked(true, lifetime);
     }
 
     pub fn runLsmMaintenanceStep(self: *IndexManager) !bool {
-        self.catalog_mutex.lockShared();
+        return self.runLsmMaintenanceStepWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
+        if (lifetime) |original| {
+            try self.catalog_mutex.lockSharedControlledIo(self.checkpointIo(), .{
+                .lifetime = @import("../../../common/seed_snapshot_lifetime.zig").authority(original),
+            });
+        } else self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
 
         var best_kind: enum { none, text, dense } = .none;
@@ -10023,7 +10197,8 @@ pub const IndexManager = struct {
         var best_score: u64 = 0;
 
         for (self.text_indexes.items, 0..) |*entry, i| {
-            const score = entry.persistent.lsmMaintenanceScore();
+            if (lifetime) |original| try original.checkpoint();
+            const score = try entry.persistent.lsmMaintenanceScoreWithLifetime(lifetime);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .text;
@@ -10031,7 +10206,8 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
-            const score = entry.index.lsmMaintenanceScore();
+            if (lifetime) |original| try original.checkpoint();
+            const score = try entry.index.lsmMaintenanceScoreWithLifetime(lifetime);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .dense;
@@ -10039,15 +10215,21 @@ pub const IndexManager = struct {
             }
         }
 
+        if (lifetime) |original| try original.checkpoint();
         if (best_score == 0) return false;
         return switch (best_kind) {
             .none => false,
-            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStep(),
-            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStep(),
+            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStepWithLifetime(lifetime),
+            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStepWithLifetime(lifetime),
         };
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *IndexManager) !bool {
+        return self.runLsmMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *IndexManager, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         if (!self.catalog_mutex.tryLockShared()) return false;
         defer self.catalog_mutex.unlockShared();
 
@@ -10056,6 +10238,7 @@ pub const IndexManager = struct {
         var best_score: u64 = 0;
 
         for (self.text_indexes.items, 0..) |*entry, i| {
+            if (lifetime) |original| try original.checkpoint();
             const raw_score = entry.persistent.lsmMaintenanceDebtHint();
             const score = if (raw_score != 0) raw_score else if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
@@ -10065,6 +10248,7 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
+            if (lifetime) |original| try original.checkpoint();
             const raw_score = entry.index.lsmMaintenanceDebtHint();
             const score = if (raw_score != 0) raw_score else if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
@@ -10074,11 +10258,12 @@ pub const IndexManager = struct {
             }
         }
 
+        if (lifetime) |original| try original.checkpoint();
         if (best_score == 0) return false;
         return switch (best_kind) {
             .none => false,
-            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStepBestEffort(),
-            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStepBestEffort(),
+            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStepBestEffortWithLifetime(lifetime),
+            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStepBestEffortWithLifetime(lifetime),
         };
     }
 
@@ -10262,8 +10447,10 @@ pub const IndexManager = struct {
     };
 
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
+        if (self.graph_metric_snapshot_closing.load(.acquire)) return error.Canceled;
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        if (self.graph_metric_snapshot_closing.load(.acquire)) return error.Canceled;
         if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) {
             const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, 0);
@@ -12144,6 +12331,7 @@ pub const IndexManager = struct {
             const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
             defer self.alloc.free(enrichment_data);
             try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+            try @import("../artifact_inventory.zig").requirePreparedCatalogUnchanged(&txn, enrichment_catalog_key, enrichment_data);
             try txn.put(enrichment_catalog_key, enrichment_data);
         }
         if (self.resolvers.items.len != resolver_checkpoint) {
@@ -12750,6 +12938,19 @@ pub const IndexManager = struct {
         updated,
         unchanged,
     };
+
+    /// Match the ordinary upsert's normalization without publishing or
+    /// detaching an inline-managed producer. Safe for idempotent DB refresh.
+    pub fn enrichmentConfigMatches(self: *IndexManager, cfg: types.EnrichmentConfig) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var internal = try enrichmentFromPublic(self.alloc, cfg);
+        defer internal.deinit(self.alloc);
+        try validateEnrichmentConfig(self, internal);
+        const existing = self.getEnrichmentByName(internal.name) orelse return false;
+        if (existing.graph_inline_managed == true) return false;
+        return try internalEnrichmentConfigsEqual(self.alloc, existing.*, internal);
+    }
 
     pub fn upsertEnrichment(self: *IndexManager, store: anytype, cfg: types.EnrichmentConfig) !EnrichmentUpsertResult {
         self.catalog_mutex.lockExclusive();
@@ -15374,6 +15575,25 @@ pub const IndexManager = struct {
 
     pub fn count(self: *const IndexManager) u32 {
         return @intCast(self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + self.status_only_index_configs.len);
+    }
+
+    /// Same eligibility as the portable target check, without cloning a
+    /// possibly large configuration merely to inspect its kind and name.
+    pub fn portableTargetIndexesAllowed(self: *const IndexManager) bool {
+        if (self.count() == 0) return true;
+        if (self.count() != 1) return false;
+        inline for (.{ self.text_indexes.items, self.dense_indexes.items, self.sparse_indexes.items, self.graph_indexes.items, self.algebraic_indexes.items }) |items| {
+            if (items.len == 1) return items[0].config.kind == .full_text and std.mem.eql(u8, items[0].config.name, "full_text_index_v0");
+        }
+        const cfg = self.status_only_index_configs[0];
+        return cfg.kind == .full_text and std.mem.eql(u8, cfg.name, "full_text_index_v0");
+    }
+
+    pub fn hasEnrichments(self: *const IndexManager) bool {
+        return self.enrichments.items.len != 0;
+    }
+    pub fn hasResolvers(self: *const IndexManager) bool {
+        return self.resolvers.items.len != 0;
     }
 
     pub fn listIndexesPublic(self: *const IndexManager, alloc: Allocator) ![]types.IndexConfig {
@@ -23383,11 +23603,31 @@ pub const IndexManager = struct {
     /// The caller holds catalog_mutex from before opening txn through commit
     /// and publication of the returned reader/envelope stamp.
     pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
-        if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
+        const owner = self.primary_store;
+        const revision = self.catalogRevision();
+        const import_revision = self.catalogImportRevision();
+        const inventory = @import("../artifact_inventory.zig");
+        try inventory.requirePreparedCatalogUnchanged(txn, index_catalog_key, expected.indexes);
+        try inventory.requirePreparedCatalogUnchanged(txn, enrichment_catalog_key, expected.enrichments);
+        try inventory.requirePreparedCatalogUnchanged(txn, resolver_catalog_key, expected.resolvers);
+        // An exact publication needs no reordering or mutation. Validate the
+        // in-memory definitions and load/repair state for every serving kind.
         const desired_encoding: resolver_catalog.CatalogEncoding = if (expected.resolvers.len == 0)
             .{ .minimum_reader_version = 1, .projection_dictionary = false }
         else
             try resolver_catalog.catalogEncoding(self.alloc, expected.resolvers);
+        const actual = try inventory.catalogs(txn);
+        if (self.count() == configs.len and std.mem.eql(u8, actual.indexes, expected.indexes) and std.mem.eql(u8, actual.enrichments, expected.enrichments) and std.mem.eql(u8, actual.resolvers, expected.resolvers) and try self.matchesArtifactInventoryNoLock(expected)) {
+            return .{
+                .reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version),
+                .format = desired_encoding.minimum_reader_version,
+                .projection_dictionary = desired_encoding.projection_dictionary,
+                .revision = revision,
+                .import_revision = import_revision,
+                .owner = owner,
+            };
+        }
+        if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
         const desired_format = desired_encoding.minimum_reader_version;
         const current_reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
         const current_resolvers = txn.get(resolver_catalog_key) catch |err| switch (err) {
@@ -23469,12 +23709,17 @@ pub const IndexManager = struct {
             };
         }
         try @import("../artifact_inventory.zig").refresh(txn);
-        return .{ .reader = reader_version, .format = desired_format, .projection_dictionary = desired_encoding.projection_dictionary };
+        return .{ .reader = reader_version, .format = desired_format, .projection_dictionary = desired_encoding.projection_dictionary, .revision = docstore_mod.DocStore.CatalogRevision.afterCommit(revision), .import_revision = import_revision, .owner = owner };
     }
 
     pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        return self.matchesArtifactInventoryNoLock(expected);
+    }
+
+    /// Caller retains catalog ownership through this observation.
+    fn matchesArtifactInventoryNoLock(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
         if (self.failed_index_loads.count() != 0 or self.status_only_index_configs.len != 0) return false;
         var repairs = self.repair_unavailable_indexes.valueIterator();
         while (repairs.next()) |slot| if (slot.blocked()) return false;
@@ -23845,6 +24090,7 @@ pub const IndexManager = struct {
         const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, retained_producers);
         defer self.alloc.free(enrichment_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+        try @import("../artifact_inventory.zig").requirePreparedCatalogUnchanged(&txn, enrichment_catalog_key, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         // Allocate the complete post-commit catalog before crossing durability.
         var next_active: std.ArrayListUnmanaged(ResolverConfig) = .empty;
@@ -24032,6 +24278,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../artifact_inventory.zig").requirePreparedCatalogUnchanged(&txn, enrichment_catalog_key, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
@@ -24045,19 +24292,47 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
     }
 
-    const CatalogReaderStamp = struct { reader: u32, format: u32, projection_dictionary: bool };
+    const CatalogReaderStamp = struct { reader: u32, format: u32, projection_dictionary: bool, revision: ?u64 = null, import_revision: ?u64 = null, owner: ?*const docstore_mod.DocStore = null };
+
+    fn catalogRevision(self: *const IndexManager) ?u64 {
+        const store = self.primary_store orelse return null;
+        return store.resolver_catalog_revision.read();
+    }
+
+    fn catalogImportRevision(self: *const IndexManager) ?u64 {
+        const store = self.primary_store orelse return null;
+        return store.portableImportRevision() catch return null;
+    }
+
+    /// Caller holds apply/catalog ownership. This checks a publication witness,
+    /// not an inference from native ABI or an unaudited cached format integer.
+    pub fn hasPreparedCatalogAttestation(self: *const IndexManager, store: *const docstore_mod.DocStore) bool {
+        if (self.primary_store != store or self.resolver_catalog_attested_store.load(.acquire) != store) return false;
+        if (store.portableImportPublicationInProgress()) return false;
+        const import_revision = store.portableImportRevision() catch return false;
+        if (self.resolver_catalog_attested_import.load(.acquire) != import_revision) return false;
+        const revision = self.resolver_catalog_attested_revision.load(.acquire);
+        if (self.resolver_catalog_format_version.load(.acquire) < resolver_catalog.prepared_transaction_reader_version) return false;
+        return store.resolver_catalog_revision.matches(revision);
+    }
 
     /// Publish only after durability, while retaining the catalog publication fence.
     pub fn publishCatalogReaderStamp(self: *IndexManager, stamp: CatalogReaderStamp) void {
         self.resolver_catalog_format_version.store(stamp.format, .release);
         self.resolver_catalog_projection_dictionary.store(stamp.projection_dictionary, .release);
         self.minimum_reader_version.store(stamp.reader, .release);
+        self.resolver_catalog_attested_import.store(stamp.import_revision orelse std.math.maxInt(u64), .release);
+        self.resolver_catalog_attested_store.store(stamp.owner, .release);
+        self.resolver_catalog_attested_revision.store(stamp.revision orelse std.math.maxInt(u64), .release);
     }
 
     /// Older writers do not retain shadow replay or honor reserved names. Fence
     /// them while any reservation exists, preserving the feature epoch in a
     /// separate baseline. Marker publication/removal and fencing share a txn.
     fn stampCatalogReaderVersion(self: *IndexManager, txn: anytype, catalog: []const u8) !CatalogReaderStamp {
+        const owner = self.primary_store;
+        const revision = self.catalogRevision();
+        const import_revision = self.catalogImportRevision();
         if (comptime @import("builtin").is_test) self.test_resolver_catalog_publications += 1;
         self.invalidateResolverNamespaceLookup();
         {
@@ -24153,9 +24428,7 @@ pub const IndexManager = struct {
         if (pending) {
             try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(@max(authoritative, if (upgraded) version else 1)));
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
-        // versionedCatalog changes only the reader fence: it preserves an
-        // object's dictionary and wraps a legacy array without inventing one.
-        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version, .projection_dictionary = encoding.projection_dictionary };
+        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version, .projection_dictionary = encoding.projection_dictionary, .revision = docstore_mod.DocStore.CatalogRevision.afterCommit(revision), .import_revision = import_revision, .owner = owner };
     }
 
     /// Permanent requirements exclude a temporary reservation fence. Parent
@@ -24183,6 +24456,9 @@ pub const IndexManager = struct {
     }
 
     fn aggregateReaderVersionNoLock(self: *IndexManager, store: anytype, required: u32) !void {
+        const owner = self.primary_store;
+        const revision = self.catalogRevision();
+        const import_revision = self.catalogImportRevision();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
@@ -24216,14 +24492,17 @@ pub const IndexManager = struct {
         }
         try txn.commit();
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
-            self.resolver_catalog_format_version.store(encoding.?.minimum_reader_version, .release);
-            self.resolver_catalog_projection_dictionary.store(encoding.?.projection_dictionary, .release);
+            self.publishCatalogReaderStamp(.{ .reader = version, .format = encoding.?.minimum_reader_version, .projection_dictionary = encoding.?.projection_dictionary, .revision = docstore_mod.DocStore.CatalogRevision.afterCommit(revision), .import_revision = import_revision, .owner = owner });
             self.invalidateWritePlanSnapshot();
         }
         self.minimum_reader_version.store(version, .release);
     }
 
     fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
+        self.resolver_catalog_attested_revision.store(std.math.maxInt(u64), .release);
+        const owner = self.primary_store;
+        const revision = self.catalogRevision();
+        const import_revision = self.catalogImportRevision();
         self.invalidateResolverNamespaceLookup();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -24302,6 +24581,9 @@ pub const IndexManager = struct {
             }
             try definitions.append(self.alloc, owned);
         }
+        self.resolver_catalog_attested_import.store(import_revision orelse std.math.maxInt(u64), .release);
+        self.resolver_catalog_attested_store.store(owner, .release);
+        self.resolver_catalog_attested_revision.store(revision orelse std.math.maxInt(u64), .release);
     }
 
     fn resolverDefinitionsAlloc(self: *const IndexManager, alloc: Allocator) ![]resolver_catalog.ResolverConfig {
@@ -50152,44 +50434,51 @@ test "ordered artifact inventory TTL replacement retains temporary envelope with
     }
 }
 
-test "loaded resolver envelopes preserve inventory and completion identity with optional dictionaries" {
-    const a = std.testing.allocator;
-    const inventory = @import("../artifact_inventory.zig");
-    for ([_]bool{ false, true }) |dictionary| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
-        defer a.free(path);
-        var store = try docstore_mod.DocStore.open(a, path, .{});
-        defer store.close();
-        var manager = try IndexManager.init(a, path);
-        defer manager.deinit();
-        const index_data = try serializeCatalog(a, &manager);
-        defer a.free(index_data);
-        const resolver_data = if (dictionary) "{\"version\":4,\"resolvers\":[],\"projections\":{}}" else "{\"version\":4,\"resolvers\":[]}";
-        var runtime_store = try initRuntimeStore(a, &store);
-        defer runtime_store.deinit();
-        {
-            var txn = try runtime_store.store.beginWrite();
-            errdefer txn.abort();
-            try txn.put(index_catalog_key, index_data);
-            try txn.put(enrichment_catalog_key, "[]");
-            try txn.put(resolver_catalog_key, resolver_data);
-            try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(4));
-            try inventory.refresh(&txn);
-            try txn.commit();
+test "read-only index memory refusal leaves healthy indexes retryable without quarantine" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const configs = [_]types.IndexConfig{
+        .{ .name = "ft_title", .kind = .full_text, .config_json = "{\"field\":\"title\"}" },
+        .{ .name = "ft_body", .kind = .full_text, .config_json = "{\"field\":\"body\"}" },
+    };
+    {
+        var setup = try IndexManager.init(alloc, path);
+        defer setup.deinit();
+        setup.updateRange(.{ .start = "", .end = "" });
+        try setup.addAllNoBackfill(&store, &configs);
+    }
+    defer test_inject_index_open_error = null;
+    for ([_]?std.Io{ std.testing.io, null }) |scheduling_io| {
+        for ([_]usize{ 1, 2 }) |parallelism| {
+            for ([_]anyerror{ error.OutOfMemory, error.ResourceBudgetExceeded }) |refusal| {
+                var manager = try IndexManager.init(alloc, path);
+                defer manager.deinit();
+                manager.setIo(scheduling_io);
+                manager.load_parallelism = parallelism;
+                manager.updateRange(.{ .start = "", .end = "" });
+                test_inject_index_open_error = refusal;
+                try std.testing.expectError(refusal, manager.loadNoBackfill(&store));
+                try std.testing.expect(manager.textIndexEntry("ft_title") == null);
+                try std.testing.expect(manager.textIndexEntry("ft_body") == null);
+                try std.testing.expect(manager.loadFailure("ft_title") == null);
+                try std.testing.expect(manager.loadFailure("ft_body") == null);
+                test_inject_index_open_error = null;
+                // The exact manager and catalog can reopen after refusal;
+                // recovery needs neither a writer nor cache invalidation.
+                try manager.loadNoBackfill(&store);
+                try std.testing.expect(manager.textIndexEntry("ft_title") != null);
+                try std.testing.expect(manager.textIndexEntry("ft_body") != null);
+                try std.testing.expect(manager.loadFailure("ft_title") == null);
+                try std.testing.expect(manager.loadFailure("ft_body") == null);
+            }
         }
-        try manager.loadResolverCatalog(&store);
-        var read = try runtime_store.store.beginRead();
-        defer read.abort();
-        _ = try inventory.local(&read);
-        const catalogs = try inventory.catalogs(&read);
-        try std.testing.expectEqualStrings(resolver_data, catalogs.resolvers);
-        try std.testing.expect(try manager.matchesArtifactInventory(catalogs));
-        var snapshot = try manager.acquireWritePlanSnapshot();
-        defer snapshot.release();
-        try std.testing.expect(snapshot.plan().matchesArtifactInventory(catalogs));
-        try std.testing.expectEqual(catalogs.digest(), snapshot.plan().completion_plan.?.catalog);
     }
 }
 
@@ -50330,6 +50619,194 @@ test "logical query analyzer revision covers configuration and dynamic schema al
     }
 }
 
+fn managedApplyTestManager() IndexManager {
+    var manager: IndexManager = undefined;
+    manager.io = std.testing.io;
+    manager.catalog_mutex = .{ .io = std.testing.io };
+    manager.text_indexes = .empty;
+    manager.dense_indexes = .empty;
+    manager.sparse_indexes = .empty;
+    manager.graph_indexes = .empty;
+    manager.algebraic_indexes = .empty;
+    return manager;
+}
+
+test "controlled managed index apply retries resolve replacement after original reentry" {
+    const admission = @import("../../../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    inline for (.{
+        .{ "text_indexes", types.IndexKind.full_text, IndexManager.TextIndex },
+        .{ "dense_indexes", types.IndexKind.dense_vector, IndexManager.DenseIndex },
+        .{ "sparse_indexes", types.IndexKind.sparse_vector, IndexManager.SparseIndex },
+        .{ "graph_indexes", types.IndexKind.graph, IndexManager.GraphIndex },
+        .{ "algebraic_indexes", types.IndexKind.algebraic, IndexManager.AlgebraicIndex },
+    }) |spec| {
+        const Entry = spec[2];
+        for (std.enums.values(Case)) |case| {
+            var manager = managedApplyTestManager();
+            var old_mutex: std.atomic.Mutex = .unlocked;
+            var replacement: std.atomic.Mutex = .unlocked;
+            var entries: [1]Entry = undefined;
+            entries[0].config.name = "idx";
+            entries[0].apply_mutex = &old_mutex;
+            @field(manager, spec[0]).items = &entries;
+            @field(manager, spec[0]).capacity = 1;
+            const Control = struct {
+                manager: *IndexManager,
+                entry: *Entry,
+                old: *std.atomic.Mutex,
+                replacement: *std.atomic.Mutex,
+                case: Case,
+                old_held: bool = true,
+                replaced: bool = false,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn release(self: *@This()) void {
+                    if (!self.old_held) return;
+                    self.old.unlock();
+                    self.old_held = false;
+                }
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn deadline(_: *anyopaque) !?u64 {
+                    return 1000;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    // A structural writer can replace the pointer while the
+                    // caller is parked: neither catalog nor apply is pinned.
+                    try std.testing.expect(self.manager.catalog_mutex.tryLockExclusive());
+                    defer self.manager.catalog_mutex.unlockExclusive();
+                    if (self.case == .begin_failure) return error.NotFound;
+                    self.entry.apply_mutex = self.replacement;
+                    self.replaced = true;
+                    if (self.case != .lifetime_in_wait) self.release();
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.release();
+                    try std.testing.expect(self.manager.catalog_mutex.tryLockExclusive());
+                    self.manager.catalog_mutex.unlockExclusive();
+                    if (self.case == .end_failure) return error.Canceled;
+                }
+            };
+            try std.testing.expect(old_mutex.tryLock());
+            var control: Control = .{ .manager = &manager, .entry = &entries[0], .old = &old_mutex, .replacement = &replacement, .case = case };
+            defer control.release();
+            var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+            const result = manager.lockManagedIndexApplyWithAdmission(.{ .name = "idx", .kind = spec[1] }, .init(&payload));
+            if (case == .success) {
+                var guard = try result;
+                try std.testing.expect(guard.mutex == &replacement);
+                guard.unlock();
+            } else {
+                try std.testing.expectError(switch (case) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .lifetime_in_wait => error.DeadlineExceeded,
+                    .success => unreachable,
+                }, result);
+                try std.testing.expect(manager.catalog_mutex.tryLockExclusive());
+                manager.catalog_mutex.unlockExclusive();
+                try std.testing.expect(replacement.tryLock());
+                replacement.unlock();
+                control.release();
+                control.case = .success;
+                var guard = try manager.lockManagedIndexApplyWithAdmission(.{ .name = "idx", .kind = spec[1] }, .init(&payload));
+                try std.testing.expect(guard.mutex == if (control.replaced) &replacement else &old_mutex);
+                guard.unlock();
+            }
+            if (spec[1] == .dense_vector or spec[1] == .sparse_vector) {
+                var vector_guard = try manager.lockVectorIndexApplyWithAdmission("idx", .init(&payload));
+                vector_guard.unlock();
+            }
+            try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+        }
+    }
+}
+
+test "controlled managed index apply rejects missing wait authority before touching catalog" {
+    const admission = @import("../../../common/read_admission.zig");
+    var manager = managedApplyTestManager();
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return null;
+        }
+    };
+    var payload: admission.Payload = .{ .ptr = &manager, .vtable = &.{ .checkpoint = Control.check, .deadline_ns = Control.deadline } };
+    manager.catalog_mutex.lockExclusive();
+    defer manager.catalog_mutex.unlockExclusive();
+    try std.testing.expectError(error.ExecutionWaitUnsupported, manager.lockManagedIndexApplyWithAdmission(.{ .name = "missing", .kind = .full_text }, .init(&payload)));
+    payload.execution_wait = .{ .ptr = &manager, .begin = Control.check, .end = Control.check };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, manager.lockVectorIndexApplyWithAdmission("missing", .init(&payload)));
+}
+
+test "controlled managed index default apply wait permits catalog replacement" {
+    if (builtin.single_threaded or is_hostless) return error.SkipZigTest;
+    const io = std.testing.io;
+    var manager = managedApplyTestManager();
+    var old: std.atomic.Mutex = .unlocked;
+    var replacement: std.atomic.Mutex = .unlocked;
+    var entries: [1]IndexManager.TextIndex = undefined;
+    entries[0].config.name = "idx";
+    entries[0].apply_mutex = &old;
+    manager.text_indexes.items = &entries;
+    manager.text_indexes.capacity = 1;
+    const F = struct {
+        manager: *IndexManager,
+        io: std.Io,
+        picked: ?*std.atomic.Mutex = null,
+        failure: ?anyerror = null,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            var guard = self.manager.lockManagedIndexApply(.{ .name = "idx", .kind = .full_text }) catch |cause| {
+                self.failure = cause;
+                self.done.set(self.io);
+                return;
+            };
+            self.picked = guard.mutex;
+            guard.unlock();
+            self.done.set(self.io);
+        }
+    };
+    try std.testing.expect(old.tryLock());
+    var old_held = true;
+    defer if (old_held) old.unlock();
+    var f: F = .{ .manager = &manager, .io = io };
+    var future = try io.concurrent(F.run, .{&f});
+    defer {
+        if (old_held) {
+            old.unlock();
+            old_held = false;
+        }
+        future.await(io);
+    }
+    const test_deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(5), .clock = .awake });
+    // Two catalog acquisitions prove the waiter has retried the busy apply
+    // mutex, rather than merely being delayed before entering the method.
+    while (manager.catalog_mutex.shared_lock_calls.load(.acquire) < 2) {
+        if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, test_deadline)) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    while (!manager.catalog_mutex.tryLockExclusive()) {
+        if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, test_deadline)) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    entries[0].apply_mutex = &replacement;
+    manager.catalog_mutex.unlockExclusive();
+    try f.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(f.failure == null);
+    try std.testing.expect(f.picked.? == &replacement);
+    // The original apply owner has not released; progress required a fresh
+    // catalog lookup and must never wait on its retired mutex pointer.
+    try std.testing.expect(old_held);
+}
+
 test "index_manager bounded native prepared text publication spills before admission exhaustion" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -50384,6 +50861,201 @@ test "index_manager bounded native prepared text publication spills before admis
     }
     try std.testing.expectEqual(@as(u32, 2), documents);
     std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
+}
+
+test "controlled index retirement drains real detached graph pins and metadata with the sole CPU" {
+    const DB = @import("../db.zig").DB;
+    const background = @import("../../background_runtime.zig");
+    const admission = @import("../../../common/read_admission.zig");
+    const cpu = @import("../../../common/runnable_scheduler.zig");
+    const now = @import("antfly_platform").time.monotonicNs;
+    const Mode = enum { success, begin_failure, end_failure, expired };
+    const Held = enum { snapshot, catalog, retirement_metadata };
+    for (std.enums.values(Held)) |held| {
+        for (std.enums.values(Mode)) |mode| {
+            const a = std.testing.allocator;
+            var backend = try background.BackendRuntimeHandle.init(a, .{});
+            defer backend.deinit();
+            const io = backend.ptr().io().?;
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/index-retire", .{directory.sub_path});
+            defer a.free(path);
+            var db = try DB.open(a, path, .{
+                .backend_runtime = backend.ptr(),
+                .primary_backend = .{ .mem = .{} },
+                .executor = .{ .backend = .manual },
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+                .start_independent_maintenance = false,
+            });
+            defer db.close();
+            try db.addIndex(.{ .name = "pinned", .kind = .graph, .config_json = "{}" });
+            const manager = db.core.index_manager;
+            var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+            defer slots.close();
+            var closer: cpu.Execution = .{};
+            defer closer.finish();
+            try closer.start(&slots, .{ .io = io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+            var health: cpu.Execution = .{};
+            defer health.finish();
+            try health.start(&slots, .{ .io = io, .native_now_ns = now }, .control);
+            const F = struct {
+                db: *DB,
+                manager: *IndexManager,
+                io: std.Io,
+                slots: *cpu.Scheduler,
+                held: Held,
+                snapshot: ?IndexManager.GraphMetricWorkerSnapshot,
+                guard_held: bool = false,
+                future: ?std.Io.Future(void) = null,
+                entered: std.Io.Event = .unset,
+                release: std.Io.Event = .unset,
+                failure: ?anyerror = null,
+                child_runs: std.atomic.Value(usize) = .init(0),
+                child_retired: std.atomic.Value(usize) = .init(0),
+                child_failed: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) void {
+                    self.entered.set(self.io);
+                    self.release.waitUncancelable(self.io);
+                    self.work() catch |cause| {
+                        self.failure = cause;
+                    };
+                }
+                fn retire(self: *@This()) void {
+                    if (self.guard_held) {
+                        if (self.held == .catalog) self.manager.catalog_mutex.unlockShared() else self.manager.graph_metric_schedule_pin_mutex.unlock(self.io);
+                        self.guard_held = false;
+                    }
+                    if (self.snapshot) |*snapshot| snapshot.deinit();
+                    self.snapshot = null;
+                }
+                fn work(self: *@This()) !void {
+                    var execution: cpu.Execution = .{};
+                    defer execution.finish();
+                    defer self.retire();
+                    try execution.start(self.slots, .{ .io = self.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .background);
+                    if (self.held == .snapshot) {
+                        if (!self.manager.catalog_mutex.tryLockShared()) return error.TestUnexpectedResult;
+                        self.manager.catalog_mutex.unlockShared();
+                        if (!self.manager.graph_metric_schedule_pin_mutex.tryLock()) return error.TestUnexpectedResult;
+                        self.manager.graph_metric_schedule_pin_mutex.unlock(self.io);
+                    }
+                    const entry = if (self.snapshot) |snapshot| snapshot.entries[0].entry else &self.manager.graph_indexes.items[0];
+                    try std.testing.expectEqualStrings("pinned", entry.config.name);
+                    // Accepted pin users may still submit backend work. Their
+                    // backend generation must remain open until this retires.
+                    try self.db.backend_runtime.durable_jobs.submit(.{ .owner_id = self.db.backend_owner_id, .class = .commit_durable, .ptr = self, .run = child, .deinit = childRetire });
+                }
+                fn child(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    errdefer self.child_failed.store(true, .release);
+                    var execution: cpu.Execution = .{};
+                    defer execution.finish();
+                    try execution.start(self.slots, .{ .io = self.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .background);
+                    _ = self.child_runs.fetchAdd(1, .release);
+                }
+                fn childRetire(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    _ = self.child_retired.fetchAdd(1, .release);
+                }
+            };
+            var f: F = .{ .db = &db, .manager = manager, .io = io, .slots = &slots, .held = held, .snapshot = try manager.graphMetricWorkerSnapshotAlloc() };
+            defer {
+                closer.finish();
+                f.release.set(io);
+                if (f.future) |*future| future.await(io);
+                f.retire();
+                db.backend_runtime.durable_jobs.closeOwner(db.backend_owner_id);
+            }
+            try std.testing.expectEqual(@as(usize, 1), f.snapshot.?.entries.len);
+            switch (held) {
+                .snapshot => {},
+                .catalog => {
+                    manager.catalog_mutex.lockShared();
+                    f.guard_held = true;
+                },
+                .retirement_metadata => {
+                    f.snapshot.?.deinit();
+                    f.snapshot = null;
+                    manager.graph_metric_schedule_pin_mutex.lockUncancelable(io);
+                    f.guard_held = true;
+                    try std.testing.expectEqual(@as(usize, 0), manager.graph_metric_schedule_pins.load(.acquire));
+                },
+            }
+            f.future = try io.concurrent(F.run, .{&f});
+            try f.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            const Control = struct {
+                f: *F,
+                closer: *cpu.Execution,
+                mode: Mode,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn lifetime(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.closer.checkLifetime();
+                    if (self.mode == .expired and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn checkpoint(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try lifetime(raw);
+                    if (self.f.slots.state(&self.closer.entry.?) != .running) return error.InvalidRunnableTransition;
+                }
+                fn deadline(raw: *anyopaque) !?u64 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.closer.entry.?.options.deadline_ns;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    if (self.mode == .begin_failure) return error.NotFound;
+                    try self.closer.park(.resource_blocked);
+                    if (self.mode != .expired) self.f.release.set(self.f.io);
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.f.release.set(self.f.io);
+                    if (self.mode == .end_failure) return error.Canceled;
+                    try self.closer.enter(.query);
+                }
+            };
+            var control: Control = .{ .f = &f, .closer = &closer, .mode = mode };
+            var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+            const original = admission.Port.init(&payload);
+            const result = db.drainCloseDependenciesWithAdmission(original);
+            if (mode == .success) try result else {
+                try std.testing.expectError(switch (mode) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .expired => error.DeadlineExceeded,
+                    else => unreachable,
+                }, result);
+                try std.testing.expect(!db.closed);
+                try std.testing.expect(manager.graph_metric_snapshot_closing.load(.acquire));
+                try std.testing.expectEqualStrings("pinned", manager.graph_indexes.items[0].config.name);
+                try std.testing.expectError(error.Canceled, manager.graphMetricWorkerSnapshotAlloc());
+                if (mode == .end_failure) try closer.enter(.query);
+                control.mode = .success;
+                try db.drainCloseDependenciesWithAdmission(original);
+            }
+            f.future.?.await(io);
+            f.future = null;
+            if (f.failure) |cause| return cause;
+            try std.testing.expectEqual(@as(usize, 0), manager.graph_metric_schedule_pins.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), f.child_runs.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), f.child_retired.load(.acquire));
+            try std.testing.expect(!f.child_failed.load(.acquire));
+            try std.testing.expect(control.begins != 0);
+            try std.testing.expectEqual(control.begins, control.ends + @as(usize, if (mode == .begin_failure) 1 else 0));
+            try std.testing.expectError(error.Canceled, manager.graphMetricWorkerSnapshotAlloc());
+            try std.testing.expectEqual(cpu.State.running, slots.state(&health.entry.?));
+            // Completed preflight retains the same index generation for
+            // physical destruction and cannot replay a retired snapshot.
+            try db.drainCloseDependenciesWithAdmission(original);
+            try std.testing.expect(!db.closed);
+        }
+    }
 }
 
 test "logical query excluded source upgrade fences historical physical postings" {
@@ -50591,6 +51263,47 @@ test "capi resolver reservation removal preserves independently raised native ep
     defer read.abort();
     try std.testing.expectEqual(required, try resolver_catalog.readMinimumReaderVersion(&read, required));
     try std.testing.expectEqual(required, try resolver_catalog.catalogReaderVersion(a, try read.get(resolver_catalog_key)));
+}
+
+test "loaded resolver envelopes preserve inventory and completion identity with optional dictionaries" {
+    const a = std.testing.allocator;
+    const inventory = @import("../artifact_inventory.zig");
+    for ([_]bool{ false, true }) |dictionary| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+        defer a.free(path);
+        var store = try docstore_mod.DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        const index_data = try serializeCatalog(a, &manager);
+        defer a.free(index_data);
+        const resolver_data = if (dictionary) "{\"version\":4,\"resolvers\":[],\"projections\":{}}" else "{\"version\":4,\"resolvers\":[]}";
+        var runtime_store = try initRuntimeStore(a, &store);
+        defer runtime_store.deinit();
+        {
+            var txn = try runtime_store.store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(index_catalog_key, index_data);
+            try txn.put(enrichment_catalog_key, "[]");
+            try txn.put(resolver_catalog_key, resolver_data);
+            try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(4));
+            try inventory.refresh(&txn);
+            try txn.commit();
+        }
+        try manager.loadResolverCatalog(&store);
+        var read = try runtime_store.store.beginRead();
+        defer read.abort();
+        _ = try inventory.local(&read);
+        const catalogs = try inventory.catalogs(&read);
+        try std.testing.expectEqualStrings(resolver_data, catalogs.resolvers);
+        try std.testing.expect(try manager.matchesArtifactInventory(catalogs));
+        var snapshot = try manager.acquireWritePlanSnapshot();
+        defer snapshot.release();
+        try std.testing.expect(snapshot.plan().matchesArtifactInventory(catalogs));
+        try std.testing.expectEqual(catalogs.digest(), snapshot.plan().completion_plan.?.catalog);
+    }
 }
 
 test "resolver curation query admission retains large immutable declarations across generation changes" {

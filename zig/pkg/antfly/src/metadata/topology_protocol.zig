@@ -93,7 +93,7 @@ const std = @import("std");
 /// Version 60 backfills and maintains root-scoped resolver pin projections.
 /// Version 61 resumes bounded pin paths and backfills static root membership.
 /// Version 62 incrementally repairs graph-fenced pin membership from edit journals.
-pub const current_version: u16 = 62;
+pub const current_version: u16 = 63;
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
@@ -107,6 +107,8 @@ pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
+/// Version 63 persists permanent, root-signed remote journal initialization.
+pub const remote_attempt_initialization_version: u16 = 63;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
@@ -290,3 +292,8 @@ pub const store_report_baseline_version: u16 = 10;
 
 /// Atomic, bounded acknowledgements for local schema migration readiness.
 pub const schema_progress_batch_version: u16 = 10;
+
+test "remote initialization merged epoch follows native resolver epochs" {
+    try std.testing.expect(remote_attempt_initialization_version > resolver_namespaces_version);
+    try std.testing.expect(current_version >= remote_attempt_initialization_version);
+}

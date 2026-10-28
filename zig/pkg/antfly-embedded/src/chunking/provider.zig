@@ -76,6 +76,7 @@ pub const Provider = struct {
         errdefer alloc.destroy(client);
         client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, io, .{
             .keep_alive = true,
+            .outbound = .{ .max_active = 20, .max_per_endpoint = 5, .max_waiters = 20 },
             .cookies_enabled = false,
         });
         self.owned_http_client = client;

@@ -867,8 +867,13 @@ test "replicated recovery batches proven followers preserves uncertain debt and 
 }
 
 pub fn runDbRecoveryOnce(self: *@import("antfly_source_root").antfly_sources.physical_db.DB, config: Config) !types.TransactionRecoveryStats {
-    var replication_mutation = try self.admitTransactionRecovery();
-    defer if (replication_mutation) |*lease| lease.release();
+    return runDbRecoveryOnceImpl(self, config);
+}
+
+fn runDbRecoveryOnceImpl(self: anytype, config: Config) !types.TransactionRecoveryStats {
+    // Each mutation stage acquires its own lease. Notification may need a seed
+    // capture or route back to this DB and cannot retain reader admission.
+    try self.checkTransactionRecoveryAdmission();
     if (!config.enabled) return .{};
     if (config.replicated_metadata) {
         return try recoverOnce(
@@ -943,6 +948,180 @@ pub fn runDbRecoveryOnce(self: *@import("antfly_source_root").antfly_sources.phy
     return recovery_stats;
 }
 
+const NotificationFixture = if (builtin.is_test) struct {
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Mode = enum { success, delivery_failure, close_before_ack };
+    const txn_id: transactions_mod.TxnId = @splat(97);
+    const Core = struct {
+        manager: *transactions_mod.TxnManager,
+        store: *backend_erased.Store,
+        pub fn batchExecutionResources(self: *@This()) struct { store: *backend_erased.Store } {
+            return .{ .store = self.store };
+        }
+        pub fn listTransactions(self: *@This(), alloc: Allocator) ![]transactions_mod.TxnSummary {
+            return self.manager.listTransactions(alloc);
+        }
+        pub fn getUnresolvedTransactionParticipants(self: *@This(), alloc: Allocator, txn: transactions_mod.TxnId) ![][]u8 {
+            return self.manager.getUnresolvedParticipants(alloc, txn);
+        }
+    };
+    const Db = struct {
+        alloc: Allocator,
+        core: *Core,
+        barrier: *Barrier,
+        gate_open: bool = true,
+        acknowledgements: usize = 0,
+        cleanups: usize = 0,
+        pub fn checkTransactionRecoveryAdmission(self: *@This()) !void {
+            if (!self.gate_open) return error.Forbidden;
+        }
+        pub fn admitTransactionRecovery(self: *@This()) !?Barrier.SharedLease {
+            var lease = self.barrier.acquireShared();
+            errdefer lease.release();
+            try self.checkTransactionRecoveryAdmission();
+            return lease;
+        }
+        pub fn recoverFinalizedTransactionIntents(self: *@This(), _: u64) !u64 {
+            var lease = self.barrier.acquireShared();
+            defer lease.release();
+            try self.checkTransactionRecoveryAdmission();
+            try std.testing.expect(self.barrier.tryAcquireExclusive() == null);
+            return 0; // Fixture decision/intents were already physically resolved.
+        }
+        pub fn markTransactionParticipantsResolved(self: *@This(), txn: transactions_mod.TxnId, participants: []const []const u8) !void {
+            var lease = self.barrier.acquireShared();
+            defer lease.release();
+            try self.checkTransactionRecoveryAdmission();
+            try std.testing.expect(self.barrier.tryAcquireExclusive() == null);
+            try self.core.manager.markParticipantsResolvedExtraBatch(txn, participants, .{});
+            self.acknowledgements += participants.len;
+        }
+        pub fn recoverLocalTransactionRecords(self: *@This(), cutoff: u64, now: u64) !transactions_mod.RecoveryStats {
+            var lease = self.barrier.acquireShared();
+            defer lease.release();
+            try self.checkTransactionRecoveryAdmission();
+            try std.testing.expect(self.barrier.tryAcquireExclusive() == null);
+            const stats = try self.core.manager.recoverTransactions(cutoff, now);
+            self.cleanups += 1;
+            return stats;
+        }
+    };
+    const Capture = struct {
+        barrier: *Barrier,
+        scheduler: *native.Scheduler,
+        captured: bool = false,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.execute() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
+            var health: native.Execution = .{};
+            defer health.finish();
+            try health.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 1 }, .control);
+            const stats = self.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.control_slots);
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 0), stats.runnable_slots - stats.control_slots - stats.cleanup_runnable_slots);
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.NotificationRetainedMutationReader;
+            capture.release();
+            self.captured = true;
+        }
+    };
+    const Resolver = struct {
+        db: *Db,
+        scheduler: *native.Scheduler,
+        execution: *native.Execution,
+        mode: Mode,
+        captures: usize = 0,
+        fn resolve(raw: *anyopaque, txn: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, version: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(txn_id, txn);
+            try std.testing.expectEqualStrings("remote", participant);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
+            try std.testing.expectEqual(@as(u64, 2000), version);
+            try self.execution.park(.resource_blocked);
+            var capture: Capture = .{ .barrier = self.db.barrier, .scheduler = self.scheduler };
+            const worker = std.Thread.spawn(.{}, Capture.run, .{&capture}) catch |err| {
+                try self.execution.enter(.background);
+                return err;
+            };
+            worker.join();
+            try self.execution.enter(.background);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), self.scheduler.stats().retained_bytes);
+            if (capture.failure) |err| return err;
+            try std.testing.expect(capture.captured);
+            self.captures += 1;
+            switch (self.mode) {
+                .success => {},
+                .delivery_failure => return error.NotificationUnavailable,
+                .close_before_ack => self.db.gate_open = false,
+            }
+        }
+    };
+    fn verify(mode: Mode) !void {
+        const alloc = std.testing.allocator;
+        var backend = mem_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try backend.runtimeStore(alloc, .{ .name = "notification-scope" });
+        defer store.deinit();
+        var manager = try transactions_mod.TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransactionWithParticipants(txn_id, 1000, &.{"remote"});
+        try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
+        try manager.resolveIntents(txn_id, .committed, 2000);
+        var barrier: Barrier = .{};
+        var core: Core = .{ .manager = &manager, .store = &store };
+        var db: Db = .{ .alloc = alloc, .core = &core, .barrier = &barrier };
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .background);
+        var resolver: Resolver = .{ .db = &db, .scheduler = &scheduler, .execution = &execution, .mode = mode };
+        const config: Config = .{ .enabled = true, .lease_owned = true, .resolver_ctx = &resolver, .resolve_participant_fn = Resolver.resolve, .cutoff_ns = 1 };
+        if (mode == .close_before_ack) {
+            try std.testing.expectError(error.Forbidden, runDbRecoveryOnceImpl(&db, config));
+            try std.testing.expectEqual(@as(usize, 0), db.acknowledgements);
+            try std.testing.expectEqual(@as(usize, 0), db.cleanups);
+        } else {
+            const stats = try runDbRecoveryOnceImpl(&db, config);
+            try std.testing.expectEqual(@as(u64, 1), stats.notification_attempts);
+            try std.testing.expectEqual(@as(u64, if (mode == .success) 1 else 0), stats.notification_successes);
+            try std.testing.expectEqual(@as(u64, if (mode == .delivery_failure) 1 else 0), stats.notification_failures);
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolver.captures);
+        try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+        if (mode != .success) {
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try manager.getTransactionStatus(txn_id));
+            const pending = try manager.getUnresolvedParticipants(alloc, txn_id);
+            defer transactions_mod.freeParticipantList(alloc, pending);
+            try std.testing.expectEqual(@as(usize, 1), pending.len);
+            try std.testing.expect(!try manager.hasIntents(txn_id));
+            db.gate_open = true;
+            resolver.mode = .success;
+            const retry = try runDbRecoveryOnceImpl(&db, config);
+            try std.testing.expectEqual(@as(u64, 1), retry.notification_successes);
+        }
+        try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, manager.getTransactionStatus(txn_id));
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+} else struct {};
+
+test "transaction recovery notification permits physical capture at C1 H1 and retains failed delivery debt" {
+    try NotificationFixture.verify(.success);
+    try NotificationFixture.verify(.delivery_failure);
+}
+
+test "transaction recovery notification rechecks local authority before acknowledgement and preserves debt" {
+    try NotificationFixture.verify(.close_before_ack);
+}
+
 const local_contract = @import("antfly_local_sources").storage_db_transaction_recovery_contract;
 
 /// Config and its callback contexts must outlive DB initialization. The
@@ -996,6 +1175,9 @@ const OwnedServerRuntime = struct {
     fn stop(ptr: *anyopaque) bool {
         return owner(ptr).runtime.stop();
     }
+    fn stopWithAdmission(ptr: *anyopaque, original: @import("antfly_local_sources").common_read_admission.Port) anyerror!void {
+        return try owner(ptr).runtime.stopWithAdmission(original);
+    }
     fn pause(ptr: *anyopaque) bool {
         return owner(ptr).runtime.pause();
     }
@@ -1021,6 +1203,7 @@ const OwnedServerRuntime = struct {
         .deinit = deinit,
         .start = start,
         .stop = stop,
+        .stop_with_admission = stopWithAdmission,
         .pause = pause,
         .resume_after_pause = resumeAfterPause,
         .ensure_running = ensureRunning,

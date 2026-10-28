@@ -17,6 +17,8 @@
 //! A publication copies only changed search paths. Readers pin a root in O(1)
 //! and materialize their shared read/planning projection outside the writer lock.
 const std = @import("std");
+const run_comparison = @import("run_comparison.zig");
+const run_summary = @import("run_summary.zig");
 const repository = @import("repository.zig");
 const state = @import("state.zig");
 const Account = @import("memory_account.zig").Account;
@@ -108,11 +110,15 @@ test "directory accounting token charges selected payloads without pinning unrel
 
 const Payload = struct {
     refs: std.atomic.Value(usize) = .init(1),
+    registered_anchor: ?Directory.RegisteredAnchor = null,
     run: Run,
     owner: *anyopaque,
     release_pin: *const fn (*anyopaque, *Run) void,
     account: *Account,
     bytes: usize,
+    // Prepaid with the physical payload, not duplicated in each index's
+    // reclaimer. Only the exclusive final entry owner may use this workspace.
+    retirement: ?@import("run_snapshot_clone.zig").Retirement = null,
 };
 
 const Entry = struct {
@@ -120,36 +126,11 @@ const Entry = struct {
     payload: ?*Payload = null,
     domain: []const u8 = "",
 
-    pub const Summary = struct {
-        smallest: ?*const Run = null,
-        largest: ?*const Run = null,
-        non_async_runs: usize = 0,
-        tombstone_runs: usize = 0,
-        unknown_tombstone_runs: usize = 0,
-        gc_requested: bool = false,
-        oldest_tombstone: u64 = std.math.maxInt(u64),
-        newest_tombstone: u64 = 0,
-    };
+    pub const Summary = run_summary.Summary;
+    pub const Preparation = SummaryPreparation(Summary, run_summary.Full);
     pub fn summarize(entry: Entry, left: Summary, right: Summary) Summary {
-        const deletes = (entry.run.tombstone_count orelse 0) != 0;
-        var smallest = entry.run;
-        var largest = entry.run;
-        for ([_]?*const Run{ left.smallest, right.smallest }) |candidate| if (candidate) |run| {
-            if (compareBound(run.smallest_namespace_name, run.smallest_key, smallest.smallest_namespace_name, smallest.smallest_key) == .lt) smallest = run;
-        };
-        for ([_]?*const Run{ left.largest, right.largest }) |candidate| if (candidate) |run| {
-            if (compareBound(run.largest_namespace_name, run.largest_key, largest.largest_namespace_name, largest.largest_key) == .gt) largest = run;
-        };
-        return .{
-            .smallest = smallest,
-            .largest = largest,
-            .non_async_runs = left.non_async_runs + right.non_async_runs + @intFromBool(entry.run.path == null or entry.run.state != null),
-            .tombstone_runs = left.tombstone_runs + right.tombstone_runs + @intFromBool(deletes),
-            .unknown_tombstone_runs = left.unknown_tombstone_runs + right.unknown_tombstone_runs + @intFromBool(entry.run.tombstone_count == null),
-            .gc_requested = left.gc_requested or right.gc_requested or entry.run.gc_requested,
-            .oldest_tombstone = @min(left.oldest_tombstone, right.oldest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else std.math.maxInt(u64)),
-            .newest_tombstone = @max(left.newest_tombstone, right.newest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else 0),
-        };
+        var preparation = Preparation.init(entry, left, right);
+        return preparation.resumeWithAdmission(null) catch unreachable;
     }
 
     pub fn retainShared(self: Entry) Entry {
@@ -164,48 +145,113 @@ const Entry = struct {
         payload.account.discharge(payload.bytes);
         allocator.destroy(payload);
     }
+    /// Retain the detached payload/account until the last physical byte is
+    /// retired. Generic registered drops remain fixed and never claim its anchor.
+    pub const Retirement = struct {
+        payload: ?*Payload,
+        claimed: bool = false,
+        pin_released: bool = false,
+        pub fn init(entry: Entry) @This() {
+            return .{ .payload = entry.payload };
+        }
+        pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+            if (self.payload == null) return true;
+            while (credits.* != 0) {
+                if (self.stepWithAdmission(allocator, credits, null) catch unreachable) return true;
+            }
+            return false;
+        }
+        pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            comptime std.debug.assert(@sizeOf(Payload) <= 16 * 1024);
+            const payload = self.payload orelse return true;
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            if (!self.claimed) {
+                self.claimed = true;
+                if (payload.refs.fetchSub(1, .acq_rel) != 1) {
+                    self.payload = null;
+                    return true;
+                }
+                std.debug.assert(payload.registered_anchor == null);
+            }
+            var isolated = payload.run;
+            isolated.version_ref_pinned = false;
+            // Completed physical work may already have freed a shared-memory
+            // header. Never inspect that original descriptor again on retry.
+            const supported = payload.retirement != null or @import("run_snapshot_clone.zig").Retirement.supports(isolated);
+            if (original != null and (!supported or !@import("../lsm_backend.zig").Backend.isDirectorySnapshotPin(payload.release_pin))) return error.ExecutionWaitUnsupported;
+            if (!self.pin_released) {
+                payload.release_pin(payload.owner, &payload.run);
+                payload.run.version_ref_pinned = false;
+                self.pin_released = true;
+            }
+            if (supported) {
+                if (payload.retirement == null) payload.retirement = try @import("run_snapshot_clone.zig").Retirement.init(payload.run);
+                if (!try payload.retirement.?.step(allocator, original)) return false;
+            } else {
+                // Unknown legacy providers retain their explicit joined path;
+                // admitted callers refuse before invoking that destructor.
+                payload.run.deinit(allocator);
+            }
+            if (original) |port| try port.checkpoint();
+            const account = payload.account;
+            const bytes = payload.bytes;
+            allocator.destroy(payload);
+            account.discharge(bytes);
+            self.payload = null;
+            return true;
+        }
+    };
     pub fn retainedBytes(_: Entry) usize {
         return 0;
     }
 };
 
+fn SummaryPreparation(comptime Result: type, comptime Cursor: type) type {
+    return struct {
+        cursor: Cursor,
+        entry: Entry,
+        pub fn init(entry: Entry, left: Result, right: Result) @This() {
+            return .{ .cursor = .init(entry.run, left, right), .entry = entry };
+        }
+        pub fn matches(self: *const @This(), entry: Entry, left: Result, right: Result) bool {
+            return self.entry.run == entry.run and self.entry.payload == entry.payload and
+                self.entry.domain.ptr == entry.domain.ptr and self.entry.domain.len == entry.domain.len and
+                std.meta.eql(self.cursor.left, left) and std.meta.eql(self.cursor.right, right);
+        }
+        pub fn resumeWithAdmission(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !Result {
+            return self.cursor.resumeWithAdmission(original);
+        }
+    };
+}
 const BoundsSummary = struct {
-    pub const Summary = struct { largest: ?*const Run = null };
+    pub const Summary = run_summary.UpperSummary;
+    pub const Preparation = SummaryPreparation(Summary, run_summary.Upper);
     pub fn summarize(entry: Entry, left: Summary, right: Summary) Summary {
-        var largest = entry.run;
-        for ([_]?*const Run{ left.largest, right.largest }) |candidate| if (candidate) |run| {
-            if (compareBound(largest.largest_namespace_name, largest.largest_key, run.largest_namespace_name, run.largest_key) == .lt) largest = run;
-        };
-        return .{ .largest = largest };
+        var preparation = Preparation.init(entry, left, right);
+        return preparation.resumeWithAdmission(null) catch unreachable;
     }
 };
 
 fn compareBound(a_ns: ?[]const u8, a: []const u8, b_ns: ?[]const u8, b: []const u8) std.math.Order {
-    const ns = state.compareNamespace(.{ .name = a_ns }, .{ .name = b_ns });
-    return if (ns == .eq) std.mem.order(u8, a, b) else ns;
+    var cursor = run_comparison.Cursor.bound(a_ns, a, b_ns, b);
+    return cursor.resumeWithAdmission(null) catch unreachable;
 }
-
+fn comparison(comptime mode: run_comparison.Mode, a: Entry, b: Entry) std.math.Order {
+    return run_comparison.compare(mode, .{ .run = a.run, .domain = a.domain }, .{ .run = b.run, .domain = b.domain });
+}
 fn compareDomain(a: Entry, b: Entry) std.math.Order {
-    const ns = state.compareNamespace(.{ .name = a.run.smallest_namespace_name }, .{ .name = b.run.smallest_namespace_name });
-    if (ns != .eq) return ns;
-    const domain = std.mem.order(u8, a.domain, b.domain);
-    return if (domain != .eq) domain else compare(a, b);
+    return comparison(.domain, a, b);
 }
-
 fn compareId(a: Entry, b: Entry) std.math.Order {
-    return std.math.order(a.run.id, b.run.id);
+    return comparison(.id, a, b);
 }
-
 fn compareBounds(a: Entry, b: Entry) std.math.Order {
-    const ns = state.compareNamespace(.{ .name = a.run.smallest_namespace_name }, .{ .name = b.run.smallest_namespace_name });
-    if (ns != .eq) return ns;
-    const key = std.mem.order(u8, a.run.smallest_key, b.run.smallest_key);
-    return if (key != .eq) key else compare(a, b);
+    return comparison(.lower, a, b);
 }
-
 fn compareEnds(a: Entry, b: Entry) std.math.Order {
-    const order = compareBound(a.run.largest_namespace_name, a.run.largest_key, b.run.largest_namespace_name, b.run.largest_key);
-    return if (order != .eq) order else compare(a, b);
+    return comparison(.upper, a, b);
 }
 
 pub const LevelAggregate = struct {
@@ -227,19 +273,7 @@ fn compareLevel(a: LevelAggregate, b: LevelAggregate) std.math.Order {
 }
 
 fn compare(a: Entry, b: Entry) std.math.Order {
-    const lhs = a.run;
-    const rhs = b.run;
-    if (lhs.level != rhs.level) return std.math.order(lhs.level, rhs.level);
-    if (lhs.level == 0) {
-        const av = if (lhs.visibility_id == 0) lhs.id else lhs.visibility_id;
-        const bv = if (rhs.visibility_id == 0) rhs.id else rhs.visibility_id;
-        if (av != bv) return std.math.order(bv, av);
-    }
-    const ns = state.compareNamespace(.{ .name = lhs.smallest_namespace_name }, .{ .name = rhs.smallest_namespace_name });
-    if (ns != .eq) return ns;
-    const key = std.mem.order(u8, lhs.smallest_key, rhs.smallest_key);
-    if (key != .eq) return key;
-    return std.math.order(lhs.id, rhs.id);
+    return comparison(.read, a, b);
 }
 
 pub const Directory = struct {
@@ -269,27 +303,57 @@ pub const Directory = struct {
     total_run_bytes: u64 = 0,
     memory_run_count: usize = 0,
     retired_next: ?*Directory = null,
+    registered_owner: ?*@import("../resource_manager.zig").PayloadRetirement = null,
+    registered_account: ?*Account = null,
+
+    fn Comparison(comptime mode: run_comparison.Mode) type {
+        return struct {
+            cursor: run_comparison.Cursor,
+            pub fn init(a: Entry, b: Entry) @This() {
+                return .{ .cursor = .init(mode, .{ .run = a.run, .domain = a.domain }, .{ .run = b.run, .domain = b.domain }) };
+            }
+            pub fn resumeWithAdmission(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !std.math.Order {
+                return self.cursor.resumeWithAdmission(original);
+            }
+        };
+    }
+    pub const ReadSearch = Tree.Search(Comparison(.read));
+    pub const IdSearch = IdTree.Search(Comparison(.id));
+    pub const LowerSearch = BoundsTree.Search(Comparison(.lower));
+    pub const UpperSearch = EndsTree.Search(Comparison(.upper));
+    pub fn locateRead(self: *const Directory, run: *const Run) ReadSearch {
+        return .init(self.tree.root, .{ .run = run });
+    }
+    pub fn locateId(self: *const Directory, run: *const Run) IdSearch {
+        return .init(self.ids.root, .{ .run = run });
+    }
+    pub fn locateLower(self: *const Directory, run: *const Run) LowerSearch {
+        return .init(self.bounds.root, .{ .run = run });
+    }
+    pub fn locateUpper(self: *const Directory, run: *const Run) UpperSearch {
+        return .init(self.ends.root, .{ .run = run });
+    }
 
     pub fn create(allocator: std.mem.Allocator) !*Directory {
         const self = try allocator.create(Directory);
         self.* = .{};
         return self;
     }
+    /// Value snapshot only: the caller funds and retains its own header.
+    pub fn forkContents(self: *const Directory) Directory {
+        return .{ .tree = self.tree.fork(), .ids = self.ids.fork(), .bounds = self.bounds.fork(), .ends = self.ends.fork(), .levels = self.levels.fork(), .generations = self.generations.fork(), .total_run_bytes = self.total_run_bytes, .memory_run_count = self.memory_run_count, .registered_owner = self.registered_owner, .registered_account = if (self.registered_account) |account| account.retain() else null };
+    }
     pub fn fork(self: *const Directory, allocator: std.mem.Allocator) !*Directory {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
         const out = try create(allocator);
-        out.tree = self.tree.fork();
-        out.ids = self.ids.fork();
-        out.bounds = self.bounds.fork();
-        out.ends = self.ends.fork();
-        out.levels = self.levels.fork();
-        out.generations = self.generations.fork();
-        out.total_run_bytes = self.total_run_bytes;
-        out.memory_run_count = self.memory_run_count;
+        out.* = self.forkContents();
         return out;
     }
     pub fn destroy(self: *Directory, allocator: std.mem.Allocator) void {
+        const guard = self.registered_account;
         self.destroyContents(allocator);
         allocator.destroy(self);
+        if (guard) |account| account.release();
     }
 
     pub const Reclaimer = struct {
@@ -306,12 +370,23 @@ pub const Directory = struct {
             return .{ .directory = directory, .tree = .init(directory.tree), .ids = .init(directory.ids), .bounds = .init(directory.bounds), .ends = .init(directory.ends), .levels = .init(directory.levels), .generations = .init(directory.generations) };
         }
         pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
-            return self.tree.step(allocator, credits) and self.ids.step(allocator, credits) and self.bounds.step(allocator, credits) and self.ends.step(allocator, credits) and self.levels.step(allocator, credits) and self.generations.step(allocator, credits);
+            return self.stepWithAdmission(allocator, credits, null) catch unreachable;
+        }
+        pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            return try self.tree.stepWithAdmission(allocator, credits, original) and try self.ids.stepWithAdmission(allocator, credits, original) and try self.bounds.stepWithAdmission(allocator, credits, original) and try self.ends.stepWithAdmission(allocator, credits, original) and try self.levels.stepWithAdmission(allocator, credits, original) and try self.generations.stepWithAdmission(allocator, credits, original);
         }
         /// Only after step reports completion, back under the accounting lock.
         pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {
+            const guard = self.directory.registered_account;
             self.directory.releaseAccounting();
             allocator.destroy(self.directory);
+            if (guard) |account| account.release();
+        }
+        /// Embedded/value headers belong to their caller's separately funded frame.
+        pub fn finishContents(self: *@This()) void {
+            const guard = self.directory.registered_account;
+            self.directory.releaseAccounting();
+            if (guard) |account| account.release();
         }
     };
 
@@ -380,38 +455,1010 @@ pub const Directory = struct {
         return result;
     }
 
-    pub fn put(self: *Directory, backend: anytype, run: Run) !void {
+    /// Prepare allocation pools only. The caller separately performs admitted
+    /// key comparisons, payload/pin preparation and atomic index publication.
+    /// Candidate/root identities must remain stable until this cursor finishes.
+    pub const IndexPreparation = struct {
+        directory: *Directory,
+        level: u32,
+        ends_edits: usize,
+        phase: usize = 0,
+        pub fn init(directory: *Directory, level: u32, ends_edits: usize) !@This() {
+            if (ends_edits == 0 or ends_edits > 2) return error.InvalidArgument;
+            return .{ .directory = directory, .level = level, .ends_edits = ends_edits };
+        }
+        pub fn memoryBound(self: *const @This()) !u64 {
+            const d = self.directory;
+            var bytes = try d.tree.prepareMemoryBound(1);
+            bytes = try std.math.add(u64, bytes, try d.ids.prepareMemoryBound(1));
+            bytes = try std.math.add(u64, bytes, try d.bounds.prepareMemoryBound(1));
+            bytes = try std.math.add(u64, bytes, try d.ends.prepareMemoryBound(self.ends_edits));
+            bytes = try std.math.add(u64, bytes, try d.levels.prepareMemoryBound(1));
+            if (self.level == 0) bytes = try std.math.add(u64, bytes, try d.generations.prepareMemoryBound(1));
+            return bytes;
+        }
+        fn prepare(tree: anytype, a: std.mem.Allocator, edits: usize, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try tree.prepareEditsWithAdmission(a, edits, port) else try tree.prepareEdits(a, edits);
+        }
+        pub fn resumeWithAdmission(self: *@This(), a: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            const d = self.directory;
+            while (self.phase < 6) {
+                if (original) |port| try port.checkpoint();
+                switch (self.phase) {
+                    0 => try prepare(&d.tree, a, 1, original),
+                    1 => try prepare(&d.ids, a, 1, original),
+                    2 => try prepare(&d.bounds, a, 1, original),
+                    3 => try prepare(&d.ends, a, self.ends_edits, original),
+                    4 => try prepare(&d.levels, a, 1, original),
+                    5 => if (self.level == 0) {
+                        try prepare(&d.generations, a, 1, original);
+                    },
+                    else => unreachable,
+                }
+                self.phase += 1;
+            }
+        }
+    };
+    /// Two edits in every index cover arbitrary old-ID removal followed by
+    /// insertion, including changes of key, level and L0 visibility sequence.
+    pub const PutPools = struct {
+        directory: *Directory,
+        phase: usize = 0,
+        pub fn memoryBound(self: *const @This()) !u64 {
+            var total: u64 = 0;
+            inline for (.{ "tree", "ids", "bounds", "ends", "levels", "generations" }) |field|
+                total = try std.math.add(u64, total, try @field(self.directory, field).prepareMemoryBound(2));
+            return total;
+        }
+        pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            inline for (.{ "tree", "ids", "bounds", "ends", "levels", "generations" }, 0..) |field, i| {
+                if (self.phase == i) {
+                    if (original) |port| try @field(self.directory, field).prepareEditsWithAdmission(allocator, 2, port) else try @field(self.directory, field).prepareEdits(allocator, 2);
+                    self.phase += 1;
+                }
+            }
+        }
+    };
+
+    /// One owned registration, represented independently of backend lifetime.
+    pub const DomainLifetime = enum { borrowed, key_or_static };
+    pub const Routing = struct {
+        domain_lifetime: DomainLifetime = .borrowed,
+        legacy: ?*const fn ([]const u8) []const u8 = null,
+        admitted: ?*const fn ([]const u8, @import("../../common/read_admission.zig").Port) anyerror![]const u8 = null,
+        pub fn fromOptions(options: anytype) @This() {
+            return .{ .legacy = options.run_partition_key, .admitted = if (options.run_partition_key != null) options.run_partition_key_with_admission else null, .domain_lifetime = if (@hasField(@TypeOf(options), "run_partition_domain_lifetime")) options.run_partition_domain_lifetime else .borrowed };
+        }
+        pub fn matches(self: @This(), other: @This()) bool {
+            return self.legacy == other.legacy and self.admitted == other.admitted and self.domain_lifetime == other.domain_lifetime;
+        }
+    };
+    pub const RegisteredAnchor = struct {
+        allocator: std.mem.Allocator,
+        manager: *@import("../resource_manager.zig").ResourceManager,
+        registration: *@import("../resource_manager.zig").PayloadRetirement,
+        routing: Routing,
+        domain: []const u8,
+    };
+    /// An acquired immutable source, including its original allocator, resident
+    /// observer and domain ancestry. The registered final anchor remains while
+    /// this non-final reference is held; releasing it performs no physical free.
+    pub const RegisteredSource = struct {
+        lease: ?EntryLease,
+        allocator: std.mem.Allocator,
+        routing: Routing,
+        pub fn run(self: *const @This()) *const Run {
+            return self.lease.?.entry.run;
+        }
+        pub fn domain(self: *const @This()) []const u8 {
+            return self.lease.?.entry.domain;
+        }
+        pub fn releaseWithAdmission(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (self.lease) |*lease| {
+                std.debug.assert(lease.entry.payload.?.registered_anchor != null and lease.entry.payload.?.refs.load(.acquire) > 1);
+                lease.deinit(self.allocator);
+                self.lease = null;
+            }
+        }
+    };
+
+    pub const EntryPin = struct {
+        owner: *anyopaque,
+        release: *const fn (*anyopaque, *Run) void,
+    };
+
+    /// Owns one immutable payload, pin and accounting reference. Its allocator,
+    /// backend and domain authority outlive it. Last-reference release still
+    /// needs physical retirement; deinit is an explicit quiesced fallback.
+    pub const EntryLease = struct {
+        entry: Entry,
+        /// The owner supplies a retained pin-release operation. It must not
+        /// invoke the legacy path registry under admission: rejection retains
+        /// its progress, and success releases exactly this payload's pin.
+        pub const PinRelease = struct {
+            context: *anyopaque,
+            resume_fn: *const fn (*anyopaque, *anyopaque, *Run, ?@import("../../common/read_admission.zig").Port) anyerror!void,
+        };
+        pub const Retirement = struct {
+            payload: ?*Payload,
+            pin: PinRelease,
+            physical: ?@import("run_snapshot_clone.zig").Retirement = null,
+            pin_released: bool = false,
+            complete: bool = false,
+
+            /// Pin release precedes path retirement. Keep the payload header
+            /// and both accounting references until every owned byte is gone.
+            fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+                if (original) |port| try port.checkpoint();
+                if (self.complete) return;
+                const payload = self.payload.?;
+                if (!self.pin_released) {
+                    try self.pin.resume_fn(self.pin.context, payload.owner, &payload.run, original);
+                    payload.run.version_ref_pinned = false;
+                    self.pin_released = true;
+                }
+                if (self.physical == null) self.physical = @import("run_snapshot_clone.zig").Retirement.init(payload.run) catch unreachable;
+                try self.physical.?.retireWithAdmission(allocator, original);
+                if (original) |port| try port.checkpoint();
+                self.finish(allocator);
+            }
+            fn finish(self: *@This(), allocator: std.mem.Allocator) void {
+                const payload = self.payload.?;
+                const account = payload.account;
+                const bytes = payload.bytes;
+                allocator.destroy(payload);
+                account.discharge(bytes);
+                account.release();
+                self.payload = null;
+                self.complete = true;
+            }
+            /// Registered owners can keep a locally stale pin operation pending
+            /// even during joined cleanup; the next manager pass resumes it.
+            pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+                try self.retire(allocator, original);
+            }
+            pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
+                try self.retire(allocator, original);
+            }
+            /// Explicit joined/quiesced fallback drives the same pin cursor,
+            /// including any progress retained before admission rejection.
+            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+                self.retire(allocator, null) catch unreachable;
+            }
+        };
+
+        /// Validate an opaque pin's issuer before a specialized release
+        /// operation interprets its owner. Rejection leaves this lease intact.
+        pub fn beginRetirementForPinWithAdmission(self: *@This(), expected: *const fn (*anyopaque, *Run) void, pin: PinRelease, original: @import("../../common/read_admission.zig").Port) !Retirement {
+            try original.checkpoint();
+            if (self.entry.payload.?.release_pin != expected) return error.ExecutionWaitUnsupported;
+            return self.beginRetirementWithAdmission(pin, original);
+        }
+
+        /// Consumes this lease only after admission and ownership validation.
+        /// Other directory/handle owners may still exist; their non-final drop
+        /// is constant work. A coordinator keeps a final lease until all such
+        /// owners drain so their generic destructors cannot become final.
+        pub fn beginRetirementWithAdmission(self: *@This(), pin: PinRelease, original: @import("../../common/read_admission.zig").Port) !Retirement {
+            return self.beginRetirement(pin, original);
+        }
+
+        /// A registered final anchor keeps this reference until every generic
+        /// directory/reader reference has drained. While it is sole, no other
+        /// valid owner can acquire a new reference. Null is quiescent teardown.
+        /// Pending leaves this lease intact and performs no physical cleanup.
+        pub fn beginFinalRetirement(self: *@This(), pin: PinRelease, original: ?@import("../../common/read_admission.zig").Port) !?Retirement {
+            if (original) |port| try port.checkpoint();
+            if (self.entry.payload.?.refs.load(.acquire) != 1) return null;
+            return try self.beginRetirement(pin, original);
+        }
+
+        /// Bind only after resident adoption and final-anchor registration,
+        /// before any reader/candidate can acquire this immutable payload.
+        pub fn bindRegisteredAnchor(self: *const @This(), anchor: RegisteredAnchor) void {
+            const payload = self.entry.payload.?;
+            std.debug.assert(payload.registered_anchor == null and payload.account.independently_funded);
+            std.debug.assert(anchor.registration.context != null and anchor.registration.step != null and anchor.registration.credit != null);
+            std.debug.assert(anchor.registration.credit.?.manager == anchor.manager);
+            std.debug.assert(anchor.allocator.ptr == payload.account.backing.ptr and anchor.allocator.vtable == payload.account.backing.vtable);
+            payload.registered_anchor = anchor;
+        }
+        pub fn registeredRouting(self: *const @This(), original: @import("../../common/read_admission.zig").Port) !Routing {
+            try original.checkpoint();
+            const payload = self.entry.payload orelse return error.InvalidArgument;
+            const anchor = payload.registered_anchor orelse return error.ExecutionWaitUnsupported;
+            if (self.entry.run != &payload.run or !payload.account.independently_funded or anchor.domain.ptr != self.entry.domain.ptr or anchor.domain.len != self.entry.domain.len or anchor.registration.context == null or anchor.registration.step == null or anchor.registration.credit == null or anchor.registration.credit.?.manager != anchor.manager or anchor.allocator.ptr != payload.account.backing.ptr or anchor.allocator.vtable != payload.account.backing.vtable) return error.InvalidArgument;
+            return anchor.routing;
+        }
+        pub fn retainRegisteredSourceWithAdmission(self: *const @This(), original: @import("../../common/read_admission.zig").Port) !RegisteredSource {
+            const routing = try self.registeredRouting(original);
+            const allocator = self.entry.payload.?.registered_anchor.?.allocator;
+            const lease = try self.retainWithAdmission(original);
+            return .{ .lease = lease, .allocator = allocator, .routing = routing };
+        }
+
+        /// Caller serializes acquisition against closing its final anchor.
+        pub fn retainWithAdmission(self: *const @This(), original: @import("../../common/read_admission.zig").Port) !EntryLease {
+            try original.checkpoint();
+            _ = self.entry.payload.?.account.retain();
+            return .{ .entry = self.entry.retainShared() };
+        }
+
+        fn beginRetirement(self: *@This(), pin: PinRelease, original: ?@import("../../common/read_admission.zig").Port) !Retirement {
+            if (original) |port| try port.checkpoint();
+            const payload = self.entry.payload.?;
+            var view = payload.run;
+            view.version_ref_pinned = false;
+            if (!@import("run_snapshot_clone.zig").Retirement.supports(view)) return error.ExecutionWaitUnsupported;
+            const account = payload.account;
+            const final = payload.refs.fetchSub(1, .acq_rel) == 1;
+            if (!final) account.release();
+            self.* = undefined;
+            return .{ .payload = if (final) payload else null, .pin = pin, .complete = !final };
+        }
+        pub fn run(self: *const @This()) *const Run {
+            return self.entry.run;
+        }
+        pub fn accountedMemoryBytes(self: *const @This(), pass: u64) u64 {
+            return self.entry.payload.?.account.chargeOnce(pass);
+        }
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            const account = self.entry.payload.?.account;
+            self.entry.deinit(allocator);
+            account.release();
+            self.* = undefined;
+        }
+    };
+
+    /// Owns an already-prepaid private fork for one removal. Caller freezes
+    /// and pins source through publication or complete abort, pins the query
+    /// through lookup, prepays this
+    /// fixed header, and excludes candidate reads/accounting/mutation. No new
+    /// payload is created; the source keeps every payload drop non-final.
+    /// Backend generation/durability/inventory receipts and predecessor-root
+    /// retirement registration must be prepared by the owning coordinator.
+    pub const Removal = struct {
+        source: *const Directory,
+        candidate: *Directory,
+        source_roots: [6]?*const anyopaque,
+        total_bytes: u64,
+        memory_runs: usize,
+        entry: ?Entry = null,
+        pending: union(enum) {
+            read_search: ReadSearch,
+            read_remove: Tree.RankRemoval,
+            id_search: IdSearch,
+            id_remove: IdTree.RankRemoval,
+            lower_search: LowerSearch,
+            lower_remove: BoundsTree.RankRemoval,
+            upper_search: UpperSearch,
+            upper_remove: EndsTree.RankRemoval,
+            level_plan,
+            level_put: LevelTree.RankInsertion,
+            level_remove: LevelTree.RankRemoval,
+            generation_plan,
+            generation_put: generation_index.Tree.RankInsertion,
+            generation_remove: generation_index.Tree.RankRemoval,
+            receipt,
+            done,
+            retiring,
+        },
+        reclaimer: ?Reclaimer = null,
+        published: bool = false,
+        taken: bool = false,
+        retired: bool = false,
+
+        fn roots(d: *const Directory) [6]?*const anyopaque {
+            var result: [6]?*const anyopaque = undefined;
+            inline for (.{ "tree", "ids", "bounds", "ends", "levels", "generations" }, 0..) |field, i|
+                result[i] = if (@field(d, field).root) |root| @ptrCast(root) else null;
+            return result;
+        }
+        pub fn init(source: *const Directory, candidate: *Directory, run: *const Run) !@This() {
+            if (source == candidate or candidate.retired_next != null or
+                !std.meta.eql(roots(source), roots(candidate)) or
+                source.total_run_bytes != candidate.total_run_bytes or source.memory_run_count != candidate.memory_run_count)
+                return error.InvalidArgument;
+            return .{ .source = source, .candidate = candidate, .source_roots = roots(source), .total_bytes = source.total_run_bytes, .memory_runs = source.memory_run_count, .pending = .{ .read_search = candidate.locateRead(run) } };
+        }
+        fn stable(self: *const @This()) bool {
+            return std.meta.eql(self.source_roots, roots(self.source)) and
+                self.source.total_run_bytes == self.total_bytes and self.source.memory_run_count == self.memory_runs;
+        }
+        fn check(self: *const @This(), original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (!self.stable()) return error.CompactionPlanningStale;
+        }
+        fn releaseRunNode(self: *@This(), allocator: std.mem.Allocator, node: anytype) void {
+            _ = self;
+            // Source is frozen and owns this exact immutable payload. Thus
+            // release cannot enter the pin registry or destroy run metadata.
+            std.debug.assert(node.left == null and node.right == null);
+            std.debug.assert(node.entry.payload.?.refs.load(.acquire) > 1);
+            node.release(allocator);
+        }
+        pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (self.published or self.taken or self.retired or std.meta.activeTag(self.pending) == .retiring) return error.InvalidArgument;
+            while (true) {
+                try self.check(original);
+                switch (self.pending) {
+                    .read_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched == null) {
+                            self.pending = .done;
+                            continue;
+                        }
+                        self.entry = job.matched.?.entry;
+                        self.pending = .{ .read_remove = try Tree.RankRemoval.init(&self.candidate.tree, job.rank) };
+                    },
+                    .read_remove => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        if (try job.takeRetired()) |node| self.releaseRunNode(allocator, node);
+                        self.pending = .{ .id_search = self.candidate.locateId(self.entry.?.run) };
+                    },
+                    .id_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched == null or job.matched.?.entry.payload != self.entry.?.payload) return error.CompactionPlanningStale;
+                        self.pending = .{ .id_remove = try IdTree.RankRemoval.init(&self.candidate.ids, job.rank) };
+                    },
+                    .id_remove => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        if (try job.takeRetired()) |node| self.releaseRunNode(allocator, node);
+                        self.pending = .{ .lower_search = self.candidate.locateLower(self.entry.?.run) };
+                    },
+                    .lower_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched == null or job.matched.?.entry.payload != self.entry.?.payload) return error.CompactionPlanningStale;
+                        self.pending = .{ .lower_remove = try BoundsTree.RankRemoval.init(&self.candidate.bounds, job.rank) };
+                    },
+                    .lower_remove => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        if (try job.takeRetired()) |node| self.releaseRunNode(allocator, node);
+                        self.pending = .{ .upper_search = self.candidate.locateUpper(self.entry.?.run) };
+                    },
+                    .upper_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched == null or job.matched.?.entry.payload != self.entry.?.payload) return error.CompactionPlanningStale;
+                        self.pending = .{ .upper_remove = try EndsTree.RankRemoval.init(&self.candidate.ends, job.rank) };
+                    },
+                    .upper_remove => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        if (try job.takeRetired()) |node| self.releaseRunNode(allocator, node);
+                        self.pending = .level_plan;
+                    },
+                    .level_plan => {
+                        const entry = self.entry.?;
+                        var level = self.source.levelStats(entry.run.level);
+                        const rank = self.candidate.levels.root.?.lowerBound(level);
+                        level.count -= 1;
+                        level.bytes -= entry.run.size_bytes;
+                        level.tombstone_runs -= @intFromBool((entry.run.tombstone_count orelse 0) != 0);
+                        self.pending = if (level.count == 0)
+                            .{ .level_remove = try LevelTree.RankRemoval.init(&self.candidate.levels, rank) }
+                        else
+                            .{ .level_put = try LevelTree.RankInsertion.init(&self.candidate.levels, level, rank, true) };
+                    },
+                    .level_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        _ = try job.takeRetired(); // Scalar aggregate has no owned payload.
+                        self.pending = .generation_plan;
+                    },
+                    .level_remove => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        if (try job.takeRetired()) |node| node.release(allocator);
+                        self.pending = .generation_plan;
+                    },
+                    .generation_plan => {
+                        const entry = self.entry.?;
+                        if (entry.run.level == 0) {
+                            const key = generation_index.Generation{ .sequence = generation_index.sequence(entry.run.*) };
+                            var generation = generation_index.Tree.find(self.source.generations.root, key).?.entry;
+                            const rank = self.candidate.generations.root.?.lowerBound(key);
+                            generation.files -= 1;
+                            generation.bytes -= entry.run.size_bytes;
+                            self.pending = if (generation.files == 0)
+                                .{ .generation_remove = try generation_index.Tree.RankRemoval.init(&self.candidate.generations, rank) }
+                            else
+                                .{ .generation_put = try generation_index.Tree.RankInsertion.init(&self.candidate.generations, generation, rank, true) };
+                        } else self.pending = .receipt;
+                    },
+                    .generation_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        _ = try job.takeRetired(); // Scalar aggregate has no owned payload.
+                        self.pending = .receipt;
+                    },
+                    .generation_remove => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        if (try job.takeRetired()) |node| node.release(allocator);
+                        self.pending = .receipt;
+                    },
+                    .receipt => {
+                        self.candidate.total_run_bytes = self.total_bytes - self.entry.?.run.size_bytes;
+                        self.candidate.memory_run_count = self.memory_runs - @intFromBool(self.entry.?.run.path == null);
+                        self.pending = .done;
+                    },
+                    .done => return,
+                    .retiring => unreachable,
+                }
+            }
+        }
+        /// Fixed pointer receipt under the caller's publication lock. The
+        /// predecessor is returned exactly once for its prearranged retirement;
+        /// no destructor or other backend state change occurs here.
+        pub fn publishWithAdmission(self: *@This(), live: *?*Directory, original: @import("../../common/read_admission.zig").Port) !*Directory {
+            try original.checkpoint();
+            if (self.published or self.taken or self.retired or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (!self.stable() or live.* != self.source) return error.CompactionPlanningStale;
+            live.* = self.candidate;
+            self.published = true;
+            return @constCast(self.source);
+        }
+        fn takePrepared(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !*Directory {
+            if (original) |port| try port.checkpoint();
+            if (self.published or self.taken or self.retired or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (!self.stable()) return error.CompactionPlanningStale;
+            self.taken = true;
+            return self.candidate;
+        }
+        pub fn takePreparedWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !*Directory {
+            return self.takePrepared(original);
+        }
+        pub fn retireStep(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            if (original) |port| try port.checkpoint();
+            if (self.published or self.taken or self.retired) return true;
+            try self.check(original);
+            // A partial tree may still have summary pointers into the removed
+            // entry. The independently pinned source keeps those bytes alive
+            // while we drop the detached node and retire the partial fork.
+            switch (self.pending) {
+                .read_remove => |*job| {
+                    if (job.detached) |node| self.releaseRunNode(allocator, node);
+                    job.detached = null;
+                },
+                .id_remove => |*job| {
+                    if (job.detached) |node| self.releaseRunNode(allocator, node);
+                    job.detached = null;
+                },
+                .lower_remove => |*job| {
+                    if (job.detached) |node| self.releaseRunNode(allocator, node);
+                    job.detached = null;
+                },
+                .upper_remove => |*job| {
+                    if (job.detached) |node| self.releaseRunNode(allocator, node);
+                    job.detached = null;
+                },
+                .level_remove => |*job| {
+                    if (job.detached) |node| node.release(allocator);
+                    job.detached = null;
+                },
+                .generation_remove => |*job| {
+                    if (job.detached) |node| node.release(allocator);
+                    job.detached = null;
+                },
+                .level_put, .generation_put => {}, // Retired scalar entries own no resources.
+                else => {},
+            }
+            self.pending = .retiring;
+            if (self.reclaimer == null) self.reclaimer = .init(self.candidate);
+            try self.check(original);
+            var credits: usize = 1;
+            if (!self.reclaimer.?.step(allocator, &credits)) return false;
+            try self.check(original);
+            self.reclaimer.?.finish(allocator);
+            self.reclaimer = null;
+            self.retired = true;
+            return true;
+        }
+        fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            while (!(try self.retireStep(allocator, original))) {}
+        }
+        pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
+            try self.retire(allocator, original);
+        }
+        /// Explicit joined/quiesced fallback. Ordinary refusal retains the job.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.retire(allocator, null) catch unreachable;
+        }
+    };
+
+    /// Owns a prepaid fork and EntryLease. Source and domain authority stay
+    /// pinned/frozen, with candidate reads/accounting/mutation excluded. Remove
+    /// by ID before inserting, so key, level and sequence changes share one
+    /// correct path. The caller separately prepares the backend's other
+    /// publication receipts and registers the old-root/entry retirement owners.
+    pub const Put = struct {
+        source: *const Directory,
+        candidate: *Directory,
+        source_roots: [6]?*const anyopaque,
+        total_bytes: u64,
+        memory_runs: usize,
+        entry: Entry,
+        lease: ?EntryLease,
+        pending: union(enum) {
+            old: IdSearch,
+            remove: Removal,
+            read_search: ReadSearch,
+            read_put: Tree.RankInsertion,
+            id_search: IdSearch,
+            id_put: IdTree.RankInsertion,
+            lower_search: LowerSearch,
+            lower_put: BoundsTree.RankInsertion,
+            upper_search: UpperSearch,
+            upper_put: EndsTree.RankInsertion,
+            level_plan,
+            level_put: LevelTree.RankInsertion,
+            generation_plan,
+            generation_put: generation_index.Tree.RankInsertion,
+            receipt,
+            done,
+        },
+        reclaimer: ?Reclaimer = null,
+        retiring: bool = false,
+        retired: bool = false,
+        published: bool = false,
+        taken: bool = false,
+
+        pub fn init(source: *const Directory, candidate: *Directory, lease: EntryLease) !@This() {
+            if (source == candidate or candidate.retired_next != null or
+                !std.meta.eql(Removal.roots(source), Removal.roots(candidate)) or
+                source.total_run_bytes != candidate.total_run_bytes or source.memory_run_count != candidate.memory_run_count or
+                (lease.entry.payload.?.account != candidate.tree.account and !lease.entry.payload.?.account.independently_funded))
+                return error.InvalidArgument;
+            return .{ .source = source, .candidate = candidate, .source_roots = Removal.roots(source), .total_bytes = source.total_run_bytes, .memory_runs = source.memory_run_count, .entry = lease.entry, .lease = lease, .pending = .{ .old = candidate.locateId(lease.entry.run) } };
+        }
+        fn stable(self: *const @This()) bool {
+            return std.meta.eql(self.source_roots, Removal.roots(self.source)) and self.total_bytes == self.source.total_run_bytes and self.memory_runs == self.source.memory_run_count;
+        }
+        fn check(self: *const @This(), original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (!self.stable()) return error.CompactionPlanningStale;
+        }
+        pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (self.published or self.taken or self.retired or self.retiring) return error.InvalidArgument;
+            while (true) {
+                try self.check(original);
+                switch (self.pending) {
+                    .old => |*job| {
+                        try job.resumeWithAdmission(original);
+                        self.pending = if (job.matched) |node|
+                            .{ .remove = try Removal.init(self.source, self.candidate, node.entry.run) }
+                        else
+                            .{ .read_search = ReadSearch.init(self.candidate.tree.root, self.entry) };
+                    },
+                    .remove => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const ready = try job.takePrepared(original);
+                        std.debug.assert(ready == self.candidate);
+                        self.pending = .{ .read_search = ReadSearch.init(self.candidate.tree.root, self.entry) };
+                    },
+                    .read_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched != null) return error.CompactionPlanningStale;
+                        self.pending = .{ .read_put = try Tree.RankInsertion.init(&self.candidate.tree, self.entry, job.rank, false) };
+                    },
+                    .read_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const retired_entry = try job.takeRetired();
+                        std.debug.assert(retired_entry == null);
+                        self.pending = .{ .id_search = IdSearch.init(self.candidate.ids.root, self.entry) };
+                    },
+                    .id_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched != null) return error.CompactionPlanningStale;
+                        self.pending = .{ .id_put = try IdTree.RankInsertion.init(&self.candidate.ids, self.entry, job.rank, false) };
+                    },
+                    .id_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const retired_entry = try job.takeRetired();
+                        std.debug.assert(retired_entry == null);
+                        self.pending = .{ .lower_search = LowerSearch.init(self.candidate.bounds.root, self.entry) };
+                    },
+                    .lower_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched != null) return error.CompactionPlanningStale;
+                        self.pending = .{ .lower_put = try BoundsTree.RankInsertion.init(&self.candidate.bounds, self.entry, job.rank, false) };
+                    },
+                    .lower_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const retired_entry = try job.takeRetired();
+                        std.debug.assert(retired_entry == null);
+                        self.pending = .{ .upper_search = UpperSearch.init(self.candidate.ends.root, self.entry) };
+                    },
+                    .upper_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched != null) return error.CompactionPlanningStale;
+                        self.pending = .{ .upper_put = try EndsTree.RankInsertion.init(&self.candidate.ends, self.entry, job.rank, false) };
+                    },
+                    .upper_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const retired_entry = try job.takeRetired();
+                        std.debug.assert(retired_entry == null);
+                        self.pending = .level_plan;
+                    },
+                    .level_plan => {
+                        var level = self.candidate.levelStats(self.entry.run.level);
+                        const replace = level.count != 0;
+                        const rank = if (self.candidate.levels.root) |root| root.lowerBound(level) else 0;
+                        level.count += 1;
+                        level.bytes += self.entry.run.size_bytes;
+                        level.tombstone_runs += @intFromBool((self.entry.run.tombstone_count orelse 0) != 0);
+                        self.pending = .{ .level_put = try LevelTree.RankInsertion.init(&self.candidate.levels, level, rank, replace) };
+                    },
+                    .level_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        _ = try job.takeRetired(); // Scalar aggregate, no payload owner.
+                        self.pending = .generation_plan;
+                    },
+                    .generation_plan => {
+                        if (self.entry.run.level != 0) {
+                            self.pending = .receipt;
+                            continue;
+                        }
+                        const key = generation_index.Generation{ .sequence = generation_index.sequence(self.entry.run.*) };
+                        const old = generation_index.Tree.find(self.candidate.generations.root, key);
+                        var generation = if (old) |node| node.entry else key;
+                        const rank = if (self.candidate.generations.root) |root| root.lowerBound(key) else 0;
+                        generation.files += 1;
+                        generation.bytes += self.entry.run.size_bytes;
+                        self.pending = .{ .generation_put = try generation_index.Tree.RankInsertion.init(&self.candidate.generations, generation, rank, old != null) };
+                    },
+                    .generation_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        _ = try job.takeRetired(); // Scalar aggregate, no payload owner.
+                        self.pending = .receipt;
+                    },
+                    .receipt => {
+                        self.candidate.total_run_bytes += self.entry.run.size_bytes;
+                        self.candidate.memory_run_count += @intFromBool(self.entry.run.path == null);
+                        self.pending = .done;
+                    },
+                    .done => return,
+                }
+            }
+        }
+        pub fn publishWithAdmission(self: *@This(), live: *?*Directory, original: @import("../../common/read_admission.zig").Port) !*Directory {
+            try original.checkpoint();
+            if (self.published or self.taken or self.retired or self.retiring or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (!self.stable() or live.* != self.source) return error.CompactionPlanningStale;
+            live.* = self.candidate;
+            self.published = true;
+            return @constCast(self.source);
+        }
+        pub const Prepared = struct { directory: *Directory, lease: EntryLease };
+        pub fn takePreparedWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !Prepared {
+            try original.checkpoint();
+            if (self.published or self.taken or self.retired or self.retiring or self.lease == null or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (!self.stable()) return error.CompactionPlanningStale;
+            const out: Prepared = .{ .directory = self.candidate, .lease = self.lease.? };
+            self.lease = null;
+            self.taken = true;
+            return out;
+        }
+        /// Abort a unique-ID append without destroying its partial tree. Every
+        /// insertion mutation is rooted in candidate; the registered lease
+        /// makes the remaining drop fixed. The caller owns queueing retirement.
+        pub fn abandonAppend(self: *@This()) Prepared {
+            std.debug.assert(!self.published and !self.taken and !self.retired and !self.retiring);
+            std.debug.assert(std.meta.activeTag(self.pending) != .remove and self.lease != null);
+            const out: Prepared = .{ .directory = self.candidate, .lease = self.lease.? };
+            self.lease = null;
+            self.taken = true;
+            return out;
+        }
+        /// Transfer the remaining pin/metadata owner to a prearranged retire
+        /// job. Aborting the candidate alone deliberately does not destroy it.
+        pub fn takeEntryLeaseWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !EntryLease {
+            try original.checkpoint();
+            if ((!self.published and !self.retired) or self.lease == null) return error.InvalidArgument;
+            const out = self.lease.?;
+            self.lease = null;
+            return out;
+        }
+        pub fn retireStep(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            if (original) |port| try port.checkpoint();
+            if (self.published or self.taken or self.retired) return true;
+            try self.check(original);
+            self.retiring = true;
+            if (std.meta.activeTag(self.pending) == .remove) {
+                if (!try self.pending.remove.retireStep(allocator, original)) return false;
+                self.retired = true;
+                return true;
+            }
+            if (self.reclaimer == null) self.reclaimer = .init(self.candidate);
+            try self.check(original);
+            var credits: usize = 1;
+            if (!self.reclaimer.?.step(allocator, &credits)) return false;
+            try self.check(original);
+            self.reclaimer.?.finish(allocator);
+            self.reclaimer = null;
+            self.retired = true;
+            return true;
+        }
+        fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            while (!(try self.retireStep(allocator, original))) {}
+        }
+        pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
+            try self.retire(allocator, original);
+        }
+        /// Explicit joined/quiesced fallback, including last entry retirement.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.retire(allocator, null) catch unreachable;
+            if (self.lease) |*lease| lease.deinit(allocator);
+            self.lease = null;
+        }
+    };
+
+    pub fn indexSpareBytes(self: *const Directory) u64 {
+        return (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity + self.generations.spare.capacity) * @sizeOf(usize);
+    }
+    pub fn indexAccountBytes(self: *const Directory) u64 {
+        var bytes: u64 = 0;
+        inline for (.{ "tree", "ids", "bounds", "ends", "levels", "generations" }) |field| {
+            if (@field(self, field).account) |account| bytes += account.bytes.load(.acquire);
+        }
+        return bytes;
+    }
+
+    /// Caller prepays/registers this fixed frame and pins immutable source
+    /// through take/abort. Serialize account observation with construction and
+    /// publication. Allocator/manager authority, label storage and shared-source
+    /// charges survive the returned entry and its physical retirement. After
+    /// take, caller owns the registered final anchor and resident usage. No
+    /// execution borrow or backend pointer is retained by this cursor.
+    pub fn EntryPreparation(comptime BackendType: type) type {
+        return struct {
+            const Self = @This();
+            const admission = @import("../../common/read_admission.zig");
+            const resources = @import("../resource_manager.zig");
+            const snapshots = @import("run_snapshot_clone.zig");
+            const registry = @import("run_pin_registry.zig");
+            const quota = @import("pin_quota.zig");
+            allocator: std.mem.Allocator,
+            partition: ?*const fn ([]const u8, admission.Port) anyerror![]const u8,
+            routing: Routing,
+            manager: *resources.ResourceManager,
+            quota_owner: *quota.Owner,
+            quota_borrow: ?*quota.Owner = null,
+            account: ?*Account,
+            clone: snapshots.Clone,
+            credit: ?resources.ConstructionCredit = null,
+            payload: ?*Payload = null,
+            domain: ?[]const u8 = null,
+            require_self_owned_domain: bool = false,
+            registration: ?registry.Operation = null,
+            registration_stale: bool = false,
+            registered_path: bool = false,
+            pin_done: bool = false,
+            pin_released: bool = false,
+            forgetting: ?registry.Operation = null,
+            forgetting_stale: bool = false,
+            physical: ?snapshots.Retirement = null,
+            ready: bool = false,
+            taken: bool = false,
+            retiring: bool = false,
+            retired: bool = false,
+
+            pub fn init(directory: *Directory, backend: *BackendType, source: Run, owner: *quota.Owner, original: admission.Port) !Self {
+                try original.checkpoint();
+                const manager = backend.options.resource_manager orelse return error.ExecutionWaitUnsupported;
+                if (owner.manager != manager) return error.InvalidArgument;
+                if (backend.options.run_partition_key != null and backend.options.run_partition_key_with_admission == null) return error.ExecutionWaitUnsupported;
+                const account = directory.tree.account orelse return error.InvalidArgument;
+                const allocator = backend.allocator;
+                const partition = if (backend.options.run_partition_key != null) backend.options.run_partition_key_with_admission else null;
+                const retained = try owner.acquireWithAdmission(original);
+                return .{ .allocator = allocator, .partition = partition, .routing = .fromOptions(backend.options), .manager = manager, .quota_owner = owner, .quota_borrow = retained, .account = account.retain(), .clone = .init(source) };
+            }
+            pub fn resumeWithAdmission(self: *Self, original: admission.Port) !void {
+                try original.checkpoint();
+                if (self.taken or self.retiring or self.retired) return error.InvalidArgument;
+                if (self.ready) return;
+                const a = self.allocator;
+                if (self.payload == null) {
+                    const bound = try std.math.add(u64, @sizeOf(Payload), try self.clone.memoryBoundWithAdmission(original));
+                    if (bound > std.math.maxInt(usize)) return error.OutOfMemory;
+                    if (self.credit == null) self.credit = try self.manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, bound, original);
+                    try self.clone.resumeWithAdmission(a, original);
+                    try original.checkpoint();
+                    const payload = try a.create(Payload);
+                    const pin = BackendType.unregisteredDirectorySnapshotPin();
+                    payload.* = .{ .run = self.clone.takeWithAdmission(null) catch unreachable, .owner = pin.owner, .release_pin = pin.release, .account = self.account.?, .bytes = @intCast(@sizeOf(Payload) + self.clone.resident_bytes) };
+                    self.payload = payload;
+                }
+                const payload = self.payload.?;
+                try payload.run.ensureReadIdentity();
+                if (self.domain == null) {
+                    self.domain = if (self.partition) |partition|
+                        try partition(payload.run.smallest_key, original)
+                    else
+                        "";
+                }
+                if (self.require_self_owned_domain and self.domain.?.len != 0 and self.routing.domain_lifetime != .key_or_static) {
+                    const bytes = payload.run.smallest_key;
+                    const domain = self.domain.?;
+                    const offset = @intFromPtr(domain.ptr) -| @intFromPtr(bytes.ptr);
+                    if (@intFromPtr(domain.ptr) < @intFromPtr(bytes.ptr) or offset > bytes.len or domain.len > bytes.len - offset) return error.ExecutionWaitUnsupported;
+                }
+                if (!self.pin_done) {
+                    if (payload.run.path) |path| {
+                        if (self.registration_stale) {
+                            try self.registration.?.retireWithAdmission(original);
+                            self.registration = null;
+                            self.registration_stale = false;
+                        }
+                        if (self.registration == null) self.registration = BackendType.prepareRunSnapshotRefOperation(path, .retain);
+                        const operation = &self.registration.?;
+                        if (!operation.committed) {
+                            self.publishPin(original) catch |err| {
+                                if (err == error.CompactionPlanningStale) self.registration_stale = true;
+                                return err;
+                            };
+                            self.registered_path = true;
+                        }
+                        const pin = try BackendType.completeDirectorySnapshotPinWithAdmission(operation, &payload.run, original);
+                        payload.owner = pin.owner;
+                        payload.release_pin = pin.release;
+                    }
+                    self.pin_done = true;
+                }
+                if (self.registration) |*operation| {
+                    try operation.retireWithAdmission(original);
+                    self.registration = null;
+                }
+                try original.checkpoint();
+                self.ready = true;
+            }
+            fn publishPin(self: *Self, original: admission.Port) !void {
+                const operation = &self.registration.?;
+                try operation.resumeFundedWithAdmission(self.quota_owner, original);
+                try operation.publishFundedWithAdmission(original);
+            }
+            fn publishForget(self: *Self, original: ?admission.Port) !void {
+                const operation = &self.forgetting.?;
+                _ = try operation.planWithAdmission(original);
+                try operation.resumeWithAdmission(original);
+                try operation.publishWithAdmission(original);
+            }
+            /// The preprepared external usage identity and final-anchor owner
+            /// must be registered before this fixed, nonfallible transfer tail.
+            pub fn takeWithAdmission(self: *Self, destination: resources.Slice, usage: *u64, original: admission.Port) !EntryLease {
+                return self.takeWithAccount(destination, usage, null, original);
+            }
+            /// A registered owner prepays this fresh dedicated account header
+            /// and holds its final reference through payload and token cleanup.
+            /// Its own resident observer funds the payload; shared directory
+            /// accounts must not also charge it during backend observation.
+            pub fn takeWithIndependentAccountWithAdmission(self: *Self, destination: resources.Slice, usage: *u64, account: *Account, original: admission.Port) !EntryLease {
+                try original.checkpoint();
+                if (!account.independently_funded or account == self.account or account.refs.load(.acquire) != 1 or account.bytes.load(.acquire) != @sizeOf(Account) or account.backing.ptr != self.allocator.ptr or account.backing.vtable != self.allocator.vtable) return error.InvalidArgument;
+                return self.takeWithAccount(destination, usage, account, original);
+            }
+            fn takeWithAccount(self: *Self, destination: resources.Slice, usage: *u64, independent: ?*Account, original: admission.Port) !EntryLease {
+                try original.checkpoint();
+                if (!self.ready or self.taken or self.retiring or self.retired) return error.InvalidArgument;
+                const payload = self.payload.?;
+                try self.credit.?.adoptUsageWithAdmission(destination, usage, payload.bytes, original);
+                const source_account = self.account.?;
+                if (independent) |account| payload.account = account.retain();
+                payload.account.charge(payload.bytes);
+                const result: EntryLease = .{ .entry = .{ .run = &payload.run, .payload = payload, .domain = self.domain.? } };
+                self.payload = null;
+                self.account = null; // This retained reference becomes the lease's.
+                if (independent != null) source_account.release();
+                self.taken = true;
+                self.credit.?.retire();
+                self.credit = null;
+                const retained = self.quota_borrow.?;
+                self.quota_borrow = null;
+                retained.releaseBorrow();
+                return result;
+            }
+            fn checkpoint(original: ?admission.Port) !void {
+                if (original) |port| try port.checkpoint();
+            }
+            fn retire(self: *Self, original: ?admission.Port) !void {
+                try checkpoint(original);
+                if (self.taken or self.retired) return;
+                self.retiring = true;
+                if (self.registration) |*operation| {
+                    try operation.retireWithAdmission(original);
+                    self.registration = null;
+                }
+                const a = self.allocator;
+                if (self.payload) |payload| {
+                    if (!self.pin_released) {
+                        try checkpoint(original);
+                        payload.release_pin(payload.owner, &payload.run);
+                        self.pin_released = true;
+                    }
+                    // Retire an unused registration before destroying its path.
+                    // A concurrent live pin makes forget a safe no-op.
+                    if (self.registered_path) {
+                        if (self.forgetting_stale) {
+                            try self.forgetting.?.retireWithAdmission(original);
+                            self.forgetting = null;
+                            self.forgetting_stale = false;
+                        }
+                        if (self.forgetting == null) self.forgetting = BackendType.prepareRunSnapshotRefOperation(payload.run.path.?, .forget);
+                        const operation = &self.forgetting.?;
+                        if (!operation.committed) {
+                            self.publishForget(original) catch |err| {
+                                if (err == error.CompactionPlanningStale) self.forgetting_stale = true;
+                                return err;
+                            };
+                        }
+                        try operation.retireWithAdmission(original);
+                        self.forgetting = null;
+                        self.registered_path = false;
+                    }
+                    if (self.physical == null) self.physical = try snapshots.Retirement.init(payload.run);
+                    try self.physical.?.retireWithAdmission(a, original);
+                    try checkpoint(original);
+                    a.destroy(payload);
+                    self.payload = null;
+                }
+                try self.clone.retireWithAdmission(a, original);
+                if (self.credit) |*credit| credit.retire();
+                self.credit = null;
+                const retained = self.quota_borrow;
+                if (retained) |owner| {
+                    if (original) |port| try owner.reconcileWithAdmission(port) else owner.reconcileJoined();
+                }
+                const account = self.account;
+                self.account = null;
+                if (account) |value| value.release();
+                self.quota_borrow = null;
+                self.retired = true;
+                // No allocator work or cursor access follows the last guard.
+                if (retained) |owner| owner.releaseBorrow();
+            }
+            pub fn retireWithAdmission(self: *Self, original: admission.Port) !void {
+                try self.retire(original);
+            }
+            /// Explicit joined/quiesced fallback. Ordinary refusal retains all
+            /// partial snapshot, registry, quota and construction owners.
+            pub fn deinit(self: *Self) void {
+                self.retire(null) catch unreachable;
+            }
+        };
+    }
+
+    /// Legacy payload/state cloning and pin registration. The owning admitted
+    /// coordinator must replace this preparatory step with prepaid retained
+    /// payload/pin work; index editing below never invokes this legacy driver.
+    pub fn prepareEntryLegacy(self: *Directory, backend: anytype, run: Run) !EntryLease {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
         const allocator = backend.allocator;
-        const previous = find(self.tree.root, .{ .run = &run });
-        try self.tree.prepare(allocator);
-        try self.ids.prepare(allocator);
-        try self.bounds.prepare(allocator);
-        try self.ends.prepareEdits(allocator, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
-        try self.levels.prepare(allocator);
-        if (run.level == 0) try self.generations.prepare(allocator);
+        const account = self.tree.account orelse return error.InvalidArgument;
         const payload = try allocator.create(Payload);
         errdefer allocator.destroy(payload);
         var owned = try repository.cloneRunCompactionSnapshot(allocator, run);
         errdefer owned.deinit(allocator);
-        try backend.retainRunSnapshotRef(&owned);
-        const release = struct {
-            fn call(ctx: *anyopaque, value: *Run) void {
-                if (comptime @hasDecl(@TypeOf(backend.*), "releaseDirectoryRunSnapshotRef")) {
-                    @TypeOf(backend.*).releaseDirectoryRunSnapshotRef(value);
-                    return;
+        try owned.ensureReadIdentity();
+        const pin: EntryPin = if (comptime @hasDecl(@TypeOf(backend.*), "retainDirectoryRunSnapshotPin")) try backend.retainDirectoryRunSnapshotPin(&owned) else blk: {
+            try backend.retainRunSnapshotRef(&owned);
+            break :blk .{ .owner = @ptrCast(backend), .release = struct {
+                fn call(ctx: *anyopaque, value: *Run) void {
+                    if (comptime @hasDecl(@TypeOf(backend.*), "releaseDirectoryRunSnapshotRef")) {
+                        @TypeOf(backend.*).releaseDirectoryRunSnapshotRef(value);
+                        return;
+                    }
+                    const owner: @TypeOf(backend) = @ptrCast(@alignCast(ctx));
+                    owner.releaseRunSnapshotRef(value);
                 }
-                const owner: @TypeOf(backend) = @ptrCast(@alignCast(ctx));
-                owner.releaseRunSnapshotRef(value);
-            }
-        }.call;
+            }.call };
+        };
         var bytes: usize = @sizeOf(Payload) + owned.smallest_key.len + owned.largest_key.len;
         if (owned.path) |path| bytes += path.len;
         if (owned.smallest_namespace_name) |name| bytes += name.len;
         if (owned.largest_namespace_name) |name| bytes += name.len;
         if (owned.state) |*present| bytes += @intCast(present.estimatedMemoryBytes());
-        const account = self.tree.account.?;
         account.charge(bytes);
-        payload.* = .{ .run = owned, .owner = @ptrCast(backend), .release_pin = release, .account = account, .bytes = bytes };
+        payload.* = .{ .run = owned, .owner = pin.owner, .release_pin = pin.release, .account = account, .bytes = bytes };
         const domain = if (comptime @hasField(@TypeOf(backend.*), "options")) blk: {
             if (comptime @hasField(@TypeOf(backend.options), "run_partition_key")) {
                 if (backend.options.run_partition_key) |partition| break :blk partition(payload.run.smallest_key);
@@ -419,7 +1466,19 @@ pub const Directory = struct {
             break :blk "";
         } else "";
         const entry = Entry{ .run = &payload.run, .payload = payload, .domain = domain };
-        defer entry.deinit(allocator);
+        _ = account.retain();
+        return .{ .entry = entry };
+    }
+
+    pub fn put(self: *Directory, backend: anytype, run: Run) !void {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
+        const allocator = backend.allocator;
+        const previous = find(self.tree.root, .{ .run = &run });
+        var indexes = try IndexPreparation.init(self, run.level, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
+        try indexes.resumeWithAdmission(allocator, null);
+        var prepared_entry = try self.prepareEntryLegacy(backend, run);
+        defer prepared_entry.deinit(allocator);
+        const entry = prepared_entry.entry;
         self.memory_run_count += @intFromBool(run.path == null);
         if (previous) |node| self.memory_run_count -= @intFromBool(node.entry.run.path == null);
         const old_bytes = if (previous) |node| node.entry.run.size_bytes else 0;
@@ -446,12 +1505,9 @@ pub const Directory = struct {
         self.ends.putPrepared(allocator, entry);
     }
     pub fn remove(self: *Directory, allocator: std.mem.Allocator, run: *const Run) !void {
-        try self.tree.prepare(allocator);
-        try self.ids.prepare(allocator);
-        try self.bounds.prepare(allocator);
-        try self.ends.prepare(allocator);
-        try self.levels.prepare(allocator);
-        if (run.level == 0) try self.generations.prepare(allocator);
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
+        var indexes = try IndexPreparation.init(self, run.level, 1);
+        try indexes.resumeWithAdmission(allocator, null);
         const existing = find(self.tree.root, .{ .run = run }) orelse return;
         // All run indexes own this payload until their prepared edits finish.
         const entry = existing.entry.retainShared();
@@ -497,6 +1553,16 @@ pub const Directory = struct {
             (Entry{ .run = self.run, .payload = payload }).deinit(allocator);
             account.release();
         }
+        /// Caller pins the immutable source directory through acquisition.
+        /// The acquired reference then stands on its own final anchor.
+        pub fn retainRegisteredSourceWithAdmission(self: @This(), original: @import("../../common/read_admission.zig").Port) !RegisteredSource {
+            try original.checkpoint();
+            const payload: *Payload = @ptrCast(@alignCast(@constCast(self.revision)));
+            const anchor = payload.registered_anchor orelse return error.ExecutionWaitUnsupported;
+            if (self.run != &payload.run) return error.InvalidArgument;
+            const view: EntryLease = .{ .entry = .{ .run = self.run, .payload = payload, .domain = anchor.domain } };
+            return view.retainRegisteredSourceWithAdmission(original);
+        }
         pub fn accountedMemoryBytes(self: @This(), pass: u64) u64 {
             const payload: *const Payload = @ptrCast(@alignCast(self.revision));
             return payload.account.chargeOnce(pass);
@@ -528,8 +1594,21 @@ pub const Directory = struct {
         visited: usize = 0,
 
         pub fn next(self: *@This()) ?Handle {
+            var budget: usize = std.math.maxInt(usize);
+            return self.nextWithBudget(&budget);
+        }
+
+        pub fn done(self: *const @This()) bool {
+            return self.descend == null and self.len == 0;
+        }
+
+        /// A null result can mean quantum exhaustion; consult done before
+        /// concluding absence. Both descents and pops spend metadata credits.
+        pub fn nextWithBudget(self: *@This(), budget: *usize) ?Handle {
             while (true) {
                 while (self.descend) |node| {
+                    if (budget.* == 0) return null;
+                    budget.* -= 1;
                     self.visited += 1;
                     const lower = node.summary.smallest.?;
                     const upper = node.summary.largest.?;
@@ -544,6 +1623,8 @@ pub const Directory = struct {
                     self.descend = node.left;
                 }
                 if (self.len == 0) return null;
+                if (budget.* == 0) return null;
+                budget.* -= 1;
                 self.len -= 1;
                 const node = self.path[self.len];
                 self.descend = node.right;
@@ -578,6 +1659,23 @@ pub const Directory = struct {
             return .{ .run = entry.run, .revision = entry.payload.? };
         }
     };
+
+    /// Allocation-free lower-bound order over this pinned immutable root.
+    pub const BoundsCursor = struct {
+        directory: *const Directory,
+        rank: usize = 0,
+        path: BoundsTree.Cursor = .{},
+        pub fn nextWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !?Handle {
+            try original.checkpoint();
+            if (self.rank == self.directory.count()) return null;
+            const entry = self.path.at(self.directory.bounds.root.?, self.rank);
+            self.rank += 1;
+            return .{ .run = entry.run, .revision = entry.payload.? };
+        }
+    };
+    pub fn boundsCursor(self: *const Directory) BoundsCursor {
+        return .{ .directory = self };
+    }
 
     pub fn readCursor(self: *const Directory) Cursor {
         return .{ .directory = self };
@@ -830,6 +1928,8 @@ pub const Directory = struct {
         stack: [2 * @bitSizeOf(usize)]*Tree.Node = undefined,
         len: usize = 0,
         phase: enum { removed, added, done } = .removed,
+        pending: ?*Tree.Node = null,
+        search: ?ReadSearch = null,
 
         pub fn init(previous: *const Directory, current: *const Directory) ChangeCursor {
             var cursor = ChangeCursor{ .previous = previous.tree.root, .current = current.tree.root };
@@ -846,18 +1946,29 @@ pub const Directory = struct {
             return self.phase == .done;
         }
         pub fn next(self: *ChangeCursor, credits: *usize) ?Change {
-            while (credits.* != 0 and !self.done()) {
-                if (self.len == 0) {
+            return self.nextWithAdmission(credits, null) catch unreachable;
+        }
+        pub fn nextWithAdmission(self: *ChangeCursor, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !?Change {
+            while ((credits.* != 0 or self.pending != null) and !self.done()) {
+                if (original) |port| try port.checkpoint();
+                if (self.pending == null and self.len == 0) {
                     if (self.phase == .removed) {
                         self.phase = .added;
                         self.push(self.current);
                     } else self.phase = .done;
                     continue;
                 }
-                credits.* -= 1;
-                self.len -= 1;
-                const node = self.stack[self.len];
-                const matched = find(if (self.phase == .removed) self.current else self.previous, node.entry);
+                if (self.pending == null) {
+                    credits.* -= 1;
+                    self.len -= 1;
+                    self.pending = self.stack[self.len];
+                    self.search = ReadSearch.init(if (self.phase == .removed) self.current else self.previous, self.pending.?.entry);
+                }
+                try self.search.?.resumeWithAdmission(original);
+                const node = self.pending.?;
+                const matched = self.search.?.matched;
+                self.pending = null;
+                self.search = null;
                 if (matched == node) continue;
                 self.push(node.right);
                 self.push(node.left);
@@ -893,13 +2004,9 @@ pub const Directory = struct {
     }
 
     fn find(root: ?*Tree.Node, entry: Entry) ?*Tree.Node {
-        var current = root;
-        while (current) |node| switch (compare(entry, node.entry)) {
-            .eq => return node,
-            .lt => current = node.left,
-            .gt => current = node.right,
-        };
-        return null;
+        var search = ReadSearch.init(root, entry);
+        search.resumeWithAdmission(null) catch unreachable;
+        return if (search.matched) |node| @constCast(node) else null;
     }
 
     fn visitRemoved(root: ?*Tree.Node, other: ?*Tree.Node, visitor: anytype) !void {
@@ -920,9 +2027,16 @@ pub const Directory = struct {
         try visitAdded(node.right, other, visitor);
     }
     pub fn project(self: *const Directory, allocator: std.mem.Allocator) ![]Run {
+        return self.projectWithAdmission(allocator, null);
+    }
+
+    pub fn projectWithAdmission(self: *const Directory, allocator: std.mem.Allocator, control: ?@import("../../common/read_admission.zig").Port) ![]Run {
+        if (control) |owner| try owner.checkpoint();
         const runs = try allocator.alloc(Run, self.count());
+        errdefer allocator.free(runs);
         var cursor: Tree.Cursor = .{};
         for (runs, 0..) |*run, i| {
+            if (control) |owner| try owner.checkpoint();
             run.* = cursor.at(self.tree.root.?, i).run.*;
             run.owns_metadata = false;
             run.owns_path = false;
@@ -930,9 +2044,11 @@ pub const Directory = struct {
             run.version_ref_pinned = false;
             run.shared_read_version = true;
         }
+        if (control) |owner| try owner.checkpoint();
         return runs;
     }
     pub fn accountedMemoryBytes(self: *const Directory, pass: u64) u64 {
+        if (self.registered_account != null) return 0;
         return @sizeOf(Directory) + (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity + self.generations.spare.capacity) * @sizeOf(*Tree.Node) +
             (if (self.generations.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0) +
@@ -945,20 +2061,12 @@ pub const Directory = struct {
     pub const PlanningOrder = struct { domain: []usize, bounds: []usize };
 
     pub fn byId(self: *const Directory, id: u64) ?*const Run {
-        var node = self.ids.root;
-        while (node) |current| {
-            switch (std.math.order(id, current.entry.run.id)) {
-                .lt => node = current.left,
-                .gt => node = current.right,
-                .eq => return current.entry.run,
-            }
-        }
-        return null;
+        const probe: Run = .{ .id = id, .level = 0, .size_bytes = 0, .path = null, .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 0, .bloom_filter = null, .state = null, .owns_metadata = false };
+        var search = self.locateId(&probe);
+        search.resumeWithAdmission(null) catch unreachable;
+        return if (search.matched) |node| node.entry.run else null;
     }
 
-    /// Scheduling is independent of component discovery. In particular, a
-    /// clock rollback makes any future-dated tombstone immediately eligible;
-    /// retaining only the minimum timestamp would lose that condition.
     pub fn tombstoneGcDelay(self: *const Directory, age: u64, now: u64) ?u64 {
         const summary = (self.tree.root orelse return null).summary;
         if (summary.gc_requested) return 0;
@@ -1412,8 +2520,899 @@ test "directory direct point traversal matches overlap sort and preserves forked
                     try std.testing.expectEqual(expected.revision, actual.revision);
                 }
                 try std.testing.expect(direct.next() == null);
+                for ([_]usize{ 1, 2, 7, 64 }) |limit| {
+                    var bounded = source.readPoint(ns, key);
+                    var zero: usize = 0;
+                    try std.testing.expect(bounded.nextWithBudget(&zero) == null);
+                    try std.testing.expectEqual(@as(usize, 0), bounded.visited);
+                    var count: usize = 0;
+                    var steps: usize = 0;
+                    while (!bounded.done()) {
+                        var credits = limit;
+                        if (bounded.nextWithBudget(&credits)) |handle| {
+                            try std.testing.expect(count < selected.items.len);
+                            try std.testing.expectEqual(selected.items[count].run.id, handle.run.id);
+                            try std.testing.expectEqual(selected.items[count].revision, handle.revision);
+                            count += 1;
+                        }
+                        try std.testing.expect(credits < limit);
+                        steps += 1;
+                        try std.testing.expect(steps <= 2 * source.count() + 1);
+                    }
+                    try std.testing.expectEqual(selected.items.len, count);
+                    try std.testing.expectEqual(direct.visited, bounded.visited);
+                }
                 if (ns != null and (std.mem.eql(u8, ns.?, "other") or std.mem.eql(u8, ns.?, "docs") and std.mem.eql(u8, key, "zz"))) try std.testing.expectEqual(@as(usize, 1), direct.visited);
             }
         }
     }
+}
+
+test "controlled physical sync retained directory rank searches preserve original rejection and pinned root identity" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+        fn check(comptime mode: run_comparison.Mode, d: *const Directory, probe: *const Run) !void {
+            const tree = switch (mode) {
+                .read => &d.tree,
+                .id => &d.ids,
+                .lower => &d.bounds,
+                .upper => &d.ends,
+                .domain => unreachable,
+            };
+            var rank: usize = 0;
+            var matched: ?u64 = null;
+            while (rank < d.count()) : (rank += 1) {
+                const entry = tree.root.?.at(rank);
+                const order = run_comparison.compare(mode, .{ .run = entry.run }, .{ .run = probe });
+                if (order == .lt) continue;
+                if (order == .eq) matched = entry.run.id;
+                break;
+            }
+            const Search = switch (mode) {
+                .read => Directory.ReadSearch,
+                .id => Directory.IdSearch,
+                .lower => Directory.LowerSearch,
+                .upper => Directory.UpperSearch,
+                .domain => unreachable,
+            };
+            const Fault = struct {
+                checks: usize = 0,
+                at: usize = std.math.maxInt(usize),
+                failure: anyerror = error.Canceled,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const at = self.checks;
+                    self.checks += 1;
+                    if (at == self.at) return self.failure;
+                }
+            };
+            var checks: usize = 1;
+            var target: usize = 0;
+            var visited: usize = 0;
+            while (target <= checks) : (target += 1) {
+                var search = Search.init(tree.root, .{ .run = probe });
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const original = @import("../../common/read_admission.zig").Port.init(&payload);
+                const result = search.resumeWithAdmission(original);
+                if (target == 0) {
+                    try result;
+                    checks = fault.checks;
+                    visited = search.visited;
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try search.resumeWithAdmission(original);
+                }
+                try std.testing.expect(search.done and search.root == tree.root);
+                try std.testing.expectEqual(rank, search.rank);
+                try std.testing.expectEqual(matched, if (search.matched) |node| node.entry.run.id else null);
+                try std.testing.expectEqual(visited, search.visited);
+            }
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const d = try Directory.create(a);
+    defer d.destroy(a);
+    const bytes = try a.alloc(u8, 2 * run_comparison.Cursor.quantum + 3);
+    defer a.free(bytes);
+    @memset(bytes, 'k');
+    for (0..8) |i| {
+        bytes[bytes.len - 1] = @intCast('a' + i);
+        try d.put(&fixture, .{ .id = 2 * i + 2, .level = @intCast(i % 2), .size_bytes = 1, .path = @constCast("/rank-search.tbl"), .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false });
+    }
+    const pinned = try d.fork(a);
+    defer pinned.destroy(a);
+    const root = pinned.tree.root;
+    // The borrowed searches below apply to this pinned epoch even after live
+    // metadata publishes a successor. The rank is never reused on that successor.
+    bytes[bytes.len - 1] = 'x';
+    try d.put(&fixture, .{ .id = 31, .level = 1, .size_bytes = 1, .path = @constCast("/rank-search.tbl"), .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false });
+    try std.testing.expect(pinned.tree.root == root and d.tree.root != root);
+    for (0..18) |i| {
+        bytes[bytes.len - 1] = @intCast('a' + i / 2);
+        const probe: Run = .{ .id = i, .level = @intCast((i / 2 + 1) % 2), .size_bytes = 1, .path = null, .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+        inline for (.{ run_comparison.Mode.read, .id, .lower, .upper }) |mode| try Fixture.check(mode, pinned, &probe);
+    }
+    for (0..pinned.count()) |i| {
+        const hit = pinned.at(i).run;
+        inline for (.{ run_comparison.Mode.read, .id, .lower, .upper }) |mode| try Fixture.check(mode, pinned, hit);
+    }
+    try std.testing.expectEqual(@as(usize, 9), fixture.pins);
+    var empty: Directory = .{};
+    const probe = pinned.at(0).run;
+    inline for (.{ run_comparison.Mode.read, .id, .lower, .upper }) |mode| try Fixture.check(mode, &empty, probe);
+}
+
+test "controlled physical sync private node summary refresh commits once after original computation and rejects stale shapes" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const d = try Directory.create(a);
+    defer d.destroy(a);
+    const bytes = try a.alloc(u8, 2 * run_comparison.Cursor.quantum + 5);
+    defer a.free(bytes);
+    @memset(bytes, 's');
+    for (0..5) |i| {
+        bytes[bytes.len - 1] = @intCast('a' + i);
+        try d.put(&fixture, .{ .id = i + 1, .level = 1, .size_bytes = 1, .path = @constCast("/refresh.tbl"), .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .tombstone_count = @intCast(i % 3), .oldest_tombstone_unix_ns = i * 11, .gc_requested = i % 2 == 1, .bloom_filter = null, .state = null, .owns_metadata = false });
+    }
+    inline for (.{ "tree", "bounds" }) |field| {
+        const tree = &@field(d, field);
+        const root = tree.root.?;
+        const expected = root.summary;
+        const shared = try d.fork(a);
+        try std.testing.expectError(error.ResourceBudgetExceeded, root.prepareRefresh());
+        shared.destroy(a);
+        const Fault = struct {
+            checks: usize = 0,
+            at: usize = std.math.maxInt(usize),
+            failure: anyerror = error.Canceled,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const at = self.checks;
+                self.checks += 1;
+                if (at == self.at) return self.failure;
+            }
+        };
+        var checkpoints: usize = 1;
+        var target: usize = 0;
+        while (target <= checkpoints) : (target += 1) {
+            root.summary = .{}; // Private stale metadata, never visible to a reader.
+            const pending = root.summary;
+            var refresh = try root.prepareRefresh();
+            var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                0 => error.Canceled,
+                1 => error.DeadlineExceeded,
+                else => error.FileNotFound,
+            } };
+            const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            const original = @import("../../common/read_admission.zig").Port.init(&payload);
+            const result = refresh.resumeWithAdmission(original);
+            if (target == 0) {
+                try result;
+                checkpoints = fault.checks;
+            } else {
+                try std.testing.expectError(fault.failure, result);
+                try std.testing.expect(!refresh.committed);
+                try std.testing.expectEqualDeep(pending, root.summary);
+                try refresh.resumeWithAdmission(original);
+            }
+            try std.testing.expect(refresh.committed);
+            try std.testing.expectEqualDeep(expected, root.summary);
+        }
+        var stale = try root.prepareRefresh();
+        const old_left = root.left;
+        root.left = null;
+        const result = stale.resumeWithAdmission(null);
+        root.left = old_left;
+        try std.testing.expectError(error.CompactionPlanningStale, result);
+        try std.testing.expect(!stale.committed);
+        try std.testing.expectEqualDeep(expected, root.summary);
+        const Refresh = @TypeOf(stale);
+        const Control = struct {
+            refresh: *Refresh,
+            entry: bool,
+            changed: bool = false,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (!self.changed and self.refresh.preparation.cursor.comparison != null) {
+                    self.changed = true;
+                    const node = self.refresh.node;
+                    if (self.entry) node.entry.run = node.left.?.entry.run else node.left.?.summary.largest = null;
+                }
+            }
+        };
+        for ([_]bool{ false, true }) |change_entry| {
+            var refresh = try root.prepareRefresh();
+            var control: Control = .{ .refresh = &refresh, .entry = change_entry };
+            const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+            const original_entry = root.entry.run;
+            const original_left_summary = root.left.?.summary;
+            const invalidated = refresh.resumeWithAdmission(@import("../../common/read_admission.zig").Port.init(&payload));
+            root.entry.run = original_entry;
+            root.left.?.summary = original_left_summary;
+            try std.testing.expect(control.changed and !refresh.committed);
+            try std.testing.expectError(error.CompactionPlanningStale, invalidated);
+            try std.testing.expectEqualDeep(expected, root.summary);
+        }
+    }
+}
+
+test "controlled physical sync retained rank insertions preserve pinned epochs through every rotation and rejection" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+    };
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const d = try Directory.create(a);
+    defer d.destroy(a);
+    const bytes = try a.alloc(u8, 2 * run_comparison.Cursor.quantum + 5);
+    defer a.free(bytes);
+    @memset(bytes, 'i');
+    for (0..3) |i| {
+        bytes[bytes.len - 1] = @intCast('a' + i);
+        try d.put(&fixture, .{ .id = i + 1, .level = 1, .size_bytes = 1, .path = @constCast("/rank-insert.tbl"), .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .tombstone_count = @intCast(i % 3), .oldest_tombstone_unix_ns = i * 11, .gc_requested = i % 2 == 1, .bloom_filter = null, .state = null, .owns_metadata = false });
+    }
+    inline for (.{ Directory.Tree, Directory.BoundsTree, Directory.IdTree }) |Tree| {
+        for ([_][3]usize{ .{ 2, 1, 0 }, .{ 0, 1, 2 }, .{ 2, 0, 1 }, .{ 0, 2, 1 } }) |order| {
+            var base: Tree = .{};
+            defer base.deinit(a);
+            for (order[0..2]) |i| {
+                const entry = d.tree.root.?.at(i);
+                try base.prepare(a);
+                base.putPrepared(a, entry);
+            }
+            const old_root = base.root;
+            const old_summary = old_root.?.summary;
+            const entry = d.tree.root.?.at(order[2]);
+            var checks: usize = 1;
+            var target: usize = 0;
+            var used: usize = 0;
+            while (target <= checks) : (target += 1) {
+                var tree = base.fork();
+                defer tree.deinit(a);
+                try tree.prepare(a);
+                const spare = tree.spare.items.len;
+                // This rank is computed on the exact root retained by the edit.
+                const rank = tree.root.?.lowerBound(entry);
+                var edit = try Tree.RankInsertion.init(&tree, entry, rank, false);
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const original = @import("../../common/read_admission.zig").Port.init(&payload);
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                const result = edit.resumeWithAdmission(failing.allocator(), original);
+                if (target == 0) {
+                    try result;
+                    checks = fault.checks;
+                    used = spare - tree.spare.items.len;
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try edit.resumeWithAdmission(failing.allocator(), original);
+                }
+                try std.testing.expectEqual(used, spare - tree.spare.items.len);
+                try std.testing.expectEqual(@as(usize, 3), tree.root.?.count);
+                try std.testing.expectEqual(@as(u8, 2), tree.root.?.height);
+                for (0..3) |i| try std.testing.expectEqual(i + 1, tree.root.?.at(i).run.id);
+                try std.testing.expectEqual(@as(u64, 2), tree.root.?.entry.run.id);
+                try std.testing.expect((try edit.takeRetired()) == null);
+                const saved = tree.root;
+                fault.at = fault.checks;
+                try std.testing.expectError(fault.failure, edit.resumeWithAdmission(failing.allocator(), original));
+                try std.testing.expect(saved == tree.root);
+                try std.testing.expect(base.root == old_root);
+                try std.testing.expectEqual(@as(usize, 2), base.root.?.count);
+                try std.testing.expectEqualDeep(old_summary, base.root.?.summary);
+                if (Tree != Directory.IdTree) {
+                    const expected = if (Tree == Directory.Tree) Entry.summarize(tree.root.?.entry, tree.root.?.left.?.summary, tree.root.?.right.?.summary) else BoundsSummary.summarize(tree.root.?.entry, tree.root.?.left.?.summary, tree.root.?.right.?.summary);
+                    try std.testing.expectEqualDeep(expected, tree.root.?.summary);
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.pins);
+}
+
+test "controlled physical sync private directory removal publishes every index together and retains bounded abort" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+        fn prepare(source: *Directory, run: *const Run) !Directory.Removal {
+            const candidate = try source.fork(a);
+            errdefer candidate.destroy(a);
+            var pools = try Directory.IndexPreparation.init(candidate, run.level, 1);
+            try pools.resumeWithAdmission(a, null);
+            return Directory.Removal.init(source, candidate, run);
+        }
+        fn perform(job: *Directory.Removal, allocator: std.mem.Allocator, live: *?*Directory, original: admission.Port) !*Directory {
+            try job.resumeWithAdmission(allocator, original);
+            return job.publishWithAdmission(live, original);
+        }
+        fn verify(source: *Directory, candidate: *Directory, removed: *const Run) !void {
+            try std.testing.expectEqual(source.count() - 1, candidate.count());
+            inline for (.{ "ids", "bounds", "ends" }) |field| try std.testing.expectEqual(candidate.count(), @field(candidate, field).root.?.count);
+            try std.testing.expectEqual(source.total_run_bytes - removed.size_bytes, candidate.total_run_bytes);
+            try std.testing.expectEqual(source.memory_run_count - @intFromBool(removed.path == null), candidate.memory_run_count);
+            try std.testing.expectEqual(candidate.memory_run_count, candidate.tree.root.?.summary.non_async_runs);
+            for (0..source.count()) |i| {
+                const run = source.at(i).run;
+                inline for (.{ Directory.locateRead, Directory.locateId, Directory.locateLower, Directory.locateUpper }) |locate| {
+                    var search = locate(candidate, run);
+                    try search.resumeWithAdmission(null);
+                    try std.testing.expectEqual(run.id != removed.id, search.matched != null);
+                }
+            }
+            for (0..3) |level_number| {
+                const number: u32 = @intCast(level_number);
+                const old = source.levelStats(number);
+                const now = candidate.levelStats(number);
+                try std.testing.expectEqual(old.count - @intFromBool(removed.level == number), now.count);
+                try std.testing.expectEqual(old.bytes - (if (removed.level == number) removed.size_bytes else 0), now.bytes);
+                try std.testing.expectEqual(old.tombstone_runs - @intFromBool(removed.level == number and (removed.tombstone_count orelse 0) != 0), now.tombstone_runs);
+            }
+            for ([_]u64{ 77, 88 }) |seq| {
+                const key = generation_index.Generation{ .sequence = seq };
+                const old = generation_index.Tree.find(source.generations.root, key).?.entry;
+                const removed_here = removed.level == 0 and generation_index.sequence(removed.*) == seq;
+                const files = old.files - @intFromBool(removed_here);
+                const now = generation_index.Tree.find(candidate.generations.root, key);
+                if (files == 0) try std.testing.expect(now == null) else {
+                    try std.testing.expectEqual(files, now.?.entry.files);
+                    try std.testing.expectEqual(old.bytes - (if (removed_here) removed.size_bytes else 0), now.?.entry.bytes);
+                }
+            }
+            try std.testing.expectEqual(@as(u64, if (removed.id == 6) 5 else 6), candidate.bounds.root.?.summary.largest.?.id);
+            try std.testing.expectEqual(@as(u64, if (removed.id == 1) 2 else 1), candidate.tree.root.?.summary.smallest.?.id);
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    var memory_state: state.State = .{};
+    defer memory_state.deinit(a);
+    try memory_state.appendUpsert(a, .{}, "f", "", true);
+    const source = try Directory.create(a);
+    defer source.destroy(a);
+    for (0..6) |i| {
+        var key = [_]u8{@intCast('a' + i)};
+        try source.put(&fixture, .{ .id = i + 1, .visibility_id = if (i < 2) 77 else 88, .level = if (i < 3) 0 else if (i < 5) 1 else 2, .size_bytes = 10 + i, .path = if (i == 5) null else @constCast("/directory-remove.tbl"), .smallest_namespace_name = null, .smallest_key = &key, .largest_namespace_name = null, .largest_key = &key, .entry_count = 1, .tombstone_count = @intCast(i % 2), .bloom_filter = null, .state = if (i == 5) memory_state else null, .owns_metadata = false });
+    }
+    const roots = Directory.Removal.roots(source);
+    for (0..source.count()) |rank| {
+        const run = source.at(rank).run;
+        var checkpoints: usize = 1;
+        var target: usize = 0;
+        while (target <= checkpoints) : (target += 1) {
+            for ([_]bool{ false, true }) |abort| {
+                if (target == 0 and abort) continue;
+                var job = try Fixture.prepare(source, run);
+                defer job.deinit(a);
+                var live: ?*Directory = source;
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const port = admission.Port.init(&payload);
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                const result = Fixture.perform(&job, failing.allocator(), &live, port);
+                if (target == 0) {
+                    try std.testing.expect(try result == source);
+                    checkpoints = fault.checks;
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try std.testing.expect(live == source);
+                    try std.testing.expectEqual(@as(usize, 6), live.?.count());
+                }
+                try std.testing.expectEqual(@as(usize, 6), fixture.pins);
+                if (abort) {
+                    fault.at = fault.checks + target % 3;
+                    try std.testing.expectError(fault.failure, job.retireWithAdmission(failing.allocator(), port));
+                    try job.retireWithAdmission(failing.allocator(), port);
+                    try std.testing.expect(job.retired and live == source);
+                } else {
+                    if (target != 0) try std.testing.expect(try Fixture.perform(&job, failing.allocator(), &live, port) == source);
+                    try std.testing.expect(live == job.candidate);
+                    try Fixture.verify(source, live.?, run);
+                    try std.testing.expectError(error.InvalidArgument, job.publishWithAdmission(&live, port));
+                    live.?.destroy(a);
+                }
+                try std.testing.expectEqualDeep(roots, Directory.Removal.roots(source));
+                try std.testing.expectEqual(@as(usize, 6), fixture.pins);
+            }
+        }
+    }
+    // Exhaust every retirement checkpoint after a fully computed private edit.
+    const run = source.at(0).run;
+    var checks: usize = 1;
+    var target: usize = 0;
+    while (target <= checks) : (target += 1) {
+        var job = try Fixture.prepare(source, run);
+        defer job.deinit(a);
+        try job.resumeWithAdmission(a, null);
+        var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1 };
+        const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+        const port = admission.Port.init(&payload);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const result = job.retireWithAdmission(failing.allocator(), port);
+        if (target == 0) {
+            try result;
+            checks = fault.checks;
+        } else {
+            try std.testing.expectError(error.Canceled, result);
+            try job.retireWithAdmission(failing.allocator(), port);
+        }
+        try std.testing.expect(job.retired);
+        try std.testing.expectEqual(@as(usize, 6), fixture.pins);
+    }
+    var job = try Fixture.prepare(source, run);
+    defer job.deinit(a);
+    var fault: Fault = .{};
+    const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+    const port = admission.Port.init(&payload);
+    var premature_live: ?*Directory = source;
+    try std.testing.expectError(error.InvalidArgument, job.publishWithAdmission(&premature_live, port));
+    try std.testing.expect(premature_live == source);
+    try std.testing.expectError(error.InvalidArgument, Directory.Removal.init(source, source, run));
+    source.total_run_bytes += 1;
+    const stale = job.resumeWithAdmission(a, port);
+    source.total_run_bytes -= 1;
+    try std.testing.expectError(error.CompactionPlanningStale, stale);
+    try job.resumeWithAdmission(a, port);
+    const other = try source.fork(a);
+    defer other.destroy(a);
+    var live: ?*Directory = other;
+    try std.testing.expectError(error.CompactionPlanningStale, job.publishWithAdmission(&live, port));
+    live = source;
+    try std.testing.expect(try job.publishWithAdmission(&live, port) == source);
+    live.?.destroy(a);
+    var missing = run.*;
+    missing.id = 999;
+    var absent = try Fixture.prepare(source, &missing);
+    defer absent.deinit(a);
+    try absent.resumeWithAdmission(a, port);
+    live = source;
+    try std.testing.expect(try absent.publishWithAdmission(&live, port) == source);
+    try std.testing.expectEqual(source.count(), live.?.count());
+    try std.testing.expectEqual(source.total_run_bytes, live.?.total_run_bytes);
+    live.?.destroy(a);
+}
+
+test "controlled physical sync private put replaces every index across ordering level and sequence moves" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        options: struct { run_partition_key: ?*const fn ([]const u8) []const u8 = partition } = .{},
+        fn partition(key: []const u8) []const u8 {
+            return key[0..@min(key.len, 1)];
+        }
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+        fn prepare(self: *@This(), source: *Directory, run: Run) !Directory.Put {
+            const candidate = try source.fork(a);
+            errdefer candidate.destroy(a);
+            var pools: Directory.PutPools = .{ .directory = candidate };
+            try std.testing.expect(try pools.memoryBound() > 0);
+            try pools.resumeWithAdmission(a, null);
+            var lease = try candidate.prepareEntryLegacy(self, run);
+            errdefer lease.deinit(a);
+            return Directory.Put.init(source, candidate, lease);
+        }
+        fn perform(job: *Directory.Put, allocator: std.mem.Allocator, live: *?*Directory, original: admission.Port) !*Directory {
+            try job.resumeWithAdmission(allocator, original);
+            return job.publishWithAdmission(live, original);
+        }
+        fn verify(source: *Directory, candidate: *Directory, incoming: *const Run) !void {
+            var expected: [7]*const Run = undefined;
+            var len: usize = 0;
+            for (0..source.count()) |i| {
+                const run = source.at(i).run;
+                if (run.id != incoming.id) {
+                    expected[len] = run;
+                    len += 1;
+                }
+            }
+            expected[len] = incoming;
+            len += 1;
+            std.mem.sort(*const Run, expected[0..len], {}, struct {
+                fn less(_: void, x: *const Run, y: *const Run) bool {
+                    return Directory.runLess(x, y);
+                }
+            }.less);
+            try std.testing.expectEqual(len, candidate.count());
+            inline for (.{ "ids", "bounds", "ends" }) |field| try std.testing.expectEqual(len, @field(candidate, field).root.?.count);
+            var total: u64 = 0;
+            var memory: usize = 0;
+            var tombstones: usize = 0;
+            var gc = false;
+            var levels: [5]LevelAggregate = undefined;
+            for (&levels, 0..) |*level, i| level.* = .{ .level = @intCast(i) };
+            var gens: [7]generation_index.Generation = undefined;
+            var gen_len: usize = 0;
+            for (expected[0..len], 0..) |run, i| {
+                try std.testing.expect(candidate.at(i).run == run);
+                try std.testing.expect(candidate.byId(run.id) == run);
+                inline for (.{ Directory.locateRead, Directory.locateId, Directory.locateLower, Directory.locateUpper }) |locate| {
+                    var search = locate(candidate, run);
+                    try search.resumeWithAdmission(null);
+                    try std.testing.expect(search.matched.?.entry.run == run);
+                    try std.testing.expectEqualStrings(partition(run.smallest_key), search.matched.?.entry.domain);
+                }
+                total += run.size_bytes;
+                memory += @intFromBool(run.path == null);
+                const deletes = (run.tombstone_count orelse 0) != 0;
+                tombstones += @intFromBool(deletes);
+                gc = gc or run.gc_requested;
+                levels[run.level].count += 1;
+                levels[run.level].bytes += run.size_bytes;
+                levels[run.level].tombstone_runs += @intFromBool(deletes);
+                if (run.level == 0) {
+                    const seq = generation_index.sequence(run.*);
+                    var idx: usize = 0;
+                    while (idx < gen_len and gens[idx].sequence != seq) : (idx += 1) {}
+                    if (idx == gen_len) {
+                        gens[idx] = .{ .sequence = seq };
+                        gen_len += 1;
+                    }
+                    gens[idx].files += 1;
+                    gens[idx].bytes += run.size_bytes;
+                }
+            }
+            try std.testing.expectEqual(total, candidate.total_run_bytes);
+            try std.testing.expectEqual(memory, candidate.memory_run_count);
+            try std.testing.expectEqual(memory, candidate.tree.root.?.summary.non_async_runs);
+            try std.testing.expectEqual(tombstones, candidate.tree.root.?.summary.tombstone_runs);
+            try std.testing.expectEqual(gc, candidate.tree.root.?.summary.gc_requested);
+            var level_count: usize = 0;
+            for (levels) |expected_level| {
+                try std.testing.expectEqualDeep(expected_level, candidate.levelStats(expected_level.level));
+                level_count += @intFromBool(expected_level.count != 0);
+            }
+            try std.testing.expectEqual(level_count, candidate.levelCount());
+            try std.testing.expectEqual(gen_len, if (candidate.generations.root) |root| root.count else 0);
+            for (gens[0..gen_len]) |expected_gen| try std.testing.expectEqualDeep(expected_gen, generation_index.Tree.find(candidate.generations.root, expected_gen).?.entry);
+            try std.testing.expect(candidate.byId(incoming.id) == incoming);
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    var memory: state.State = .{};
+    defer memory.deinit(a);
+    try memory.appendUpsert(a, .{}, "f", "", true);
+    var next_memory: state.State = .{};
+    defer next_memory.deinit(a);
+    try next_memory.appendUpsert(a, .{}, "m", "new", false);
+    const source = try Directory.create(a);
+    defer source.destroy(a);
+    for (0..6) |i| {
+        var key = [_]u8{@intCast('a' + i)};
+        try source.put(&fixture, .{ .id = i + 1, .visibility_id = if (i < 2) 77 else 88, .level = if (i < 3) 0 else if (i < 5) 1 else 2, .size_bytes = 10 + i, .path = if (i == 5) null else @constCast("/put-source.tbl"), .smallest_namespace_name = null, .smallest_key = &key, .largest_namespace_name = null, .largest_key = &key, .entry_count = 1, .tombstone_count = @intCast(i % 2), .oldest_tombstone_unix_ns = i * 11, .bloom_filter = null, .state = if (i == 5) memory else null, .owns_metadata = false });
+    }
+    const empty = try Directory.create(a);
+    defer empty.destroy(a);
+    for (0..10) |scenario| {
+        const base = if (scenario == 9) empty else source;
+        var incoming: Run = .{ .id = 9, .level = 1, .visibility_id = 333, .size_bytes = 37, .path = @constCast("/put-next.tbl"), .smallest_namespace_name = null, .smallest_key = @constCast("m"), .largest_namespace_name = null, .largest_key = @constCast("n"), .entry_count = 1, .tombstone_count = 0, .gc_requested = true, .bloom_filter = null, .state = null, .owns_metadata = false };
+        switch (scenario) {
+            1, 2 => {
+                incoming = base.byId(2).?.*;
+                incoming.size_bytes = 37;
+                incoming.tombstone_count = 0;
+                if (scenario == 2) incoming.largest_key = @constCast("zz");
+            },
+            3 => {
+                incoming.id = 2;
+                incoming.smallest_namespace_name = @constCast("docs");
+                incoming.largest_namespace_name = @constCast("docs");
+            },
+            4 => {
+                incoming.id = 1;
+                incoming.level = 0;
+            },
+            5 => {
+                incoming.id = 3;
+                incoming.level = 3;
+            },
+            6 => {
+                incoming.id = 4;
+                incoming.level = 0;
+                incoming.visibility_id = 444;
+            },
+            7 => {
+                incoming.id = 5;
+                incoming.path = null;
+                incoming.state = next_memory;
+                incoming.largest_key = @constCast("m");
+            },
+            8 => {
+                incoming.id = 6;
+                incoming.level = 2;
+            },
+            else => {},
+        }
+        const roots = Directory.Removal.roots(base);
+        const baseline_pins = fixture.pins;
+        var checks: usize = 1;
+        var target: usize = 0;
+        while (target <= checks) : (target += 1) {
+            for ([_]bool{ false, true }) |abort| {
+                if (target == 0 and abort) continue;
+                var job = try fixture.prepare(base, incoming);
+                defer job.deinit(a);
+                const prepared_run = job.entry.run;
+                var live: ?*Directory = base;
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const port = admission.Port.init(&payload);
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                const result = Fixture.perform(&job, failing.allocator(), &live, port);
+                if (target == 0) {
+                    try std.testing.expect(try result == base);
+                    checks = fault.checks;
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try std.testing.expect(live == base);
+                }
+                try std.testing.expectEqual(baseline_pins + 1, fixture.pins);
+                if (abort and (scenario == 0 or scenario == 9)) {
+                    // Flush append abort transfers every partial index at each
+                    // original rejection point. A separate owner retires it;
+                    // the rejected scope is never consulted again.
+                    var abandoned = job.abandonAppend();
+                    var retirement = Directory.Reclaimer.init(abandoned.directory);
+                    while (true) {
+                        var credits: usize = 1;
+                        if (retirement.step(a, &credits)) break;
+                    }
+                    retirement.finish(a);
+                    abandoned.lease.deinit(a);
+                    try std.testing.expectEqual(baseline_pins, fixture.pins);
+                    try std.testing.expectEqualDeep(roots, Directory.Removal.roots(base));
+                    continue;
+                }
+                if (abort) {
+                    fault.at = fault.checks + target % 3;
+                    try std.testing.expectError(fault.failure, job.retireWithAdmission(failing.allocator(), port));
+                    try job.retireWithAdmission(failing.allocator(), port);
+                    try std.testing.expect(job.retired and live == base);
+                } else {
+                    if (target != 0) try std.testing.expect(try Fixture.perform(&job, failing.allocator(), &live, port) == base);
+                    try Fixture.verify(base, live.?, prepared_run);
+                    const pass = @import("memory_account.zig").nextPass();
+                    try std.testing.expect(live.?.accountedMemoryBytes(pass) > 0);
+                    try std.testing.expectEqual(@as(u64, 0), job.lease.?.accountedMemoryBytes(pass));
+                    try std.testing.expectError(error.InvalidArgument, job.publishWithAdmission(&live, port));
+                }
+                fault.at = fault.checks;
+                try std.testing.expectError(fault.failure, job.takeEntryLeaseWithAdmission(port));
+                var returned_lease = try job.takeEntryLeaseWithAdmission(port);
+                try std.testing.expectError(error.InvalidArgument, job.takeEntryLeaseWithAdmission(port));
+                returned_lease.deinit(a);
+                if (!abort) live.?.destroy(a);
+                try std.testing.expectEqual(baseline_pins, fixture.pins);
+                try std.testing.expectEqualDeep(roots, Directory.Removal.roots(base));
+            }
+        }
+    }
+}
+
+test "controlled physical sync directory lease retains final payload pin bytes and charge through retirement rejection" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pin_phase: usize = 0,
+        releases: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), run: *Run) !void {
+            self.pins += 1;
+            run.version_ref_pinned = true;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), run: *Run) void {
+            std.debug.assert(self.pins == 1 and run.version_ref_pinned);
+            self.pins -= 1;
+            self.releases += 1;
+            run.version_ref_pinned = false;
+        }
+        fn release(raw: *anyopaque, owner: *anyopaque, run: *Run, original: ?admission.Port) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(raw == owner);
+            // Model a retained registry lookup: no lock or path allocation is
+            // hidden in this fixture. The production registry remains separate.
+            while (self.pin_phase < 3) {
+                if (original) |port| try port.checkpoint();
+                self.pin_phase += 1;
+            }
+            if (original) |port| try port.checkpoint();
+            self.releaseRunSnapshotRef(run);
+        }
+        fn pin(self: *@This()) Directory.EntryLease.PinRelease {
+            return .{ .context = self, .resume_fn = release };
+        }
+    };
+    const bytes = try a.alloc(u8, 3 * 16 * 1024 + 7);
+    defer a.free(bytes);
+    @memset(bytes, 'l');
+    var state_source: state.State = .{};
+    defer state_source.deinit(a);
+    try state_source.appendUpsert(a, .{ .name = "docs" }, bytes, bytes, true);
+    const base = Run{ .id = 301, .level = 0, .size_bytes = 1, .path = null, .smallest_namespace_name = null, .smallest_key = bytes, .largest_namespace_name = null, .largest_key = bytes, .entry_count = 1, .bloom_filter = null, .state = state_source, .owns_metadata = false };
+    for (0..3) |mode| {
+        var total: usize = 0;
+        var target: usize = 0;
+        while (target <= total) : (target += 1) {
+            for ([_]bool{ false, true }) |quiesced| {
+                if (target == 0 and quiesced) continue;
+                var source = base;
+                if (mode == 0) {
+                    source.path = @constCast("/retire/301.sst");
+                    source.state = null;
+                }
+                if (mode == 2) {
+                    source = try repository.cloneRunCompactionSnapshot(a, source);
+                    try source.shareMemory(a);
+                }
+                var fixture: Fixture = .{ .allocator = a };
+                const directory = try Directory.create(a);
+                defer directory.destroy(a);
+                try directory.tree.prepare(a);
+                const account = directory.tree.account.?;
+                const baseline = account.bytes.load(.acquire);
+                var lease: ?Directory.EntryLease = try directory.prepareEntryLegacy(&fixture, source);
+                defer if (lease) |*value| value.deinit(a);
+                if (mode == 2) source.deinit(a); // Payload owns the last shared pin.
+                const charged = account.bytes.load(.acquire);
+                try std.testing.expect(charged > baseline);
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const original = admission.Port.init(&payload);
+                var retirement: ?Directory.EntryLease.Retirement = null;
+                defer if (retirement) |*value| value.deinit(a);
+                const result: anyerror!void = blk: {
+                    retirement = lease.?.beginRetirementWithAdmission(fixture.pin(), original) catch |err| break :blk err;
+                    lease = null;
+                    retirement.?.retireWithAdmission(a, original) catch |err| break :blk err;
+                    break :blk {};
+                };
+                if (target == 0) {
+                    try result;
+                    total = fault.checks;
+                    try std.testing.expect(total > 10);
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try std.testing.expectEqual(charged, account.bytes.load(.acquire));
+                }
+                if (lease) |*value| {
+                    retirement = try value.beginRetirementWithAdmission(fixture.pin(), original);
+                    lease = null;
+                }
+                if (quiesced) retirement.?.deinit(a) else try retirement.?.retireWithAdmission(a, original);
+                try std.testing.expectEqual(baseline, account.bytes.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), fixture.pins);
+                try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+                fault.at = fault.checks;
+                try std.testing.expectError(fault.failure, retirement.?.retireWithAdmission(a, original));
+                try retirement.?.retireWithAdmission(a, original);
+                try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+            }
+        }
+    }
+    // A directory/handle still owns the payload. Dropping this lease cannot
+    // start pin release or physical retirement, even on the quiesced path.
+    var fixture: Fixture = .{ .allocator = a };
+    const directory = try Directory.create(a);
+    defer directory.destroy(a);
+    try directory.tree.prepare(a);
+    var lease = try directory.prepareEntryLegacy(&fixture, base);
+    var other: Directory.EntryLease = .{ .entry = lease.entry.retainShared() };
+    _ = other.entry.payload.?.account.retain();
+    var fault: Fault = .{};
+    const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+    const original = admission.Port.init(&payload);
+    lease.entry.payload.?.run.shared_read_version = true;
+    fault.at = fault.checks;
+    try std.testing.expectError(error.Canceled, lease.beginRetirementWithAdmission(fixture.pin(), original));
+    try std.testing.expectError(error.ExecutionWaitUnsupported, lease.beginRetirementWithAdmission(fixture.pin(), original));
+    try std.testing.expectEqual(@as(usize, 2), lease.entry.payload.?.refs.load(.acquire));
+    lease.entry.payload.?.run.shared_read_version = false;
+    var first = try lease.beginRetirementWithAdmission(fixture.pin(), original);
+    try std.testing.expect(first.complete);
+    try first.retireWithAdmission(a, original);
+    first.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), fixture.pins);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pin_phase);
+    var last = try other.beginRetirementWithAdmission(fixture.pin(), original);
+    defer last.deinit(a);
+    try last.retireWithAdmission(a, original);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
 }

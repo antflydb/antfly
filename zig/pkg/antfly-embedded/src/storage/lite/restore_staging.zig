@@ -18,6 +18,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
+const OwnedIo = @import("../owned_io.zig").Owner;
+const resource_manager = @import("../resource_manager.zig");
 
 const backup_codec = @import("../backup_codec.zig");
 const backup_bundle = @import("../backup_bundle.zig");
@@ -41,6 +43,9 @@ const full_text_index_defaults = @import("../../common/full_text_index_defaults.
 pub const max_afb_file_bytes: usize = 64 * 1024 * 1024 * 1024;
 
 pub const PreparationOptions = struct {
+    /// Borrowed for this synchronous preparation, including format dispatch.
+    io: ?std.Io = null,
+    resource_manager: ?*resource_manager.ResourceManager = null,
     max_input_bytes: u64 = max_afb_file_bytes,
     max_prepared_bytes: u64 = 128 * 1024 * 1024 * 1024,
 };
@@ -370,18 +375,20 @@ pub fn stageInputRestoreBackupWithOptions(
         owned_backup_id = try defaultBackupIdAlloc(allocator, input_path);
         break :blk owned_backup_id.?;
     };
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    const owner = if (options.io == null) try OwnedIo.create(allocator, options.resource_manager) else null;
+    defer if (owner) |value| value.destroy();
+    const io = options.io orelse owner.?.io();
     var source = try openInputFile(io, input_path);
     defer source.close(io);
     try checkInputLimit(io, source, options.max_input_bytes);
     var magic: [8]u8 = undefined;
     if (try source.readPositionalAll(io, &magic, 0) != magic.len) return error.InvalidMagic;
+    var nested_options = options;
+    nested_options.io = io;
     if (std.mem.startsWith(u8, &magic, "AFLITE"))
-        return stageAfliteRestoreBackupWithOptions(allocator, input_path, table_name, resolved_backup_id, location_uri, options);
+        return stageAfliteRestoreBackupWithOptions(allocator, input_path, table_name, resolved_backup_id, location_uri, nested_options);
     if (backup_codec.isAfbFormat(&magic))
-        return stageAfbRestoreBackupWithOptions(allocator, input_path, table_name, backup_id, resolved_backup_id, location_uri, options);
+        return stageAfbRestoreBackupWithOptions(allocator, input_path, table_name, backup_id, resolved_backup_id, location_uri, nested_options);
     return error.InvalidMagic;
 }
 
@@ -416,13 +423,13 @@ fn stageAfliteRestoreBackupWithOptions(
     location_uri: []const u8,
     options: PreparationOptions,
 ) !StagedRestore {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    const owner = if (options.io == null) try OwnedIo.create(allocator, options.resource_manager) else null;
+    defer if (owner) |value| value.destroy();
+    const io = options.io orelse owner.?.io();
     var source = try openInputFile(io, path);
     defer source.close(io);
     try checkInputLimit(io, source, options.max_input_bytes);
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    var lite = try LiteDb.openWithOptions(allocator, path, .query_readonly, .{ .io = io, .resource_manager = options.resource_manager });
     defer lite.close();
 
     const scratch = try temporaryPortablePath(allocator, io);
@@ -509,9 +516,9 @@ fn stageAfbRestoreBackupWithOptions(
     location_uri: []const u8,
     options: PreparationOptions,
 ) !StagedRestore {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    const owner = if (options.io == null) try OwnedIo.create(allocator, options.resource_manager) else null;
+    defer if (owner) |value| value.destroy();
+    const io = options.io orelse owner.?.io();
     var source = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -601,7 +608,7 @@ fn stagePortableFile(
     metadata_owned = false;
     integrity_owned = false;
     defer freeManifest(allocator, manifest);
-    var location = try backups_api.openBackupLocation(allocator, location_uri);
+    var location = try backups_api.openBackupLocationWithOptions(allocator, location_uri, .{ .filesystem_io = io, .network_io = io });
     defer location.deinit(allocator);
     switch (location) {
         .file => |root| {
@@ -611,7 +618,7 @@ fn stagePortableFile(
         },
         .remote => |*store| try store.writeFile(allocator, io, snapshot_path, scratch, "application/vnd.antfly.backup", .none),
     }
-    try backups_api.writeManifestToLocation(allocator, &location, &manifest);
+    try backups_api.writeManifestToLocationWithIo(allocator, io, &location, &manifest);
     return .{
         .backup_id = try allocator.dupe(u8, portable_backup_id),
         .location = try allocator.dupe(u8, location_uri),
@@ -643,13 +650,17 @@ fn stageNativeAfbRestoreBackup(
     defer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
     try backup_bundle_io.extractNativeFileToStagingDirectory(allocator, io, source, initial_stat.size, staging_root);
 
-    var source_manifest = try backups_api.readManifest(allocator, staging_root, root_manifest.backup_id);
+    const manifest_path = try backups_api.metadataPath(allocator, staging_root, root_manifest.backup_id);
+    defer allocator.free(manifest_path);
+    const manifest_bytes = try readFileAllocWithIo(allocator, io, manifest_path, backups_api.max_backup_manifest_bytes);
+    defer allocator.free(manifest_bytes);
+    var source_manifest = try backups_api.parseTableBackupManifest(allocator, manifest_bytes, root_manifest.backup_id);
     defer source_manifest.deinit(allocator);
     if (source_manifest.format != .native or !std.mem.eql(u8, source_manifest.table_name, root_manifest.table_name))
         return error.BackupArtifactFormatMismatch;
 
     if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
-    var location = try backups_api.openBackupLocation(allocator, location_uri);
+    var location = try backups_api.openBackupLocationWithOptions(allocator, location_uri, .{ .filesystem_io = io, .network_io = io });
     defer location.deinit(allocator);
     for (source_manifest.shards) |shard| {
         const canonical_path = try backups_api.shardSnapshotRelPath(allocator, source_manifest.backup_id, shard.group_id);
@@ -657,7 +668,7 @@ fn stageNativeAfbRestoreBackup(
         if (!std.mem.eql(u8, canonical_path, shard.snapshot_path)) return error.InvalidBackupManifest;
         const extracted_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging_root, shard.snapshot_path });
         defer allocator.free(extracted_shard);
-        try backups_api.copyDirectoryToLocation(allocator, &location, source_manifest.backup_id, shard.group_id, extracted_shard);
+        try backups_api.copyDirectoryToLocationUsingIoWithCancellation(allocator, io, &location, source_manifest.backup_id, shard.group_id, extracted_shard, .none);
     }
     var target_manifest = try backups_api.deriveRestoreManifestForTargetTable(
         allocator,
@@ -665,7 +676,7 @@ fn stageNativeAfbRestoreBackup(
         target_table_name,
     );
     defer target_manifest.deinit(allocator);
-    try backups_api.writeManifestToLocation(allocator, &location, &target_manifest);
+    try backups_api.writeManifestToLocationWithIo(allocator, io, &location, &target_manifest);
 
     return .{
         .backup_id = try allocator.dupe(u8, target_manifest.backup_id),
@@ -1074,9 +1085,10 @@ fn appendJsonU64(
 }
 
 fn readFileAlloc(allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    return readFileAllocWithIo(allocator, std.testing.io, path, max_bytes);
+}
+
+fn readFileAllocWithIo(allocator: Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) {
         return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
     }
@@ -2434,6 +2446,31 @@ test "lite restore staging inspector refuses an active archive writer" {
     var counter: InspectionCounter = .{};
     try std.testing.expectError(error.WriterLocked, portable_backup.inspectPortableFileBlocks(a, io, reader, .{}, &counter, InspectionCounter.visit));
     try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+}
+
+test "lite restore staging borrowed IO avoids private executor admission and preserves limits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fixture = @embedFile("../testdata/cross_backend_v1.afb");
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.afb", .data = fixture });
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root_path);
+    const path = try std.fs.path.join(a, &.{ root_path, "input.afb" });
+    defer a.free(path);
+    const location = try std.fmt.allocPrint(a, "file://{s}/prepared", .{root_path});
+    defer a.free(location);
+    var resources = resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1 } });
+    defer resources.deinit(a);
+    try std.testing.expectError(error.ResourceBudgetExceeded, stageInputRestoreBackupWithOptions(a, path, "docs", "test", location, .{ .resource_manager = &resources }));
+    try std.testing.expectError(error.BackupInputLimitExceeded, stageInputRestoreBackupWithOptions(a, path, "docs", "test", location, .{ .io = io, .resource_manager = &resources, .max_input_bytes = fixture.len - 1 }));
+    var staged = try stageInputRestoreBackupWithOptions(a, path, "docs", "test", location, .{ .io = io, .resource_manager = &resources });
+    defer staged.deinit(a);
+    try std.testing.expectEqual(@as(u64, 0), resources.snapshot().memory.used_bytes);
+    const original = try tmp.dir.readFileAlloc(io, "input.afb", a, .limited(fixture.len + 1));
+    defer a.free(original);
+    try std.testing.expectEqualSlices(u8, fixture, original);
 }
 
 test "backup preflight Lite and portable inspect all records without changing source" {

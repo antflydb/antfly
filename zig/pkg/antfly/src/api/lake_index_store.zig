@@ -34,9 +34,13 @@ pub const Store = struct {
         return openNative(a, config, secrets, read_only, config.deployment_mode, null);
     }
     pub fn openNative(a: A, config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, read_only: bool, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8) !Store {
+        return openNativeFor(a, config, secrets, read_only, deployment, local_base_dir, .{});
+    }
+    pub fn openNativeFor(a: A, config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, read_only: bool, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !Store {
+        try context.ensureActive();
         const storage = if (config) |value| value.storage else local.common_config.Config.StorageConfig{};
         var opened = if (storage.artifacts.connection != null)
-            try configured.openNativeArtifactObjectStoreAlloc(a, config.?, secrets, read_only)
+            try configured.openNativeArtifactObjectStoreFor(a, config.?, secrets, read_only, context)
         else fallback: {
             if (deployment != .standalone and deployment != .embedded) return error.NativeArtifactStorageRequired;
             const base = local_base_dir orelse storage.local_base_dir orelse
@@ -45,14 +49,15 @@ pub const Store = struct {
             defer a.free(root);
             const uri = try std.fmt.allocPrint(a, "file://{s}", .{root});
             defer a.free(uri);
-            break :fallback try local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(a, uri, "native-lake-indexes", .{ .ensure_bucket = !read_only });
+            break :fallback try local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(a, uri, "native-lake-indexes", .{ .ensure_bucket = !read_only, .context = context });
         };
         errdefer opened.deinit();
         // The configured opener already enforces create-if-missing policy.
         // This wrapper must never add bucket provisioning authority.
-        var implementation = try artifacts.ObjectStore.initWithClientOptions(a, opened.client, opened.bucket, opened.prefix, .{ .read_only = read_only, .filesystem = opened.fs_client });
+        var implementation = try artifacts.ObjectStore.initWithClientOptions(a, opened.client, opened.bucket, opened.prefix, .{ .read_only = read_only, .filesystem = opened.fs_client, .context = context });
         errdefer implementation.deinit();
         implementation.cloud_retention_qualified = if (config) |value| value.lake_indexes.cloud_generations.qualified_retention else false;
+        implementation.upload_context = context;
         const encoded = try std.json.Stringify.valueAlloc(a, .{
             .domain = "native-lake-artifact-store-v1",
             .connection = storage.artifacts.connection,

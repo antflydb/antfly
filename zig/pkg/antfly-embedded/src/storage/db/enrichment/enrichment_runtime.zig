@@ -50,6 +50,7 @@ const enrichment_config_validation = @import("config_validation.zig");
 const enrichment_neighbor_context = @import("neighbor_context.zig");
 const enrichment_artifact_codec = @import("artifact_codec.zig");
 const enrichment_worker = @import("enrichment_worker.zig");
+const ProgressMailbox = @import("progress_mailbox.zig").Mailbox(inference_request_context.Phase);
 const enrichment_lease = @import("enrichment_lease.zig");
 const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
@@ -79,6 +80,9 @@ const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const background_runtime_mod = @import("../../background_runtime.zig");
+const close_admission = @import("../../../common/read_admission.zig");
+const cleanup_wait = @import("../../../common/cleanup_wait.zig");
+const maintenance_stop = @import("../maintenance_stop.zig");
 const template = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
 else
@@ -444,10 +448,25 @@ const default_sync_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 const borrowed_cancellation_poll_min_ns: i64 = 25 * std.time.ns_per_ms;
 const borrowed_cancellation_poll_max_ns: i64 = 250 * std.time.ns_per_ms;
 
+// One synchronous catch-up owns this slot until every dispatched lane joins.
+// Concurrent guards preserve the first request rejection without touching the
+// durable provider retry identity or rechecking a one-shot callback.
+const ForegroundAuthorityRejection = struct {
+    code: std.atomic.Value(u32) = .init(0),
+    fn remember(self: *@This(), cause: anyerror) void {
+        _ = self.code.cmpxchgStrong(0, @intFromError(cause), .acq_rel, .acquire);
+    }
+    fn check(self: *const @This()) !void {
+        const code = self.code.load(.acquire);
+        if (code != 0) return @errorFromInt(@as(u16, @intCast(code)));
+    }
+};
+
 const ForegroundCatchUpGuard = struct {
     cancellation: CancellationToken = .none,
     deadline_ns: ?u64 = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
+    authority_rejection: ?*ForegroundAuthorityRejection = null,
 
     fn bounded(clock: platform_clock.Clock, config: Config, cancellation: CancellationToken) @This() {
         const timeout_ns = std.math.mul(
@@ -472,8 +491,19 @@ const ForegroundCatchUpGuard = struct {
     }
 
     fn check(self: @This()) !void {
-        if (self.cancellation.isCancelled())
-            return RuntimeError.EnrichmentWaitCanceled;
+        if (self.authority_rejection) |rejection|
+            rejection.check() catch return RuntimeError.EnrichmentWaitCanceled;
+        if (self.cancellation.check_fn != null) {
+            self.cancellation.check() catch |cause| {
+                if (self.authority_rejection) |rejection| {
+                    rejection.remember(cause);
+                    // Existing pipeline cancellation handling performs joined
+                    // unwind without durable worker/request failure accounting.
+                    return RuntimeError.EnrichmentWaitCanceled;
+                }
+                return cause;
+            };
+        } else if (self.cancellation.isCancelled()) return RuntimeError.EnrichmentWaitCanceled;
         if (self.deadline_ns) |deadline_ns| {
             if (self.clock.nowRealtimeNs() >= deadline_ns)
                 return RuntimeError.EnrichmentWaitTimeout;
@@ -1203,7 +1233,8 @@ fn updateIndexPreparation(runtime: *EnrichmentRuntime, index_names: []const []co
 /// Records completed request-path chunk work. The synchronous caller does not
 /// expose a preparation lifetime, so this updates throughput counters without
 /// manufacturing an in-flight phase.
-pub fn noteIndexChunksCreated(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+pub fn noteIndexChunksCreated(invocation: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+    const runtime = invocation.request_telemetry_parent orelse invocation;
     if (count == 0) return;
     updateIndexPreparation(runtime, index_names, false, count);
 }
@@ -1238,6 +1269,7 @@ fn updateIndexPublishing(runtime: *EnrichmentRuntime, index_names: []const []con
 }
 
 fn clearActiveInferenceAssumeLocked(runtime: *EnrichmentRuntime) void {
+    runtime.progress_mailbox.invalidate();
     runtime.active_inference_phase = .queued;
     runtime.active_model_len = 0;
     runtime.active_backend_len = 0;
@@ -1262,6 +1294,8 @@ fn updateActiveDeadlineAssumeLocked(
 }
 
 fn updatePublicationStateAssumeLocked(runtime: *EnrichmentRuntime, count: usize, started: bool) void {
+    consumeInferenceProgressAssumeLocked(runtime);
+    runtime.progress_mailbox.invalidate();
     if (count == 0) {
         if (!started and runtime.active_postprocess and runtime.active_publication_count == 0)
             clearActiveInferenceAssumeLocked(runtime);
@@ -1380,6 +1414,7 @@ fn noteEmbedBatchStartedFor(runtime: *EnrichmentRuntime, retry_fingerprint: u64,
         runtime.active_postprocess = false;
         runtime.active_postprocess_started_ns = 0;
         runtime.active_postprocess_started_ms = 0;
+        runtime.progress_mailbox.invalidate();
         runtime.active_inference_phase = .loading_model;
         runtime.active_model_len = 0;
         runtime.active_backend_len = 0;
@@ -1406,6 +1441,7 @@ fn noteEmbedBatchStartedFor(runtime: *EnrichmentRuntime, retry_fingerprint: u64,
         runtime.active_postprocess = false;
         runtime.active_postprocess_started_ns = 0;
         runtime.active_postprocess_started_ms = 0;
+        runtime.progress_mailbox.invalidate();
         runtime.active_inference_phase = .loading_model;
         runtime.active_model_len = 0;
         runtime.active_backend_len = 0;
@@ -1428,6 +1464,7 @@ fn noteEmbedBatchStartedFor(runtime: *EnrichmentRuntime, retry_fingerprint: u64,
         runtime.active_postprocess = false;
         runtime.active_postprocess_started_ns = 0;
         runtime.active_postprocess_started_ms = 0;
+        runtime.progress_mailbox.invalidate();
         runtime.active_inference_phase = .loading_model;
         runtime.active_model_len = 0;
         runtime.active_backend_len = 0;
@@ -1437,6 +1474,8 @@ fn noteEmbedBatchStartedFor(runtime: *EnrichmentRuntime, retry_fingerprint: u64,
 }
 
 fn finishActiveEmbedBatchAssumeLocked(runtime: *EnrichmentRuntime, success: bool) void {
+    consumeInferenceProgressAssumeLocked(runtime);
+    runtime.progress_mailbox.invalidate();
     runtime.active_embed_batch_items = 0;
     runtime.active_embed_batch_bytes = 0;
     runtime.active_embed_batch_max_bytes = 0;
@@ -1538,52 +1577,48 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
     runtime.notifyActivityHook();
 }
 
+// This callback may run while the native team is still computing. It must not
+// wait for the coordinator, invoke observer hooks or park that team's CPU loan.
 fn noteInferenceProgress(raw: ?*anyopaque, progress: inference_request_context.Progress) void {
     const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(raw.?));
+    const generation = runtime.progress_mailbox.captureGeneration();
     const now_ns = runtime.deadline_clock.nowRealtimeNs();
-    // Provider progress uses the native inference clock. Sample the target
-    // first so returning to the runtime clock cannot extend the budget.
+    // Sample the target before the native source so progress cannot renew time.
     const deadline_ns = if (progress.deadline_ns) |deadline|
         now_ns +| (deadline -| platform_time.monotonicNs())
     else
         null;
-    const now_ms = runtime.clock.nowRealtimeMs();
-    if (comptime builtin.os.tag == .freestanding) {
-        runtime.active_inference_phase = progress.phase;
-        runtime.last_progress_ns = now_ns;
-        runtime.last_progress_ms = now_ms;
-        runtime.active_progress_completed = progress.completed;
-        runtime.active_progress_total = progress.total;
-        updateActiveDeadlineAssumeLocked(runtime, deadline_ns, now_ns, now_ms);
-        if (progress.model.len > 0) {
-            runtime.active_model_len = @min(progress.model.len, runtime.active_model_buf.len);
-            @memcpy(runtime.active_model_buf[0..runtime.active_model_len], progress.model[0..runtime.active_model_len]);
-        }
-        if (progress.backend.len > 0) {
-            runtime.active_backend_len = @min(progress.backend.len, runtime.active_backend_buf.len);
-            @memcpy(runtime.active_backend_buf[0..runtime.active_backend_len], progress.backend[0..runtime.active_backend_len]);
-        }
-        return;
+    _ = runtime.progress_mailbox.publishInGeneration(generation, .{
+        .phase = progress.phase,
+        .completed = progress.completed,
+        .total = progress.total,
+        .model = progress.model,
+        .backend = progress.backend,
+        .deadline_ns = deadline_ns,
+        .now_ns = now_ns,
+        .now_ms = runtime.clock.nowRealtimeMs(),
+    });
+}
+
+// Caller owns the coordinator mutex (or the single-threaded runtime). This
+// never waits for a publisher. Stats readers and ordinary lifecycle activity
+// boundaries consume samples; observer publication stays on those owning paths.
+fn consumeInferenceProgressAssumeLocked(runtime: *EnrichmentRuntime) void {
+    const sample = runtime.progress_mailbox.take() orelse return;
+    runtime.active_inference_phase = sample.phase;
+    runtime.last_progress_ns = @max(runtime.last_progress_ns, sample.now_ns);
+    runtime.last_progress_ms = @max(runtime.last_progress_ms, sample.now_ms);
+    runtime.active_progress_completed = sample.completed;
+    runtime.active_progress_total = sample.total;
+    updateActiveDeadlineAssumeLocked(runtime, sample.deadline_ns, sample.now_ns, sample.now_ms);
+    if (sample.model_len > 0) {
+        runtime.active_model_len = sample.model_len;
+        @memcpy(runtime.active_model_buf[0..sample.model_len], sample.model[0..sample.model_len]);
     }
-    const io_impl = runtime.io_impl orelse return;
-    const io = io_impl.io();
-    runtime.mutex.lockUncancelable(io);
-    runtime.active_inference_phase = progress.phase;
-    runtime.last_progress_ns = now_ns;
-    runtime.last_progress_ms = now_ms;
-    runtime.active_progress_completed = progress.completed;
-    runtime.active_progress_total = progress.total;
-    updateActiveDeadlineAssumeLocked(runtime, deadline_ns, now_ns, now_ms);
-    if (progress.model.len > 0) {
-        runtime.active_model_len = @min(progress.model.len, runtime.active_model_buf.len);
-        @memcpy(runtime.active_model_buf[0..runtime.active_model_len], progress.model[0..runtime.active_model_len]);
+    if (sample.backend_len > 0) {
+        runtime.active_backend_len = sample.backend_len;
+        @memcpy(runtime.active_backend_buf[0..sample.backend_len], sample.backend[0..sample.backend_len]);
     }
-    if (progress.backend.len > 0) {
-        runtime.active_backend_len = @min(progress.backend.len, runtime.active_backend_buf.len);
-        @memcpy(runtime.active_backend_buf[0..runtime.active_backend_len], progress.backend[0..runtime.active_backend_len]);
-    }
-    runtime.mutex.unlock(io);
-    runtime.notifyActivityHook();
 }
 
 fn statusPhaseName(active: bool, phase: inference_request_context.Phase) []const u8 {
@@ -1602,7 +1637,8 @@ fn statusPhaseName(active: bool, phase: inference_request_context.Phase) []const
 // deliberately do not overwrite the replay worker's single active-batch
 // snapshot. Treating concurrent request batches as that one slot lets the
 // first completion clear another still-running batch from runtime status.
-fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize) void {
+fn noteTrackedRequestEmbedBatchStarted(invocation: *EnrichmentRuntime, index_names: []const []const u8, items: usize) void {
+    const runtime = invocation.request_telemetry_parent orelse invocation;
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
@@ -1626,7 +1662,7 @@ fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names:
 }
 
 fn noteTrackedRequestEmbedBatchFinished(
-    runtime: *EnrichmentRuntime,
+    invocation: *EnrichmentRuntime,
     index_names: []const []const u8,
     items: usize,
     bytes: usize,
@@ -1634,6 +1670,7 @@ fn noteTrackedRequestEmbedBatchFinished(
     elapsed_ns: u64,
     success: bool,
 ) void {
+    const runtime = invocation.request_telemetry_parent orelse invocation;
     if (!success) {
         if (comptime builtin.os.tag == .freestanding) {
             noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
@@ -2759,7 +2796,8 @@ fn isGraphRecoveryPending(err: anyerror) bool {
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
-    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending or isGraphRecoveryPending(err);
+    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending or
+        err == error.EnrichmentWaitCanceled or err == error.EnrichmentWaitTimeout or isGraphRecoveryPending(err);
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
@@ -3480,11 +3518,20 @@ const AssetInvocationCancellation = struct {
     lifecycle: CancellationToken,
     request: CancellationToken,
     inherited: CancellationToken,
+    rejection: @import("antfly_cancellation").Rejection = .{},
+
+    fn check(ptr: *const anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+        try self.rejection.check();
+        self.lifecycle.check() catch |err| return self.rejection.remember(err);
+        self.request.check() catch |err| return self.rejection.remember(err);
+        self.inherited.check() catch |err| return self.rejection.remember(err);
+        try self.rejection.check();
+    }
 
     fn isCancelled(ptr: *const anyopaque) bool {
-        const self: *const @This() = @ptrCast(@alignCast(ptr));
-        return self.lifecycle.isCancelled() or self.request.isCancelled() or
-            self.inherited.isCancelled();
+        check(ptr) catch return true;
+        return false;
     }
 };
 
@@ -3515,6 +3562,7 @@ fn scopedAssetProducer(
         .cancellation = .{
             .ptr = cancellation,
             .is_cancelled_fn = AssetInvocationCancellation.isCancelled,
+            .check_fn = if (cancellation.lifecycle.check_fn != null or cancellation.request.check_fn != null or cancellation.inherited.check_fn != null) AssetInvocationCancellation.check else null,
         },
         .max_response_bytes = producer.invocation_context.max_response_bytes,
         .document_checkpoints = producer.invocation_context.document_checkpoints,
@@ -3557,6 +3605,7 @@ fn checkProviderFailureGuard(runtime: *EnrichmentRuntime) !void {
 }
 
 fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_context.RequestContext {
+    if (runtime.provider_request_context) |context| return context;
     const guard = runtime.active_provider_guard;
     const cancellation = if (guard.cancellation.ptr != null)
         guard.cancellation
@@ -3580,6 +3629,18 @@ fn foregroundProviderRequestContext(runtime: *EnrichmentRuntime) ?inference_requ
     const guard = runtime.active_provider_guard;
     if (guard.deadline_ns == null and guard.cancellation.ptr == null) return null;
     return assetProviderRequestContext(runtime);
+}
+
+// Config copies in controlled preparation already intersect inherited controls.
+// Explicit retry calls must retain that provider-specific intersection as well.
+fn denseProviderRequestContext(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder) ?inference_request_context.RequestContext {
+    if (runtime.provider_request_context != null) return provider.part_request_context orelse assetProviderRequestContext(runtime);
+    return foregroundProviderRequestContext(runtime);
+}
+
+fn sparseProviderRequestContext(runtime: *EnrichmentRuntime, provider: embedder_mod.SparseEmbedder) ?inference_request_context.RequestContext {
+    if (runtime.provider_request_context != null) return provider.request_context orelse assetProviderRequestContext(runtime);
+    return foregroundProviderRequestContext(runtime);
 }
 
 fn checkProviderFailureGuardRecording(
@@ -3899,7 +3960,7 @@ fn embedDenseWithRetryUncached(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+        const vector = (if (denseProviderRequestContext(runtime, dense_embedder)) |context|
             dense_embedder.embedDenseWithContext(runtime.alloc, embedding_name, text, dims, context)
         else
             dense_embedder.embedDense(runtime.alloc, embedding_name, text, dims)) catch |err| {
@@ -3973,10 +4034,10 @@ fn embedDenseBatchAttemptLimits(dense_embedder: embedder_mod.DenseEmbedder, runt
     // Context-aware callbacks still require an explicit reentrancy guarantee.
     // Custom and legacy providers retain their serial path by default.
     const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
-    if (parallelism <= 1 or dense_embedder.dense_embed_batch_with_context_fn == null) {
+    if (runtime.provider_request_context != null or parallelism <= 1 or dense_embedder.dense_embed_batch_with_context_fn == null) {
         if (dense_embedder.dense_embed_batch_with_context_fn != null)
-            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, assetProviderRequestContext(runtime));
-        return if (foregroundProviderRequestContext(runtime)) |context|
+            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, denseProviderRequestContext(runtime, dense_embedder) orelse assetProviderRequestContext(runtime));
+        return if (denseProviderRequestContext(runtime, dense_embedder)) |context|
             dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, context)
         else
             dense_embedder.embedDenseBatch(runtime.alloc, name, texts, dims);
@@ -4253,7 +4314,7 @@ fn embedDensePartsWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+        const vector = (if (denseProviderRequestContext(runtime, dense_embedder)) |context|
             dense_embedder.embedDensePartsWithContext(runtime.alloc, embedding_name, parts, dims, context)
         else
             dense_embedder.embedDenseParts(runtime.alloc, embedding_name, parts, dims)) catch |err| {
@@ -4291,7 +4352,7 @@ fn embedSparseWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse = (if (foregroundProviderRequestContext(runtime)) |context|
+        const sparse = (if (sparseProviderRequestContext(runtime, sparse_embedder)) |context|
             sparse_embedder.embedSparseWithContext(runtime.alloc, embedding_name, text, context)
         else
             sparse_embedder.embedSparse(runtime.alloc, embedding_name, text)) catch |err| {
@@ -4330,7 +4391,7 @@ fn embedSparseBatchWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse_batch = (if (foregroundProviderRequestContext(runtime)) |context|
+        const sparse_batch = (if (sparseProviderRequestContext(runtime, sparse_embedder)) |context|
             sparse_embedder.embedSparseBatchWithContext(runtime.alloc, embedding_name, texts, context)
         else
             sparse_embedder.embedSparseBatch(runtime.alloc, embedding_name, texts)) catch |err| {
@@ -5818,6 +5879,12 @@ const UnsupportedEnrichmentRuntime = struct {
     shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
+    /// Invocation-local only; never installed on the shared lifecycle runtime.
+    provider_request_context: ?inference_request_context.RequestContext = null,
+    /// Only scoped, independently admitted producer children can populate runnable.
+    provider_independent_execution: bool = false,
+    /// Request counters use the resident runtime; provider controls stay local.
+    request_telemetry_parent: ?*EnrichmentRuntime = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime.
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
@@ -5888,6 +5955,7 @@ const UnsupportedEnrichmentRuntime = struct {
     active_publication_count: u64 = 0,
     active_publication_started_ms: u64 = 0,
     active_publication_started_ns: u64 = 0,
+    progress_mailbox: ProgressMailbox = .{},
     active_inference_phase: inference_request_context.Phase = .queued,
     active_model_buf: [256]u8 = undefined,
     active_model_len: usize = 0,
@@ -6023,7 +6091,17 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     pub fn stop(self: *@This()) void {
-        _ = self;
+        self.progress_mailbox.invalidate();
+    }
+
+    pub fn stopWithAdmission(self: *@This(), original: close_admission.Port) !void {
+        const Ready = struct {
+            fn get(_: *anyopaque) anyerror!bool {
+                return true;
+            }
+        };
+        try cleanup_wait.until(null, original, self, Ready.get, null);
+        self.stop();
     }
 
     pub fn isStarted(_: *const @This()) bool {
@@ -6035,6 +6113,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     fn notifyActivityHook(self: *@This()) void {
+        consumeInferenceProgressAssumeLocked(self);
         if (self.status_hook) |hook| hook.notifyActivity();
     }
 
@@ -6110,12 +6189,19 @@ const UnsupportedEnrichmentRuntime = struct {
         try self.catchUpUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
     }
 
+    pub fn waitForAppliedWithExecutionWait(self: *@This(), sequence: u64, cancellation: CancellationToken, deadline_ns: ?u64, _: ?@import("../../../common/execution_wait.zig").Boundary) !void {
+        // This implementation executes the producer inline; it has no physical
+        // futex wait at which CPU can be lent.
+        return self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+    }
+
     pub fn catchUpUntilWithVisibilityDeadline(
         self: *@This(),
         sequence: u64,
         cancellation: CancellationToken,
         deadline_ns: ?u64,
     ) !void {
+        if (cancellation.check_fn != null) try cancellation.check();
         if (sequence == 0) return;
         const wait_after_sequence = self.applied_sequence;
         // A completed or terminal prefix wins a racing transport
@@ -6127,14 +6213,19 @@ const UnsupportedEnrichmentRuntime = struct {
                 return RuntimeError.EnrichmentWorkerFailed;
             return;
         }
-        const guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        var rejection: ForegroundAuthorityRejection = .{};
+        var guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        guard.authority_rejection = &rejection;
         self.catchUpUntilGuarded(sequence, guard) catch |err| {
+            try rejection.check();
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
             if ((err == RuntimeError.EnrichmentWaitCanceled or err == RuntimeError.EnrichmentWaitTimeout) and
                 terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
                 return RuntimeError.EnrichmentWorkerFailed;
             return err;
         };
+        try rejection.check();
+        if (cancellation.check_fn != null) try cancellation.check();
         const failure_envelope = terminalFailureEnvelopeSnapshot(self);
         if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
             return RuntimeError.EnrichmentWorkerFailed;
@@ -6232,6 +6323,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
+        consumeInferenceProgressAssumeLocked(self);
         const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
         const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
         return .{
@@ -6321,6 +6413,12 @@ const PlatformEnrichmentRuntime = struct {
 
     alloc: Allocator,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
+    /// Invocation-local only; never installed on the shared lifecycle runtime.
+    provider_request_context: ?inference_request_context.RequestContext = null,
+    /// Only scoped, independently admitted producer children can populate runnable.
+    provider_independent_execution: bool = false,
+    /// Request counters use the resident runtime; provider controls stay local.
+    request_telemetry_parent: ?*EnrichmentRuntime = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime. Per-operation lane leases protect
     /// lazily owned executors during concurrent shutdown.
@@ -6361,7 +6459,15 @@ const PlatformEnrichmentRuntime = struct {
     cond: Io.Condition = .init,
     sync_wait_epoch: std.atomic.Value(u32) = .init(0),
     sync_waiter_count: std.atomic.Value(u32) = .init(0),
-    replay_pass_active: bool = false,
+    replay_pass_active: std.atomic.Value(bool) = .init(false),
+    // Final close is distinct from restartable provider reconfiguration.
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    closing: std.atomic.Value(bool) = .init(false),
+    close_started: bool = false,
+    close_joined: Io.Event = .unset,
+    close_changed: Io.Event = .unset,
+    close_generation: std.atomic.Value(u64) = .init(0),
+    close_waiters: std.atomic.Value(u32) = .init(0),
     /// Startup maintenance must run even with no pending replay documents.
     graph_stage_recovery_pending: bool = false,
     shutdown: bool = false,
@@ -6418,6 +6524,7 @@ const PlatformEnrichmentRuntime = struct {
     active_publication_count: u64 = 0,
     active_publication_started_ms: u64 = 0,
     active_publication_started_ns: u64 = 0,
+    progress_mailbox: ProgressMailbox = .{},
     active_inference_phase: inference_request_context.Phase = .queued,
     active_model_buf: [256]u8 = undefined,
     active_model_len: usize = 0,
@@ -6554,6 +6661,7 @@ const PlatformEnrichmentRuntime = struct {
     pub fn reloadDurableState(self: *EnrichmentRuntime) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentReloadDurableState", .{self});
         if (self.future != null) return error.EnrichmentRuntimeStarted;
+        self.progress_mailbox.invalidate();
         self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
         restoreThreadedRuntimeStatus(self, persisted_status);
@@ -6562,6 +6670,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub fn deinit(self: *EnrichmentRuntime) void {
+        self.closing.store(true, .release);
         self.stop();
         self.vector_label_cache.deinit();
         clearIndexEmbeddingActivity(self);
@@ -6578,6 +6687,13 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub fn stop(self: *EnrichmentRuntime) void {
+        platform.sync.lockYielding(&self.lifecycle_mutex);
+        if (self.closing.load(.acquire)) {
+            self.lifecycle_mutex.unlock();
+            self.finishFinalTeardown();
+            return;
+        }
+        defer self.lifecycle_mutex.unlock();
         self.beginTeardown();
         if (self.io_impl) |io_impl| {
             const io = io_impl.io();
@@ -6593,13 +6709,82 @@ const PlatformEnrichmentRuntime = struct {
             // replay ownership fence. shutdown=true prevents new passes from
             // entering while the current owner exits.
             self.mutex.lockUncancelable(io);
-            while (self.replay_pass_active) {
+            while (self.replay_pass_active.load(.acquire)) {
                 self.cond.waitUncancelable(io, &self.mutex);
             }
             self.mutex.unlock(io);
         }
+        // Every native/provider callback has joined. A queued advisory sample
+        // must not reappear in the stopped runtime or a later replay owner.
+        self.progress_mailbox.invalidate();
         self.future = null;
         self.shutdown = false;
+        self.ownership.release();
+    }
+
+    fn lifecycleIo(self: *EnrichmentRuntime) ?Io {
+        return if (self.io_impl) |implementation| implementation.io() else null;
+    }
+
+    fn closeHandle(self: *EnrichmentRuntime) maintenance_stop.Borrowed {
+        return .{
+            .mutex = &self.lifecycle_mutex,
+            .registration = &self.future,
+            .stopping = &self.closing,
+            .finisher = &self.close_started,
+            .joined = &self.close_joined,
+            .changed = &self.close_changed,
+            .generation = &self.close_generation,
+            .waiters = &self.close_waiters,
+        };
+    }
+
+    fn replayRetired(raw: *anyopaque) anyerror!bool {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(raw));
+        return !runtime.replay_pass_active.load(.acquire);
+    }
+
+    fn finishFinalTeardown(self: *EnrichmentRuntime) void {
+        self.beginTeardown();
+        const io = self.lifecycleIo();
+        self.closeHandle().stop(io, false);
+        while (self.replay_pass_active.load(.acquire)) {
+            if (io) |lane| lane.sleep(.fromMilliseconds(1), .awake) catch {} else platform.time.yieldNow();
+        }
+        if (io) |lane| self.mutex.lockUncancelable(lane);
+        defer if (io) |lane| self.mutex.unlock(lane);
+        self.progress_mailbox.invalidate();
+        self.ownership.release();
+    }
+
+    /// Retains providers, the store and lease until every scheduled and inline
+    /// replay owner has returned and the original caller has reentered CPU.
+    pub fn stopWithAdmission(self: *EnrichmentRuntime, original: close_admission.Port) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) {
+            var relay: close_admission.ExecutionErrorRelay = .{};
+            const borrowed = try relay.bind(original);
+            @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentStopWithAdmission", .{ self, borrowed }) catch |cause| return relay.errors.rejection orelse cause;
+            if (relay.errors.rejection) |cause| return cause;
+            return;
+        }
+        const io = self.lifecycleIo();
+        try cleanup_wait.lockAtomic(&self.lifecycle_mutex, io, original);
+        self.closing.store(true, .release);
+        self.shutdown_requested.store(true, .release);
+        self.lifecycle_mutex.unlock();
+        // No lifecycle guard is retained while borrowing the caller's CPU.
+        if (io) |lane| {
+            try cleanup_wait.lockIo(&self.mutex, lane, original);
+            self.shutdown = true;
+            self.shutdown_event.set(lane);
+            broadcastRuntimeStateChanged(self, lane);
+            self.mutex.unlock(lane);
+        }
+        try self.closeHandle().stopWithAdmission(io, original);
+        try cleanup_wait.until(io, original, self, replayRetired, null);
+        if (io) |lane| try cleanup_wait.lockIo(&self.mutex, lane, original);
+        defer if (io) |lane| self.mutex.unlock(lane);
+        self.progress_mailbox.invalidate();
         self.ownership.release();
     }
 
@@ -6625,12 +6810,16 @@ const PlatformEnrichmentRuntime = struct {
     /// Resume provider admission after a joined stop while the caller owns
     /// synchronous replay. Restore drains must not launch a competing worker.
     pub fn resumeInlineAfterStop(self: *EnrichmentRuntime) !void {
+        platform.sync.lockYielding(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (self.future != null) return error.EnrichmentWorkerAlreadyRunning;
         try self.prepareExecution();
     }
 
     fn prepareExecution(self: *EnrichmentRuntime) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        self.progress_mailbox.invalidate();
         self.shutdown_event.reset();
         self.shutdown_requested.store(false, .release);
         const cancellation = CancellationToken.fromAtomic(&self.shutdown_requested);
@@ -6649,6 +6838,9 @@ const PlatformEnrichmentRuntime = struct {
 
     pub fn start(self: *EnrichmentRuntime) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentStart", .{self});
+        platform.sync.lockYielding(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (self.future != null) return;
         try self.prepareExecution();
         self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.producer, self, workerStep);
@@ -6682,10 +6874,14 @@ const PlatformEnrichmentRuntime = struct {
 
     fn notifyActivityHook(self: *EnrichmentRuntime) void {
         const hook = blk: {
-            const io_impl = self.io_impl orelse break :blk self.status_hook;
+            const io_impl = self.io_impl orelse {
+                consumeInferenceProgressAssumeLocked(self);
+                break :blk self.status_hook;
+            };
             const io = io_impl.io();
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
+            consumeInferenceProgressAssumeLocked(self);
             break :blk self.status_hook;
         };
         if (hook) |value| value.notifyActivity();
@@ -6769,6 +6965,16 @@ const PlatformEnrichmentRuntime = struct {
         deadline_ns: ?u64,
     ) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentWaitForAppliedWithVisibilityDeadline", .{ self, sequence, cancellation, deadline_ns });
+        return self.waitForAppliedWithExecutionWait(sequence, cancellation, deadline_ns, null);
+    }
+
+    pub fn waitForAppliedWithExecutionWait(
+        self: *EnrichmentRuntime,
+        sequence: u64,
+        cancellation: CancellationToken,
+        deadline_ns: ?u64,
+        boundary: ?@import("../../../common/execution_wait.zig").Boundary,
+    ) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
@@ -6789,6 +6995,13 @@ const PlatformEnrichmentRuntime = struct {
         var cancellation_poll_ns = borrowed_cancellation_poll_min_ns;
 
         while (true) {
+            // Scoped request authority must be checked outside the worker lock
+            // and before returning a ready result. Legacy transport cancellation
+            // still lets an already-applied prefix win the race below.
+            const request_cancelled = if (cancellation.check_fn != null) blk: {
+                try cancellation.check();
+                break :blk false;
+            } else cancellation.isCancelled();
             self.mutex.lockUncancelable(io);
             if (self.applied_sequence >= sequence) {
                 const failure_envelope = terminalFailureEnvelopeSnapshot(self);
@@ -6812,7 +7025,7 @@ const PlatformEnrichmentRuntime = struct {
                 self.mutex.unlock(io);
                 return RuntimeError.EnrichmentWaitCanceled;
             }
-            if (cancellation.isCancelled()) {
+            if (request_cancelled) {
                 self.mutex.unlock(io);
                 return RuntimeError.EnrichmentWaitCanceled;
             }
@@ -6845,6 +7058,11 @@ const PlatformEnrichmentRuntime = struct {
                 })
             else
                 deadline;
+            if (boundary) |original| original.beginWait() catch |err| {
+                const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
+                std.debug.assert(previous_waiters > 0);
+                return err;
+            };
             const wait_result = Io.futexWaitTimeout(
                 io,
                 u32,
@@ -6854,8 +7072,13 @@ const PlatformEnrichmentRuntime = struct {
             );
             const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
             std.debug.assert(previous_waiters > 0);
+            // Registration and physical wait have ended on every path. Reenter
+            // the same operation before consuming a wake, cancellation or the
+            // now-applied prefix; failure preserves its original retained owner.
+            if (boundary) |original| try original.endWait();
             wait_result catch |err| switch (err) {
                 error.Canceled => {
+                    if (cancellation.check_fn != null) try cancellation.check();
                     // Resolve a terminal transition racing cancellation before
                     // reporting an ambiguous post-commit wait outcome.
                     // Timed futex expiry is a successful (possibly spurious)
@@ -6920,13 +7143,17 @@ const PlatformEnrichmentRuntime = struct {
         deadline_ns: ?u64,
     ) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentCatchUpUntilWithVisibilityDeadline", .{ self, sequence, cancellation, deadline_ns });
+        if (cancellation.check_fn != null) try cancellation.check();
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
         const wait_after_sequence = self.applied_sequence;
         self.mutex.unlock(io);
-        const guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        var rejection: ForegroundAuthorityRejection = .{};
+        var guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        guard.authority_rejection = &rejection;
         self.catchUpUntilGuarded(sequence, guard) catch |err| {
+            try rejection.check();
             self.mutex.lockUncancelable(io);
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
             self.mutex.unlock(io);
@@ -6935,6 +7162,8 @@ const PlatformEnrichmentRuntime = struct {
                 return RuntimeError.EnrichmentWorkerFailed;
             return err;
         };
+        try rejection.check();
+        if (cancellation.check_fn != null) try cancellation.check();
         self.mutex.lockUncancelable(io);
         const failure_envelope = terminalFailureEnvelopeSnapshot(self);
         self.mutex.unlock(io);
@@ -6948,6 +7177,7 @@ const PlatformEnrichmentRuntime = struct {
 
         self.notifySequence(sequence);
         while (true) {
+            if (guard.cancellation.check_fn != null) try guard.check();
             self.mutex.lockUncancelable(io);
             const applied = self.applied_sequence;
             const recovery_pending = self.graph_stage_recovery_pending;
@@ -6964,7 +7194,7 @@ const PlatformEnrichmentRuntime = struct {
                 .retry_in_progress => return RuntimeError.EnrichmentRetryInProgress,
                 .run_pass => {},
             }
-            try guard.check();
+            if (guard.cancellation.check_fn == null) try guard.check();
             runForegroundCatchUpPassGuarded(self, io, sequence, guard) catch |err| {
                 if (isGraphRecoveryPending(err)) continue;
                 return switch (err) {
@@ -7021,6 +7251,7 @@ const PlatformEnrichmentRuntime = struct {
         if (maybe_io) |io| self.mutex.lockUncancelable(io);
         defer if (maybe_io) |io| self.mutex.unlock(io);
 
+        consumeInferenceProgressAssumeLocked(self);
         const ownership_stats = self.ownership.stats();
         const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
         const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
@@ -7512,6 +7743,103 @@ test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
     try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
 }
 
+fn progressMailboxTestRuntime(clock: *platform_clock.ManualClock) EnrichmentRuntime {
+    return .{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1000 },
+        .ownership = undefined,
+        .deadline_clock = clock.clock(),
+    };
+}
+
+test "enrichment progress mailbox production callback never waits on the coordinator or invokes activity hooks" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = std.testing.io;
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(7 * std.time.ns_per_s);
+    var runtime = progressMailboxTestRuntime(&clock);
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        done: std.atomic.Value(bool) = .init(false),
+        activities: std.atomic.Value(usize) = .init(0),
+        fn activity(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.runtime.mutex.tryLock()) {
+                _ = self.activities.fetchAdd(100, .monotonic);
+                return;
+            }
+            self.runtime.mutex.unlock(std.testing.io);
+            _ = self.activities.fetchAdd(1, .monotonic);
+        }
+        fn changed(_: *anyopaque) void {}
+        fn run(self: *@This()) void {
+            noteInferenceProgress(self.runtime, .{ .phase = .executing, .completed = 7, .total = 9, .model = "model", .backend = "native" });
+            self.done.store(true, .release);
+        }
+    };
+    var probe: Probe = .{ .runtime = &runtime };
+    runtime.status_hook = .{ .ptr = &probe, .on_change = Probe.changed, .on_activity = Probe.activity };
+    runtime.mutex.lockUncancelable(io);
+    var locked = true;
+    defer if (locked) runtime.mutex.unlock(io);
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    const until = platform_time.monotonicNs() + 250 * std.time.ns_per_ms;
+    while (!probe.done.load(.acquire) and platform_time.monotonicNs() < until) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    const completed_while_locked = probe.done.load(.acquire);
+    runtime.mutex.unlock(io);
+    locked = false;
+    thread.join();
+    try std.testing.expect(completed_while_locked);
+    try std.testing.expectEqual(@as(usize, 0), probe.activities.load(.acquire));
+    try std.testing.expectEqual(inference_request_context.Phase.queued, runtime.active_inference_phase);
+    // An ordinary owning boundary consumes the copied sample and invokes the
+    // activity hook after releasing the coordinator lock.
+    runtime.notifyActivityHook();
+    try std.testing.expectEqual(@as(usize, 1), probe.activities.load(.acquire));
+    try std.testing.expectEqual(inference_request_context.Phase.executing, runtime.active_inference_phase);
+    try std.testing.expectEqual(@as(u64, 7), runtime.active_progress_completed);
+    try std.testing.expectEqualStrings("model", runtime.active_model_buf[0..runtime.active_model_len]);
+}
+
+test "enrichment progress mailbox lifecycle consumption cannot revive execution after completion or publication" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(7 * std.time.ns_per_s);
+    var runtime = progressMailboxTestRuntime(&clock);
+    noteInferenceProgress(&runtime, .{ .phase = .executing, .completed = 7, .total = 9 });
+    finishActiveEmbedBatchAssumeLocked(&runtime, true);
+    try std.testing.expectEqual(inference_request_context.Phase.serializing, runtime.active_inference_phase);
+    consumeInferenceProgressAssumeLocked(&runtime);
+    try std.testing.expectEqual(inference_request_context.Phase.serializing, runtime.active_inference_phase);
+    noteInferenceProgress(&runtime, .{ .phase = .executing });
+    updatePublicationStateAssumeLocked(&runtime, 1, true);
+    consumeInferenceProgressAssumeLocked(&runtime);
+    try std.testing.expectEqual(inference_request_context.Phase.publishing, runtime.active_inference_phase);
+    noteInferenceProgress(&runtime, .{ .phase = .executing, .model = "old" });
+    clearActiveInferenceAssumeLocked(&runtime);
+    consumeInferenceProgressAssumeLocked(&runtime);
+    try std.testing.expectEqual(inference_request_context.Phase.queued, runtime.active_inference_phase);
+    try std.testing.expectEqual(@as(usize, 0), runtime.active_model_len);
+    noteInferenceProgress(&runtime, .{ .phase = .executing, .model = "before-stop" });
+    // This fixture has no durable lease or live worker, but exercises the
+    // actual joined-stop boundary and its queued telemetry retirement.
+    runtime.ownership.lease_owned = false;
+    runtime.stop();
+    consumeInferenceProgressAssumeLocked(&runtime);
+    try std.testing.expectEqual(inference_request_context.Phase.queued, runtime.active_inference_phase);
+    try std.testing.expectEqual(@as(usize, 0), runtime.active_model_len);
+}
+
 test "enrichment provider deadlines and progress cross native clock boundaries" {
     if (comptime builtin.os.tag == .freestanding) return error.SkipZigTest;
     var clock: platform_clock.ManualClock = .{};
@@ -7560,13 +7888,16 @@ test "enrichment provider deadlines and progress cross native clock boundaries" 
         try std.testing.expect(remaining > 0 and remaining <= 1_000);
         // Provider progress returns its native deadline to the runtime epoch.
         try provider.update(.executing, 1, 2);
+        consumeInferenceProgressAssumeLocked(&runtime);
         try std.testing.expect(runtime.active_deadline_ns > epoch);
         try std.testing.expect(runtime.active_deadline_ns <= epoch + std.time.ns_per_s);
         try std.testing.expectEqual(@as(u64, 1), runtime.active_progress_completed);
         const saved = runtime.active_deadline_ns;
         noteInferenceProgress(&runtime, .{ .phase = .executing });
+        consumeInferenceProgressAssumeLocked(&runtime);
         try std.testing.expectEqual(saved, runtime.active_deadline_ns);
         noteInferenceProgress(&runtime, .{ .phase = .executing, .deadline_ns = 0 });
+        consumeInferenceProgressAssumeLocked(&runtime);
         try std.testing.expectEqual(epoch, runtime.active_deadline_ns);
         clock.advanceMs(1_000);
         try std.testing.expectError(error.Timeout, assetProviderRequestContext(&runtime).check());
@@ -8504,13 +8835,13 @@ fn workerStep(runtime: *EnrichmentRuntime) ?u64 {
     };
     const io = runtime.io_impl.?.io();
     runtime.mutex.lockUncancelable(io);
-    if (runtime.shutdown or ((runtime.worker_failed or runtime.last_error_name != null) and !runtime.graph_stage_recovery_pending) or
+    if (runtime.closing.load(.acquire) or runtime.shutdown or ((runtime.worker_failed or runtime.last_error_name != null) and !runtime.graph_stage_recovery_pending) or
         (runtime.target_sequence <= runtime.applied_sequence and !runtime.retrying and !runtime.graph_stage_recovery_pending))
     {
         runtime.mutex.unlock(io);
         return if (runtime.shutdown) null else if (runtime.document_checkpoint_gc_pending.load(.acquire)) 1000 else if (runtime.document_checkpoints_present.load(.acquire)) 30_000 else null;
     }
-    if (runtime.replay_pass_active) {
+    if (runtime.replay_pass_active.load(.acquire)) {
         runtime.mutex.unlock(io);
         return 25;
     }
@@ -8529,7 +8860,7 @@ fn beginReplayPass(
     guard: ForegroundCatchUpGuard,
 ) !bool {
     runtime.mutex.lockUncancelable(io);
-    while (runtime.replay_pass_active and !runtime.shutdown) {
+    while (runtime.replay_pass_active.load(.acquire) and !runtime.shutdown and !runtime.closing.load(.acquire)) {
         if (guard.deadline_ns == null and guard.cancellation.ptr == null) {
             runtime.cond.waitUncancelable(io, &runtime.mutex);
             continue;
@@ -8543,7 +8874,7 @@ fn beginReplayPass(
         try guard.check();
         runtime.mutex.lockUncancelable(io);
     }
-    if (runtime.shutdown) {
+    if (runtime.shutdown or runtime.closing.load(.acquire)) {
         runtime.mutex.unlock(io);
         return error.EnrichmentRetryAborted;
     }
@@ -8564,15 +8895,15 @@ fn beginReplayPass(
         runtime.mutex.unlock(io);
         return RuntimeError.EnrichmentRetryInProgress;
     }
-    runtime.replay_pass_active = true;
+    runtime.replay_pass_active.store(true, .release);
     runtime.mutex.unlock(io);
     return true;
 }
 
 fn endReplayPass(runtime: *EnrichmentRuntime, io: Io) void {
     runtime.mutex.lockUncancelable(io);
-    std.debug.assert(runtime.replay_pass_active);
-    runtime.replay_pass_active = false;
+    std.debug.assert(runtime.replay_pass_active.load(.acquire));
+    runtime.replay_pass_active.store(false, .release);
     broadcastRuntimeStateChanged(runtime, io);
     runtime.mutex.unlock(io);
 }
@@ -8597,7 +8928,7 @@ test "enrichment replay passes are single flight" {
         .notify_fn = undefined,
         .config = .{},
         .ownership = undefined,
-        .replay_pass_active = true,
+        .replay_pass_active = .init(true),
     };
     const Waiter = struct {
         runtime: *EnrichmentRuntime,
@@ -8628,7 +8959,7 @@ test "enrichment replay passes are single flight" {
     endReplayPass(&runtime, io);
     waiter.acquired.waitUncancelable(io);
     try std.testing.expect(waiter.err == null);
-    try std.testing.expect(runtime.replay_pass_active);
+    try std.testing.expect(runtime.replay_pass_active.load(.acquire));
     endReplayPass(&runtime, io);
 
     runtime.applied_sequence = 1;
@@ -9083,6 +9414,9 @@ test "enrichment runtime graph indexed keys survive rollback bulk append and tra
 /// authoritative node admission can force one bounded serial drain/retry.
 const SharedPdfWindowScheduler = struct {
     runtime: *EnrichmentRuntime,
+    /// Invocation-local coordinator metadata. Independently granted native
+    /// buffers use runtime.alloc as raw backing rather than charging twice.
+    metadata_alloc: ?Allocator = null,
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     sequence: u64,
     current: usize = 0,
@@ -9156,19 +9490,23 @@ const SharedPdfWindowScheduler = struct {
         return .{ .runtime = runtime, .requests = requests, .sequence = sequence };
     }
 
+    fn metadataAllocator(self: *const @This()) Allocator {
+        return self.metadata_alloc orelse self.runtime.alloc;
+    }
+
     pub fn deinit(self: *@This()) void {
         if (self.spool_root) |root| {
             if (self.spool_dirty and self.precommit == null) self.cleanupSpool() catch |err|
                 std.log.warn("shared PDF result cleanup failed: {s}", .{@errorName(err)});
-            self.runtime.alloc.free(root);
+            self.metadataAllocator().free(root);
         }
-        if (self.spool_attempt_key) |key| self.runtime.alloc.free(key);
+        if (self.spool_attempt_key) |key| self.metadataAllocator().free(key);
         if (self.consumers) |consumers| {
             for (consumers) |*consumer| {
-                if (consumer.owned_config) consumer.config.deinit(self.runtime.alloc);
-                consumer.plans.deinit(self.runtime.alloc);
+                if (consumer.owned_config) consumer.config.deinit(self.metadataAllocator());
+                consumer.plans.deinit(self.metadataAllocator());
             }
-            self.runtime.alloc.free(consumers);
+            self.metadataAllocator().free(consumers);
         }
     }
 
@@ -9182,7 +9520,7 @@ const SharedPdfWindowScheduler = struct {
 
     fn ensureConsumers(self: *@This()) !void {
         if (self.consumers != null) return;
-        const consumers = try self.runtime.alloc.alloc(Consumer, self.requests.len);
+        const consumers = try self.metadataAllocator().alloc(Consumer, self.requests.len);
         @memset(consumers, .{});
         self.consumers = consumers;
     }
@@ -9218,7 +9556,7 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn cleanupSpool(self: *@This()) !void {
-        try clearPrivateStorePrefix(self.runtime, self.runtime.alloc, &self.runtime.store, self.spool_root.?);
+        try clearPrivateStorePrefix(self.runtime, self.metadataAllocator(), &self.runtime.store, self.spool_root.?);
         // Keep the registry row until every result row has been removed. A
         // crash or failed fence at any intermediate point is recoverable.
         try storePutPrivateBatchWithRetry(self.runtime, &self.runtime.store, &.{}, &.{self.spool_attempt_key.?});
@@ -9239,22 +9577,22 @@ const SharedPdfWindowScheduler = struct {
         if (self.precommit != null) return;
         if (request.kind != .dense_embedding or request.embedding_input != .pdf_page_images) return;
         const embedder = self.runtime.config.dense_embedder orelse return;
-        const indexes = try self.runtime.index_manager.denseIndexesForEmbedding(self.runtime.alloc, requestEmbeddingName(request), request.expected_dims);
+        const indexes = try self.runtime.index_manager.denseIndexesForEmbedding(self.metadataAllocator(), requestEmbeddingName(request), request.expected_dims);
         defer {
-            for (indexes) |name| self.runtime.alloc.free(name);
-            self.runtime.alloc.free(indexes);
+            for (indexes) |name| self.metadataAllocator().free(name);
+            self.metadataAllocator().free(indexes);
         }
         if (indexes.len == 0) return;
-        const source_url = try extractSourceText(self.runtime.alloc, self.runtime.config, raw, request) orelse return;
-        defer self.runtime.alloc.free(source_url);
+        const source_url = try extractSourceText(self.metadataAllocator(), self.runtime.config, raw, request) orelse return;
+        defer self.metadataAllocator().free(source_url);
         consumer.source_identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
-        const execution_lease = try embedder.resolvePartLease(self.runtime.alloc, requestEmbeddingName(request));
+        const execution_lease = try embedder.resolvePartLease(self.metadataAllocator(), requestEmbeddingName(request));
         const caps = execution_lease.capabilities.?;
         consumer.execution_lease = execution_lease;
         const raster = embedder.supportsRasterItems() and caps.borrowed_rasters;
         if (!caps.supports(.{ .image = true }) or (!raster and !caps.acceptsMimeType("image/png")) or caps.result_cardinality != .one_per_item)
             return error.UnsupportedEmbeddingProvider;
-        const policy = try enrichment_types.parseExecutionPolicyJson(self.runtime.alloc, request.execution_json);
+        const policy = try enrichment_types.parseExecutionPolicyJson(self.metadataAllocator(), request.execution_json);
         consumer.max_items = @min(@min(policy.batch_items orelse caps.batch.preferred_items, caps.batch.max_items), generated_ocr_absolute_batch_max_items);
         consumer.max_items = try embedder.withPartLease(execution_lease).partBatchLimit(requestEmbeddingName(request), request.expected_dims, consumer.max_items);
         if (consumer.max_items == 0)
@@ -9263,7 +9601,7 @@ const SharedPdfWindowScheduler = struct {
         consumer.max_pages = effectivePdfMaxDocumentPages(policy.max_document_pages, generatedPdfMaxDocumentPages());
         consumer.capabilities = caps;
         applyDocumentExtractionRuntimePolicy(&consumer.config);
-        try consumer.plans.resize(self.runtime.alloc, consumer.max_items + 1);
+        try consumer.plans.resize(self.metadataAllocator(), consumer.max_items + 1);
         for (1..consumer.plans.items.len) |count| consumer.plans.items[count] = try embedder.withPartLease(execution_lease).partInvocationMemoryForMime(
             requestEmbeddingName(request),
             count,
@@ -9299,7 +9637,7 @@ const SharedPdfWindowScheduler = struct {
         fn cancel(slot: *?*@This()) void {
             const self = slot.* orelse return;
             slot.* = null;
-            const alloc = self.jobs.scheduler.runtime.alloc;
+            const alloc = self.jobs.scheduler.metadataAllocator();
             if (self.jobs.scheduler.active_work == self) self.jobs.scheduler.active_work = null;
             self.jobs.deinit(); // cancel and join before releasing borrowed PNGs
             self.png.deinit();
@@ -9331,7 +9669,7 @@ const SharedPdfWindowScheduler = struct {
         } });
         if (self.current + 1 >= self.requests.len) return null;
         try self.ensureConsumers();
-        const work = try self.runtime.alloc.create(WindowWork);
+        const work = try self.metadataAllocator().create(WindowWork);
         work.* = .{ .jobs = .{ .scheduler = self } };
         var owned: ?*WindowWork = work;
         errdefer WindowWork.cancel(&owned);
@@ -9390,7 +9728,7 @@ const SharedPdfWindowScheduler = struct {
                         (consumer.config.content_type.len > 0 and !std.mem.eql(u8, source.content_type, consumer.config.content_type))) continue;
                 }
                 var pending_mask: ?[]bool = null;
-                defer if (pending_mask) |mask| self.runtime.alloc.free(mask);
+                defer if (pending_mask) |mask| self.metadataAllocator().free(mask);
                 const media = if (rendered == .raster and !consumer.transform.raster) blk: {
                     const demand = self.pendingPngPages(consumer, index, request, source_sha, rendered, text_source) catch |err| {
                         if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
@@ -9577,14 +9915,15 @@ const SharedPdfWindowScheduler = struct {
             } else if (producer.vtable.produce_batch_reported_with_context == null) return false;
             if (producer.vtable.invocation_memory_for_requests_with_context == null) return false;
             const runtime = self.scheduler.runtime;
+            if (runtime.provider_request_context != null) return false;
             const backend = runtime.backend_runtime orelse return false;
             if (self.lane == null) self.lane = backend.acquireInferenceLane() catch |err| switch (err) {
                 error.BackendRuntimeUnavailable => return false,
                 else => return err,
             };
             if (self.count >= @min(self.jobs.len, self.lane.?.concurrentCapacity())) try self.retireOne();
-            const job = try runtime.alloc.create(Job);
-            errdefer runtime.alloc.destroy(job);
+            const job = try self.scheduler.metadataAllocator().create(Job);
+            errdefer self.scheduler.metadataAllocator().destroy(job);
             var invocation = try self.admit(consumer, required +| runtime_document_replay_segment_memory_bytes);
             errdefer invocation.deinit();
             job.* = .{
@@ -9664,6 +10003,7 @@ const SharedPdfWindowScheduler = struct {
 
         fn submit(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, sha: []const u8, stage_id: []const u8, rendered: PdfEmbeddingRenderedWindow, required: usize) !bool {
             const runtime = self.scheduler.runtime;
+            if (runtime.provider_request_context != null) return false;
             const provider = runtime.config.dense_embedder orelse return false;
             if (rendered == .raster) {
                 if (provider.dense_embed_raster_items_with_context_fn == null) return false;
@@ -9678,9 +10018,9 @@ const SharedPdfWindowScheduler = struct {
             // replay path owns retry; do not enqueue another speculative call.
             if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
             if (consumer.err) |err| return err;
-            const job = try runtime.alloc.create(Job);
+            const job = try self.scheduler.metadataAllocator().create(Job);
             var owns_job = true;
-            errdefer if (owns_job) runtime.alloc.destroy(job);
+            errdefer if (owns_job) self.scheduler.metadataAllocator().destroy(job);
             job.* = .{
                 .embedder = provider.withPartLease(consumer.execution_lease orelse .{ .capabilities = consumer.capabilities }),
                 .consumer = consumer,
@@ -9790,7 +10130,7 @@ const SharedPdfWindowScheduler = struct {
             defer {
                 setActiveFailureFingerprint(runtime, fingerprint);
                 runtime.retry_error_has_request_identity = retry_identity;
-                job.deinit(runtime.alloc);
+                job.deinit(self.scheduler.metadataAllocator());
                 slot.* = null;
                 self.count -= 1;
             }
@@ -9882,14 +10222,14 @@ const SharedPdfWindowScheduler = struct {
             };
             for (self.jobs) |entry| if (entry) |job| {
                 if (job.future) |*future| future.await(self.lane.?.io());
-                job.deinit(self.scheduler.runtime.alloc);
+                job.deinit(self.scheduler.metadataAllocator());
             };
             if (self.lane) |*lane| lane.release();
         }
     };
 
     fn prepareTextConsumer(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !void {
-        const alloc = self.runtime.alloc;
+        const alloc = self.metadataAllocator();
         var outer = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
         defer outer.deinit(alloc);
         if (outer.type != .document_extraction) return;
@@ -9945,7 +10285,7 @@ const SharedPdfWindowScheduler = struct {
         // The ordinary precommit path owns force-reprocess and unchanged-source
         // checks. Speculation must not clean replay attempts or skip that path.
         if (self.precommit != null) return false;
-        const alloc = self.runtime.alloc;
+        const alloc = self.metadataAllocator();
         const artifact = requestArtifactName(request);
         const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact);
         defer alloc.free(state_key);
@@ -9969,9 +10309,9 @@ const SharedPdfWindowScheduler = struct {
 
     fn ensureSpool(self: *@This()) !void {
         if (self.spool_root == null) {
-            const root = try internal_keys.sharedPdfConsumerRootPrefixAlloc(self.runtime.alloc, self.requests[self.current].doc_key);
-            errdefer self.runtime.alloc.free(root);
-            self.spool_attempt_key = try internal_keys.sharedPdfConsumerAttemptKeyAlloc(self.runtime.alloc, self.requests[self.current].doc_key);
+            const root = try internal_keys.sharedPdfConsumerRootPrefixAlloc(self.metadataAllocator(), self.requests[self.current].doc_key);
+            errdefer self.metadataAllocator().free(root);
+            self.spool_attempt_key = try internal_keys.sharedPdfConsumerAttemptKeyAlloc(self.metadataAllocator(), self.requests[self.current].doc_key);
             self.spool_root = root;
         }
     }
@@ -9989,18 +10329,18 @@ const SharedPdfWindowScheduler = struct {
         if (config.routes.len != 0 or config.route_preset != .mixed_files) return false;
         for (self.requests, 0..) |request, index| {
             if (index == self.current or request.kind != .asset or self.completed(index)) continue;
-            var outer = asset_producer_mod.parseProducerConfig(self.runtime.alloc, request.producer_json) catch continue;
-            defer outer.deinit(self.runtime.alloc);
+            var outer = asset_producer_mod.parseProducerConfig(self.metadataAllocator(), request.producer_json) catch continue;
+            defer outer.deinit(self.metadataAllocator());
             if (outer.type != .document_extraction) continue;
-            var other = document_extraction_mod.parseConfig(self.runtime.alloc, outer.config_json) catch continue;
-            defer other.deinit(self.runtime.alloc);
+            var other = document_extraction_mod.parseConfig(self.metadataAllocator(), outer.config_json) catch continue;
+            defer other.deinit(self.metadataAllocator());
             applyDocumentExtractionRuntimePolicy(&other);
-            try document_extraction_mod.applySourceMetadataFromJson(self.runtime.alloc, &other, raw);
+            try document_extraction_mod.applySourceMetadataFromJson(self.metadataAllocator(), &other, raw);
             if (other.routes.len != 0 or other.route_preset != .mixed_files or
                 !std.mem.eql(u8, config.credentials, other.credentials) or
                 !std.meta.eql(config.pdf_decode_limits, other.pdf_decode_limits)) continue;
-            const url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, raw, request) orelse continue;
-            defer self.runtime.alloc.free(url);
+            const url = try extractAssetSourceValue(self.metadataAllocator(), self.runtime.config, raw, request) orelse continue;
+            defer self.metadataAllocator().free(url);
             if (std.mem.eql(u8, source_url, url)) return true;
         }
         return false;
@@ -10356,12 +10696,12 @@ const SharedPdfWindowScheduler = struct {
     fn pendingPngPages(self: *@This(), consumer: *Consumer, index: usize, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow, text_source: ?TextSource) ![]bool {
         if (!consumer.text) return self.pendingEmbeddingPages(consumer, request, source_sha, window);
         const source = text_source orelse return error.InvalidPdfRenderWindow;
-        const pending = try self.runtime.alloc.alloc(bool, source.indices.len);
-        errdefer self.runtime.alloc.free(pending);
+        const pending = try self.metadataAllocator().alloc(bool, source.indices.len);
+        errdefer self.metadataAllocator().free(pending);
         for (source.indices, pending) |unit_index, *needed| {
             const unit = source.units[unit_index];
-            const key = try self.textKey(self.runtime.alloc, index, unit.page_number orelse return error.InvalidPdfRenderWindow);
-            defer self.runtime.alloc.free(key);
+            const key = try self.textKey(self.metadataAllocator(), index, unit.page_number orelse return error.InvalidPdfRenderWindow);
+            defer self.metadataAllocator().free(key);
             needed.* = !try self.textStageExists(key);
         }
         return pending;
@@ -10373,15 +10713,15 @@ const SharedPdfWindowScheduler = struct {
         const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
-        const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
+        const stage_id = try std.fmt.allocPrint(self.metadataAllocator(), "epoch-{d}:sequence-{d}:source-{x}", .{
             if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
         });
-        defer runtime.alloc.free(stage_id);
+        defer self.metadataAllocator().free(stage_id);
         const total = switch (window) {
             inline else => |batch| batch.results.len,
         };
-        const pending = try runtime.alloc.alloc(bool, total);
-        errdefer runtime.alloc.free(pending);
+        const pending = try self.metadataAllocator().alloc(bool, total);
+        errdefer self.metadataAllocator().free(pending);
         {
             var txn: ?backend_erased.ReadTxn = runtime.store.beginRead() catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -10393,14 +10733,14 @@ const SharedPdfWindowScheduler = struct {
                     inline else => |batch| batch.results[i].page_number,
                 };
                 const hash = pdfPageEmbeddingSourceHash(source_sha, page, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
-                const unit_id = try std.fmt.allocPrint(runtime.alloc, "page:{d:0>6}", .{page});
-                defer runtime.alloc.free(unit_id);
-                const page_key = try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, request.doc_key, requestArtifactName(request), unit_id);
-                defer runtime.alloc.free(page_key);
+                const unit_id = try std.fmt.allocPrint(self.metadataAllocator(), "page:{d:0>6}", .{page});
+                defer self.metadataAllocator().free(unit_id);
+                const page_key = try internal_keys.documentUnitArtifactKeyAlloc(self.metadataAllocator(), request.doc_key, requestArtifactName(request), unit_id);
+                defer self.metadataAllocator().free(page_key);
                 const final_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
-                defer runtime.alloc.free(final_key);
-                const stage_key = try pdfPageEmbeddingStageKeyAlloc(runtime.alloc, request.doc_key, requestArtifactName(request), embedding_name, stage_id, unit_id);
-                defer runtime.alloc.free(stage_key);
+                defer self.metadataAllocator().free(final_key);
+                const stage_key = try pdfPageEmbeddingStageKeyAlloc(self.metadataAllocator(), request.doc_key, requestArtifactName(request), embedding_name, stage_id, unit_id);
+                defer self.metadataAllocator().free(stage_key);
                 const read = if (txn) |*value| value else null;
                 needed.* = !try shouldSkipEmbeddingArtifactInTxn(runtime, read, final_key, hash) and !try shouldSkipEmbeddingArtifactInTxn(runtime, read, stage_key, hash);
             }
@@ -10415,27 +10755,27 @@ const SharedPdfWindowScheduler = struct {
         const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
-        const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
+        const stage_id = try std.fmt.allocPrint(self.metadataAllocator(), "epoch-{d}:sequence-{d}:source-{x}", .{
             if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
         });
-        defer runtime.alloc.free(stage_id);
+        defer self.metadataAllocator().free(stage_id);
         const total = switch (window) {
             inline else => |batch| batch.results.len,
         };
         const owned_pending = if (pending_mask == null) try self.pendingEmbeddingPages(consumer, request, source_sha, window) else null;
-        defer if (owned_pending) |mask| runtime.alloc.free(mask);
+        defer if (owned_pending) |mask| self.metadataAllocator().free(mask);
         const pending = pending_mask orelse owned_pending.?;
         // Compact descriptors, never page buffers. Cache hits must not split
         // compatible pending pages into singleton provider invocations.
         const rendered: PdfEmbeddingRenderedWindow = switch (window) {
             inline else => |batch, tag| blk: {
                 var compact = batch;
-                compact.results = try compactPendingPdfResults(runtime.alloc, batch.results, pending);
+                compact.results = try compactPendingPdfResults(self.metadataAllocator(), batch.results, pending);
                 break :blk @unionInit(PdfEmbeddingRenderedWindow, @tagName(tag), compact);
             },
         };
         defer switch (rendered) {
-            inline else => |batch| runtime.alloc.free(batch.results),
+            inline else => |batch| self.metadataAllocator().free(batch.results),
         };
         const pending_count = switch (rendered) {
             inline else => |batch| batch.results.len,
@@ -11141,8 +11481,32 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     const resources = runtime.config.resource_manager orelse manager.resource_manager.?;
     const before = resources.sliceStats(.document_extraction_working_set).used_bytes;
     {
-        const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..3], "{}");
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)].hard_limit_bytes = 1;
+        var denied_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .identity_allocator = alloc });
+        defer denied_manager.deinit(alloc);
+        var backing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        var denied = resource_manager_mod.BudgetedAllocator.init(&denied_manager, .relational_preparation_working_set, backing.allocator(), 1);
+        defer denied.deinit();
+        try std.testing.expectError(error.OutOfMemory, PrecommitDocumentExecution.createWithAllocator(&runtime, denied.allocator(), requests[0..3], "{}"));
+        try std.testing.expect(denied.denied());
+        try std.testing.expectEqual(@as(usize, 0), backing.alloc_index);
+        try std.testing.expectEqual(@as(usize, 0), denied.live_bytes);
+    }
+    var preparation_budget = resource_manager_mod.BudgetedAllocator.init(resources, .relational_preparation_working_set, alloc, 1);
+    defer preparation_budget.deinit();
+    {
+        var failing = std.testing.FailingAllocator.init(preparation_budget.allocator(), .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, PrecommitDocumentExecution.createWithAllocator(&runtime, failing.allocator(), requests[0..3], "{}"));
+        try std.testing.expectEqual(@as(usize, 0), preparation_budget.live_bytes);
+        failing.fail_index = std.math.maxInt(usize);
+        const execution = try PrecommitDocumentExecution.createWithAllocator(&runtime, failing.allocator(), requests[0..3], "{}");
         defer execution.destroy();
+        try std.testing.expect(preparation_budget.live_bytes >= @sizeOf(PrecommitDocumentExecution));
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, execution.scheduler.ensureConsumers());
+        try std.testing.expect(execution.scheduler.consumers == null);
+        failing.fail_index = std.math.maxInt(usize);
         execution.validateSource(source.fingerprint);
         try execution.scheduler.ensureConsumers();
         for (1..3) |i| {
@@ -11177,6 +11541,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         harness.text_calls = 0;
     }
     try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), preparation_budget.live_bytes);
     {
         const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..2], "{}");
         defer execution.destroy();
@@ -16711,8 +17076,9 @@ test "shared PDF precommit cache yields to larger render windows and downloads" 
         budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
             .hard_limit_bytes = if (aggregate_pressure) 0 else 64 * 1024,
         };
-        var manager = resource_manager_mod.ResourceManager.init(.{
+        var manager = try resource_manager_mod.metadata_fixture.init(.{
             .budgets = budgets,
+            .identity_allocator = alloc,
             .memory_budget = .{ .hard_limit_bytes = if (aggregate_pressure) 64 * 1024 else 0 },
         });
         defer manager.deinit(alloc);
@@ -16793,6 +17159,8 @@ test "shared PDF precommit cache reclamation skips locked borrowers and preserve
 /// Only typed page results survive a window. Public artifact publication stays
 /// in DB's existing atomic batch, and optional staging is strictly bounded.
 pub const PrecommitDocumentExecution = struct {
+    owner_alloc: Allocator,
+    provider_cancellations: [4]AssetInvocationCancellation = undefined,
     runtime: EnrichmentRuntime,
     scheduler: SharedPdfWindowScheduler,
     results: PrecommitResultCache = .{},
@@ -16809,13 +17177,45 @@ pub const PrecommitDocumentExecution = struct {
     }
 
     pub fn create(parent: *EnrichmentRuntime, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !*@This() {
+        return createWithAllocator(parent, parent.alloc, requests, raw);
+    }
+
+    /// Borrow the original preparation allocator through every physical join.
+    /// It owns invocation and coordinator metadata; separately granted native
+    /// windows/results retain raw backing and their existing resource ledger.
+    pub fn createWithAllocator(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !*@This() {
+        return createWithContextMode(parent, alloc, requests, raw, parent.provider_request_context, parent.provider_independent_execution);
+    }
+
+    /// Original lifetime is borrowed through all physical joins. CPU stays
+    /// retained by the caller; a parent's runnable is never lent under holders.
+    pub fn createWithContext(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, context: ?inference_request_context.RequestContext) !*@This() {
+        return createWithContextMode(parent, alloc, requests, raw, context, false);
+    }
+
+    /// Called only by a retired-holder stage that owns an independent child.
+    /// Parallel producers remain disabled for every scoped request context.
+    pub fn createWithIndependentContext(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, context: inference_request_context.RequestContext) !*@This() {
+        if (context.runnable == null) return error.InvalidRunnableTransition;
+        return createWithContextMode(parent, alloc, requests, raw, context, true);
+    }
+
+    fn createWithContextMode(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, context: ?inference_request_context.RequestContext, independent: bool) !*@This() {
+        if (context) |original| {
+            if (original.runnable) |borrow| {
+                if (!independent or borrow.cpu_slots != 1) return error.InvalidRunnableTransition;
+                try borrow.validate();
+                try borrow.checkLifetime();
+            }
+            try original.check();
+        }
         if (builtin.os.tag == .freestanding) return error.UnsupportedPrecommitDocumentExecution;
-        const alloc = parent.alloc;
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
         self.* = .{
+            .owner_alloc = alloc,
             .runtime = .{
-                .alloc = alloc,
+                .alloc = parent.alloc,
                 .backend_runtime = parent.backend_runtime,
                 .io_impl = parent.io_impl,
                 .clock = parent.clock,
@@ -16830,6 +17230,8 @@ pub const PrecommitDocumentExecution = struct {
                 .notify_ctx = self,
                 .notify_fn = ignoreNotification,
                 .config = parent.config,
+                .request_telemetry_parent = parent.request_telemetry_parent orelse (if (context != null) parent else null),
+                .provider_independent_execution = independent,
                 .shared_vector_label_cache = parent.shared_vector_label_cache orelse &parent.vector_label_cache,
                 .ownership = try ownership_mod.State.init(alloc, parent.store, "precommit-no-lease", .{}),
             },
@@ -16837,12 +17239,52 @@ pub const PrecommitDocumentExecution = struct {
         };
         errdefer self.runtime.ownership.deinit(alloc);
         const manager = parent.config.resource_manager orelse parent.index_manager.resource_manager;
-        try self.results.init(alloc, manager);
+        try self.results.init(parent.alloc, manager);
         self.scheduler = SharedPdfWindowScheduler.init(&self.runtime, requests, 0);
+        self.scheduler.metadata_alloc = alloc;
         self.scheduler.precommit = self;
         self.scheduler.raw_doc = raw;
         self.runtime.shared_pdf_windows = &self.scheduler;
+        errdefer self.results.deinit();
+        if (context) |original| try self.installProviderContext(original);
         return self;
+    }
+
+    fn mergeProviderContext(self: *@This(), slot: usize, original: inference_request_context.RequestContext, inherited: ?inference_request_context.RequestContext) !inference_request_context.RequestContext {
+        if (inherited) |value| if (value.runnable) |borrow| {
+            if (!self.runtime.provider_independent_execution or original.runnable == null or !std.meta.eql(borrow, original.runnable.?)) return error.InvalidRunnableTransition;
+        };
+        self.provider_cancellations[slot] = .{
+            .lifecycle = self.runtime.config.cancellation,
+            .request = original.cancellation orelse .none,
+            .inherited = if (inherited) |value| value.cancellation orelse .none else .none,
+        };
+        var merged = original;
+        if (inherited) |value| if (value.deadline_ns) |deadline| {
+            merged.deadline_ns = if (merged.deadline_ns) |current| @min(current, deadline) else deadline;
+        };
+        merged.cancellation = .{ .ptr = &self.provider_cancellations[slot], .check_fn = AssetInvocationCancellation.check, .is_cancelled_fn = AssetInvocationCancellation.isCancelled };
+        try merged.check();
+        return merged;
+    }
+
+    fn installProviderContext(self: *@This(), original: inference_request_context.RequestContext) !void {
+        const context = try self.mergeProviderContext(0, original, null);
+        self.runtime.provider_request_context = context;
+        self.runtime.active_provider_guard = .{
+            .clock = self.runtime.deadline_clock,
+            .deadline_ns = if (context.deadline_ns) |deadline| self.runtime.deadline_clock.nowRealtimeNs() +| (deadline -| platform_time.monotonicNs()) else null,
+            .cancellation = context.cancellation orelse .none,
+        };
+        if (self.runtime.config.dense_embedder) |*provider| provider.part_request_context = try self.mergeProviderContext(1, original, provider.part_request_context);
+        if (self.runtime.config.sparse_embedder) |*provider| provider.request_context = try self.mergeProviderContext(2, original, provider.request_context);
+        if (self.runtime.config.asset_producer) |*provider| {
+            const inherited = provider.invocation_context;
+            const scoped = try self.mergeProviderContext(3, original, .{ .io = context.io, .deadline_ns = inherited.deadline_ns, .cancellation = inherited.cancellation, .progress = inherited.progress, .runnable = inherited.runnable });
+            var invocation = asset_producer_mod.InvocationContext.fromRequestContext(scoped);
+            invocation.max_response_bytes = inherited.max_response_bytes;
+            provider.* = provider.withInvocationContext(invocation);
+        }
     }
 
     pub fn select(self: *@This(), index: usize) void {
@@ -16899,8 +17341,8 @@ pub const PrecommitDocumentExecution = struct {
         clearIsolatedFailedIndexes(&self.runtime);
         self.runtime.inference_recovery.deinit(alloc);
         self.runtime.vector_label_cache.deinit();
-        if (builtin.os.tag != .freestanding) self.runtime.ownership.deinit(alloc);
-        alloc.destroy(self);
+        if (builtin.os.tag != .freestanding) self.runtime.ownership.deinit(self.owner_alloc);
+        self.owner_alloc.destroy(self);
     }
 };
 
@@ -17824,7 +18266,7 @@ const SharedPdfPngWindow = struct {
             }
             if (count == 0) return;
             var first_error: ?anyerror = null;
-            const stats = lane.executor().runBatch(contexts[0..count], EncodeJob.run, 1) catch |err| blk: {
+            const stats = lane.pageExecutor().runBatch(contexts[0..count], EncodeJob.run, 1) catch |err| blk: {
                 first_error = err;
                 break :blk null;
             };
@@ -20317,7 +20759,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         .started_ns = 0,
     };
     var pdf_prefetch_future: ?Io.Future(void) = null;
-    const pdf_prefetch_io = runtime.config.io;
+    const pdf_prefetch_io = if (runtime.provider_request_context == null) runtime.config.io else null;
     defer {
         SharedPdfWindowScheduler.WindowWork.cancel(&shared_work);
         pdf_prefetch_cancel_requested.store(true, .release);
@@ -29330,7 +29772,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
         .use_borrowed_rasters = use_borrowed_rasters,
         .cancel_requested = &prefetch_cancel_requested,
     };
-    const prefetch_io = runtime.config.io;
+    const prefetch_io = if (runtime.provider_request_context == null) runtime.config.io else null;
     const prefetch_batches = generatedPdfRenderPrefetchBatches();
     var prefetch_job = PdfEmbeddingWindowPrefetch{
         .preparer = &window_preparer,
@@ -38709,6 +39151,308 @@ test "model aware media fused reuse rejects a changed provider generation with t
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
 }
 
+test "controlled enrichment visibility checks original authority outside worker mutex before ready results" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        io: Io,
+        cause: anyerror,
+        calls: usize = 0,
+        fail_call: usize,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (!self.runtime.mutex.tryLock()) return error.TestUnexpectedResult;
+            self.runtime.mutex.unlock(self.io);
+            // Reject only once: the original error cannot be recovered by
+            // calling a boolean adapter or checking authority a second time.
+            if (self.calls == self.fail_call) return self.cause;
+        }
+    };
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for (0..3) |scenario| for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        var runtime = EnrichmentRuntime{
+            .alloc = std.testing.allocator,
+            .io_impl = .{ .borrowed = io },
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{ .sync_wait_timeout_ms = 1_000 },
+            .ownership = undefined,
+            .applied_sequence = if (scenario == 1) 1 else 0,
+        };
+        var probe: Probe = .{ .runtime = &runtime, .io = io, .cause = cause, .fail_call = if (scenario == 2) 2 else 1 };
+        try std.testing.expectError(cause, runtime.waitForAppliedWithVisibilityDeadline(1, .{ .ptr = &probe, .check_fn = Probe.check }, null));
+        try std.testing.expectEqual(probe.fail_call, probe.calls);
+        try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+        try std.testing.expect(!runtime.worker_failed and !runtime.retrying);
+        try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(io);
+    };
+}
+
+test "controlled enrichment visibility inline catch-up restores original rejection after owned pass unwind" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        io: Io,
+        cause: anyerror,
+        calls: usize = 0,
+        fail_call: usize,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (!self.runtime.mutex.tryLock()) return error.TestUnexpectedResult;
+            self.runtime.mutex.unlock(self.io);
+            // Reject only once: the original error cannot be recovered by
+            // calling a boolean adapter or checking authority a second time.
+            if (self.calls == self.fail_call) return self.cause;
+        }
+    };
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for (0..4) |scenario| for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        var runtime = EnrichmentRuntime{
+            .alloc = std.testing.allocator,
+            .io_impl = .{ .borrowed = io },
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{ .sync_wait_timeout_ms = 1_000 },
+            .ownership = undefined,
+            .applied_sequence = if (scenario == 1 or scenario == 2) 1 else 0,
+        };
+        var probe: Probe = .{ .runtime = &runtime, .io = io, .cause = cause, .fail_call = if (scenario == 3) 4 else if (scenario == 2) 2 else 1 };
+        try std.testing.expectError(cause, runtime.catchUpUntilWithVisibilityDeadline(1, .{ .ptr = &probe, .check_fn = Probe.check }, null));
+        try std.testing.expectEqual(probe.fail_call, probe.calls);
+        try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+        try std.testing.expect(!runtime.worker_failed and !runtime.retrying and !runtime.replay_pass_active.load(.acquire));
+        try std.testing.expect(runtime.active_provider_guard.authority_rejection == null);
+        try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(io);
+    };
+}
+
+test "controlled enrichment visibility inline guard retains first cause across copied guards" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 1) return error.CatalogGenerationChanged;
+        }
+    };
+    var probe: Probe = .{};
+    var rejection: ForegroundAuthorityRejection = .{};
+    const guard: ForegroundCatchUpGuard = .{ .cancellation = .{ .ptr = &probe, .check_fn = Probe.check }, .authority_rejection = &rejection };
+    const copy = guard;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, guard.check());
+    try std.testing.expectError(error.EnrichmentWaitCanceled, copy.check());
+    rejection.remember(error.DeadlineExceeded);
+    try std.testing.expectError(error.CatalogGenerationChanged, rejection.check());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "controlled enrichment visibility waiter unwind bypasses durable provider retry classification" {
+    for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout }) |cause| {
+        try std.testing.expect(isEnrichmentControlError(cause));
+        // The early control decision must not read or charge a provider identity.
+        try std.testing.expect(shouldYieldRequestErrorFor(undefined, 123, cause));
+    }
+    try std.testing.expect(!isEnrichmentControlError(error.ExtractionTransientFailure));
+    try std.testing.expect(!isEnrichmentControlError(error.OutOfMemory));
+}
+
+test "controlled enrichment visibility futex wait lends CPU and preserves original owner on reentry refusal" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const native = @import("../../../common/runnable_scheduler.zig");
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        execution: *native.Execution,
+        scheduler: *native.Scheduler,
+        io: Io,
+        cause: ?anyerror,
+        refuse_begin: bool,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn fence(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cause) |cause| return cause;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            try std.testing.expect(self.runtime.mutex.tryLock());
+            self.runtime.mutex.unlock(self.io);
+            if (self.refuse_begin) return self.cause.?;
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 23), self.scheduler.stats().retained_bytes);
+            var peer: native.Execution = .{};
+            try peer.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 17, .allow_wait = false }, .background);
+            defer peer.finish();
+            var health: native.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 5, .allow_wait = false }, .control);
+            defer health.finish();
+            try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 45), self.scheduler.stats().retained_bytes);
+            // Model a concurrent worker's applied checkpoint and wake epoch.
+            // This fixture does not execute a physical provider or store write.
+            self.runtime.mutex.lockUncancelable(self.io);
+            self.runtime.applied_sequence = 1;
+            _ = self.runtime.sync_wait_epoch.fetchAdd(1, .release);
+            self.runtime.mutex.unlock(self.io);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try std.testing.expectEqual(@as(u32, 0), self.runtime.sync_waiter_count.load(.acquire));
+            try std.testing.expect(self.runtime.mutex.tryLock());
+            self.runtime.mutex.unlock(self.io);
+            try self.execution.enterWithCheck(.query, .{ .context = self, .check = fence });
+        }
+    };
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for ([_]bool{ false, true }) |refuse_begin| for ([_]?anyerror{ null, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        if (refuse_begin and cause == null) continue;
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: native.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+        defer execution.finish();
+        var runtime = EnrichmentRuntime{
+            .alloc = std.testing.allocator,
+            .io_impl = .{ .borrowed = io },
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{ .sync_wait_timeout_ms = 1_000 },
+            .ownership = undefined,
+        };
+        var probe: Probe = .{ .runtime = &runtime, .execution = &execution, .scheduler = &scheduler, .io = io, .cause = cause, .refuse_begin = refuse_begin };
+        const result = runtime.waitForAppliedWithExecutionWait(1, .none, null, .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end });
+        if (cause) |err| try std.testing.expectError(err, result) else try result;
+        try std.testing.expectEqual(@as(usize, 1), probe.begins);
+        try std.testing.expectEqual(@as(usize, if (refuse_begin) 0 else 1), probe.ends);
+        try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (!refuse_begin and cause != null) 0 else 1), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        try std.testing.expect(!runtime.worker_failed and !runtime.retrying);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(io);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "controlled enrichment visibility canceled future preserves reentry rejection after unregistering waiter" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const native = @import("../../../common/runnable_scheduler.zig");
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var execution: native.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    defer execution.finish();
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = io },
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1_000 },
+        .ownership = undefined,
+    };
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        execution: *native.Execution,
+        io: Io,
+        entered: Io.Event = .unset,
+        ends: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+            self.entered.set(self.io);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try std.testing.expectEqual(@as(u32, 0), self.runtime.sync_waiter_count.load(.acquire));
+            try self.execution.enter(.query);
+        }
+        fn run(self: *@This()) !void {
+            try self.runtime.waitForAppliedWithExecutionWait(1, .none, null, .{ .ptr = self, .begin = begin, .end = end });
+        }
+    };
+    var probe: Probe = .{ .runtime = &runtime, .execution = &execution, .io = io };
+    var future = try io.concurrent(Probe.run, .{&probe});
+    var joined = false;
+    defer if (!joined) {
+        _ = future.cancel(io) catch {};
+    };
+    probe.entered.waitUncancelable(io);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u32, 1), runtime.sync_waiter_count.load(.acquire));
+    var peer: native.Execution = .{};
+    try peer.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 17, .allow_wait = false }, .background);
+    defer peer.finish();
+    var health: native.Execution = .{};
+    try health.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 5, .allow_wait = false }, .control);
+    defer health.finish();
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 45), scheduler.stats().retained_bytes);
+    peer.finish();
+    health.finish();
+    const result = future.cancel(io);
+    joined = true;
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expectEqual(@as(usize, 1), probe.ends);
+    try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), runtime.applied_sequence);
+    try std.testing.expectError(error.Canceled, execution.checkLifetime());
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
 fn testPreflightLiteralModelInput(asset: bool) !void {
     const a = std.testing.allocator;
     const text = "Example: <<<dotprompt:media:url file:///private/example.pdf>>>";
@@ -38804,6 +39548,217 @@ test "backup preflight reader media parts match execution" {
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"source_local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+}
+
+test "controlled enrichment shutdown retains scheduled and foreground provider borrows across original wait failures" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    const Mode = enum { background, foreground, foreground_with_idle_registration };
+    for (std.enums.values(Case)) |case| {
+        for (std.enums.values(Mode)) |mode| {
+            var background = try background_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+            defer background.deinit();
+            const io = background.ptr().io().?;
+            var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+            defer backend.close();
+            var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "enrichment-close" });
+            defer store.deinit();
+            var runtime: EnrichmentRuntime = .{
+                .alloc = std.testing.allocator,
+                .io_impl = .{ .borrowed = io },
+                .backend_runtime = background.ptr(),
+                .store = store,
+                .owns_store = false,
+                .change_journal = undefined,
+                .replay_source = undefined,
+                .index_manager = undefined,
+                .write_ctx = undefined,
+                .write_fn = undefined,
+                .notify_ctx = undefined,
+                .notify_fn = undefined,
+                .config = .{},
+                .ownership = try ownership_mod.State.init(std.testing.allocator, &store, "enrichment-close-lease", .{ .lease_owned = true, .owner_id = "enrichment-close", .lease_ttl_ms = 30_000 }),
+            };
+            defer runtime.ownership.deinit(std.testing.allocator);
+            try std.testing.expect(try runtime.ownership.ensureLease(1));
+            if (case == .success and mode == .background) {
+                try runtime.start();
+                runtime.stop();
+                try std.testing.expect(!runtime.closing.load(.acquire) and runtime.future == null);
+                try runtime.resumeInlineAfterStop();
+                try std.testing.expect(!runtime.shutdown_requested.load(.acquire));
+                try std.testing.expect(try runtime.ownership.ensureLease(2));
+            }
+            const F = struct {
+                runtime: *EnrichmentRuntime,
+                io: Io,
+                entered: Io.Event = .unset,
+                release: Io.Event = .unset,
+                provider_returned: std.atomic.Value(bool) = .init(false),
+                provider_destroyed: bool = false,
+                fn embed(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.entered.set(self.io);
+                    // Native work deliberately ignores cooperative cancellation
+                    // until it returns its allocator-owned result.
+                    self.release.waitUncancelable(self.io);
+                    const result = try alloc.alloc(f32, dims);
+                    @memset(result, 0);
+                    self.provider_returned.store(true, .release);
+                    return result;
+                }
+                fn destroy(raw: *anyopaque, _: Allocator) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    std.debug.assert(!self.provider_destroyed);
+                    self.provider_destroyed = true;
+                }
+                fn run(self: *@This()) void {
+                    const owns_pass = beginReplayPass(self.runtime, self.io, 1, .{}) catch @panic("replay admission failed");
+                    std.debug.assert(owns_pass);
+                    const embedding = self.runtime.config.dense_embedder.?.embedDense(self.runtime.alloc, "dense", "text", 1) catch @panic("provider failed");
+                    self.runtime.alloc.free(embedding);
+                    endReplayPass(self.runtime, self.io);
+                }
+                fn step(self: *@This()) ?u64 {
+                    self.run();
+                    return null;
+                }
+                fn idle(_: *@This()) ?u64 {
+                    return null;
+                }
+            };
+            var fixture: F = .{ .runtime = &runtime, .io = io };
+            runtime.config.dense_embedder = .{ .ptr = &fixture, .dense_embed_fn = F.embed, .deinit_fn = F.destroy };
+            var direct: ?Io.Future(void) = null;
+            defer {
+                fixture.release.set(io);
+                if (direct) |*future| future.await(io);
+                runtime.closing.store(true, .release);
+                runtime.stop();
+            }
+            if (mode == .background) {
+                runtime.future = try (try background.ptr().maintenanceScheduler()).registerClass(.producer, &fixture, F.step);
+            } else {
+                if (mode == .foreground_with_idle_registration) runtime.future = try (try background.ptr().maintenanceScheduler()).registerClass(.producer, &fixture, F.idle);
+                direct = try io.concurrent(F.run, .{&fixture});
+            }
+            try fixture.entered.wait(io);
+            const Control = struct {
+                fixture: *F,
+                case: Case,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn deadline(_: *anyopaque) !?u64 {
+                    return 1000;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    if (self.case == .begin_failure) return error.NotFound;
+                    if (self.case != .lifetime_in_wait) self.fixture.release.set(self.fixture.io);
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.fixture.release.set(self.fixture.io);
+                    if (self.case == .end_failure) return error.Canceled;
+                }
+            };
+            var control: Control = .{ .fixture = &fixture, .case = case };
+            var payload: close_admission.Payload = .{
+                .ptr = &control,
+                .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline },
+                .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end },
+            };
+            const result = runtime.stopWithAdmission(.init(&payload));
+            if (case == .success) try result else {
+                try std.testing.expectError(switch (case) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .lifetime_in_wait => error.DeadlineExceeded,
+                    .success => unreachable,
+                }, result);
+                try std.testing.expect(runtime.closing.load(.acquire) and runtime.shutdown_requested.load(.acquire));
+                try std.testing.expect(runtime.ownership.stats().has_lease);
+                try std.testing.expect(!fixture.provider_destroyed);
+                if (mode == .background) try std.testing.expect(runtime.future != null);
+                try std.testing.expectError(error.Canceled, runtime.start());
+                try std.testing.expectError(error.Canceled, runtime.resumeInlineAfterStop());
+                fixture.release.set(io);
+                control.case = .success;
+                try runtime.stopWithAdmission(.init(&payload));
+            }
+            try std.testing.expect(fixture.provider_returned.load(.acquire));
+            try std.testing.expect(!fixture.provider_destroyed);
+            runtime.config.dense_embedder.?.deinit(runtime.alloc);
+            try std.testing.expect(fixture.provider_destroyed);
+            try std.testing.expect(!runtime.replay_pass_active.load(.acquire));
+            try std.testing.expect(!runtime.ownership.stats().has_lease and runtime.future == null);
+            try std.testing.expectError(error.EnrichmentRetryAborted, beginReplayPass(&runtime, io, 2, .{}));
+            try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+        }
+    }
+}
+
+test "controlled enrichment shutdown interrupted state publication still fences worker redispatch" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = std.testing.io;
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "interrupted-close" });
+    defer store.deinit();
+    var runtime: EnrichmentRuntime = .{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = io },
+        .store = store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .target_sequence = 1,
+        .ownership = try ownership_mod.State.init(std.testing.allocator, &store, "interrupted-close-lease", .{}),
+    };
+    defer runtime.ownership.deinit(std.testing.allocator);
+    defer runtime.stop();
+    const Control = struct {
+        begins: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            return error.NotFound;
+        }
+        fn end(_: *anyopaque) !void {
+            @panic("failed begin cannot reenter");
+        }
+    };
+    var control: Control = .{};
+    var payload: close_admission.Payload = .{
+        .ptr = &control,
+        .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline },
+        .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end },
+    };
+    runtime.mutex.lockUncancelable(io);
+    const result = runtime.stopWithAdmission(.init(&payload));
+    runtime.mutex.unlock(io);
+    try std.testing.expectError(error.NotFound, result);
+    try std.testing.expectEqual(@as(usize, 1), control.begins);
+    try std.testing.expect(runtime.closing.load(.acquire) and runtime.shutdown_requested.load(.acquire));
+    try std.testing.expect(!runtime.shutdown);
+    try std.testing.expect(workerStep(&runtime) == null);
+    try std.testing.expectError(error.EnrichmentRetryAborted, beginReplayPass(&runtime, io, 1, .{}));
 }
 
 test "model aware media pass resumes acknowledged pages after interruption and source change" {

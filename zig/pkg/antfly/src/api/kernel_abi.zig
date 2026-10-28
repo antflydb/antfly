@@ -21,6 +21,7 @@ const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 pub const memory_abi = @import("runtime_memory_abi");
 pub const native_abi = @import("antfly_runtime_abi").native_abi;
+pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 
 pub const Status = error_abi.Status;
 pub const StatusCode = error_abi.Code;
@@ -28,10 +29,38 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-// Combines the current control contract with retained document capabilities.
-pub const abi_version: u32 = 23;
+// Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
+// Fence merged logical-query layouts and failure/guard contracts.
+pub const abi_version: u32 = 62;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
+
+/// The producer owns the executor implementation and its worker accounting.
+/// Exclusive leases own independent lanes. Shared SQL roles retain a node
+/// executor; consumers join their own tasks before releasing a role lease.
+pub const SqlWorkerRole = enum(c_int) { exclusive = 0, execution = 1, control = 2, cleanup = 3, bounded_read = 4 };
+pub const SqlWorkerBorrow = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    context: *anyopaque,
+    capacity: usize,
+    io: native_abi.IoBorrow,
+    release: *const fn (*anyopaque) callconv(.c) void,
+};
+pub const SqlWorkerFactory = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    context: *anyopaque,
+    /// Dedicated service envelope; shared roles use shared_capacity.
+    capacity: usize,
+    shared_capacity: usize = 0,
+    /// Funding is required; null is rejected before allocation. Its borrowed
+    /// allocator carrier outlives release. Producers copy this
+    /// callback table before returning; they never retain the argument pointer.
+    /// Exclusive executors use it through physical join. Shared executors keep
+    /// their node allocator; only this borrower's wrapper uses caller funding.
+    acquire: *const fn (*anyopaque, c_int, usize, ?*const memory_abi.Allocator, *SqlWorkerBorrow) callconv(.c) Status,
+};
 
 pub const RuntimeIoBorrows = extern struct {
     version: u32 = abi_version,
@@ -40,6 +69,9 @@ pub const RuntimeIoBorrows = extern struct {
     api_network: ?*const native_abi.IoBorrow = null,
     api_filesystem: ?*const native_abi.IoBorrow = null,
     durable: ?*const native_abi.IoBorrow = null,
+    sql_execution: ?*const native_abi.IoBorrow = null,
+    sql_control: ?*const native_abi.IoBorrow = null,
+    sql_workers: ?*const SqlWorkerFactory = null,
 };
 
 pub const CreateContext = extern struct {
@@ -70,6 +102,15 @@ pub const CallContext = extern struct {
     input_contract: native_abi.TypeContract = .of(void),
     output: ?*anyopaque = null,
     output_contract: native_abi.TypeContract = .of(void),
+};
+
+pub const RunnableOwnerCreateContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    owner_alloc: *const memory_abi.Allocator,
+    policy: *const anyopaque,
+    policy_contract: native_abi.TypeContract,
+    out_handle: *?*anyopaque,
 };
 
 pub const HandlerCreateContext = extern struct {
@@ -113,6 +154,14 @@ pub const CancellationView = http_abi.CancellationView;
 pub const RequestBodySource = http_abi.RequestBodySource;
 pub const StreamSink = http_abi.StreamSink;
 
+/// Original absolute deadline in the request-scoped executor's awake clock.
+/// Presence is separate because zero is a valid, already-expired timestamp.
+/// Only layout values cross the independently compiled API boundary.
+pub const HttpDeadline = extern struct {
+    timestamp_ns: u64 = 0,
+    present: u8 = 0,
+};
+
 pub const HttpHandleContext = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
@@ -125,6 +174,7 @@ pub const HttpHandleContext = extern struct {
     executor: native_abi.IoBorrow,
     out_response_handle: *?*anyopaque,
     out_response: *HttpResponseView,
+    deadline: HttpDeadline = .{},
 };
 
 /// Evaluates the API kernel's internal-service ingress policy for routes that
@@ -141,6 +191,7 @@ pub const InternalServiceAuthContext = extern struct {
     executor: native_abi.IoBorrow,
     out_response_handle: *?*anyopaque,
     out_response: *HttpResponseView,
+    deadline: HttpDeadline = .{},
     out_legacy_accepted: *u8,
 };
 
@@ -177,6 +228,38 @@ pub const HandlerStats = extern struct {
     query_body_in_flight: usize,
     query_body_peak_in_flight: usize,
     query_body_rejected_total: u64,
+    query_configured_capacity: usize,
+    query_queued: usize,
+    query_queued_bytes: u64,
+    query_waited_total: u64,
+    query_wait_ns_total: u64,
+    query_wait_completed_total: u64,
+    query_wait_buckets: [11]u64,
+    query_expired_total: u64,
+    query_cancelled_total: u64,
+    query_queue_capacity: u32,
+    query_queue_bytes: u64,
+    query_wait_ms: u32,
+    query_policy_version: u64,
+    query_policy_retired_total: u64,
+    query_retiring_waiters: usize,
+    query_draining: bool,
+    query_suspended: bool,
+    query_quiescent: bool,
+    query_sql_waiting_enabled: bool,
+    memory: [3]WorkloadMemoryStats,
+    runnable: RunnableStats,
+    read_memory: @import("antfly_runtime_abi").ReadMemoryStats,
+};
+
+pub const RunnableStats = @import("antfly_runtime_abi").RunnableStats;
+
+pub const WorkloadMemoryStats = extern struct {
+    enabled: bool,
+    limit_bytes: usize,
+    used_bytes: usize,
+    peak_bytes: usize,
+    rejected_total: u64,
 };
 
 /// Features exposed by the independently code-generated API-kernel archive.
@@ -187,6 +270,11 @@ pub const Capability = struct {
     pub const route_manifest: u64 = 1 << 3;
     pub const inference_admission_stats: u64 = 1 << 4;
     pub const internal_service_ingress: u64 = 1 << 5;
+    pub const node_runnable_owner: u64 = 1 << 6;
+    pub const node_runnable_execution: u64 = 1 << 7;
+    pub const remote_attempt_owner: u64 = 1 << 8;
+    pub const remote_peer_refresh: u64 = 1 << 9;
+    pub const pgwire_bound_port: u64 = 1 << 10;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -201,6 +289,7 @@ pub const FunctionTable = extern struct {
     destroy: *const fn (*anyopaque) callconv(.c) void,
     request_stats: *const fn (*const CallContext) callconv(.c) Status,
     query_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
+    runnable_scheduling_stats: *const fn (*const CallContext) callconv(.c) Status,
     write_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     set_provider: *const fn (*const CallContext) callconv(.c) Status,
     set_ha_executor: *const fn (*const CallContext) callconv(.c) Status,
@@ -222,6 +311,17 @@ pub const FunctionTable = extern struct {
     handler_destroy: *const fn (*anyopaque) callconv(.c) void,
     inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
+    configure_http_transport: *const fn (*const CallContext) callconv(.c) Status,
+    runnable_owner_create: *const fn (*const RunnableOwnerCreateContext) callconv(.c) Status,
+    runnable_owner_close: *const fn (*const CallContext) callconv(.c) Status,
+    runnable_owner_destroy: *const fn (*const CallContext) callconv(.c) Status,
+    runnable_owner_execution_port: *const fn (*const CallContext) callconv(.c) Status,
+    bootstrap_remote_attempts: *const fn (*const CallContext) callconv(.c) Status,
+    remote_attempt_owner_stats: *const fn (*const CallContext) callconv(.c) Status,
+    refresh_remote_attempt_peers: *const fn (*const CallContext) callconv(.c) Status,
+    /// Optional append-only tail. Zero means no listener; never expose a
+    /// native listener/server pointer to the host for address inspection.
+    pgwire_bound_port: ?*const fn (*const CallContext) callconv(.c) Status = null,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -243,7 +343,12 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     const known = Capability.core |
         Capability.route_manifest |
         Capability.inference_admission_stats |
-        Capability.internal_service_ingress;
+        Capability.internal_service_ingress |
+        Capability.node_runnable_owner |
+        Capability.node_runnable_execution |
+        Capability.remote_attempt_owner |
+        Capability.remote_peer_refresh |
+        Capability.pgwire_bound_port;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -254,6 +359,16 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("inference_admission_stats"));
     if (required_capabilities & Capability.internal_service_ingress != 0)
         required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
+    if (required_capabilities & Capability.node_runnable_owner != 0)
+        required = @max(required, functionTableFieldEnd("runnable_owner_destroy"));
+    if (required_capabilities & Capability.node_runnable_execution != 0)
+        required = @max(required, functionTableFieldEnd("runnable_owner_execution_port"));
+    if (required_capabilities & Capability.remote_attempt_owner != 0)
+        required = @max(required, functionTableFieldEnd("remote_attempt_owner_stats"));
+    if (required_capabilities & Capability.remote_peer_refresh != 0)
+        required = @max(required, functionTableFieldEnd("refresh_remote_attempt_peers"));
+    if (required_capabilities & Capability.pgwire_bound_port != 0)
+        required = @max(required, functionTableFieldEnd("pgwire_bound_port"));
     return required;
 }
 
@@ -261,6 +376,7 @@ test "API kernel control contexts retain C layout" {
     const std = @import("std");
     try std.testing.expectEqual(.@"extern", @typeInfo(CreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(CallContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(RunnableOwnerCreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(HandlerCreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(RouteManifestContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(AuthorizeInferenceContext).@"struct".layout);
@@ -286,11 +402,37 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
     try std.testing.expect(!validFunctionTable(&table, Capability.inference_admission_stats));
     try std.testing.expect(!validFunctionTable(&table, Capability.internal_service_ingress));
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_owner));
     table.struct_size = requiredFunctionTableSize(Capability.core).? - 1;
     try std.testing.expect(!validFunctionTable(&table, Capability.core));
     table.struct_size = requiredFunctionTableSize(Capability.core).?;
     try std.testing.expect(validFunctionTable(&table, Capability.core));
     try std.testing.expect(!validFunctionTable(&table, 1 << 63));
+    table.capabilities |= Capability.node_runnable_owner;
+    table.struct_size = requiredFunctionTableSize(Capability.node_runnable_owner).? - 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_owner));
+    table.struct_size += 1;
+    try std.testing.expect(validFunctionTable(&table, Capability.node_runnable_owner));
+    // The old owner prefix remains usable, but cannot expose the new tail.
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_execution));
+    table.capabilities |= Capability.node_runnable_execution;
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_execution));
+    table.struct_size = requiredFunctionTableSize(Capability.node_runnable_execution).? - 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_execution));
+    table.struct_size += 1;
+    try std.testing.expect(validFunctionTable(&table, Capability.node_runnable_execution));
+    try std.testing.expect(!validFunctionTable(&table, Capability.remote_attempt_owner));
+    table.capabilities |= Capability.remote_attempt_owner;
+    table.struct_size = requiredFunctionTableSize(Capability.remote_attempt_owner).? - 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.remote_attempt_owner));
+    table.struct_size += 1;
+    try std.testing.expect(validFunctionTable(&table, Capability.remote_attempt_owner));
+    try std.testing.expect(!validFunctionTable(&table, Capability.remote_peer_refresh));
+    table.capabilities |= Capability.remote_peer_refresh;
+    table.struct_size = requiredFunctionTableSize(Capability.remote_peer_refresh).? - 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.remote_peer_refresh));
+    table.struct_size += 1;
+    try std.testing.expect(validFunctionTable(&table, Capability.remote_peer_refresh));
 }
 
 test "API imported runtime capability struct retains versioned C layout" {
@@ -299,4 +441,31 @@ test "API imported runtime capability struct retains versioned C layout" {
     try std.testing.expect(validContext(RuntimeIoBorrows, abi_version, @sizeOf(RuntimeIoBorrows)));
     try std.testing.expect(!validContext(RuntimeIoBorrows, abi_version - 1, @sizeOf(RuntimeIoBorrows)));
     try std.testing.expect(!validContext(RuntimeIoBorrows, abi_version, @sizeOf(RuntimeIoBorrows) - 1));
+}
+
+test "API kernel pgwire port tail preserves older prefixes and rejects truncated capabilities" {
+    const std = @import("std");
+    var table: FunctionTable = undefined;
+    table.abi_version = abi_version;
+    table.capabilities = Capability.remote_peer_refresh;
+    table.struct_size = requiredFunctionTableSize(Capability.remote_peer_refresh).?;
+    try std.testing.expect(validFunctionTable(&table, Capability.remote_peer_refresh));
+    try std.testing.expect(!validFunctionTable(&table, Capability.pgwire_bound_port));
+    table.capabilities |= Capability.pgwire_bound_port;
+    try std.testing.expect(!validFunctionTable(&table, Capability.pgwire_bound_port));
+    table.struct_size = requiredFunctionTableSize(Capability.pgwire_bound_port).? - 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.pgwire_bound_port));
+    table.struct_size += 1;
+    try std.testing.expect(validFunctionTable(&table, Capability.pgwire_bound_port));
+    try std.testing.expect(validFunctionTable(&table, Capability.remote_peer_refresh));
+}
+
+test "API kernel HTTP original deadline rejects old and truncated call layouts" {
+    const std = @import("std");
+    inline for (.{ HttpHandleContext, InternalServiceAuthContext }) |T| {
+        try std.testing.expect(validContext(T, abi_version, @sizeOf(T)));
+        try std.testing.expect(!validContext(T, abi_version - 1, @sizeOf(T)));
+        try std.testing.expect(!validContext(T, abi_version, @offsetOf(T, "deadline")));
+        try std.testing.expect(!validContext(T, abi_version, @sizeOf(T) - 1));
+    }
 }

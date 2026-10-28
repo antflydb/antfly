@@ -285,6 +285,12 @@ pub fn validatePortableAuthSeedBody(alloc: Allocator, expected_generation: []con
             if (key.len == "userpass:".len or value.len == 0) return error.InvalidPortableAuthSeed;
             user_count += 1;
         }
+        if (std.mem.startsWith(u8, key, "userinstance:")) {
+            // Credential instances survive capture/restart so deletion and
+            // recreation cannot restore authority to a previous user identity.
+            if (key.len == "userinstance:".len or value.len != 16 or
+                std.mem.allEqual(u8, value, 0)) return error.InvalidPortableAuthSeed;
+        }
         if (std.mem.startsWith(u8, key, "usermeta:")) {
             var metadata = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch
                 return error.InvalidPortableAuthSeed;
@@ -436,4 +442,30 @@ test "empty standalone seed retains epoch and rejects incomplete topology" {
     invalid = empty;
     invalid.auth_enabled = true;
     try std.testing.expectError(error.AuthSeedTopologyMismatch, validate(alloc, io, ".", "empty-1", invalid));
+}
+
+test "portable auth seed preserves credential instances and rejects malformed identities" {
+    const alloc = std.testing.allocator;
+    var entries = [_]PortableAuthSeedEntry{
+        .{ .namespace = auth_users_namespace, .key_base64 = "dXNlcmluc3RhbmNlOmFsaWNl", .value_base64 = "AQEBAQEBAQEBAQEBAQEBAQ==" },
+        .{ .namespace = auth_users_namespace, .key_base64 = "dXNlcnBhc3M6YWxpY2U=", .value_base64 = "Zml4dHVyZS1wYXNzd29yZC1oYXNo" },
+    };
+    const Fixture = struct {
+        fn validate(allocator: Allocator, rows: []const PortableAuthSeedEntry) !void {
+            const body = try std.json.Stringify.valueAlloc(allocator, PortableAuthSeed{ .format_version = portable_auth_seed_format_version, .generation = "instance-seed", .entries = rows }, .{});
+            defer allocator.free(body);
+            try validatePortableAuthSeedBody(allocator, "instance-seed", body);
+        }
+    };
+    try Fixture.validate(alloc, &entries);
+    const valid = entries[0];
+    entries[0].value_base64 = "AAAAAAAAAAAAAAAAAAAAAA==";
+    try std.testing.expectError(error.InvalidPortableAuthSeed, Fixture.validate(alloc, &entries));
+    entries[0].value_base64 = "AQEBAQEBAQEBAQEBAQEB";
+    try std.testing.expectError(error.InvalidPortableAuthSeed, Fixture.validate(alloc, &entries));
+    entries[0] = valid;
+    entries[0].key_base64 = "dXNlcmluc3RhbmNlOg==";
+    try std.testing.expectError(error.InvalidPortableAuthSeed, Fixture.validate(alloc, &entries));
+    entries[0].key_base64 = "dXNlcmluc3RhbmNlLWV4dHJhOmFsaWNl";
+    try std.testing.expectError(error.InvalidPortableAuthSeed, Fixture.validate(alloc, &entries));
 }

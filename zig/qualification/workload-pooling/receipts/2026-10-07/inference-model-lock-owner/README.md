@@ -1,0 +1,9 @@
+# Real API owner model-lock wait gate
+
+The reusable `zig build antfly-inference-owner-handoff-test -Doptimize=ReleaseSafe` target owns only the real API execution capsules, shared runnable scheduler, inference control and owner-admission boundary. It does not require a storage or numerical model archive.
+
+Final native macOS and pinned Nix/glibc aarch64-linux-gnu runs pass nine tests (4/4 and 3/3 build steps respectively), exit 0. The result metadata checks four current source hashes, preserves exact commands and full logs, and retains earlier passing runs before the explicit deadline case was added. Linux ran in a 2 CPU, 2 GiB container without extra swap using the pinned Nix/glibc image and ReleaseSafe GNU target.
+
+The new integration fixture starts a real two-slot inference capsule with retained bytes and an original deadline. A contended gate parks that capsule through the actual checked C owner port. Scheduler stats prove zero runnable slots, one resource-blocked operation and unchanged retained bytes. A peer query and a protected control operation both acquire capacity while the parent is parked, then retire. Normal resume restores the original two-slot demand and byte charge. Separate cancellation and expired-original-deadline cases reject reacquisition and leave the model mutex unlocked. Final owning cleanup drains all operation, CPU and byte counters. Existing owner/borrowed handoff regressions also pass.
+
+This establishes real scheduler accounting and control admission at this wait boundary. It does not prove numerical model throughput/fairness, complete physical broker cohort scheduling, subprocess waits, other resource waits, foreign backend CPU teams, serverless support, total process memory bounds, or automatic/default overload qualification. Production composition must still be qualified with the consolidated source.

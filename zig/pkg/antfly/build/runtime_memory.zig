@@ -44,8 +44,27 @@ pub const CompileMemoryProfile = struct {
     macos_shared_storage_sdk27: bool = false,
 };
 
+/// The routed implementation test owner is separate from production archives.
+/// Pinned Nix/glibc GNU ARM64 ReleaseSafe reached 17,479,122,944 bytes;
+/// 21 GiB supplies >25% measured compiler headroom, without changing runtimes.
+pub fn routedImplementationCompileMaxRss(profile: CompileMemoryProfile) usize {
+    if (profile.target.os.tag == .macos) {
+        // Native ReleaseSafe routed write tests reached 15,716,696,064 bytes.
+        // Twenty GiB supplies >25% headroom above that measured peak.
+        const measured_macos = profile.host.os.tag == .macos and profile.optimize == .safe and !profile.sanitize_thread;
+        return @as(usize, if (measured_macos) 20 else 12) << 30;
+    }
+    const measured = profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
+        profile.target.os.tag == .linux and profile.target.cpu.arch == .aarch64 and profile.target.abi == .gnu and
+        profile.optimize == .safe and !profile.sanitize_thread;
+    return @as(usize, if (measured) 21 else 8) << 30;
+}
+
 pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProfile) usize {
     const target = profile.target;
+    const native_gnu_arm64_safe = profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
+        target.os.tag == .linux and target.cpu.arch == .aarch64 and target.abi == .gnu and
+        profile.optimize == .safe and !profile.sanitize_thread;
     const baseline_cpu = std.Target.Cpu.baseline(target.cpu.arch, target.os);
     if (profile.macos_metal_blas_release and
         std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
@@ -167,17 +186,24 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // measured peak, while fitting a 36 GiB host's 28.8 GiB compiler
         // budget. Further headroom requires partitioning the API owner;
         // overlapping this unit with another large compile is unsafe.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 28 else 12) * 1024 * 1024 * 1024,
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 28 else if (native_gnu_arm64_safe) 15 else 12) * 1024 * 1024 * 1024,
+        // Pinned Nix GNU ARM64 ReleaseSafe retains its measured 15 GiB reservation.
         // September's macOS 20 GiB claim is below the reported 22–23 GB
         // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
         // Keep the measured Linux profiles separate. The other macOS bumps
         // below are provisional 25% margins over claims reported as exceeded;
         // replace them with cold-build evidence before lowering them.
-        .storage_kernel => @as(usize, if (target.os.tag == .macos) 28 else 20) * 1024 * 1024 * 1024,
-        // Hosted object-table integration raised the measured aarch64-macOS
-        // ReleaseFast distributed peak to 15.41 GB. Reserve >=25% headroom
-        // without reducing Linux runner concurrency.
-        .distributed => @as(usize, if (target.os.tag == .macos) 18 else 11) * 1024 * 1024 * 1024,
+        // The contextual-wait GNU ARM64 ReleaseSafe archive measured
+        // 21,815,246,848 bytes, above the previous 20 GiB reservation.
+        // Twenty-six GiB preserves >25% headroom for that measured profile.
+        .storage_kernel => @as(usize, if (target.os.tag == .macos) 28 else if (native_gnu_arm64_safe) 26 else 20) * 1024 * 1024 * 1024,
+        // Latest-main aarch64-macOS ReleaseSafe reached 14.01 decimal GB,
+        // exceeding 13 GiB. Reserve 17 GiB (>25% above that observed peak)
+        // for this profile; preserve other hosts/modes and runtime limits.
+        // Pinned Nix GNU ARM64 ReleaseSafe peaked at 13,191,520,256 bytes;
+        // sixteen GiB provides >25% measured headroom for that profile.
+        .distributed => @as(usize, if (target.os.tag == .macos) 18 else if (native_gnu_arm64_safe) 16 else 11) * 1024 * 1024 * 1024,
+        // Upstream hosted lake measurements raise the macOS distributed claim to 18 GiB.
         .enrichment_compute => 4 * 1024 * 1024 * 1024,
         // This is deliberately a separate non-PIC product unit. The
         // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
@@ -191,12 +217,27 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // scheduler can overlap whichever roots fit without forcing
         // callers to serialize the whole build.
         .inference => @as(usize, if (target.os.tag == .macos) 20 else 16) * 1024 * 1024 * 1024,
-        // ARM64 Linux ReleaseFast CLI peaked at 3.52 GB during the logical
-        // query API qualification; 4 GiB retains headroom above that peak.
-        // macOS CLI exceeded the newer 3 GiB claim too; provision 4 GiB
-        // pending a fresh cold-build trace.
-        .cli => 4 * 1024 * 1024 * 1024,
+        // Native GNU ARM64 ReleaseSafe needs the measured five GiB claim.
+        // Other CLI targets retain main's four GiB headroom.
+        .cli => @as(usize, if (native_gnu_arm64_safe) 5 else 4) * 1024 * 1024 * 1024,
     };
+}
+
+test "native GNU ARM64 ReleaseSafe claims cover pinned Nix compiler peaks" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu });
+    const profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .safe, .strip = false, .cpu_inference = true };
+    for ([_]RuntimeLibraryUnit{ .cli, .api_kernel, .distributed, .storage_kernel }, [_]usize{ 3_645_767_680, 12_550_221_824, 13_191_520_256, 21_815_246_848 }) |unit, peak| {
+        try std.testing.expect(runtimeCompileMaxRss(unit, profile) >= peak + peak / 4);
+    }
+    var other = profile;
+    other.optimize = .fast;
+    try std.testing.expectEqual(@as(usize, 4) << 30, runtimeCompileMaxRss(.cli, other));
+    try std.testing.expectEqual(@as(usize, 12) << 30, runtimeCompileMaxRss(.api_kernel, other));
+    try std.testing.expectEqual(@as(usize, 11) << 30, runtimeCompileMaxRss(.distributed, other));
+    try std.testing.expectEqual(@as(usize, 20) << 30, runtimeCompileMaxRss(.storage_kernel, other));
+    other = profile;
+    other.sanitize_thread = true;
+    try std.testing.expectEqual(@as(usize, 12) << 30, runtimeCompileMaxRss(.api_kernel, other));
 }
 
 /// Test objects have different working sets from runtime archives. Keep
@@ -210,8 +251,11 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // secret-backends-tests peaked at 15,418,605,568 bytes.
     // Hosted truncate recovery/data implementation peaked at
     // 12,111,249,408/13,980,401,664 bytes.
-    // Earlier owners retain their existing >25% margins below. Expanded
-    // owners use separately measured floors without changing other hosts.
+    // Enrichment close-preflight integration peaked at 13,262,782,464 bytes.
+    // Cold retained-dense-close preflight reached 17,806,262,272 bytes.
+    // Its 22 GiB floor includes >25% headroom.
+    // Reserve >25% headroom
+    // without changing cross-host, release or other test-object reservations.
     if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
         target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug)
     {
@@ -243,6 +287,7 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
             .{ .name = "api-derived-coverage-tests", .gib = 17 },
             .{ .name = "raft-unit-tests", .gib = 17 },
             .{ .name = "api-table-write-implementation-tests", .gib = 16 },
+            .{ .name = "owner-close-preflight-tests", .gib = 22 },
             .{ .name = "secret-backends-tests", .gib = 19 },
             .{ .name = "antfly-hosted-truncate-fk-recovery", .gib = 15 },
             .{ .name = "antfly-hosted-self-fk-recovery", .gib = 14 },
@@ -410,6 +455,42 @@ test "measured ReleaseSafe CPU archives overlap within the E2E runner budget" {
     try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, measured) + runtimeCompileMaxRss(.inference, measured) <= 22 * gib);
 }
 
+test "routed implementation compiler claim covers measured native GNU ARM64 only" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu });
+    const profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .safe, .strip = false, .cpu_inference = true };
+    const peak: usize = 17_479_122_944;
+    try std.testing.expectEqual(@as(usize, 21) << 30, routedImplementationCompileMaxRss(profile));
+    try std.testing.expect(routedImplementationCompileMaxRss(profile) >= peak + peak / 4);
+    var other = profile;
+    other.optimize = .fast;
+    try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.sanitize_thread = true;
+    try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.host = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl });
+    try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    try std.testing.expectEqual(@as(usize, 12) << 30, routedImplementationCompileMaxRss(other));
+}
+
+test "native macOS routed ReleaseSafe claim covers the physical write owner peak" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .safe, .strip = false, .cpu_inference = false };
+    const peak: usize = 15_716_696_064;
+    try std.testing.expect(routedImplementationCompileMaxRss(profile) >= peak + peak / 4);
+    var other = profile;
+    other.optimize = .fast;
+    try std.testing.expectEqual(@as(usize, 12) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.sanitize_thread = true;
+    try std.testing.expectEqual(@as(usize, 12) << 30, routedImplementationCompileMaxRss(other));
+}
+
 test "opt-in Darwin claims retain margins and reject unmeasured profiles" {
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos, .cpu_model = .baseline });
     const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .fast, .strip = true, .cpu_inference = false, .macos_metal_blas_release = true };
@@ -558,8 +639,8 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", macos, linux, .debug, 12 * gib));
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", linux, macos, .debug, 12 * gib));
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
-    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests", "api-table-write-implementation-tests", "secret-backends-tests", "antfly-hosted-truncate-fk-recovery", "data-runtime-implementation-tests", "antfly-hosted-self-fk-recovery", "antfly-hosted-initial-fk-recovery" };
-    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976, 13_252_476_928, 15_418_605_568, 12_111_249_408, 13_980_401_664, 11_942_445_056, 11_940_200_448 };
+    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests", "api-table-write-implementation-tests", "secret-backends-tests", "antfly-hosted-truncate-fk-recovery", "data-runtime-implementation-tests", "antfly-hosted-self-fk-recovery", "antfly-hosted-initial-fk-recovery", "owner-close-preflight-tests" };
+    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976, 13_252_476_928, 15_418_605_568, 12_111_249_408, 13_980_401_664, 11_942_445_056, 11_940_200_448, 17_806_262_272 };
     for (names, peaks) |name, measured| {
         const floor = testCompileMaxRss(name, macos, macos, .debug, 12 * gib);
         try std.testing.expect(floor >= measured + measured / 4);

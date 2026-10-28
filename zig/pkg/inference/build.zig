@@ -94,6 +94,7 @@ fn configureMetal(
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     module.addCSourceFile(.{ .file = b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
+    module.addCSourceFile(.{ .file = b.path("src/backends/metal_device_credit.m"), .flags = &.{"-fobjc-arc"} });
 }
 
 fn configureNativeTool(

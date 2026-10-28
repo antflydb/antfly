@@ -905,26 +905,76 @@ pub const Reader = struct {
     preserve_path: bool = false,
     window_upper: ?[]const u8 = null,
     cached: ?artifacts.CachedRead = null,
+    context: local.serverless_query_lake_read_context.Context = .{},
+    saved_context: ?local.serverless_query_lake_read_context.Context = null,
+    saved_cached_context: ?local.serverless_query_lake_read_context.Context = null,
     pub fn init(self: *Reader, a: A, store: *stores.ArtifactStore, root: Root, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation) !void {
         return self.initCached(a, store, root, fingerprint, lower, upper, cancellation, null);
     }
     pub fn initCached(self: *Reader, a: A, store: *stores.ArtifactStore, root: Root, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation, cached: ?artifacts.CachedRead) !void {
+        return self.initCachedFor(a, store, root, fingerprint, lower, upper, cancellation, cached, if (cached) |cache| cache.context else .{}, null);
+    }
+    /// Construction may download the root path. Only those synchronous reads
+    /// borrow the opening execution; the retained tree starts with its original
+    /// lifetime context even when construction fails after a physical read.
+    pub fn initCachedFor(self: *Reader, a: A, store: *stores.ArtifactStore, root: Root, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation, cached: ?artifacts.CachedRead, context: local.serverless_query_lake_read_context.Context, execution: ?*local.common_request_admission.runnable_scheduler.Execution) !void {
+        const opening = if (execution) |owner| context.withExecution(owner) else context;
+        try opening.ensureActive();
         try root.validate();
-        return self.initVerified(a, store, .{ .value = root }, fingerprint, lower, upper, cancellation, cached);
+        return self.initVerifiedFor(a, store, .{ .value = root }, fingerprint, lower, upper, cancellation, cached, context, execution);
     }
     pub fn initVerified(self: *Reader, a: A, store: *stores.ArtifactStore, verified: VerifiedRoot, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation, cached: ?artifacts.CachedRead) !void {
+        return self.initVerifiedFor(a, store, verified, fingerprint, lower, upper, cancellation, cached, if (cached) |cache| cache.context else .{}, null);
+    }
+    pub fn initVerifiedFor(self: *Reader, a: A, store: *stores.ArtifactStore, verified: VerifiedRoot, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation, cached: ?artifacts.CachedRead, context: local.serverless_query_lake_read_context.Context, execution: ?*local.common_request_admission.runnable_scheduler.Execution) !void {
+        const opening = if (execution) |owner| context.withExecution(owner) else context;
+        try opening.ensureActive();
         const root = verified.value;
         if (!std.mem.eql(u8, &root.fingerprint, &fingerprint)) return error.ExternalLakeIndexUnavailable;
-        self.* = .{ .root = root, .pages = undefined, .cached = cached };
+        self.* = .{ .root = root, .pages = undefined, .cached = cached, .context = opening };
+        defer self.context = context;
+        // Decoded-page loaders borrow the opening execution too. Restore the
+        // original cache authority before this retained reader escapes.
+        if (self.cached) |*cache| cache.context = opening;
+        defer if (self.cached) |*cache| {
+            cache.context = cached.?.context;
+        };
         self.pages = .{ .domain = root.domain, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &self.remaining_writes };
+        self.pages.read_cache = .{ .ptr = self, .read = readPage };
         if (cached) |shared| {
             self.pages.read_cache = .{ .ptr = self, .read = readPage, .read_many = readPages, .decoded_read = readDecoded, .decoded_many = readDecodedMany };
             self.pages.io = shared.context.io;
         }
         self.cursor = try tree.Cursor.init(a, self.pages.store(), root.page, lower, upper);
+        errdefer {
+            self.cursor.?.deinit();
+            self.cursor = null;
+        }
+        try opening.ensureActive();
+    }
+    /// Borrow only the execution of this pull. Tree cursors retain their
+    /// positions and payloads, while the original publication authority stays
+    /// attached across calls and is checked even for resident pages.
+    pub fn bindExecution(self: *Reader, execution: *local.common_request_admission.runnable_scheduler.Execution) !void {
+        if (self.saved_context != null) return error.InvalidCoordinatorScanBinding;
+        try self.context.ensureActive();
+        try execution.checkpoint();
+        self.saved_context = self.context;
+        self.context = self.context.withExecution(execution);
+        if (self.cached) |*cache| {
+            self.saved_cached_context = cache.context;
+            cache.context = cache.context.withExecution(execution);
+        }
+    }
+    pub fn releaseExecution(self: *Reader) void {
+        self.context = self.saved_context orelse return;
+        if (self.saved_cached_context) |context| self.cached.?.context = context;
+        self.saved_cached_context = null;
+        self.saved_context = null;
     }
     /// Enclosed immutable subtrees carry exact counts without leaf reads.
     pub fn countRange(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) !u64 {
+        try self.context.ensureActive();
         return tree.countRange(a, self.pages.store(), self.root.page, lower, upper);
     }
     fn readDecoded(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, ref: tree.Ref, token: Cancellation, remaining: *u64) !tree.Page {
@@ -962,7 +1012,7 @@ pub const Reader = struct {
     fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, len: usize, digest: [32]u8, cancellation: Cancellation, budget: *u64) ![]u8 {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try stores.chargeReadBudget(budget, len);
-        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, len, digest, cancellation, self.cached);
+        return artifacts.readPageRangeFor(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, len, digest, cancellation, self.cached, self.context);
     }
     pub fn deinit(self: *Reader) void {
         for (&self.file_names) |*entry| if (entry.*) |held| {
@@ -1146,6 +1196,7 @@ pub const Reader = struct {
         for (names, output) |name, *digest| digest.* = local.storage_rowsource_identity.navigationDigest(self.identityVersion(), self.root.source, self.root.snapshot, name.file);
     }
     pub fn nextPredicateBlocks(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) ![]const predicate_blocks.Block {
+        try self.context.ensureActive();
         if (self.exhausted) return &.{};
         if (self.predicate_cursor == null) self.predicate_cursor = try tree.Cursor.init(self.cursor.?.alloc, self.pages.store(), self.root.predicates, lower, upper);
         var blocks: std.ArrayList(predicate_blocks.Block) = .empty;
@@ -1239,6 +1290,7 @@ pub const Reader = struct {
     /// Reverse-tree order is physical file/group/row order. Test the stored
     /// tuple against the exact seek bounds without opening Parquet columns.
     pub fn nextPhysical(self: *Reader, a: A, max_rows: usize, lower: []const u8, upper: ?[]const u8) ![]const rows.RowRef {
+        try self.context.ensureActive();
         if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
         if (self.physical_cursor == null) self.physical_cursor = try tree.Cursor.init(self.cursor.?.alloc, self.pages.store(), self.root.reverse orelse return error.InvalidNativeLakeRowIndex, "", null);
         var refs: std.ArrayList(rows.RowRef) = .empty;
@@ -1332,6 +1384,7 @@ pub const Reader = struct {
         return result;
     }
     pub fn nextEntries(self: *Reader, a: A, max_rows: usize) ![]const Entry {
+        try self.context.ensureActive();
         if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
         var entries: std.ArrayList(Entry) = .empty;
         errdefer entries.deinit(a);
@@ -1352,6 +1405,7 @@ pub const Reader = struct {
         return .{ .external = .{ .source_id = self.root.source, .snapshot_id = self.root.snapshot, .identity_version = self.identityVersion(), .file_id = try self.fileAtAlloc(a, file), .row_group_ordinal = std.mem.readInt(u32, physical[4..8], .big), .row_ordinal = std.mem.readInt(u64, physical[8..16], .big) } };
     }
     pub fn next(self: *Reader, a: A, max_rows: usize) ![]const rows.RowRef {
+        try self.context.ensureActive();
         if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
         var refs: std.ArrayList(rows.RowRef) = .empty;
         errdefer refs.deinit(a);
@@ -1628,6 +1682,204 @@ test "external lake ordered update strategy accounts for inserted and removed ro
     try std.testing.expect(!preferCopyOnWrite(100_000, 1, 20_000));
     try std.testing.expect(!preferCopyOnWrite(100_000, 20_000, 0));
     try std.testing.expect(preferCopyOnWrite(2, 2, 2));
+}
+
+test "external lake ordered pulls borrow each execution and retain publication authority" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Execution = Runnable.Execution;
+    const Case = enum { success, canceled, expired, revoked };
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        base: stores.ArtifactStore,
+        scheduler: *Runnable.Scheduler,
+        signal: *std.atomic.Value(bool),
+        case: Case,
+        enabled: bool = false,
+        revoked: bool = false,
+        calls: usize = 0,
+        controls: usize = 0,
+        fn authority(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.revoked) return error.TestPublicationRevoked;
+        }
+        fn before(self: *@This()) !void {
+            if (self.enabled) {
+                try std.testing.expect(self.scheduler.stats().resource_blocked > 0);
+                var control: Execution = .{};
+                try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                try control.checkpoint();
+                control.finish();
+                self.controls += 1;
+                self.calls += 1;
+            }
+        }
+        fn after(self: *@This()) void {
+            if (self.enabled) switch (self.case) {
+                .success => {},
+                .canceled => self.signal.store(true, .release),
+                .expired => Clock.value = 10,
+                .revoked => self.revoked = true,
+            };
+        }
+        fn read(raw: *anyopaque, alloc: A, id: []const u8, max: usize, token: Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.before();
+            const bytes = try self.base.getAllocWithCancellationUsingAllocator(alloc, id, token);
+            if (bytes.len > max) {
+                alloc.free(bytes);
+                return error.ArtifactTooLarge;
+            }
+            self.after();
+            return bytes;
+        }
+        fn range(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.before();
+            const bytes = try self.base.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, length, token);
+            self.after();
+            return bytes;
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("ordered-call-owner");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const Make = struct {
+        fn add(sort: *local.sql_spill.Sort, n: u32, file: u32, row: u64) !void {
+            var key: [148]u8 = @splat('x');
+            std.mem.writeInt(u32, key[0..4], n, .big);
+            @memcpy(key[132..148], &coordinate(file, .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = row }));
+            try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = n });
+        }
+    };
+    const files: []const local.serverless_external_source_types.FileEntry = &.{
+        .{ .file_id = @constCast("a"), .object_uri = @constCast("file://a"), .byte_len = 1, .row_count = 2048, .row_groups = &.{} },
+        .{ .file_id = @constCast("b"), .object_uri = @constCast("file://b"), .byte_len = 1, .row_count = 1, .row_groups = &.{} },
+    };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = @constCast(files[0..1]) };
+    var first = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 64 * 1024);
+    defer first.deinit();
+    for (0..2048) |n| try Make.add(&first, @intCast(n), 0, n);
+    const ref = try publish(a, ca, &store, &first, "ordered", @splat(3), inventory, &.{}, .none);
+    const root = try loadRoot(ca, store, ref, .none, null);
+    for ([_]bool{ false, true }) |cached| for (std.enums.values(Case)) |case| for ([_]bool{ false, true }) |during_open| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_operations = 16, .max_bytes = 64 * 1024 * 1024 });
+        var signal: std.atomic.Value(bool) = .init(false);
+        var fixture: Fixture = .{ .base = store, .scheduler = &scheduler, .signal = &signal, .case = case, .enabled = during_open };
+        var vtable = store.vtable.*;
+        vtable.get_bounded_alloc_with_cancellation = Fixture.read;
+        vtable.get_range_alloc_with_cancellation = Fixture.range;
+        var observed = store;
+        observed.ptr = &fixture;
+        observed.vtable = &vtable;
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        const original: local.serverless_query_lake_read_context.Context = .{ .io = std.testing.io, .authority = .{ .ptr = &fixture, .check = Fixture.authority } };
+        Clock.value = 0;
+        var opening_execution: Execution = .{};
+        try opening_execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        defer opening_execution.finish();
+        var reader: Reader = undefined;
+        const opened = reader.initCachedFor(a, &observed, root, @splat(3), "", null, .none, if (cached) .{ .cache = &cache, .scope = @splat(7), .context = original } else null, original, &opening_execution);
+        if (during_open and case != .success) {
+            const expected = switch (case) {
+                .canceled => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                .revoked => error.TestPublicationRevoked,
+                .success => unreachable,
+            };
+            try std.testing.expectError(expected, opened);
+            try std.testing.expect(reader.context.execution == null);
+            try std.testing.expect(reader.cursor == null);
+            try std.testing.expect(fixture.calls > 0);
+            try std.testing.expectEqual(fixture.calls, fixture.controls);
+            opening_execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            continue;
+        }
+        try opened;
+        defer reader.deinit();
+        try std.testing.expect(reader.context.execution == null);
+        if (reader.cached) |value| try std.testing.expect(value.context.execution == null);
+        if (during_open) {
+            try std.testing.expect(fixture.calls > 0);
+            try std.testing.expectEqual(fixture.calls, fixture.controls);
+        }
+        opening_execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        fixture.enabled = true;
+        fixture.calls = 0;
+        fixture.controls = 0;
+        var seen: usize = 0;
+        var calls: usize = 0;
+        while (seen < 2048) {
+            Clock.value = 0;
+            var execution: Execution = .{};
+            try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+            defer execution.finish();
+            try reader.bindExecution(&execution);
+            try std.testing.expectError(error.InvalidCoordinatorScanBinding, reader.bindExecution(&execution));
+            const result = reader.nextEntries(ca, 400);
+            reader.releaseExecution();
+            try std.testing.expect(reader.context.execution == null);
+            try std.testing.expect(reader.saved_context == null);
+            if (case != .success and fixture.calls > 0) {
+                const expected = switch (case) {
+                    .canceled => error.Canceled,
+                    .expired => error.DeadlineExceeded,
+                    .revoked => error.TestPublicationRevoked,
+                    .success => unreachable,
+                };
+                try std.testing.expectError(expected, result);
+                execution.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                break;
+            }
+            const entries = try result;
+            try std.testing.expect(entries.len > 0);
+            for (entries) |entry| {
+                try std.testing.expectEqual(@as(u64, @intCast(seen)), entry.ref.external.row_ordinal);
+                seen += 1;
+            }
+            calls += 1;
+            try execution.checkpoint();
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        }
+        try std.testing.expect(fixture.calls > 0);
+        try std.testing.expectEqual(fixture.calls, fixture.controls);
+        if (case == .success) {
+            try std.testing.expect(calls > 1);
+            // Resident cursor frames still require the original publication authority.
+            fixture.revoked = true;
+            try std.testing.expectError(error.TestPublicationRevoked, reader.nextEntries(ca, 1));
+            var fresh: Execution = .{};
+            try fresh.start(&scheduler, .{ .io = std.testing.io }, .query);
+            defer fresh.finish();
+            try std.testing.expectError(error.TestPublicationRevoked, reader.bindExecution(&fresh));
+            try std.testing.expect(reader.context.execution == null);
+        }
+    };
 }
 
 test "external lake public ordering seeks complete ties across files and directions" {

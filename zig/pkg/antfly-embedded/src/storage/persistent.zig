@@ -1042,17 +1042,17 @@ const MainStoreOwner = union(enum) {
         };
     }
 
-    fn runLsmMaintenanceStep(self: *MainStoreOwner) !bool {
+    fn runLsmMaintenanceStepWithLifetime(self: *MainStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         return switch (self.*) {
             .mem => false,
-            .lsm => |*handle| try handle.backend.runMaintenanceStep(),
+            .lsm => |*handle| try handle.backend.runMaintenanceStepWithLifetime(lifetime),
         };
     }
 
-    fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
+    fn runLsmMaintenanceStepBestEffortWithLifetime(self: *MainStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         return switch (self.*) {
             .mem => false,
-            .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
+            .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffortWithLifetime(lifetime),
         };
     }
 
@@ -1931,6 +1931,14 @@ pub const PersistentIndex = struct {
         try self.main_store_owner.sync(force);
     }
 
+    pub fn lsmMaintenanceScoreWithLifetime(self: *const PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        if (lifetime) |original| try original.checkpoint();
+        return switch (self.main_store_owner) {
+            .mem => 0,
+            .lsm => |handle| try handle.backend.maintenanceScoreWithLifetime(lifetime),
+        };
+    }
+
     pub fn lsmMaintenanceScore(self: *const PersistentIndex) u64 {
         return self.main_store_owner.lsmMaintenanceScore();
     }
@@ -2091,15 +2099,29 @@ pub const PersistentIndex = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *PersistentIndex) !bool {
-        self.lockStorage();
+        return self.runLsmMaintenanceStepWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepWithLifetime(self: *PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
+        if (lifetime) |original| {
+            try @import("../common/seed_snapshot_lifetime.zig").lockIo(persistentStorageIo(self.io), &self.storage_mu, original);
+        } else self.lockStorage();
         defer self.unlockStorage();
-        return try self.main_store_owner.runLsmMaintenanceStep();
+        return try self.main_store_owner.runLsmMaintenanceStepWithLifetime(lifetime);
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex) !bool {
-        self.lockStorage();
+        return self.runLsmMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
+        if (lifetime != null) {
+            if (!self.storage_mu.tryLock()) return false;
+        } else self.lockStorage();
         defer self.unlockStorage();
-        return try self.main_store_owner.runLsmMaintenanceStepBestEffort();
+        return try self.main_store_owner.runLsmMaintenanceStepBestEffortWithLifetime(lifetime);
     }
 
     /// Index a pre-built segment (WAL-protected, durable after return).
@@ -2419,6 +2441,10 @@ pub const PersistentIndex = struct {
 
     pub fn acquireSnapshot(self: *PersistentIndex) *index_mod.IndexSnapshot {
         return self.writer.acquireSnapshot();
+    }
+
+    pub fn acquireStatusSnapshotWithAdmission(self: *PersistentIndex, io: std.Io, original: @import("../common/read_admission.zig").Port) !*index_mod.IndexSnapshot {
+        return self.writer.acquireStatusSnapshotWithAdmission(io, original);
     }
 
     pub fn walStatsSnapshot(self: *PersistentIndex) wal_mod.WalStats {

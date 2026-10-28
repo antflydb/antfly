@@ -396,7 +396,7 @@ const PendingColumns = struct {
             self.ready.set(io);
             return self;
         }
-        fn acquire(self: *Credit) !bool {
+        fn acquire(self: *Credit, wait: ?@import("execution_wait.zig").Boundary) !bool {
             while (true) {
                 if (self.stopped.load(.acquire)) return false;
                 const count = self.available.load(.acquire);
@@ -405,7 +405,7 @@ const PendingColumns = struct {
                     continue;
                 }
                 self.ready.reset();
-                if (self.available.load(.acquire) == 0 and !self.stopped.load(.acquire)) try self.ready.wait(self.io);
+                if (self.available.load(.acquire) == 0 and !self.stopped.load(.acquire)) try @import("execution_wait.zig").run(wait, std.Io.Event.wait, .{ &self.ready, self.io });
             }
         }
         fn stop(self: *Credit) void {
@@ -453,6 +453,10 @@ const PendingColumns = struct {
     fn cell(self: *const PendingColumns, a: std.mem.Allocator, row: usize, column: usize) !@import("scalar.zig").Datum {
         return self.values.cell(a, self.begin + row, column);
     }
+    fn cellControlled(self: *const PendingColumns, a: std.mem.Allocator, row: usize, column: usize, control: ?@import("operator_work.zig").Control) !@import("scalar.zig").Datum {
+        return self.values.cellControlled(a, self.begin + row, column, control);
+    }
+
     fn reserveRecords(self: *PendingColumns, count: usize) !void {
         const a = self.owner.arena.allocator();
         try self.owner.positions.ensureUnusedCapacity(a, count);
@@ -496,6 +500,7 @@ const ParallelScan = struct {
     lane: usize = 0,
     workers: [8]Worker = undefined,
     worker_count: usize = 0,
+    scope: ?@import("parallel_scheduler.zig").ExecutionScope = null,
     batch_mode: bool = false,
     serial: bool = false,
     ready: std.Io.Event = .unset,
@@ -504,10 +509,65 @@ const ParallelScan = struct {
         index: usize,
         credit: *PendingColumns.Credit,
         task: ?@import("parallel_scheduler.zig").Task(anyerror!void) = null,
+        execution: ?*@import("../common/runnable_scheduler.zig").Execution = null,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *Worker = @ptrCast(@alignCast(raw));
+            try self.execution.?.checkpoint();
+        }
+        fn noResolve(_: *anyopaque, _: std.mem.Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.InvalidChildScanBackend;
+        }
+        fn noScan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.InvalidChildScanBackend;
+        }
+        fn noMutation(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.InvalidChildScanBackend;
+        }
+        fn runChild(self: *Worker, execution: *@import("../common/runnable_scheduler.zig").Execution) anyerror!void {
+            self.execution = execution;
+            defer self.execution = null;
+            var index = self.index;
+            defer {
+                // All provider receivers retire before this physical task does.
+                var closing = self.index;
+                while (closing < self.pipeline.lanes.len) : (closing += self.pipeline.worker_count) {
+                    const lane = &self.pipeline.lanes[closing];
+                    if (lane.stream.cursor) |cursor| cursor.close(cursor.ptr);
+                    lane.stream.cursor = null;
+                    lane.execution = null;
+                }
+            }
+            while (index < self.pipeline.lanes.len) : (index += self.pipeline.worker_count) {
+                const lane = &self.pipeline.lanes[index];
+                lane.execution = execution;
+                lane.stream.context.backend = .{
+                    .ptr = self,
+                    .vtable = &.{ .resolve = noResolve, .scan = noScan, .mutate = noMutation, .checkpoint = checkpoint },
+                    .settings_view = lane.stream.context.backend.settings_view,
+                };
+                const cursor = lane.stream.cursor.?;
+                try cursor.bind_execution.?(cursor.ptr, execution);
+            }
+            return self.run();
+        }
+        fn discard(_: std.mem.Allocator, _: void) void {}
+        fn retired(args: anytype, failure: ?anyerror) void {
+            const self: *Worker = args[0];
+            var index = self.index;
+            while (index < self.pipeline.lanes.len) : (index += self.pipeline.worker_count) {
+                const lane = &self.pipeline.lanes[index];
+                lane.failure = lane.failure orelse failure;
+                lane.queue.close(self.pipeline.io);
+            }
+        }
         fn run(self: *Worker) anyerror!void {
             // Nested expression jobs must not consume admission intended for
             // sibling scan workers while the parent is still starting them.
-            try self.pipeline.ready.wait(self.pipeline.io);
+            try @import("execution_wait.zig").run(
+                if (self.execution) |execution| @import("spill.zig").childWait(execution) else null,
+                std.Io.Event.wait,
+                .{ &self.pipeline.ready, self.pipeline.io },
+            );
             var index = self.index;
             while (index < self.pipeline.lanes.len) : (index += self.pipeline.worker_count) {
                 const lane = &self.pipeline.lanes[index];
@@ -523,6 +583,8 @@ const ParallelScan = struct {
     const Lane = struct {
         stream: Stream,
         credit: *PendingColumns.Credit,
+        execution: ?*@import("../common/runnable_scheduler.zig").Execution = null,
+        io: std.Io,
         slots: [2]*PendingColumns = undefined,
         queue: std.Io.Queue(*PendingColumns) = undefined,
         current: ?*PendingColumns = null,
@@ -530,9 +592,9 @@ const ParallelScan = struct {
         consumed_scan: usize = 0,
         failure: ?anyerror = null,
         fn produce(self: *Lane) !void {
-            const io = self.stream.context.backend.execution_io.?;
+            const io = self.io;
             while (!self.stream.exhausted) {
-                if (!try self.credit.acquire()) return;
+                if (!try self.credit.acquire(if (self.execution) |execution| @import("spill.zig").childWait(execution) else null)) return;
                 const before = self.stream.visited;
                 const pending = try self.stream.executeColumns(self.stream.context.limits.executionRows());
                 pending.credit(self.credit);
@@ -540,8 +602,12 @@ const ParallelScan = struct {
                 defer if (owned) pending.deinit();
                 pending.scan_rows = self.stream.visited - before;
                 const terminal = pending.terminal_error != null;
-                _ = try self.queue.put(io, &.{pending}, 1);
-                owned = false;
+                const wait = if (self.execution) |execution| @import("spill.zig").childWait(execution) else null;
+                if (wait) |boundary| try boundary.begin(boundary.ptr);
+                const result = self.queue.put(io, &.{pending}, 1);
+                if (result) |_| owned = false else |_| {}
+                if (wait) |boundary| try boundary.end(boundary.ptr);
+                _ = try result;
                 if (terminal) break;
             }
         }
@@ -549,14 +615,16 @@ const ParallelScan = struct {
     fn start(source: *Stream) !?*ParallelScan {
         const cursor = source.cursor orelse return null;
         const batch_mode = cursor.split_ordered_batch != null;
-        const split = cursor.split_ordered_batch orelse cursor.split_ordered orelse return null;
-        const io = source.context.backend.execution_io orelse return null;
+        if (!batch_mode and cursor.split_ordered == null) return null;
+        const scope = source.context.backend.cpu_scope;
+        const io = if (scope) |owner| owner.io else source.context.backend.execution_io orelse return null;
+        if (scope != null and cursor.bind_execution == null) return null;
         if (source.context.limits.retained_bytes < 16 * 1024 * 1024 or source.remaining < 8192) return null;
         if ((cursor.estimated_rows orelse 0) < 8192 and (cursor.estimated_bytes orelse 0) < 2 * 1024 * 1024) return null;
         const a = source.budget.allocator();
         const maximum = if (cursor.ordered_split_bytes == 0) 16 else @min(16, (source.budget.limit -| source.budget.live) / 4 / cursor.ordered_split_bytes);
         if (maximum < 2) return null;
-        const children = (try split(cursor.ptr, a, maximum)) orelse {
+        const children = (try cursor.splitOrderedFor(if (scope) |owner| owner.execution else null, a, maximum, batch_mode)) orelse {
             if (batch_mode) source.exhausted = true;
             return null;
         };
@@ -565,9 +633,24 @@ const ParallelScan = struct {
             for (children) |child| child.close(child.ptr);
             return null;
         }
+        if (scope != null) for (children) |child| {
+            if (child.bind_execution == null) {
+                for (children) |open| open.close(open.ptr);
+                return null;
+            }
+        };
         const scheduler = @import("parallel_scheduler.zig").global();
-        const workspace_budget = scheduler.cpuWorkspaceBudget(source.context.limits.retained_bytes / 2);
-        const fanout = @max(1, scheduler.fanout(children.len, workspace_budget, 4 * 1024 * 1024));
+        // Scoped children spend their original node's authority. Legacy
+        // workers share this scheduler and leave room for required IO before
+        // choosing their speculative CPU workspace.
+        const workspace_budget = if (scope != null)
+            source.context.limits.retained_bytes / 2
+        else
+            scheduler.cpuWorkspaceBudget(source.context.limits.retained_bytes / 2);
+        const fanout = @max(1, if (scope != null)
+            @min(@as(usize, 8), @min(children.len, workspace_budget / (4 * 1024 * 1024)))
+        else
+            scheduler.fanout(children.len, workspace_budget, 4 * 1024 * 1024));
         if (!batch_mode and fanout < 2) {
             for (children) |child| child.close(child.ptr);
             return null;
@@ -578,7 +661,7 @@ const ParallelScan = struct {
         var moved: usize = 0;
         errdefer for (children[moved..]) |child| child.close(child.ptr);
         const self = try a.create(ParallelScan);
-        self.* = .{ .a = a, .io = io, .lanes = &.{}, .batch_mode = batch_mode };
+        self.* = .{ .a = a, .io = io, .scope = scope, .lanes = &.{}, .batch_mode = batch_mode };
         errdefer self.close();
         const lanes = try a.alloc(Lane, children.len);
         self.storage = lanes;
@@ -590,6 +673,7 @@ const ParallelScan = struct {
             const credit = self.workers[index % fanout].credit;
             lane.* = .{
                 .credit = credit,
+                .io = io,
                 .stream = .{
                     .budget = .{ .backing = a, .limit = workspace },
                     // Context borrows the parent cursor's aggregate regex owner.
@@ -620,7 +704,10 @@ const ParallelScan = struct {
         }
         // A producer needs a concurrent consumer for bounded backpressure.
         for (self.workers[0..self.worker_count]) |*worker| {
-            worker.task = @import("parallel_scheduler.zig").global().submit(io, workspace, Worker.run, .{worker});
+            worker.task = if (scope) |owner|
+                try owner.submitNotified(workspace +| @sizeOf(Worker), a, Worker.runChild, .{worker}, Worker.discard, Worker.retired)
+            else
+                scheduler.submitWithIoReserve(io, workspace, Worker.run, .{worker});
             if (worker.task == null) {
                 if (!batch_mode) {
                     self.close();
@@ -662,6 +749,27 @@ const ParallelScan = struct {
         self.a.free(self.storage);
         self.a.destroy(self);
     }
+    fn receive(lane: *Lane) !?*PendingColumns {
+        var item: [1]*PendingColumns = undefined;
+        _ = lane.queue.get(lane.io, &item, 1) catch |err| switch (err) {
+            error.Closed => return null,
+            else => return err,
+        };
+        return item[0];
+    }
+    fn discardReceived(page: ?*PendingColumns) void {
+        if (page) |owned| owned.deinit();
+    }
+    fn join(self: *ParallelScan) !void {
+        var failure: ?anyerror = null;
+        for (self.workers[0..self.worker_count]) |*worker| if (worker.task) |*task| {
+            task.await(self.io) catch |err| {
+                failure = failure orelse err;
+            };
+            worker.task = null;
+        };
+        if (failure) |err| return err;
+    }
     fn advanceScan(source: *Stream, lane: *Lane, position: usize) !void {
         const delta = position - lane.consumed_scan;
         try source.admitRows(delta);
@@ -671,27 +779,31 @@ const ParallelScan = struct {
         while (self.lane < self.lanes.len and source.remaining != 0) {
             const lane = &self.lanes[self.lane];
             if (lane.current == null) {
-                var item: [1]*PendingColumns = undefined;
-                if (self.serial) {
+                const item: ?*PendingColumns = if (self.serial) serial: {
                     if (lane.stream.exhausted) {
                         self.lane += 1;
                         continue;
                     }
                     const before = lane.stream.visited;
-                    item[0] = try lane.stream.executeColumns(lane.stream.context.limits.executionRows());
-                    item[0].scan_rows = lane.stream.visited - before;
-                } else _ = lane.queue.get(self.io, &item, 1) catch |err| switch (err) {
-                    error.Closed => {
-                        if (lane.failure) |failure| return failure;
-                        self.lane += 1;
-                        continue;
-                    },
-                    else => return err,
+                    const page = try lane.stream.executeColumns(lane.stream.context.limits.executionRows());
+                    page.scan_rows = lane.stream.visited - before;
+                    break :serial page;
+                } else try @import("execution_wait.zig").runOwned(if (self.scope) |scope_| scope_.wait else null, receive, .{lane}, discardReceived, .{});
+                var transferred = false;
+                errdefer if (!transferred) {
+                    if (item) |owned| owned.deinit();
                 };
-                lane.current = item[0];
+                try source.context.checkpoint();
+                if (item == null) {
+                    if (lane.failure) |failure| return failure;
+                    self.lane += 1;
+                    continue;
+                }
+                lane.current = item;
+                transferred = true;
                 lane.index = 0;
                 lane.consumed_scan = 0;
-                if (item[0].scan_rows == 0 and !item[0].exhausted) try source.admitEmptyPage();
+                if (item.?.scan_rows == 0 and !item.?.exhausted) try source.admitEmptyPage();
             }
             const current = lane.current.?;
             var failure: ?anyerror = null;
@@ -730,6 +842,7 @@ const ParallelScan = struct {
             part.deinit();
             if (failure) |err| return err;
         }
+        if (source.remaining != 0) try self.join();
         const empty = try PendingColumns.create(self.a);
         empty.exhausted = true;
         return empty;
@@ -881,7 +994,7 @@ pub const Stream = struct {
             };
             if (binding.aggregate) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (binding.window) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
-            if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
+            if (external or (backend.execution_io == null and backend.spill_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
                 if (self.parameter_invocation) |invocation| invocation.deinitFrame();
                 if (self.settings) |view| view.deinit();
                 self.arena.deinit();
@@ -894,7 +1007,7 @@ pub const Stream = struct {
             // defaults. Its owned manager needs this stable heap address before
             // the run can borrow it; rows become valid only after init succeeds.
             owner.* = .{
-                .manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes },
+                .manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_io orelse backend.spill_manager.?.io, .parallel_work = backend.execution_io != null and backend.spill_wait == null, .cpu_scope = backend.cpu_scope, .async_writes = backend.execution_io != null and backend.spill_wait == null, .wait = backend.spill_wait, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes },
                 .shared = backend.spill_manager,
                 .a = self.budget.allocator(),
                 .width = binding.columns.len,
@@ -1085,7 +1198,7 @@ pub const Stream = struct {
             var end = begin;
             var bytes: usize = 0;
             while (end < pending.len() and end - begin < max_rows) {
-                for (0..self.context.binding.columns.len) |column| bytes +|= try pending.values.cellBytes(arena.allocator(), pending.begin + end, column);
+                for (0..self.context.binding.columns.len) |column| bytes +|= try pending.values.cellBytesControlled(arena.allocator(), pending.begin + end, column, self.context.workControl());
                 end += 1;
                 if (bytes >= self.context.limits.page_bytes) break;
             }
@@ -1135,7 +1248,7 @@ pub const Stream = struct {
             for (values, 0..) |*value, index| value.* = try encoded.cell(a, index, 0);
             return values;
         }
-        if (try @import("vector_eval.zig").evaluateColumnsScheduled(a, program, page, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io)) |values| return values;
+        if (try @import("vector_eval.zig").evaluateColumnsWithScopes(a, program, page, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io, self.context.backend.cpu_scope, self.context.backend.coordinator_scope)) |values| return values;
         const values = try a.alloc(@import("scalar.zig").Datum, page.selection.len);
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
         defer scratch.deinit();
@@ -1217,7 +1330,7 @@ pub const Stream = struct {
             // fails the exhausted quota before becoming visible.
             const wanted: u32 = @intCast(@max(1, @min(@min(capacity, @min(credit, self.context.limits.scan_rows -| self.visited)), @min(self.remaining, max_rows - pending.len()) +| self.skip)));
             const cursor = self.cursor.?;
-            const page = try cursor.next_columns.?(cursor.ptr, a, wanted);
+            const page = try cursor.columnsFor(if (self.context.backend.cpu_scope) |scope| scope.execution else null, a, wanted);
             if (page.selection.len > wanted) return error.InvalidSqlBackendResponse;
             if (page.selection.len != 0) try self.admitRows(page.selection.len) else if (page.after != null) try self.admitEmptyPage();
             const before = pending.len();
@@ -1271,7 +1384,7 @@ pub const Stream = struct {
             try programs.append(a, program);
             try slots.append(a, index);
         };
-        const evaluated = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io);
+        const evaluated = try @import("vector_eval.zig").evaluateColumnsEncodedManyWithScopes(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io, self.context.backend.cpu_scope, self.context.backend.coordinator_scope);
         for (evaluated, programs.items, slots.items) |values, program, index| {
             if (values) |batch| {
                 projections[index] = batch;
@@ -1325,9 +1438,12 @@ pub const Stream = struct {
                 return projection_.page.encodedJson(index, projection_.stream.fields[ordinal]);
             }
             fn cell(raw: *anyopaque, alloc: std.mem.Allocator, index: usize, ordinal: usize) anyerror!@import("scalar.zig").Datum {
+                return cellControlled(raw, alloc, index, ordinal, null);
+            }
+            fn cellControlled(raw: *anyopaque, alloc: std.mem.Allocator, index: usize, ordinal: usize, control: ?@import("operator_work.zig").Control) anyerror!@import("scalar.zig").Datum {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
-                const cell_ = if (projection_.projections[ordinal]) |values| try values.cell(alloc, index, 0) else blk: {
-                    const raw_ = try projection_.page.typedCell(alloc, index, projection_.stream.fields[ordinal], projection_.stream.context.binding.columns[ordinal].element_type == .numeric);
+                const cell_ = if (projection_.projections[ordinal]) |values| try values.cellControlled(alloc, index, 0, control) else blk: {
+                    const raw_ = try projection_.page.cellControlled(alloc, index, projection_.stream.fields[ordinal], control);
                     break :blk raw_;
                 };
                 const column = projection_.stream.context.binding.columns[ordinal];
@@ -1343,7 +1459,9 @@ pub const Stream = struct {
         // complete batch is published only after all typed columns succeed.
         if (self.one_scan_page) try pending.reserveRecords(selection.items.len);
         const before = pending.len();
-        try pending.values.appendBatch(.{ .reader = .{ .ptr = &projection, .read = Projection.cell, .read_dictionary = Projection.dictionary, .read_json = Projection.json, .read_frozen = Projection.frozen, .count = selection.items.len, .width = self.fields.len } });
+        var payload_lease = @import("typed_store.zig").Store.JsonLease.initControlled(a, self.context.workControl());
+        defer payload_lease.deinit();
+        try pending.values.appendBatchLeased(.{ .reader = .{ .ptr = &projection, .read = Projection.cell, .read_controlled = Projection.cellControlled, .read_dictionary = Projection.dictionary, .read_json = Projection.json, .read_frozen = Projection.frozen, .count = selection.items.len, .width = self.fields.len } }, &payload_lease);
         if (self.one_scan_page) for (positions.items, failures) |position, failure| pending.record(position, failure);
         for (before..pending.len()) |row| for (0..self.fields.len) |column| {
             output_bytes +|= try pending.values.cellBytes(a, row, column);
@@ -1448,7 +1566,7 @@ pub const Stream = struct {
                 const row = try a.alloc(Json, self.context.binding.columns.len);
                 const nulls = try a.alloc(bool, self.context.binding.columns.len);
                 for (row, nulls, 0..) |*out, *sql_null, column| {
-                    const datum = try pending.cell(a, index, column);
+                    const datum = try pending.cellControlled(a, index, column, self.context.workControl());
                     sql_null.* = datum.sql_null;
                     var output_context = self.context;
                     output_context.arena = a;
@@ -1500,7 +1618,7 @@ pub const Stream = struct {
             var request = self.request;
             request.limit = wanted;
             request.after = self.after;
-            const page = if (self.cursor) |cursor| try cursor.next(cursor.ptr, native_scratch, wanted) else try self.context.backend.vtable.scan(self.context.backend.ptr, native_scratch, self.context.binding.table.?, request);
+            const page = if (self.cursor) |cursor| try cursor.nextFor(if (self.context.backend.cpu_scope) |scope| scope.execution else null, native_scratch, wanted) else try self.context.backend.vtable.scan(self.context.backend.ptr, native_scratch, self.context.binding.table.?, request);
             defer page.deinit();
             if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
             if (self.visited + page.rows.len > self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
@@ -1695,7 +1813,7 @@ test "SQL decision pull streams carry trusted source routing" {
 }
 
 test "SQL blocking results transfer sorted operators and deliver bounded continuation pages" {
-    for ([_]bool{ false, true }) |typed| for ([_][]const u8{
+    for ([_]bool{ false, true }) |serial| for ([_]bool{ false, true }) |typed| for ([_][]const u8{
         "SELECT n FROM docs ORDER BY n DESC",
         "SELECT n % 37 AS k, count(*) AS c FROM docs GROUP BY n % 37 ORDER BY k",
         "SELECT n, row_number() OVER (ORDER BY n DESC) AS r FROM docs ORDER BY n DESC",
@@ -1704,10 +1822,12 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
         defer compiled.deinit();
         var fixture: Fixture = .{ .count = 1000 };
         var backend = fixture.backend();
-        backend.execution_io = std.testing.io;
+        if (serial) backend.spill_io = std.testing.io else backend.execution_io = std.testing.io;
         const stream = (try Stream.open(std.heap.page_allocator, backend, &compiled, &.{}, .{ .result_rows = 2, .page_rows = 16, .retained_bytes = 256 * 1024 })).?;
         defer stream.close();
         try std.testing.expect(stream.spool != null);
+        try std.testing.expectEqual(!serial, stream.spool.?.manager.parallel_work);
+        try std.testing.expectEqual(!serial, stream.spool.?.manager.async_writes);
         if (std.mem.indexOf(u8, sql, "row_number()") != null) {
             try std.testing.expect(stream.spool.?.sorted == null);
             try std.testing.expectEqual(expected, @as(usize, @intCast(stream.spool.?.rows.size)));
@@ -2198,7 +2318,7 @@ fn ownedBlockScenario(a: std.mem.Allocator) !void {
     var root_owned = true;
     defer if (root_owned) root.deinit();
     const credit = try PendingColumns.Credit.create(a, std.testing.io);
-    try std.testing.expect(try credit.acquire());
+    try std.testing.expect(try credit.acquire(null));
     root.credit(credit);
     // Joining/stopping a producer releases its reference before delivery.
     credit.stop();
@@ -2751,24 +2871,247 @@ test "SQL pull stream reuses proven provider order and stops before scanning a l
     try std.testing.expectEqual(@as(usize, 1), fixture.closed);
 }
 
-test "SQL direct native invalid cast preserves successful prefixes" {
-    const a = std.testing.allocator;
-    for ([_]bool{true}) |native| {
-        var fixture: Fixture = .{ .count = 2 };
-        var backend = fixture.backend();
-        var vtable = backend.vtable.*;
-        if (native) vtable.open_scan = NativeColumns.open;
-        backend.vtable = &vtable;
-        var compiled = try compiler.compile(a, "SELECT CAST(CASE WHEN n=0 THEN '1' ELSE 'bad' END AS BIGINT) FROM docs", .{});
-        defer compiled.deinit();
-        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 1024, .page_rows = 256 })).?;
-        defer stream.close();
-        var first = try stream.next(2);
-        defer first.deinit();
-        try std.testing.expectEqual(@as(usize, 1), first.output.rows.len);
-        try std.testing.expectEqual(@as(i64, 1), first.output.rows[0][0].integer);
-        try std.testing.expectError(error.SqlInvalidTextRepresentation, stream.next(2));
+test "SQL scan startup wait releases runnable capacity and preserves original authority" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { resumed, canceled, expired, closed };
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        Clock.now_ns.store(0, .release);
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{
+            .io = io,
+            .native_now_ns = Clock.now,
+            .deadline_ns = 100,
+            .cancellation = .{ .ptr = &canceled, .requested = Clock.requested },
+        }, .query);
+        defer execution.finish();
+        var pipeline: ParallelScan = .{ .a = std.testing.allocator, .io = io, .lanes = &.{} };
+        var worker: ParallelScan.Worker = .{ .pipeline = &pipeline, .index = 0, .credit = undefined, .execution = &execution };
+        var future = try io.concurrent(ParallelScan.Worker.run, .{&worker});
+        defer _ = future.cancel(io) catch {};
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (scheduler.stats().resource_blocked != 1) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.ScanStartupDidNotPark;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        // An ordinary peer and protected control can progress before startup.
+        var peer: Runnable.Execution = .{};
+        try peer.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        peer.finish();
+        var control: Runnable.Execution = .{};
+        try control.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        control.finish();
+        switch (mode) {
+            .resumed => {},
+            .canceled => canceled.store(true, .release),
+            .expired => Clock.now_ns.store(100, .release),
+            .closed => scheduler.close(),
+        }
+        pipeline.ready.set(io);
+        switch (mode) {
+            .resumed => try future.await(io),
+            .canceled => try std.testing.expectError(error.Canceled, future.await(io)),
+            .expired => try std.testing.expectError(error.DeadlineExceeded, future.await(io)),
+            .closed => try std.testing.expectError(error.SchedulerClosed, future.await(io)),
+        }
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
+}
+
+test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and join original failures" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { success, filtered, limit, expression, early_close, canceled, deadline, revoked, registry_full };
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+    const Owner = struct {
+        const Child = struct {
+            fixture: Fixture,
+            execution: ?*Runnable.Execution = null,
+            fn bind(raw: *anyopaque, execution: *Runnable.Execution) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.execution = execution;
+            }
+            fn next(raw: *anyopaque, a: std.mem.Allocator, wanted: u32) !catalog.ColumnPage {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.?.checkpoint();
+                return NativeColumns.nextColumns(&self.fixture, a, wanted);
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                Fixture.close(&self.fixture);
+                self.execution = null;
+            }
+        };
+        execution: *Runnable.Execution,
+        serial: Fixture = .{},
+        children: [2]Child = .{ .{ .fixture = .{ .count = 5000 } }, .{ .fixture = .{ .offset = 5000, .count = 10000 } } },
+        invalid_callbacks: std.atomic.Value(usize) = .init(0),
+        revoked: bool = false,
+        splits: usize = 0,
+        closes: usize = 0,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const state = self.execution.entry.?.state;
+            if (state != .running and state != .stopped) {
+                _ = self.invalid_callbacks.fetchAdd(1, .monotonic);
+                return error.TestUnexpectedCoordinatorCallback;
+            }
+            try self.execution.checkpoint();
+            if (self.revoked) return error.Forbidden;
+        }
+        fn begin(raw: *anyopaque) !void {
+            try check(raw);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+            try check(raw);
+        }
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = raw, .next = Fixture.next, .next_columns = serialNext, .split_ordered = split, .bind_execution = Child.bind, .close = close, .estimated_rows = 10000 };
+        }
+        fn serialNext(raw: *anyopaque, a: std.mem.Allocator, wanted: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return NativeColumns.nextColumns(&self.serial, a, wanted);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn split(raw: *anyopaque, a: std.mem.Allocator, _: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursors = try a.alloc(catalog.Cursor, 2);
+            for (&self.children, cursors) |*child, *cursor| cursor.* = .{ .ptr = child, .next = Fixture.next, .next_columns = Child.next, .bind_execution = Child.bind, .close = Child.close };
+            self.splits += 1;
+            return cursors;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |coordinator_only| for (std.enums.values(Mode)) |mode| {
+        Clock.now_ns.store(0, .release);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024, .checkpoint_budget = 1, .max_operations = if (mode == .registry_full) 2 else 32 });
+        var cancel: std.atomic.Value(bool) = .init(false);
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = 100, .native_now_ns = Clock.now, .cancellation = .{ .ptr = &cancel, .requested = Owner.requested } }, .query);
+        defer execution.finish();
+        var owner = Owner{ .execution = &execution };
+        const boundary = @import("execution_wait.zig").Boundary{ .ptr = &owner, .begin = Owner.begin, .end = Owner.end };
+        var backend = Fixture.backend(undefined);
+        var vtable = backend.vtable.*;
+        vtable.checkpoint = Owner.check;
+        vtable.open_scan = Owner.open;
+        backend.ptr = &owner;
+        backend.vtable = &vtable;
+        const scope = @import("parallel_scheduler.zig").ExecutionScope{ .execution = &execution, .allocator = a, .io = std.testing.io, .wait = boundary, .checkpoint = Owner.check };
+        backend.coordinator_scope = scope.coordinator();
+        if (!coordinator_only) backend.cpu_scope = scope;
+        const sql = switch (mode) {
+            .filtered => "SELECT n + 1 FROM docs WHERE n % 2 = 0",
+            .limit => "SELECT n + 1 FROM docs LIMIT 8192 OFFSET 7",
+            .expression => "SELECT 1 / (9999 - n) FROM docs",
+            else => "SELECT n + 1 FROM docs",
+        };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        {
+            const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 })).?;
+            defer stream.close();
+            var first = try stream.nextBatch(137);
+            try std.testing.expect((stream.parallel != null) == (!coordinator_only and mode != .registry_full));
+            var first_owned = true;
+            defer if (first_owned) first.deinit();
+            try std.testing.expectEqual(@as(usize, 137), first.values.len());
+            var health: Runnable.Execution = .{};
+            try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try health.checkpoint();
+            health.finish();
+            switch (mode) {
+                .early_close => {
+                    if (stream.parallel) |parallel| {
+                        parallel.close();
+                        stream.parallel = null;
+                    }
+                    try std.testing.expectEqual(@as(i64, 1), (try first.values.cell(a, 0, 0)).value.integer);
+                    try execution.checkpoint();
+                },
+                .canceled => {
+                    cancel.store(true, .release);
+                    try std.testing.expectError(error.Canceled, stream.nextBatch(137));
+                },
+                .deadline => {
+                    Clock.now_ns.store(100, .release);
+                    try std.testing.expectError(error.DeadlineExceeded, stream.nextBatch(137));
+                },
+                .revoked => {
+                    owner.revoked = true;
+                    try std.testing.expectError(error.Forbidden, stream.nextBatch(137));
+                },
+                .success, .filtered, .limit, .expression, .registry_full => {
+                    var seen: usize = 0;
+                    for (0..first.values.len()) |row| {
+                        if (mode != .expression) try std.testing.expectEqual(@as(i64, @intCast(if (mode == .filtered) seen * 2 + 1 else seen + 1 + @as(usize, if (mode == .limit) 7 else 0))), (try first.values.cell(a, row, 0)).value.integer);
+                        seen += 1;
+                    }
+                    first.deinit();
+                    first_owned = false;
+                    while (true) {
+                        var page = stream.nextBatch(137) catch |err| {
+                            try std.testing.expectEqual(error.SqlDivisionByZero, err);
+                            break;
+                        };
+                        defer page.deinit();
+                        for (0..page.values.len()) |row| {
+                            if (mode != .expression) try std.testing.expectEqual(@as(i64, @intCast(if (mode == .filtered) seen * 2 + 1 else seen + 1 + @as(usize, if (mode == .limit) 7 else 0))), (try page.values.cell(a, row, 0)).value.integer);
+                            seen += 1;
+                        }
+                        if (page.exhausted) break;
+                    }
+                    try std.testing.expectEqual(@as(usize, switch (mode) {
+                        .filtered => 5000,
+                        .limit => 8192,
+                        .expression => 9999,
+                        else => 10000,
+                    }), seen);
+                    if (mode == .limit) try std.testing.expectEqual(@as(usize, 8199), stream.visited);
+                },
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (coordinator_only) 0 else 1), owner.splits);
+        try std.testing.expectEqual(@as(usize, 1), owner.closes);
+        for (owner.children) |child| {
+            try std.testing.expectEqual(@as(usize, if (coordinator_only) 0 else 1), child.fixture.closed);
+            try std.testing.expect(child.execution == null);
+        }
+        try std.testing.expectEqual(@as(usize, 0), owner.invalid_callbacks.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().child_operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
 }
 
 test "SQL encoded JSON streaming retains bytes across pages and materializes only expressions" {
@@ -2939,6 +3282,26 @@ test "SQL blocking production sort ingestion keeps scan JSON frozen" {
         } else {
             try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(a, invalid_backend, &narrow, &.{}, .{ .retained_bytes = 512 * 1024, .page_rows = 16 }));
         }
+    }
+}
+
+test "SQL direct native invalid cast preserves successful prefixes" {
+    const a = std.testing.allocator;
+    for ([_]bool{true}) |native| {
+        var fixture: Fixture = .{ .count = 2 };
+        var backend = fixture.backend();
+        var vtable = backend.vtable.*;
+        if (native) vtable.open_scan = NativeColumns.open;
+        backend.vtable = &vtable;
+        var compiled = try compiler.compile(a, "SELECT CAST(CASE WHEN n=0 THEN '1' ELSE 'bad' END AS BIGINT) FROM docs", .{});
+        defer compiled.deinit();
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 1024, .page_rows = 256 })).?;
+        defer stream.close();
+        var first = try stream.next(2);
+        defer first.deinit();
+        try std.testing.expectEqual(@as(usize, 1), first.output.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), first.output.rows[0][0].integer);
+        try std.testing.expectError(error.SqlInvalidTextRepresentation, stream.next(2));
     }
 }
 

@@ -1541,6 +1541,17 @@ pub fn createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
     load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) !Session {
+    return createMetalSessionWithKernelJitAndLoadContextAndDeviceBudget(allocator, model_path, config, load_context, a4b_request, null);
+}
+
+pub fn createMetalSessionWithKernelJitAndLoadContextAndDeviceBudget(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    device_memory_budget: ?runtime.kv.device_memory.Budget,
+) !Session {
     return createGpuHostedSessionWithTaskOverride(
         allocator,
         model_path,
@@ -1549,6 +1560,7 @@ pub fn createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
         config,
         load_context,
         a4b_request,
+        device_memory_budget,
     );
 }
 
@@ -1568,7 +1580,7 @@ pub fn createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null);
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null, null);
 }
 
 pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
@@ -2487,6 +2499,7 @@ fn createGpuHostedSessionWithTaskOverride(
     kernel_jit_config: kernel_jit.Config,
     kernel_jit_load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
+    device_memory_budget: ?runtime.kv.device_memory.Budget,
 ) !Session {
     try kernel_jit_config.validate();
     try metal_runtime.validateMetalJitLoadContext(kernel_jit_config, kernel_jit_load_context);
@@ -2801,6 +2814,11 @@ fn createGpuHostedSessionWithTaskOverride(
     backend_resources_transferred = true;
     gpu_jina_lora_adapter = null;
     errdefer archClose(impl);
+    // Retain the load owner's capability before qualification or any shared
+    // provider creation. The later prompt cache binds the same domain identity.
+    if (device_memory_budget) |budget|
+        try configureSessionDeviceMemoryBudget(.{ .ptr = impl, .vtable = &arch_vtable }, budget);
+
     if (comptime build_options.enable_metal) {
         if (boundary_identity) |identity| if (identity.precision == .fp32) {
             // Only metadata is attached here. The managed loader supplies its
@@ -7738,6 +7756,25 @@ pub fn attachGraphRuntimeStrategy(session: Session, strategy: graph_runtime.Stra
     arch_session.graph_runtime_strategy = strategy;
 }
 
+/// Bind the session's shared KV admission owner without starting native work.
+/// Unsupported session/backend kinds have no shared Metal provider to bind.
+pub fn configureSessionDeviceMemoryBudget(session: Session, budget: runtime.kv.device_memory.Budget) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal) return;
+    try metal_compute_mod.MetalCompute.configureSharedDeviceMemoryBudget(gpuBackendData(self), self.io, budget);
+}
+
+/// Caller retains the session while cloning its constructor-installed pool.
+pub fn cloneSessionDeviceMemoryBudget(session: Session) !?runtime.kv.device_memory.Budget {
+    if (comptime !build_options.enable_metal) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal) return null;
+    return try metal_compute_mod.MetalCompute.cloneSharedDeviceMemoryBudget(gpuBackendData(self), self.io);
+}
+
 pub const MetalWorkloadProfileExport = if (build_options.enable_metal) metal_runtime.WorkloadProfileExport else void;
 
 fn qwenWorkspaceProvider(session: Session) !*@import("../backends/metal_native_provider.zig").MetalNativeProvider {
@@ -11482,6 +11519,7 @@ fn archBackend(ptr: *anyopaque) BackendType {
 
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    var device_memory_budget: ?runtime.kv.device_memory.Budget = null;
     if (self.video_coefficients) |*cache| cache.deinit();
     if (self.video_coefficient_permit) |*permit| permit.deinit();
     if (self.video_coefficient_device_permit) |*permit| permit.deinit();
@@ -11517,6 +11555,8 @@ fn archClose(ptr: *anyopaque) void {
                 if (gpu_data.tensor_store) |store| store.deinit();
                 if (gpu_data.tier_cache) |*tier_cache|
                     tier_cache.deinitAdmission();
+                device_memory_budget = gpu_data.device_memory_budget;
+                gpu_data.device_memory_budget = null;
             }
         },
         .pjrt => {
@@ -11536,6 +11576,79 @@ fn archClose(ptr: *anyopaque) void {
         .wasm => {},
     }
     self.allocator.destroy(self);
+    if (device_memory_budget) |budget| {
+        budget.close();
+        budget.deinit();
+    }
+}
+
+test "inference worker Metal session budget retires after actual session metadata free" {
+    if (comptime !build_options.enable_metal) return;
+    const Probe = struct {
+        tracker: *std.testing.FailingAllocator,
+        references: usize = 1,
+        closes: usize = 0,
+        fn retain(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+            if (self.references == 0)
+                std.debug.assert(self.tracker.allocated_bytes == self.tracker.freed_bytes);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.tracker.allocated_bytes == self.tracker.freed_bytes);
+            self.closes += 1;
+        }
+        fn reserve(raw: *anyopaque, _: std.mem.Allocator, _: usize) !runtime.kv.device_memory.Credit {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.closes != 0) return error.ResourceOwnerShuttingDown;
+            return error.UnexpectedDeviceAllocation;
+        }
+    };
+    inline for (.{ false, true }) |prefetch_initialized| {
+        var tracker = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var probe: Probe = .{ .tracker = &tracker };
+        const allocator = tracker.allocator();
+        const self = try allocator.create(ArchSession);
+        self.* = .{
+            .allocator = allocator,
+            .arch_config = .{ .gpt = .{ .hidden_size = 4, .num_hidden_layers = 1, .num_attention_heads = 1, .intermediate_size = 8, .vocab_size = 16 } },
+            .backend_type = .metal,
+            .backend_data = .{ .metal = .{ .allocator = allocator, .prefix = "", .lazy_weights = .empty } },
+        };
+        // Constructor failures can precede queue initialization. Both cleanup
+        // phases must retire metadata before releasing the final capability.
+        if (prefetch_initialized) metal_compute_mod.initPrefetchQueue(&self.backend_data.metal, allocator);
+        var live = true;
+        defer if (live) archClose(self);
+        const session: Session = .{ .ptr = self, .vtable = &arch_vtable };
+        const budget: runtime.kv.device_memory.Budget = .{ .context = &probe, .allocator = allocator, .retain_context = Probe.retain, .release_context = Probe.release, .close_context = Probe.close, .acquire = Probe.reserve };
+        try configureSessionDeviceMemoryBudget(session, budget);
+        try std.testing.expectEqual(@as(usize, 2), probe.references);
+        try std.testing.expect(gpuBackendData(self).shared_metal_native_provider == null);
+        try configureSessionDeviceMemoryBudget(session, budget);
+        try std.testing.expectEqual(@as(usize, 2), probe.references);
+        const cache_budget = (try cloneSessionDeviceMemoryBudget(session)).?;
+        try std.testing.expectEqual(@as(usize, 3), probe.references);
+        var scratch = budget;
+        scratch.family = .scratch;
+        try std.testing.expectError(error.MetalDeviceBudgetOwnershipConflict, configureSessionDeviceMemoryBudget(session, scratch));
+        try std.testing.expectEqual(@as(usize, 3), probe.references);
+        budget.deinit();
+        archClose(self);
+        live = false;
+        try std.testing.expectEqual(@as(usize, 1), probe.closes);
+        try std.testing.expectEqual(@as(usize, 1), probe.references);
+        try std.testing.expectError(error.ResourceOwnerShuttingDown, cache_budget.reserve(1));
+        cache_budget.deinit();
+        try std.testing.expectEqual(@as(usize, 0), probe.references);
+        try std.testing.expectEqual(tracker.allocated_bytes, tracker.freed_bytes);
+    }
 }
 
 test "architecture close retires prefetch before destroying weight maps" {

@@ -112,6 +112,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         },
     };
     const antfly_main_mod = b.createModule(main_module_options);
+    addSharedSignalStackOwner(b, antfly_main_mod, target, link_libc);
+    addSharedSignalStackOwner(b, capi_mod, target, link_libc);
     // Tests share imports, not the product's final-link inputs and archives.
     const antfly_main_tests = b.addTest(.{
         .root_module = b.createModule(main_module_options),
@@ -289,6 +291,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     // This executable loads the production archive, including version consumers.
     production_antfly_imports.build_info.link(linked_inference_abi_integration_mod);
     linked_inference_abi_integration_mod.link_libc = link_libc;
+    addSharedSignalStackOwner(b, linked_inference_abi_integration_mod, target, link_libc);
     addMacosSdkPaths(b, linked_inference_abi_integration_mod, target);
     const linked_inference_abi_integration = b.addExecutable(.{
         .name = "linked-inference-abi-integration",
@@ -300,6 +303,22 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     );
     if (production_antfly_imports.shared_inference_core) linked_inference_abi_integration_mod.linkLibrary(options.native_inference);
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
+
+    const worker_probe_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/inference_worker_abi_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    worker_probe_mod.addImport("antfly_inference_bridge", production_antfly_imports.inference_bridge);
+    worker_probe_mod.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    production_antfly_imports.build_info.link(worker_probe_mod);
+    worker_probe_mod.link_libc = link_libc;
+    addSharedSignalStackOwner(b, worker_probe_mod, target, link_libc);
+    addMacosSdkPaths(b, worker_probe_mod, target);
+    const worker_probe = b.addExecutable(.{ .name = "inference-worker-abi-integration", .root_module = worker_probe_mod });
+    worker_probe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
+    const run_worker_probe = b.addRunArtifact(worker_probe);
+    b.step("linked-inference-worker-integration-test", "Run actual worker CPU demand transport and parent ownership checks").dependOn(&run_worker_probe.step);
 
     for (runtime_library_link_order) |unit| {
         antfly_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
@@ -321,6 +340,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         role_mod.addImport("structlog", structlog_mod);
         role_mod.addImport("antfly_platform", platform_mod);
         role_mod.link_libc = link_libc;
+        addSharedSignalStackOwner(b, role_mod, target, link_libc);
         addMacosSdkPaths(b, role_mod, target);
         role_mod.addOptions("runtime_artifact_options", role_options);
         production_antfly_imports.build_info.link(role_mod);
@@ -377,4 +397,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .run_linked_inference_abi_integration = run_linked_inference_abi_integration,
         .runtime_library_artifacts = runtime_library_artifacts,
     };
+}
+
+fn addSharedSignalStackOwner(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, link_libc: bool) void {
+    // RTLD_NEXT requires dynamic libc. Static musl targets retain Zig's
+    // original per-runtime stacks and do not interpose pthread creation.
+    if (!link_libc or !(target.result.os.tag == .macos or (target.result.os.tag == .linux and target.result.abi.isGnu()))) return;
+    module.addCSourceFile(.{ .file = b.path("lib/platform/src/native_signal_stack.c"), .flags = &.{ "-std=c11", "-pthread" } });
+    if (target.result.os.tag == .linux) module.linkSystemLibrary("dl", .{});
 }

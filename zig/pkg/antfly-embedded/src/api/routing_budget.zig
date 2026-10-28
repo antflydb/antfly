@@ -25,6 +25,7 @@ pub const RoutingBudget = struct {
     deadline_ns: ?u64 = null,
     io: ?runtime_io_abi.Borrow = null,
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
+    admission: ?@import("../common/read_admission.zig").Port = null,
 
     const checkpoint_stride: usize = 64;
 
@@ -68,10 +69,20 @@ pub const RoutingBudget = struct {
     }
 
     pub fn checkpoint(self: RoutingBudget) !void {
+        if (self.admission) |port| try port.checkpoint();
         try self.cancellation.check();
         if (self.deadline_ns) |deadline| {
             if (self.nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
+    }
+
+    /// One cooperative retry wait, always charged to this original absolute
+    /// deadline. A scoped executor may reject waiting before physical work.
+    pub fn waitForProgress(self: RoutingBudget) !void {
+        try self.checkpoint();
+        const duration = if (self.deadline_ns) |deadline| @min(std.time.ns_per_ms, deadline -| self.nowNs()) else std.time.ns_per_ms;
+        if (duration != 0) try self.sleepNs(duration);
+        try self.checkpoint();
     }
 
     pub fn checkpointIndex(self: RoutingBudget, index: usize) !void {
@@ -106,6 +117,7 @@ pub const RouteBudget = struct {
     }
 
     pub fn check(self: RouteBudget) !void {
+        if (self.clock.admission) |original| try original.checkpoint();
         if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         if (self.clock.deadline_ns) |deadline| if (self.clock.nowNs() >= deadline) return error.Timeout;
     }

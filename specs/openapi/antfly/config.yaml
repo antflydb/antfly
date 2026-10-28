@@ -252,7 +252,7 @@ components:
           description: Literal path to an externally managed secret file. Never written by the API.
     PgwireConfig:
       type: object
-      description: Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+      description: Optional PostgreSQL wire listener. Requires authentication. Supports native transactions. Remote bindings require externally protected transport.
       properties:
         enabled:
           type: boolean
@@ -265,6 +265,34 @@ components:
           minimum: 1
           maximum: 65535
           default: 5432
+        max_session_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+          description: |
+            Aggregate bytes allocated through pgwire connection budgets, covering
+            protocol messages, prepared state, portals, and caller-owned response
+            arenas. Zero preserves the sum of the per-connection ceilings. This
+            is separate from global backend plan/cache and process memory budgets.
+        max_retained_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+          description: Aggregate pgwire retained-state allocation ceiling for prepared plans, portals, cursor state/spools, and settings. Charged within max_session_bytes. Zero uses the sum of per-connection retained ceilings.
+        retained_bytes_per_connection:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          default: 8388608
+          description: Per-connection retained-state allocation ceiling, separate from transient frames and response pages.
+        idle_transaction_timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          default: 30000
+          description: Maximum wait for the next message in an active or failed transaction, capped by the ordinary connection idle timeout. Expiry disconnects the owner and runs normal cleanup; durable decisions remain recoverable.
         max_connections:
           type: integer
           minimum: 1
@@ -1132,14 +1160,122 @@ components:
     AdmissionConfig:
       type: object
       additionalProperties: false
-      description: Node-local foreground database request admission settings.
+      description: Node-local foreground database request admission settings. Omitted runnable policy enables automatic startup sizing; omitted query waiting allows eight requests and eight MiB of retained input for at most 250 milliseconds. Explicit runnable null disables scheduling and implicit waiting. Explicit operation counts, including zero, retain their meanings.
       properties:
+        max_retained_memory_bytes:
+          type: integer
+          format: uint64
+          minimum: 1048576
+          default: 268435456
+          description: Aggregate API-owned durable session and job storage, protocol sessions, provider state and catalogue/cache allocations. Shared across persistent owners and independent of request, transport, storage-engine and model envelopes. In automatic runnable mode this is an upper bound, additionally limited to 1/8 of the effective process memory budget.
+        max_request_duration_ms:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 86400000
+          default: 300000
+          description: Absolute HTTP request and stream lifetime in milliseconds, from ingress through response delivery. Shorter forwarded and query budgets still apply. Expiry bounds caller work and waiting; accepted durable decisions retain their independent completion and recovery ownership.
+        max_request_memory_bytes:
+          type: integer
+          format: uint64
+          minimum: 1048576
+          default: 268435456
+          description: Aggregate API request, response, SQL plan, and in-memory transaction allocation envelope. One eighth, capped at 16 MiB, is reserved for verified SQL control work. Storage, inference, transport, and durable completion retain separate envelopes. In automatic runnable mode this is an upper bound, additionally limited to 1/8 of the effective process memory budget.
+        runnable:
+          $ref: "#/components/schemas/RunnableSchedulingConfig"
         query:
           $ref: "#/components/schemas/QueryAdmissionConfig"
         write:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    RunnableSchedulingConfig:
+      type: object
+      nullable: true
+      additionalProperties: false
+      description: Node-wide runnable scheduling across execution classes. Omitting admission.runnable enables automatic initial sizing using the declared defaults as ceilings. Setting null disables runnable scheduling and implicit query waiting. An explicit object uses its property defaults, including fixed mode unless capacity_mode is supplied. Automatic mode resolves once before node publication and preserves protected health and cleanup capacity.
+      properties:
+        capacity_mode:
+          type: string
+          enum: [fixed, automatic]
+          default: fixed
+          description: Fixed preserves declared capacity. Automatic uses affinity and visible CPU quotas, with a protected-lane floor inside the declared slot ceiling, and limits metadata to 1/32 of the effective host/container/process memory budget. Request and retained-state pools each receive at most 1/8 of that budget. Resolution is frozen before publication; active policy is never resized.
+        slots:
+          type: integer
+          minimum: 3
+          maximum: 65535
+          default: 8
+          description: Total runnable slots, or the upper bound in automatic mode, including health/control and cleanup reserves. Managed startup requires at least one ordinary slot after both reserves. Protected lanes can share OS CPU time on small quotas and do not promise dedicated cores.
+        control_slots:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Health/control CPU slots reserved within slots, independently from cleanup. The combined reserves must leave at least one ordinary slot.
+        cleanup_slots:
+          type: integer
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: Dedicated cleanup CPU slots drawn from slots. Managed startup establishes one slot when zero is configured, before publishing work; it does not increase the total slot limit.
+        read_isolation:
+          type: boolean
+          nullable: true
+          default: null
+          description: Reserve bounded_read_slots ordinary CPU slots, including one nonborrowable floor, and one quarter of ordinary scheduling entries and metadata for server-verified bounded reads. General reads, analytical reads and other ordinary classes share the remainder. Omitted or null selects automatic isolation only in automatic capacity mode with enough ordinary slots for the configured bounded reserve plus one general slot and eight entries; fixed mode defaults to disabled. Explicit false disables isolation, including in automatic mode. Explicit true requires sufficient capacity, including managed cleanup, or startup fails. Unverified plans cannot claim the bounded lane. When enabled, production startup carves one quarter of the ordinary request heap into finite read pools, with half for demoted reads and one quarter each for bounded and transition allocations. This reduces the ordinary heap without increasing max_request_memory_bytes. Existing control and retained-state envelopes remain separate. Only verified operators may use the protected pools; this does not bound every backend allocation or preempt non-yielding work.
+        bounded_read_slots:
+          type: integer
+          minimum: 1
+          maximum: 65533
+          default: 1
+          description: Bounded-read CPU reserve within the total slot ceiling when read isolation is enabled. One slot is a nonborrowable floor. Only capacity above that floor may lend a CPU to a server-verified stage; at most one CPU loan is supported. The default reserves only the floor and permits no CPU lending. The reserve must leave at least one general slot after health and cleanup; automatic isolation is disabled when that capacity is unavailable unless explicitly required.
+        weights:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          default: [4, 2, 1, 1]
+          description: Query, write, inference and background slot-service weights.
+        max_operations:
+          type: integer
+          minimum: 4
+          default: 128
+          description: Outstanding operation entries including protected controls. Managed startup requires at least two control entries, reserved within this bound.
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 8388608
+          description: Caller-declared scheduling metadata bytes across queued, running and blocked operations; not a whole-process heap limit.
+        control_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 65536
+          description: Protected scheduling metadata bytes reserved within max_bytes. Up to four operation entries, capped at half max_operations, are also reserved for controls.
+        max_wait_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          default: 250
+        max_backfills:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          default: 8
+        quantum_ms:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 2
+        checkpoint_budget:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 64
 
     GraphExecutionConfig:
       type: object
@@ -1227,10 +1363,41 @@ components:
           default: 3600
           description: End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
 
+    QueryAdmissionWaiting:
+      type: object
+      additionalProperties: false
+      description: |
+        Bounded waiting for contextual REST, native SQL and managed serverless
+        reads. Omitting admission.query.waiting uses eight queued requests, eight
+        MiB of retained input and a 250 millisecond ceiling when scheduling is
+        enabled. An explicit object uses the zero property defaults: {} is
+        fail-fast. Waiting retains a bounded runtime task and owned input;
+        existing executor and transport bounds still apply. Write, inference,
+        MCP, and unsupported legacy direct calls remain fail-fast. All three limits must be positive to enable waiting, or all
+        zero to disable it. These are queued input limits, not total heap limits.
+      properties:
+        max_queued_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 0
+        max_queued_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+        max_wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          default: 0
+
     QueryAdmissionConfig:
       type: object
       additionalProperties: false
       properties:
+        waiting:
+          $ref: "#/components/schemas/QueryAdmissionWaiting"
         max_concurrent_requests:
           type: integer
           minimum: 0
@@ -1244,9 +1411,10 @@ components:
             retrieval-agent, A2A, and direct API-kernel execution. Full-text,
             vector, hybrid, graph, aggregation, federated searches, and document
             scans consume it. Point lookups and operational/control-plane reads
-            remain outside it. Excess HTTP work is rejected immediately with
-            HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure
-            response. Excess work is not queued. Set to 0 to disable query
+            remain outside it. Supported contextual reads wait within the bounded
+            admission.query.waiting policy before excess work returns HTTP 429
+            and Retry-After: 1; asynchronous protocols use their native failure
+            response. Explicit empty waiting settings retain immediate rejection. Set to 0 to disable query
             admission. This budget is independent of transport safeguards,
             write admission, and
             admission.inference.max_concurrent_requests.

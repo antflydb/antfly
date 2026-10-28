@@ -585,6 +585,28 @@ pub const ServingSource = struct {
     pub fn openWithContext(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context) !ServingSource {
         return openCached(alloc, schema, options, context, null);
     }
+    /// Capture uses this call's execution only until all provider requests and
+    /// owned metadata have completed. The pinned source may outlive that call.
+    pub fn openCachedFor(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) !ServingSource {
+        return openScoped(alloc, schema, options, context, cache, false, null, execution);
+    }
+    pub fn openLazyCachedFor(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) !ServingSource {
+        return openScoped(alloc, schema, options, context, cache, true, null, execution);
+    }
+    pub fn openLazyNavigatedFor(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: *@import("lake_serving_cache.zig").Cache, navigation: SnapshotNavigation, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) !ServingSource {
+        return openScoped(alloc, schema, options, context, cache, true, navigation, execution);
+    }
+    fn openScoped(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, lazy: bool, navigation: ?SnapshotNavigation, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) !ServingSource {
+        const active = if (execution) |owner| context.withExecution(owner) else context;
+        var source = try openCachedMode(alloc, schema, options, active, cache, lazy, navigation);
+        errdefer source.deinit();
+        // Provider requests have joined. The pinned source retains lifetime
+        // authority while later pulls attach their own call execution.
+        source.context_store.?.context = context;
+        if (execution) |owner| try owner.checkpoint();
+        try context.ensureActive();
+        return source;
+    }
     pub fn openCached(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache) !ServingSource {
         return openCachedMode(alloc, schema, options, context, cache, false, null);
     }
@@ -1347,6 +1369,150 @@ pub const ServingSource = struct {
     }
 };
 
+test "lake SQL statement capture suspends metadata IO and detaches pinned source before call retirement" {
+    const storage = @import("../../storage/object_storage.zig");
+    const Runnable = @import("../../common/runnable_scheduler.zig");
+    const Context = @import("lake_read_context.zig");
+    const Clock = struct {
+        var value: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return value.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Case = enum { success, canceled, expired, original_cancel, original_deadline, open_error, unscheduled };
+    const Fixture = struct {
+        base: storage.ObjectStorage,
+        vtable: storage.ObjectStorage.VTable,
+        scheduler: *Runnable.Scheduler,
+        signal: *std.atomic.Value(bool),
+        case: Case,
+        opens: usize = 0,
+        acquired: usize = 0,
+        retired: usize = 0,
+        lists: usize = 0,
+        parked_lists: usize = 0,
+        control: usize = 0,
+        after_capture: bool = false,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn client(self: *@This(), alloc: std.mem.Allocator) storage.ObjectStorage {
+            self.vtable.list_objects = list;
+            self.vtable.get_object = get;
+            self.vtable.deinit = deinit;
+            return .{ .allocator = alloc, .ptr = self, .vtable = &self.vtable };
+        }
+        fn open(raw: *const anyopaque, alloc: std.mem.Allocator, _: host_store.Binding) !host_store.OpenedObjectStore {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.opens += 1;
+            // Validation/credential preparation keeps its CPU grant. Physical
+            // provider IO requires an explicit initialization capability.
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
+            if (self.case == .open_error) return error.Forbidden;
+            var owned = try object_store_support.OpenedObjectStore.initWithExistingClient(alloc, self.client(alloc), "bucket", "events");
+            owned.owns_client = true;
+            self.acquired += 1;
+            return owned;
+        }
+        fn deinit(_: std.mem.Allocator, raw: *anyopaque) void {
+            from(raw).retired += 1;
+        }
+        fn list(raw: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, options: storage.ListOptions) !storage.ListResult {
+            const self = from(raw);
+            self.lists += 1;
+            const stats = self.scheduler.stats();
+            if (self.case == .unscheduled) {
+                try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), stats.runnable_slots);
+                try std.testing.expectEqual(@as(usize, 1), stats.resource_blocked);
+                self.parked_lists += 1;
+                var control: Runnable.Execution = .{};
+                try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                try control.checkpoint();
+                control.finish();
+                self.control += 1;
+            }
+            var base = self.base;
+            base.allocator = alloc;
+            const result = try base.listObjects(bucket, options);
+            if (self.case == .canceled) self.signal.store(true, .release);
+            if (self.case == .expired) Clock.value.store(10, .release);
+            return result;
+        }
+        fn get(raw: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self = from(raw);
+            try std.testing.expect(self.after_capture);
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |lazy| for (std.enums.values(Case)) |case| {
+        var memory = storage.MemoryObjectStorage.init(a);
+        defer memory.deinit();
+        var base = memory.client();
+        try base.makeBucket("bucket");
+        var put = try base.putObject("bucket", "events/part.parquet", "payload", .{});
+        put.deinit(a);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024 });
+        var signal: std.atomic.Value(bool) = .init(false);
+        Clock.value.store(0, .release);
+        var execution: Runnable.Execution = .{};
+        // Source-lifetime cancellation/expiry must be checked independently of
+        // the optional CPU scope's token and clock.
+        const source_only = case == .original_cancel or case == .original_deadline;
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = if (source_only) null else .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        defer execution.finish();
+        var fixture: Fixture = .{ .base = base, .vtable = base.vtable.*, .scheduler = &scheduler, .signal = &signal, .case = case };
+        const schema: storage_schema.TableSchema = .{ .storage_mode = .relational, .external_base_source = .{
+            .binding = .{ .table_id = "events", .format = .parquet, .source_uri = "s3://bucket/events", .schema_fingerprint = "v1" },
+            .table_id = @constCast("events"),
+            .source_uri = @constCast("s3://bucket/events"),
+            .schema_fingerprint = @constCast("v1"),
+        } };
+        const original: Context.Context = .{ .io = std.testing.io, .cancellation = storage.CancellationToken.fromAtomic(&signal), .deadline_ns = if (case == .original_deadline) 0 else null };
+        if (case == .original_cancel) signal.store(true, .release);
+        const result = if (lazy) ServingSource.openLazyCachedFor(a, schema, .{ .resolver = .{ .ptr = &fixture, .open_fn = Fixture.open } }, original, null, if (case == .unscheduled) null else &execution) else ServingSource.openCachedFor(a, schema, .{ .resolver = .{ .ptr = &fixture, .open_fn = Fixture.open } }, original, null, if (case == .unscheduled) null else &execution);
+        if (case == .success or case == .unscheduled) {
+            var source = try result;
+            defer source.deinit();
+            try std.testing.expectEqual(@as(usize, 1), source.inventory.files.len);
+            try std.testing.expect(source.context_store.?.context.execution == null);
+            try std.testing.expect(source.context_store.?.context.wait == null);
+            try std.testing.expect(source.context_store.?.context.cancellation.?.ptr == original.cancellation.?.ptr);
+            try std.testing.expect(source.scanner.object_reader.wait == null);
+            try execution.checkpoint();
+            execution.finish();
+            fixture.after_capture = true;
+            var client = source.context_store.?.client(a);
+            var read = try client.getObject("bucket", "events/part.parquet", .{});
+            defer read.deinit(a);
+            try std.testing.expectEqualStrings("payload", read.body);
+        } else {
+            const expected = switch (case) {
+                .canceled, .original_cancel => error.Canceled,
+                .expired, .original_deadline => error.DeadlineExceeded,
+                .open_error => error.Forbidden,
+                else => unreachable,
+            };
+            try std.testing.expectError(expected, result);
+        }
+        try std.testing.expectEqual(fixture.acquired, fixture.retired);
+        try std.testing.expectEqual(if (source_only) @as(usize, 0) else 1, fixture.opens);
+        if (case == .success or case == .canceled or case == .expired) {
+            try std.testing.expectEqual(@as(usize, 1), fixture.parked_lists);
+            try std.testing.expectEqual(@as(usize, 1), fixture.control);
+        }
+        if (execution.entry) |entry| try std.testing.expectEqual(@as(usize, 0), entry.children);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
 test "external lake metadata navigation coalesces cold immutable snapshot discovery" {
     const io = std.testing.io;
     const cache_mod = @import("lake_decoded_cache.zig");
@@ -1495,7 +1661,7 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try std.testing.expectEqual(first.plan_lease.?.item, second.plan_lease.?.item);
     try std.testing.expect(first.canonicalOrder().?.ptr == second.canonicalOrder().?.ptr);
     try std.testing.expect(!first.hasLazyInventory());
-    try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &cache, metadata });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &cache, metadata });
     var constrained = @import("lake_serving_cache.zig").Cache.init(a);
     defer constrained.deinit();
     constrained.decoded.max_loading_bytes = 32 * 1024 * 1024;
@@ -1505,5 +1671,5 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try std.testing.expect(private.private_snapshot != null);
     try private.ensureInventory(.{});
     try private.ownInventory();
-    try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &constrained, metadata });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &constrained, metadata });
 }

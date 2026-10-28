@@ -52,8 +52,17 @@ class CacheLifetime(unittest.TestCase):
         "Unix cache lifetime policy",
     )
     def test_shared_compiler_output_survives_late_inventory_and_is_released(self):
-        with tempfile.TemporaryDirectory() as root:
+        # This fixture invokes the real compiler. Keep both compiler caches
+        # inside the checkout, and retire the whole isolated build on exit.
+        fixture_parent = ZIG / ".zig-cache"
+        fixture_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="test-cache-lifetime-", dir=fixture_parent
+        ) as root:
             root = Path(root).resolve()
+            compiler_environment = dict(
+                os.environ, ZIG_GLOBAL_CACHE_DIR=str(root / "zig-global")
+            )
             for relative in (
                 "build_support/antfly/test_cache_lifetime.zig",
                 "build_support/antfly/source_paths.zig",
@@ -117,6 +126,7 @@ pub fn build(b: *std.Build) void {
                     "off",
                 ],
                 cwd=root,
+                env=compiler_environment,
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -133,6 +143,7 @@ pub fn build(b: *std.Build) void {
             result = subprocess.run(
                 ["zig", "build", "unit-test", "--cache-dir", str(cache)],
                 cwd=root,
+                env=compiler_environment,
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -142,7 +153,9 @@ pub fn build(b: *std.Build) void {
             # PR CI calls this checked-out Makefile through reusable workflows
             # on main. Exercise automatic enablement and manifest retirement
             # for both a successful gate and a test failure.
-            environment = dict(os.environ, CI="true", ZIG_LOCAL_CACHE_DIR=str(cache))
+            environment = dict(
+                compiler_environment, CI="true", ZIG_LOCAL_CACHE_DIR=str(cache)
+            )
             command = [
                 "make",
                 "unit-test",
@@ -196,6 +209,7 @@ pub fn build(b: *std.Build) void {
             result = subprocess.run(
                 ["zig", "build", "unit-test", "--cache-dir", str(override)],
                 cwd=root,
+                env=compiler_environment,
                 capture_output=True,
                 text=True,
                 timeout=120,

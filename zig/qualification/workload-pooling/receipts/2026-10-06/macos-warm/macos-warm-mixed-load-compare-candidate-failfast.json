@@ -1,0 +1,34 @@
+{
+  "passed": true,
+  "failures": [],
+  "comparisons": [
+    {
+      "name": "burst",
+      "success_p95_ratio": 0.9862424385788519,
+      "throughput_ratio": 0.9988060568314847
+    },
+    {
+      "name": "low-load",
+      "success_p95_ratio": 0.9910542326238528,
+      "throughput_ratio": 1.0000956596401216
+    },
+    {
+      "name": "recovery",
+      "success_p95_ratio": 1.0205939229448817,
+      "throughput_ratio": 1.000350480505522
+    },
+    {
+      "name": "sustained-overload",
+      "success_p95_ratio": 0.9940843636142519,
+      "throughput_ratio": 0.9858499021697819
+    }
+  ],
+  "baseline_binary_sha256": "5351981fdf2566ecc98db4aa0de941e2b55fc3a1e53eb1e0e5bad904881058f8",
+  "candidate_binary_sha256": "5351981fdf2566ecc98db4aa0de941e2b55fc3a1e53eb1e0e5bad904881058f8",
+  "automatic_defaults_qualified": false,
+  "remaining_default_gates": [
+    "Linux and larger profiles",
+    "whole-node ownership closure",
+    "distributed protected progress"
+  ]
+}

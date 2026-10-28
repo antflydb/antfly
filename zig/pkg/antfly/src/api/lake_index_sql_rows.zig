@@ -24,6 +24,7 @@ const ordered = @import("lake_index_ordered_rows.zig");
 const native_rows = @import("lake_index_native_rows.zig");
 const Store = @import("lake_index_store.zig").Store;
 const A = std.mem.Allocator;
+const Execution = local.common_request_admission.runnable_scheduler.Execution;
 const tree = @import("../serverless/graph_segment/page_tree.zig");
 const Owner = struct {
     a: A,
@@ -47,6 +48,7 @@ const Owner = struct {
     request: catalog.Scan,
     context: operation.RequestContext,
     read_context: local.serverless_query_lake_read_context.Context,
+    saved_read_context: ?local.serverless_query_lake_read_context.Context = null,
     child: ?catalog.Cursor = null,
     child_exhausted: bool = false,
     window: std.heap.ArenaAllocator,
@@ -98,9 +100,27 @@ const Owner = struct {
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Owner = @ptrCast(@alignCast(raw));
-        self.read_context.ensureActive() catch return true;
+        self.read_context.checkLifetime() catch return true;
         return false;
     }
+    fn bindCoordinator(raw: *anyopaque, execution: *local.common_request_admission.runnable_scheduler.Execution) !void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.saved_read_context != null) return error.InvalidCoordinatorScanBinding;
+        try self.read_context.ensureActive();
+        try self.reader.bindExecution(execution);
+        self.saved_read_context = self.read_context;
+        self.read_context = self.read_context.withExecution(execution);
+    }
+    fn releaseCoordinator(raw: *anyopaque) void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        const context = self.saved_read_context orelse return;
+        // Nested Parquet pulls retire their speculation before returning.
+        // Ordered tree and covering artifact reads are synchronous.
+        self.reader.releaseExecution();
+        self.read_context = context;
+        self.saved_read_context = null;
+    }
+
     fn exhausted(self: *const Owner) bool {
         return self.reader.exhausted and self.probe_done;
     }
@@ -244,7 +264,7 @@ const Owner = struct {
         if (self.covered) return self.nextCoveredRows(a, limit);
         if (self.cursor_header != null) return self.nextOrdered(a, limit);
         while (try self.prepare()) {
-            var page = try self.child.?.next(self.child.?.ptr, a, limit);
+            var page = try self.child.?.nextFor(self.read_context.execution, a, limit);
             self.child_exhausted = page.after == null;
             if (page.rows.len == 0) {
                 page.deinit();
@@ -287,7 +307,7 @@ const Owner = struct {
                 if (!try child.set_dynamic_filter.?(child.ptr, filter)) return error.InvalidSqlBackendResponse;
             }
             while (true) {
-                const page = try child.next(child.ptr, self.a, 256);
+                const page = try child.nextFor(self.read_context.execution, self.a, 256);
                 defer page.deinit();
                 for (page.rows) |row| {
                     const rank = ranks.get(row.id) orelse return error.InvalidNativeLakeRowIndex;
@@ -360,7 +380,7 @@ const Owner = struct {
                 self.cover_lease = owned;
                 break :cached_block owned.value.*;
             } else uncached: {
-                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, null);
+                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifactFor(a, self.artifacts, cover.block, self.reader.pages.cancellation, null, self.read_context);
                 break :uncached try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
             };
             if (block.values.len != self.reader.root.cover.len or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
@@ -477,7 +497,7 @@ const Owner = struct {
                 var scratch = std.heap.ArenaAllocator.init(self.a);
                 defer scratch.deinit();
                 const sa = scratch.allocator();
-                const page = try child.next_columns.?(child.ptr, sa, 256);
+                const page = try child.columnsFor(self.read_context.execution, sa, 256);
                 try page.validate();
                 const cells = try sa.alloc(local.sql_scalar.Datum, request.fields.len);
                 for (page.selection, 0..) |physical, row| {
@@ -515,7 +535,7 @@ const Owner = struct {
         if (self.covered) return self.nextCovered(limit);
         if (self.request.order.len != 0 and self.cursor_header != null) return self.nextOrderedColumns(limit);
         while (try self.prepare()) {
-            var page = try self.child.?.next_columns.?(self.child.?.ptr, a, limit);
+            var page = try self.child.?.columnsFor(self.read_context.execution, a, limit);
             self.child_exhausted = page.after == null;
             if (page.selection.len == 0) continue;
             if (!self.exhausted() and page.after == null) {
@@ -699,8 +719,11 @@ pub const Predicate = struct {
         return owner.mapRefsLimited(a, refs, allowance);
     }
     pub fn next(self: *Predicate, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
+        return self.nextFor(a, count, null);
+    }
+    pub fn nextFor(self: *Predicate, a: A, count: usize, execution: ?*Execution) ![]const local.storage_rowsource_types.RowRef {
         if (self.scan) while (true) {
-            const page = try self.cursor.next_columns.?(self.cursor.ptr, a, @intCast(count));
+            const page = try self.cursor.columnsFor(execution, a, @intCast(count));
             if (page.native != null) return error.InvalidSqlBackendResponse;
             if (page.selection.len == 0) {
                 if (page.after == null) return &.{};
@@ -710,6 +733,8 @@ pub const Predicate = struct {
             for (refs, page.selection) |*ref, position| ref.* = page.batch.rowRef(position);
             return refs;
         };
+        if (execution) |active| try Owner.bindCoordinator(self.cursor.ptr, active);
+        defer if (execution != null) Owner.releaseCoordinator(self.cursor.ptr);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
         if (owner.public_order) |*cursor| {
@@ -746,7 +771,7 @@ pub fn tryOpenPredicateWithContext(a: A, server: *server_api.ApiHttpServer, tabl
     for (indexes) |index| {
         const indexed = (try chooseAccess(ca, &.{index}, .{ .fields = &.{}, .conditions = conditions, .limit = 1024 })) orelse continue;
         var work: u64 = 0;
-        const opened = openWithContext(a, server, table, indexed, context, source, .automatic, &work, true, pinned) catch |err| switch (err) {
+        const opened = openWithContext(a, server, table, indexed, context, source, .automatic, &work, true, pinned, null) catch |err| switch (err) {
             error.InvalidBatchRequest => continue,
             else => return err,
         };
@@ -845,7 +870,7 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
             if (!generatedCoveringField(table, field) and !covers(cover, field)) break false;
         } else true;
         if (!sufficient) continue;
-        const cursor = (try openWithContext(a, server, table, .{ .fields = fields, .index_range = .{ .name = definition.name }, .limit = 1 }, context, source, .automatic, null, false, pinned)) orelse continue;
+        const cursor = (try openWithContext(a, server, table, .{ .fields = fields, .index_range = .{ .name = definition.name }, .limit = 1 }, context, source, .automatic, null, false, pinned, pinned.read_context.execution)) orelse continue;
         defer cursor.close(cursor.ptr);
         const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
         const root = owner.reader.root;
@@ -1136,7 +1161,10 @@ pub fn tryOpenPredicateScan(a: A, table: catalog.Table, conditions: []const cata
 }
 
 pub fn openPinned(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !catalog.Cursor {
-    return (try openWithPolicy(a, server, table, request, context, source, .required, null, false)) orelse error.ExternalLakeIndexUnavailable;
+    return openPinnedFor(a, server, table, request, context, source, null);
+}
+pub fn openPinnedFor(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, execution: ?*Execution) !catalog.Cursor {
+    return (try openWithPolicy(a, server, table, request, context, source, .required, null, false, execution)) orelse error.ExternalLakeIndexUnavailable;
 }
 
 // Combine predicate and inclusive cursor bounds before access proof. Keeping a
@@ -1166,6 +1194,10 @@ pub const SearchOrder = struct {
     filter_query_json: []const u8 = "",
 };
 pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool, search_order: SearchOrder) !?Predicate {
+    return tryOpenOrderedPredicateFor(a, server, table, request, context, source, reverse, search_order, null);
+}
+pub fn tryOpenOrderedPredicateFor(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool, search_order: SearchOrder, execution: ?*Execution) !?Predicate {
+    if (execution) |owner| try owner.checkpoint();
     const definitions = table.external_indexes orelse return null;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -1182,7 +1214,7 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
     for (indexes) |index| {
         const indexed = (try orderedCandidate(ca, table, index, request)) orelse continue;
         var cost: u64 = 0;
-        const cursor = (try openWithPolicy(a, server, table, indexed.scan, context, source, .automatic, &cost, true)) orelse continue;
+        const cursor = (try openWithPolicy(a, server, table, indexed.scan, context, source, .automatic, &cost, true, execution)) orelse continue;
         if (!cursor.order_satisfied) {
             cursor.close(cursor.ptr);
             continue;
@@ -1193,7 +1225,7 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
         var physical_order = search_order;
         physical_order.id_descending = search_order.id_descending != indexed.reversed;
         const physical_reverse = reverse != indexed.reversed;
-        const complete = preparePublicOrder(a, cursor, index, parsed, indexed.scan, physical_reverse, physical_order) catch |err| {
+        const complete = preparePublicOrderFor(a, cursor, index, parsed, indexed.scan, physical_reverse, physical_order, execution) catch |err| {
             cursor.close(cursor.ptr);
             return err;
         };
@@ -1211,6 +1243,8 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
     }
     if (best) |cursor| {
         if (best_reverse and !best_complete) {
+            if (execution) |active| try Owner.bindCoordinator(cursor.ptr, active);
+            defer if (execution != null) Owner.releaseCoordinator(cursor.ptr);
             const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
             const replacement = try @import("../serverless/graph_segment/page_tree.zig").Cursor.initReverse(a, owner.reader.pages.store(), owner.reader.root.page, owner.predicate_lower, owner.predicate_upper);
             owner.reader.cursor.?.deinit();
@@ -1219,6 +1253,12 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
         return .{ .cursor = cursor, .complete_order = best_complete, .filter_proof = best_filter_proof };
     }
     return null;
+}
+
+fn preparePublicOrderFor(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder, execution: ?*Execution) !bool {
+    if (execution) |active| try Owner.bindCoordinator(cursor.ptr, active);
+    defer if (execution != null) Owner.releaseCoordinator(cursor.ptr);
+    return preparePublicOrder(a, cursor, definition, parsed, request, reverse, search_order);
 }
 
 /// Bind a complete compiled row predicate to the exact normalized conditions
@@ -1404,8 +1444,12 @@ fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_re
 }
 
 pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?catalog.Cursor {
+    return tryOpenAutoFor(a, server, table, request, context, source, null);
+}
+pub fn tryOpenAutoFor(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, execution: ?*Execution) !?catalog.Cursor {
+    if (execution) |owner| try owner.checkpoint();
     if (request.index_range != null or request.primary_order or request.row_refs != null or request.physical_selection != null or request.primary_key != null) return null;
-    if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null, false);
+    if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null, false, execution);
     const definitions = table.external_indexes orelse return null;
     if (definitions.schema_json.len == 0 or server.source.lakeIndexLifecycleAuthority(context) == null) return null;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1422,7 +1466,7 @@ pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
     for (indexes) |index| {
         const indexed = (try chooseAccess(ca, &.{index}, request)) orelse continue;
         var cost: u64 = 0;
-        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, false)) orelse continue;
+        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, false, execution)) orelse continue;
         if (cost < best_cost) {
             if (best) |prior| prior.close(prior.ptr);
             best = cursor;
@@ -1601,7 +1645,7 @@ fn tryOpenDynamic(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
         var scan = request;
         scan.index_range = .{ .name = index.name };
         var cost: u64 = 0;
-        const cursor = (openDynamicContext(a, server, table, scan, context, source, .automatic, &cost, false, null, filter, best_cost, &projections) catch |err| switch (err) {
+        const cursor = (openDynamicContext(a, server, table, scan, context, source, .automatic, &cost, false, null, filter, best_cost, &projections, null) catch |err| switch (err) {
             // Optional planning work must not consume the fallback scan's budget.
             error.ArtifactReadBudgetExceeded => continue,
             else => return err,
@@ -1781,13 +1825,13 @@ fn chooseAccess(a: A, indexes: []const local.storage_relational_index.Relational
     return best;
 }
 
-fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool) !?catalog.Cursor {
-    return openWithContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, null);
+fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, execution: ?*Execution) !?catalog.Cursor {
+    return openWithContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, null, execution);
 }
-fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext) !?catalog.Cursor {
-    return openDynamicContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, pinned, null, std.math.maxInt(u64), null);
+fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext, execution: ?*Execution) !?catalog.Cursor {
+    return openDynamicContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, pinned, null, std.math.maxInt(u64), null, execution);
 }
-fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext, dynamic: ?*const local.sql_dynamic_filter.Filter, cost_limit: u64, projections: ?*Projections) !?catalog.Cursor {
+fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext, dynamic: ?*const local.sql_dynamic_filter.Filter, cost_limit: u64, projections: ?*Projections, execution: ?*Execution) !?catalog.Cursor {
     const index_name = if (request.index_range) |range| range.name else if (request.index_equality) |equality| equality.name else return error.ExternalLakeIndexUnavailable;
     if (request.primary_order or request.row_refs != null or request.physical_selection != null) return error.UnsupportedSqlExecution;
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
@@ -1826,7 +1870,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
         };
         owner.read_context = owner.lease.?.readContext();
         server.attachLakeRepairHint(source);
-        selected = (try @import("lake_index_selection.zig").selectCachedWithLease(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache, owner.lease)) orelse return null;
+        selected = (try @import("lake_index_selection.zig").selectCachedWithLease(ca, table, source, &owner.store, if (execution) |active| owner.read_context.withExecution(active) else owner.read_context, policy, &server.lake_read_cache, owner.lease)) orelse return null;
     }
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
     defer parsed.deinit(a);
@@ -1902,8 +1946,9 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     } else return if (policy == .automatic) null else error.ExternalLakeRowIndexNotPublished;
     owner.row_resolver = try source.resolverForIndex(declaration.name);
     const cancel: operation.CancellationToken = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
-    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
-    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
+    const opening_context = if (execution) |active| owner.read_context.withExecution(active) else owner.read_context;
+    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = opening_context }, declaration.artifact) else false;
+    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = opening_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
     const root = owner.metadata.?.value.value;
     if ((identities_only or dynamic != null) and !owner.acceptsCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
     const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
@@ -1930,7 +1975,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     if (upper) |end| {
         if (std.mem.order(u8, lower, end) != .lt) empty_range = true;
     }
-    try owner.reader.initVerified(a, &owner.artifacts, owner.metadata.?.value.*, expected, lower, if (dynamic != null) null else upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context });
+    try owner.reader.initVerifiedFor(a, &owner.artifacts, owner.metadata.?.value.*, expected, lower, if (dynamic != null) null else upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.read_context, execution);
     if (empty_range) owner.reader.exhausted = true;
     owner.reader_open = true;
     if (dynamic != null) {
@@ -1941,6 +1986,8 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
         owner.reader.preserve_path = true;
         owner.reader.window_upper = upper;
     }
+    if (execution) |active| try Owner.bindCoordinator(owner, active);
+    defer if (execution != null) Owner.releaseCoordinator(owner);
     owner.covered = root.cover.len != 0;
     for (request.fields) |field| if (!covers(root.cover, field)) {
         owner.covered = false;
@@ -2041,7 +2088,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     };
     const estimates = source.estimates();
     keep = true;
-    return .{ .column_statistics = statistics.items, .estimated_rows = if (estimates) |value| value.rows else if (root.page) |page| page.records else 0, .estimated_bytes = if (estimates) |value| value.bytes else null, .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
+    return .{ .column_statistics = statistics.items, .estimated_rows = if (estimates) |value| value.rows else if (root.page) |page| page.records else 0, .estimated_bytes = if (estimates) |value| value.bytes else null, .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .coordinator_execution = .{ .bind = Owner.bindCoordinator, .release = Owner.releaseCoordinator }, .close = Owner.close };
 }
 
 pub fn prefixSuccessor(a: A, prefix: []const u8) !?[]const u8 {

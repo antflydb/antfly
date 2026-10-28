@@ -16,6 +16,7 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
+const WriteControl = @import("../net/socket.zig").WriteControl;
 
 const http = @import("http.zig");
 const stream_mod = @import("stream.zig");
@@ -35,6 +36,8 @@ const SharedBodyBudget = @import("body_budget.zig").SharedBodyBudget;
 pub const Frame = struct {
     header: Http2FrameHeader,
     payload: []u8,
+    /// Local ingress metadata; never serialized as part of a wire frame.
+    request_deadline_ms: i64 = 0,
 
     pub fn deinit(self: *Frame, allocator: Allocator) void {
         allocator.free(self.payload);
@@ -69,6 +72,9 @@ pub const H2Connection = struct {
     /// Signaled when send window increases (WINDOW_UPDATE received), allowing
     /// writeDataBlocking to wake up and send more data.
     send_window_event: Io.Event = .unset,
+    // A generation allows concurrent credit waiters without resetting an Event
+    // while another writer still waits on it.
+    send_window_generation: std.atomic.Value(u32) = .init(0),
 
     /// Maximum bytes of DATA payload allowed per stream. 0 = unlimited.
     /// Set from ServerConfig.max_body_size or ClientConfig.max_response_size.
@@ -77,6 +83,8 @@ pub const H2Connection = struct {
     /// Optional aggregate budget shared by all server-side H2 connections.
     /// Each stream reservation is released by Stream.deinit().
     recv_data_budget: ?*SharedBodyBudget = null,
+    recv_body_memory_context: ?*anyopaque = null,
+    recv_body_memory_resolver: ?*const fn (*anyopaque, []const hpack.DecodedHeader) @import("body_budget.zig").BodyMemory = null,
 
     /// Timeout for writeDataBlocking to wait for flow-control window space.
     /// Prevents indefinite blocking when a peer stops sending WINDOW_UPDATE.
@@ -230,6 +238,12 @@ pub const H2Connection = struct {
     /// Reads one HTTP/2 frame. Handles CONTINUATION reassembly.
     /// Returns the complete frame; caller owns the payload memory.
     pub fn readFrame(self: *Self, reader: anytype) !Frame {
+        const Reader = switch (@typeInfo(@TypeOf(reader))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(reader),
+        };
+        errdefer self.resetContinuation();
+        if (comptime @hasDecl(Reader, "beginFrameRead")) try reader.beginFrameRead();
         while (true) {
             var hdr_buf: [9]u8 = undefined;
             try readExact(reader, &hdr_buf);
@@ -274,6 +288,7 @@ pub const H2Connection = struct {
                             .stream_id = stream_id,
                         },
                         .payload = assembled,
+                        .request_deadline_ms = frameRequestDeadline(reader),
                     };
                 }
                 continue;
@@ -292,13 +307,23 @@ pub const H2Connection = struct {
                 continue;
             }
 
-            return .{ .header = hdr, .payload = payload };
+            return .{ .header = hdr, .payload = payload, .request_deadline_ms = frameRequestDeadline(reader) };
         }
+    }
+
+    fn frameRequestDeadline(reader: anytype) i64 {
+        const Reader = switch (@typeInfo(@TypeOf(reader))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(reader),
+        };
+        return if (comptime @hasDecl(Reader, "frameRequestDeadlineMs")) reader.frameRequestDeadlineMs() else 0;
     }
 
     /// Writes a single frame (header + payload).
     pub fn writeFrame(self: *Self, writer: anytype, frame_type: Http2FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
         _ = self;
+        const Writer = if (@typeInfo(@TypeOf(writer)) == .pointer) std.meta.Child(@TypeOf(writer)) else @TypeOf(writer);
+        if (comptime @hasDecl(Writer, "beginFrame")) writer.beginFrame();
         const hdr = Http2FrameHeader{
             .length = @intCast(payload.len),
             .frame_type = frame_type,
@@ -308,10 +333,18 @@ pub const H2Connection = struct {
         const hdr_bytes = hdr.serialize();
         try writer.writeAll(&hdr_bytes);
         if (payload.len > 0) try writer.writeAll(payload);
+        if (comptime @hasDecl(Writer, "finishFrame")) writer.finishFrame();
     }
 
     /// Sends HEADERS (+ CONTINUATION if needed), splitting at MAX_FRAME_SIZE.
     pub fn writeHeaders(self: *Self, writer: anytype, stream_id: u31, header_block: []const u8, end_stream: bool) !void {
+        const Writer = if (@typeInfo(@TypeOf(writer)) == .pointer) std.meta.Child(@TypeOf(writer)) else @TypeOf(writer);
+        if (comptime @hasDecl(Writer, "beginHeaderBlock")) writer.beginHeaderBlock();
+        try self.writeHeadersInner(writer, stream_id, header_block, end_stream);
+        if (comptime @hasDecl(Writer, "finishHeaderBlock")) writer.finishHeaderBlock();
+    }
+
+    fn writeHeadersInner(self: *Self, writer: anytype, stream_id: u31, header_block: []const u8, end_stream: bool) !void {
         const max_size = self.peer_settings.max_frame_size;
         if (header_block.len <= max_size) {
             var flags: u8 = FLAG_END_HEADERS;
@@ -372,12 +405,118 @@ pub const H2Connection = struct {
     /// this method blocks (yields the fiber) when the send window is exhausted,
     /// waiting for WINDOW_UPDATE frames from the peer.
     ///
-    /// **Caller must hold `write_mutex`**. The mutex is temporarily released
-    /// while waiting for window space so the receive loop can process frames.
+    /// This controlled variant acquires its own write mutex. Callers must not
+    /// hold it. Weighted reentry happens after atomic frame completion unlocks.
+    /// Owns the write lock only while inspecting state and transmitting a
+    /// frame. Credit and lock waits retain the stream's original controls.
+    pub fn writeDataBlockingControlled(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, control: WriteControl) !void {
+        var offset: usize = 0;
+        var stall_deadline: ?Io.Timeout = null;
+        if (data.len == 0) {
+            beginConnectionWrite(writer);
+            const result = self.writeControlledDataFrame(writer, stream_id, data, end_stream, control, &offset);
+            try finishConnectionWrite(writer);
+            _ = try result;
+            return;
+        }
+        while (offset < data.len) {
+            try control.check();
+            beginConnectionWrite(writer);
+            const result = self.writeControlledDataFrame(writer, stream_id, data, end_stream, control, &offset);
+            try finishConnectionWrite(writer);
+            const generation = try result;
+            if (generation == null) {
+                stall_deadline = null;
+                continue;
+            }
+            if (stall_deadline == null) stall_deadline = self.send_window_timeout.toDeadline(self.io);
+            var ms: u64 = 25;
+            if (stall_deadline.?.toDurationFromNow(self.io)) |duration| {
+                const ns = duration.raw.toNanoseconds();
+                if (ns <= 0) return error.Timeout;
+                ms = @min(ms, @as(u64, @intCast(@divTrunc(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms))));
+            }
+            ms = (try control.timeout(ms)).?;
+            try control.withWait(waitForCreditTick, .{ &self.send_window_generation.raw, self.io, generation.?, ms });
+        }
+    }
+
+    fn beginConnectionWrite(writer: anytype) void {
+        const Writer = switch (@typeInfo(@TypeOf(writer))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(writer),
+        };
+        if (@hasDecl(Writer, "beginConnectionWrite")) writer.beginConnectionWrite();
+    }
+    fn finishConnectionWrite(writer: anytype) !void {
+        const Writer = switch (@typeInfo(@TypeOf(writer))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(writer),
+        };
+        if (@hasDecl(Writer, "finishConnectionWrite")) try writer.finishConnectionWrite();
+    }
+
+    fn writeControlledDataFrame(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, control: WriteControl, offset: *usize) !?u32 {
+        try control.lock(&self.write_mutex, self.io);
+        defer self.write_mutex.unlock(self.io);
+        const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+        if (stream.responseWriteError(self.is_server)) |err| return err;
+        if (data.len == 0) {
+            if (end_stream) {
+                try self.writeFrame(writer, .data, FLAG_END_STREAM, stream_id, &.{});
+                stream.sendEndStream();
+            }
+            return null;
+        }
+        const sw: usize = if (stream.send_window > 0) @intCast(stream.send_window) else 0;
+        const cw: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
+        const count = @min(data.len - offset.*, @min(@min(sw, cw), self.peer_settings.max_frame_size));
+        if (count == 0) {
+            return self.send_window_generation.load(.acquire);
+        }
+        const amount: i32 = @intCast(count);
+        try stream.updateSendWindow(-amount);
+        try self.stream_manager.updateConnectionSendWindow(-amount);
+        const last = offset.* + count == data.len;
+        self.writeFrame(writer, .data, if (last and end_stream) FLAG_END_STREAM else 0, stream_id, data[offset.*..][0..count]) catch |err| {
+            stream.updateSendWindow(amount) catch {};
+            self.stream_manager.updateConnectionSendWindow(amount) catch {};
+            return err;
+        };
+        offset.* += count;
+        if (last and end_stream) stream.sendEndStream();
+        return null;
+    }
+
+    pub fn sendHeadersControlled(self: *Self, writer: anytype, stream_id: u31, headers: []const hpack.HeaderEntry, end_stream: bool, control: WriteControl) !void {
+        beginConnectionWrite(writer);
+        const result = self.sendHeadersControlledLocked(writer, stream_id, headers, end_stream, control);
+        try finishConnectionWrite(writer);
+        try result;
+    }
+    fn sendHeadersControlledLocked(self: *Self, writer: anytype, stream_id: u31, headers: []const hpack.HeaderEntry, end_stream: bool, control: WriteControl) !void {
+        try control.lock(&self.write_mutex, self.io);
+        defer self.write_mutex.unlock(self.io);
+        try self.sendHeaders(writer, stream_id, headers, end_stream);
+    }
+
+    fn waitForCreditTick(generation: *const u32, io: Io, observed: u32, ms: u64) !void {
+        // A wake or polling timeout only authorizes another state check. The
+        // controlled caller owns the absolute deadline and checked reentry.
+        try io.futexWaitTimeout(u32, generation, observed, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } });
+    }
+
+    pub fn notifySendCredit(self: *Self, io: Io) void {
+        _ = self.send_window_generation.fetchAdd(1, .release);
+        io.futexWake(u32, &self.send_window_generation.raw, std.math.maxInt(u32));
+        self.send_window_event.set(io);
+    }
+
     pub fn writeDataBlocking(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool) !void {
         const max_size = self.peer_settings.max_frame_size;
 
         var offset: usize = 0;
+        var stall_deadline: ?Io.Timeout = null;
         while (offset < data.len) {
             const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
             if (stream.responseWriteError(self.is_server)) |err| return err;
@@ -391,25 +530,21 @@ pub const H2Connection = struct {
             const chunk_size = @min(remaining, @min(window, max_size));
 
             if (chunk_size == 0) {
-                // Window exhausted — release mutex, wait for WINDOW_UPDATE, reacquire.
-                {
-                    self.write_mutex.unlock(self.io);
-                    defer self.write_mutex.lockUncancelable(self.io);
-                    self.send_window_event.reset();
-                    // Re-check after reset (receive loop may have updated between our check and reset).
-                    const s2 = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-                    if (s2.responseWriteError(self.is_server)) |err| return err;
-                    const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
-                    const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
-                    if (sw2 == 0 or cw2 == 0) {
-                        self.send_window_event.waitTimeout(self.io, self.send_window_timeout) catch |err| switch (err) {
-                            error.Timeout => return error.Timeout,
-                            error.Canceled => return error.Canceled,
-                        };
-                    }
+                if (stall_deadline == null) stall_deadline = self.send_window_timeout.toDeadline(self.io);
+                if (stall_deadline.?.toDurationFromNow(self.io)) |duration| {
+                    if (duration.raw.toNanoseconds() <= 0) return error.Timeout;
                 }
+                const generation = self.send_window_generation.load(.acquire);
+                self.write_mutex.unlock(self.io);
+                {
+                    defer self.write_mutex.lockUncancelable(self.io);
+                    try self.io.futexWaitTimeout(u32, &self.send_window_generation.raw, generation, stall_deadline.?);
+                }
+                // Spurious wakes and competing streams cannot replace the
+                // original stall deadline. State is rechecked under the lock.
                 continue;
             }
+            stall_deadline = null;
 
             const chunk_i32: i32 = @intCast(chunk_size);
             try stream.updateSendWindow(-chunk_i32);
@@ -510,7 +645,7 @@ pub const H2Connection = struct {
             };
         }
         // Wake any fiber blocked in writeDataBlocking waiting for window space.
-        self.send_window_event.set(self.io);
+        self.notifySendCredit(self.io);
     }
 
     /// Handles a received GOAWAY frame. Signals streams above the peer's
@@ -777,6 +912,9 @@ pub const H2Connection = struct {
             // without changing those established encoder-only call paths.
             if (value.state == .closed and value.cancellation.load(.acquire)) return error.StreamReset;
         }
+        const Writer = if (@typeInfo(@TypeOf(writer)) == .pointer) std.meta.Child(@TypeOf(writer)) else @TypeOf(writer);
+        if (comptime @hasDecl(Writer, "beginEncoding")) try writer.beginEncoding();
+        errdefer if (comptime @hasDecl(Writer, "abortEncoding")) writer.abortEncoding();
         const encoded = try hpack.encodeHeaders(&self.stream_manager.hpack_encode_ctx, h2_headers, self.allocator);
         defer self.allocator.free(encoded);
         try self.writeHeaders(writer, stream_id, encoded, end_stream);
@@ -813,6 +951,19 @@ pub const H2Connection = struct {
     /// Copies payload data so the original frame can be freed afterward.
     /// HPACK decoding happens here (in the receive loop) to avoid concurrent
     /// decode races on the shared hpack_decode_ctx (RFC 7540 §4.3).
+    /// A closed stream still participates in connection-wide compression and
+    /// flow control. Discard payload ownership while preserving sibling state.
+    fn discardClosedStreamFrame(self: *Self, frame: *const Frame) !void {
+        if (frame.header.frame_type == .headers) {
+            const decoded = try self.decodeFrameHeaders(frame.payload, frame.header.flags);
+            defer self.allocator.free(decoded.headers);
+            for (decoded.headers) |header| header.deinit(self.allocator);
+        } else if (frame.header.frame_type == .data and frame.payload.len > 0) {
+            try self.stream_manager.updateConnectionRecvWindow(-@as(i32, @intCast(frame.payload.len)));
+        }
+        return error.ClosedStream;
+    }
+
     pub fn deliverToMailbox(self: *Self, frame: *const Frame) !void {
         const sid = frame.header.stream_id;
         if (sid == 0) return;
@@ -828,7 +979,7 @@ pub const H2Connection = struct {
             // fully processed and removed are a stream error, not a
             // connection error. Return ClosedStream so the caller can
             // send RST_STREAM(STREAM_CLOSED) without killing the connection.
-            if (sid <= self.stream_manager.max_closed_stream_id) return error.ClosedStream;
+            if (sid <= self.stream_manager.max_closed_stream_id) return self.discardClosedStreamFrame(frame);
 
             // RFC 7540 §5.1.2: Don't create new streams after GOAWAY.
             if (self.goaway_received) return error.ProtocolError;
@@ -839,7 +990,7 @@ pub const H2Connection = struct {
                     self.stream_manager.next_client_stream_id
                 else
                     self.stream_manager.next_server_stream_id;
-                if (sid < last_seen) return error.ClosedStream;
+                if (sid < last_seen) return self.discardClosedStreamFrame(frame);
             }
 
             break :blk try self.stream_manager.getOrCreateStream(sid);
@@ -847,6 +998,8 @@ pub const H2Connection = struct {
 
         switch (frame.header.frame_type) {
             .headers => {
+                if (!stream.got_headers and stream.request_deadline_ms == 0)
+                    stream.request_deadline_ms = frame.request_deadline_ms;
                 // Decode HPACK immediately in the receive loop. This is the
                 // only safe place since hpack_decode_ctx is connection-scoped
                 // and stateful — concurrent decodes corrupt the dynamic table.
@@ -875,6 +1028,14 @@ pub const H2Connection = struct {
 
                     stream_mod.freeDecodedHeaders(self.allocator, stream.request_headers);
                     stream.request_headers = dec.headers;
+                    if (self.recv_body_memory_resolver) |resolve| {
+                        if (self.recv_body_memory_context) |context| {
+                            const memory = resolve(context, dec.headers);
+                            stream.data_allocator = memory.allocator;
+                            stream.data_budget = memory.budget;
+                            stream.max_data_size = memory.max_bytes;
+                        }
+                    }
 
                     if (!self.is_server) {
                         if (stream.max_error_data_size) |limit| error_limit: {
@@ -998,7 +1159,7 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
-                const budget = self.recv_data_budget;
+                const budget = if (self.recv_body_memory_resolver != null) stream.data_budget else self.recv_data_budget;
                 if (budget) |shared| {
                     if (!shared.tryReserve(data_payload.len)) {
                         stream.stream_error = error.BodyCapacityExceeded;
@@ -1008,9 +1169,13 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
-                stream.data_buf.appendSlice(self.allocator, data_payload) catch |err| {
+                stream.data_buf.appendSlice(stream.data_allocator orelse self.allocator, data_payload) catch |err| {
                     if (budget) |shared| shared.release(data_payload.len);
-                    return err;
+                    stream.stream_error = err;
+                    stream.completed = true;
+                    if (stream.data_event) |ev| ev.set(self.io);
+                    stream.completion_event.set(self.io);
+                    return;
                 };
                 if (budget) |shared| {
                     stream.data_budget = shared;
@@ -1055,6 +1220,9 @@ pub const H2Connection = struct {
                 stream.reset();
                 stream.completion_event.set(self.io);
                 if (stream.data_event) |ev| ev.set(self.io);
+                // Credit-blocked response writers must observe the reset too.
+                // Publish cancellation/state before waking them to recheck.
+                self.notifySendCredit(self.io);
             },
             else => {},
         }
@@ -1070,12 +1238,14 @@ pub const H2Connection = struct {
 
         const maybe = try self.dispatchFrame(&frame, writer);
         if (maybe) |sf| {
-            self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
+            self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload, .request_deadline_ms = sf.request_deadline_ms }) catch |err| switch (err) {
                 // RFC 7540 §5.1: late frame for a closed stream — send
                 // RST_STREAM(STREAM_CLOSED) but keep the connection alive.
-                // No WINDOW_UPDATE accumulation: deliverToMailbox returned
-                // before accepting the data, so no credit was consumed.
+                // Discarded DATA still consumes connection credit; refund
+                // that credit without reopening the retired stream.
                 error.ClosedStream => {
+                    if (sf.header.frame_type == .data and sf.payload.len > 0)
+                        try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
                     self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
                     return sf.header.stream_id;
                 },
@@ -1083,8 +1253,8 @@ pub const H2Connection = struct {
             };
             // Accumulate WINDOW_UPDATE *after* successful delivery so the
             // credit matches the actual recv window decrement in deliverToMailbox.
-            // This avoids permanent window inflation when delivery fails
-            // (ClosedStream) after accumulateWindowUpdate has already flushed.
+            // ClosedStream has its own refund path after consuming only
+            // connection credit, so a retired stream never gains credit.
             if (sf.header.frame_type == .data and sf.payload.len > 0) {
                 try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
             }
@@ -1097,7 +1267,7 @@ pub const H2Connection = struct {
                         // A server handler already waiting on this body can
                         // translate aggregate ingress exhaustion into a 429
                         // response, then reset the still-open remote half.
-                        const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded else false;
+                        const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded or err == error.OutOfMemory else false;
                         if (!(is_body_capacity and stream.data_event != null)) {
                             const code: Http2ErrorCode = if (is_body_capacity)
                                 .enhance_your_calm
@@ -1143,8 +1313,10 @@ pub const H2Connection = struct {
             if (maybe) |sf| {
                 // deliverToMailbox decodes HPACK + copies payload under lock,
                 // ensuring the shared hpack_decode_ctx is not accessed concurrently.
-                self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
+                self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload, .request_deadline_ms = sf.request_deadline_ms }) catch |err| switch (err) {
                     error.ClosedStream => {
+                        if (sf.header.frame_type == .data and sf.payload.len > 0)
+                            try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
                         self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
                         return sf.header.stream_id;
                     },
@@ -1160,7 +1332,7 @@ pub const H2Connection = struct {
                 if (sf.header.frame_type == .data) {
                     if (self.stream_manager.getStream(sf.header.stream_id)) |stream| {
                         if (stream.stream_error != null) {
-                            const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded else false;
+                            const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded or err == error.OutOfMemory else false;
                             if (!(is_body_capacity and stream.data_event != null)) {
                                 const code: Http2ErrorCode = if (is_body_capacity)
                                     .enhance_your_calm
@@ -1232,13 +1404,16 @@ pub const H2Connection = struct {
         while (it.next()) |entry| {
             const s = entry.value_ptr.*;
             s.cancellation.store(true, .release);
-            if (!s.completed) {
+            // `completed` also marks the incoming request body. A half-closed
+            // request may still own a credit-blocked response writer.
+            if (s.state != .closed) {
                 s.stream_error = err;
                 s.completed = true;
                 if (s.data_event) |ev| ev.set(self.io);
                 s.completion_event.set(self.io);
             }
         }
+        self.notifySendCredit(self.io);
     }
 
     // ---------------------------------------------------------------
@@ -1268,11 +1443,10 @@ pub const H2Connection = struct {
         } else if (@hasDecl(Child, "recv")) {
             return reader.recv(buf);
         } else if (Reader == *std.Io.Reader) {
-            var iov = [_][]u8{buf};
-            return reader.readVec(&iov) catch |err| switch (err) {
-                error.EndOfStream => @as(usize, 0),
-                else => err,
-            };
+            // Buffered readers (including TLS) may return zero from readVec
+            // while filling their own buffer. Only EndOfStream denotes EOF.
+            // This adapter fills the requested frame span through that progress.
+            return reader.readSliceShort(buf);
         } else {
             @compileError("readSome: reader must have .read() or .recv() method, got " ++ @typeName(Reader));
         }
@@ -3529,6 +3703,362 @@ test "H2 error envelopes select their bounded limit before DATA allocation" {
         } else {
             try std.testing.expectEqual(error.StreamDataOverflow, stream.stream_error.?);
             try std.testing.expectEqual(@as(usize, 0), stream.data_buf.items.len);
+        }
+    }
+}
+
+const ControlledH2Test = struct {
+    io: Io,
+    deadline_ms: i64,
+    canceled: std.atomic.Value(bool) = .init(false),
+    observed: Io.Event = .unset,
+    fn check(raw: ?*anyopaque) WriteControl.Error!void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.observed.set(self.io);
+        if (self.canceled.load(.acquire)) return error.Canceled;
+        if (@import("../util/common.zig").milliTimestamp(self.io) >= self.deadline_ms) return error.Timeout;
+    }
+    fn remaining(raw: ?*anyopaque) WriteControl.Error!?u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        return @intCast(@max(0, self.deadline_ms - @import("../util/common.zig").milliTimestamp(self.io)));
+    }
+    fn view(self: *@This()) WriteControl {
+        return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining };
+    }
+};
+
+test "H2 controlled flow wait retains original deadline and permits connection control progress" {
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.send_window = 0;
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var control = ControlledH2Test{ .io = io, .deadline_ms = @import("../util/common.zig").milliTimestamp(io) + 250 };
+    var call = try io.concurrent(struct {
+        fn run(conn: *H2Connection, bytes: *std.ArrayListUnmanaged(u8), original: *ControlledH2Test) anyerror!void {
+            return conn.writeDataBlockingControlled(testWriter(bytes, std.testing.allocator), 1, "blocked", true, original.view());
+        }
+    }.run, .{ &connection, &wire, &control });
+    defer call.cancel(io) catch {};
+    try control.observed.wait(io);
+    // The connection's own control traffic can acquire the same mutex while
+    // the stream lacks DATA credit. No shared deadline or timeout is changed.
+    try io.sleep(.fromMilliseconds(30), .awake);
+    try std.testing.expect(connection.write_mutex.tryLock());
+    try connection.sendPing(testWriter(&wire, std.testing.allocator), "control!".*);
+    connection.write_mutex.unlock(io);
+    try std.testing.expectError(error.Timeout, call.await(io));
+    try std.testing.expect(!stream.end_stream_sent);
+    try std.testing.expectEqual(@as(i32, 0), stream.send_window);
+    try std.testing.expectEqual(@as(usize, 17), wire.items.len);
+    try std.testing.expect(connection.write_mutex.tryLock());
+    connection.write_mutex.unlock(io);
+}
+
+test "H2 controlled lock wait honors original deadline without emitting a frame" {
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var control = ControlledH2Test{ .io = io, .deadline_ms = @import("../util/common.zig").milliTimestamp(io) + 100 };
+    connection.write_mutex.lockUncancelable(io);
+    defer connection.write_mutex.unlock(io);
+    try std.testing.expectError(error.Timeout, connection.writeDataBlockingControlled(testWriter(&wire, std.testing.allocator), 1, "blocked", true, control.view()));
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+    try std.testing.expect(!stream.end_stream_sent);
+}
+
+test "H2 controlled flow wait observes original cancellation without END_STREAM" {
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.send_window = 0;
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var control = ControlledH2Test{ .io = io, .deadline_ms = @import("../util/common.zig").milliTimestamp(io) + 1000 };
+    var call = try io.concurrent(struct {
+        fn run(conn: *H2Connection, bytes: *std.ArrayListUnmanaged(u8), original: *ControlledH2Test) anyerror!void {
+            return conn.writeDataBlockingControlled(testWriter(bytes, std.testing.allocator), 1, "blocked", true, original.view());
+        }
+    }.run, .{ &connection, &wire, &control });
+    defer call.cancel(io) catch {};
+    try control.observed.wait(io);
+    control.canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, call.await(io));
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+    try std.testing.expect(!stream.end_stream_sent);
+    try std.testing.expect(connection.write_mutex.tryLock());
+    connection.write_mutex.unlock(io);
+}
+
+test "H2 controlled available credit sends valid DATA and END_STREAM" {
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var control = ControlledH2Test{ .io = io, .deadline_ms = @import("../util/common.zig").milliTimestamp(io) + 1000 };
+    try connection.writeDataBlockingControlled(testWriter(&wire, std.testing.allocator), 1, "payload", true, control.view());
+    try std.testing.expectEqualStrings("payload", wire.items[9..]);
+    try std.testing.expectEqual(@as(u8, H2Connection.FLAG_END_STREAM), wire.items[4]);
+    try std.testing.expect(stream.end_stream_sent);
+}
+
+test "H2 controlled credit waits release CPU and restore it before frame serialization" {
+    const State = struct {
+        conn: *H2Connection,
+        parked: std.atomic.Value(bool) = .init(false),
+        waiting: Io.Event = .unset,
+        begins: usize = 0,
+        ends: usize = 0,
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // Before the first publication, the peer has not acquired the
+            // mutex. Later polling callbacks can overlap the peer's window
+            // update; a failed tryLock then does not imply caller ownership.
+            if (self.begins == 0) {
+                try std.testing.expect(self.conn.write_mutex.tryLock());
+                self.conn.write_mutex.unlock(self.conn.io);
+            }
+            try std.testing.expect(!self.parked.swap(true, .acq_rel));
+            self.begins += 1;
+            self.waiting.set(self.conn.io);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked.swap(false, .acq_rel));
+            self.ends += 1;
+        }
+        fn run(self: *@This()) !void {
+            try self.conn.writeDataBlockingControlled(self, 1, "payload", true, .{ .ptr = self, .wait_begin_fn = begin, .wait_end_fn = end });
+        }
+        pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+            // Header/DATA serialization runs only after the weighted resume.
+            try std.testing.expect(!self.parked.load(.acquire));
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.send_window = 0;
+    var state = State{ .conn = &connection };
+    defer state.bytes.deinit(std.testing.allocator);
+    var task = try io.concurrent(State.run, .{&state});
+    defer task.cancel(io) catch {};
+    try state.waiting.wait(io);
+    connection.write_mutex.lockUncancelable(io);
+    stream.send_window = 100;
+    connection.notifySendCredit(io);
+    connection.write_mutex.unlock(io);
+    try task.await(io);
+    try std.testing.expect(state.begins > 0);
+    try std.testing.expectEqual(state.begins, state.ends);
+    try std.testing.expect(!state.parked.load(.acquire));
+    try std.testing.expect(stream.end_stream_sent);
+    try std.testing.expectEqual(@as(usize, 16), state.bytes.items.len);
+    try std.testing.expectEqualStrings("payload", state.bytes.items[9..]);
+}
+
+test "H2 controlled header block remains atomic and unlocks before denied reentry" {
+    const Writer = struct {
+        connection: *H2Connection,
+        active: bool = false,
+        writes: usize = 0,
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        pub fn beginConnectionWrite(self: *@This()) void {
+            std.debug.assert(!self.active);
+            self.active = true;
+        }
+        pub fn finishConnectionWrite(self: *@This()) !void {
+            try std.testing.expect(self.active);
+            try std.testing.expect(self.writes >= 4);
+            try std.testing.expect(self.connection.write_mutex.tryLock());
+            self.connection.write_mutex.unlock(self.connection.io);
+            self.active = false;
+            return error.Denied;
+        }
+        pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+            try std.testing.expect(self.active);
+            self.writes += 1;
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    var connection = H2Connection.initServer(std.testing.allocator, std.testing.io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    const value = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'a');
+    var writer = Writer{ .connection = &connection };
+    defer writer.bytes.deinit(std.testing.allocator);
+    try std.testing.expectError(error.Denied, connection.sendHeadersControlled(&writer, 1, &.{.{ .name = "x-large", .value = value }}, false, .{}));
+    try std.testing.expect(!writer.active);
+    var offset: usize = 0;
+    var frames: usize = 0;
+    while (offset < writer.bytes.items.len) {
+        const header = writer.bytes.items[offset..][0..9];
+        const length = (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | header[2];
+        try std.testing.expectEqual(@as(u8, if (frames == 0) 1 else 9), header[3]);
+        offset += 9 + length;
+        try std.testing.expectEqual(offset == writer.bytes.items.len, header[4] & H2Connection.FLAG_END_HEADERS != 0);
+        frames += 1;
+    }
+    try std.testing.expect(frames >= 2);
+    try std.testing.expectEqual(writer.bytes.items.len, offset);
+}
+
+test "H2 controlled peer initial window applies to future incoming and locally created streams" {
+    var server = H2Connection.initServer(std.testing.allocator, std.testing.io);
+    defer server.deinit();
+    var settings = http.Http2ConnectionSettings{};
+    settings.initial_window_size = 0;
+    var buffer: [36]u8 = undefined;
+    try server.applyPeerSettings(http.encodeSettingsPayloadBuf(settings, &buffer));
+    const incoming = try server.stream_manager.getOrCreateStream(1);
+    try incoming.open();
+    try std.testing.expectEqual(@as(i32, 0), incoming.send_window);
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    try std.testing.expectError(error.FlowControlError, server.writeData(testWriter(&wire, std.testing.allocator), 1, "blocked", true));
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+    try incoming.updateSendWindow(5);
+    try server.writeData(testWriter(&wire, std.testing.allocator), 1, "ready", true);
+    try std.testing.expect(incoming.end_stream_sent);
+    var client = H2Connection.initClient(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+    settings.initial_window_size = 7;
+    try client.applyPeerSettings(http.encodeSettingsPayloadBuf(settings, &buffer));
+    const first = try client.stream_manager.createStream();
+    try std.testing.expectEqual(@as(i32, 7), first.send_window);
+    try first.updateSendWindow(-3);
+    settings.initial_window_size = 0;
+    try client.applyPeerSettings(http.encodeSettingsPayloadBuf(settings, &buffer));
+    try std.testing.expectEqual(@as(i32, -3), first.send_window);
+    const next = try client.stream_manager.createStream();
+    try std.testing.expectEqual(@as(i32, 0), next.send_window);
+}
+
+test "late retired-stream DATA refunds only connection credit" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |locked| {
+        var conn = H2Connection.initServer(alloc, std.testing.io);
+        defer conn.deinit();
+        conn.window_update_threshold = 1;
+        const stream = try conn.stream_manager.getOrCreateStream(1);
+        stream.state = .open;
+        conn.stream_manager.removeStream(1);
+        const initial = conn.stream_manager.connection_recv_window;
+        for (0..8) |_| {
+            var input: std.ArrayListUnmanaged(u8) = .empty;
+            defer input.deinit(alloc);
+            try conn.writeFrame(testWriter(&input, alloc), .data, 0, 1, "abc");
+            var reader: TestReader = .{ .data = input.items };
+            var output: std.ArrayListUnmanaged(u8) = .empty;
+            defer output.deinit(alloc);
+            const writer = testWriter(&output, alloc);
+            const delivered = if (locked) try conn.processOneFrameLocked(&reader, writer) else try conn.processOneFrame(&reader, writer);
+            try std.testing.expectEqual(@as(?u31, 1), delivered);
+            try std.testing.expectEqual(initial, conn.stream_manager.connection_recv_window);
+            try std.testing.expectEqual(@as(u32, 0), conn.pending_conn_window_update);
+            try std.testing.expectEqual(@as(usize, 0), conn.stream_manager.activeStreamCount());
+            var reply_reader: TestReader = .{ .data = output.items };
+            var credit = try conn.readFrame(&reply_reader);
+            defer credit.deinit(alloc);
+            try std.testing.expectEqual(Http2FrameType.window_update, credit.header.frame_type);
+            try std.testing.expectEqual(@as(u31, 0), credit.header.stream_id);
+            try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, credit.payload[0..4], .big));
+            var reset = try conn.readFrame(&reply_reader);
+            defer reset.deinit(alloc);
+            try std.testing.expectEqual(Http2FrameType.rst_stream, reset.header.frame_type);
+            try std.testing.expectEqual(@as(u31, 1), reset.header.stream_id);
+        }
+    }
+}
+
+test "late retired-stream HEADERS preserve shared HPACK state" {
+    const alloc = std.testing.allocator;
+    var sender = H2Connection.initServer(alloc, std.testing.io);
+    defer sender.deinit();
+    var receiver = H2Connection.initClient(alloc, std.testing.io);
+    defer receiver.deinit();
+    const first = try receiver.stream_manager.createStream();
+    first.state = .open;
+    receiver.stream_manager.removeStream(first.id);
+    const second = try receiver.stream_manager.createStream();
+    const headers = [_]hpack.HeaderEntry{ .{ .name = ":status", .value = "200" }, .{ .name = "x-retained-table", .value = "shared-value" } };
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(alloc);
+    const writer = testWriter(&wire, alloc);
+    try sender.sendHeaders(writer, 1, &headers, true);
+    try sender.sendHeaders(writer, second.id, &headers, true);
+    var reader: TestReader = .{ .data = wire.items };
+    var discarded = try receiver.readFrame(&reader);
+    defer discarded.deinit(alloc);
+    try std.testing.expectError(error.ClosedStream, receiver.deliverToMailbox(&discarded));
+    var accepted = try receiver.readFrame(&reader);
+    defer accepted.deinit(alloc);
+    try receiver.deliverToMailbox(&accepted);
+    const decoded = second.request_headers.?;
+    try std.testing.expectEqualStrings("x-retained-table", decoded[1].name);
+    try std.testing.expectEqualStrings("shared-value", decoded[1].value);
+    try std.testing.expect(second.completed);
+}
+
+test "pooled H2 stream buffered progress preserves frames and rejects truncated payload" {
+    const Buffered = struct {
+        reader: std.Io.Reader,
+        input: []const u8,
+        calls: usize = 0,
+        fn stream(r: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            var empty: [0][]u8 = .{};
+            return readVec(r, &empty);
+        }
+        fn readVec(r: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            self.calls += 1;
+            if (self.calls == 1) return 0;
+            if (self.calls > 2) return error.EndOfStream;
+            @memcpy(r.buffer[0..self.input.len], self.input);
+            r.seek = 0;
+            r.end = self.input.len;
+            // Same buffered-output contract as the TLS reader: the bytes are
+            // available in reader.buffer rather than copied to the caller.
+            return 0;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var conn = H2Connection.initClient(alloc, std.testing.io);
+    defer conn.deinit();
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(alloc);
+    try conn.writeFrame(testWriter(&wire, alloc), .ping, H2Connection.FLAG_ACK, 0, "h2ping\x00\x00");
+    for ([_]bool{ false, true }) |truncated| {
+        var buffer: [17]u8 = undefined;
+        var source: Buffered = .{ .reader = .{ .buffer = &buffer, .seek = 0, .end = 0, .vtable = &.{ .stream = Buffered.stream, .readVec = Buffered.readVec } }, .input = wire.items[0 .. wire.items.len - @as(usize, if (truncated) 1 else 0)] };
+        if (truncated) {
+            try std.testing.expectError(error.ConnectionClosed, conn.readFrame(&source.reader));
+        } else {
+            var frame = try conn.readFrame(&source.reader);
+            defer frame.deinit(alloc);
+            try std.testing.expectEqual(Http2FrameType.ping, frame.header.frame_type);
+            try std.testing.expectEqual(H2Connection.FLAG_ACK, frame.header.flags);
+            try std.testing.expectEqualStrings("h2ping\x00\x00", frame.payload);
         }
     }
 }

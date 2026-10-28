@@ -125,6 +125,13 @@ pub fn encodeAlloc(alloc: Allocator, record: Record) ![]u8 {
 pub fn encodeInto(out: []u8, record: Record) !void {
     const required = try encodedLen(record.payload.len);
     if (out.len != required) return error.InvalidOutputLength;
+    _ = try decodeRecordKind(@backingInt(record.kind));
+    _ = try decodePayloadCodec(@backingInt(record.payload_codec));
+    try encodeHeader(out[0..header_size], record, record.payload.len, Crc32.hash(record.payload));
+    @memcpy(out[header_size..], record.payload);
+}
+
+fn encodeHeader(out: *[header_size]u8, record: Record, payload_len: usize, payload_crc: u32) !void {
     const record_kind = try decodeRecordKind(@backingInt(record.kind));
     const payload_codec = try decodePayloadCodec(@backingInt(record.payload_codec));
 
@@ -143,13 +150,83 @@ pub fn encodeInto(out: []u8, record: Record) !void {
     std.mem.writeInt(u64, out[lsn_offset..][0..8], record.lsn, .little);
     std.mem.writeInt(u64, out[previous_lsn_offset..][0..8], record.previous_lsn, .little);
     std.mem.writeInt(i64, out[commit_timestamp_ns_offset..][0..8], record.commit_timestamp_ns, .little);
-    std.mem.writeInt(u64, out[payload_len_offset..][0..8], @intCast(record.payload.len), .little);
-    std.mem.writeInt(u32, out[payload_crc_offset..][0..4], Crc32.hash(record.payload), .little);
+    std.mem.writeInt(u64, out[payload_len_offset..][0..8], @intCast(payload_len), .little);
+    std.mem.writeInt(u32, out[payload_crc_offset..][0..4], payload_crc, .little);
     std.mem.writeInt(u32, out[header_crc_offset..][0..4], Crc32.hash(out[0..header_crc_offset]), .little);
-    @memcpy(out[header_size..], record.payload);
 }
 
+/// Envelope storage and the payload checksum are acquired before the local
+/// commit. Sealing only writes the fixed-size header; it does not allocate,
+/// copy the payload, or rescan it. No request control survives construction.
+pub const Prepared = struct {
+    allocator: Allocator,
+    encoded: []u8,
+    payload_crc: u32,
+
+    pub fn init(allocator: Allocator, payload: []const u8, control: ?@import("../../common/read_admission.zig").Port) !Prepared {
+        if (control) |port| try port.checkpoint();
+        const encoded = try allocator.alloc(u8, try encodedLen(payload.len));
+        errdefer allocator.free(encoded);
+        var crc = Crc32.init();
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            if (control) |port| try port.checkpoint();
+            const end = offset + @min(payload.len - offset, 4096);
+            @memcpy(encoded[header_size + offset .. header_size + end], payload[offset..end]);
+            crc.update(payload[offset..end]);
+            offset = end;
+        }
+        if (control) |port| try port.checkpoint();
+        return .{ .allocator = allocator, .encoded = encoded, .payload_crc = crc.final() };
+    }
+
+    pub fn seal(self: *Prepared, metadata: Record) ![]const u8 {
+        // Payload ownership is internal; metadata cannot substitute other bytes
+        // after precommit admission or reuse a checksum for a different value.
+        if (metadata.payload.len != 0) return error.InvalidArgument;
+        try encodeHeader(self.encoded[0..header_size], metadata, self.encoded.len - header_size, self.payload_crc);
+        return self.encoded;
+    }
+
+    pub fn deinit(self: *Prepared) void {
+        self.allocator.free(self.encoded);
+        self.* = undefined;
+    }
+};
+
 pub fn decode(bytes: []const u8) !RecordView {
+    return decodeWithAdmission(bytes, null);
+}
+
+/// Caller-held publication/snapshot dependencies must pass a retained-lifetime
+/// port. Neither this synchronous decoder nor its borrowed result owns it.
+pub fn decodeWithAdmission(bytes: []const u8, control: ?@import("../../common/read_admission.zig").Port) !RecordView {
+    if (control) |port| try port.checkpoint();
+    const payload_len = try declaredPayloadLen(bytes);
+    const total_len = try encodedLen(payload_len);
+    if (bytes.len < total_len) return error.EndOfStream;
+    if (bytes.len != total_len) return error.TrailingBytes;
+
+    const payload = bytes[header_size..total_len];
+    const stored_payload_crc = std.mem.readInt(u32, bytes[payload_crc_offset..][0..4], .little);
+    const computed_payload_crc = if (control) |port| blk: {
+        var crc = Crc32.init();
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            try port.checkpoint();
+            const end = offset + @min(64 * 1024, payload.len - offset);
+            crc.update(payload[offset..end]);
+            offset = end;
+        }
+        try port.checkpoint();
+        break :blk crc.final();
+    } else Crc32.hash(payload);
+    if (stored_payload_crc != computed_payload_crc) return error.PayloadCrcMismatch;
+
+    return decodeFields(bytes, payload);
+}
+
+fn declaredPayloadLen(bytes: []const u8) !usize {
     if (bytes.len < header_size) return error.EndOfStream;
     if (!std.mem.eql(u8, bytes[0..8], &magic)) return error.InvalidMagic;
 
@@ -166,15 +243,10 @@ pub fn decode(bytes: []const u8) !RecordView {
     const payload_len_u64 = std.mem.readInt(u64, bytes[payload_len_offset..][0..8], .little);
     if (payload_len_u64 > std.math.maxInt(usize)) return error.PayloadTooLarge;
     const payload_len: usize = @intCast(payload_len_u64);
-    const total_len = try encodedLen(payload_len);
-    if (bytes.len < total_len) return error.EndOfStream;
-    if (bytes.len != total_len) return error.TrailingBytes;
+    return payload_len;
+}
 
-    const payload = bytes[header_size..total_len];
-    const stored_payload_crc = std.mem.readInt(u32, bytes[payload_crc_offset..][0..4], .little);
-    const computed_payload_crc = Crc32.hash(payload);
-    if (stored_payload_crc != computed_payload_crc) return error.PayloadCrcMismatch;
-
+fn decodeFields(bytes: []const u8, payload: []const u8) !RecordView {
     return .{
         .kind = try decodeRecordKind(std.mem.readInt(u16, bytes[record_kind_offset..][0..2], .little)),
         .payload_codec = try decodePayloadCodec(std.mem.readInt(u16, bytes[payload_codec_offset..][0..2], .little)),
@@ -190,6 +262,68 @@ pub fn decode(bytes: []const u8) !RecordView {
         .payload = payload,
     };
 }
+
+/// Scalar streaming verification/matching state. Input and expected payload
+/// are fresh synchronous borrows; no provider, allocator or Port is retained.
+pub const MatchCursor = struct {
+    pub const Expected = struct { lsn: u64, kind: RecordKind, payload: []const u8, shard_id: u64, table_id: u64 };
+    header: [header_size]u8 = undefined,
+    offset: usize = 0,
+    payload_len: ?usize = null,
+    crc: Crc32 = .init(),
+    equal: bool = true,
+    result: ?bool = null,
+    failure: ?anyerror = null,
+
+    /// Consume at most 64 KiB exactly once, in order. `last` identifies the end
+    /// of the entire owned WAL value, not just the current input window.
+    pub fn consume(self: *@This(), bytes: []const u8, last: bool, expected: Expected, control: @import("../../common/read_admission.zig").Port) !?bool {
+        if (bytes.len > 64 * 1024 or (bytes.len == 0 and !last)) return error.InvalidArgument;
+        if (self.failure) |err| return err;
+        if (self.result != null) return error.InvalidArgument;
+        return self.advance(bytes, last, expected, control) catch |err| {
+            self.failure = err;
+            return err;
+        };
+    }
+    fn advance(self: *@This(), bytes: []const u8, last: bool, expected: Expected, control: @import("../../common/read_admission.zig").Port) !?bool {
+        try control.checkpoint();
+        var input = bytes;
+        if (self.offset < header_size) {
+            const take = @min(input.len, header_size - self.offset);
+            @memcpy(self.header[self.offset..][0..take], input[0..take]);
+            self.offset += take;
+            input = input[take..];
+            if (self.offset == header_size) self.payload_len = try declaredPayloadLen(&self.header);
+        }
+        if (self.payload_len) |len| {
+            const total = try encodedLen(len);
+            const next = try std.math.add(usize, self.offset, input.len);
+            if (next > total) return error.TrailingBytes;
+            const payload_offset = self.offset - header_size;
+            self.crc.update(input);
+            if (len != expected.payload.len) self.equal = false;
+            if (self.equal and !std.mem.eql(u8, input, expected.payload[payload_offset..][0..input.len])) self.equal = false;
+            self.offset = next;
+            if (last) {
+                if (self.offset < total) return error.EndOfStream;
+                if (self.crc.final() != std.mem.readInt(u32, self.header[payload_crc_offset..][0..4], .little)) return error.PayloadCrcMismatch;
+                // Kind/codec and WAL continuity follow payload validation,
+                // matching the complete decoder's corruption precedence.
+                const record = try decodeFields(&self.header, &.{});
+                if (record.lsn != expected.lsn) return error.RecordWalLsnMismatch;
+                const next_lsn = std.math.add(u64, record.previous_lsn, 1) catch return error.RecordPreviousLsnMismatch;
+                if (next_lsn != record.lsn) return error.RecordPreviousLsnMismatch;
+                const matched = self.equal and record.kind == expected.kind and record.shard_id == expected.shard_id and record.table_id == expected.table_id;
+                try control.checkpoint();
+                self.result = matched;
+                return matched;
+            }
+        } else if (last) return error.EndOfStream;
+        try control.checkpoint();
+        return null;
+    }
+};
 
 test "replication record round trips all envelope fields" {
     const payload = "doc:alpha={\"ok\":true}";
@@ -340,4 +474,190 @@ test "replication record refuses to encode unknown current-version kind and code
         .lsn = 4,
         .previous_lsn = 3,
     }));
+}
+
+test "replication record controlled decoding rejects original lifetime between payload checksum quanta" {
+    const read = @import("../../common/read_admission.zig");
+    const State = struct {
+        checks: usize = 0,
+        reject_at: usize = 0,
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject_at) return self.cause;
+        }
+    };
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 3 * 64 * 1024 + 17);
+    defer a.free(bytes);
+    @memset(bytes, 93);
+    const encoded = try encodeAlloc(a, .{ .kind = .batch_mutation, .cluster_id = 1, .shard_id = 2, .table_id = 3, .timeline_id = 1, .epoch = 1, .lsn = 7, .previous_lsn = 6, .payload = bytes });
+    defer a.free(encoded);
+    var state: State = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+    const control = read.Port.init(&payload);
+    try std.testing.expectEqualDeep(try decode(encoded), try decodeWithAdmission(encoded, control));
+    const checks = state.checks;
+    try std.testing.expect(checks >= 6);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        for (1..checks + 1) |reject_at| {
+            state = .{ .cause = cause, .reject_at = reject_at };
+            try std.testing.expectError(cause, decodeWithAdmission(encoded, control));
+            try std.testing.expectEqual(reject_at, state.checks);
+        }
+    }
+    state = .{};
+    encoded[encoded.len - 1] ^= 1;
+    try std.testing.expectError(error.PayloadCrcMismatch, decodeWithAdmission(encoded, control));
+    try std.testing.expectError(error.PayloadCrcMismatch, decode(encoded));
+}
+
+fn drainMatchForTest(encoded: []const u8, expected: MatchCursor.Expected, quantum: usize) !bool {
+    const read_control = @import("../../common/read_admission.zig");
+    const Check = struct {
+        active: bool = true,
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.active) return error.ExpiredMatchBorrow;
+        }
+    };
+    var cursor: MatchCursor = .{};
+    while (true) {
+        const offset = cursor.offset;
+        const take = @min(quantum, encoded.len - offset);
+        const source = try std.testing.allocator.dupe(u8, encoded[offset..][0..take]);
+        defer std.testing.allocator.free(source);
+        const payload = try std.testing.allocator.dupe(u8, expected.payload);
+        defer std.testing.allocator.free(payload);
+        var state: Check = .{};
+        const authority: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = Check.run, .check_lifetime = Check.run } };
+        var fresh = expected;
+        fresh.payload = payload;
+        const result = cursor.consume(source, offset + take == encoded.len, fresh, read_control.Port.init(&authority));
+        state.active = false;
+        @memset(source, 0xDD);
+        @memset(payload, 0xCC);
+        if (try result) |matched| return matched;
+        try std.testing.expectEqual(offset + take, cursor.offset);
+    }
+}
+
+test "replication record controlled continuation verifies exact payload with fresh window and expectation borrows" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 65536 + 19);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 73);
+    const encoded = try encodeAlloc(a, .{ .kind = .batch_mutation, .cluster_id = 1, .shard_id = 2, .table_id = 3, .timeline_id = 4, .epoch = 5, .lsn = 7, .previous_lsn = 6, .payload = payload });
+    defer a.free(encoded);
+    const expected: MatchCursor.Expected = .{ .lsn = 7, .kind = .batch_mutation, .payload = payload, .shard_id = 2, .table_id = 3 };
+    for ([_]usize{ 97, 4093, 65536 }) |quantum| try std.testing.expect(try drainMatchForTest(encoded, expected, quantum));
+    const wrong = try a.dupe(u8, payload);
+    defer a.free(wrong);
+    wrong[wrong.len - 1] ^= 1;
+    var mismatch = expected;
+    mismatch.payload = wrong;
+    try std.testing.expect(!try drainMatchForTest(encoded, mismatch, 4093));
+    mismatch = expected;
+    mismatch.table_id += 1;
+    try std.testing.expect(!try drainMatchForTest(encoded, mismatch, 4093));
+    const empty = try encodeAlloc(a, .{ .kind = .batch_mutation, .cluster_id = 1, .shard_id = 2, .table_id = 3, .timeline_id = 4, .epoch = 5, .lsn = 7, .previous_lsn = 6 });
+    defer a.free(empty);
+    mismatch = expected;
+    mismatch.payload = "";
+    try std.testing.expect(try drainMatchForTest(empty, mismatch, 1));
+}
+
+test "replication record controlled continuation preserves corruption precedence and WAL continuity" {
+    const a = std.testing.allocator;
+    const valid = try encodeAlloc(a, .{ .kind = .batch_mutation, .cluster_id = 1, .shard_id = 2, .table_id = 3, .timeline_id = 4, .epoch = 5, .lsn = 7, .previous_lsn = 6, .payload = "wanted" });
+    defer a.free(valid);
+    const expected: MatchCursor.Expected = .{ .lsn = 7, .kind = .batch_mutation, .payload = "wanted", .shard_id = 2, .table_id = 3 };
+    for (0..14) |variant| {
+        const bytes = try a.alloc(u8, valid.len + 1);
+        defer a.free(bytes);
+        @memcpy(bytes[0..valid.len], valid);
+        bytes[valid.len] = 0;
+        var len = valid.len;
+        switch (variant) {
+            0 => bytes[0] ^= 1,
+            1 => std.mem.writeInt(u16, bytes[version_offset..][0..2], 0, .little),
+            2 => std.mem.writeInt(u16, bytes[header_len_offset..][0..2], header_size + 1, .little),
+            3 => bytes[header_crc_offset] ^= 1,
+            4 => bytes[header_size] ^= 1,
+            5, 12 => std.mem.writeInt(u16, bytes[record_kind_offset..][0..2], 0xFFFF, .little),
+            6 => std.mem.writeInt(u16, bytes[payload_codec_offset..][0..2], 0xFFFF, .little),
+            7 => std.mem.writeInt(u64, bytes[lsn_offset..][0..8], 9, .little),
+            8 => std.mem.writeInt(u64, bytes[previous_lsn_offset..][0..8], 7, .little),
+            9 => std.mem.writeInt(u64, bytes[payload_len_offset..][0..8], 7, .little),
+            10 => len += 1,
+            11 => len = header_size - 1,
+            13 => std.mem.writeInt(u64, bytes[payload_len_offset..][0..8], std.math.maxInt(u64), .little),
+            else => unreachable,
+        }
+        if (variant == 12) bytes[header_size] ^= 1;
+        if ((variant >= 5 and variant <= 9) or variant == 12 or variant == 13)
+            std.mem.writeInt(u32, bytes[header_crc_offset..][0..4], Crc32.hash(bytes[0..header_crc_offset]), .little);
+        const Reference = struct {
+            fn validate(input: []const u8) !void {
+                const record = try decode(input);
+                if (record.lsn != 7) return error.RecordWalLsnMismatch;
+                const next = std.math.add(u64, record.previous_lsn, 1) catch return error.RecordPreviousLsnMismatch;
+                if (next != record.lsn) return error.RecordPreviousLsnMismatch;
+            }
+        };
+        Reference.validate(bytes[0..len]) catch |cause| {
+            try std.testing.expectError(cause, drainMatchForTest(bytes[0..len], expected, 17));
+            continue;
+        };
+        return error.ExpectedCorruptRecord;
+    }
+}
+
+test "replication record prepared envelope matches wire bytes without postprepare allocations or payload borrows" {
+    const alloc = std.testing.allocator;
+    var input: [9001]u8 = @splat(91);
+    input[3] = 0;
+    const original = input;
+    var storage: [header_size + input.len]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var prepared = try Prepared.init(fixed.allocator(), &input, null);
+    defer prepared.deinit();
+    @memset(&input, 1);
+    try std.testing.expectError(error.OutOfMemory, fixed.allocator().alloc(u8, 1));
+    for ([_]u64{ 1, 71, 999999 }) |lsn| {
+        const metadata: Record = .{ .kind = .batch_mutation, .payload_codec = .json, .flags = 7, .cluster_id = 8, .shard_id = 9, .table_id = 10, .timeline_id = 11, .epoch = 12, .lsn = lsn, .previous_lsn = lsn - 1, .commit_timestamp_ns = 1234 };
+        const actual = try prepared.seal(metadata);
+        var record = metadata;
+        record.payload = &original;
+        const expected = try encodeAlloc(alloc, record);
+        defer alloc.free(expected);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        try std.testing.expectEqualSlices(u8, &original, (try decode(actual)).payload);
+        try std.testing.expectError(error.InvalidArgument, prepared.seal(record));
+    }
+}
+
+test "replication record prepared envelope preserves original refusal and retires partial construction" {
+    const admission = @import("../../common/read_admission.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        fail_at: usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.DeadlineExceeded;
+        }
+    };
+    const input: [12289]u8 = @splat(31);
+    // Initial fence, four copy/checksum quanta, and final construction fence.
+    for (1..7) |fail_at| {
+        var fixture: Fixture = .{ .fail_at = fail_at };
+        var payload: admission.Payload = .{ .ptr = &fixture, .vtable = &.{ .checkpoint = Fixture.check } };
+        try std.testing.expectError(error.DeadlineExceeded, Prepared.init(std.testing.allocator, &input, admission.Port.init(&payload)));
+        try std.testing.expectEqual(fail_at, fixture.calls);
+    }
+    var storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    try std.testing.expectError(error.OutOfMemory, Prepared.init(fixed.allocator(), &input, null));
 }

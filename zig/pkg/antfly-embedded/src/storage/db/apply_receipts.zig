@@ -38,7 +38,7 @@ pub fn orderedApplyReceiptWrite(
 
 pub fn readOrderedApplyReceipt(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
+    store: anytype,
 ) !?OrderedApplyReceipt {
     const raw = store.get(alloc, internal_keys.ordered_document_applied_entry_key[0..]) catch |err| switch (err) {
         error.NotFound => return null,

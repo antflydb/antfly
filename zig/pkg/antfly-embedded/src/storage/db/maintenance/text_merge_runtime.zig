@@ -64,6 +64,7 @@ pub var test_publication_handoffs: std.atomic.Value(u32) = .init(0);
 pub var test_lookup_prepare_apply_lock_released: std.atomic.Value(bool) = .init(false);
 pub var test_wait_for_fd_admission: std.atomic.Value(bool) = .init(false);
 pub var test_fd_admission_entered: std.atomic.Value(bool) = .init(false);
+var test_fd_retirement_gate: ?*Io.Event = null;
 pub var test_fd_admission_canceled: std.atomic.Value(bool) = .init(false);
 pub var test_wait_for_producer_shutdown: std.atomic.Value(bool) = .init(false);
 pub var test_producer_shutdown_wait_entered: std.atomic.Value(bool) = .init(false);
@@ -95,6 +96,17 @@ const UnsupportedTextMergeRuntime = struct {
 
     pub fn stop(_: *@This()) bool {
         return false;
+    }
+    pub fn closeProducerAdmissionWithAdmission(self: *@This(), original: @import("../../../common/read_admission.zig").Port) !void {
+        const Ready = struct {
+            fn get(_: *anyopaque) anyerror!bool {
+                return true;
+            }
+        };
+        try @import("../../../common/cleanup_wait.zig").until(null, original, self, Ready.get, null);
+    }
+    pub fn stopWithAdmission(self: *@This(), original: @import("../../../common/read_admission.zig").Port) !void {
+        try self.closeProducerAdmissionWithAdmission(original);
     }
 
     pub fn pause(_: *@This()) bool {
@@ -191,10 +203,16 @@ const PlatformTextMergeRuntime = struct {
     producer_wait_epoch: std.atomic.Value(u32) = .init(0),
     producer_admission_head: ?*ProducerAdmissionWaiter = null,
     producer_admission_tail: ?*ProducerAdmissionWaiter = null,
-    admission_closed: bool = false,
+    admission_closed: std.atomic.Value(bool) = .init(false),
+    producer_closing: std.atomic.Value(bool) = .init(false),
     fd_retry_epoch: ?u32 = null,
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    join_finisher: bool = false,
+    joined: Io.Event = .unset,
+    join_changed: Io.Event = .unset,
+    join_generation: std.atomic.Value(u64) = .init(0),
+    join_waiters: std.atomic.Value(u32) = .init(0),
 
     pub const ProducerPermit = struct {
         runtime: *TextMergeRuntime,
@@ -286,21 +304,87 @@ const PlatformTextMergeRuntime = struct {
     }
 
     pub fn start(self: *TextMergeRuntime) !void {
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         self.desired_running = true;
         self.paused = false;
         self.setAdmissionClosedLocked(false);
         try self.startLocked();
     }
 
+    /// Wake blocked publishers before the executor joins them. The merge
+    /// registration and reservation maps remain owned until physical teardown.
+    pub fn closeProducerAdmissionWithAdmission(self: *TextMergeRuntime, original: @import("../../../common/read_admission.zig").Port) !void {
+        self.producer_closing.store(true, .release);
+        self.signalProducerAdmissionChanged();
+        const Ready = struct {
+            fn get(_: *anyopaque) anyerror!bool {
+                return true;
+            }
+        };
+        const cleanup = @import("../../../common/cleanup_wait.zig");
+        try cleanup.until(self.io, original, self, Ready.get, null);
+        if (self.io) |io| {
+            try cleanup.lockIo(&self.mutex, io, original);
+            self.admission_closed.store(true, .release);
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
+        }
+    }
+
+    fn finalJoin(self: *TextMergeRuntime) @import("../maintenance_stop.zig").Borrowed {
+        return .{
+            .mutex = &self.lifecycle_mutex,
+            .registration = &self.future,
+            .stopping = &self.producer_closing,
+            .finisher = &self.join_finisher,
+            .joined = &self.joined,
+            .changed = &self.join_changed,
+            .generation = &self.join_generation,
+            .waiters = &self.join_waiters,
+            .cancel_active = true,
+        };
+    }
+
+    /// Permanently stop without holding runtime guards while the original
+    /// caller lends execution. Failed waits retain the registration for retry.
+    pub fn stopWithAdmission(self: *TextMergeRuntime, original: @import("../../../common/read_admission.zig").Port) !void {
+        try self.closeProducerAdmissionWithAdmission(original);
+        const cleanup = @import("../../../common/cleanup_wait.zig");
+        try cleanup.lockAtomic(&self.lifecycle_mutex, self.io, original);
+        self.desired_running = false;
+        self.paused = true;
+        self.lifecycle_mutex.unlock();
+        if (self.io) |io| {
+            try cleanup.lockIo(&self.mutex, io, original);
+            self.shutdown = true;
+            self.notified = true;
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
+        }
+        try self.finalJoin().stopWithAdmission(self.io, original);
+    }
+
     /// Gracefully drains the active merge, if any, and stops the worker.
     /// Structural catalog mutations call this before moving or closing an
     /// inline index runtime, so no task can retain a pointer across mutation.
     pub fn stop(self: *TextMergeRuntime) bool {
+        if (self.producer_closing.load(.acquire)) {
+            // Controlled close may have abandoned its join. Resume physical
+            // completion through the same exclusive finisher before freeing.
+            self.finalJoin().stop(self.io, true);
+            return true;
+        }
         if (!self.config.enabled) return false;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
+        if (self.producer_closing.load(.acquire)) {
+            self.lifecycle_mutex.unlock();
+            self.finalJoin().stop(self.io, true);
+            return true;
+        }
         defer self.lifecycle_mutex.unlock();
         self.desired_running = false;
         self.paused = true;
@@ -312,9 +396,11 @@ const PlatformTextMergeRuntime = struct {
     /// running state. A failed resume can therefore be retried safely without
     /// racing a later structural catalog mutation.
     pub fn pause(self: *TextMergeRuntime) bool {
+        if (self.producer_closing.load(.acquire)) return false;
         if (!self.config.enabled) return false;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.producer_closing.load(.acquire)) return false;
         self.paused = true;
         const desired = self.desired_running;
         _ = self.stopLocked();
@@ -322,9 +408,11 @@ const PlatformTextMergeRuntime = struct {
     }
 
     pub fn resumeAfterPause(self: *TextMergeRuntime) !void {
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         self.paused = false;
         if (self.desired_running) try self.startLocked();
     }
@@ -333,6 +421,7 @@ const PlatformTextMergeRuntime = struct {
     /// currently owns the pause; true means the runtime is running or no
     /// longer desires a worker.
     pub fn ensureRunning(self: *TextMergeRuntime) !bool {
+        if (self.producer_closing.load(.acquire)) return false;
         if (!self.config.enabled) return true;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
@@ -349,8 +438,10 @@ const PlatformTextMergeRuntime = struct {
     }
 
     fn startLocked(self: *TextMergeRuntime) !void {
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         if (self.future != null or self.paused or !self.desired_running) return;
         const io = self.io orelse return error.MissingBackendRuntimeIo;
+        if (self.producer_closing.load(.acquire)) return error.TextMergeRuntimeShutdown;
         if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
         self.mutex.lockUncancelable(io);
         self.shutdown = false;
@@ -649,7 +740,7 @@ const PlatformTextMergeRuntime = struct {
             }
             const io = self.io.?;
             self.mutex.lockUncancelable(io);
-            if (self.admission_closed) {
+            if (self.producer_closing.load(.acquire) or self.admission_closed.load(.acquire)) {
                 self.mutex.unlock(io);
                 return error.TextMergeRuntimeShutdown;
             }
@@ -689,7 +780,7 @@ const PlatformTextMergeRuntime = struct {
             self.apply_mutex.unlockShared();
 
             self.mutex.lockUncancelable(io);
-            if (self.admission_closed) {
+            if (self.producer_closing.load(.acquire) or self.admission_closed.load(.acquire)) {
                 self.mutex.unlock(io);
                 return error.TextMergeRuntimeShutdown;
             }
@@ -816,7 +907,7 @@ const PlatformTextMergeRuntime = struct {
     fn setAdmissionClosedLocked(self: *TextMergeRuntime, closed: bool) void {
         const io = self.io orelse return;
         self.mutex.lockUncancelable(io);
-        self.admission_closed = closed;
+        self.admission_closed.store(closed, .release);
         self.cond.broadcast(io);
         self.mutex.unlock(io);
         self.signalProducerAdmissionChanged();
@@ -890,10 +981,7 @@ const PlatformTextMergeRuntime = struct {
     }
 
     fn isAdmissionClosed(self: *TextMergeRuntime) bool {
-        const io = self.io orelse return self.admission_closed;
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.admission_closed;
+        return self.producer_closing.load(.acquire) or self.admission_closed.load(.acquire);
     }
 
     pub fn stats(self: *TextMergeRuntime) types.TextMergeStats {
@@ -977,6 +1065,7 @@ fn workerStep(runtime: *TextMergeRuntime) ?u64 {
         const io = runtime.io.?;
         runtime.native_storage_pool.reserveDescriptorsForTest(io, 1) catch |err| {
             if (err == error.Canceled) test_fd_admission_canceled.store(true, .release);
+            if (test_fd_retirement_gate) |gate| gate.waitUncancelable(io);
             return null;
         };
         runtime.native_storage_pool.releaseDescriptorsForTest(io, 1);
@@ -1000,6 +1089,7 @@ fn workerStep(runtime: *TextMergeRuntime) ?u64 {
 }
 
 fn isShutdown(runtime: *TextMergeRuntime) bool {
+    if (runtime.producer_closing.load(.acquire)) return true;
     const io = runtime.io orelse return runtime.shutdown;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
@@ -1107,4 +1197,179 @@ test "text merge publication handoff releases index lease before global contenti
     try std.testing.expect(!global.tryLockExclusive());
     global.unlockExclusive();
     lease.?.unlock();
+}
+
+test "controlled text merge producer close wakes publishers before interrupted state publication" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        const io = std.testing.io;
+        var runtime: TextMergeRuntime = .{ .alloc = std.testing.allocator, .io = io, .native_storage_pool = undefined, .index_manager = undefined, .apply_mutex = undefined, .config = .{ .enabled = true } };
+        const F = struct {
+            runtime: *TextMergeRuntime,
+            done: Io.Event = .unset,
+            failure: ?anyerror = null,
+            fn run(self: *@This()) void {
+                var permit = self.runtime.acquireProducerPermit("held", 1, 1) catch |cause| {
+                    self.failure = cause;
+                    self.done.set(self.runtime.io.?);
+                    return;
+                };
+                permit.release();
+                self.failure = error.TestUnexpectedResult;
+                self.done.set(self.runtime.io.?);
+            }
+        };
+        test_wait_for_producer_shutdown.store(true, .release);
+        test_producer_shutdown_wait_entered.store(false, .release);
+        defer test_wait_for_producer_shutdown.store(false, .release);
+        var f: F = .{ .runtime = &runtime };
+        var future = try io.concurrent(F.run, .{&f});
+        const Control = struct {
+            runtime: *TextMergeRuntime,
+            case: Case,
+            unlocked: bool = true,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn release(self: *@This()) void {
+                if (self.unlocked) return;
+                self.runtime.mutex.unlock(self.runtime.io.?);
+                self.unlocked = true;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.release();
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.release();
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var control: Control = .{ .runtime = &runtime, .case = case };
+        defer {
+            control.release();
+            runtime.producer_closing.store(true, .release);
+            runtime.signalProducerAdmissionChanged();
+            future.await(io);
+            runtime.deinit();
+        }
+        const deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(5), .clock = .awake });
+        while (!test_producer_shutdown_wait_entered.load(.acquire)) {
+            if (Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        runtime.mutex.lockUncancelable(io);
+        control.unlocked = false;
+        const admission = @import("../../../common/read_admission.zig");
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = runtime.closeProducerAdmissionWithAdmission(.init(&payload));
+        if (case == .success) try result else try std.testing.expectError(switch (case) {
+            .begin_failure => error.NotFound,
+            .end_failure => error.Canceled,
+            .lifetime_in_wait => error.DeadlineExceeded,
+            .success => unreachable,
+        }, result);
+        // Even failed mutex wait entry must wake the publisher immediately,
+        // without borrowing a caller grant or waiting for the peer guard.
+        try f.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try std.testing.expectEqual(error.TextMergeRuntimeShutdown, f.failure.?);
+        control.release();
+        control.case = .success;
+        try runtime.closeProducerAdmissionWithAdmission(.init(&payload));
+        try std.testing.expectError(error.Canceled, runtime.start());
+        try std.testing.expectError(error.TextMergeRuntimeShutdown, runtime.acquireProducerPermit("late", 1, 1));
+        try std.testing.expect(!try runtime.ensureRunning());
+        try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+    }
+}
+
+test "controlled text merge shutdown cancels descriptor waits and retains failed joins" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const admission = @import("../../../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        var backend = try background_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+        defer backend.deinit();
+        const io = backend.ptr().io().?;
+        var pool = storage_io_mod.NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 1);
+        defer pool.deinit();
+        try pool.reserveDescriptorsForTest(io, 1);
+        defer pool.releaseDescriptorsForTest(io, 1);
+        var gate: Io.Event = .unset;
+        test_fd_retirement_gate = &gate;
+        test_wait_for_fd_admission.store(true, .release);
+        test_fd_admission_entered.store(false, .release);
+        test_fd_admission_canceled.store(false, .release);
+        var runtime: TextMergeRuntime = .{ .alloc = std.testing.allocator, .io = io, .native_storage_pool = &pool, .index_manager = undefined, .apply_mutex = undefined, .config = .{ .enabled = true }, .backend_runtime = backend.ptr() };
+        defer {
+            gate.set(io);
+            runtime.deinit();
+            test_fd_retirement_gate = null;
+            test_wait_for_fd_admission.store(false, .release);
+        }
+        try runtime.start();
+        const test_deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(5), .clock = .awake });
+        while (pool.snapshotStats().fd_admission_waiters == 0) {
+            if (Io.Clock.Timestamp.now(io, .awake).compare(.gte, test_deadline)) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        const Control = struct {
+            gate: *Io.Event,
+            io: Io,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.gate.set(self.io);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.gate.set(self.io);
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var control: Control = .{ .gate = &gate, .io = io, .case = case };
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = runtime.stopWithAdmission(.init(&payload));
+        if (case == .success) try result else {
+            try std.testing.expectError(switch (case) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .lifetime_in_wait => error.DeadlineExceeded,
+                .success => unreachable,
+            }, result);
+            try std.testing.expect(runtime.future != null and !runtime.joined.isSet() and !runtime.join_finisher);
+            gate.set(io);
+            control.case = .success;
+            try runtime.stopWithAdmission(.init(&payload));
+        }
+        try std.testing.expect(runtime.joined.isSet() and runtime.future == null);
+        try std.testing.expect(test_fd_admission_canceled.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
+        try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectError(error.Canceled, runtime.start());
+        try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+    }
 }

@@ -175,6 +175,9 @@ pub const ReplayPublication = struct {
 };
 
 pub const AsyncContext = struct {
+    /// Borrowed from the DB backend through session/physical callback drain.
+    capture_cleanup_owner: ?@import("antfly_runtime_abi").runnable_abi.Owner = null,
+    capture_cleanup_budget_ns: u64 = 5 * std.time.ns_per_s,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,
@@ -632,6 +635,8 @@ pub const ProfiledLock = struct {
 };
 
 pub const BatchExecutionContext = struct {
+    /// Borrowed at a stable address; all nested work joins before root release.
+    mutation_root: ?*MutationBarrier.RootSharedLease = null,
     alloc: Allocator,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
@@ -674,27 +679,7 @@ pub const TtlCleanupContext = struct {
     coordinated_port: ?coordinated_ttl.Port = null,
 };
 
-pub const ManagedSyncTargets = struct {
-    full_text_indexes: []const []const u8 = &.{},
-    all_indexes: []const []const u8 = &.{},
-    // Visibility targets are broader than synchronous wait targets: a record
-    // with a missing dependency, or source work that schedules a generated
-    // downstream artifact, still advances that index's convergence target.
-    // Each identity owns its name so target collection does not need a second
-    // parallel allocation solely to manage name lifetime.
-    target_identities: []const IndexTargetVisibility = &.{},
-    target_scope_known: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: Allocator) void {
-        for (self.full_text_indexes) |name| alloc.free(@constCast(name));
-        if (self.full_text_indexes.len > 0) alloc.free(self.full_text_indexes);
-        for (self.all_indexes) |name| alloc.free(@constCast(name));
-        if (self.all_indexes.len > 0) alloc.free(self.all_indexes);
-        for (self.target_identities) |identity| alloc.free(@constCast(identity.index_name));
-        if (self.target_identities.len > 0) alloc.free(self.target_identities);
-        self.* = undefined;
-    }
-};
+pub const ManagedSyncTargets = @import("managed_sync_targets.zig").ManagedSyncTargets;
 
 pub const ManagedIndexCandidate = struct {
     ref: index_manager_mod.ManagedIndexRef,
@@ -964,7 +949,7 @@ pub const RelationalPriorMembership = struct {
         self.alloc.free(self.members);
     }
 
-    pub fn read(self: *@This(), db: anytype, txn: *docstore_mod.DocStore.Txn, plan: relational_index_plans.View, ready: []const bool, document: []const u8) ![]const bool {
+    pub fn read(self: *@This(), db: anytype, txn: anytype, plan: relational_index_plans.View, ready: []const bool, document: []const u8) ![]const bool {
         if (self.members.len == 0) return self.members;
         @memset(self.members, false);
         const needed = for (plan.boundIndexes(), ready) |index, is_ready| {
@@ -1005,6 +990,43 @@ pub const RelationalPriorMembership = struct {
     }
 };
 
+/// Original non-suspending authority for synchronous pre-decision providers.
+/// IO and callbacks borrow this stable scope through every physical child join.
+pub const PreparationProviderScope = struct {
+    controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = undefined,
+    io_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
+    deadline_ns: ?u64 = null,
+    rejection: @import("antfly_cancellation").Rejection = .{},
+
+    pub fn bind(self: *@This(), controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, inputs: ?@import("../../api/batch_execution_admission.zig").ProducerInputs, fallback_io: std.Io) !@import("antfly_inference_execution_context").RequestContext {
+        self.* = .{ .controls = controls, .deadline_ns = if (inputs) |value| value.deadline_ns else null };
+        if (inputs) |value| self.io_receiver = try value.io.receive();
+        try check(self);
+        const context: @import("antfly_inference_execution_context").RequestContext = .{
+            .io = if (self.io_receiver) |*receiver| receiver.io() else fallback_io,
+            .deadline_ns = self.deadline_ns,
+            .cancellation = .{ .ptr = self, .check_fn = check },
+        };
+        return context;
+    }
+
+    /// Restore the native admission cause after inference's transport aliases.
+    /// Inspect only an already latched rejection; never poll after durability.
+    pub fn originalFailure(self: *const @This(), fallback: anyerror) anyerror {
+        self.rejection.check() catch |cause| return cause;
+        return fallback;
+    }
+
+    fn check(raw: *const anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+        try self.rejection.check();
+        self.controls.lifetime.check() catch |err| return self.rejection.remember(err);
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline)
+            return self.rejection.remember(error.Timeout);
+        try self.rejection.check();
+    }
+};
+
 /// Owned visibility handoff from commit to its small outer completion frame.
 /// Targets retain the exact admitted identities; no catalog re-lookup is used.
 pub const BatchVisibilityCompletion = struct {
@@ -1019,6 +1041,30 @@ pub const BatchVisibilityCompletion = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    /// Native preparation-only exit before replay reservation or publication.
+    /// Selected only for authoritative accepted transaction inputs.
+    assembly: ?*@import("artifact_authored_acceptance.zig").Assembly = null,
+    /// Borrowed synchronous outcome marker, never retained by an assembly.
+    /// A reported commit/terminal resolution prohibits preparation retries.
+    primary_commit_observed: ?*bool = null,
+    /// Pre-decision only. Never used to veto accepted durability or visibility.
+    provider_context: ?@import("antfly_inference_execution_context").RequestContext = null,
+    /// Used only after owned service holders retire, never passed to providers.
+    provider_execution: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+    /// Resolver-owned reader, borrowed until the batch orders its local tails.
+    /// The batch retires its nested reader first and nulls this slot before waits.
+    enclosing_mutation_retirement: ?*?MutationBarrier.SharedLease = null,
+    /// Separate from pre-decision controls; checked against retired holders at
+    /// the committed visibility wait, never used for apply or mutation admission.
+    committed_visibility_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
+    /// Borrowed at a stable address; all nested work joins before root release.
+    mutation_root: ?*MutationBarrier.RootSharedLease = null,
+    /// Borrowed only during pre-decision snapshot/apply acquisition. This
+    /// authority never cancels mandatory retirement after primary durability.
+    admission_controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition = null,
+    /// Set only by the foreground admission entrypoint, before this write has
+    /// a decision. Mandatory replay/resolution keeps the default wait policy.
+    avoid_admission_capacity_cycle: bool = false,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
     /// Native-only completion observation; never encoded in a replicated command.
@@ -1026,6 +1072,9 @@ pub const BatchExecutionOptions = struct {
     legacy_group_plan_generation: ?u64 = null,
     row_policy_principal: ?*const row_policy_authority_mod.Payload = null,
     row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease = null,
+    /// The DB wrapper explicitly transfers retirement of its own write lease
+    /// after local effects/tails are ordered. Borrowed leases remain caller-owned.
+    row_policy_retirement: ?*row_policy_gate_mod.Gate.Lease = null,
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
@@ -1065,12 +1114,15 @@ pub const BatchExecutionOptions = struct {
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    /// Borrowed decoded owner, retained through cloning and the atomic decision.
+    accepted_effects: ?*const transactions_mod.PreparedEffects = null,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
     commit_version: u64,
     expected_intent_revision: u64,
     intent_keys: []const []const u8,
     resolved_participant: ?[]const u8 = null,
+    defer_retained_coordinator_acknowledgement: bool = false,
     schema_binding: ?transactions_mod.SchemaBinding = null,
     schema_namespace_generation: ?u64 = null,
 };
@@ -1108,6 +1160,8 @@ pub const ShadowState = struct {
 };
 
 pub const LocalExecutionState = struct {
+    close_index_status: @import("close_index_status.zig").Program = .{},
+    retained_preparation_owner: ?*@import("prepared_lifetime.zig").Owner = null,
     /// Optional generation hint, accessed only under the physical query-pin guard.
     native_query_reuse: ?@import("native_query_reuse.zig").State = null,
     native_query_reuse_epoch: [16]u8 = @splat(0),
@@ -1151,6 +1205,10 @@ pub const LocalExecutionState = struct {
     /// startup barrier also serves as this transient publication barrier.
     row_policy_replication_outbox_pending: std.atomic.Value(bool) = .init(false),
     durable_replication_flush_mutex: std.Io.Mutex = .init,
+    /// Shared by DB, prepared mutations and recovery executions. Accepted jobs
+    /// join before this DB-owned state retires; publishers borrow it synchronously.
+    replication_recovery_cursor: @import("durable_outbox.zig").RecoveryCursor = .{},
+    replication_intent_capture: @import("durable_outbox_store.zig").IntentCapture = .{},
     /// Crash-left records must be replayed before this process publishes its
     /// first hot-standby mutation. Once crossed, foreground commits append under the
     /// apply/log ordering fences and may await independent LSNs concurrently.
@@ -1624,16 +1682,7 @@ pub const ChunkEmbeddingSource = materialized_sources.ChunkEmbeddingSource;
 
 pub const clearChunkEmbeddingSourceList = materialized_sources.clearChunkEmbeddingSourceList;
 
-pub const PrecomputedCoverageOutcome = struct {
-    index_name: []u8,
-    doc_key: []u8,
-    outcome: DerivedCoverageOutcome,
-
-    pub fn deinit(self: @This(), alloc: Allocator) void {
-        alloc.free(self.index_name);
-        alloc.free(self.doc_key);
-    }
-};
+pub const PrecomputedCoverageOutcome = @import("prepared_effect_types.zig").PrecomputedCoverageOutcome;
 
 pub const PrecomputedCoverageCandidate = struct {
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -1770,36 +1819,7 @@ pub const GeneratedPrecomputeMode = enum {
     all,
 };
 
-pub const PrecomputedGeneratedBatch = struct {
-    artifact_writes: []types.BatchWrite = &.{},
-    artifact_delete_keys: []const []const u8 = &.{},
-    documents: []const derived_types.DerivedDocument = &.{},
-    dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
-    sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
-    generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
-    coverage_outcomes: []PrecomputedCoverageOutcome = &.{},
-
-    pub fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
-        for (self.artifact_writes) |write| {
-            alloc.free(@constCast(write.key));
-            alloc.free(@constCast(write.value));
-        }
-        if (self.artifact_writes.len > 0) alloc.free(self.artifact_writes);
-        for (self.artifact_delete_keys) |key| alloc.free(key);
-        if (self.artifact_delete_keys.len > 0) alloc.free(self.artifact_delete_keys);
-
-        var derived_batch = derived_types.DerivedBatch{
-            .documents = self.documents,
-            .dense_embeddings = self.dense_embeddings,
-            .sparse_embeddings = self.sparse_embeddings,
-            .generated_enrichment_refs = self.generated_enrichment_refs,
-        };
-        derived_types.deinitDerivedBatch(alloc, &derived_batch);
-        for (self.coverage_outcomes) |outcome| outcome.deinit(alloc);
-        if (self.coverage_outcomes.len > 0) alloc.free(self.coverage_outcomes);
-        self.* = undefined;
-    }
-};
+pub const PrecomputedGeneratedBatch = @import("prepared_effect_types.zig").PrecomputedGeneratedBatch;
 
 pub const GraphArtifactRefView = struct {
     name: []const u8,
@@ -2134,7 +2154,7 @@ pub fn appendEnrichmentTerminalFailureMarkerDeletePageForIssue(
     return state.entries_examined;
 }
 
-pub const DerivedCoverageOutcome = enum { produced, skipped, terminal_failed };
+pub const DerivedCoverageOutcome = @import("prepared_effect_types.zig").DerivedCoverageOutcome;
 
 pub const DerivedCoverageDocOutcome = struct {
     doc_key: []const u8,

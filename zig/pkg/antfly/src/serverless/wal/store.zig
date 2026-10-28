@@ -16,6 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wal_types = @import("types.zig");
+const Execution = @import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution;
 
 pub const WalStore = struct {
     allocator: Allocator,
@@ -25,6 +26,7 @@ pub const WalStore = struct {
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         append: *const fn (*anyopaque, []const u8, u64, []const u8) anyerror!u64,
+        append_with_execution: ?*const fn (*anyopaque, []const u8, u64, []const u8, *Execution) anyerror!u64 = null,
         append_idempotent: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8) anyerror!u64 = null,
         append_idempotent_if_latest: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, u64) anyerror!?u64 = null,
         read_from_alloc: *const fn (*anyopaque, Allocator, []const u8, u64) anyerror![]wal_types.Record,
@@ -39,6 +41,13 @@ pub const WalStore = struct {
 
     pub fn append(self: *WalStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
         return try self.vtable.append(self.ptr, namespace, timestamp_ns, payload);
+    }
+
+    /// Converted stores may loan CPU only at their verified wait boundaries.
+    /// Legacy providers retain the grant throughout their physical operation.
+    pub fn appendWithExecution(self: *WalStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8, execution: *Execution) !u64 {
+        if (self.vtable.append_with_execution) |append_fn| return append_fn(self.ptr, namespace, timestamp_ns, payload, execution);
+        return self.append(namespace, timestamp_ns, payload);
     }
 
     /// Append exactly once for a durable caller-supplied operation identity.

@@ -409,6 +409,7 @@ pub const Runtime = struct {
     capability_cache: remote_capabilities.Cache,
     execution: execution_context.Context = .{},
     request_progress: ?execution_context.ProgressSink = null,
+    request_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     owned_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
@@ -545,6 +546,7 @@ pub const Runtime = struct {
             else
                 null,
             .progress = self.request_progress,
+            .runnable = self.request_runnable,
         };
     }
 
@@ -1092,10 +1094,19 @@ pub const Runtime = struct {
     const RuntimeInvocationCancellation = struct {
         configured: CancellationToken,
         invocation: CancellationToken,
+        rejection: @import("antfly_cancellation").Rejection = .{},
+
+        fn check(ptr: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            try self.rejection.check();
+            self.configured.check() catch |err| return self.rejection.remember(err);
+            self.invocation.check() catch |err| return self.rejection.remember(err);
+            try self.rejection.check();
+        }
 
         fn isCancelled(ptr: *const anyopaque) bool {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            return self.configured.isCancelled() or self.invocation.isCancelled();
+            check(ptr) catch return true;
+            return false;
         }
     };
 
@@ -1121,12 +1132,14 @@ pub const Runtime = struct {
         scoped.execution.cancellation = .{
             .ptr = cancellation,
             .is_cancelled_fn = RuntimeInvocationCancellation.isCancelled,
+            .check_fn = if (cancellation.configured.check_fn != null or cancellation.invocation.check_fn != null) RuntimeInvocationCancellation.check else null,
         };
         scoped.execution.max_response_bytes = if (context.max_response_bytes) |requested|
             if (self.execution.max_response_bytes) |configured| @min(requested, configured) else requested
         else
             self.execution.max_response_bytes;
         scoped.request_progress = context.progress orelse self.request_progress;
+        scoped.request_runnable = context.runnable orelse self.request_runnable;
         scoped.document_checkpoints = context.document_checkpoints orelse self.document_checkpoints;
         return scoped;
     }
@@ -3930,11 +3943,68 @@ test "asset producer runtime invocation context can only tighten configured cont
     try std.testing.expectEqual(@as(?u64, 200), scoped.execution.deadline_ns);
     try std.testing.expectEqual(@as(?usize, 1024), scoped.execution.max_response_bytes);
     try std.testing.expect(!scoped.execution.cancellation.isCancelled());
+    var transport_only = scoped.requestContext();
+    transport_only.deadline_ns = null;
+    try std.testing.expect(!transport_only.requiresControlledProvider());
     invocation_canceled.store(true, .release);
     try std.testing.expect(scoped.execution.cancellation.isCancelled());
     invocation_canceled.store(false, .release);
     configured_canceled.store(true, .release);
     try std.testing.expect(scoped.execution.cancellation.isCancelled());
+
+    const Authority = struct {
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |cause| return cause;
+        }
+    };
+    configured_canceled.store(false, .release);
+    runtime.execution.deadline_ns = std.math.maxInt(u64);
+    var authority: Authority = .{};
+    for ([_]anyerror{ error.OriginalAssetAuthorityRejected, error.Forbidden, error.DeadlineExceeded, error.Canceled }) |cause| {
+        authority.failure = cause;
+        var original_cancellation: Runtime.RuntimeInvocationCancellation = undefined;
+        const controlled = Runtime.invocationRuntime(&runtime, .{
+            .deadline_ns = std.math.maxInt(u64),
+            .cancellation = .{ .ptr = &authority, .check_fn = Authority.check },
+        }, &original_cancellation);
+        const expected = switch (cause) {
+            error.Canceled => error.Cancelled,
+            error.DeadlineExceeded => error.Timeout,
+            else => cause,
+        };
+        try std.testing.expect(controlled.execution.cancellation.isCancelled());
+        authority.failure = null;
+        try std.testing.expectError(expected, controlled.requestContext().check());
+        try std.testing.expect(controlled.execution.cancellation.isCancelled());
+    }
+    const runtime_abi = @import("antfly_runtime_abi");
+    const Child = struct {
+        calls: usize = 0,
+        reject: bool = false,
+        fn check(raw: *anyopaque) callconv(.c) runtime_abi.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (self.reject) runtime_abi.error_abi.statusFromError(error.SchedulerClosed) else .ok;
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime_abi.error_abi.Status {
+            return .ok;
+        }
+    };
+    var child: Child = .{};
+    const child_borrow: runtime_abi.runnable_abi.Borrowed = .{ .context = &child, .cpu_slots = 1, .parent_class = @backingInt(runtime_abi.runnable_abi.Class.write), .checkpoint = Child.check, .park = Child.phase, .enter = Child.phase, .check_lifetime = Child.check };
+    const invocation = asset_producer.InvocationContext.fromRequestContext(.{ .io = std.testing.io, .deadline_ns = null, .runnable = child_borrow });
+    try std.testing.expect(invocation.requiresControlledProvider());
+    var scoped_cancellation: Runtime.RuntimeInvocationCancellation = undefined;
+    const child_scoped = Runtime.invocationRuntime(&runtime, invocation, &scoped_cancellation);
+    try std.testing.expect(child_scoped.requestContext().runnable.?.context == @as(*anyopaque, &child));
+    try child_scoped.requestContext().check();
+    try std.testing.expectEqual(@as(usize, 1), child.calls);
+    try std.testing.expect(runtime.request_runnable == null);
+    child.reject = true;
+    try std.testing.expectError(error.SchedulerClosed, child_scoped.requestContext().check());
+    try std.testing.expectError(error.SchedulerClosed, invocation.check());
 }
 
 const producer_config = @import("generating/producer_config.zig");

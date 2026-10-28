@@ -956,6 +956,18 @@ pub const AntflyApiHandler = struct {
         try self.registerRaftAdminRoutes(server);
     }
 
+    pub fn registerRemoteAttemptControlRoutesWithMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        try self.installMiddleware(server);
+        try self.registerRemoteAttemptControlRoutes(server);
+    }
+    fn registerRemoteAttemptControlRoutes(self: *AntflyApiHandler, server: anytype) !void {
+        try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
+        try server.postWithBodyLimit(internal_routes.remote_attempt_status, 2, httpx.Handler.bind(self, remoteAttemptStatus));
+        try server.postWithBodyLimit(internal_routes.remote_attempt_fence, 2, httpx.Handler.bind(self, remoteAttemptFence));
+        try server.postWithBodyLimit(internal_routes.remote_attempt_cancel, 2, httpx.Handler.bind(self, remoteAttemptCancel));
+        try server.postWithBodyLimit(internal_routes.remote_attempt_capabilities, 32, httpx.Handler.bind(self, remoteAttemptCapabilities));
+    }
+
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
@@ -977,8 +989,8 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const authenticated = identity orelse return next.call(ctx);
 
-        const cached = try self.api_server.alloc.create(CachedAuthenticatedIdentity);
-        cached.* = .{ .alloc = self.api_server.alloc, .identity = authenticated };
+        const cached = try self.authenticationAllocator(ctx).create(CachedAuthenticatedIdentity);
+        cached.* = .{ .alloc = self.authenticationAllocator(ctx), .identity = authenticated };
         identity = null;
         ctx.setData(authenticated_identity_context_key, cached, CachedAuthenticatedIdentity.destroy) catch |err| {
             CachedAuthenticatedIdentity.destroy(cached);
@@ -1012,6 +1024,7 @@ pub const AntflyApiHandler = struct {
         const raw_encoding = ctx.header("content-encoding") orelse return next.call(ctx);
         const encoding = std.mem.trim(u8, raw_encoding, " \t");
         if (std.ascii.eqlIgnoreCase(encoding, "identity")) return next.call(ctx);
+        if (internal_routes.isRemoteAttemptControl(ctx.request.uri.path)) return textResponse(ctx, 415, "remote control requests require identity encoding");
         if (!std.ascii.eqlIgnoreCase(encoding, "gzip") and !std.ascii.eqlIgnoreCase(encoding, "x-gzip")) {
             return textResponse(ctx, 415, "unsupported content encoding");
         }
@@ -1029,6 +1042,18 @@ pub const AntflyApiHandler = struct {
         try ctx.request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
         _ = ctx.request.headers.remove("content-encoding");
         return next.call(ctx);
+    }
+
+    /// Tighten an internal budget in the original clock without changing its
+    /// epoch or renewing its authority. First ingress uses the transport clock.
+    fn tightenApplicationDeadline(ctx: *httpx.Context, budget_ms: u64) void {
+        if (ctx.application_deadline_ns == null) ctx.application_deadline_io = ctx.io;
+        const now = if (ctx.application_deadline_io) |io|
+            @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds)))
+        else
+            platform_time.monotonicNs();
+        const candidate = now +| @as(u64, budget_ms) *| std.time.ns_per_ms;
+        ctx.application_deadline_ns = @min(ctx.application_deadline_ns orelse candidate, candidate);
     }
 
     /// Every ingress path applies the same policies. A public budget cannot
@@ -1074,7 +1099,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        @import("../request_deadline.zig").tighten(ctx, budget_ms);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishCatalogRouteFenceDeadline(ctx: *httpx.Context) void {
@@ -1087,7 +1112,7 @@ pub const AntflyApiHandler = struct {
             }
         else
             metadata_api.catalog_route_default_deadline_ms;
-        @import("../request_deadline.zig").tighten(ctx, budget_ms);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishInternalTxnPreDecisionDeadline(ctx: *httpx.Context) void {
@@ -1103,7 +1128,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        @import("../request_deadline.zig").tighten(ctx, budget_ms);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishInternalTxnStatusDeadline(ctx: *httpx.Context) void {
@@ -1118,7 +1143,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        @import("../request_deadline.zig").tighten(ctx, budget_ms);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishInternalOnlineMergeDeadline(ctx: *httpx.Context) void {
@@ -1136,7 +1161,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        @import("../request_deadline.zig").tighten(ctx, budget_ms);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishInternalBackupDeadline(ctx: *httpx.Context) void {
@@ -1153,7 +1178,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        @import("../request_deadline.zig").tighten(ctx, budget_ms);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     /// Continuous-HA mutation safety belongs to ingress policy, not to a
@@ -1170,6 +1195,11 @@ pub const AntflyApiHandler = struct {
     /// The HA namespace retains its independent replication credential.
     fn enforceInternalServiceAuth(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         if (try self.internalServiceAuthRejection(ctx)) |response| return response;
+        // Returned control bytes may wait on transport after handler CPU ends.
+        defer if (ctx.getData(remote_control_context_key)) |raw| {
+            const data: *RemoteControlContext = @ptrCast(@alignCast(raw));
+            data.execution.park(.output_blocked) catch {};
+        };
         if (ctx.application_deadline_invalid)
             return textResponse(ctx, 400, "invalid transaction deadline");
         return next.call(ctx);
@@ -1177,6 +1207,8 @@ pub const AntflyApiHandler = struct {
 
     fn internalServiceAuthRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
         if (!requiresInternalServicePrincipal(ctx.request.uri.path)) return null;
+        const received_at_ns = platform_time.monotonicNs();
+        if (ctx.request.method == .POST and internal_routes.isRemoteAttemptControl(ctx.request.uri.path)) return self.remoteControlIngress(ctx);
         const secret = self.api_server.cfg.internal_service_secret orelse
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "internal service authentication is not configured"));
         if (secret.len == 0)
@@ -1192,11 +1224,15 @@ pub const AntflyApiHandler = struct {
             }
             return @as(?httpx.Response, try unauthorizedResponse(ctx));
         };
-        var identity = self.api_server.authenticateInternalServiceRequest(token) catch
+        const auth_allocator = self.authenticationAllocator(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequestWithAllocator(auth_allocator, token) catch
             return @as(?httpx.Response, try unauthorizedResponse(ctx));
-        defer identity.deinit(self.api_server.alloc);
+        defer identity.deinit(auth_allocator);
         if (!identity.is_internal_service)
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 403, "internal service credential required"));
+        const carries_attempt = @import("../common/remote_attempt_wire.zig").carriesContext(auth_allocator, identity.metadata_json) catch
+            return @as(?httpx.Response, try textResponse(ctx, 503, "remote attempt context is not supported on this route"));
+        if (carries_attempt) return self.remoteReadIngress(ctx, identity, received_at_ns);
         return null;
     }
 
@@ -1478,6 +1514,8 @@ pub const AntflyApiHandler = struct {
             try server.put(path, hot_standby_handler);
             try server.delete(path, hot_standby_handler);
         }
+        try server.get("/admin/v1/workload/query", httpx.Handler.bind(self, getWorkloadPolicy));
+        try server.put("/admin/v1/workload/query", httpx.Handler.bind(self, putWorkloadPolicy));
         try server.post(admin_routes.maintenance_check, httpx.Handler.bind(self, checkStorage));
         try server.post(admin_routes.maintenance_compact, httpx.Handler.bind(self, compactStorage));
         try server.post(admin_routes.maintenance_vacuum, httpx.Handler.bind(self, vacuumStorage));
@@ -1501,7 +1539,7 @@ pub const AntflyApiHandler = struct {
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
-        try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
+        try self.registerRemoteAttemptControlRoutes(server);
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
@@ -1528,6 +1566,8 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ "/retained-read", httpx.Handler.bind(self, internalRetainedRead));
+        try server.post(table_prefix ++ "/owned-query/:root_incarnation/:reporter_incarnation", httpx.Handler.bind(self, internalOwnedGroupQuery));
+        try server.post(table_prefix ++ "/owned-retained-read/:root_incarnation/:reporter_incarnation", httpx.Handler.bind(self, internalOwnedRetainedRead));
         try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
         try server.post(table_prefix ++ routes.query_preflight_suffix, httpx.Handler.bind(self, internalGroupQueryPreflight));
         try server.post(table_prefix ++ routes.vector_worker_suffix, httpx.Handler.bind(self, internalGroupVectorWorker));
@@ -1777,6 +1817,7 @@ pub const AntflyApiHandler = struct {
             .DELETE => .delete,
             else => return textResponse(ctx, 405, "method not allowed"),
         };
+        var cancellation = requestCancellation(ctx);
         const body = (try ctx.body()) orelse "";
         var response = (try self.api_server.executeHotStandbyRoute(.{
             .method = method,
@@ -1784,6 +1825,8 @@ pub const AntflyApiHandler = struct {
             .authorization = ctx.header("authorization"),
             .content_type = ctx.header("content-type"),
             .body = body,
+            .deadline_ns = cancellation.execution_deadline_ns,
+            .cancellation = &cancellation,
         })) orelse return textResponse(ctx, 404, "not found");
         defer response.deinit();
         _ = ctx.status(response.status);
@@ -1952,12 +1995,13 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |response| return response;
         const body = (try ctx.body()) orelse "";
-        var response = try protocol_adapters.executeA2aRequest(
+        var response = try protocol_adapters.executeA2aRequestWithContext(
             self.api_server,
             ctx.header("authorization"),
             body,
             ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
             authenticated_identity,
+            operationContext(ctx, authenticated_identity),
         );
         defer response.deinit(self.api_server.alloc);
         _ = ctx.status(response.status);
@@ -2073,8 +2117,13 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn nativeRequestDeadline(ctx: *const httpx.Context) ?u64 {
+        return ctx.nativeDeadlineInClock(platform_time.monotonicNs);
+    }
+
     fn requestCancellation(ctx: *const httpx.Context) http_common.RequestCancellation {
         return .{
+            .execution_deadline_ns = nativeRequestDeadline(ctx),
             .borrowed = ctx.cancellation,
             .borrowed_context = if (ctx.cancellation_probe != null) ctx else null,
             .borrowed_is_cancelled = if (ctx.cancellation_probe != null) struct {
@@ -3389,6 +3438,175 @@ pub const AntflyApiHandler = struct {
         });
     }
 
+    const RemoteReadContext = struct {
+        allocator: std.mem.Allocator,
+        verified: @import("../common/remote_attempt_wire.zig").Verified,
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocator.destroy(self);
+        }
+    };
+    const remote_read_context_key = "antfly-verified-remote-read";
+
+    fn remoteReadIngress(self: *AntflyApiHandler, ctx: *httpx.Context, identity: AuthenticatedIdentity, received_at_ns: u64) !?httpx.Response {
+        if (ctx.request.method != .POST or !(internal_routes.isOwnedGroupQuery(ctx.request.uri.path) or internal_routes.isRetainedRead(ctx.request.uri.path)))
+            return try textResponse(ctx, 503, "remote attempt context is not supported on this route");
+        const service = self.api_server.remoteAttemptControl() orelse return try textResponse(ctx, 503, "remote attempt control is not configured");
+        if (!self.api_server.runnableSchedulingStats().enabled) return try textResponse(ctx, 503, "remote reads require execution scheduling");
+        internal_routes.validateOwnedReadScope(ctx.request.uri.path, service.registry.local.root_incarnation, service.registry.local.reporter_incarnation) catch |err| return try remoteControlError(ctx, err);
+        // AFAT v1 binds method, path and body. Do not accept query parameters or
+        // routing overrides outside that signed envelope.
+        if (ctx.request.uri.query != null or ctx.header(@import("prepared_query_routing.zig").header_name) != null or ctx.header(metadata_api.catalog_route_fence_header) != null)
+            return try textResponse(ctx, 400, "remote read routing must be bound by the request body");
+        if (ctx.header("content-encoding")) |encoding| {
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, encoding, " \t"), "identity")) return try textResponse(ctx, 415, "remote reads require identity encoding");
+        }
+        const streaming = ctx.hasStreamingRequestBody();
+        if (streaming and !self.query_body_admission.tryAcquire()) return try textResponse(ctx, 503, "query capacity unavailable");
+        defer if (streaming) self.query_body_admission.release();
+        const body = (try ctx.body()) orelse "";
+        const allocator = self.authenticationAllocator(ctx);
+        var verified = @import("../common/remote_attempt_wire.zig").authorize(allocator, identity, service.registry.local.root_incarnation, .read, "POST", ctx.request.uri.path, body, received_at_ns, service.maximum_duration_ns) catch |err| return try remoteControlError(ctx, err);
+        const original = operationContext(ctx, null).platformDeadline() catch |err| return try internalQueryOwnerError(ctx, err);
+        if (original.deadline_ns) |deadline| verified.local_deadline_ns = @min(deadline, verified.local_deadline_ns);
+        if (platform_time.monotonicNs() >= verified.local_deadline_ns) return try internalQueryOwnerError(ctx, error.DeadlineExceeded);
+        const data = try allocator.create(RemoteReadContext);
+        errdefer allocator.destroy(data);
+        data.* = .{ .allocator = allocator, .verified = verified };
+        try ctx.setData(remote_read_context_key, data, RemoteReadContext.destroy);
+        return null;
+    }
+
+    const RemoteControlContext = struct {
+        allocator: std.mem.Allocator,
+        context: *httpx.Context,
+        deadline_ns: u64,
+        verified: @import("../common/remote_attempt_wire.zig").Verified = undefined,
+        discovery: ?RequestAdmission.Lease = null,
+        execution: http_server_mod.RunnableScheduler.Execution = .{},
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.context.isCancellationRequested();
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (canceled(self)) return error.Canceled;
+            if (platform_time.monotonicNs() >= self.deadline_ns) return error.DeadlineExceeded;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            try self.execution.enterWithCheck(.control, .{ .context = self, .check = check });
+        }
+        fn wait(self: *@This()) @import("../common/remote_fence_store.zig").Wait {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const allocator = self.allocator;
+            var discovery = self.discovery;
+            self.execution.finish();
+            allocator.destroy(self);
+            // Free the physical context before admitting another observer.
+            if (discovery) |*lease| lease.release();
+        }
+    };
+    const remote_control_context_key = "antfly-verified-remote-control";
+
+    fn remoteControlError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.Unauthorized => unauthorizedResponse(ctx),
+            error.RemoteFencePending => textResponse(ctx, 409, "remote fence pending"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "remote control deadline exceeded"),
+            error.Canceled => textResponse(ctx, 408, "remote control canceled"),
+            error.InvalidRemoteAttempt, error.InvalidRemoteAttemptPrincipal, error.UnsupportedRemoteAttemptProtocol => textResponse(ctx, 400, "invalid remote control request"),
+            else => textResponse(ctx, 503, "remote control unavailable"),
+        };
+    }
+    fn remoteControlIngress(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
+        const service = self.api_server.remoteAttemptControl() orelse return try textResponse(ctx, 503, "remote attempt control is not configured");
+        const token = ctx.header(internal_service_auth.header_name) orelse return try unauthorizedResponse(ctx);
+        if (ctx.request.uri.query != null) return try textResponse(ctx, 400, "remote control query parameters are not supported");
+        if (ctx.header("content-encoding")) |encoding| {
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, encoding, " \t"), "identity")) return try textResponse(ctx, 415, "remote control requests require identity encoding");
+        }
+        const received_at = platform_time.monotonicNs();
+        const capability_probe = std.mem.eql(u8, ctx.request.uri.path, internal_routes.remote_attempt_capabilities);
+        // Bound observers before body receipt, allocation or protected CPU.
+        // Retain the lease through physical response/context retirement.
+        var discovery: ?RequestAdmission.Lease = if (capability_probe)
+            self.api_server.remote_capability_admission.tryAcquireLease() orelse return try textResponse(ctx, 503, "remote discovery capacity exhausted")
+        else
+            null;
+        defer if (discovery) |*lease| lease.release();
+        const body = (try ctx.body()) orelse "";
+        if (capability_probe) {
+            if (body.len != 32) return try textResponse(ctx, 400, "remote capability nonce must be 32 bytes");
+        } else if (!std.mem.eql(u8, body, "{}")) return try textResponse(ctx, 400, "remote control body must be {}");
+        const kind: @import("../common/remote_attempt_wire.zig").Kind = if (capability_probe) .capabilities else if (std.mem.eql(u8, ctx.request.uri.path, internal_routes.remote_attempt_fence)) .fence else if (std.mem.eql(u8, ctx.request.uri.path, internal_routes.remote_attempt_cancel)) .cancel else .status;
+        const original = operationContext(ctx, null).platformDeadline() catch |err| return try remoteControlError(ctx, err);
+        const initial_deadline = @min(original.deadline_ns orelse std.math.maxInt(u64), received_at +| service.maximum_duration_ns);
+        const allocator = self.api_server.controlAllocator();
+        const data = try allocator.create(RemoteControlContext);
+        data.* = .{ .allocator = allocator, .context = ctx, .deadline_ns = initial_deadline, .discovery = discovery };
+        discovery = null;
+        var transferred = false;
+        defer if (!transferred) RemoteControlContext.destroy(data);
+        self.api_server.startSqlRunnable(&data.execution, .{
+            .io = ctx.io,
+            .native_now_ns = platform_time.monotonicNs,
+            .deadline_ns = initial_deadline,
+            .cancellation = .{ .ptr = data, .requested = RemoteControlContext.canceled },
+            .retained_bytes = @sizeOf(RemoteControlContext) + token.len + 1024,
+        }, .control) catch |err| return try remoteControlError(ctx, err);
+        var verified = self.api_server.authenticateRemoteAttempt(token, service.registry.local.root_incarnation, kind, "POST", ctx.request.uri.path, body, service.maximum_duration_ns) catch |err| return try remoteControlError(ctx, err);
+        // Include CPU admission and JWT work in the original received duration.
+        verified.local_deadline_ns = @min(verified.local_deadline_ns, @min(initial_deadline, received_at +| @min(verified.context.remaining_ns, service.maximum_duration_ns)));
+        data.deadline_ns = verified.local_deadline_ns;
+        data.verified = verified;
+        RemoteControlContext.check(data) catch |err| return try remoteControlError(ctx, err);
+        try ctx.setData(remote_control_context_key, data, RemoteControlContext.destroy);
+        transferred = true;
+        return null;
+    }
+
+    fn remoteAttemptCapabilities(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (!self.api_server.sql_control_admission.tryAcquire()) return textResponse(ctx, 503, "remote control capacity exhausted");
+        defer self.api_server.sql_control_admission.release();
+        const service = self.api_server.remoteAttemptControl() orelse return textResponse(ctx, 503, "remote attempt control is not configured");
+        const data: *RemoteControlContext = @ptrCast(@alignCast(ctx.getData(remote_control_context_key) orelse return unauthorizedResponse(ctx)));
+        const reply = self.api_server.signRemoteCapabilities(service.registry, service.signer, data.verified, operationContext(ctx, null)) catch |err| return remoteControlError(ctx, err);
+        const encoded = reply.encode();
+        return textResponse(ctx, 200, &encoded);
+    }
+    fn remoteAttemptStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.remoteAttemptControl(ctx, .status);
+    }
+    fn remoteAttemptFence(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.remoteAttemptControl(ctx, .fence);
+    }
+    fn remoteAttemptCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.remoteAttemptControl(ctx, .cancel);
+    }
+    fn remoteAttemptControl(self: *AntflyApiHandler, ctx: *httpx.Context, kind: @import("../common/remote_attempt_wire.zig").Kind) !httpx.Response {
+        if (!self.api_server.sql_control_admission.tryAcquire()) return textResponse(ctx, 503, "remote control capacity exhausted");
+        defer self.api_server.sql_control_admission.release();
+        const service = self.api_server.remoteAttemptControl() orelse return textResponse(ctx, 503, "remote attempt control is not configured");
+        // No migration bypass or raw-header fallback. Only ingress may install
+        // this verified context, and the same captured deadline reaches storage.
+        const data: *RemoteControlContext = @ptrCast(@alignCast(ctx.getData(remote_control_context_key) orelse return unauthorizedResponse(ctx)));
+        if (data.verified.context.kind != kind) return unauthorizedResponse(ctx);
+        const reply = self.api_server.signVerifiedRemoteControlWithWait(service.registry, service.signer, data.verified, operationContext(ctx, null), data.wait()) catch |err| return remoteControlError(ctx, err);
+        const encoded = reply.encode();
+        // Builder.build copies the borrowed bytes into the owned response.
+        return textResponse(ctx, 200, &encoded);
+    }
+
     fn internalQueryContext(self: *AntflyApiHandler, ctx: *httpx.Context) internal_query_operations.Context {
         var result = self.api_server.internalQueryContext();
         if (result.query_planning) |*planning| {
@@ -3442,12 +3660,193 @@ pub const AntflyApiHandler = struct {
         return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
     }
 
+    const InternalQueryJob = struct {
+        owner: *@import("internal_query_owner.zig").Owner,
+        server: *ApiHttpServer,
+        operations: internal_group_operations.Operations,
+        planning: internal_query_operations.Context,
+        worker_io: std.Io,
+        completion_io: std.Io,
+        done: std.Io.Event = .unset,
+        group_id: u64,
+        table_name: []const u8,
+        input: []const u8,
+        received_at_ns: u64,
+        prepared_header: ?[]const u8,
+        route_fence: ?[]const u8,
+        stage: enum { admission, planning, prepared, routing, query, encoding } = .admission,
+        failure: ?anyerror = null,
+        body: ?[]const u8 = null,
+        identity_read_generation: ?u64 = null,
+        remote: ?@import("../common/remote_attempt_wire.zig").Verified = null,
+        catalog_fence_applied: bool = false,
+
+        fn run(self: *@This()) void {
+            defer self.done.set(self.completion_io);
+            defer self.owner.parkOutput();
+            self.runChecked() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn runChecked(self: *@This()) !void {
+            const retained_input = self.input.len +| self.table_name.len +| (if (self.remote != null) @as(usize, @sizeOf(RemoteReadContext)) else 0);
+            try self.owner.start(self.server, self.worker_io, retained_input);
+            if (self.server.remoteQueryClient(self.owner.allocator())) |client| try self.owner.bindRemoteQueries(client);
+            if (self.remote) |verified| {
+                try self.owner.prepareRemote(verified);
+                const service = self.server.remoteAttemptControl() orelse return error.RemoteMembershipUnavailable;
+                const binding = try self.server.authorizeRemoteAttemptMembership(verified, self.owner.context, service.registry.local);
+                switch (try self.owner.admitRemote(service.registry, verified, binding, self.server.remoteQueryMembershipAuthority())) {
+                    .started => {},
+                    .duplicate_active => return error.RemoteAttemptAlreadyActive,
+                    .terminal => return error.RemoteAttemptTerminal,
+                    .capacity => return error.SchedulerFull,
+                    .deadline => return error.DeadlineExceeded,
+                }
+            }
+            const alloc = self.owner.allocator();
+            self.stage = .planning;
+            var envelope: ?std.json.Parsed(@import("owned_group_query.zig").Envelope) = null;
+            defer if (envelope) |*value| value.deinit();
+            const original_fence = self.owner.context.catalog_route_fence_json;
+            defer self.owner.context.catalog_route_fence_json = original_fence;
+            var input = self.input;
+            var prepared_header = self.prepared_header;
+            var route_fence = self.route_fence;
+            if (self.remote != null) {
+                envelope = try @import("owned_group_query.zig").decode(alloc, self.input);
+                input = envelope.?.value.query;
+                prepared_header = envelope.?.value.prepared_routing;
+                route_fence = envelope.?.value.route_fence;
+                self.owner.context.catalog_route_fence_json = route_fence orelse "";
+            }
+            const contract = @import("antfly_local_sources").api_query_contract;
+            try self.owner.tightenDeadline(try contract.queryExecutionDeadlineNsFromBodyAt(alloc, input, self.received_at_ns));
+            var request = try self.planning.planQueryWithContext(alloc, self.table_name, input, self.owner.context);
+            defer request.deinit(alloc);
+            self.stage = .prepared;
+            const prepared = @import("prepared_query_routing.zig");
+            if (!try prepared.apply(alloc, self.table_name, prepared_header, route_fence, &request.req)) {
+                self.stage = .routing;
+                try self.planning.routeQueryWithContext(alloc, self.owner.context, self.table_name, &request.req);
+            }
+            try self.owner.tightenDeadline(request.req.execution_deadline_ns);
+            self.stage = .query;
+            var result = try self.operations.query(alloc, self.owner.context, self.group_id, self.table_name, request.req);
+            defer result.deinit(alloc);
+            self.catalog_fence_applied = if (route_fence) |bytes| bytes.len != 0 else false;
+            self.stage = .encoding;
+            try self.owner.context.ensureActive();
+            if (self.owner.team) |team| {
+                const status = team.borrow.checkpoint(team.borrow.context);
+                if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+            } else try self.owner.execution.checkpoint();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.parseFromSliceLeaky(metadata_openapi.QueryResponses, arena.allocator(), result.json, .{ .allocate = .alloc_always });
+            var encoded = try httpx.Response.fromJson(alloc, 200, value);
+            defer encoded.deinit();
+            try self.owner.context.ensureActive();
+            self.body = encoded.body;
+            encoded.body = null;
+            encoded.body_owned = false;
+            self.identity_read_generation = result.identity_read_generation;
+        }
+    };
+
+    fn internalOwnedGroupQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (ctx.getData(remote_read_context_key) == null or !self.api_server.runnableSchedulingStats().enabled) return textResponse(ctx, 503, "owned read admission is required");
+        return self.internalGroupQuery(ctx);
+    }
+    fn internalOwnedRetainedRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (ctx.getData(remote_read_context_key) == null or !self.api_server.runnableSchedulingStats().enabled) return textResponse(ctx, 503, "owned read admission is required");
+        return self.internalRetainedRead(ctx);
+    }
+
     fn internalGroupQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (!self.api_server.runnableSchedulingStats().enabled) return self.internalGroupQueryLegacy(ctx);
+        const received_at_ns = platform_time.monotonicNs();
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const streaming = ctx.hasStreamingRequestBody();
+        if (streaming and !self.query_body_admission.tryAcquire()) return textResponse(ctx, 503, "query capacity unavailable");
+        defer if (streaming) self.query_body_admission.release();
+        const body = (try ctx.body()) orelse "";
+        const io = self.api_server.sqlExecutionIo() catch return textResponse(ctx, 503, "query workers unavailable");
+        const Owner = @import("internal_query_owner.zig").Owner;
+        const remote: ?*const RemoteReadContext = if (ctx.getData(remote_read_context_key)) |raw| @ptrCast(@alignCast(raw)) else null;
+        var request_context = operationContext(ctx, null).platformDeadline() catch |err| return internalQueryOwnerError(ctx, err);
+        if (remote) |data| request_context.deadline_ns = if (request_context.deadline_ns) |deadline| @min(deadline, data.verified.local_deadline_ns) else data.verified.local_deadline_ns;
+        const owner = Owner.create(self.api_server.alloc, self.api_server.runnable_owner, self.api_server.readMemoryPool(), request_context) catch |err| return internalQueryOwnerError(ctx, err);
+        defer owner.release();
+        var job: InternalQueryJob = .{
+            .owner = owner,
+            .server = self.api_server,
+            .operations = self.internalGroupOperations(),
+            .planning = self.api_server.internalQueryContext(),
+            .worker_io = io,
+            .completion_io = ctx.io,
+            .group_id = params.group_id,
+            .table_name = params.table_name,
+            .input = body,
+            .received_at_ns = received_at_ns,
+            .remote = if (remote) |data| data.verified else null,
+            .prepared_header = ctx.header(@import("prepared_query_routing.zig").header_name),
+            .route_fence = ctx.header(metadata_api.catalog_route_fence_header),
+        };
+        defer if (job.body) |bytes| owner.allocator().free(bytes);
+        var future = io.concurrent(InternalQueryJob.run, .{&job}) catch return textResponse(ctx, 503, "query workers unavailable");
+        job.done.waitUncancelable(ctx.io);
+        @import("protected_future.zig").wait(io, &future);
+        if (job.failure) |err| {
+            if (err == error.OutOfMemory or err == error.SchedulerFull or err == error.RunnableWaitTimeout or err == error.SchedulerClosed or err == error.DeadlineExceeded or err == error.Canceled) return internalQueryOwnerError(ctx, err);
+            return switch (job.stage) {
+                .admission => internalQueryOwnerError(ctx, err),
+                .planning => internalQueryPlanningErrorResponse(ctx, err),
+                .prepared => textResponse(ctx, 400, @errorName(err)),
+                .routing => switch (err) {
+                    error.TableNotFound => textResponse(ctx, 404, @errorName(err)),
+                    error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => textResponse(ctx, 500, "invalid table metadata"),
+                    else => err,
+                },
+                .query => if (err == error.InvalidArgument) textResponse(ctx, 400, @errorName(err)) else internalGroupErrorResponse(ctx, @errorCast(err)),
+                .encoding => err,
+            };
+        }
+        var response = try ctx.response.build();
+        errdefer response.deinit();
+        try response.headers.set("content-type", "application/json");
+        if (job.identity_read_generation) |generation| {
+            var buf: [32]u8 = undefined;
+            try response.headers.set(query_api.QueryResponse.identity_read_generation_header, try std.fmt.bufPrint(&buf, "{d}", .{generation}));
+        }
+        if (job.catalog_fence_applied) try response.headers.set(metadata_api.catalog_route_fence_ack_header, metadata_api.catalog_route_fence_ack_value);
+        try response.headers.setContentLength(job.body.?.len);
+        response.releaseBody();
+        response.body = job.body;
+        response.body_owned = true;
+        response.body_allocator = owner.allocator();
+        job.body = null;
+        try owner.retainResponse(&response);
+        return response;
+    }
+
+    fn internalQueryOwnerError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.RemoteAttemptAlreadyActive => textResponse(ctx, 409, "remote attempt already active"),
+            error.RemoteAttemptTerminal => textResponse(ctx, 409, "remote attempt terminal"),
+            error.DeadlineExceeded, error.Timeout => textResponse(ctx, 504, "query deadline exceeded"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "query canceled"),
+            else => textResponse(ctx, 503, "query capacity unavailable"),
+        };
+    }
+
+    fn internalGroupQueryLegacy(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
         const query_context = self.internalQueryContext(ctx);
-        var query_request = query_context.planQuery(ctx.allocator, params.table_name, body) catch |err|
+        var query_request = query_context.planQueryWithContext(ctx.allocator, params.table_name, body, operationContext(ctx, null)) catch |err|
             return internalQueryPlanningErrorResponse(ctx, err);
         defer query_request.deinit(ctx.allocator);
         query_request.req.cancellation = operationContext(ctx, null).cancellation;
@@ -3495,7 +3894,7 @@ pub const AntflyApiHandler = struct {
         const preflight = try parseInternalQueryPreflight(ctx.allocator, body);
         defer ctx.allocator.free(preflight.query_request_body);
         const query_context = self.internalQueryContext(ctx);
-        var query_request = query_context.planQuery(ctx.allocator, params.table_name, preflight.query_request_body) catch |err|
+        var query_request = query_context.planQueryWithContext(ctx.allocator, params.table_name, preflight.query_request_body, operationContext(ctx, null)) catch |err|
             return internalQueryPlanningErrorResponse(ctx, err);
         defer query_request.deinit(ctx.allocator);
         query_request.req.cancellation = operationContext(ctx, null).cancellation;
@@ -3543,46 +3942,208 @@ pub const AntflyApiHandler = struct {
         return internalQueryResponse(ctx, &result);
     }
 
+    const InternalRetainedReadJob = struct {
+        owner: *@import("internal_query_owner.zig").Owner,
+        server: *ApiHttpServer,
+        retained: @import("retained_read_owner.zig").Owner,
+        scope: @import("../storage/retained_read_registry.zig").Scope,
+        table: []const u8,
+        input: @import("retained_read_rpc.zig").Request,
+        input_bytes: usize,
+        remote: ?@import("../common/remote_attempt_wire.zig").Verified = null,
+        page_format: @import("retained_read_page.zig").Format = .json,
+        signed_body: []const u8 = "",
+        signed_control: bool = false,
+        received_at_ns: u64 = 0,
+        worker_io: std.Io,
+        completion_io: std.Io,
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        body: ?[]u8 = null,
+
+        fn isControl(input: @import("retained_read_rpc.zig").Request) bool {
+            return input.operation == .close or input.operation == .cancel;
+        }
+        fn run(self: *@This()) void {
+            defer self.done.set(self.completion_io);
+            defer self.owner.parkOutput();
+            self.runChecked() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn runChecked(self: *@This()) !void {
+            const rpc = @import("retained_read_rpc.zig");
+            const control = if (self.remote != null) self.signed_control else isControl(self.input);
+            const retained_input = self.input_bytes +| self.table.len +| (if (self.remote != null) @as(usize, @sizeOf(RemoteReadContext)) else 0);
+            try self.owner.startClass(self.server, self.worker_io, retained_input, if (control) .control else .query);
+            var envelope: ?std.json.Parsed(@import("owned_retained_read.zig").Envelope) = null;
+            defer if (envelope) |*value| value.deinit();
+            var parsed: ?std.json.Parsed(rpc.Request) = null;
+            defer if (parsed) |*value| value.deinit();
+            const original_fence = self.owner.context.catalog_route_fence_json;
+            defer self.owner.context.catalog_route_fence_json = original_fence;
+            var input = self.input;
+            var retained = self.retained;
+            var scope = self.scope;
+            if (self.remote) |verified| {
+                try self.owner.prepareRemote(verified);
+                const service = self.server.remoteAttemptControl() orelse return error.RemoteMembershipUnavailable;
+                const binding = try self.server.authorizeRemoteAttemptMembership(verified, self.owner.context, service.registry.local);
+                // Cleanup creates no native read capability. Its authority is
+                // the authenticated coordinator and exact token, independent of
+                // a closing data gate. Entering that gate would deadlock a
+                // generation fence waiting for this very token's destruction.
+                if (!control) switch (try self.owner.admitRemote(service.registry, verified, binding, self.server.remoteQueryMembershipAuthority())) {
+                    .started => {},
+                    .duplicate_active => return error.RemoteAttemptAlreadyActive,
+                    .terminal => return error.RemoteAttemptTerminal,
+                    .capacity => return error.SchedulerFull,
+                    .deadline => return error.DeadlineExceeded,
+                };
+                const alloc = self.owner.allocator();
+                envelope = try @import("owned_retained_read.zig").decode(alloc, self.signed_body);
+                parsed = std.json.parseFromSlice(rpc.Request, alloc, envelope.?.value.request, .{ .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRetainedReadEnvelope;
+                input = parsed.?.value;
+                if (input.lease_ms == 0 or input.lease_ms > rpc.max_lease_ms or isControl(input) != control) return error.InvalidRetainedReadEnvelope;
+                try self.owner.tightenDeadline(self.received_at_ns +| @as(u64, input.lease_ms) * std.time.ns_per_ms);
+                self.owner.context.catalog_route_fence_json = envelope.?.value.route_fence;
+                try retained.source.bindCatalogRouteFenceJson(alloc, envelope.?.value.route_fence, scope.group_id, self.owner.context.deadline_ns, self.owner.context.cancellation);
+                const route = retained.source.route_fence orelse return error.InvalidRetainedReadEnvelope;
+                scope.table_id = route.table_id;
+                scope.group_id = route.route.group_id;
+                scope.topology_revision = route.topology_epoch;
+                scope.schema_version = input.schema_version;
+                if (!control) retained.request_parent = (try self.owner.retainedReadParent()) orelse return error.InvalidRemoteAttempt;
+            }
+            var context = self.owner.context;
+            context.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.worker_io);
+            self.body = try rpc.executeWithCodecContext(self.owner.allocator(), retained, scope, self.table, input, self.page_format, context);
+        }
+        fn response(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            var result = try ctx.response.build();
+            errdefer result.deinit();
+            const page = @import("retained_read_page.zig");
+            try result.headers.set("content-type", if (std.mem.startsWith(u8, self.body.?, page.compact_magic)) page.compact_media_type else if (std.mem.startsWith(u8, self.body.?, page.magic)) page.media_type else "application/json");
+            try result.headers.setContentLength(self.body.?.len);
+            result.releaseBody();
+            result.body = self.body;
+            result.body_owned = true;
+            result.body_allocator = self.owner.allocator();
+            self.body = null;
+            try self.owner.retainResponse(&result);
+            return result;
+        }
+    };
+
     fn internalRetainedRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const rpc = @import("retained_read_rpc.zig");
+        const received_at = platform_time.monotonicNs();
         // Unlike legacy stateless internal reads, retained handles NEVER accept
         // unsigned migration traffic. Bind each operation to the authenticated
         // service credential, not a principal supplied by the request body.
         const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
-        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
-        defer identity.deinit(self.api_server.alloc);
+        const auth_allocator = self.authenticationAllocator(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequestWithAllocator(auth_allocator, credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(auth_allocator);
         if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing retained read request");
         if (body.len > rpc.max_request_bytes) return textResponse(ctx, 413, "retained read request too large");
+        if (ctx.getData(remote_read_context_key)) |raw| {
+            const remote: *const RemoteReadContext = @ptrCast(@alignCast(raw));
+            return self.internalSignedRetainedRead(ctx, params.group_id, params.table_name, body, received_at, remote.verified);
+        }
         var request_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 16 << 20 };
         var parsed = std.json.parseFromSlice(rpc.Request, request_budget.allocator(), body, .{ .parse_numbers = false }) catch return textResponse(ctx, 400, "invalid retained read request");
         defer parsed.deinit();
-        const request = operationContext(ctx, null);
-        try request.ensureActive();
+        var request = operationContext(ctx, null).platformDeadline() catch |err| return internalQueryOwnerError(ctx, err);
+        if (parsed.value.lease_ms == 0 or parsed.value.lease_ms > rpc.max_lease_ms) return textResponse(ctx, 400, "invalid retained read lease");
+        const maximum_deadline = received_at +| @as(u64, parsed.value.lease_ms) * std.time.ns_per_ms;
+        request.deadline_ns = @min(request.deadline_ns orelse maximum_deadline, maximum_deadline);
+        request.ensureActive() catch |err| return internalQueryOwnerError(ctx, err);
         var source = self.api_server.table_reads orelse return textResponse(ctx, 503, "retained read source unavailable");
         source.bindCatalogRouteFenceJson(ctx.allocator, request.catalog_route_fence_json, params.group_id, request.deadline_ns, request.cancellation) catch return textResponse(ctx, 400, "invalid catalog route fence");
         const route = source.route_fence orelse return textResponse(ctx, 400, "catalog route fence required");
         var principal: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(identity.credential_principal, &principal, .{});
         const runtime = self.api_server.retainedReadRuntime() catch return textResponse(ctx, 503, "retained read owner unavailable");
-        const encoded = rpc.executeWithCodec(ctx.allocator, .{ .registry = &runtime.registry, .source = source }, .{
+        const scope: @import("../storage/retained_read_registry.zig").Scope = .{
             .principal = principal,
             .authorization_revision = 1,
             .table_id = route.table_id,
             .group_id = route.route.group_id,
             .topology_revision = route.topology_epoch,
             .schema_version = parsed.value.schema_version,
-        }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| return textResponse(ctx, switch (err) {
-            error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
-            error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
-            error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
-            else => 503,
-        }, @errorName(err));
-        defer ctx.allocator.free(encoded);
-        try ctx.setHeader("content-type", if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").compact_magic)) @import("retained_read_page.zig").compact_media_type else if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").magic)) @import("retained_read_page.zig").media_type else "application/json");
-        return ctx.response.body(try ctx.allocator.dupe(u8, encoded)).build();
+        };
+        const control = InternalRetainedReadJob.isControl(parsed.value);
+        const io = (if (control) self.api_server.sqlControlIo() else self.api_server.sqlExecutionIo()) catch return textResponse(ctx, 503, "retained read workers unavailable");
+        const Owner = @import("internal_query_owner.zig").Owner;
+        const owner = Owner.create(if (control) self.api_server.controlAllocator() else self.api_server.alloc, self.api_server.runnable_owner, if (control) null else self.api_server.readMemoryPool(), request) catch |err| return internalQueryOwnerError(ctx, err);
+        defer owner.release();
+        var job: InternalRetainedReadJob = .{ .owner = owner, .server = self.api_server, .retained = .{ .registry = &runtime.registry, .source = source }, .scope = scope, .table = params.table_name, .input = parsed.value, .input_bytes = body.len, .page_format = @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse ""), .worker_io = io, .completion_io = ctx.io };
+        defer if (job.body) |bytes| owner.allocator().free(bytes);
+        var future = io.concurrent(InternalRetainedReadJob.run, .{&job}) catch return textResponse(ctx, 503, "retained read workers unavailable");
+        job.done.waitUncancelable(ctx.io);
+        @import("protected_future.zig").wait(io, &future);
+        if (job.failure) |err| {
+            if (err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled or err == error.SchedulerFull or err == error.SchedulerClosed or err == error.RunnableWaitTimeout) return internalQueryOwnerError(ctx, err);
+            return textResponse(ctx, switch (err) {
+                error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
+                error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
+                error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
+                else => 503,
+            }, @errorName(err));
+        }
+        return job.response(ctx);
+    }
+
+    fn internalSignedRetainedRead(self: *AntflyApiHandler, ctx: *httpx.Context, group_id: u64, table: []const u8, body: []const u8, received_at: u64, verified: @import("../common/remote_attempt_wire.zig").Verified) !httpx.Response {
+        const control = @import("owned_retained_read.zig").isControlBody(body);
+        var request = operationContext(ctx, null).platformDeadline() catch |err| return internalQueryOwnerError(ctx, err);
+        request.deadline_ns = @min(request.deadline_ns orelse verified.local_deadline_ns, verified.local_deadline_ns);
+        const source = self.api_server.table_reads orelse return textResponse(ctx, 503, "retained read source unavailable");
+        const runtime = self.api_server.retainedReadRuntime() catch return textResponse(ctx, 503, "retained read owner unavailable");
+        const io = (if (control) self.api_server.sqlControlIo() else self.api_server.sqlExecutionIo()) catch return textResponse(ctx, 503, "retained read workers unavailable");
+        const Owner = @import("internal_query_owner.zig").Owner;
+        const owner = Owner.create(if (control) self.api_server.controlAllocator() else self.api_server.alloc, self.api_server.runnable_owner, if (control) null else self.api_server.readMemoryPool(), request) catch |err| return internalQueryOwnerError(ctx, err);
+        defer owner.release();
+        var digest: [32]u8 = undefined;
+        // Use a domain-separated token principal for this signed protocol.
+        // The authenticated coordinator identity includes the cluster epoch.
+        var principal_bytes: [16]u8 = undefined;
+        std.mem.writeInt(u128, &principal_bytes, verified.context.id.coordinator, .big);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-owned-retained-read-v1");
+        hash.update(&principal_bytes);
+        hash.final(&digest);
+        var job: InternalRetainedReadJob = .{
+            .owner = owner,
+            .server = self.api_server,
+            .retained = .{ .registry = &runtime.registry, .source = source },
+            .scope = .{ .principal = digest, .authorization_revision = 1, .table_id = 0, .group_id = group_id, .topology_revision = 0, .schema_version = 0 },
+            .table = table,
+            .input = .{ .operation = .admit, .schema_version = 0 },
+            .input_bytes = body.len,
+            .remote = verified,
+            .signed_body = body,
+            .signed_control = control,
+            .received_at_ns = received_at,
+            .worker_io = io,
+            .completion_io = ctx.io,
+        };
+        defer if (job.body) |bytes| owner.allocator().free(bytes);
+        var future = io.concurrent(InternalRetainedReadJob.run, .{&job}) catch return textResponse(ctx, 503, "retained read workers unavailable");
+        job.done.waitUncancelable(ctx.io);
+        @import("protected_future.zig").wait(io, &future);
+        if (job.failure) |err| {
+            if (err == error.InvalidRetainedReadEnvelope) return textResponse(ctx, 400, @errorName(err));
+            return internalQueryOwnerError(ctx, err);
+        }
+        var response = try job.response(ctx);
+        errdefer response.deinit();
+        try response.headers.set(metadata_api.catalog_route_fence_ack_header, metadata_api.catalog_route_fence_ack_value);
+        return response;
     }
 
     fn internalGroupScan(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3918,6 +4479,18 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        if (std.mem.startsWith(u8, body, "ATPS")) {
+            const protocol = distributed_txn.preparation_protocol;
+            const input = protocol.decodeStatusQuery(body, null) catch return textResponse(ctx, 400, "invalid transaction request");
+            const observation = self.internalGroupOperations().txnPreparationStatusWithRequest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+                return internalTxnErrorResponse(ctx, err, .status);
+            const encoded = try protocol.encodeStatusReply(input, params.group_id, observation, null);
+            const owned = try ctx.allocator.dupe(u8, &encoded);
+            errdefer ctx.allocator.free(owned);
+            try ctx.setHeader("content-type", "application/octet-stream");
+            _ = ctx.response.bodyOwned(ctx.allocator, owned);
+            return ctx.response.build();
+        }
         const input = distributed_txn.parseTxnStatusRequestWithScope(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         const status = self.internalGroupOperations().txnStatusWithRequest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .status);
@@ -3955,10 +4528,17 @@ pub const AntflyApiHandler = struct {
     // Authentication helper
     // ---------------------------------------------------------------
 
+    fn authenticationAllocator(self: *AntflyApiHandler, ctx: *const httpx.Context) std.mem.Allocator {
+        return if (http_server_mod.isProtectedHttpControl(ctx.request.method, ctx.request.uri.path, ctx.request.body orelse ""))
+            self.api_server.controlAllocator()
+        else
+            self.api_server.alloc;
+    }
+
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
         if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null and
             ctx.header(http_server_mod.trusted_principal_header) == null) return null;
-        return self.api_server.authenticateRequest(.{
+        return self.api_server.authenticateRequestWithAllocator(self.authenticationAllocator(ctx), .{
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
         }) catch |err| switch (err) {
@@ -4072,9 +4652,20 @@ pub const AntflyApiHandler = struct {
     ) !?httpx.Response {
         const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
             @compileError("public operation is missing an admission policy: " ++ operation_id);
-        const acquired = switch (class) {
+        try operationContext(ctx, null).ensureActive();
+        const acquired = if (comptime std.mem.eql(u8, operation_id, "commitTransactionSession")) self.api_server.sql_control_admission.tryAcquire() else switch (class) {
             .none => @compileError("operation does not use foreground admission: " ++ operation_id),
-            .query => self.api_server.tryAcquireQuery(),
+            .query => if (self.api_server.cfg.query_waiting.max_wait_ms == 0 or isNdjsonContentType(ctx.header("content-type"))) self.api_server.tryAcquireQuery() else query: {
+                establishQueryAdmissionDeadline(ctx);
+                const options = queryAdmissionOptions(ctx);
+                _ = self.api_server.query_admission.acquire(options) catch |err| switch (err) {
+                    error.Canceled => return err,
+                    error.DeadlineExceeded => return try admissionFailureResponse(ctx, 504, "deadline_exceeded"),
+                    error.AdmissionClosed => return try admissionFailureResponse(ctx, 503, "draining"),
+                    else => return try admissionFailureResponse(ctx, 429, admissionFailureReason(err)),
+                };
+                break :query true;
+            },
             .write => self.api_server.tryAcquireWrite(),
             .inference => self.api_server.tryAcquireInference(),
         };
@@ -4091,7 +4682,67 @@ pub const AntflyApiHandler = struct {
         return null;
     }
 
+    fn establishQueryAdmissionDeadline(ctx: *httpx.Context) void {
+        const body = ctx.request.body orelse return;
+        const declared = query_contract.queryExecutionDeadlineNsFromBody(ctx.allocator, body) catch return;
+        const deadline = declared orelse return;
+        const context = operationContext(ctx, null).platformDeadline() catch return;
+        ctx.application_deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        ctx.application_deadline_io = null;
+    }
+
+    fn retainedRequestBytes(ctx: *const httpx.Context) u64 {
+        var bytes: u64 = @sizeOf(httpx.Context) + @sizeOf(httpx.Request);
+        bytes +|= if (ctx.request.body_allocation) |body| body.len else if (ctx.request.body) |body| body.len else 0;
+        bytes +|= ctx.request.uri.path.len;
+        bytes +|= @as(u64, ctx.request.headers.entries.capacity) *| @sizeOf(@TypeOf(ctx.request.headers.entries.items[0]));
+        for (ctx.request.headers.iterator()) |header| bytes +|= @as(u64, header.name.len) +| header.value.len;
+        return bytes;
+    }
+
+    fn queryAdmissionOptions(ctx: *httpx.Context) @import("antfly_local_sources").common_bounded_admission.Options {
+        return .{
+            .io = ctx.io,
+            .deadline_ns = ctx.application_deadline_ns,
+            .clock_io = ctx.application_deadline_io,
+            .native_now_ns = if (ctx.application_deadline_io == null) platform_time.monotonicNs else null,
+            .cancellation = .{ .ptr = ctx, .requested = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                    return context.isCancellationRequested();
+                }
+            }.call },
+            .retained_bytes = retainedRequestBytes(ctx),
+        };
+    }
+
+    fn admissionFailureReason(err: anyerror) []const u8 {
+        return switch (err) {
+            error.AdmissionFull => "execution_capacity",
+            error.AdmissionQueueFull => "queue_count",
+            error.AdmissionBytesExhausted => "queue_bytes",
+            error.AdmissionRequestTooLarge => "request_bytes",
+            error.AdmissionWaitTimeout => "wait_timeout",
+            else => "capacity_unavailable",
+        };
+    }
+
+    fn admissionFailureResponse(ctx: *httpx.Context, status: u16, reason: []const u8) !httpx.Response {
+        if (status == 429) try ctx.setHeader("Retry-After", "1");
+        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
+        return ctx.status(status).json(.{
+            .@"error" = if (status == 429) "instance_busy" else if (status == 503) "draining" else "deadline_exceeded",
+            .reason = reason,
+            .stage = "admission",
+            .execution_started = false,
+        });
+    }
+
     fn releasePublicOperation(self: *AntflyApiHandler, comptime operation_id: []const u8) void {
+        if (comptime std.mem.eql(u8, operation_id, "commitTransactionSession")) {
+            self.api_server.sql_control_admission.release();
+            return;
+        }
         const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
             @compileError("public operation is missing an admission policy: " ++ operation_id);
         switch (class) {
@@ -4146,7 +4797,7 @@ pub const AntflyApiHandler = struct {
             identity.* = cached.identity;
             cached.identity = null;
         } else {
-            identity.* = self.api_server.authenticateRequest(.{
+            identity.* = self.api_server.authenticateRequestWithAllocator(self.authenticationAllocator(ctx), .{
                 .authorization = ctx.header("authorization"),
                 .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
             }) catch |err| switch (err) {
@@ -4186,6 +4837,53 @@ pub const AntflyApiHandler = struct {
     // ---------------------------------------------------------------
     // metadata_openapi handler interface (29 methods)
     // ---------------------------------------------------------------
+
+    fn getWorkloadPolicy(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeStorageMaintenance(ctx, &identity)) |response| return response;
+        return ctx.json(.{
+            .query = self.api_server.queryAdmissionStats(),
+            .memory = self.api_server.workloadMemoryStats(),
+            .cleanup = self.api_server.sqlCleanupStats(),
+            .runnable = self.api_server.runnableSchedulingStats(),
+        });
+    }
+
+    fn putWorkloadPolicy(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeStorageMaintenance(ctx, &identity)) |response| return response;
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing workload policy");
+        if (body.len > 1024) return textResponse(ctx, 413, "workload policy exceeds 1024 bytes");
+        var parsed = std.json.parseFromSlice(http_server_mod.WorkloadPolicyRequest, ctx.allocator, body, .{}) catch
+            return textResponse(ctx, 400, "invalid workload policy");
+        defer parsed.deinit();
+        const policy = parsed.value;
+        const gate = &self.api_server.query_admission;
+        if (policy.action == .drain) {
+            if (policy.capacity != null or policy.waiting != null or policy.suspended != null)
+                return textResponse(ctx, 400, "drain does not accept a replacement policy");
+            gate.drain(policy.expected_version) catch |err| return workloadPolicyError(ctx, err);
+        } else {
+            gate.update(
+                policy.expected_version,
+                policy.capacity orelse return textResponse(ctx, 400, "capacity required"),
+                policy.waiting orelse return textResponse(ctx, 400, "waiting required"),
+                policy.suspended orelse return textResponse(ctx, 400, "suspended required"),
+            ) catch |err| return workloadPolicyError(ctx, err);
+        }
+        return ctx.json(.{ .query = self.api_server.queryAdmissionStats(), .memory = self.api_server.workloadMemoryStats(), .cleanup = self.api_server.sqlCleanupStats() });
+    }
+
+    fn workloadPolicyError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.PolicyConflict => textResponse(ctx, 409, "policy version changed; refresh before retrying"),
+            error.AdmissionClosed => textResponse(ctx, 409, "admission is permanently draining"),
+            error.InvalidConfig => textResponse(ctx, 422, "policy exceeds startup reservations or has invalid waiting bounds"),
+            else => err,
+        };
+    }
 
     pub fn getStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
@@ -5528,13 +6226,14 @@ pub const AntflyApiHandler = struct {
             execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, prepared.tables) catch |err|
                 return self.transactionPreparationError(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         }
-        const outcome = (source.commitTransactionWithIdAndCancellation(
+        const outcome = (source.commitTransactionWithIdAndControl(
             alloc,
             txn_id,
             session.begin_timestamp,
             execution_plan.?.value,
             session.sync_level,
             commit_request.cancellation,
+            .{ .pre_decision = distributed_txn.CommitControl.fromRequest(commit_request).pre_decision, .participant_plan_store = self.api_server.txn_sessions.participantPlanStore() },
         ) catch |err| switch (err) {
             error.TransactionTooLarge => {
                 _ = self.api_server.txn_sessions.remove(alloc, txn_id);
@@ -5889,7 +6588,16 @@ pub const AntflyApiHandler = struct {
     }
 
     const SQLPreparedMode = enum { statement, prepare, execute, close };
+    const SQLInput = @import("sql_input_capsule.zig").Request;
+    const SQLInputOwner = @import("sql_input_capsule.zig").Capsule(SQLInput);
+    const SQLInputFrame = @import("sql_input_capsule.zig").OwnedFrame(operation_contract.CancellationToken);
+    const SQLDecodeJob = @import("sql_input_capsule.zig").DecodeJob;
     const SQLJob = struct {
+        remote_client: ?@import("remote_attempt_client.zig").Client = null,
+        remote_owner: ?*@import("remote_read_operation_owner.zig").Owner = null,
+        remote_dispatch: ?@import("retained_query_dispatch.zig").Dispatcher = null,
+        read_memory: ?@import("../common/read_memory.zig").Group = null,
+        input_owner: *SQLInputOwner,
         adapter: sql_execution.Adapter,
         statement: []const u8,
         principal: []const u8,
@@ -5904,6 +6612,11 @@ pub const AntflyApiHandler = struct {
         done: std.Io.Event = .unset,
         result: ?sql_runtime.Result = null,
         encoded_read: ?[]const u8 = null,
+        response_status: u16 = 200,
+        transport_allocator: ?std.mem.Allocator = null,
+        transport_response: ?[]const u8 = null,
+        encoding_failure: ?anyerror = null,
+        output_owner: ?@import("sql_output_control.zig").Owner = null,
         failure: ?anyerror = null,
         diagnostic: sql_compiler.Diagnostic = .{},
         diagnostic_message_buffer: [256]u8 = undefined,
@@ -5911,6 +6624,7 @@ pub const AntflyApiHandler = struct {
         execution_entered: bool = false,
         is_write: bool = false,
         preparation: *RequestAdmission.Lease,
+        protected_control: bool = false,
         prepared_mode: SQLPreparedMode = .statement,
         prepared_id: ?[]const u8 = null,
         prepared_response: ?[]const u8 = null,
@@ -5918,111 +6632,358 @@ pub const AntflyApiHandler = struct {
         connection_owned: ?@import("sql_connections.zig").Owned = null,
         connection_session_hex: [32]u8 = undefined,
 
+        fn bindRemoteReads(self: *@This()) !void {
+            if (self.remote_client != null or self.remote_owner != null or self.remote_dispatch != null or self.adapter.read_remote_setup != null) return error.InvalidRunnableTransition;
+            self.remote_client = self.adapter.server.remoteRetainedReadClient();
+            if (self.remote_client != null)
+                self.adapter.read_remote_setup = .{ .ptr = self, .prepare = prepareRemoteReads };
+        }
+
+        fn prepareRemoteReads(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.remote_dispatch != null) return;
+            if (self.remote_owner != null) return error.InvalidRunnableTransition;
+            const client = self.remote_client orelse return error.InvalidRunnableTransition;
+            if (!client.reads_ready) return error.RemoteReadUnavailable;
+            const server = self.adapter.server;
+            const runnable = self.adapter.runnable orelse return error.ExecutionWaitUnsupported;
+            try runnable.checkLifetime();
+            const Registrar = struct {
+                server: *http_server_mod.ApiHttpServer,
+                pub fn bind(registrar: @This(), parent: @import("retained_read_retirement.zig").Parent) !@import("retained_read_retirement.zig").Binding {
+                    return registrar.server.readRetirementBinding(parent);
+                }
+            };
+            const scheduler = if (server.runnable_owner) |active| &active.scheduler else if (server.runnable_scheduler) |*active| active else return error.CleanupCapacityUnavailable;
+            self.remote_owner = try @import("remote_read_operation_owner.zig").Owner.create(server.controlAllocator(), scheduler, Registrar{ .server = server });
+            errdefer {
+                // Keep the rejecting setup capability installed on failure;
+                // a later accessor must never fall back to legacy execution.
+                self.remote_owner.?.finishForeground();
+                self.remote_owner = null;
+            }
+            self.remote_dispatch = try @import("retained_query_dispatch.zig").Dispatcher.initRetained(client, self, remoteDeadline, self.remote_owner.?.retainedParent());
+            self.remote_owner.?.adoptEndpoints(&self.remote_dispatch.?);
+            self.adapter.read_retirement = self.remote_owner.?.binding;
+            self.adapter.read_remote_executor = self.remote_dispatch.?.executor();
+        }
+
+        fn remoteDeadline(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.input_owner.execution.checkLifetime();
+            return (try self.adapter.context.platformDeadline()).deadline_ns;
+        }
+
+        // Only synchronous dispatch callbacks borrow SQLJob. Published
+        // uncertainty owns copied metadata and the independent node parent.
+        // Invoke after local read fences and result streams have retired.
+        fn finishRemoteReads(self: *@This()) void {
+            self.adapter.read_remote_setup = null;
+            self.remote_client = null;
+            self.adapter.read_retirement = null;
+            self.adapter.read_remote_executor = null;
+            if (self.remote_dispatch) |*dispatcher| dispatcher.deinit();
+            self.remote_dispatch = null;
+            if (self.remote_owner) |owner| owner.finishForeground();
+            self.remote_owner = null;
+        }
+
+        fn outputControl(self: *@This()) @import("sql_json_source.zig").Control {
+            if (self.output_owner == null) self.output_owner = .{
+                .execution = &self.input_owner.execution,
+                .options = self.input_owner.options,
+                .validator = .{ .ptr = &self.adapter, .check = struct {
+                    fn check(raw: *anyopaque, force: bool) !void {
+                        const adapter: *sql_execution.Adapter = @ptrCast(@alignCast(raw));
+                        try adapter.validateReadFence(force);
+                        try adapter.context.ensureActive();
+                    }
+                }.check },
+            };
+            return self.output_owner.?.control();
+        }
+
+        fn executionAllocator(self: *@This()) std.mem.Allocator {
+            return if (self.read_memory) |*group| group.allocator() else self.workAllocator();
+        }
+
+        fn releaseReadMemory(self: *@This()) void {
+            if (self.read_memory) |*group| group.deinit();
+            self.read_memory = null;
+        }
+
+        fn workAllocator(self: *@This()) std.mem.Allocator {
+            return if (self.protected_control) self.adapter.server.controlAllocator() else self.adapter.server.alloc;
+        }
+
         fn deliverRead(raw: *anyopaque, alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream) anyerror!sql_runtime.Result {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.encodeRead(alloc, stream) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
+            return self.encodeRead(alloc, stream) catch |err| {
+                if (self.prepared_response_budget.exhausted) return error.SqlProgramLimitExceeded;
+                if (err == error.WriteFailed) if (self.output_owner) |owner| if (owner.failure) |cause| return cause;
+                return err;
+            };
+        }
+        fn numericOutputCheckpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const control = self.outputControl();
+            try control.check(control.ptr);
         }
         fn encodeRead(self: *@This(), alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream) !sql_runtime.Result {
             const a = self.prepared_response_budget.allocator();
-            var writer: std.Io.Writer.Allocating = .init(a);
-            defer writer.deinit();
-            // Keep NULL flags in one bit per cell; encode rows directly from
-            // leased columns and release each page before pulling the next.
-            var nulls: std.ArrayList(u8) = .empty;
-            defer nulls.deinit(a);
+            const control = self.outputControl();
+            var encoder: @import("sql_json_output.zig").Encoder = undefined;
+            encoder.init(a, control, .{});
+            defer encoder.deinit();
+            return self.encodeReadInto(alloc, stream, &encoder, control) catch |err| return encoder.original(err);
+        }
+        fn encodeReadInto(self: *@This(), alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream, encoder: *@import("sql_json_output.zig").Encoder, control: @import("sql_json_source.zig").Control) !sql_runtime.Result {
+            const a = self.prepared_response_budget.allocator();
+            // Bit-packed flags share the controlled growth/copy implementation.
+            var nulls = @import("sql_json_output.zig").Buffer.init(a, control);
+            defer nulls.deinit();
             var cells: usize = 0;
             var rows: usize = 0;
             const columns = stream.context.binding.columns;
-            try writer.writer.writeAll("{\"columns\":");
-            try std.json.Stringify.value(columns, .{}, &writer.writer);
-            try writer.writer.writeAll(",\"rows\":[");
+            try encoder.beginObject();
+            try encoder.objectField("columns");
+            try encoder.write(columns);
+            try encoder.objectField("rows");
+            try encoder.beginArray();
             while (true) {
                 var page = try stream.nextBatch(256);
                 defer page.deinit();
                 if (page.values.len() > self.limit -| rows) return error.SqlProgramLimitExceeded;
                 for (0..page.values.len()) |row| {
-                    if (rows != 0) try writer.writer.writeByte(',');
-                    try writer.writer.writeByte('[');
+                    try encoder.beginArray();
                     for (columns, 0..) |definition, column| {
-                        if (column != 0) try writer.writer.writeByte(',');
                         const value = try page.values.cell(page.arena.allocator(), row, column);
-                        if (cells % 8 == 0) try nulls.append(a, 0);
-                        if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
+                        if (cells % 8 == 0) try nulls.append(&.{0});
+                        if (value.sql_null) nulls.storage[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
                         cells += 1;
                         if (value.sql_null) {
-                            try writer.writer.writeAll("null");
+                            try encoder.write(null);
                         } else if (value.array) |array| {
                             if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
-                            try @import("antfly_local_sources").sql_array_wire.encode(array.*, &writer.writer, .{ .wire_bytes = self.prepared_response_budget.limit });
+                            // Admission counts and emission traverse one checked
+                            // view under the same original output authority.
+                            var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = page.arena.allocator(), .checkpoint = numericOutputCheckpoint, .ptr = self };
+                            try @import("antfly_local_sources").sql_array_wire.encodeControlled(array.*, encoder, .{ .wire_bytes = self.prepared_response_budget.limit, .context = &context });
                         } else if (value.numeric) |number| {
                             if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
-                            var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit };
+                            var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit, .checkpoint = numericOutputCheckpoint, .ptr = self };
                             const exact = try @import("antfly_local_sources").sql_numeric_value.format(&context, number.*);
-                            try std.json.Stringify.value(exact, .{}, &writer.writer);
+                            try encoder.write(exact);
                         } else if (value.patterns) |patterns| {
-                            try writer.writer.writeByte('[');
+                            try encoder.beginArray();
                             var offset: u64 = 0;
-                            var first = true;
                             while (try patterns.next(patterns.ptr, page.arena.allocator(), &offset)) |pattern| {
-                                try self.adapter.context.ensureActive();
-                                if (!first) try writer.writer.writeByte(',');
-                                first = false;
-                                try std.json.Stringify.value(pattern.value, .{}, &writer.writer);
+                                try control.check(control.ptr);
+                                try encoder.write(pattern.value);
                             }
-                            try writer.writer.writeByte(']');
+                            try encoder.endArray();
                         } else if (definition.type == .integer) {
                             const integer = try @import("antfly_local_sources").sql_describe.coerce(value.value, .integer);
                             var buffer: [20]u8 = undefined;
                             const exact = try std.fmt.bufPrint(&buffer, "{d}", .{integer.integer});
-                            try std.json.Stringify.value(exact, .{}, &writer.writer);
-                        } else try std.json.Stringify.value(value.value, .{}, &writer.writer);
+                            try encoder.write(exact);
+                        } else try encoder.write(value.value);
                     }
-                    try writer.writer.writeByte(']');
+                    try encoder.endArray();
                     rows += 1;
                 }
                 if (page.exhausted) break;
             }
-            try writer.writer.writeAll("],\"sql_nulls\":[");
+            try encoder.endArray();
+            try encoder.objectField("sql_nulls");
+            try encoder.beginArray();
             for (0..rows) |row| {
-                if (row != 0) try writer.writer.writeByte(',');
-                try writer.writer.writeByte('[');
+                try encoder.beginArray();
                 for (0..columns.len) |column| {
-                    if (column != 0) try writer.writer.writeByte(',');
                     const index = row * columns.len + column;
-                    const flag = nulls.items[index / 8] & (@as(u8, 1) << @intCast(index % 8)) != 0;
-                    try writer.writer.writeAll(if (flag) "true" else "false");
+                    const flag = nulls.storage[index / 8] & (@as(u8, 1) << @intCast(index % 8)) != 0;
+                    try encoder.write(flag);
                 }
-                try writer.writer.writeByte(']');
+                try encoder.endArray();
             }
-            try writer.writer.writeAll("],\"rows_affected\":0,\"command_tag\":\"SELECT\",\"transaction_status\":\"idle\"}");
-            try self.adapter.context.ensureActive();
+            try encoder.endArray();
+            try encoder.objectField("rows_affected");
+            try encoder.write(@as(u8, 0));
+            try encoder.objectField("command_tag");
+            try encoder.write("SELECT");
+            try encoder.objectField("transaction_status");
+            try encoder.write("idle");
+            try encoder.endObject();
+            try self.output_owner.?.finish();
             var result = try sql_runtime.Result.empty(alloc, "SELECT");
             errdefer result.deinit();
-            self.encoded_read = try writer.toOwnedSlice();
+            self.encoded_read = try encoder.toOwnedSlice();
             return result;
+        }
+
+        fn encodeResult(self: *@This()) !void {
+            const execution = &self.input_owner.execution;
+            if (execution.entry) |*entry| {
+                if (entry.scheduler) |owner| {
+                    if (owner.state(entry) != .running) try execution.enter(entry.class);
+                }
+            }
+            const control = self.outputControl();
+            try control.check(control.ptr);
+            try self.adapter.context.ensureActive();
+            const a = self.prepared_response_budget.allocator();
+            const result = &self.result.?;
+            const columns = try a.alloc(sql_wire.SQLColumn, result.output.columns.len);
+            defer a.free(columns);
+            for (result.output.columns, columns) |column, *output| output.* = .{
+                .name = column.name,
+                .type = switch (column.type) {
+                    inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
+                },
+                .element_type = if (column.type == .array or column.element_type == .numeric) switch (column.element_type orelse return error.InvalidSqlBackendResponse) {
+                    inline else => |kind| @field(sql_wire.SQLArrayElementType, @tagName(kind)),
+                } else null,
+                .numeric_modifier = if (column.numeric_modifier) |modifier| .{ .precision = modifier.precision, .scale = modifier.scale } else null,
+            };
+            const output: sql_wire.SQLResponse = .{
+                .columns = columns,
+                .rows = result.output.rows,
+                .sql_nulls = result.output.sql_nulls,
+                .session_id = if (self.adapter.result_session_id) |*id| id else null,
+                .transaction_status = switch (self.adapter.transaction_status) {
+                    .idle => .idle,
+                    .in_transaction => .in_transaction,
+                    .failed => .failed,
+                },
+                .rows_affected = @intCast(result.output.rows_affected),
+                .command_tag = result.output.command_tag,
+                .ddl_receipt = if (result.output.ddl_receipt) |receipt| .{
+                    .database = receipt.database,
+                    .namespace = receipt.namespace,
+                    .table = receipt.table,
+                    .table_id = receipt.table_id,
+                    .schema_version = receipt.schema_version,
+                    .state = switch (receipt.state) {
+                        inline else => |state| @field(sql_wire.SQLDDLReceiptState, @tagName(state)),
+                    },
+                    .diagnostic = receipt.diagnostic,
+                    .restore_job_id = receipt.restore_job_id,
+                    .idempotency_key = receipt.idempotency_key,
+                } else null,
+                .transaction_id = if (self.adapter.outcome_transaction_id) |*id| id else null,
+                .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
+                    inline else => |kind| @field(sql_wire.SQLMutationOutcome, @tagName(kind)),
+                } else null,
+            };
+            const encoded = try @import("sql_json_output.zig").valueAlloc(a, output, .{ .emit_null_optional_fields = false }, control);
+            errdefer a.free(encoded);
+            try self.output_owner.?.finish();
+            self.encoded_read = encoded;
+            self.response_status = if (output.ddl_receipt) |receipt| sqlDdlReceiptHttpStatus(receipt.state) else 200;
+        }
+
+        fn releaseResponses(self: *@This()) void {
+            if (self.transport_response) |encoded| self.transport_allocator.?.free(encoded);
+            self.transport_response = null;
+            const allocator = self.prepared_response_budget.allocator();
+            if (self.prepared_response) |encoded| allocator.free(encoded);
+            self.prepared_response = null;
+            if (self.encoded_read) |encoded| allocator.free(encoded);
+            self.encoded_read = null;
+        }
+
+        fn finishResult(self: *@This()) !void {
+            defer if (self.result) |*result| {
+                result.deinit();
+                self.result = null;
+            };
+            if (self.result != null and self.encoded_read == null) try self.encodeResult();
+        }
+
+        fn finishTransport(self: *@This()) !void {
+            try self.finishResult();
+            const allocator = self.transport_allocator orelse return;
+            const source = self.prepared_response orelse self.encoded_read orelse return;
+            const execution = &self.input_owner.execution;
+            if (execution.entry) |*entry| if (entry.scheduler) |owner| {
+                if (owner.state(entry) != .running) try execution.enter(entry.class);
+            };
+            const control = self.outputControl();
+            const encoded = try @import("sql_json_output.zig").copyAlloc(allocator, source, control);
+            errdefer allocator.free(encoded);
+            try self.output_owner.?.finish();
+            self.transport_response = encoded;
+        }
+
+        fn takeTransportResponse(self: *@This(), ctx: *httpx.Context, status: u16) !httpx.Response {
+            _ = ctx.status(status);
+            try ctx.setHeader("content-type", "application/json");
+            std.debug.assert(ctx.response.body_data == null and !ctx.response.body_owned);
+            // ResponseBuilder transfers this buffer and frees it on build
+            // failure. No worker budget or stack pointer escapes the join.
+            ctx.response.body_data = self.transport_response orelse return error.InvalidSqlBackendResponse;
+            ctx.response.body_owned = true;
+            self.transport_response = null;
+            return ctx.response.build();
+        }
+
+        fn finishResponse(self: *@This()) void {
+            self.finishTransport() catch |err| {
+                // Read authority/cancellation errors use normal SQL diagnostics.
+                // Completed writes keep the non-replay acknowledgement path;
+                // response budget exhaustion keeps its encoding-limit message.
+                if (!self.is_write and !self.prepared_response_budget.exhausted) self.failure = err else self.encoding_failure = err;
+            };
         }
 
         fn run(self: *@This()) void {
             // Wake on the executor that owns the request waiter, not the
             // backend executor running this worker.
             defer self.done.set(self.completion_io);
+            defer @import("sql_input_capsule.zig").parkForHandoff(&self.input_owner.execution);
+            defer self.releaseReadMemory();
+            defer {
+                self.adapter.runnable = null;
+                self.adapter.serial_execution = false;
+            }
+            defer if (self.connection_owned) |*value| {
+                value.deinit();
+                self.connection_owned = null;
+            };
+            defer self.finishRemoteReads();
+            defer self.adapter.endReadFence();
+            self.adapter.retain_read_guard = true;
+            defer if (self.failure != null or self.encoding_failure != null) self.releaseResponses();
+            defer if (self.result) |*result| {
+                result.deinit();
+                self.result = null;
+            };
             defer self.preparation.release();
             self.runChecked() catch |err| {
                 self.failure = err;
+                return;
             };
+            self.finishResponse();
         }
 
         fn runChecked(self: *@This()) !void {
             try self.adapter.context.ensureActive();
+            // One stable root owns preparation, execution and physical plan
+            // retirement. Coarse admission parks CPU under its original input,
+            // cancellation and deadline authority instead of starting again.
+            const preparation_runnable = &self.input_owner.execution;
+            try preparation_runnable.enter(if (self.protected_control) .control else .query);
+            _ = try self.input_owner.captureParameters(self.parameters, self.statement.len);
+            const preparation_options = self.input_owner.options;
+            var preparation_owner: @import("sql_preparation.zig").Owner = .{ .execution = preparation_runnable, .options = preparation_options };
             const prepared = @import("sql_prepared.zig");
             var resource: ?prepared.Owned = null;
             defer if (resource) |*value| value.deinit();
-            defer if (self.connection_owned) |*value| value.deinit();
             const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
             const resource_principal = http_server_mod.transactionPrincipal(self.adapter.identity.*) orelse "";
             if (self.adapter.connection_id) |connection_id| {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
-                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms);
+                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, self.workAllocator(), connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms);
                 const connection = self.connection_owned.?.value;
                 if (connection.state == .beginning or connection.state == .uncertain) return error.SqlConnectionBusy;
                 if ((!self.adapter.inherit_session_database and !std.mem.eql(u8, self.adapter.database, connection.database)) or
@@ -6049,6 +7010,8 @@ pub const AntflyApiHandler = struct {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;
                 const owner = self.adapter.server.localSessionNodeId();
                 if (self.prepared_mode == .close) {
+                    var control = try self.adapter.server.acquireSqlControl();
+                    defer control.release();
                     self.prepared_response = try self.prepared_response_budget.allocator().dupe(u8, "{}");
                     errdefer {
                         self.prepared_response_budget.allocator().free(self.prepared_response.?);
@@ -6061,7 +7024,7 @@ pub const AntflyApiHandler = struct {
                     return;
                 }
                 if (self.prepared_mode == .execute) {
-                    resource = try prepared.loadForConnection(store, std.heap.page_allocator, self.prepared_id.?, resource_principal, owner, now_ms, self.adapter.connection_id);
+                    resource = try prepared.loadForConnection(store, self.workAllocator(), self.prepared_id.?, resource_principal, owner, now_ms, self.adapter.connection_id);
                     const value = resource.?.value;
                     try value.verifyExecutionSession(self.adapter.session_id);
                     self.statement = value.statement;
@@ -6093,11 +7056,11 @@ pub const AntflyApiHandler = struct {
                         .catalog => |catalog_setting| catalog_setting != .show,
                         .reset_all, .discard_all => true,
                     };
-                    var execution = try self.adapter.server.acquireSqlExecution(self.is_write);
-                    defer execution.release();
                     self.preparation.release();
+                    var execution = try self.adapter.server.acquireSqlExecutionUnderRunnable(preparation_runnable, self.is_write, false, preparation_options);
+                    defer execution.release();
                     self.execution_entered = true;
-                    self.result = try @import("sql_http_settings.zig").execute(std.heap.page_allocator, &self.adapter, command, self.parameters);
+                    self.result = try @import("sql_http_settings.zig").execute(self.workAllocator(), &self.adapter, command, self.parameters);
                     return;
                 }
             }
@@ -6136,14 +7099,14 @@ pub const AntflyApiHandler = struct {
                 self.adapter.namespace = self.namespace;
                 self.adapter.setting_overlay = state.setting_active.items;
             }
-            var lease = self.cache.acquire(self.cache_io, .{
+            var lease = @import("sql_control.zig").Plan.acquireControlled(self.workAllocator(), self.cache, self.cache_io, .{
                 .statement = self.statement,
                 .principal = self.principal,
                 .database = self.database,
                 .namespace = self.namespace,
-            }, &self.diagnostic) catch |err| {
-                self.compile_diagnostic_valid = err != error.SqlPlanCacheBusy and err != error.InvalidSqlPlanCacheConfig;
-                self.failure = err;
+            }, &self.diagnostic, self.protected_control, preparation_owner.control()) catch |err| {
+                self.compile_diagnostic_valid = @import("sql_preparation.zig").hasCompilerDiagnostic(err);
+                self.failure = preparation_owner.original(err);
                 return;
             };
             defer lease.release(self.cache_io);
@@ -6157,7 +7120,7 @@ pub const AntflyApiHandler = struct {
                 var bindings: std.ArrayListUnmanaged(prepared.Binding) = .empty;
                 self.adapter.collect_prepared_bindings = &bindings;
                 defer self.adapter.collect_prepared_bindings = null;
-                var binding_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 32 << 20 };
+                var binding_budget: SQLMemoryBudget = .{ .backing = self.workAllocator(), .limit = 32 << 20 };
                 var describe_backend = self.adapter.backend();
                 if (compiled.uses_current_setting) describe_backend.setting_capture = self.adapter.settingCapture();
                 var description = @import("antfly_local_sources").sql_describe.describe(binding_budget.allocator(), describe_backend, compiled, &.{}) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
@@ -6176,7 +7139,7 @@ pub const AntflyApiHandler = struct {
                 for (parameter_descriptors, parameter_types, description.binding.parameter_descriptors) |*output, kind, descriptor| output.* = .{ .type = kind, .nullable = descriptor.nullable, .element_type = if (descriptor.element_type) |element| switch (element) {
                     inline else => |tag| @field(sql_wire.SQLArrayElementType, @tagName(tag)),
                 } else null };
-                const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .parameter_descriptors = parameter_descriptors, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
+                const response = @import("sql_json_output.zig").valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .parameter_descriptors = parameter_descriptors, .columns = description.binding.columns }, .{}, self.outputControl()) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 errdefer self.prepared_response_budget.allocator().free(response);
                 try self.adapter.context.ensureActive();
                 try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .parameter_descriptors = description.binding.parameter_descriptors, .bindings = bindings.items }, now_ms);
@@ -6187,19 +7150,41 @@ pub const AntflyApiHandler = struct {
                 .select, .explain => false,
                 .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
             };
-            var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {
+            self.preparation.release();
+            if (!self.is_write) try @import("sql_read_lane.zig").apply(preparation_runnable, compiled);
+            var execution = self.adapter.server.acquireSqlExecutionUnderRunnable(preparation_runnable, self.is_write, self.protected_control, preparation_options) catch |err| {
                 self.failure = err;
                 return;
             };
             defer execution.release();
-            self.preparation.release();
+            if (!self.is_write) if (self.adapter.server.readMemoryPool()) |pool| {
+                self.read_memory = try @import("../common/read_memory.zig").Group.init(pool, .general, pool.limits.bytes[0]);
+            };
+            // Ordinary writes keep this same root through accepted durable
+            // completion; read/control adapters may suspend its CPU grant.
+            const runnable = preparation_runnable;
+            if ((!self.is_write or self.protected_control) and runnable.entry != null) self.adapter.runnable = runnable;
+            var write_completion: ?@import("runnable_write_team.zig").Completion = null;
+            if (self.is_write) {
+                if (runnable.entry) |entry| {
+                    const memory = self.adapter.server.request_memory orelse return error.ExecutionWaitUnsupported;
+                    write_completion = try @import("runnable_write_team.zig").Completion.init(runnable, memory.allocator(entry.class == .control));
+                    self.adapter.write_execution = runnable;
+                    self.adapter.write_completion = &write_completion.?;
+                }
+            }
+            // Receivers stay in this scope through the original root finish.
+            defer self.adapter.write_completion = null;
+            defer self.adapter.write_execution = null;
+            self.adapter.serial_execution = runnable.entry != null;
+            if (!self.is_write) try self.bindRemoteReads();
             self.execution_entered = true;
             self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
             var execution_backend = self.adapter.backend();
             if (resource) |owned| execution_backend.parameter_descriptor_hints = owned.value.parameter_descriptors;
             var execution_limits = self.execution_limits;
             execution_limits.result_rows = self.limit;
-            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
+            self.result = self.adapter.execute(self.executionAllocator(), compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -6303,27 +7288,85 @@ pub const AntflyApiHandler = struct {
             break :body (try ctx.body()) orelse return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "missing SQL request body" });
         };
         if (body.len > @import("http_routes.zig").sql_max_request_body_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL request body exceeds 4 MiB" });
-        var preparation = self.api_server.sql_preparation_admission.tryAcquireLease() orelse return sqlOverloadedResponse(ctx);
+        const protected_control = mode == .close or (mode == .statement and @import("sql_control.zig").classifyBody(body));
+        const preparation_owner = if (protected_control) &self.api_server.sql_control_preparation else &self.api_server.sql_preparation_admission;
+        var preparation = preparation_owner.tryAcquireLease() orelse return sqlOverloadedResponse(ctx);
         defer preparation.release();
         var preparation_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 8 << 20 };
         const preparation_alloc = preparation_budget.allocator();
-        const Input = struct {
-            read_requirements: ?@import("antfly_local_sources").sql_read_requirements.Requirements = null,
-            statement: ?[]const u8 = null,
-            parameters: ?[]const std.json.Value = null,
-            database: ?[]const u8 = null,
-            namespace: ?[]const u8 = null,
-            limit: ?i64 = null,
-            session_id: ?[]const u8 = null,
-            connection_id: ?[]const u8 = null,
+        var input_context = tableMutationContext(ctx, &identity);
+        var input_frame: ?*SQLInputFrame = null;
+        defer if (input_frame) |frame| frame.release();
+        var input_owner: ?*SQLInputOwner = null;
+        defer if (input_owner) |value| value.release();
+        var legacy_parsed: ?std.json.Parsed(SQLInput) = null;
+        defer if (legacy_parsed) |*value| value.deinit();
+        var runtime_io: ?std.Io = null;
+        const request = if (self.api_server.cfg.backend_runtime != null) decoded: {
+            runtime_io = (if (protected_control) self.api_server.sqlControlIo() else self.api_server.sqlExecutionIo()) catch
+                return sqlOverloadedResponse(ctx);
+            input_context = input_context.platformDeadline() catch |err| {
+                var message: [256]u8 = undefined;
+                return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &message) });
+            };
+            const allocator = if (self.api_server.request_memory) |memory| memory.allocator(protected_control) else self.api_server.alloc;
+            input_frame = SQLInputFrame.create(allocator, self.api_server.runnable_owner, input_context.cancellation) catch |err| {
+                var message: [256]u8 = undefined;
+                return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &message) });
+            };
+            const frame = input_frame.?;
+            const original_options: @import("antfly_local_sources").common_bounded_admission.Options = .{
+                .io = ctx.io,
+                .deadline_ns = input_context.deadline_ns,
+                .native_now_ns = platform_time.monotonicNs,
+                .cancellation = .{ .ptr = &frame.cancellation, .requested = struct {
+                    fn requested(raw: *const anyopaque) bool {
+                        return @as(*const operation_contract.CancellationToken, @ptrCast(@alignCast(raw))).isCancelled();
+                    }
+                }.requested },
+                .retained_bytes = @as(u64, body.len) +| 1024,
+            };
+            const owner = if (frame.node) |node| &node.scheduler else if (self.api_server.runnable_scheduler) |*node| node else null;
+            input_owner = SQLInputOwner.create(allocator, allocator, frame.parents(), owner, original_options, if (protected_control) .control else .query, body, 8 << 20) catch |err| {
+                if (err == error.OutOfMemory) return ctx.status(500).json(sql_wire.SQLDiagnostic{ .code = "XX000", .message = "SQL preparation memory unavailable" });
+                var message: [256]u8 = undefined;
+                return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &message) });
+            };
+            const owned = input_owner.?;
+            // Register before publishing any worker: even parse/dispatch/error
+            // responses retain the same capsule through physical transport.
+            // A direct handler call has no buffered network delivery to pin.
+            if (ctx.h1_sock != null or ctx.h2 != null) try owned.retainUntilContextRetires(ctx);
+            var decode = SQLDecodeJob{ .input = owned, .completion_io = ctx.io };
+            var task_pin = owned.retainTask();
+            var future = runtime_io.?.concurrent(SQLDecodeJob.run, .{&decode}) catch {
+                task_pin.releaseAfterJoin();
+                return sqlOverloadedResponse(ctx);
+            };
+            decode.done.waitUncancelable(ctx.io);
+            @import("protected_future.zig").wait(runtime_io.?, &future);
+            task_pin.releaseAfterJoin();
+            if (decode.failure) |err| {
+                if (owned.budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL preparation memory budget exceeded" });
+                if (err == error.OutOfMemory) return ctx.status(500).json(sql_wire.SQLDiagnostic{ .code = "XX000", .message = "SQL preparation memory unavailable" });
+                if (!decode.started or err == error.Canceled or err == error.DeadlineExceeded or err == error.RunnableWaitTimeout or err == error.SchedulerClosed or err == error.InvalidRunnableTransition or err == error.ExecutionWaitUnsupported) {
+                    var message: [256]u8 = undefined;
+                    return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &message) });
+                }
+                return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL request" });
+            }
+            break :decoded owned.parsed.?.value;
+        } else legacy: {
+            // No worker can execute SQL here. Retain the existing parse/shape
+            // diagnostics without inventing a runnable owner on the network.
+            legacy_parsed = std.json.parseFromSlice(SQLInput, preparation_alloc, body, .{ .parse_numbers = false }) catch |err| {
+                if (preparation_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL preparation memory budget exceeded" });
+                if (err == error.OutOfMemory) return ctx.status(500).json(sql_wire.SQLDiagnostic{ .code = "XX000", .message = "SQL preparation memory unavailable" });
+                return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL request" });
+            };
+            break :legacy legacy_parsed.?.value;
         };
-        var parsed = std.json.parseFromSlice(Input, preparation_alloc, body, .{ .parse_numbers = false }) catch |err| {
-            if (preparation_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL preparation memory budget exceeded" });
-            if (err == error.OutOfMemory) return ctx.status(500).json(sql_wire.SQLDiagnostic{ .code = "XX000", .message = "SQL preparation memory unavailable" });
-            return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL request" });
-        };
-        defer parsed.deinit();
-        const request = parsed.value;
+        if (request.read_requirements != null and request.lake_visibility != null) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read_requirements and lake_visibility are mutually exclusive" });
         const execution_limits = sqlExecutionLimits(ctx) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL execution budget" });
         const read_requirements = request.read_requirements orelse @import("antfly_local_sources").sql_read_requirements.Requirements{};
         read_requirements.validate(.sql) catch |err| return ctx.status(if (err == error.UnsupportedReadVisibility) @as(u16, 501) else @as(u16, 400)).json(sql_wire.SQLDiagnostic{ .code = if (err == error.UnsupportedReadVisibility) "0A000" else "22023", .message = "invalid or unsupported SQL read requirements" });
@@ -6358,7 +7401,7 @@ pub const AntflyApiHandler = struct {
 
         // Never run a blocking catalog/row operation on the network executor,
         // including when the backend executor is absent or saturated.
-        const runtime_io = http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg) orelse {
+        _ = self.api_server.cfg.backend_runtime orelse {
             if (mode != .statement) return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
             // A missing execution lane is a capacity failure for supported
             // statements, but preserve the useful 501 syntax/shape contract
@@ -6378,7 +7421,8 @@ pub const AntflyApiHandler = struct {
             };
         };
         var job = SQLJob{
-            .adapter = .{ .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .input_owner = input_owner.?,
+            .adapter = .{ .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted or request.lake_visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = input_context, .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -6389,19 +7433,27 @@ pub const AntflyApiHandler = struct {
             .limit = @intCast(limit),
             .execution_limits = execution_limits,
             .completion_io = ctx.io,
+            .transport_allocator = ctx.allocator,
             .cache_io = self.api_server.sqlPlanCacheIo(),
             .cache = self.api_server.sqlPlanCache(),
             .preparation = &preparation,
+            .protected_control = protected_control,
+            .prepared_response_budget = .{ .backing = if (protected_control) self.api_server.controlAllocator() else self.api_server.alloc, .limit = 16 << 20 },
         };
-        var future = runtime_io.concurrent(SQLJob.run, .{&job}) catch
+        var execution_task_pin = input_owner.?.retainTask();
+        var future = runtime_io.?.concurrent(SQLJob.run, .{&job}) catch {
+            execution_task_pin.releaseAfterJoin();
             return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
+        };
         // Borrowed request/identity storage remains alive until the worker has
         // completely finished. Cancellation is observed by native checkpoints;
         // never cancel a durable mutation future after proposal admission.
         // A canceled request must still join durable work, without repeatedly
         // hitting an already-canceled sleep and spinning until commit ends.
         job.done.waitUncancelable(ctx.io);
-        @import("protected_future.zig").wait(runtime_io, &future);
+        @import("protected_future.zig").wait(runtime_io.?, &future);
+        execution_task_pin.releaseAfterJoin();
+        defer job.releaseResponses();
         if (job.failure) |err| {
             const diagnostic = sql_execution.diagnostic(err);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
@@ -6419,70 +7471,12 @@ pub const AntflyApiHandler = struct {
                 },
             });
         }
-        if (job.prepared_response) |encoded| {
-            defer job.prepared_response_budget.allocator().free(encoded);
-            return jsonResponse(ctx, 200, encoded);
-        }
-        var result = job.result.?;
-        defer result.deinit();
-        if (job.encoded_read) |encoded| {
-            defer job.prepared_response_budget.allocator().free(encoded);
-            return jsonResponse(ctx, 200, encoded);
-        }
-        const columns = ctx.allocator.alloc(sql_wire.SQLColumn, result.output.columns.len) catch |err| {
+        if (job.encoding_failure) |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
+            if (job.prepared_response_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL encoded result exceeds its 16 MiB memory budget" });
             return err;
-        };
-        defer ctx.allocator.free(columns);
-        for (result.output.columns, columns) |column, *output| output.* = .{
-            .name = column.name,
-            .type = switch (column.type) {
-                inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
-            },
-            .element_type = if (column.type == .array or column.element_type == .numeric) switch (column.element_type orelse return error.InvalidSqlBackendResponse) {
-                inline else => |kind| @field(sql_wire.SQLArrayElementType, @tagName(kind)),
-            } else null,
-            .numeric_modifier = if (column.numeric_modifier) |modifier| .{ .precision = modifier.precision, .scale = modifier.scale } else null,
-        };
-        const output: sql_wire.SQLResponse = .{
-            .columns = columns,
-            .rows = result.output.rows,
-            .sql_nulls = result.output.sql_nulls,
-            .session_id = if (job.adapter.result_session_id) |*id| id else null,
-            .transaction_status = switch (job.adapter.transaction_status) {
-                .idle => .idle,
-                .in_transaction => .in_transaction,
-                .failed => .failed,
-            },
-            .rows_affected = @intCast(result.output.rows_affected),
-            .command_tag = result.output.command_tag,
-            .ddl_receipt = if (result.output.ddl_receipt) |receipt| .{
-                .database = receipt.database,
-                .namespace = receipt.namespace,
-                .table = receipt.table,
-                .table_id = receipt.table_id,
-                .schema_version = receipt.schema_version,
-                .state = switch (receipt.state) {
-                    inline else => |state| @field(sql_wire.SQLDDLReceiptState, @tagName(state)),
-                },
-                .diagnostic = receipt.diagnostic,
-                .restore_job_id = receipt.restore_job_id,
-                .idempotency_key = receipt.idempotency_key,
-            } else null,
-            .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
-            .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
-                inline else => |kind| @field(sql_wire.SQLMutationOutcome, @tagName(kind)),
-            } else null,
-        };
-        var encoding_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 16 << 20 };
-        const encoded = std.json.Stringify.valueAlloc(encoding_budget.allocator(), output, .{ .emit_null_optional_fields = false }) catch |err| {
-            if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
-            if (encoding_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL encoded result exceeds its 16 MiB memory budget" });
-            return err;
-        };
-        defer encoding_budget.allocator().free(encoded);
-        const response_status: u16 = if (output.ddl_receipt) |receipt| sqlDdlReceiptHttpStatus(receipt.state) else 200;
-        return jsonResponse(ctx, response_status, encoded) catch |err| {
+        }
+        return job.takeTransportResponse(ctx, job.response_status) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             return err;
         };
@@ -6518,36 +7512,53 @@ pub const AntflyApiHandler = struct {
         // slow ingress and query compute cannot starve one another.
         if (try self.acquirePublicOperation(ctx, "globalQuery")) |response| return response;
         defer self.releasePublicOperation("globalQuery");
-        var cancellation = requestCancellation(ctx);
+        const owner = try @import("runnable_http_response.zig").Owner.createForServer(self.api_server, requestCancellation(ctx));
+        defer owner.releaseUnlessTransferred();
+        const cancellation = &owner.cancellation;
+        const execution = &owner.execution;
         if (isNdjsonContentType(ctx.header("content-type")) or (@import("composed_query.zig").hasSource(ctx.allocator, body_data) catch false)) {
-            var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithCancellation(
+            if (try self.api_server.admitPublicMultiQueryRunnable(execution, "", body_data, cancellation)) |value| {
+                var response = value;
+                return self.respondOwnedQuery(ctx, &response, owner);
+            }
+            if (self.api_server.remoteQueryClient(self.api_server.alloc)) |client| try owner.bindRemoteQueries(client);
+            var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithRemoteAuthority(
                 body_data,
                 authenticated_identity,
-                &cancellation,
+                cancellation,
+                execution,
+                owner.remoteQueries(),
             );
-            return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
+            return self.respondOwnedQuery(ctx, &resp, owner);
         }
         var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data) catch {
             _ = ctx.status(400);
             return ctx.text("invalid query request");
         };
         defer parsed_table.deinit();
-        var delivery: QueryDelivery = .{ .ctx = ctx };
-        var resp = try self.api_server.handleAdmittedPublicTableQueryWithDelivery(
+        if (try self.api_server.admitPublicQueryRunnable(execution, parsed_table.table_name, body_data, cancellation)) |value| {
+            var response = value;
+            return self.respondOwnedQuery(ctx, &response, owner);
+        }
+        if (self.api_server.remoteQueryClient(self.api_server.alloc)) |client| try owner.bindRemoteQueries(client);
+        var delivery: QueryDelivery = .{ .ctx = ctx, .execution = execution };
+        var resp = try self.api_server.handleAdmittedPublicTableQueryWithRemoteAuthority(
             parsed_table.table_name,
             body_data,
             ctx.header("content-type"),
             authenticated_identity,
-            &cancellation,
+            cancellation,
             delivery.sink(),
+            execution,
+            owner.remoteQueries(),
         );
-        if (delivery.writer) |*writer| {
+        if (delivery.writer != null) {
             defer resp.deinit(self.api_server.alloc);
             if (resp.status != 200) return error.QueryDeliveryFailed;
-            try writer.close();
+            try delivery.close();
             return ctx.response.build();
         }
-        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
+        return self.respondOwnedQuery(ctx, &resp, owner);
     }
 
     pub fn evaluate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -7906,7 +8917,7 @@ pub const AntflyApiHandler = struct {
         const local_create_handled = local_outcome == .applied;
         if (local_create_handled) {
             std.log.info("public create table wait projected presence table={s}", .{decoded_table_name});
-            self.api_server.waitForProjectedTablePresence(decoded_table_name) catch |err| switch (err) {
+            self.api_server.waitForProjectedTablePresenceWithContext(decoded_table_name, operationContext(ctx, null)) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
                     return committedMutationOutcomeResponse(ctx, .visibility_pending);
@@ -7929,7 +8940,7 @@ pub const AntflyApiHandler = struct {
             };
             if (!metadata_wait_handled) {
                 std.log.info("public create table wait metadata visibility table={s}", .{decoded_table_name});
-                self.api_server.waitForTableVisibility(decoded_table_name, .present) catch |err| switch (err) {
+                self.api_server.waitForTableVisibilityWithContext(decoded_table_name, .present, operationContext(ctx, null)) catch |err| switch (err) {
                     error.TableVisibilityTimeout => {
                         std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
                         return committedMutationOutcomeResponse(ctx, .visibility_pending);
@@ -7963,7 +8974,7 @@ pub const AntflyApiHandler = struct {
         var drop_result: metadata_table_topology_mutations.DropResult = undefined;
         while (true) {
             metadata_drop_attempts += 1;
-            drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
+            drop_result = self.api_server.source.dropTableExactWithContext(alloc, operationContext(ctx, null), decoded_table_name) catch |err| switch (err) {
                 error.VectorMigrationActive => return textResponse(ctx, 409, "table storage migration is active"),
                 error.TableNotFound => {
                     _ = ctx.status(404);
@@ -8023,7 +9034,7 @@ pub const AntflyApiHandler = struct {
         // follower projection. Metadata is already committed, so every wait
         // failure is reported as convergence debt rather than a replayable DDL
         // failure.
-        self.api_server.waitForTableVisibility(decoded_table_name, .absent) catch |err| {
+        self.api_server.waitForTableVisibilityWithContext(decoded_table_name, .absent, operationContext(ctx, null)) catch |err| {
             repair_required = true;
             std.log.warn(
                 "public drop table committed before local absence became observable table={s} err={s}",
@@ -8056,9 +9067,24 @@ pub const AntflyApiHandler = struct {
         return ctx.text("");
     }
 
+    fn respondOwnedQuery(self: *AntflyApiHandler, ctx: *httpx.Context, response: *contextual_operations.OwnedResponse, owner: *@import("runnable_http_response.zig").Owner) !httpx.Response {
+        var result = try respondOwnedContextualResponse(ctx, response, self.api_server.alloc);
+        errdefer result.deinit();
+        // A standalone handler invocation has no physical buffered transport.
+        // Real H1/H2 writers retain the context until output has joined.
+        if (ctx.h1_sock != null or ctx.h2 != null) try owner.retainUntilContextRetires(ctx);
+        return result;
+    }
+
     const QueryDelivery = struct {
         ctx: *httpx.Context,
+        execution: ?*http_server_mod.RunnableScheduler.Execution = null,
         writer: ?httpx.Context.StreamWriter = null,
+        fn close(self: *@This()) !void {
+            if (self.execution) |execution| if (execution.entry != null) try execution.park(.output_blocked);
+            try self.writer.?.close();
+            if (self.execution) |execution| if (execution.entry != null) try execution.enter(try execution.retainedClass());
+        }
         fn sink(self: *@This()) ?@import("antfly_local_sources").api_query_response.Delivery {
             if (self.ctx.stream_delegate == null and self.ctx.h1_sock == null and self.ctx.h2 == null) return null;
             return .{ .ptr = self, .start_fn = start, .write_fn = write };
@@ -8098,17 +9124,29 @@ pub const AntflyApiHandler = struct {
             break :blk try ctx.allocator.dupe(u8, decoded);
         };
         defer ctx.allocator.free(logical);
-        var cancellation = requestCancellation(ctx);
-        var delivery: QueryDelivery = .{ .ctx = ctx };
-        var resp = self.api_server.handleAdmittedPublicTableQueryWithDelivery(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation, delivery.sink()) catch |err| return err;
-        if (delivery.writer) |*writer| {
+        const owner = try @import("runnable_http_response.zig").Owner.createForServer(self.api_server, requestCancellation(ctx));
+        defer owner.releaseUnlessTransferred();
+        const cancellation = &owner.cancellation;
+        const execution = &owner.execution;
+        const rejection = if (isNdjsonContentType(ctx.header("content-type")))
+            try self.api_server.admitPublicMultiQueryRunnable(execution, logical, body_data, cancellation)
+        else
+            try self.api_server.admitPublicQueryRunnable(execution, logical, body_data, cancellation);
+        if (rejection) |value| {
+            var response = value;
+            return self.respondOwnedQuery(ctx, &response, owner);
+        }
+        if (self.api_server.remoteQueryClient(self.api_server.alloc)) |client| try owner.bindRemoteQueries(client);
+        var delivery: QueryDelivery = .{ .ctx = ctx, .execution = execution };
+        var resp = self.api_server.handleAdmittedPublicTableQueryWithRemoteAuthority(logical, body_data, ctx.header("content-type"), authenticated_identity, cancellation, delivery.sink(), execution, owner.remoteQueries()) catch |err| return err;
+        if (delivery.writer != null) {
             defer resp.deinit(self.api_server.alloc);
             // A post-commit error closes the stream; never send a second status.
             if (resp.status != 200) return error.QueryDeliveryFailed;
-            try writer.close();
+            try delivery.close();
             return ctx.response.build();
         }
-        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
+        return self.respondOwnedQuery(ctx, &resp, owner);
     }
 
     pub fn batchWrite(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -8882,6 +9920,7 @@ pub const AntflyApiHandler = struct {
     pub fn lookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.LookupKeyParams) !httpx.Response {
         return self.lookupKeyImpl(ctx, table_name, key, params) catch |err| {
             switch (err) {
+                error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.Timeout => return internalQueryOwnerError(ctx, err),
                 error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => return textResponse(ctx, 403, "row policy authentication required"),
                 error.RowPolicyCatalogChanged, error.RowPolicyReadersActive, error.RowPolicyTopologyUnsupported, error.RowPolicyUnsupported => return textResponse(ctx, 409, "row policy publication changed"),
                 error.RowPolicyAuthorityUnavailable => return textResponse(ctx, 503, "row policy authority unavailable"),
@@ -8897,12 +9936,47 @@ pub const AntflyApiHandler = struct {
     }
 
     fn lookupKeyImpl(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.LookupKeyParams) !httpx.Response {
-        _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (try self.acquirePublicOperation(ctx, "lookupKey")) |response| return response;
+        var admission_owned = true;
+        defer if (admission_owned) self.releasePublicOperation("lookupKey");
+        const retirement = try self.api_server.alloc.create(LookupAdmissionRetirement);
+        var retirement_owned = true;
+        defer if (retirement_owned) self.api_server.alloc.destroy(retirement);
+        var response = try self.lookupKeyUnderAdmission(ctx, table_name, key, params, &authenticated_identity);
+        errdefer response.deinit();
+        try operationContext(ctx, authenticated_identity).ensureExecutionActive();
+        retirement.* = .{ .server = self.api_server, .alloc = self.api_server.alloc, .previous = response.retirement };
+        response.retirement = .{ .ptr = retirement, .release = LookupAdmissionRetirement.release };
+        retirement_owned = false;
+        admission_owned = false;
+        return response;
+    }
+
+    /// Keep the coarse operation permit through physical output retirement.
+    /// The legacy provider's inner dependency graph does not yet admit a
+    /// runnable CPU owner; do not put a token around its blocking call.
+    const LookupAdmissionRetirement = struct {
+        server: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        previous: @FieldType(httpx.Response, "retirement"),
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const server = self.server;
+            const alloc = self.alloc;
+            if (self.previous) |owner| owner.release(owner.ptr);
+            alloc.destroy(self);
+            server.releaseQuery();
+        }
+    };
+
+    fn lookupKeyUnderAdmission(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.LookupKeyParams, identity_owner: *?AuthenticatedIdentity) !httpx.Response {
+        _ = params;
+        const authenticated_identity = identity_owner;
         const alloc = ctx.allocator;
-        const binding = (try self.resolvePublicTableBinding(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
+        const binding = (try self.resolvePublicTableBinding(ctx, table_name, authenticated_identity)) orelse return ctx.response.build();
         defer binding.deinit(alloc);
         const decoded_table_name = binding.physical;
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
@@ -8918,11 +9992,11 @@ pub const AntflyApiHandler = struct {
         defer if (row_policy_proof) |proof| alloc.free(proof);
         if (binding.logical) |logical| {
             const target = try system_catalog.Target.parse(logical);
-            const identity: ?*const AuthenticatedIdentity = if (authenticated_identity) |*value| value else null;
+            const identity: ?*const AuthenticatedIdentity = if (authenticated_identity.*) |*value| value else null;
             row_policy_proof = try self.api_server.rowPolicyReadProof(
                 alloc,
                 identity,
-                operationContext(ctx, authenticated_identity),
+                operationContext(ctx, authenticated_identity.*),
                 binding.table_id orelse return error.RowPolicyCatalogChanged,
                 binding.physical,
                 target.database,
@@ -8935,7 +10009,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid read consistency");
         };
-        if (self.api_server.tryObjectTableLookup(decoded_table_name, decoded_key, consistency, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| switch (err) {
+        if (self.api_server.tryObjectTableLookup(decoded_table_name, decoded_key, consistency, authenticated_identity.*, operationContext(ctx, authenticated_identity.*)) catch |err| switch (err) {
             error.TableGenerationChanged => return jsonErrorResponse(ctx, 409, "table incarnation changed; refresh and retry"),
             else => return err,
         }) |value| {
@@ -8954,10 +10028,10 @@ pub const AntflyApiHandler = struct {
             decoded_key,
             lookup_opts.opts,
             consistency,
-            operationContext(ctx, authenticated_identity),
+            operationContext(ctx, authenticated_identity.*),
         ) catch |err| switch (err) {
             error.TableNotFound => {
-                binding.validateAbsence(self.api_server, alloc, operationContext(ctx, authenticated_identity)) catch |binding_err| {
+                binding.validateAbsence(self.api_server, alloc, operationContext(ctx, authenticated_identity.*)) catch |binding_err| {
                     if (binding_err != error.GenerationTransitionActive) return binding_err;
                     var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                     return respondOwnedApiResponse(ctx, &response);
@@ -8983,6 +10057,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("group leader unavailable");
             },
+            error.Backpressured,
             error.PersistentDescriptorAdmissionExhausted,
             error.ResourceBudgetExceeded,
             error.StorageBusy,
@@ -9015,7 +10090,7 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         }) orelse {
-            binding.validateAbsence(self.api_server, alloc, operationContext(ctx, authenticated_identity)) catch |binding_err| {
+            binding.validateAbsence(self.api_server, alloc, operationContext(ctx, authenticated_identity.*)) catch |binding_err| {
                 if (binding_err != error.GenerationTransitionActive) return binding_err;
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);
@@ -9025,7 +10100,7 @@ pub const AntflyApiHandler = struct {
         };
         defer result.deinit(alloc);
 
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
+        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity.*, decoded_table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
             if (!(try self.api_server.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
@@ -10370,7 +11445,7 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         inner: *Inner,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            if (@import("http_routes.zig").publicPostBodyLimit(prefix ++ path)) |limit| return self.inner.postWithBodyLimit(prefix ++ path, limit, handler_fn);
+            if (@import("http_routes.zig").postBodyLimit(prefix ++ path)) |limit| return self.inner.postWithBodyLimit(prefix ++ path, limit, handler_fn);
             try self.inner.post(prefix ++ path, handler_fn);
         }
 
@@ -10450,14 +11525,38 @@ const HttpxE2eServer = struct {
         query_capacity: usize,
         max_connections: u32,
     ) !void {
-        api_server.query_admission = RequestAdmission.init(query_capacity);
+        return self.initWithTransportLimits(allocator, api_server, query_capacity, max_connections, 0);
+    }
+
+    fn initWithTransportLimits(
+        self: *HttpxE2eServer,
+        allocator: std.mem.Allocator,
+        api_server: *ApiHttpServer,
+        query_capacity: usize,
+        max_connections: u32,
+        max_request_tasks: u32,
+    ) !void {
+        api_server.query_admission = try RequestAdmission.initConfigured(query_capacity, api_server.cfg.query_waiting);
+        try self.initTransportWithExistingAdmission(allocator, api_server, query_capacity, max_connections, max_request_tasks);
+    }
+
+    // Shared protocol fixtures must preserve the stable operation owner and
+    // its startup reservation, including counters and already published leases.
+    fn initTransportWithExistingAdmission(
+        self: *HttpxE2eServer,
+        allocator: std.mem.Allocator,
+        api_server: *ApiHttpServer,
+        query_body_capacity: usize,
+        max_connections: u32,
+        max_request_tasks: u32,
+    ) !void {
         self.* = .{
             .allocator = allocator,
             .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
             .server = undefined,
             .handler = .{
                 .api_server = api_server,
-                .query_body_admission = RequestAdmission.init(query_capacity),
+                .query_body_admission = RequestAdmission.init(query_body_capacity),
             },
             .thread = null,
         };
@@ -10466,14 +11565,15 @@ const HttpxE2eServer = struct {
         try self.handler.initRuntime(allocator);
         errdefer self.handler.deinitRuntime();
 
-        self.server = httpx.Server.initWithConfig(allocator, self.io_impl.io(), .{
+        self.server = httpx.Server.initWithConfig(allocator, self.io_impl.io(), api_server.configurePublicHttpTransport(.{
             .host = "127.0.0.1",
             .port = 0,
             .header_read_timeout_ms = 30_000,
             .body_read_timeout_ms = 30_000,
             .response_write_timeout_ms = 30_000,
             .max_connections = max_connections,
-        });
+            .max_request_tasks = max_request_tasks,
+        }));
         errdefer self.server.deinit();
 
         try self.handler.registerRoutes(&self.server);
@@ -10831,6 +11931,8 @@ const LookupStatusSource = struct {
 
 /// Test metadata authority shared by direct and HTTP schema route regressions.
 pub const SchemaUpdateStatusSource = struct {
+    // Committed fixture metadata outlives a transport request allocation scope.
+    schema_allocator: std.mem.Allocator,
     memory_logical_name: ?[]const u8 = null,
     table_name: []const u8 = "docs",
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
@@ -10879,12 +11981,14 @@ pub const SchemaUpdateStatusSource = struct {
     }
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.owns_schema_json) alloc.free(self.schema_json.?);
+        std.debug.assert(alloc.ptr == self.schema_allocator.ptr and alloc.vtable == self.schema_allocator.vtable);
+        if (self.owns_schema_json) self.schema_allocator.free(self.schema_json.?);
     }
 
-    fn replaceSchemaJson(self: *@This(), alloc: std.mem.Allocator, next: []const u8) !void {
-        if (self.owns_schema_json) alloc.free(self.schema_json.?);
-        self.schema_json = try alloc.dupe(u8, next);
+    fn replaceSchemaJson(self: *@This(), next: []const u8) !void {
+        const owned = try self.schema_allocator.dupe(u8, next);
+        if (self.owns_schema_json) self.schema_allocator.free(self.schema_json.?);
+        self.schema_json = owned;
         self.owns_schema_json = true;
     }
 
@@ -10928,7 +12032,8 @@ pub const SchemaUpdateStatusSource = struct {
     pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqualStrings("docs", table_name);
-        try self.replaceSchemaJson(alloc, schema_json);
+        _ = alloc;
+        try self.replaceSchemaJson(schema_json);
     }
 
     fn mutateSchema(
@@ -10954,7 +12059,7 @@ pub const SchemaUpdateStatusSource = struct {
         }
         const updated = try tables_api.applySchemaMutationRecord(alloc, &current, mode, body);
         defer metadata_table_manager.freeTable(alloc, updated);
-        try self.replaceSchemaJson(alloc, updated.schema_json);
+        try self.replaceSchemaJson(updated.schema_json);
         return .{
             .version = try tables_api.schemaVersion(updated.schema_json),
             .schema_json = try alloc.dupe(u8, updated.schema_json),
@@ -11293,6 +12398,84 @@ test "internal read-index absence response requires typed native proof" {
             try std.testing.expect(response.headers.get(metadata_api.read_index_absence_header) == null);
         }
     }
+}
+
+test "HTTP ingress deadline composition preserves original clock and shorter forwarded budgets" {
+    const Case = struct {
+        path: []const u8,
+        header: []const u8,
+        establish: *const fn (*httpx.Context) void,
+    };
+    const cases = [_]Case{
+        .{ .path = "/internal/v1/groups/7/tables/docs/online-merge-io", .header = @import("online_merge_io.zig").contract.remaining_ms_header, .establish = AntflyApiHandler.establishInternalOnlineMergeDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/batch-routed-v1", .header = internal_batch_forwarding.remaining_ms_header, .establish = AntflyApiHandler.establishInternalRoutedBatchDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-begin", .header = distributed_txn_contract.pre_decision_remaining_ms_header, .establish = AntflyApiHandler.establishInternalTxnPreDecisionDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-status", .header = distributed_txn_contract.status_remaining_ms_header, .establish = AntflyApiHandler.establishInternalTxnStatusDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/backup-shard", .header = backups_api.backup_remaining_ms_header, .establish = AntflyApiHandler.establishInternalBackupDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/lookup/doc", .header = metadata_api.catalog_route_deadline_ms_header, .establish = AntflyApiHandler.establishCatalogRouteFenceDeadline },
+    };
+    var transport = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer transport.deinit();
+    var original_clock = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer original_clock.deinit();
+    original_clock.monotonic_ns = 100 * std.time.ns_per_ms;
+    for (cases) |case| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, case.path);
+        defer request.deinit();
+        try request.setHeader(case.header, "250");
+        try request.setHeader(metadata_api.catalog_route_fence_header, "{}");
+        // The original clock has an unrelated epoch from this transport.
+        // A longer server ceiling must still honor the forwarded budget.
+        for ([_]u64{ 50, 200, 1000 }) |original_ms| {
+            var ctx = httpx.Context.init(std.testing.allocator, transport.io(), &request);
+            defer ctx.deinit();
+            ctx.application_deadline_ns = original_ms * std.time.ns_per_ms;
+            ctx.application_deadline_io = original_clock.io();
+            case.establish(&ctx);
+            try std.testing.expectEqual(@as(u64, @min(original_ms, 350)) * std.time.ns_per_ms, ctx.application_deadline_ns.?);
+            try std.testing.expect(ctx.application_deadline_io.?.userdata == original_clock.io().userdata);
+            try std.testing.expect(!ctx.application_deadline_invalid);
+            // Repeating ingress cannot renew an already established deadline.
+            const first = ctx.application_deadline_ns.?;
+            case.establish(&ctx);
+            try std.testing.expectEqual(first, ctx.application_deadline_ns.?);
+        }
+        // A native-clock original remains native; transport epoch zero cannot
+        // reinterpret its timestamp as a long-lived or already-expired budget.
+        var native_ctx = httpx.Context.init(std.testing.allocator, transport.io(), &request);
+        defer native_ctx.deinit();
+        const before = platform_time.monotonicNs();
+        native_ctx.application_deadline_ns = before + 5 * std.time.ns_per_s;
+        case.establish(&native_ctx);
+        const after = platform_time.monotonicNs();
+        try std.testing.expect(native_ctx.application_deadline_io == null);
+        try std.testing.expect(native_ctx.application_deadline_ns.? >= before + 250 * std.time.ns_per_ms);
+        try std.testing.expect(native_ctx.application_deadline_ns.? <= after + 250 * std.time.ns_per_ms);
+    }
+}
+
+test "HTTP ingress deadline composition validates metadata after an original deadline is installed" {
+    const Case = struct { path: []const u8, header: []const u8, establish: *const fn (*httpx.Context) void };
+    const cases = [_]Case{
+        .{ .path = "/internal/v1/groups/7/tables/docs/online-merge-io", .header = @import("online_merge_io.zig").contract.remaining_ms_header, .establish = AntflyApiHandler.establishInternalOnlineMergeDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/batch-routed-v1", .header = internal_batch_forwarding.remaining_ms_header, .establish = AntflyApiHandler.establishInternalRoutedBatchDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-prepare", .header = distributed_txn_contract.pre_decision_remaining_ms_header, .establish = AntflyApiHandler.establishInternalTxnPreDecisionDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-status", .header = distributed_txn_contract.status_remaining_ms_header, .establish = AntflyApiHandler.establishInternalTxnStatusDeadline },
+        .{ .path = "/internal/v1/groups/7/tables/docs/backup-shard", .header = backups_api.backup_remaining_ms_header, .establish = AntflyApiHandler.establishInternalBackupDeadline },
+    };
+    for (cases) |case| for ([_][]const u8{ "0", "invalid", "4294967295" }) |raw| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, case.path);
+        defer request.deinit();
+        try request.setHeader(case.header, raw);
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        const original = platform_time.monotonicNs() + std.time.ns_per_s;
+        ctx.application_deadline_ns = original;
+        case.establish(&ctx);
+        try std.testing.expect(ctx.application_deadline_invalid);
+        try std.testing.expectEqual(original, ctx.application_deadline_ns.?);
+        try std.testing.expect(ctx.application_deadline_io == null);
+    };
 }
 
 test "online merge ingress bounds owner work using the transport clock" {
@@ -11739,7 +12922,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
             return .{ .ptr = self, .vtable = &.{
                 .batch = batch,
                 .commit_transaction_with_id = commitTransactionWithId,
-                .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_id_with_control = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
             } };
         }
@@ -11782,10 +12965,16 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
             cancellation: db_mod.types.CancellationToken,
+            control: distributed_txn.CommitControl,
         ) anyerror!?distributed_txn.CommitOutcome {
+            try std.testing.expect(control.participant_plan_store != null);
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.cancellation_commit_calls += 1;
-            try std.testing.expect(cancellation.ptr != null);
+            if (cancellation.ptr != null) {
+                self.cancellation_commit_calls += 1;
+            } else {
+                // Maintenance retains the cohort but has independent lifetime.
+                try std.testing.expect(control.pre_decision.cancellation.ptr == null);
+            }
             return commitTransactionWithId(ptr, alloc_, txn_id, begin_timestamp, tables, sync_level);
         }
 
@@ -11848,6 +13037,10 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     defer alloc.free(commit_url);
     const commit_body = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"counter\":{\"value\":1}}}}}";
 
+    // A fresh-write burst must not block durable completion or recovery ACKs.
+    api_server.write_admission.capacity = 1;
+    var occupied_write = api_server.write_admission.tryAcquireLease().?;
+    defer occupied_write.release();
     var first = try requestWithRetry(&client, client_io.io(), .POST, commit_url, commit_body, &headers, 20);
     defer first.deinit();
     try std.testing.expectEqual(@as(u16, 202), first.status.code);
@@ -13541,7 +14734,7 @@ test "httpx SQL dispatch preserves imported executor authority including unavail
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     for ([_]?std.Io{ null, imported_io }, 0..) |executor, i| {
-        server.cfg.imported_runtime_io.?.durable = executor;
+        server.cfg.imported_runtime_io.?.sql_execution = executor;
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
         defer request.deinit();
         request.body = "{\"statement\":\"SELECT id FROM docs\"}";
@@ -13684,7 +14877,16 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
     var session_store = try storage.runtimeStore(alloc, .{ .name = "http-sql-settings-test" });
     defer session_store.deinit();
     var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &session_store);
-    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .backend_runtime = backend_runtime.ptr(),
+        .session_store = &durable,
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 2,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
+    }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
     defer server.deinit();
     const begun = try server.txn_sessions.beginForPrincipal(alloc, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, server.localSessionNodeId(), "settings_user");
     const session_id = std.fmt.bytesToHex(begun.txn_id, .lower);
@@ -13880,7 +15082,16 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
     // A new API instance has no cached session or prepared directory state;
     // it must rehydrate both from the durable store before execution.
     {
-        var restarted = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+        var restarted = ApiHttpServer.init(alloc, .{
+            .auth_enabled = true,
+            .user_manager = &auth.manager,
+            .backend_runtime = backend_runtime.ptr(),
+            .session_store = &durable,
+            .query_max_concurrent_requests = 1,
+            .write_max_concurrent_requests = 1,
+            .sql_max_concurrent_preparations = 2,
+            .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
+        }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
         defer restarted.deinit();
         var restarted_handler = AntflyApiHandler{ .api_server = &restarted };
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql/prepared/id/execute");
@@ -13954,7 +15165,16 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var native = try storage.runtimeStore(alloc, .{ .name = "http-sql-connection-routes-test" });
     defer native.deinit();
     var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &native);
-    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .backend_runtime = backend_runtime.ptr(),
+        .session_store = &durable,
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 2,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
+    }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const Route = struct {
@@ -14971,6 +16191,34 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     // sql-0557, sql-1205, sql-1206, sql-1265, sql-1268, sql-1269.
     // sql-1578.
     const alloc = std.testing.allocator;
+    var qualification_phase: []const u8 = "fixture initialization";
+    errdefer std.debug.print("SQL pooling qualification failed during {s}\n", .{qualification_phase});
+    // Direct adapters mirror the listener fence and join every retained
+    // cleanup task before their request/page arenas leave scope.
+    const FixtureLifetime = struct {
+        references: std.atomic.Value(usize) = .init(1),
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.references.fetchAdd(1, .monotonic);
+            std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The decrement is the callback's last access to its owner.
+            const previous = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 1);
+        }
+
+        fn drain(self: *@This()) void {
+            const io = std.testing.io;
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            while (self.references.load(.acquire) != 1)
+                io.sleep(.fromMilliseconds(1), .awake) catch unreachable;
+        }
+    };
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"},"amount":{"type":"integer"},"quantity":{"type":"integer"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"customer_id":{"type":"integer"},"tenant_id":{"type":"integer"},"created_at":{"type":"keyword"},"metadata":{"type":"object","properties":{"source":{"type":"keyword"}},"additionalProperties":false}},"additionalProperties":false}}}}
     ;
@@ -14978,6 +16226,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         schema: []const u8 = schema_json,
         records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema_json }},
         calls: usize = 0,
+        calls_mutex: std.atomic.Mutex = .unlocked,
         replace_after_open: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
@@ -14985,9 +16234,13 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
+            while (!self.calls_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.calls_mutex.unlock();
             // This fixture has no row-policy publication. The production
             // admission path treats that absence as an unprotected table.
             if (input == .policy_publication_status) return a.dupe(u8, "null");
+            if (input == .setting_snapshot) return std.json.Stringify.valueAlloc(a, .{ .scope = input.setting_snapshot, .epoch = @as(u64, 1), .definitions = &.{} }, .{});
+            if (input == .read and input.read.kind == .namespace) return a.dupe(u8, "{}");
             self.calls += 1;
             if (self.replace_after_open and self.calls == 3) return error.CatalogGenerationChanged;
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = self.schema }, .{});
@@ -15012,7 +16265,22 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     };
     var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql");
     defer directory.cleanup();
-    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    // The default native control/recovery and Raft lanes prepay their entire
+    // guarded stack ceilings (over 1 GiB with the pinned pthread profile).
+    // Fund that floor plus SQL/request envelopes without shrinking any lane.
+    // Socket qualification later exhausts every remaining storage credit.
+    var storage_manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 2 << 30 }, .identity_allocator = alloc });
+    defer storage_manager.deinit(alloc);
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .io_threaded,
+        .memory_parent = storage_manager.memoryParentPort(),
+        .shared_sql_memory_parent = storage_manager.memoryParentPort(),
+    });
+    defer backend_runtime.deinit();
+    try std.testing.expect(backend_runtime.ptr().sharedSqlMemoryStats(.control) != null);
+    if (std.Thread.use_pthreads) try std.testing.expect(backend_runtime.ptr().runtimeMemoryStats().?.control_reserved_bytes > 64 << 20);
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .resource_manager = &storage_manager, .backend_runtime = backend_runtime.ptr() });
     defer db.close();
     try db.setSchemaJson(alloc, schema_json);
     {
@@ -15026,17 +16294,558 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
     }
     var reads = table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
-    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
-    defer backend_runtime.deinit();
     var prepared_backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer prepared_backend.close();
     var prepared_store = try prepared_backend.runtimeStore(alloc, .{ .name = "http-prepared-test" });
     defer prepared_store.deinit();
     var prepared_durable = transactions_api.DurableSessionStore.initRuntime(alloc, &prepared_store);
     var source: Source = .{};
-    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
+    const Accounting = struct {
+        fn reserve(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
+            return @as(*resources.ResourceManager, @ptrCast(@alignCast(ptr))).reserveExternal(bytes);
+        }
+        fn release(ptr: *anyopaque, bytes: usize) callconv(.c) void {
+            @as(*resources.ResourceManager, @ptrCast(@alignCast(ptr))).releaseExternal(bytes);
+        }
+    };
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        // Preserve the 1 MiB preparation stimulus inside the derived general
+        // read heap as well as the original ordinary request envelope.
+        .request_memory_bytes = 16 << 20,
+        .memory_accounting = .{ .ptr = &storage_manager, .reserve_fn = Accounting.reserve, .release_fn = Accounting.release },
+        .backend_runtime = backend_runtime.ptr(),
+        .session_store = &prepared_durable,
+        .query_max_concurrent_requests = 4,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 2,
+        .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .checkpoint_budget = 1, .max_wait_ms = 5000 },
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
+    }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
     defer server.deinit();
+    try std.testing.expect(server.readMemoryStats().enabled);
+    try std.testing.expectEqual(@as(u64, 1), server.runnableSchedulingStats().general_capacity_slots);
+    try std.testing.expectEqual(@as(u64, 1), server.runnableSchedulingStats().bounded_read_capacity_slots);
+    // Live policy changes stay within the configured admission ceiling. Start
+    // with one operation slot for queue tests, then restore four to isolate
+    // the runnable scheduler from coarse operation admission.
+    try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
     var handler = AntflyApiHandler{ .api_server = &server };
+    {
+        // Real native rows through both adapters, sharing one queue owner.
+        var auth = try initTestAuthManager(alloc);
+        defer auth.store.deinit();
+        defer auth.policy_store.deinit();
+        try bindTestAuthManager(alloc, &auth);
+        defer auth.manager.deinit();
+        var permission = try usermgr.Permission.initOwned(alloc, .table, "usage_records", .read);
+        defer permission.deinit(alloc);
+        var namespace_permission = try usermgr.Permission.initOwned(alloc, .namespace, "*", .read);
+        defer namespace_permission.deinit(alloc);
+        var user = try auth.manager.createUser("pool-reader", "secret", &.{ permission, namespace_permission });
+        defer user.deinit(alloc);
+        server.cfg.user_manager = &auth.manager;
+        defer server.cfg.user_manager = null;
+        var pg = @import("sql_pgwire.zig").Adapter{ .server = &server };
+        const wire = @import("../pgwire/backend.zig");
+        const backend = pg.backend();
+        const identity = try backend.vtable.authenticate(backend.context, alloc, "pool-reader", "secret");
+        defer identity.release(identity.context, alloc);
+        // Mirror the listener's retained request arena: the adapter and
+        // allocator remain alive until asynchronous stream cleanup retires.
+        var fixture_lifetime: FixtureLifetime = .{};
+        defer fixture_lifetime.drain();
+        var cancel: std.atomic.Value(bool) = .init(false);
+        const statement = "SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1";
+        const wire_request: wire.Request = .{
+            .retained_lifetime = .{ .context = &fixture_lifetime, .retain_fn = FixtureLifetime.retain, .release_fn = FixtureLifetime.release },
+            .statement = statement,
+            .parameters = &.{.{ .integer = 9007199254740993 }},
+            .parameter_types = &.{.integer},
+            .limit = 1,
+            .io = std.testing.io,
+            .cancel_requested = &cancel,
+            .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 10 * std.time.ns_per_s } },
+        };
+        _ = try server.sqlExecutionIo();
+        try std.testing.expect(server.sqlQueryWaitingEnabled());
+        const MixedJob = struct {
+            http_handler: *AntflyApiHandler,
+            backend: wire.Backend,
+            identity: wire.Identity,
+            request: wire.Request,
+            use_http: bool,
+            begin_transaction: bool = false,
+            statement_override: ?[]const u8 = null,
+            carry_request_authority: bool = false,
+            expect_canceled: bool = false,
+            cancel_peer_on_completion: ?*std.atomic.Value(bool) = null,
+            completed: ?*std.atomic.Value(bool) = null,
+            peer_completed: ?*const std.atomic.Value(bool) = null,
+            completed_before_peer: ?*std.atomic.Value(bool) = null,
+            cache_at_completion: ?*@import("../sql/plan_cache.zig").Stats = null,
+            err: ?anyerror = null,
+            fn run(self: *@This()) void {
+                self.check() catch |err| {
+                    self.err = err;
+                };
+                if (self.cache_at_completion) |observed|
+                    observed.* = self.http_handler.api_server.sqlPlanCache().stats(self.http_handler.api_server.sqlPlanCacheIo());
+                if (self.completed_before_peer) |observed|
+                    observed.store(!self.peer_completed.?.load(.acquire), .release);
+                if (self.cancel_peer_on_completion) |cancel_peer| cancel_peer.store(true, .release);
+                if (self.completed) |completed| completed.store(true, .release);
+            }
+            fn check(self: *@This()) !void {
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                const allocator = arena.allocator();
+                if (self.use_http) {
+                    var request = try httpx.Request.init(allocator, .POST, "http://127.0.0.1/db/v1/sql");
+                    defer request.deinit();
+                    request.body = if (self.begin_transaction) "{\"statement\":\"BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY\"}" else if (self.statement_override) |statement_override|
+                        try std.json.Stringify.valueAlloc(allocator, .{ .statement = statement_override, .parameters = self.request.parameters }, .{})
+                    else
+                        "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}";
+                    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+                    defer ctx.deinit();
+                    if (self.carry_request_authority) {
+                        ctx.cancellation = self.request.cancel_requested;
+                        ctx.application_deadline_ns = @intCast(@max(0, self.request.deadline.raw.nanoseconds));
+                        ctx.application_deadline_io = self.request.io;
+                    }
+                    var response = try self.http_handler.executeSQL(&ctx);
+                    defer response.deinit();
+                    if (self.expect_canceled) {
+                        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+                        const diagnostic = try std.json.parseFromSliceLeaky(sql_wire.SQLDiagnostic, allocator, response.body.?, .{});
+                        try std.testing.expectEqualStrings("57014", diagnostic.code);
+                        try std.testing.expect(diagnostic.message.len > 0);
+                        try std.testing.expect(!std.mem.eql(u8, diagnostic.message, "invalid SQL syntax"));
+                        try std.testing.expectEqual(@as(?i64, null), diagnostic.position);
+                        return;
+                    }
+                    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+                    const result = try std.json.parseFromSliceLeaky(sql_wire.SQLResponse, allocator, response.body.?, .{});
+                    if (self.begin_transaction) {
+                        try std.testing.expectEqualStrings("BEGIN", result.command_tag);
+                        const session_id = result.session_id orelse return error.MissingWriteSession;
+                        var cleanup_request = try httpx.Request.init(allocator, .POST, "http://127.0.0.1/db/v1/sql");
+                        defer cleanup_request.deinit();
+                        cleanup_request.body = try std.json.Stringify.valueAlloc(allocator, .{ .statement = "ROLLBACK", .session_id = session_id }, .{});
+                        var cleanup_ctx = httpx.Context.init(allocator, std.testing.io, &cleanup_request);
+                        defer cleanup_ctx.deinit();
+                        var cleanup_response = try self.http_handler.executeSQL(&cleanup_ctx);
+                        defer cleanup_response.deinit();
+                        try std.testing.expectEqual(@as(u16, 200), cleanup_response.status.code);
+                        return;
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+                    try std.testing.expectEqualStrings("9007199254740993", result.rows[0][0].string);
+                    try std.testing.expectEqualStrings("exact", result.rows[0][1].string);
+                } else {
+                    var diagnostic: wire.Diagnostic = .{};
+                    var execution_request = self.request;
+                    if (self.expect_canceled) execution_request.diagnostics = &diagnostic;
+                    var result = self.backend.vtable.execute(self.backend.context, allocator, self.identity, execution_request) catch |err| {
+                        if (!self.expect_canceled) return err;
+                        try std.testing.expectEqual(error.QueryCanceled, err);
+                        const code = diagnostic.code orelse return error.MissingCancellationDiagnostic;
+                        try std.testing.expectEqualStrings("57014", &code);
+                        try std.testing.expect(diagnostic.message_len > 0);
+                        try std.testing.expect(!std.mem.eql(u8, diagnostic.message[0..diagnostic.message_len], "invalid SQL syntax"));
+                        return;
+                    };
+                    defer result.deinit();
+                    if (self.expect_canceled) return error.ExpectedPreparationCancellation;
+                    if (self.begin_transaction) {
+                        try std.testing.expectEqualStrings("BEGIN", result.command_tag);
+                        var cleanup_request = self.request;
+                        cleanup_request.statement = "ROLLBACK";
+                        cleanup_request.session_id = result.session_id orelse return error.MissingWriteSession;
+                        var cleanup = try self.backend.vtable.execute(self.backend.context, allocator, self.identity, cleanup_request);
+                        defer cleanup.deinit();
+                        try std.testing.expectEqualStrings("ROLLBACK", cleanup.command_tag);
+                        return;
+                    }
+                    // Native results may borrow typed cells instead of
+                    // materializing a second JSON row matrix. Read through
+                    // the same checked contract used by the pgwire encoder.
+                    try std.testing.expectEqual(@as(usize, 1), result.rowCount());
+                    try std.testing.expectEqual(@as(usize, 2), result.columns.len);
+                    const id = try result.cell(allocator, 0, 0);
+                    const name = try result.cell(allocator, 0, 1);
+                    try std.testing.expect(!id.sql_null and !name.sql_null);
+                    switch (id.value) {
+                        .integer => |value| try std.testing.expectEqual(@as(i64, 9007199254740993), value),
+                        .string, .number_string => |value| try std.testing.expectEqualStrings("9007199254740993", value),
+                        else => return error.InvalidResult,
+                    }
+                    try std.testing.expectEqual(wire.Type.integer, result.columns[0].type);
+                    try std.testing.expectEqualStrings("exact", name.value.string);
+                    try std.testing.expectEqual(wire.TransactionStatus.idle, result.transaction_status);
+                }
+            }
+        };
+        qualification_phase = "shared admission and scheduling";
+        var held = server.query_admission.tryAcquireLease().?;
+        defer held.release();
+        var jobs = [_]MixedJob{
+            .{ .http_handler = &handler, .backend = backend, .identity = identity, .request = wire_request, .use_http = true },
+            .{ .http_handler = &handler, .backend = backend, .identity = identity, .request = wire_request, .use_http = false },
+        };
+        var group: std.Io.Group = .init;
+        defer group.cancel(std.testing.io);
+        for (&jobs) |*job| try group.concurrent(std.testing.io, MixedJob.run, .{job});
+        const until = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+        while (server.queryAdmissionStats().queued != jobs.len) {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        // Cancel an actual queued native pgwire operation before grant.
+        var cancel_queued: std.atomic.Value(bool) = .init(false);
+        var cancelled = jobs[1];
+        cancelled.request.cancel_requested = &cancel_queued;
+        var cancelled_future = try std.testing.io.concurrent(MixedJob.run, .{&cancelled});
+        defer cancelled_future.cancel(std.testing.io);
+        while (server.queryAdmissionStats().queued != 3) {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        cancel_queued.store(true, .release);
+        cancelled_future.await(std.testing.io);
+        try std.testing.expectEqual(error.QueryCanceled, cancelled.err.?);
+        try std.testing.expectEqualStrings("57014", sql_execution.sqlState(cancelled.err.?));
+        try std.testing.expectEqual(@as(usize, 2), server.queryAdmissionStats().queued);
+        try std.testing.expectEqual(@as(u64, 1), server.queryAdmissionStats().cancelled_total);
+        // Both waiters have relinquished preparation capacity.
+        try std.testing.expectEqual(@as(usize, 0), server.sql_preparation_admission.stats().in_flight);
+        // Completion on the general backend remains startable during waiting.
+        var completion = try backend_runtime.ptr().io().?.concurrent(struct {
+            fn call(lease: *RequestAdmission.Lease) void {
+                lease.release();
+            }
+        }.call, .{&held});
+        completion.await(backend_runtime.ptr().io().?);
+        try group.await(std.testing.io);
+        for (jobs) |job| if (job.err) |err| return err;
+        try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+        try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().queued);
+        try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().peak_in_flight);
+        // Two admitted native operations share the same one-slot scheduler,
+        // rather than being serialized by the coarse admission gate.
+        try server.query_admission.update(server.queryAdmissionStats().policy_version, 4, server.cfg.query_waiting, false);
+        var runnable_hold: http_server_mod.RunnableScheduler.Execution = .{};
+        try server.startSqlRunnable(&runnable_hold, .{ .io = std.testing.io }, .query);
+        defer runnable_hold.finish();
+        const catalog_calls_before_preparation = source.calls;
+        var scheduled_jobs = jobs;
+        for (&scheduled_jobs) |*job| job.err = null;
+        var scheduled_group: std.Io.Group = .init;
+        defer scheduled_group.cancel(std.testing.io);
+        for (&scheduled_jobs) |*job| try scheduled_group.concurrent(std.testing.io, MixedJob.run, .{job});
+        const scheduling_until = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+        while (server.runnable_scheduler.?.stats().queued != 2) {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= scheduling_until.nanoseconds) return error.SchedulingWaitersDidNotStart;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        // Both protocols queue before plan preparation and coarse admission.
+        // No catalog execution can run under the occupied ordinary slot.
+        try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+        try std.testing.expectEqual(catalog_calls_before_preparation, source.calls);
+        // Authenticated ROLLBACK progresses on reserved control capacity while
+        // both ordinary protocol preparations remain queued.
+        const control_txn = try server.txn_sessions.beginForPrincipal(server.alloc, .{ .sql = .{ .database = "default", .namespace = "public", .mode = .read_only, .isolation = .read_committed } }, server.localSessionNodeId(), "pool-reader");
+        const control_id = std.fmt.bytesToHex(control_txn.txn_id, .lower);
+        var rollback_request = wire_request;
+        rollback_request.statement = "ROLLBACK";
+        rollback_request.parameters = &.{};
+        rollback_request.parameter_types = &.{};
+        rollback_request.session_id = &control_id;
+        // Wire metadata belongs to the caller arena; Result.deinit releases
+        // the native result owner before that enclosing arena is reclaimed.
+        var rollback_arena = std.heap.ArenaAllocator.init(alloc);
+        defer rollback_arena.deinit();
+        var rollback = try backend.vtable.execute(backend.context, rollback_arena.allocator(), identity, rollback_request);
+        defer rollback.deinit();
+        try std.testing.expectEqualStrings("ROLLBACK", rollback.command_tag);
+        try std.testing.expectEqual(@as(usize, 2), server.runnable_scheduler.?.stats().queued);
+        const control_stats = server.runnableSchedulingStats();
+        try std.testing.expect(control_stats.enabled);
+        try std.testing.expectEqual(@as(u64, 4), control_stats.capacity_slots);
+        try std.testing.expectEqual(@as(u64, 2), control_stats.control_capacity_slots);
+        try std.testing.expectEqual(@as(u64, 2), control_stats.queued);
+        try std.testing.expectEqual(@as(u64, 0), control_stats.control_slots);
+        try std.testing.expect(control_stats.grants[4] > 0);
+        runnable_hold.finish();
+        try scheduled_group.await(std.testing.io);
+        for (scheduled_jobs) |job| if (job.err) |err| return err;
+        try std.testing.expect(server.runnable_scheduler.?.stats().yields > 0);
+        try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
+        // Both public protocols execute BEGIN in the write class, then retire
+        // the resulting sessions through protected ROLLBACK. A read-only class
+        // integration or an ordinary-write bypass cannot satisfy this receipt.
+        {
+            // This source does not implement serializable range guards. A
+            // default-isolation rejection must still retire its write grant.
+            const unsupported_grants_before = server.runnableSchedulingStats().grants[1];
+            var unsupported_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer unsupported_request.deinit();
+            unsupported_request.body = "{\"statement\":\"BEGIN READ ONLY\"}";
+            var unsupported_ctx = httpx.Context.init(alloc, std.testing.io, &unsupported_request);
+            defer unsupported_ctx.deinit();
+            var unsupported_response = try handler.executeSQL(&unsupported_ctx);
+            defer unsupported_response.deinit();
+            try std.testing.expectEqual(@as(u16, 501), unsupported_response.status.code);
+            var unsupported_diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, unsupported_response.body.?, .{});
+            defer unsupported_diagnostic.deinit();
+            try std.testing.expectEqualStrings("0A000", unsupported_diagnostic.value.code);
+            try std.testing.expectEqual(unsupported_grants_before + 1, server.runnableSchedulingStats().grants[1]);
+            const unsupported_stats = server.runnable_scheduler.?.stats();
+            try std.testing.expectEqual(@as(usize, 0), unsupported_stats.operations);
+            try std.testing.expectEqual(@as(usize, 0), unsupported_stats.runnable_slots);
+            try std.testing.expectEqual(@as(u64, 0), unsupported_stats.retained_bytes);
+        }
+        const write_grants_before = server.runnableSchedulingStats().grants[1];
+        const write_admissions_before = server.writeAdmissionStats().granted_total.?;
+        var write_jobs = jobs;
+        for (&write_jobs) |*job| {
+            job.err = null;
+            job.begin_transaction = true;
+            job.request.statement = "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY";
+            job.request.parameters = &.{};
+            job.request.parameter_types = &.{};
+            // Preserve the fixture's fail-fast, one-operation write admission.
+            try job.check();
+        }
+        // Each statement owns one write admission lease. Cooperative yields
+        // may grant that same retained execution CPU more than once.
+        try std.testing.expectEqual(write_admissions_before + 2, server.writeAdmissionStats().granted_total.?);
+        try std.testing.expectEqual(@as(usize, 0), server.writeAdmissionStats().in_flight);
+        try std.testing.expect(server.runnableSchedulingStats().grants[1] >= write_grants_before + 2);
+        const writes_done = server.runnable_scheduler.?.stats();
+        try std.testing.expectEqual(@as(usize, 0), writes_done.operations);
+        try std.testing.expectEqual(@as(usize, 0), writes_done.runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), writes_done.retained_bytes);
+        var serial_identity: ?AuthenticatedIdentity = null;
+        var serial_write_adapter: sql_execution.Adapter = .{ .server = &server, .identity = &serial_identity, .context = .{}, .serial_execution = true };
+        const serial_write_backend = serial_write_adapter.backend();
+        try std.testing.expect(serial_write_backend.execution_io == null);
+        try std.testing.expect(serial_write_backend.spill_io != null);
+        try std.testing.expect(serial_write_backend.spill_wait == null);
+        {
+            var node_owner = try http_server_mod.RunnableScheduler.NodeOwner.init(.{ .slots = 2, .checkpoint_budget = 1 });
+            defer node_owner.deinit();
+            var first = ApiHttpServer.init(alloc, .{ .runnable_owner_handle = &node_owner }, server.source, null, null);
+            var first_live = true;
+            defer if (first_live) first.deinit();
+            var second = ApiHttpServer.init(alloc, .{ .runnable_owner_handle = &node_owner }, server.source, null, null);
+            var second_live = true;
+            defer if (second_live) second.deinit();
+            try std.testing.expectEqual(@as(usize, 2), node_owner.borrowers);
+            try std.testing.expect(first.runnable_scheduler == null and second.runnable_scheduler == null);
+            var shared_query: http_server_mod.RunnableScheduler.Execution = .{};
+            defer shared_query.finish();
+            try first.startSqlRunnable(&shared_query, .{ .io = server.embedding_provider_runtime.io, .retained_bytes = 17 }, .query);
+            first.deinit();
+            first_live = false;
+            try shared_query.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), node_owner.borrowers);
+            try std.testing.expectEqual(@as(u64, 17), node_owner.scheduler.stats().retained_bytes);
+            var shared_control: http_server_mod.RunnableScheduler.Execution = .{};
+            defer shared_control.finish();
+            try second.startSqlRunnable(&shared_control, .{ .io = server.embedding_provider_runtime.io }, .control);
+            try std.testing.expectEqual(@as(usize, 1), node_owner.scheduler.stats().control_slots);
+            shared_control.finish();
+            shared_query.finish();
+            node_owner.close();
+            try std.testing.expectError(error.SchedulerClosed, ApiHttpServer.initWithConfig(alloc, .{ .runnable_owner_handle = &node_owner }, server.source, null, null));
+            try std.testing.expectError(error.InvalidApiServerConfig, ApiHttpServer.initWithConfig(alloc, .{ .runnable_owner_handle = &node_owner, .runnable_policy = .{} }, server.source, null, null));
+            second.deinit();
+            second_live = false;
+            try std.testing.expectEqual(@as(usize, 0), node_owner.borrowers);
+            try std.testing.expectEqual(@as(usize, 0), node_owner.scheduler.stats().operations);
+        }
+        {
+            // Provider CPU must obey the same parent ownership as SQL operators.
+            var decision_config = try common_config.Config.parseFromSlice(alloc, "{}");
+            defer decision_config.deinit();
+            try decision_config.registry.registerDeciderConfig("parent", .{ .provider = .antfly, .model = "parent-model" });
+            const previous_config = server.cfg.node_config;
+            server.cfg.node_config = &decision_config;
+            defer server.cfg.node_config = previous_config;
+            const write_runtime = (try serial_write_adapter.decisionRuntime()).?;
+            try std.testing.expect(!write_runtime.parallel_work);
+            try std.testing.expect(write_runtime.parent_execution == null);
+            try std.testing.expect(write_runtime.context.?.runnable == null);
+            var provider_execution: http_server_mod.RunnableScheduler.Execution = .{};
+            defer provider_execution.finish();
+            try server.startSqlRunnable(&provider_execution, .{ .io = server.embedding_provider_runtime.io }, .query);
+            serial_write_adapter.serial_execution = false;
+            serial_write_adapter.runnable = &provider_execution;
+            var read_runtime = (try serial_write_adapter.decisionRuntime()).?;
+            try std.testing.expect(!read_runtime.parallel_work);
+            try std.testing.expect(read_runtime.parent_execution.?.ptr == @as(*anyopaque, @ptrCast(&serial_write_adapter)));
+            try read_runtime.provider().checkpoint();
+            const provider_borrow = read_runtime.context.?.runnable.?;
+            try provider_borrow.validate();
+            var provider_transfer = try @import("antfly_runtime_abi").runnable_abi.Transfer.init(provider_borrow, .inference);
+            try std.testing.expectEqual(http_server_mod.RunnableScheduler.Class.inference, provider_execution.entry.?.class);
+            try provider_transfer.returnToParent();
+            try std.testing.expectEqual(http_server_mod.RunnableScheduler.Class.query, provider_execution.entry.?.class);
+            serial_write_adapter.runnable = null;
+            const unscheduled_runtime = (try serial_write_adapter.decisionRuntime()).?;
+            try std.testing.expect(unscheduled_runtime.parallel_work);
+            try std.testing.expect(unscheduled_runtime.parent_execution == null);
+            try std.testing.expect(unscheduled_runtime.context.?.runnable == null);
+        }
+        try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
+        const configured_query_capacity_before_protocols = server.queryAdmissionStats().configured_capacity;
+        qualification_phase = "pgwire socket";
+        try @import("sql_pgwire_socket_test.zig").qualify(&server, &storage_manager);
+        qualification_phase = "HTTP/2 socket";
+        try qualifyNativeH2Waiting(&server);
+        try std.testing.expectEqual(configured_query_capacity_before_protocols, server.queryAdmissionStats().configured_capacity);
+        fixture_lifetime.drain();
+        {
+            // Closing requests cleanup; admission and the request lifetime stay
+            // retained until that cleanup physically retires.
+            qualification_phase = "retained stream";
+            // This is a new statement after the independent socket scenarios.
+            // Its deadline begins here and remains fixed across every page.
+            var stream_request = wire_request;
+            stream_request.deadline = .{ .clock = .awake, .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(10)) };
+            const stream = (try backend.vtable.open_stream.?(backend.context, alloc, identity, stream_request)).?;
+            defer stream.close(stream.context);
+            try std.testing.expectEqual(@as(usize, 2), fixture_lifetime.references.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+            try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
+            const parked_stats = server.runnableSchedulingStats();
+            try std.testing.expectEqual(@as(u64, 1), parked_stats.operations);
+            try std.testing.expectEqual(@as(u64, 0), parked_stats.runnable_slots);
+            try std.testing.expectEqual(@as(u64, 1), parked_stats.output_blocked);
+            var page = try stream.next(stream.context, alloc, stream_request, 1);
+            defer page.result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.result.rowCount());
+            try std.testing.expectEqual(@as(usize, 2), page.result.columns.len);
+            const name = try page.result.cell(alloc, 0, 1);
+            try std.testing.expect(!name.sql_null);
+            try std.testing.expectEqualStrings("exact", name.value.string);
+            try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
+            cancel.store(true, .release);
+            try std.testing.expectError(error.QueryCanceled, stream.next(stream.context, alloc, stream_request, 1));
+            try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+        }
+        fixture_lifetime.drain();
+        try std.testing.expectEqual(@as(usize, 1), fixture_lifetime.references.load(.acquire));
+        // Exercise both public preparation adapters with a long SQL comment,
+        // then repeat their cache hits. The cheap peer observes completion from
+        // inside its own worker, avoiding a timing-based main-thread sample.
+        {
+            // Prior stream cancellation has physically retired before these
+            // independent invocations receive their own deadline/cancel scope.
+            qualification_phase = "preparation fairness";
+            cancel.store(false, .release);
+            try server.query_admission.update(server.queryAdmissionStats().policy_version, 4, server.cfg.query_waiting, false);
+            const comment: [1 << 20]u8 = @splat('x');
+            const long_statement = "/*" ++ comment ++ "*/ SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1";
+            for ([_]bool{ true, false, true, false, true, false }, 0..) |long_uses_http, case_index| {
+                const cancellation_case = case_index >= 4;
+                const selected_statement: []const u8 = if (cancellation_case) long_statement ++ " /*cancel-before-cache-publication*/" else long_statement;
+                var cancel_preparation: std.atomic.Value(bool) = .init(false);
+                const cache_before = server.sqlPlanCache().stats(server.sqlPlanCacheIo());
+                var cache_at_cheap_completion: @import("../sql/plan_cache.zig").Stats = .{};
+                var long_done: std.atomic.Value(bool) = .init(false);
+                var cheap_done: std.atomic.Value(bool) = .init(false);
+                var cheap_won: std.atomic.Value(bool) = .init(false);
+                var long_request = wire_request;
+                long_request.statement = selected_statement;
+                long_request.cancel_requested = &cancel_preparation;
+                long_request.deadline = .{ .clock = .awake, .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(10)) };
+                var cheap_request = wire_request;
+                cheap_request.deadline = long_request.deadline;
+                var long_job: MixedJob = .{ .http_handler = &handler, .backend = backend, .identity = identity, .request = long_request, .use_http = long_uses_http, .statement_override = selected_statement, .carry_request_authority = true, .expect_canceled = cancellation_case, .completed = &long_done };
+                var cheap_job: MixedJob = .{ .http_handler = &handler, .backend = backend, .identity = identity, .request = cheap_request, .use_http = !long_uses_http, .carry_request_authority = true, .cancel_peer_on_completion = if (cancellation_case) &cancel_preparation else null, .completed = &cheap_done, .peer_completed = &long_done, .completed_before_peer = &cheap_won, .cache_at_completion = &cache_at_cheap_completion };
+                var preparation_hold: http_server_mod.RunnableScheduler.Execution = .{};
+                try server.startSqlRunnable(&preparation_hold, .{ .io = std.testing.io }, .query);
+                var preparation_group: std.Io.Group = .init;
+                defer {
+                    preparation_hold.finish();
+                    preparation_group.cancel(std.testing.io);
+                }
+                const until_preparation = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+                try preparation_group.concurrent(std.testing.io, MixedJob.run, .{&long_job});
+                // Publish the long operation first; a cheap-first race cannot
+                // satisfy fairness or cancel a preparation that never started.
+                while (server.runnable_scheduler.?.stats().queued != 1) {
+                    if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until_preparation.nanoseconds) return error.LongPreparationDidNotQueue;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+                try preparation_group.concurrent(std.testing.io, MixedJob.run, .{&cheap_job});
+                while (server.runnable_scheduler.?.stats().queued != 2) {
+                    if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until_preparation.nanoseconds) return error.PreparationPeersDidNotQueue;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+                const queued = server.runnable_scheduler.?.stats();
+                try std.testing.expect(queued.retained_bytes >= long_statement.len + statement.len);
+                try std.testing.expectEqual(@as(usize, 2), server.sql_preparation_admission.stats().in_flight);
+                // The existing protected ROLLBACK session path must still
+                // progress while both ordinary preparations are queued.
+                const fairness_control_txn = try server.txn_sessions.beginForPrincipal(server.alloc, .{ .sql = .{ .database = "default", .namespace = "public", .mode = .read_only, .isolation = .read_committed } }, server.localSessionNodeId(), "pool-reader");
+                const control_txn_id = std.fmt.bytesToHex(fairness_control_txn.txn_id, .lower);
+                var control_request = rollback_request;
+                control_request.session_id = &control_txn_id;
+                control_request.deadline = long_request.deadline;
+                var control_arena = std.heap.ArenaAllocator.init(alloc);
+                defer control_arena.deinit();
+                var control_result = try backend.vtable.execute(backend.context, control_arena.allocator(), identity, control_request);
+                defer control_result.deinit();
+                try std.testing.expectEqualStrings("ROLLBACK", control_result.command_tag);
+                preparation_hold.finish();
+                try preparation_group.await(std.testing.io);
+                if (cheap_job.err) |err| return err;
+                if (long_job.err) |err| return err;
+                try std.testing.expect(cheap_done.load(.acquire));
+                try std.testing.expect(long_done.load(.acquire));
+                try std.testing.expect(cheap_won.load(.acquire));
+                // Query completion ordering alone could pass if the long plan
+                // had already compiled and yielded later during execution.
+                // Cold plans must remain unpublished; on hits, only the cheap
+                // peer's cache hit may have completed at this observation.
+                try std.testing.expectEqual(cache_before.entries, cache_at_cheap_completion.entries);
+                try std.testing.expectEqual(cache_before.hits + 1, cache_at_cheap_completion.hits);
+                const cache_after = server.sqlPlanCache().stats(server.sqlPlanCacheIo());
+                try std.testing.expectEqual(cache_before.misses + @intFromBool(case_index < 2), cache_after.misses);
+                try std.testing.expectEqual(cache_before.hits + 1 + @intFromBool(!cancellation_case and case_index >= 2), cache_after.hits);
+                if (cancellation_case) {
+                    try std.testing.expect(cancel_preparation.load(.acquire));
+                    try std.testing.expectEqual(cache_before.entries, cache_after.entries);
+                    try std.testing.expectEqual(@as(usize, 0), cache_after.compiling);
+                    try std.testing.expectEqual(@as(usize, 0), cache_after.leases);
+                }
+                const retired = server.runnable_scheduler.?.stats();
+                try std.testing.expectEqual(@as(usize, 0), retired.operations);
+                try std.testing.expectEqual(@as(usize, 0), retired.runnable_slots);
+                try std.testing.expectEqual(@as(u64, 0), retired.retained_bytes);
+                try std.testing.expectEqual(@as(usize, 0), server.sql_preparation_admission.stats().in_flight);
+                try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+                std.debug.print("preparation fairness: protocol={s} pass={d} canceled={any} cheap_peer_completed_first=true retired_operations=0 retired_bytes=0\n", .{ if (long_uses_http) "http" else "pgwire", case_index, cancellation_case });
+            }
+            try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+    const protocol_service = server.runnableSchedulingStats().service;
+    try protocol_service.validate();
+    try std.testing.expect(protocol_service.available);
+    // Both adapters have executed actual query work, beyond issuing grants.
+    try std.testing.expect(protocol_service.estimated_slot_ns[0] > 0);
+    try std.testing.expect(protocol_service.observed_slot_ns[0] > 0);
+    const retired_read_memory = server.readMemoryStats();
+    for (retired_read_memory.used_bytes) |used| try std.testing.expectEqual(@as(u64, 0), used);
+    for (retired_read_memory.groups) |count| try std.testing.expectEqual(@as(u64, 0), count);
+    try std.testing.expectEqual(@as(u64, 0), retired_read_memory.transition_reserved_bytes);
     // Receipts must be checked even when a native cursor, constant result or
     // streaming plan would otherwise bypass the lake reader.
     for ([_][]const u8{ "SELECT id FROM usage_records WHERE _id = 'a'", "SELECT SUM(amount) FROM usage_records", "SELECT u.id FROM usage_records u JOIN usage_records v ON u.id = v.id", "SELECT 1" }) |statement| {
@@ -15065,6 +16874,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
     }
 
+    qualification_phase = "SQL parity";
     const reference_cases = [_][]const u8{
         "sql-0172", "sql-0180", "sql-0181", "sql-0183", "sql-0184", "sql-0223", "sql-0224",
         "sql-0229", "sql-0234", "sql-0235", "sql-0236", "sql-0237", "sql-0247", "sql-0297",
@@ -15481,7 +17291,15 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var execute_context = httpx.Context.init(alloc, std.testing.io, &execute_request);
             defer execute_context.deinit();
             execute_context.params = &params;
+            var held_query = if (!closed) server.query_admission.tryAcquireLease() else null;
+            defer if (held_query) |*lease| lease.release();
+            var grant: ?std.Io.Future(anyerror!void) = if (held_query) |*lease|
+                try backend_runtime.ptr().io().?.concurrent(releaseQueryWhenQueued, .{ &server, lease, backend_runtime.ptr().io().? })
+            else
+                null;
+            defer if (grant) |*future| future.cancel(backend_runtime.ptr().io().?) catch {};
             var executed = try handler.executePreparedSQL(&execute_context, id);
+            if (grant) |*future| try future.await(backend_runtime.ptr().io().?);
             defer executed.deinit();
             try std.testing.expectEqual(@as(u16, if (closed) 400 else 200), executed.status.code);
             if (!closed) {
@@ -15686,7 +17504,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var text_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &text_db, raft_mod.read_gate.alreadyReadSafeBarrier());
         var text_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &text_db);
         var text_source: Source = .{ .schema = text_schema_json, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = text_schema_json }} };
-        var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
+        var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 } }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
         defer text_server.deinit();
         var text_handler = AntflyApiHandler{ .api_server = &text_server };
         const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
@@ -16091,6 +17909,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             request.body = case.body;
             var ctx = httpx.Context.init(alloc, std.testing.io, &request);
             defer ctx.deinit();
+            const write_grants_before_insert = text_server.runnableSchedulingStats().grants[1];
+            const write_admissions_before_insert = text_server.writeAdmissionStats().granted_total.?;
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
             if (response.status.code != 200) std.debug.print("SQL INSERT DEFAULT: {s}\n", .{response.body orelse ""});
@@ -16098,9 +17918,75 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
             defer result.deinit();
             try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
+            // One operation admission survives any number of preparation,
+            // execution and retained-completion CPU grants.
+            try std.testing.expectEqual(write_admissions_before_insert + 1, text_server.writeAdmissionStats().granted_total.?);
+            try std.testing.expect(text_server.runnableSchedulingStats().grants[1] >= write_grants_before_insert + 2);
+            try std.testing.expectEqual(@as(usize, 0), text_server.writeAdmissionStats().in_flight);
+            const inserted_stats = text_server.runnable_scheduler.?.stats();
+            try std.testing.expectEqual(@as(usize, 0), inserted_stats.operations);
+            try std.testing.expectEqual(@as(usize, 0), inserted_stats.runnable_slots);
+            try std.testing.expectEqual(@as(u64, 0), inserted_stats.retained_bytes);
             try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
             if (case.expected_id) |expected_id| try std.testing.expectEqualStrings(expected_id, result.value.rows[0][0].string) else try std.testing.expect(result.value.rows[0][0].string.len != 0);
             try std.testing.expectEqualStrings("reset", result.value.rows[0][1].string);
+        }
+        {
+            // Authenticated pgwire mutations use the same native write owner.
+            // Remove the probe row so subsequent corpus cases retain their
+            // original data set.
+            var write_auth = try initTestAuthManager(alloc);
+            defer write_auth.store.deinit();
+            defer write_auth.policy_store.deinit();
+            try bindTestAuthManager(alloc, &write_auth);
+            defer write_auth.manager.deinit();
+            var write_permission = try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin);
+            defer write_permission.deinit(alloc);
+            var write_user = try write_auth.manager.createUser("pool-writer", "secret", &.{write_permission});
+            defer write_user.deinit(alloc);
+            text_server.cfg.user_manager = &write_auth.manager;
+            defer text_server.cfg.user_manager = null;
+            var write_pg: @import("sql_pgwire.zig").Adapter = .{ .server = &text_server };
+            const write_backend = write_pg.backend();
+            const write_identity = try write_backend.vtable.authenticate(write_backend.context, alloc, "pool-writer", "secret");
+            defer write_identity.release(write_identity.context, alloc);
+            for ([_][]const u8{
+                "INSERT INTO usage_records (id,status,quantity) VALUES ('pg_write_probe','probe',7) RETURNING id",
+                "DELETE FROM usage_records WHERE id = 'pg_write_probe' RETURNING id",
+            }) |statement| {
+                var write_arena = std.heap.ArenaAllocator.init(alloc);
+                defer write_arena.deinit();
+                var write_cancel: std.atomic.Value(bool) = .init(false);
+                const write_grants_before = text_server.runnableSchedulingStats().grants[1];
+                const write_admissions_before = text_server.writeAdmissionStats().granted_total.?;
+                var written = try write_backend.vtable.execute(write_backend.context, write_arena.allocator(), write_identity, .{
+                    .statement = statement,
+                    .parameters = &.{},
+                    .limit = 1,
+                    .io = std.testing.io,
+                    .cancel_requested = &write_cancel,
+                    .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 5 * std.time.ns_per_s } },
+                });
+                defer written.deinit();
+                try std.testing.expectEqual(@as(u64, 1), written.rows_affected);
+                try std.testing.expectEqual(@as(usize, 1), written.rowCount());
+                const returned_id = try written.cell(write_arena.allocator(), 0, 0);
+                try std.testing.expect(!returned_id.sql_null);
+                try std.testing.expectEqualStrings("pg_write_probe", returned_id.value.string);
+                // Native pgwire uses one admission through checkpointed completion.
+                try std.testing.expectEqual(write_admissions_before + 1, text_server.writeAdmissionStats().granted_total.?);
+                try std.testing.expect(text_server.runnableSchedulingStats().grants[1] >= write_grants_before + 2);
+                try std.testing.expectEqual(@as(usize, 0), text_server.writeAdmissionStats().in_flight);
+                const written_stats = text_server.runnable_scheduler.?.stats();
+                try std.testing.expectEqual(@as(usize, 0), written_stats.operations);
+                try std.testing.expectEqual(@as(usize, 0), written_stats.runnable_slots);
+                try std.testing.expectEqual(@as(u64, 0), written_stats.retained_bytes);
+                const write_service = text_server.runnableSchedulingStats().service;
+                try write_service.validate();
+                try std.testing.expect(write_service.available);
+                try std.testing.expect(write_service.estimated_slot_ns[1] > 0);
+                try std.testing.expect(write_service.observed_slot_ns[1] > 0);
+            }
         }
         {
             // sql-1494: DEFAULT VALUES has no SQL value cells. Native schema
@@ -16246,9 +18132,11 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer grant.deinit(alloc);
         var user = try manager.createUser("cursor_reader", "secret", &.{grant});
         defer user.deinit(alloc);
-        var pg_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .user_manager = &manager }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
+        var pg_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .user_manager = &manager, .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
         defer pg_server.deinit();
         var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &pg_server };
+        var cursor_lifetime: FixtureLifetime = .{};
+        defer cursor_lifetime.drain();
         const wire_backend = pg_adapter.backend();
         const credential = try wire_backend.vtable.authenticate(wire_backend.context, alloc, "cursor_reader", "secret");
         defer credential.release(credential.context, alloc);
@@ -16261,6 +18149,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .io = std.testing.io,
             .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
             .cancel_requested = &canceled,
+            .retained_lifetime = .{ .context = &cursor_lifetime, .retain_fn = FixtureLifetime.retain, .release_fn = FixtureLifetime.release },
         };
         for ([_][]const u8{
             "SELECT ARRAY[1,NULL,9223372036854775807]::bigint[]",
@@ -16305,6 +18194,9 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         for ([_]bool{ false, true }) |declared| for ([_]u16{ 0, 1 }) |format| {
             var array_arena: std.heap.ArenaAllocator = .init(alloc);
             defer array_arena.deinit();
+            // Stream/page defers run first; join retained task metadata before
+            // freeing the allocator borrowed by the native cursor.
+            defer cursor_lifetime.drain();
             const array_alloc = array_arena.allocator();
             const sources = @import("antfly_local_sources");
             const wire_values = @import("../pgwire/values.zig");
@@ -16343,6 +18235,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.*, &work));
         };
         {
+            defer cursor_lifetime.drain();
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;
             defer stream.close(stream.context);
             const expected = [_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" };
@@ -16360,6 +18253,13 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             }
             try std.testing.expectEqual(expected.len, offset);
         }
+        cursor_lifetime.drain();
+        try std.testing.expectEqual(@as(usize, 1), cursor_lifetime.references.load(.acquire));
+        const cursor_retired = pg_server.runnable_scheduler.?.stats();
+        try std.testing.expectEqual(@as(usize, 0), cursor_retired.operations);
+        try std.testing.expectEqual(@as(usize, 0), cursor_retired.runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), cursor_retired.retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), pg_server.query_admission.stats().in_flight);
         var result_arena = std.heap.ArenaAllocator.init(alloc);
         defer result_arena.deinit();
         var result = try wire_backend.vtable.execute(wire_backend.context, result_arena.allocator(), credential, request);
@@ -16786,7 +18686,7 @@ test "httpx relational row query mutation endpoints enforce exact versions and s
     // Admission and participants must agree on the authoritative schema.
     // The generic lookup fixture advertises a document table at epoch zero,
     // which should be rejected for this schema-fenced relational mutation.
-    var status_source = SchemaUpdateStatusSource{ .schema_json = schema_json };
+    var status_source = SchemaUpdateStatusSource{ .schema_allocator = alloc, .schema_json = schema_json };
     var server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), writes.source());
     var e2e: HttpxE2eServer = undefined;
     try e2e.init(alloc, &server);
@@ -17252,7 +19152,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
 test "httpx antfly schema update returns full table status after projection" {
     const alloc = std.testing.allocator;
 
-    var source = SchemaUpdateStatusSource{};
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
@@ -17295,12 +19195,12 @@ test "httpx antfly schema update returns full table status after projection" {
 
 test "httpx antfly schema update owns self partial support and requires coordinated publication" {
     const alloc = std.testing.allocator;
-    var source = SchemaUpdateStatusSource{};
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     const initial =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
-    try source.replaceSchemaJson(alloc, initial);
+    try source.replaceSchemaJson(initial);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
     defer api_server.deinit();
@@ -17641,7 +19541,7 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
     };
     var fixture: Fixture = .{ .alloc = alloc, .schema = source_schema };
     defer fixture.deinit();
-    var source = SchemaUpdateStatusSource{ .schema_json = source_schema };
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc, .schema_json = source_schema };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.readFacts } }, source.iface(), null, writes.iface());
@@ -17709,7 +19609,7 @@ test "httpx schema rewrite authorizes incoming dependencies before source admiss
     const child =
         \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"docs","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
-    var source = SchemaUpdateStatusSource{ .schema_json = parent, .dependency = .{ .table_id = 8, .name = "dependent", .schema_json = child, .indexes_json = "{}", .placement_role = "data" } };
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc, .schema_json = parent, .dependency = .{ .table_id = 8, .name = "dependent", .schema_json = child, .indexes_json = "{}", .placement_role = "data" } };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, writes.iface());
@@ -17758,7 +19658,7 @@ test "httpx schema patch merges at the authority and accepts version zero ETag" 
     defer alloc.free(reader_authorization);
     const admin_authorization = try encodeBasicAuthorization(alloc, "schema_admin", "secret");
     defer alloc.free(admin_authorization);
-    var source = SchemaUpdateStatusSource{};
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, writes.iface());
@@ -18086,15 +19986,763 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
     return &result;
 }
 
+test "httpx query waiting expires before execution and preserves original timeout" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .query_waiting = .{ .max_queued_requests = 1, .max_queued_bytes = 4096, .max_wait_ms = 10 },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var held = server.query_admission.tryAcquireLease().?;
+    defer held.release();
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer request.deinit();
+    request.body = "{\"timeout_ms\":1}";
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = (try handler.acquirePublicOperation(&ctx, "queryTable")).?;
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "execution_started\":false") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().queued);
+    const cancellation = AntflyApiHandler.requestCancellation(&ctx);
+    try std.testing.expectEqual(ctx.application_deadline_ns, cancellation.execution_deadline_ns);
+    try std.testing.expect(cancellation.execution_deadline_ns.? <= platform_time.monotonicNs());
+    // Transaction controls retain their independent, immediate write owner.
+    var write = try server.acquireSqlExecution(true);
+    write.release();
+}
+
+test "SQL query waiting shares HTTP owner and retains fail fast writes" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .query_waiting = .{ .max_queued_requests = 1, .max_queued_bytes = 4096, .max_wait_ms = 1 },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    var read = server.query_admission.tryAcquireLease().?;
+    defer read.release();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, server.acquireSqlExecutionWithOptions(false, .{ .io = std.testing.io, .retained_bytes = 1 }));
+    var write = try server.acquireSqlExecutionWithOptions(true, .{ .io = std.testing.io });
+    defer write.release();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, server.acquireSqlExecutionWithOptions(true, .{ .io = std.testing.io }));
+    try std.testing.expectError(error.DeadlineExceeded, server.acquireSqlExecutionWithOptions(false, .{ .io = std.testing.io, .deadline_ns = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().queued);
+}
+
+test "httpx query waiting real sockets absorb burst and keep status responsive" {
+    for ([_]struct { connections: u32, tasks: u32, expected: u16 }{
+        .{ .connections = 16, .tasks = 0, .expected = 429 },
+        // Two ordinary handler slots, four reserved control slots.
+        .{ .connections = 6, .tasks = 1, .expected = 503 },
+    }) |profile| {
+        const alloc = std.testing.allocator;
+        var source = AuthStatusSource{};
+        var api = ApiHttpServer.init(alloc, .{
+            .query_max_concurrent_requests = 1,
+            .query_waiting = .{ .max_queued_requests = 2, .max_queued_bytes = 16384, .max_wait_ms = 5000 },
+        }, source.iface(), null, null);
+        defer api.deinit();
+        var listener: HttpxE2eServer = undefined;
+        try listener.initWithTransportLimits(alloc, &api, 1, profile.connections, profile.tasks);
+        defer listener.deinit();
+        const base = try listener.baseUrl(alloc);
+        defer alloc.free(base);
+        const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base});
+        defer alloc.free(query_url);
+        const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/status", .{base});
+        defer alloc.free(status_url);
+        var client_runtime = std.Io.Threaded.init(alloc, .{});
+        defer client_runtime.deinit();
+        const io = client_runtime.io();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        // Establish the fixture's ordinary response before testing waiting.
+        var baseline = try requestWithRetry(&client, io, .POST, query_url, "{}", null, 20);
+        defer baseline.deinit();
+        try std.testing.expectEqual(@as(u16, 404), baseline.status.code);
+        var held = api.query_admission.tryAcquireLease().?;
+        defer held.release();
+        const Job = struct {
+            alloc: std.mem.Allocator,
+            io: std.Io,
+            url: []const u8,
+            status: u16 = 0,
+            err: ?anyerror = null,
+            fn run(self: *@This()) void {
+                var owned_client = httpx.Client.initWithConfig(self.alloc, self.io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+                defer owned_client.deinit();
+                var response = requestWithRetry(&owned_client, self.io, .POST, self.url, "{}", null, 20) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                defer response.deinit();
+                self.status = response.status.code;
+            }
+        };
+        var jobs = [_]Job{
+            .{ .alloc = alloc, .io = io, .url = query_url },
+            .{ .alloc = alloc, .io = io, .url = query_url },
+        };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (&jobs) |*job| try group.concurrent(io, Job.run, .{job});
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+        while (api.queryAdmissionStats().queued != jobs.len) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        var status = try getWithRetry(&client, io, status_url, null, 20);
+        defer status.deinit();
+        try std.testing.expectEqual(@as(u16, 200), status.status.code);
+        var excess = try requestWithRetry(&client, io, .POST, query_url, "{}", null, 20);
+        defer excess.deinit();
+        try std.testing.expectEqual(profile.expected, excess.status.code);
+        if (profile.expected == 429) try std.testing.expect(std.mem.indexOf(u8, excess.body.?, "queue_count") != null);
+        held.release();
+        try group.await(io);
+        for (jobs) |job| {
+            try std.testing.expect(job.err == null);
+            try std.testing.expectEqual(baseline.status.code, job.status);
+        }
+        try std.testing.expectEqual(@as(usize, 0), api.queryAdmissionStats().queued);
+        try std.testing.expectEqual(@as(u64, 0), api.queryAdmissionStats().queued_bytes);
+        try std.testing.expectEqual(@as(usize, 0), api.queryAdmissionStats().in_flight);
+        try std.testing.expectEqual(@as(usize, 1), api.queryAdmissionStats().peak_in_flight);
+    }
+}
+
+test "SQL protected executor reserves bounded workers and rolls back exhaustion" {
+    const alloc = std.testing.allocator;
+    var worker_heap = std.testing.FailingAllocator.init(alloc, .{});
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(worker_heap.allocator(), .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .worker_capacity = 32 },
+    });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 1,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 4096, .max_wait_ms = 100 },
+    }, source.iface(), null, null);
+    var api_closed = false;
+    defer if (!api_closed) api.deinit();
+    const transport = api.configurePublicHttpTransport(.{ .max_connections = 6, .max_request_tasks = 1 });
+    try std.testing.expectEqual(@as(u32, 6), transport.max_request_tasks);
+    try std.testing.expectEqual(@as(u32, 6), transport.h2_max_concurrent_streams);
+    const limited = api.configurePublicHttpTransport(.{ .max_connections = 6, .max_request_tasks = 1, .h2_max_concurrent_streams = 1 });
+    try std.testing.expectEqual(@as(u32, 1), limited.h2_max_concurrent_streams);
+    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 32 });
+    defer occupied.release();
+    worker_heap.fail_index = worker_heap.alloc_index;
+    const failed = api.sqlExecutionIo();
+    worker_heap.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, failed);
+    try std.testing.expect(worker_heap.has_induced_failure);
+    try std.testing.expect(!api.sqlQueryWaitingEnabled());
+    try std.testing.expectEqual(@as(usize, 32), runtime.ptr().laneStats().reserved_workers);
+    occupied.release();
+    const io = try api.sqlExecutionIo();
+    try std.testing.expect(io.userdata != runtime.ptr().io().?.userdata);
+    try std.testing.expect(api.sqlQueryWaitingEnabled());
+    try std.testing.expectEqual(@as(usize, 17), runtime.ptr().laneStats().reserved_workers);
+    _ = try api.sqlExecutionIo();
+    try std.testing.expectEqual(@as(usize, 17), runtime.ptr().laneStats().reserved_workers);
+    api.deinit();
+    api_closed = true;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+}
+
+fn releaseQueryWhenQueued(server: *ApiHttpServer, lease: *RequestAdmission.Lease, io: std.Io) anyerror!void {
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (server.queryAdmissionStats().queued == 0) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    lease.release();
+}
+
+fn qualifyNativeH2Waiting(api: *ApiHttpServer) !void {
+    const alloc = std.testing.allocator;
+    var fixture: HttpxE2eServer = undefined;
+    try fixture.initTransportWithExistingAdmission(alloc, api, 1, 6, 1);
+    defer fixture.deinit();
+    const rollback_id = try beginSqlQualificationSession(&fixture.handler);
+    const commit_id = try beginSqlQualificationSession(&fixture.handler);
+    const rollback = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "ROLLBACK", .session_id = @as([]const u8, &rollback_id) }, .{});
+    defer alloc.free(rollback);
+    const io = fixture.io_impl.io();
+    var socket = try httpx.Socket.connect(fixture.server.boundAddress().?, io);
+    defer socket.close();
+    try socket.setRecvTimeout(5000);
+    var peer = httpx.H2Connection.initClient(alloc, io);
+    defer peer.deinit();
+    try peer.sendClientPreface(&socket);
+    var held = api.query_admission.tryAcquireLease().?;
+    defer held.release();
+    const query_body = "{\"statement\":\"SELECT id, name FROM usage_records WHERE _id = 'a'\"}";
+    var queued: [2]u31 = undefined;
+    for (&queued, 0..) |*sid, index| {
+        const stream = try peer.stream_manager.createStream();
+        sid.* = stream.id;
+        const headers = try httpx.H2Connection.buildRequestHeaders("POST", "/db/v1/sql", "http", "localhost", &.{.{ .name = "content-type", .value = "application/json" }}, alloc);
+        defer alloc.free(headers);
+        try peer.sendHeaders(&socket, stream.id, headers, false);
+        try peer.writeData(&socket, stream.id, query_body, true);
+        const queued_until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+        while (api.queryAdmissionStats().queued != index + 1) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= queued_until.nanoseconds) return error.H2QueriesDidNotQueue;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (api.queryAdmissionStats().queued != 2) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.H2QueriesDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var preparations: [2]RequestAdmission.Lease = undefined;
+    for (&preparations) |*lease| lease.* = api.sql_preparation_admission.tryAcquireLease().?;
+    defer for (&preparations) |*lease| lease.release();
+    var write = api.write_admission.tryAcquireLease().?;
+    defer write.release();
+    const base = try fixture.baseUrl(alloc);
+    defer alloc.free(base);
+    const sql_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/sql", .{base});
+    defer alloc.free(sql_url);
+    const commit = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .session_id = @as([]const u8, &commit_id) }, .{});
+    defer alloc.free(commit);
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    var committed = try requestWithRetry(&client, io, .POST, sql_url, commit, null, 1);
+    defer committed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), committed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, committed.body.?, "COMMIT") != null);
+    const rejected = try peer.stream_manager.createStream();
+    const control = try peer.stream_manager.createStream();
+    const status = try peer.stream_manager.createStream();
+    for ([_]u31{ rejected.id, control.id }) |sid| {
+        const headers = try httpx.H2Connection.buildRequestHeaders("POST", "/db/v1/sql", "http", "localhost", &.{.{ .name = "content-type", .value = "application/json" }}, alloc);
+        defer alloc.free(headers);
+        try peer.sendHeaders(&socket, sid, headers, false);
+    }
+    try peer.writeData(&socket, rejected.id, query_body, true);
+    try peer.writeData(&socket, control.id, rollback[0..5], false);
+    try peer.writeData(&socket, control.id, rollback[5..], true);
+    const headers = try httpx.H2Connection.buildRequestHeaders("GET", "/db/v1/status", "http", "localhost", &.{}, alloc);
+    defer alloc.free(headers);
+    try peer.sendHeaders(&socket, status.id, headers, true);
+    while (rejected.stream_error == null or !control.completed or !status.completed)
+        _ = try peer.processOneFrame(&socket, &socket);
+    try std.testing.expect(std.mem.indexOf(u8, control.data_buf.items, "ROLLBACK") != null);
+    try std.testing.expect(status.data_buf.items.len != 0);
+    try std.testing.expectEqual(@as(usize, 2), api.queryAdmissionStats().queued);
+    try peer.sendRstStream(&socket, queued[0], .cancel);
+    const cancelled_until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (api.queryAdmissionStats().queued != 1) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= cancelled_until.nanoseconds) return error.H2ResetDidNotCancelWaiter;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    held.release();
+    const completed = peer.stream_manager.getStream(queued[1]).?;
+    while (!completed.completed) _ = try peer.processOneFrame(&socket, &socket);
+    try std.testing.expect(std.mem.indexOf(u8, completed.data_buf.items, "9007199254740993") != null);
+    try std.testing.expectEqual(@as(usize, 0), api.queryAdmissionStats().queued);
+    try std.testing.expectEqual(@as(usize, 0), api.queryAdmissionStats().in_flight);
+}
+
+fn beginSqlQualificationSession(handler: *AntflyApiHandler) ![32]u8 {
+    const alloc = std.testing.allocator;
+    var request = try httpx.Request.init(alloc, .POST, "/db/v1/sql");
+    defer request.deinit();
+    request.body = "{\"statement\":\"BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY\"}";
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var begun = try handler.executeSQL(&context);
+    defer begun.deinit();
+    try std.testing.expectEqual(@as(u16, 200), begun.status.code);
+    var result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begun.body.?, .{});
+    defer result.deinit();
+    var id: [32]u8 = undefined;
+    @memcpy(&id, result.value.session_id.?);
+    return id;
+}
+
+test "SQL protected executor cleanup workers retain control progress under full saturation" {
+    const alloc = std.testing.allocator;
+    var worker_heap = std.testing.FailingAllocator.init(alloc, .{});
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(worker_heap.allocator(), .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .worker_capacity = 32 },
+    });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+        .query_max_concurrent_requests = 4,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 1,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 4096, .max_wait_ms = 100 },
+    }, source.iface(), null, null);
+    var api_closed = false;
+    defer if (!api_closed) api.deinit();
+    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 32 });
+    defer occupied.release();
+    // Service saturation leaves SQL control available. A real node-allocator
+    // failure during cleanup construction preserves the control reservation.
+    _ = try api.sqlControlIo();
+    worker_heap.fail_index = worker_heap.alloc_index;
+    const failed = api.sqlCleanupIo();
+    worker_heap.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, failed);
+    try std.testing.expect(worker_heap.has_induced_failure);
+    try std.testing.expect(api.sql_cleanup_workers == null);
+    try std.testing.expectEqual(@as(usize, 37), runtime.ptr().laneStats().reserved_workers);
+    occupied.release();
+    try std.testing.expectEqual(@as(usize, 5), runtime.ptr().laneStats().reserved_workers);
+    const foreground = try api.sqlExecutionIo();
+    const cleanup_io = try api.sqlCleanupIo();
+    const control = try api.sqlControlIo();
+    try std.testing.expect(cleanup_io.userdata != foreground.userdata and cleanup_io.userdata != control.userdata);
+    // The 32-worker node reserves eight shared cleanup workers, independent
+    // of this API's four-request foreground admission limit.
+    try std.testing.expectEqual(@as(usize, 8), api.sql_cleanup_workers.?.capacity);
+    try std.testing.expectEqual(@as(usize, 25), runtime.ptr().laneStats().reserved_workers);
+    _ = try api.sqlCleanupIo();
+    try std.testing.expectEqual(@as(usize, 25), runtime.ptr().laneStats().reserved_workers);
+    const Blocked = struct {
+        fn run(gate: *std.Io.Event, io: std.Io) std.Io.Cancelable!void {
+            try gate.wait(io);
+        }
+        fn health(calls: *std.atomic.Value(usize)) void {
+            _ = calls.fetchAdd(1, .monotonic);
+        }
+    };
+    var cleanup_gate: std.Io.Event = .unset;
+    var foreground_gate: std.Io.Event = .unset;
+    var cleanup_jobs: std.Io.Group = .init;
+    var foreground_jobs: std.Io.Group = .init;
+    var jobs_live = true;
+    defer if (jobs_live) cleanup_jobs.cancel(cleanup_io);
+    defer if (jobs_live) foreground_jobs.cancel(foreground);
+    defer if (jobs_live) cleanup_gate.set(cleanup_io);
+    defer if (jobs_live) foreground_gate.set(foreground);
+    for (0..api.sql_cleanup_workers.?.capacity) |_| try cleanup_jobs.concurrent(cleanup_io, Blocked.run, .{ &cleanup_gate, cleanup_io });
+    for (0..api.sql_workers.?.capacity) |_| try foreground_jobs.concurrent(foreground, Blocked.run, .{ &foreground_gate, foreground });
+    try std.testing.expectError(error.ConcurrencyUnavailable, cleanup_jobs.concurrent(cleanup_io, Blocked.run, .{ &cleanup_gate, cleanup_io }));
+    try std.testing.expectError(error.ConcurrencyUnavailable, foreground_jobs.concurrent(foreground, Blocked.run, .{ &foreground_gate, foreground }));
+    var calls: std.atomic.Value(usize) = .init(0);
+    var health = try control.concurrent(Blocked.health, .{&calls});
+    health.await(control);
+    try std.testing.expectEqual(@as(usize, 1), calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 25), runtime.ptr().laneStats().reserved_workers);
+    cleanup_gate.set(cleanup_io);
+    foreground_gate.set(foreground);
+    try cleanup_jobs.await(cleanup_io);
+    try foreground_jobs.await(foreground);
+    jobs_live = false;
+    api.deinit();
+    api_closed = true;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+}
+
+test "SQL protected executor preserves an explicitly disabled shared SQL worker budget" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .sql_worker_capacity = 0 } });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, source.iface(), null, null);
+    defer api.deinit();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlCleanupIo());
+    const foreground = try api.sqlExecutionIo();
+    try std.testing.expect(foreground.userdata == runtime.ptr().io().?.userdata);
+    const control = try api.sqlControlIo();
+    try std.testing.expect(control.userdata == runtime.ptr().controlIo().?.userdata);
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expect(!api.sqlQueryWaitingEnabled());
+}
+
+test "SQL protected control transport validates typed paths before granting reserve" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{ .query_waiting = .{ .max_queued_requests = 2, .max_queued_bytes = 4096, .max_wait_ms = 100 } }, source.iface(), null, null);
+    defer api.deinit();
+    const transport = api.configurePublicHttpTransport(.{ .max_connections = 8, .max_request_tasks = 1 });
+    const classify = transport.is_protected_request.?;
+    const id = "00000000000000000000000000000001";
+    for ([_][]const u8{
+        "/db/v1/transactions/" ++ id ++ "/commit",
+        "/db/v1/transactions/" ++ id ++ "/abort",
+        "/db/v1/transactions/" ++ id ++ "/savepoints/7/rollback",
+    }) |path| try std.testing.expect(classify(.POST, path));
+    for ([_][]const u8{
+        "/db/v1/transactions/begin",
+        "/db/v1/transactions/commit",
+        "/db/v1/transactions/" ++ id ++ "/savepoints/rollback",
+        "/db/v1/transactions/" ++ id ++ "/savepoints//rollback",
+        "/db/v1/transactions/" ++ id ++ "/savepoints/7/rollback/extra",
+        "/db/v1/sql?priority=control",
+    }) |path| try std.testing.expect(!classify(.POST, path));
+    for ([_][]const u8{
+        "/db/v1/sql/prepared/" ++ id,
+        "/db/v1/sql/connections/" ++ id,
+    }) |path| {
+        try std.testing.expect(classify(.DELETE, path));
+        try std.testing.expect(!classify(.POST, path));
+    }
+    try std.testing.expect(!classify(.DELETE, "/db/v1/sql/prepared/not-hex"));
+}
+
+test "httpx workload policy requires admin and versioned bounded updates" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    const waiting: @import("antfly_local_sources").common_bounded_admission.Waiting = .{ .max_queued_requests = 2, .max_queued_bytes = 4096, .max_wait_ms = 100 };
+    var api = try ApiHttpServer.initWithConfig(alloc, .{ .admin_bearer_token = "operator-secret", .query_max_concurrent_requests = 2, .query_waiting = waiting }, source.iface(), null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    var request = try httpx.Request.init(alloc, .PUT, "http://localhost/admin/v1/workload/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    request.body = "{\"expected_version\":1,\"capacity\":1,\"waiting\":{\"max_queued_requests\":1,\"max_queued_bytes\":1024,\"max_wait_ms\":50},\"suspended\":true}";
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        try std.testing.expectEqual(@as(u64, 1), api.queryAdmissionStats().policy_version);
+    }
+    try request.headers.set("Authorization", "Bearer operator-secret");
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(api.queryAdmissionStats().suspended);
+        try std.testing.expect(!api.tryAcquireQuery());
+        var control = try api.acquireSqlControl();
+        control.release();
+    }
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    }
+    request.body = "{\"expected_version\":2,\"capacity\":3,\"waiting\":{},\"suspended\":false}";
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 422), response.status.code);
+    }
+    request.body = "{\"expected_version\":2,\"capacity\":2,\"waiting\":{},\"suspended\":false}";
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(api.tryAcquireQuery());
+        api.releaseQuery();
+    }
+    request.body = "{\"expected_version\":3,\"action\":\"drain\"}";
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(api.queryAdmissionStats().draining);
+        try std.testing.expect(api.queryAdmissionStats().quiescent);
+    }
+    const transport = api.configurePublicHttpTransport(.{});
+    try std.testing.expect(transport.is_protected_request.?(.GET, "/admin/v1/workload/query"));
+    try std.testing.expect(transport.is_protected_body_request.?(.PUT, "/admin/v1/workload/query", request.body.?));
+    try std.testing.expect(!transport.is_protected_body_request.?(.PUT, "/admin/v1/workload/query", "{\"expected_version\":3,\"sql\":\"SELECT 1\"}"));
+    try std.testing.expect(http_server_mod.requiresAdminPermission("/admin/v1/workload/query"));
+}
+
+test "SQL protected executor cleanup owner reserves independent reaper and reclaims all worker capacity" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = try ApiHttpServer.initWithConfig(alloc, .{
+        .backend_runtime = runtime.ptr(),
+        .admin_bearer_token = "cleanup-observer",
+        .query_max_concurrent_requests = 4,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 1,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 4096, .max_wait_ms = 100 },
+    }, source.iface(), null, null);
+    var closed = false;
+    defer if (!closed) api.deinit();
+    const cleanup_io = try api.sqlCleanupIo();
+    try std.testing.expect(api.sqlCleanupStats() == null);
+    try std.testing.expectEqual(@as(usize, 13), runtime.ptr().laneStats().reserved_workers);
+    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 32 });
+    defer occupied.release();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlCleanupOwner());
+    try std.testing.expect(api.sql_cleanup_runtime == null and api.sql_cleanup_reaper_workers == null);
+    try std.testing.expectEqual(@as(usize, 45), runtime.ptr().laneStats().reserved_workers);
+    occupied.release();
+    // Force the stable Runtime allocation to fail after reaper admission.
+    // Retry must get its worker back without waiting for API shutdown.
+    // Pre-admit the funded reaper so the injected failure is specifically the
+    // Runtime allocation, after worker admission, rather than its IO wrapper.
+    const memory = api.request_memory.?;
+    api.sql_cleanup_reaper_workers = try @import("sql_worker_lease.zig").Lease.acquireNativeFunded(runtime.ptr(), memory.cleanupAllocator(), 1);
+    const cleanup_child = memory.cleanup.?.child;
+    var failing = std.testing.FailingAllocator.init(cleanup_child, .{ .fail_index = 0 });
+    memory.cleanup.?.child = failing.allocator();
+    const failed_owner = api.sqlCleanupOwner();
+    memory.cleanup.?.child = cleanup_child;
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, failed_owner);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(api.sql_cleanup_runtime == null and api.sql_cleanup_reaper_workers == null);
+    try std.testing.expectEqual(@as(usize, 13), runtime.ptr().laneStats().reserved_workers);
+    const active = try api.sqlCleanupOwner();
+    const stats = api.sqlCleanupStats().?;
+    try std.testing.expectEqual(@as(usize, 8), stats.capacity);
+    try std.testing.expectEqual(@as(usize, 0), stats.retained);
+    try std.testing.expect(!stats.closing);
+    const control_io = try api.sqlControlIo();
+    try std.testing.expect(active.io.userdata != cleanup_io.userdata and active.io.userdata != control_io.userdata);
+    try std.testing.expectEqual(@as(usize, 8), active.registry.limit);
+    try std.testing.expectEqual(@as(usize, 14), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(active, try api.sqlCleanupOwner());
+    try std.testing.expectEqual(@as(usize, 14), runtime.ptr().laneStats().reserved_workers);
+    _ = try api.sqlExecutionIo();
+    try std.testing.expectEqual(@as(usize, 26), runtime.ptr().laneStats().reserved_workers);
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    var request = try httpx.Request.init(alloc, .GET, "http://localhost/admin/v1/workload/query");
+    defer request.deinit();
+    try request.headers.set("Authorization", "Bearer cleanup-observer");
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.getWorkloadPolicy(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const body = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+    defer body.deinit();
+    const runnable_stats = body.value.object.get("runnable").?.object;
+    try std.testing.expect(!runnable_stats.get("enabled").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), runnable_stats.get("capacity_slots").?.integer);
+    const cleanup_stats = body.value.object.get("cleanup").?.object;
+    try std.testing.expectEqual(@as(i64, 8), cleanup_stats.get("capacity").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), cleanup_stats.get("retained").?.integer);
+    api.deinit();
+    closed = true;
+    // The server lifetime has ended. Verify worker retirement through the
+    // independent backend owner, rather than accessing the destroyed server.
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+}
+
+test "SQL protected executor cleanup diagnostics and control worker progress during blocked API shutdown" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const abi = @import("antfly_runtime_abi");
+    const owners = @import("runnable_owner_execution.zig");
+    const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const allocation = @import("../common/allocation_budget.zig");
+    const Fixture = struct {
+        memory: *allocation.Shared,
+        owner: *owners.State,
+        handle: *anyopaque,
+        released: *std.atomic.Value(usize),
+        retired: *std.atomic.Value(usize),
+        body: ?[]u8 = null,
+        refs: std.atomic.Value(usize) = .init(1),
+        ready: std.Io.Event = .unset,
+        go: std.Io.Event = .unset,
+        fn now() u64 {
+            return 0;
+        }
+        fn checked(status: abi.error_abi.Status) !void {
+            if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+        }
+        fn retain(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.refs.fetchAdd(1, .monotonic);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            std.debug.assert(self.body == null);
+            const allocator = self.memory.allocator();
+            const port = self.owner.port();
+            const handle = self.handle;
+            const released = self.released;
+            allocator.destroy(self);
+            port.finish(handle);
+            _ = released.fetchAdd(1, .release);
+        }
+        fn cleanup(raw: *anyopaque, borrow: abi.runnable_abi.Borrowed, io: std.Io) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(borrow.park(borrow.context, @backingInt(abi.runnable_abi.Wait.resource)));
+            self.ready.set(io);
+            self.go.waitUncancelable(io);
+            try checked(borrow.enter(borrow.context, @backingInt(abi.runnable_abi.Class.query)));
+            try checked(borrow.checkpoint(borrow.context));
+            self.memory.allocator().free(self.body.?);
+            self.body = null;
+        }
+        fn retire(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Successful cleanup still has a mandatory metadata retirement
+            // fence. An error here intentionally retains the registry slot.
+            if (self.body != null) return error.PhysicalCleanupIncomplete;
+            _ = self.retired.fetchAdd(1, .release);
+        }
+    };
+    const Shutdown = struct {
+        api: *ApiHttpServer,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.api.deinit();
+            self.done.store(true, .release);
+        }
+    };
+    const Observer = struct {
+        api: *ApiHttpServer,
+        io: std.Io,
+        control_io: std.Io,
+        done: std.Io.Event = .unset,
+        control_done: std.Io.Event = .unset,
+        fn control(self: *@This()) void {
+            self.control_done.set(self.control_io);
+        }
+        fn run(self: *@This()) !void {
+            defer self.done.set(self.io);
+            // This takes the actual publisher mutex. A mutex held across
+            // shutdown's physical join would stall this observer until timeout.
+            const stats = self.api.sqlCleanupStats() orelse return error.CleanupOwnerUnpublishedEarly;
+            try std.testing.expect(stats.closing);
+            try std.testing.expectEqual(@as(usize, 1), stats.retained);
+            var control_lease = try self.api.acquireSqlControl();
+            defer control_lease.release();
+            var control_future = try self.control_io.concurrent(@This().control, .{self});
+            defer control_future.await(self.control_io);
+            try self.control_done.waitTimeout(self.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            var handler: AntflyApiHandler = .{ .api_server = self.api };
+            var request = try httpx.Request.init(std.testing.allocator, .GET, "http://localhost/admin/v1/workload/query");
+            defer request.deinit();
+            try request.headers.set("Authorization", "Bearer shutdown-observer");
+            var context = httpx.Context.init(std.testing.allocator, self.io, &request);
+            defer context.deinit();
+            var response = try handler.getWorkloadPolicy(&context);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const body = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body.?, .{});
+            defer body.deinit();
+            const cleanup_stats = body.value.object.get("cleanup").?.object;
+            try std.testing.expect(cleanup_stats.get("closing").?.bool);
+            try std.testing.expectEqual(@as(i64, 1), cleanup_stats.get("retained").?.integer);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var backend = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer backend.deinit();
+    var observer_threads = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
+    defer observer_threads.deinit();
+    var shutdown_threads = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
+    defer shutdown_threads.deinit();
+    const observer_io = observer_threads.io();
+    const shutdown_io = shutdown_threads.io();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{ .backend_runtime = backend.ptr(), .admin_bearer_token = "shutdown-observer", .query_max_concurrent_requests = 4, .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 4096, .max_wait_ms = 100 } }, source.iface(), null, null);
+    var api_closed = false;
+    defer if (!api_closed) api.deinit();
+    const cleanup_io = try api.sqlCleanupIo();
+    const active = try api.sqlCleanupOwner();
+    const control_io = try api.sqlControlIo();
+    try std.testing.expectEqual(@as(usize, 14), backend.ptr().laneStats().reserved_workers);
+    var owner: owners.State = .{ .owner_alloc = alloc, .owner = try scheduler.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Fixture.now };
+    defer owner.owner.deinit();
+    var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
+    var released: std.atomic.Value(usize) = .init(0);
+    var retired: std.atomic.Value(usize) = .init(0);
+    const io_borrow = abi.native_abi.IoBorrow.init(&cleanup_io);
+    const port = owner.port();
+    var handle: ?*anyopaque = null;
+    try Fixture.checked(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.runnable_abi.Class.query), .has_deadline = 1, .native_deadline = 1, .deadline_ns = 10, .out_handle = &handle }));
+    const fixture = try memory.allocator().create(Fixture);
+    fixture.* = .{ .memory = &memory, .owner = &owner, .handle = handle.?, .released = &released, .retired = &retired };
+    const borrow = try abi.runnable_abi.Borrowed.fromOwner(port, handle.?, 1, .query);
+    var reservation = try active.registry.reserve(cleanup_io, borrow, &.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 }, fixture, .{ .retain = Fixture.retain, .release = Fixture.release, .cleanup = Fixture.cleanup, .retire = Fixture.retire });
+    fixture.body = try memory.allocator().alloc(u8, 64);
+    try reservation.publish();
+    try reservation.start();
+    try reservation.transfer();
+    Fixture.release(fixture);
+    try fixture.ready.waitTimeout(observer_io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    var shutdown: Shutdown = .{ .api = &api };
+    var shutdown_future = try shutdown_io.concurrent(Shutdown.run, .{&shutdown});
+    var physically_released = false;
+    var shutdown_joined = false;
+    defer {
+        if (!physically_released) fixture.go.set(cleanup_io);
+        if (!shutdown_joined) shutdown_future.await(shutdown_io);
+        api_closed = true;
+    }
+    const deadline = std.Io.Clock.awake.now(observer_io).addDuration(.fromSeconds(5));
+    while (!active.registry.snapshot().closing) {
+        if (std.Io.Clock.awake.now(observer_io).nanoseconds >= deadline.nanoseconds) return error.Timeout;
+        try observer_io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var observer: Observer = .{ .api = &api, .io = observer_io, .control_io = control_io };
+    var observation = try observer_io.concurrent(Observer.run, .{&observer});
+    var observation_joined = false;
+    defer if (!observation_joined) {
+        // Unblock shutdown before joining a failed observer, so the old
+        // publisher-lock regression produces a bounded test failure.
+        if (!physically_released) {
+            fixture.go.set(cleanup_io);
+            physically_released = true;
+        }
+        _ = observation.await(observer_io) catch {};
+    };
+    try observer.done.waitTimeout(observer_io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try observation.await(observer_io);
+    observation_joined = true;
+    try std.testing.expect(!shutdown.done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), released.load(.acquire));
+    try std.testing.expect(memory.stats().used_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 14), backend.ptr().laneStats().reserved_workers);
+    fixture.go.set(cleanup_io);
+    physically_released = true;
+    shutdown_future.await(shutdown_io);
+    shutdown_joined = true;
+    api_closed = true;
+    try std.testing.expect(shutdown.done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), retired.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), released.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), backend.ptr().laneStats().reserved_workers);
+}
+
 test "httpx lake query delivery requires a transport and forwards delegated JSON writes" {
     const a = std.testing.allocator;
     var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/tables/docs/query");
     defer request.deinit();
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
-    var delivery: AntflyApiHandler.QueryDelivery = .{ .ctx = &ctx };
+    var owner = try http_server_mod.RunnableScheduler.Scheduler.init(.{ .slots = 2 });
+    var execution: http_server_mod.RunnableScheduler.Execution = .{};
+    try execution.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    defer execution.finish();
+    try execution.park(.resource_blocked);
+    try execution.enter(.inference);
+    var delivery: AntflyApiHandler.QueryDelivery = .{ .ctx = &ctx, .execution = &execution };
     try std.testing.expect(delivery.sink() == null);
     const State = struct {
+        owner: *http_server_mod.RunnableScheduler.Scheduler,
         started: bool = false,
         written: bool = false,
         closed: bool = false,
@@ -18113,16 +20761,29 @@ test "httpx lake query delivery requires a transport and forwards delegated JSON
         fn close(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expect(self.written);
+            try std.testing.expectEqual(@as(usize, 0), self.owner.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.owner.stats().output_blocked);
+            try std.testing.expectEqual(@as(usize, 1), self.owner.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), self.owner.stats().retained_bytes);
+            var control: http_server_mod.RunnableScheduler.Execution = .{};
+            try control.start(self.owner, .{ .io = std.testing.io }, .control);
+            try control.checkpoint();
+            control.finish();
             self.closed = true;
         }
     };
-    var state: State = .{};
+    var state: State = .{ .owner = &owner };
     ctx.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
     const sink = delivery.sink().?;
     try sink.start_fn(sink.ptr, 2);
     try sink.write_fn(sink.ptr, "{}");
-    try delivery.writer.?.close();
+    try delivery.close();
     try std.testing.expect(state.closed);
+    try std.testing.expectEqual(http_server_mod.RunnableScheduler.Class.inference, try execution.retainedClass());
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
 }
 
 test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NULLs" {
@@ -18636,6 +21297,1296 @@ test "public graph metric borrowed wire owned HTTP responses keep buffers throug
     try std.testing.expectEqual(@as(usize, 0), owner.freed_bytes);
     response.releaseBody();
     try std.testing.expectEqual(owner.allocated_bytes, owner.freed_bytes);
+}
+
+test "HTTP SQL worker response resumes original root and retires result before handoff on success and encoding failure" {
+    const input_module = @import("sql_input_capsule.zig");
+    const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Cancellation = struct {
+        canceled: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+    };
+    const Policy = struct {
+        fn check(_: *anyopaque, _: bool) !void {
+            return error.CatalogGenerationChanged;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]enum { success, memory, canceled, policy, write_canceled, transport_memory, write_transport_memory }{ .success, .memory, .canceled, .policy, .write_canceled, .transport_memory, .write_transport_memory }) |scenario| {
+        const memory = @import("../common/read_memory.zig");
+        var read_pool = try memory.Pool.init(alloc, null, .{ .bytes = @splat(1 << 20), .groups = @splat(1) });
+        defer read_pool.deinit();
+        var owner = try scheduler.Scheduler.init(.{ .slots = 2 });
+        var frame: input_module.ScopedFrame = .{ .node = null };
+        var cancellation: Cancellation = .{};
+        var transport_failure = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        const input = try input_module.Capsule(input_module.Request).create(alloc, alloc, .{ .context = &frame, .retain = input_module.ScopedFrame.retain, .release = input_module.ScopedFrame.release }, &owner, .{ .io = std.testing.io, .cancellation = .{ .ptr = &cancellation, .requested = Cancellation.requested } }, .query, "{}", 8 << 20);
+        defer input.release();
+        try input.start();
+        const entry = &input.execution.entry.?;
+        const bytes = input.execution.entry.?.bytes;
+        try input.execution.park(.output_blocked);
+        var adapter: sql_execution.Adapter = undefined;
+        adapter.context = .{};
+        adapter.read_guard = null;
+        adapter.runnable = &input.execution;
+        adapter.result_session_id = null;
+        adapter.outcome_transaction_id = null;
+        adapter.transaction_status = .idle;
+        var job: AntflyApiHandler.SQLJob = .{
+            .input_owner = input,
+            .adapter = adapter,
+            .statement = "SELECT value",
+            .principal = "anonymous",
+            .database = "default",
+            .namespace = "public",
+            .parameters = &.{},
+            .limit = 1,
+            .completion_io = std.testing.io,
+            .transport_allocator = if (scenario == .transport_memory or scenario == .write_transport_memory) transport_failure.allocator() else alloc,
+            .cache_io = std.testing.io,
+            .cache = undefined,
+            .preparation = undefined,
+            .prepared_response_budget = .{ .backing = alloc, .limit = if (scenario == .memory) 8 else 16 << 20 },
+        };
+        job.read_memory = try memory.Group.init(&read_pool, .general, 1 << 20);
+        defer job.releaseReadMemory();
+        job.result = try sql_runtime.Result.singleText(job.executionAllocator(), "SELECT", "value", "exact \"text\" λ");
+        try std.testing.expect(read_pool.stats().total_used > 0);
+        defer if (job.result) |*result| result.deinit();
+        defer job.releaseResponses();
+        cancellation.canceled = scenario == .canceled or scenario == .write_canceled;
+        job.is_write = scenario == .write_canceled or scenario == .write_transport_memory;
+        if (scenario == .policy) job.output_owner = .{ .execution = &input.execution, .options = input.options, .validator = .{ .ptr = &job, .check = Policy.check } };
+        job.finishResponse();
+        switch (scenario) {
+            .success => {
+                try std.testing.expect(job.failure == null and job.encoding_failure == null);
+                var parsed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, job.encoded_read.?, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("value", parsed.value.columns[0].name);
+                try std.testing.expectEqualStrings("exact \"text\" λ", parsed.value.rows[0][0].string);
+                try std.testing.expectEqualStrings("SELECT", parsed.value.command_tag);
+                try std.testing.expectEqual(@as(u16, 200), job.response_status);
+                try std.testing.expectEqualSlices(u8, job.encoded_read.?, job.transport_response.?);
+                const pointer = job.transport_response.?.ptr;
+                var request = try httpx.Request.init(alloc, .GET, "http://localhost/sql");
+                defer request.deinit();
+                var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try job.takeTransportResponse(&ctx, 200);
+                defer response.deinit();
+                try std.testing.expectEqual(pointer, response.body.?.ptr);
+                try std.testing.expect(job.transport_response == null);
+                job.releaseResponses();
+                // Transport bytes remain valid after the worker's source and
+                // stack-backed response budget retire.
+                try std.testing.expectEqualStrings("application/json", response.headers.get("content-type").?);
+                try std.testing.expect(std.mem.indexOf(u8, response.body.?, "SELECT") != null);
+                try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
+            },
+            .memory => {
+                try std.testing.expectEqual(error.OutOfMemory, job.encoding_failure.?);
+                try std.testing.expect(job.failure == null);
+                try std.testing.expect(job.prepared_response_budget.exhausted);
+                try std.testing.expectEqual(@as(usize, 0), job.prepared_response_budget.live);
+            },
+            .transport_memory => {
+                try std.testing.expectEqual(error.OutOfMemory, job.failure.?);
+                try std.testing.expect(job.encoding_failure == null);
+                try std.testing.expect(!job.prepared_response_budget.exhausted);
+                try std.testing.expect(job.transport_response == null);
+            },
+            .write_transport_memory => {
+                try std.testing.expectEqual(error.OutOfMemory, job.encoding_failure.?);
+                try std.testing.expect(job.failure == null);
+                try std.testing.expect(!job.prepared_response_budget.exhausted);
+                try std.testing.expect(job.transport_response == null);
+            },
+            .policy => {
+                try std.testing.expectEqual(error.CatalogGenerationChanged, job.failure.?);
+                try std.testing.expect(job.encoding_failure == null);
+            },
+            .write_canceled => {
+                try std.testing.expectEqual(error.Canceled, job.encoding_failure.?);
+                try std.testing.expect(job.failure == null);
+            },
+            .canceled => {
+                try std.testing.expectEqual(error.Canceled, job.failure.?);
+                try std.testing.expect(job.encoding_failure == null);
+                try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+            },
+        }
+        try std.testing.expect(job.result == null);
+        try std.testing.expectEqual(@as(usize, 0), read_pool.stats().total_used);
+        job.releaseReadMemory();
+        try std.testing.expectEqual(@as(usize, 0), read_pool.stats().groups[0]);
+        if (scenario == .success) try std.testing.expectEqual(@as(usize, 0), job.prepared_response_budget.live);
+        job.releaseResponses();
+        try std.testing.expectEqual(@as(usize, 0), job.prepared_response_budget.live);
+        try std.testing.expect(entry == &input.execution.entry.?);
+        try std.testing.expectEqual(input.options.cancellation.?.ptr, input.execution.entry.?.options.cancellation.?.ptr);
+        try std.testing.expectEqual(bytes, input.execution.entry.?.bytes);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    }
+}
+
+test "HTTP SQL worker response streams exact cells and retires leased pages on cancellation and budget exhaustion" {
+    const local = @import("antfly_local_sources");
+    const catalog = local.sql_catalog;
+    const input_module = @import("sql_input_capsule.zig");
+    const scheduler = local.common_request_admission.runnable_scheduler;
+    const Cancellation = struct {
+        canceled: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+    };
+    const Source = struct {
+        offset: usize = 0,
+        opened: usize = 0,
+        closed: usize = 0,
+        cancel: bool,
+        cancellation: *Cancellation,
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .mutate = mutate, .checkpoint = checkpoint } };
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: local.sql_ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "id", .path = "id", .type = .integer }} };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedStatelessScan;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn openScan(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.opened += 1;
+            return .{ .ptr = self, .next = next, .close = close };
+        }
+        fn next(raw: *anyopaque, alloc: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const count = @min(@as(usize, 1), 2 - self.offset);
+            const rows = try alloc.alloc(catalog.Row, count);
+            for (rows) |*row| row.* = .{ .id = "id", .version = 1, .value = .{ .object = .empty } };
+            self.offset += count;
+            if (self.cancel) self.cancellation.canceled = true;
+            return .{ .rows = rows, .after = if (self.offset < 2) "next" else null };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const text: [8192]u8 = @splat('x');
+    const statement = "SELECT $1::bigint n,$2::text t,$3::bigint[] a,$4::numeric d,NULL z FROM docs";
+    for ([_]enum { success, canceled, memory }{ .success, .canceled, .memory }) |scenario| {
+        var node = try scheduler.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+        var frame: input_module.ScopedFrame = .{ .node = null };
+        var cancellation: Cancellation = .{};
+        const input = try input_module.Capsule(input_module.Request).create(alloc, alloc, .{ .context = &frame, .retain = input_module.ScopedFrame.retain, .release = input_module.ScopedFrame.release }, &node, .{ .io = std.testing.io, .cancellation = .{ .ptr = &cancellation, .requested = Cancellation.requested } }, .query, "{}", 8 << 20);
+        defer input.release();
+        try input.start();
+        var compiled = try sql_compiler.compile(alloc, statement, .{});
+        defer compiled.deinit();
+        var source: Source = .{ .cancel = scenario == .canceled, .cancellation = &cancellation };
+        const parameters = [_]std.json.Value{ .{ .integer = 9007199254740993 }, .{ .string = &text }, .{ .string = "[0:2]={9007199254740993,NULL,7}" }, .{ .string = "12345678901234567890.123456789" } };
+        var stream: ?*local.sql_read_stream.Stream = (try local.sql_read_stream.Stream.open(alloc, source.backend(), &compiled, &parameters, .{ .page_rows = 1 })).?;
+        defer if (stream) |value| value.close();
+        var adapter: sql_execution.Adapter = undefined;
+        adapter.context = .{};
+        adapter.read_guard = null;
+        adapter.runnable = &input.execution;
+        var job: AntflyApiHandler.SQLJob = .{
+            .input_owner = input,
+            .adapter = adapter,
+            .statement = statement,
+            .principal = "anonymous",
+            .database = "default",
+            .namespace = "public",
+            .parameters = &parameters,
+            .limit = 2,
+            .completion_io = std.testing.io,
+            .cache_io = std.testing.io,
+            .cache = undefined,
+            .preparation = undefined,
+            .prepared_response_budget = .{ .backing = alloc, .limit = if (scenario == .memory) 64 else 16 << 20 },
+        };
+        defer job.releaseResponses();
+        switch (scenario) {
+            .success => {
+                var result = try AntflyApiHandler.SQLJob.deliverRead(&job, alloc, stream.?);
+                defer result.deinit();
+                var parsed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, job.encoded_read.?, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqual(@as(usize, 2), parsed.value.rows.len);
+                for (parsed.value.rows, parsed.value.sql_nulls.?) |row, flags| {
+                    try std.testing.expectEqualStrings("9007199254740993", row[0].string);
+                    try std.testing.expectEqualStrings(&text, row[1].string);
+                    try std.testing.expectEqual(@as(i64, 0), row[2].object.get("dimensions").?.array.items[0].object.get("lower_bound").?.integer);
+                    try std.testing.expectEqualStrings("9007199254740993", row[2].object.get("values").?.array.items[0].string);
+                    try std.testing.expectEqualStrings("12345678901234567890.123456789", row[3].string);
+                    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, true }, flags);
+                }
+                try std.testing.expect(node.stats().yields > 4);
+            },
+            .canceled => try std.testing.expectError(error.Canceled, AntflyApiHandler.SQLJob.deliverRead(&job, alloc, stream.?)),
+            .memory => try std.testing.expectError(error.SqlProgramLimitExceeded, AntflyApiHandler.SQLJob.deliverRead(&job, alloc, stream.?)),
+        }
+        job.releaseResponses();
+        try std.testing.expectEqual(@as(usize, 0), job.prepared_response_budget.live);
+        stream.?.close();
+        stream = null;
+        try std.testing.expectEqual(@as(usize, 1), source.opened);
+        try std.testing.expectEqual(@as(usize, 1), source.closed);
+        try std.testing.expectEqual(@as(usize, 1), node.stats().operations);
+    }
+}
+
+test "HTTP SQL worker response array preflight preserves legacy wire quota and refuses partial publication on every checkpoint" {
+    const local = @import("antfly_local_sources");
+    const arrays = local.sql_array_value;
+    const numeric = local.sql_numeric_value;
+    const encoder_module = @import("sql_json_output.zig");
+    const a = std.testing.allocator;
+    const Poll = struct {
+        checks: usize = 0,
+        fail_at: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.fail_at != 0 and self.checks == self.fail_at) return error.Canceled;
+        }
+        fn numericCheck(raw: ?*anyopaque) !void {
+            try check(raw.?);
+        }
+        fn control(self: *@This()) @import("sql_json_source.zig").Control {
+            return .{ .ptr = self, .check = check };
+        }
+    };
+    var text: [16384]u8 = @splat('x');
+    text[4095] = 0xce;
+    text[4096] = 0xbb;
+    const decimal_text: [4096]u8 = @splat('1');
+    var numeric_context: numeric.Context = .{ .alloc = a };
+    var number = try numeric.parse(&numeric_context, &decimal_text);
+    defer number.deinit();
+    const dimensions = [_]arrays.Dimension{.{ .length = 2, .lower = -1 }};
+    const text_elements = [_]arrays.Element{ .{ .value = .{ .string = &text }, .sql_null = false }, .{} };
+    const number_elements = [_]arrays.Element{ .{ .numeric = &number.value, .sql_null = false }, .{} };
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(a);
+    try object.put(a, &text, .{ .string = &text });
+    const json_elements = [_]arrays.Element{ .{ .value = .{ .object = object }, .sql_null = false }, .{} };
+    for ([_]arrays.Value{ .{ .element_type = .text, .dimensions = &dimensions, .elements = &text_elements }, .{ .element_type = .numeric, .dimensions = &dimensions, .elements = &number_elements }, .{ .element_type = .jsonb, .dimensions = &dimensions, .elements = &json_elements } }) |array| {
+        var reference: numeric.Context = .{ .alloc = a };
+        const expected = try local.sql_array_wire.encodeAlloc(a, array, .{ .context = &reference });
+        defer a.free(expected);
+        var poll: Poll = .{};
+        var context: numeric.Context = .{ .alloc = a, .checkpoint = Poll.numericCheck, .ptr = &poll };
+        var encoder: encoder_module.Encoder = undefined;
+        encoder.init(a, poll.control(), .{});
+        defer encoder.deinit();
+        try local.sql_array_wire.encodeControlled(array, &encoder, .{ .context = &context });
+        const actual = try encoder.toOwnedSlice();
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expectEqual(reference.remaining, context.remaining);
+        const checks = poll.checks;
+        try std.testing.expect(checks > 4);
+        for (1..checks + 1) |at| {
+            var failing_poll: Poll = .{ .fail_at = at };
+            var failing_context: numeric.Context = .{ .alloc = a, .checkpoint = Poll.numericCheck, .ptr = &failing_poll };
+            var failing_encoder: encoder_module.Encoder = undefined;
+            failing_encoder.init(a, failing_poll.control(), .{});
+            defer failing_encoder.deinit();
+            const failure = operation: {
+                local.sql_array_wire.encodeControlled(array, &failing_encoder, .{ .context = &failing_context }) catch |err| break :operation err;
+                const owned = failing_encoder.toOwnedSlice() catch |err| break :operation err;
+                a.free(owned);
+                break :operation @as(anyerror, error.UnexpectedSuccessfulScan);
+            };
+            try std.testing.expectEqual(error.Canceled, failure);
+        }
+        var limit_poll: Poll = .{};
+        var limited: encoder_module.Encoder = undefined;
+        limited.init(a, limit_poll.control(), .{});
+        defer limited.deinit();
+        try limited.beginArray();
+        const before = limited.sink.bytes.len;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, local.sql_array_wire.encodeControlled(array, &limited, .{ .wire_bytes = 1 }));
+        try std.testing.expectEqual(before, limited.sink.bytes.len);
+        const empty = try limited.countValue(@as([]const u8, "next"));
+        try std.testing.expectEqual(@as(usize, 6), empty);
+        try limited.write("next");
+        try limited.endArray();
+        const restored = try limited.toOwnedSlice();
+        defer a.free(restored);
+        try std.testing.expectEqualStrings("[\"next\"]", restored);
+    }
+}
+
+test "internal query owner production handler accounts backend work and buffered output" {
+    const alloc = std.testing.allocator;
+    const runtime_abi = @import("antfly_runtime_abi");
+    const Fixture = struct {
+        server: *ApiHttpServer = undefined,
+        calls: usize = 0,
+        fail_memory: bool = false,
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs", .schema_json = "{\"version\":0}", .read_schema_json = "{\"version\":0}", .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}" }},
+        fn metadataSnapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var snapshot_ = try LookupStatusSource.adminSnapshot(raw);
+            snapshot_.tables = &self.tables;
+            return snapshot_;
+        }
+        fn query(raw: *anyopaque, a: std.mem.Allocator, group_id: u64, table: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings("full_text_index_v0", req.index_name.?);
+            try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+            const borrow = req.execution_runnable orelse return error.TestMissingRunnable;
+            var status = borrow.checkpoint(borrow.context);
+            if (!status.isOk()) return runtime_abi.error_abi.errorFromStatus(status);
+            const snapshot = try a.dupe(u8, "physical snapshot held through backend work");
+            defer a.free(snapshot);
+            try std.testing.expect(self.server.readMemoryStats().used_bytes[0] > 0);
+            status = borrow.park(borrow.context, @backingInt(runtime_abi.runnable_abi.Wait.resource));
+            if (!status.isOk()) return runtime_abi.error_abi.errorFromStatus(status);
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableSchedulingStats().resource_blocked);
+            var health: http_server_mod.RunnableScheduler.Execution = .{};
+            defer health.finish();
+            try self.server.startSqlRunnable(&health, .{ .io = std.testing.io, .retained_bytes = 7, .allow_wait = false }, .control);
+            health.finish();
+            status = borrow.enter(borrow.context, @backingInt(runtime_abi.runnable_abi.Class.query));
+            if (!status.isOk()) return runtime_abi.error_abi.errorFromStatus(status);
+            if (self.fail_memory) return error.OutOfMemory;
+            return .{ .json = try a.dupe(u8, "{\"responses\":[]}"), .identity_read_generation = 42 };
+        }
+        fn iface(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .query_group_local = query } };
+        }
+    };
+    var runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 16, .sql_worker_capacity = 16 } });
+    defer runtime.deinit();
+    var source: Fixture = .{};
+    var server = try ApiHttpServer.initWithConfig(alloc, .{ .backend_runtime = runtime.ptr(), .request_memory_bytes = 16 << 20, .retained_memory_bytes = 16 << 20, .runnable_policy = .{ .slots = 4, .max_operations = 16, .read_isolation = true } }, .{ .ptr = &source, .vtable = &.{ .status = LookupStatusSource.status, .admin_snapshot = Fixture.metadataSnapshot, .free_admin_snapshot = LookupStatusSource.freeAdminSnapshot } }, source.iface(), null);
+    defer server.deinit();
+    source.server = &server;
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+    for ([_]enum { success, memory, expired }{ .success, .memory, .expired }) |case| {
+        source.fail_memory = case == .memory;
+        var request = try httpx.Request.init(alloc, .POST, "/internal/v1/groups/7/tables/docs/query");
+        defer request.deinit();
+        try request.setBody("{\"limit\":1,\"timeout_ms\":1000}");
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        if (case == .expired) ctx.application_deadline_ns = 1;
+        const calls = source.calls;
+        var response = try handler.internalGroupQuery(&ctx);
+        var live = true;
+        defer if (live) response.deinit();
+        try std.testing.expectEqual(@as(u16, switch (case) {
+            .success => 200,
+            .memory => 503,
+            .expired => 504,
+        }), response.status.code);
+        if (case == .success) {
+            try std.testing.expectEqualStrings("42", response.header(query_api.QueryResponse.identity_read_generation_header).?);
+            try std.testing.expectEqualStrings("{\"responses\":[]}", response.body.?);
+            try std.testing.expect(response.retirement != null);
+            try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().operations);
+            try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 1), server.readMemoryStats().groups[0]);
+            try std.testing.expect(server.readMemoryStats().used_bytes[0] > 0);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+            if (case == .expired) try std.testing.expectEqual(calls, source.calls);
+        }
+        response.deinit();
+        live = false;
+        try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+        try std.testing.expectEqual(@as(u64, 0), server.readMemoryStats().used_bytes[0]);
+        try std.testing.expectEqual(@as(u64, 0), server.readMemoryStats().groups[0]);
+    }
+}
+
+test "internal query owner signed ingress holds the physical lease through output and rejects replay" {
+    const a = std.testing.allocator;
+    const wire = @import("../common/remote_attempt_wire.zig");
+    const member = @import("../common/remote_membership.zig");
+    const replies = @import("../common/remote_attempt_reply.zig");
+    const worker = @import("../common/remote_worker.zig");
+    const abi = @import("antfly_runtime_abi");
+    const local: member.Local = .{ .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 };
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const Fixture = struct {
+        server: *ApiHttpServer = undefined,
+        registry: *worker.Registry,
+        calls: usize = 0,
+        snapshots: usize = 0,
+        linear_reads: usize = 0,
+        fail_membership: bool = false,
+        retained_captures: usize = 0,
+        retained_closes: usize = 0,
+        retained_close_failure: ?anyerror = null,
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs", .schema_json = "{\"version\":0}", .read_schema_json = "{\"version\":0}", .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}" }},
+        nodes: [2]metadata_table_manager.NodeRecord = .{ .{ .node_id = 7 }, .{ .node_id = 9 } },
+        stores: [1]metadata_table_manager.StoreRecord,
+        fn capture(raw: *anyopaque, _: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: u64, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.StatementReadFence {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retained_captures += 1;
+            return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = undefined, .release = close } };
+        }
+        fn validate(_: *anyopaque) !void {}
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.server.runnableSchedulingStats().control_slots != 1) self.retained_close_failure = error.TestMissingProtectedControl;
+            self.retained_closes += 1;
+        }
+        fn retainedRequest(self: *@This(), handler: *AntflyApiHandler, secret: []const u8, attempt: wire.Context, body: []const u8, status_code: u16) !?@import("../storage/retained_read_registry.zig").Token {
+            const alloc = std.testing.allocator;
+            const path = "/internal/v1/groups/7/tables/docs/owned-retained-read/11/17";
+            var signed = attempt;
+            signed.request_digest = wire.requestDigest("POST", path, body);
+            const subject_bytes = signed.subject();
+            const credential = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "cluster", .subject = &subject_bytes, .remote_attempt = signed }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            defer alloc.free(credential);
+            var request = try httpx.Request.init(alloc, .POST, path);
+            defer request.deinit();
+            try request.setBody(body);
+            try request.headers.set(internal_service_auth.header_name, credential);
+            var ctx = httpx.Context.init(if (@import("owned_retained_read.zig").isControlBody(body)) self.server.controlAllocator() else alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+            ctx.params = &params;
+            try std.testing.expect((try handler.internalServiceAuthRejection(&ctx)) == null);
+            var response = try handler.internalOwnedRetainedRead(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(status_code, response.status.code);
+            if (status_code != 200) return null;
+            try std.testing.expectEqualStrings(metadata_api.catalog_route_fence_ack_value, response.header(metadata_api.catalog_route_fence_ack_header).?);
+            var parsed = try std.json.parseFromSlice(@import("retained_read_rpc.zig").Response, alloc, response.body.?, .{});
+            defer parsed.deinit();
+            return parsed.value.token;
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_incarnation = local.metadata_incarnation, .metrics = .{} };
+        }
+        fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .status = try status(raw), .nodes = &self.nodes, .stores = &self.stores, .tables = &self.tables, .ranges = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn checked(value: abi.error_abi.Status) !void {
+            if (!value.isOk()) return abi.error_abi.errorFromStatus(value);
+        }
+        fn linear(raw: *anyopaque, request: @import("antfly_local_sources").api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.linear_reads += 1;
+            try request.ensureActive();
+            const team = request.execution_team orelse return error.TestMissingRunnable;
+            const scratch = try team.allocator.dupe(u8, "owned authoritative snapshot scratch");
+            defer team.allocator.free(scratch);
+            const original_class = try team.borrow.currentClass();
+            try checked(team.borrow.park(team.borrow.context, @backingInt(abi.runnable_abi.Wait.resource)));
+            var control: http_server_mod.RunnableScheduler.Execution = .{};
+            defer control.finish();
+            try self.server.startSqlRunnable(&control, .{ .io = std.testing.io, .retained_bytes = 7, .allow_wait = false }, .control);
+            control.finish();
+            try checked(team.borrow.enter(team.borrow.context, @backingInt(original_class)));
+            if (self.fail_membership) return error.RemoteMembershipUnavailable;
+            return try snapshot(raw);
+        }
+        fn routedQuery(raw: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, table: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            try std.testing.expectEqual(@as(u64, 4), fence.catalog_revision);
+            try std.testing.expectEqual(@as(u64, 1), req.prepared_read_table_id);
+            try std.testing.expectEqualStrings("full_text_index_v2", req.index_name.?);
+            try std.testing.expectEqualStrings("full_text_index_v2", req.primary_text_index_name.?);
+            return query(raw, alloc, group, table, req, consistency);
+        }
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.snapshots += 1;
+            defer self.snapshots -= 1;
+            const bytes = try alloc.dupe(u8, "physical snapshot scratch");
+            defer alloc.free(bytes);
+            try std.testing.expectEqual(@as(usize, 1), self.registry.snapshot().attempts);
+            const borrow = req.execution_runnable orelse return error.TestMissingRunnable;
+            const before = self.linear_reads;
+            try checked(borrow.park(borrow.context, @backingInt(abi.runnable_abi.Wait.resource)));
+            try checked(borrow.enter(borrow.context, @backingInt(abi.runnable_abi.Class.query)));
+            try std.testing.expect(self.linear_reads > before);
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}"), .identity_read_generation = 42 };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try @import("../common/remote_fence_store.zig").Store.create(a, std.testing.io, tmp.dir, 11, 2);
+    defer store.deinit();
+    var registry = try worker.Registry.init(a, &store, local, .{ .coordinators = 2, .attempts = 4, .per_coordinator_attempts = 4, .duplicate_window = 8, .bytes = 512 << 10, .per_coordinator_bytes = 512 << 10, .resource_references = 4 }, platform_time.monotonicNs);
+    defer registry.deinit() catch unreachable;
+    const Fresh = struct {
+        fn ready(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    try registry.completeRecovery(.{ .context = &tmp, .quiescent = Fresh.ready });
+    var envelope: wire.Context = .{ .kind = .fence, .id = .{ .coordinator = try member.coordinatorIdentity(local.metadata_incarnation, 7), .generation = 1, .operation = 0, .sequence = 0 }, .worker_incarnation = 11, .remaining_ns = 5 * std.time.ns_per_s, .charged_bytes = 0, .request_digest = @splat(7) };
+    _ = try registry.fence(.{ .context = envelope, .local_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s }, .{ .coordinator_node_id = 7, .worker_node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 });
+    const secret = "owned-read-test-service-secret-32-bytes";
+    var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 16, .sql_worker_capacity = 16 } });
+    defer backend.deinit();
+    var source = Fixture{ .registry = &registry, .stores = .{.{ .store_id = 13, .node_id = 9, .reporter_incarnation = 17, .replica_root_incarnation = 11, .replica_root_public_key = key.public_key.toBytes() }} };
+    var server = try ApiHttpServer.initWithConfig(a, .{ .backend_runtime = backend.ptr(), .internal_service_secret = secret, .internal_service_issuer = "cluster", .request_memory_bytes = 16 << 20, .retained_memory_bytes = 16 << 20, .runnable_policy = .{ .slots = 4, .max_operations = 16, .read_isolation = true } }, .{ .ptr = &source, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .linearizable_snapshot = Fixture.linear, .free_admin_snapshot = Fixture.free } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .query_group_local = Fixture.query, .query_group_local_routed = Fixture.routedQuery, .try_statement_read_fence_group_local_routed = Fixture.capture }, .remote_statement_fences_safe = true }, null);
+    defer server.deinit();
+    source.server = &server;
+    const signer = try replies.Signer.init(local, key.public_key.toBytes(), @splat(7));
+    server.cfg.remote_attempt_control = .{ .registry = &registry, .signer = &signer };
+    defer server.cfg.remote_attempt_control = null;
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const path = "/internal/v1/groups/7/tables/docs/owned-query/11/17";
+    const prepared = (try @import("prepared_query_routing.zig").encode(a, "docs", .{ .prepared_read_table_id = 1, .index_name = "full_text_index_v2", .primary_text_index_name = "full_text_index_v2" })).?;
+    defer a.free(prepared);
+    const fence_json = try std.json.Stringify.valueAlloc(a, metadata_api.CatalogRouteFence{ .metadata_group_id = 1, .catalog_revision = 4, .table_id = 1, .topology_epoch = 9, .route = .{ .group_id = 7, .range_id = 1, .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 } } }, .{});
+    defer a.free(fence_json);
+    const body = try @import("owned_group_query.zig").encode(a, "{\"limit\":1,\"timeout_ms\":1000}", prepared, fence_json);
+    defer a.free(body);
+    envelope.kind = .read;
+    envelope.id.operation = 71;
+    envelope.id.sequence = 1;
+    envelope.charged_bytes = 256 << 10;
+    envelope.request_digest = wire.requestDigest("POST", path, body);
+    const subject = envelope.subject();
+    // Valid signatures cannot authorize legacy endpoints or another process.
+    var legacy_router = httpx.Router.init(a);
+    defer legacy_router.deinit();
+    try legacy_router.add(.POST, "/internal/v1/groups/{group_id}/tables/{table_name}/query", httpx.Handler.bind(&handler, AntflyApiHandler.internalGroupQuery));
+    var route_params: [16]httpx.RouteParam = undefined;
+    try std.testing.expect(legacy_router.find(.POST, path, &route_params) == null);
+    for ([_][]const u8{ "/internal/v1/groups/7/tables/docs/query", "/internal/v1/groups/7/tables/docs/owned-query/11/18" }, 0..) |refused_path, index| {
+        var refused_envelope = envelope;
+        refused_envelope.request_digest = wire.requestDigest("POST", refused_path, body);
+        const refused_token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = server.cfg.internal_service_issuer.?, .subject = &subject, .remote_attempt = refused_envelope }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        defer a.free(refused_token);
+        var refused_request = try httpx.Request.init(a, .POST, refused_path);
+        defer refused_request.deinit();
+        try refused_request.setBody(body);
+        try refused_request.headers.set(internal_service_auth.header_name, refused_token);
+        var refused_context = httpx.Context.init(a, std.testing.io, &refused_request);
+        defer refused_context.deinit();
+        var refusal = (try handler.internalServiceAuthRejection(&refused_context)) orelse return error.TestUnexpectedResult;
+        defer refusal.deinit();
+        try std.testing.expectEqual(@as(u16, if (index == 0) 400 else 503), refusal.status.code);
+        try std.testing.expectEqual(@as(usize, 0), source.calls);
+        try std.testing.expectEqual(@as(usize, 0), registry.snapshot().attempts);
+        try std.testing.expectEqual(@as(u64, 0), server.runnableSchedulingStats().operations);
+    }
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = server.cfg.internal_service_issuer.?, .subject = &subject, .remote_attempt = envelope }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    var request = try httpx.Request.init(a, .POST, path);
+    defer request.deinit();
+    try request.setBody(body);
+    try request.headers.set(internal_service_auth.header_name, token);
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+    ctx.params = &params;
+    try std.testing.expect((try handler.internalServiceAuthRejection(&ctx)) == null);
+    var response = try handler.internalOwnedGroupQuery(&ctx);
+    var response_live = true;
+    defer if (response_live) response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings("{\"responses\":[]}", response.body.?);
+    try std.testing.expectEqualStrings("42", response.header(query_api.QueryResponse.identity_read_generation_header).?);
+    try std.testing.expectEqualStrings(metadata_api.catalog_route_fence_ack_value, response.header(metadata_api.catalog_route_fence_ack_header).?);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(@as(usize, 0), source.snapshots);
+    try std.testing.expectEqual(@as(usize, 1), registry.snapshot().attempts);
+    try std.testing.expectEqual(@as(usize, 256 << 10), registry.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().runnable_slots);
+    var duplicate = try handler.internalOwnedGroupQuery(&ctx);
+    defer duplicate.deinit();
+    try std.testing.expectEqual(@as(u16, 409), duplicate.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    response.deinit();
+    response_live = false;
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().attempts);
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().bytes);
+    try std.testing.expectEqual(@as(u64, 0), server.readMemoryStats().used_bytes[0]);
+    var terminal = try handler.internalOwnedGroupQuery(&ctx);
+    defer terminal.deinit();
+    try std.testing.expectEqual(@as(u16, 409), terminal.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+
+    try std.testing.expect(internal_routes.isOwnedGroupQuery(path));
+    for ([_][]const u8{ "/internal/v1/groups/7/tables/docs/query/preflight", "/internal/v1/groups/7/tables/docs/query/", "/internal/v1/groups/7/tables//query", "/internal/v1/groups/no/tables/docs/query", "/internal/v1/groups/0/tables/docs/query", "/internal/v1/tables/docs/query" }) |unsupported| try std.testing.expect(!internal_routes.isOwnedGroupQuery(unsupported));
+    // Unsigned routing overrides must never change a signed read's semantics.
+    try request.headers.set(@import("prepared_query_routing.zig").header_name, "unbound");
+    var rejected = (try handler.internalServiceAuthRejection(&ctx)).?;
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+
+    const Case = enum { altered_body, query_parameters, unsupported_route, wrong_kind, expired_ingress, expired_admission, membership_unavailable, insufficient_memory };
+    for ([_]Case{ .altered_body, .query_parameters, .unsupported_route, .wrong_kind, .expired_ingress, .expired_admission, .membership_unavailable, .insufficient_memory }, 2..) |case, sequence| {
+        var attempt = envelope;
+        attempt.id.sequence = sequence;
+        if (case == .wrong_kind) {
+            attempt.kind = .status;
+            attempt.charged_bytes = 0;
+        }
+        if (case == .insufficient_memory) attempt.charged_bytes = @sizeOf(@import("internal_query_owner.zig").Owner) + 1;
+        const name = attempt.subject();
+        const credential = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "cluster", .subject = &name, .remote_attempt = attempt }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        defer a.free(credential);
+        var denied_request = try httpx.Request.init(a, .POST, switch (case) {
+            .query_parameters => path ++ "?override=true",
+            .unsupported_route => path ++ "/preflight",
+            else => path,
+        });
+        defer denied_request.deinit();
+        try denied_request.setBody(if (case == .altered_body) "{}" else body);
+        try denied_request.headers.set(internal_service_auth.header_name, credential);
+        var denied_ctx = httpx.Context.init(a, std.testing.io, &denied_request);
+        defer denied_ctx.deinit();
+        denied_ctx.params = &params;
+        if (case == .expired_ingress) denied_ctx.application_deadline_ns = 1;
+        source.fail_membership = case == .membership_unavailable;
+        var denied = if (try handler.internalServiceAuthRejection(&denied_ctx)) |ingress_response| ingress_response else blk: {
+            if (case == .expired_admission) {
+                const data: *AntflyApiHandler.RemoteReadContext = @ptrCast(@alignCast(denied_ctx.getData(AntflyApiHandler.remote_read_context_key).?));
+                data.verified.local_deadline_ns = 1;
+            }
+            break :blk try handler.internalGroupQuery(&denied_ctx);
+        };
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, switch (case) {
+            .altered_body, .query_parameters => 400,
+            .wrong_kind => 401,
+            .expired_ingress, .expired_admission => 504,
+            else => 503,
+        }), denied.status.code);
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+        try std.testing.expectEqual(@as(usize, 0), source.snapshots);
+        try std.testing.expectEqual(@as(usize, 0), registry.snapshot().attempts);
+        try std.testing.expectEqual(@as(usize, 0), registry.snapshot().bytes);
+        try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+        try std.testing.expectEqual(@as(u64, 0), server.readMemoryStats().used_bytes[0]);
+    }
+    // Exercise real AFAT authentication and membership admission for retained
+    // resources, beyond the worker-only lifetime fixtures.
+    const rpc = @import("retained_read_rpc.zig");
+    const owned = @import("owned_retained_read.zig");
+    var retained_attempt = envelope;
+    retained_attempt.id.operation = 72;
+    retained_attempt.id.sequence = 11;
+    const capture_body = try owned.encode(a, "{\"operation\":\"capture\",\"schema_version\":0,\"lease_ms\":5000}", fence_json);
+    defer a.free(capture_body);
+    const retained_token = (try source.retainedRequest(&handler, secret, retained_attempt, capture_body, 200)).?;
+    try std.testing.expectEqual(@as(usize, 1), source.retained_captures);
+    try std.testing.expectEqual(@as(usize, 1), registry.snapshot().attempts);
+    try std.testing.expectEqual(@as(usize, 256 << 10), registry.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().operations);
+    try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 1), server.readMemoryStats().groups[0]);
+    const validate_request = try std.json.Stringify.valueAlloc(a, rpc.Request{ .operation = .validate, .schema_version = 0, .token = retained_token }, .{});
+    defer a.free(validate_request);
+    const validate_body = try owned.encode(a, validate_request, fence_json);
+    defer a.free(validate_body);
+    retained_attempt.id.sequence = 12;
+    _ = try source.retainedRequest(&handler, secret, retained_attempt, validate_body, 200);
+    try std.testing.expectEqual(@as(usize, 1), registry.snapshot().attempts);
+    // Another operation cannot adopt this token, even with the same service
+    // credential and coordinator. Cleanup remains independently authorized.
+    retained_attempt.id.operation = 73;
+    retained_attempt.id.sequence = 13;
+    _ = try source.retainedRequest(&handler, secret, retained_attempt, validate_body, 503);
+    try std.testing.expectEqual(@as(usize, 1), registry.snapshot().attempts);
+    const close_request = try std.json.Stringify.valueAlloc(a, rpc.Request{ .operation = .close, .schema_version = 0, .token = retained_token }, .{});
+    defer a.free(close_request);
+    const close_body = try owned.encode(a, close_request, fence_json);
+    defer a.free(close_body);
+    try std.testing.expect(http_server_mod.isProtectedHttpControl(.POST, "/internal/v1/groups/7/tables/docs/retained-read", close_body));
+    // Closing data admission and starting a newer generation must still leave
+    // exact cleanup available. No data attempt may bypass this fence.
+    registry.closeAdmission();
+    var next_generation = envelope;
+    next_generation.kind = .fence;
+    next_generation.id.generation = 2;
+    next_generation.id.operation = 0;
+    next_generation.id.sequence = 0;
+    next_generation.charged_bytes = 0;
+    const membership_binding: member.Binding = .{ .coordinator_node_id = 7, .worker_node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 };
+    try std.testing.expectError(error.RemoteFencePending, registry.fence(.{ .context = next_generation, .local_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }, membership_binding));
+    var holders: [2]http_server_mod.RunnableScheduler.Execution = @splat(.{});
+    defer for (&holders) |*hold| hold.finish();
+    for (&holders) |*hold| try server.startSqlRunnable(hold, .{ .io = std.testing.io, .allow_wait = false }, .query);
+    retained_attempt.id.sequence = 14;
+    _ = try source.retainedRequest(&handler, secret, retained_attempt, close_body, 200);
+    try std.testing.expectEqual(@as(usize, 1), source.retained_closes);
+    if (source.retained_close_failure) |err| return err;
+    for (&holders) |*hold| hold.finish();
+    _ = try registry.fence(.{ .context = next_generation, .local_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }, membership_binding);
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().attempts);
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+    try std.testing.expectEqual(@as(u64, 0), server.readMemoryStats().groups[0]);
+}
+
+test "retained read RPC worker admits original CPU and retains buffered output" {
+    const a = std.testing.allocator;
+    const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const registry_mod = @import("../storage/retained_read_registry.zig");
+    const ReadSource = @import("antfly_local_sources").api_table_read_source;
+    const Fixture = struct {
+        server: *ApiHttpServer,
+        calls: usize = 0,
+        deadline: u64,
+        fn lookup(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, opts: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?ReadSource.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableSchedulingStats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableSchedulingStats().operations);
+            try std.testing.expect(opts.execution_deadline_ns.? <= self.deadline);
+            try opts.cancellation.?.check();
+            return null;
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .runnable_policy = .{ .slots = 2, .max_wait_ms = 1 } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var registry = try registry_mod.Registry.init(a, std.testing.io, 1, 4, 4, 10 * std.time.ns_per_s);
+    defer registry.deinit();
+    const scope: registry_mod.Scope = .{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    for ([_]enum { success, saturated, canceled }{ .success, .saturated, .canceled }) |outcome| {
+        var hold: scheduler.Execution = .{};
+        defer hold.finish();
+        if (outcome == .saturated) try server.startSqlRunnable(&hold, .{ .io = std.testing.io, .allow_wait = false }, .query);
+        var signal: std.atomic.Value(bool) = .init(outcome == .canceled);
+        var fixture: Fixture = .{ .server = &server, .deadline = platform_time.monotonicNs() + std.time.ns_per_s };
+        const owner = @import("internal_query_owner.zig").Owner.create(a, null, null, .{ .deadline_ns = fixture.deadline, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&signal) }) catch |err| {
+            try std.testing.expectEqual(error.Canceled, err);
+            try std.testing.expectEqual(.canceled, outcome);
+            continue;
+        };
+        var owner_live = true;
+        defer if (owner_live) owner.release();
+        var job: AntflyApiHandler.InternalRetainedReadJob = .{ .owner = owner, .server = &server, .retained = .{ .registry = &registry, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .lookup_group_local = Fixture.lookup } } }, .scope = scope, .table = "rows", .input = .{ .operation = .admit, .schema_version = 5 }, .input_bytes = 64, .worker_io = std.testing.io, .completion_io = std.testing.io };
+        defer if (job.body) |bytes| owner.allocator().free(bytes);
+        job.run();
+        if (outcome == .saturated) {
+            try std.testing.expectEqual(error.RunnableWaitTimeout, job.failure.?);
+            try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+            continue;
+        }
+        if (job.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/groups/3/tables/rows/retained-read");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try job.response(&ctx);
+        var response_live = true;
+        defer if (response_live) response.deinit();
+        owner.release();
+        owner_live = false;
+        try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().output_blocked);
+        try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().runnable_slots);
+        response.deinit();
+        response_live = false;
+        try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+    }
+}
+
+test "retained read RPC cleanup uses protected CPU and memory under foreground saturation" {
+    const a = std.testing.allocator;
+    const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const registry_mod = @import("../storage/retained_read_registry.zig");
+    const Fixture = struct {
+        server: *ApiHttpServer,
+        closes: usize = 0,
+        failure: ?anyerror = null,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This()) !void {
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableSchedulingStats().control_slots);
+            try std.testing.expectEqual(@as(usize, 2), self.server.runnableSchedulingStats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableSchedulingStats().control_operations);
+        }
+    };
+    var server = try ApiHttpServer.initWithConfig(a, .{ .request_memory_bytes = 1 << 20, .retained_memory_bytes = 1 << 20, .runnable_policy = .{ .slots = 2 } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var hold: scheduler.Execution = .{};
+    defer hold.finish();
+    try server.startSqlRunnable(&hold, .{ .io = std.testing.io, .allow_wait = false }, .query);
+    const memory = server.request_memory.?;
+    const remaining = memory.foreground.limit - memory.foreground.stats().used_bytes;
+    const pressure = try server.alloc.alloc(u8, remaining - @import("../common/allocation_budget.zig").Partitioned.overhead(.of(u8)));
+    defer server.alloc.free(pressure);
+    var registry = try registry_mod.Registry.init(a, std.testing.io, 1, 4, 4, 10 * std.time.ns_per_s);
+    defer registry.deinit();
+    const scope: registry_mod.Scope = .{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    var fixture: Fixture = .{ .server = &server };
+    const token = try registry.insert(scope, 10, platform_time.monotonicNs(), platform_time.monotonicNs() + std.time.ns_per_s, .{ .ptr = &fixture, .close = Fixture.close, .kind = .snapshot });
+    const owner = try @import("internal_query_owner.zig").Owner.create(server.controlAllocator(), null, null, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s });
+    defer owner.release();
+    var job: AntflyApiHandler.InternalRetainedReadJob = .{ .owner = owner, .server = &server, .retained = .{ .registry = &registry, .source = undefined }, .scope = scope, .table = "rows", .input = .{ .operation = .close, .schema_version = 5, .token = token }, .input_bytes = 64, .worker_io = std.testing.io, .completion_io = std.testing.io };
+    defer if (job.body) |bytes| owner.allocator().free(bytes);
+    job.run();
+    if (job.failure) |err| return err;
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+    try std.testing.expect(job.body != null);
+    try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().output_blocked);
+    try std.testing.expectEqual(memory.foreground.limit, memory.foreground.stats().used_bytes);
+}
+
+test "retained read RPC authenticated handler uses admitted workers and protected close" {
+    const a = std.testing.allocator;
+    const ReadSource = @import("antfly_local_sources").api_table_read_source;
+    const registry_mod = @import("../storage/retained_read_registry.zig");
+    const Fixture = struct {
+        server: *ApiHttpServer = undefined,
+        calls: usize = 0,
+        closed: usize = 0,
+        deadline: u64 = 0,
+        failure: ?anyerror = null,
+        fn lookup(raw: *anyopaque, _: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: u64, _: []const u8, _: []const u8, opts: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?ReadSource.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableSchedulingStats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableSchedulingStats().operations);
+            try std.testing.expect(opts.execution_deadline_ns.? <= self.deadline);
+            try opts.cancellation.?.check();
+            return null;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+            if (self.server.runnableSchedulingStats().control_slots != 1) self.failure = error.TestMissingProtectedControl;
+        }
+    };
+    var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 16, .sql_worker_capacity = 16 } });
+    defer backend.deinit();
+    var fixture: Fixture = .{};
+    const secret = "retained-read-handler-test-secret-32bytes";
+    var server = try ApiHttpServer.initWithConfig(a, .{ .backend_runtime = backend.ptr(), .internal_service_secret = secret, .internal_service_issuer = "cluster", .request_memory_bytes = 8 << 20, .retained_memory_bytes = 8 << 20, .runnable_policy = .{ .slots = 2 } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .lookup_group_local_routed = Fixture.lookup } }, null);
+    defer server.deinit();
+    fixture.server = &server;
+    const credential = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "cluster" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(credential);
+    const route: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } };
+    const encoded_route = try std.json.Stringify.valueAlloc(a, route, .{});
+    defer a.free(encoded_route);
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "3" }, .{ .name = "table_name", .value = "rows" } };
+    for ([_]bool{ false, true }) |expired| {
+        var request = try httpx.Request.init(a, .POST, "/internal/v1/groups/3/tables/rows/retained-read");
+        defer request.deinit();
+        try request.setBody("{\"operation\":\"admit\",\"schema_version\":5,\"lease_ms\":1000}");
+        try request.headers.set(internal_service_auth.header_name, credential);
+        try request.headers.set(metadata_api.catalog_route_fence_header, encoded_route);
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        fixture.deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+        ctx.application_deadline_ns = if (expired) 1 else fixture.deadline;
+        var response = try handler.internalRetainedRead(&ctx);
+        try std.testing.expectEqual(@as(u16, if (expired) 504 else 200), response.status.code);
+        if (!expired) {
+            try std.testing.expect(response.retirement != null);
+            try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().output_blocked);
+        }
+        response.deinit();
+        try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var identity = try server.authenticateInternalServiceRequest(credential);
+    defer identity.deinit(server.alloc);
+    var principal: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(identity.credential_principal, &principal, .{});
+    const scope: registry_mod.Scope = .{ .principal = principal, .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    const retained = try server.retainedReadRuntime();
+    const token = try retained.registry.insert(scope, 10, platform_time.monotonicNs(), platform_time.monotonicNs() + std.time.ns_per_s, .{ .ptr = &fixture, .close = Fixture.close, .kind = .snapshot });
+    var hold: http_server_mod.RunnableScheduler.Execution = .{};
+    defer hold.finish();
+    try server.startSqlRunnable(&hold, .{ .io = std.testing.io, .allow_wait = false }, .query);
+    const memory = server.request_memory.?;
+    const remaining = memory.foreground.limit - memory.foreground.stats().used_bytes;
+    const pressure = try server.alloc.alloc(u8, remaining - @import("../common/allocation_budget.zig").Partitioned.overhead(.of(u8)));
+    defer server.alloc.free(pressure);
+    var request = try httpx.Request.init(a, .POST, "/internal/v1/groups/3/tables/rows/retained-read");
+    defer request.deinit();
+    const body = try std.json.Stringify.valueAlloc(a, @import("retained_read_rpc.zig").Request{ .operation = .close, .schema_version = 5, .token = token }, .{});
+    defer a.free(body);
+    try request.setBody(body);
+    try request.headers.set(internal_service_auth.header_name, credential);
+    try request.headers.set(metadata_api.catalog_route_fence_header, encoded_route);
+    var ctx = httpx.Context.init(server.controlAllocator(), std.testing.io, &request);
+    defer ctx.deinit();
+    ctx.params = &params;
+    try std.testing.expect(http_server_mod.isProtectedHttpControl(.POST, request.uri.path, body));
+    var response = try handler.internalRetainedRead(&ctx);
+    try std.testing.expectEqual(memory.foreground.limit, memory.foreground.stats().used_bytes);
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+    if (fixture.failure) |err| return err;
+    response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().operations);
+}
+
+test "runnable point lookup coarse admission retains output permits without introducing legacy CPU dependencies" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("lookupKey").?);
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("lookupNamespaceTableDocument").?);
+    const scheduling = http_server_mod.RunnableScheduler;
+    const Mode = enum { success, missing, saturated, cpu_busy, quota, expired, canceled, late_cancel, corrupt, disabled, storage_busy };
+    const Fixture = struct {
+        server: *ApiHttpServer = undefined,
+        mode: Mode,
+        signal: *std.atomic.Value(bool),
+        calls: usize = 0,
+        fn lookup(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqualStrings("doc:a", key);
+            try std.testing.expect(opts.execution_deadline_ns != null);
+            try opts.cancellation.?.check();
+            try std.testing.expectEqual(@as(usize, 1), self.server.queryAdmissionStats().in_flight);
+            // An existing admitted holder can resume independently of this
+            // legacy call. The coarse permit must never become its CPU token.
+            try std.testing.expectEqual(@as(u64, if (self.mode == .cpu_busy) 1 else 0), self.server.runnableSchedulingStats().operations);
+            if (self.mode == .storage_busy) return error.Backpressured;
+            if (self.mode == .missing) return null;
+            if (self.mode == .corrupt) return error.CorruptInput;
+            if (self.mode == .quota) {
+                const bytes = try alloc.alloc(u8, 2 << 20);
+                alloc.free(bytes);
+                return error.TestMissingLookupAllocationBound;
+            }
+            const bytes = try alloc.dupe(u8, "{\"id\":9007199254740993}");
+            if (self.mode == .late_cancel) self.signal.store(true, .release);
+            return .{ .json = bytes, .version = 9007199254740994 };
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        for ([_]bool{ false, true }) |alias| {
+            var signal = std.atomic.Value(bool).init(mode == .canceled);
+            var fixture: Fixture = .{ .mode = mode, .signal = &signal };
+            var status = LookupStatusSource{};
+            var server = try ApiHttpServer.initWithConfig(a, .{ .query_max_concurrent_requests = 1, .request_memory_bytes = 1 << 20, .retained_memory_bytes = 1 << 20, .runnable_policy = if (mode == .disabled) null else .{ .slots = 2, .max_wait_ms = 1 } }, status.iface(), .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, null);
+            defer server.deinit();
+            fixture.server = &server;
+            const baseline = server.request_memory.?.foreground.stats().used_bytes;
+            var holder: scheduling.Execution = .{};
+            defer holder.finish();
+            if (mode == .cpu_busy) try server.startSqlRunnable(&holder, .{ .io = std.testing.io, .allow_wait = false }, .query);
+            if (mode == .saturated) try std.testing.expect(server.tryAcquireQuery());
+            defer if (mode == .saturated) server.releaseQuery();
+            var handler: AntflyApiHandler = .{ .api_server = &server };
+            var request = try httpx.Request.init(a, .GET, "http://localhost/db/v1/tables/docs/documents/doc:a");
+            defer request.deinit();
+            var ctx = httpx.Context.init(server.alloc, std.testing.io, &request);
+            var context_live = true;
+            defer if (context_live) ctx.deinit();
+            ctx.application_deadline_ns = if (mode == .expired) 0 else platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+            ctx.cancellation = &signal;
+            const outcome = if (alias) handler.lookupNamespaceTableDocument(&ctx, "default", "public", "docs", "doc:a", .{}) else handler.lookupKey(&ctx, "docs", "doc:a", .{});
+            if (mode == .corrupt) {
+                try std.testing.expectError(error.CorruptInput, outcome);
+            } else {
+                var response = try outcome;
+                var live = true;
+                defer if (live) response.deinit();
+                const expected: u16 = switch (mode) {
+                    .success, .cpu_busy, .disabled => 200,
+                    .missing => 404,
+                    .saturated => 429,
+                    .quota, .storage_busy => 503,
+                    .expired => 504,
+                    .canceled, .late_cancel => 408,
+                    .corrupt => unreachable,
+                };
+                try std.testing.expectEqual(expected, response.status.code);
+                if (mode == .storage_busy) try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+                const holds_permit = mode == .storage_busy or mode == .success or mode == .missing or mode == .cpu_busy or mode == .disabled;
+                if (holds_permit) {
+                    try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+                    try std.testing.expect(!server.tryAcquireQuery());
+                    try std.testing.expect(response.retirement != null);
+                }
+                if (mode == .success or mode == .cpu_busy or mode == .disabled) {
+                    try std.testing.expectEqualStrings("9007199254740994", response.headers.get("X-Antfly-Version").?);
+                    try std.testing.expectEqualStrings("{\"id\":9007199254740993}", response.body.?);
+                }
+                if (mode == .success or mode == .missing) {
+                    var writer: scheduling.Execution = .{};
+                    defer writer.finish();
+                    try server.startSqlRunnable(&writer, .{ .io = std.testing.io, .allow_wait = false }, .write);
+                    var control: scheduling.Execution = .{};
+                    defer control.finish();
+                    try server.startSqlRunnable(&control, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                    control.finish();
+                    writer.finish();
+                }
+                response.deinit();
+                live = false;
+            }
+            const no_call = mode == .saturated or mode == .expired or mode == .canceled;
+            try std.testing.expectEqual(@as(usize, if (no_call) 0 else 1), fixture.calls);
+            ctx.deinit();
+            context_live = false;
+            holder.finish();
+            try std.testing.expectEqual(@as(u64, 0), server.runnableSchedulingStats().operations);
+            try std.testing.expectEqual(@as(u64, 0), server.runnableSchedulingStats().retained_bytes);
+            try std.testing.expectEqual(@as(usize, if (mode == .saturated) 1 else 0), server.queryAdmissionStats().in_flight);
+            try std.testing.expectEqual(baseline, server.request_memory.?.foreground.stats().used_bytes);
+        }
+    }
+}
+
+test "runnable point lookup output retirement chains existing owners before releasing query capacity" {
+    const Fixture = struct {
+        server: *ApiHttpServer,
+        calls: usize = 0,
+        observed_flight: usize = 0,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.observed_flight = self.server.queryAdmissionStats().in_flight;
+        }
+    };
+    const a = std.testing.allocator;
+    var status = LookupStatusSource{};
+    var server = try ApiHttpServer.initWithConfig(a, .{ .query_max_concurrent_requests = 1, .request_memory_bytes = 1 << 20, .retained_memory_bytes = 1 << 20 }, status.iface(), null, null);
+    defer server.deinit();
+    const baseline = server.request_memory.?.foreground.stats().used_bytes;
+    try std.testing.expect(server.tryAcquireQuery());
+    var fixture: Fixture = .{ .server = &server };
+    var response = httpx.Response.init(server.alloc, 200);
+    response.body = try server.alloc.dupe(u8, "{}");
+    response.body_owned = true;
+    response.retirement = .{ .ptr = &fixture, .release = Fixture.release };
+    const retirement = try server.alloc.create(AntflyApiHandler.LookupAdmissionRetirement);
+    retirement.* = .{ .server = &server, .alloc = server.alloc, .previous = response.retirement };
+    response.retirement = .{ .ptr = retirement, .release = AntflyApiHandler.LookupAdmissionRetirement.release };
+    try std.testing.expect(!server.tryAcquireQuery());
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.observed_flight);
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+    try std.testing.expectEqual(baseline, server.request_memory.?.foreground.stats().used_bytes);
+}
+
+test "remote attempt client discovery ingress rejects before streaming body or protected CPU and releases malformed input" {
+    const a = std.testing.allocator;
+    var source: AuthStatusSource = .{};
+    const wire = @import("../common/remote_attempt_wire.zig");
+    const secret = "0123456789abcdef0123456789abcdef";
+    const local: @import("../common/remote_membership.zig").Local = .{ .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try @import("../common/remote_fence_store.zig").Store.create(a, std.testing.io, tmp.dir, 11, 2);
+    defer store.deinit();
+    var registry = try @import("../common/remote_worker.zig").Registry.init(a, &store, local, .{ .coordinators = 2, .attempts = 2, .per_coordinator_attempts = 2, .duplicate_window = 8, .bytes = 8192, .per_coordinator_bytes = 8192, .resource_references = 2 }, platform_time.monotonicNs);
+    defer registry.deinit() catch unreachable;
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const signer = try @import("../common/remote_attempt_reply.zig").Signer.initEnrolled(.{ .local = local, .public_key = pair.public_key.toBytes() }, .{ .root_incarnation = 11, .seed = @as([32]u8, @splat(7)), .public_key = pair.public_key.toBytes() });
+    var api = try ApiHttpServer.initWithConfig(a, .{ .runnable_policy = .{ .slots = 2 }, .internal_service_secret = secret, .internal_service_issuer = "cluster", .remote_attempt_control = .{ .registry = &registry, .signer = &signer } }, source.iface(), null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/internal/v1/attempt/capabilities");
+    defer request.deinit();
+    try request.headers.set(internal_service_auth.header_name, "not-decoded-before-admission");
+    var context = httpx.Context.init(a, std.testing.io, &request);
+    defer context.deinit();
+    const Body = struct {
+        calls: usize = 0,
+        fn readAll(raw: ?*anyopaque) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return "short nonce";
+        }
+    };
+    var body: Body = .{};
+    context.body_delegate = .{ .ptr = &body, .read_all = Body.readAll, .streaming = true };
+    var held = api.remote_capability_admission.tryAcquireLease() orelse return error.TestUnexpectedResult;
+    defer held.release();
+    var busy = (try handler.remoteControlIngress(&context)) orelse return error.TestUnexpectedResult;
+    defer busy.deinit();
+    try std.testing.expectEqual(@as(u16, 503), busy.status.code);
+    try std.testing.expectEqual(@as(usize, 0), body.calls);
+    try std.testing.expectEqual(@as(usize, 1), api.remote_capability_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), api.runnableSchedulingStats().operations);
+    var health: http_server_mod.RunnableScheduler.Execution = .{};
+    defer health.finish();
+    try api.startSqlRunnable(&health, .{ .io = std.testing.io, .retained_bytes = 11 }, .control);
+    health.finish();
+    held.release();
+    var malformed = (try handler.remoteControlIngress(&context)) orelse return error.TestUnexpectedResult;
+    defer malformed.deinit();
+    try std.testing.expectEqual(@as(u16, 400), malformed.status.code);
+    try std.testing.expectEqual(@as(usize, 1), body.calls);
+    try std.testing.expectEqual(@as(usize, 0), api.remote_capability_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), api.runnableSchedulingStats().operations);
+    try std.testing.expectEqual(@as(u64, 0), api.runnableSchedulingStats().retained_bytes);
+
+    // Authenticated ingress transfers the lease into the physical context.
+    // Returning handler CPU or emitting a response does not retire that context.
+    const nonce: [32]u8 = @splat(9);
+    const probe: wire.Context = .{ .kind = .capabilities, .id = .{ .coordinator = 7, .generation = 1, .operation = 0, .sequence = 0 }, .worker_incarnation = 11, .remaining_ns = 5 * std.time.ns_per_s, .charged_bytes = 0, .request_digest = wire.requestDigest("POST", internal_routes.remote_attempt_capabilities, &nonce) };
+    const subject = probe.subject();
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "cluster", .subject = &subject, .remote_attempt = probe }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    var valid_request = try httpx.Request.init(a, .POST, "http://127.0.0.1/internal/v1/attempt/capabilities");
+    defer valid_request.deinit();
+    valid_request.body = &nonce;
+    try valid_request.headers.set(internal_service_auth.header_name, token);
+    var valid_context = httpx.Context.init(a, std.testing.io, &valid_request);
+    var valid_live = true;
+    defer if (valid_live) valid_context.deinit();
+    try std.testing.expect((try handler.remoteControlIngress(&valid_context)) == null);
+    const data: *AntflyApiHandler.RemoteControlContext = @ptrCast(@alignCast(valid_context.getData(AntflyApiHandler.remote_control_context_key).?));
+    try data.execution.park(.output_blocked);
+    try std.testing.expectEqual(@as(usize, 1), api.remote_capability_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(u64, 1), api.runnableSchedulingStats().operations);
+    try std.testing.expectEqual(@as(u64, 1), api.runnableSchedulingStats().output_blocked);
+    var output_busy = (try handler.remoteControlIngress(&context)) orelse return error.TestUnexpectedResult;
+    defer output_busy.deinit();
+    try std.testing.expectEqual(@as(u16, 503), output_busy.status.code);
+    try api.startSqlRunnable(&health, .{ .io = std.testing.io, .retained_bytes = 11 }, .control);
+    health.finish();
+    valid_context.deinit();
+    valid_live = false;
+    try std.testing.expectEqual(@as(usize, 0), api.remote_capability_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(u64, 0), api.runnableSchedulingStats().operations);
+    try std.testing.expectEqual(@as(u64, 0), api.runnableSchedulingStats().retained_bytes);
+}
+
+test "SQL bounded read workers default queue uses private foreground and protected worker capacity" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr(), .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = true }, .query_waiting = common_config.default_query_waiting }, source.iface(), null, null);
+    var closed = false;
+    defer if (!closed) api.deinit();
+    const foreground = try api.sqlExecutionIo();
+    const bounded = try api.sqlBoundedReadIo();
+    const control = try api.sqlControlIo();
+    try std.testing.expect(api.sqlQueryWaitingEnabled());
+    try std.testing.expect(api.sql_workers != null);
+    try std.testing.expectEqual(@as(usize, 12), api.sql_workers.?.capacity);
+    try std.testing.expectEqual(@as(usize, 1), api.sql_bounded_read_workers.?.capacity);
+    try std.testing.expect(foreground.userdata != runtime.ptr().io().?.userdata);
+    try std.testing.expect(bounded.userdata != foreground.userdata and bounded.userdata != control.userdata);
+    try std.testing.expectEqual(@as(usize, 18), runtime.ptr().laneStats().reserved_workers);
+    _ = try api.sqlBoundedReadIo();
+    try std.testing.expectEqual(@as(usize, 18), runtime.ptr().laneStats().reserved_workers);
+    const Job = struct {
+        fn block(io: std.Io, gate: *std.Io.Event) void {
+            gate.waitUncancelable(io);
+        }
+        fn probe(io: std.Io) !void {
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "/antfly-api-bounded-worker-missing", .{}));
+        }
+    };
+    var gate: std.Io.Event = .unset;
+    var tasks: std.Io.Group = .init;
+    var joined = false;
+    defer if (!joined) {
+        gate.set(std.testing.io);
+        tasks.await(foreground) catch {};
+    };
+    for (0..api.sql_workers.?.capacity) |_| try tasks.concurrent(foreground, Job.block, .{ foreground, &gate });
+    try std.testing.expectError(error.ConcurrencyUnavailable, foreground.concurrent(Job.probe, .{foreground}));
+    var protected = try bounded.concurrent(Job.probe, .{bounded});
+    try protected.await(bounded);
+    var health = try control.concurrent(Job.probe, .{control});
+    try health.await(control);
+    gate.set(std.testing.io);
+    tasks.await(foreground) catch {};
+    joined = true;
+    api.deinit();
+    closed = true;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
+}
+
+test "SQL bounded read workers retain protected reservation across failed foreground publication" {
+    const alloc = std.testing.allocator;
+    var worker_heap = std.testing.FailingAllocator.init(alloc, .{});
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(worker_heap.allocator(), .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr(), .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = true }, .query_waiting = common_config.default_query_waiting }, source.iface(), null, null);
+    var closed = false;
+    defer if (!closed) api.deinit();
+    _ = try api.sqlControlIo();
+    _ = try api.sqlBoundedReadIo();
+    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 32 });
+    defer occupied.release();
+    worker_heap.fail_index = worker_heap.alloc_index;
+    const failed = api.sqlExecutionIo();
+    worker_heap.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, failed);
+    try std.testing.expect(worker_heap.has_induced_failure);
+    try std.testing.expect(api.sql_workers == null);
+    try std.testing.expect(api.sql_bounded_read_workers != null);
+    try std.testing.expect(api.sql_control_workers != null);
+    try std.testing.expectEqual(@as(usize, 38), runtime.ptr().laneStats().reserved_workers);
+    const protected = api.sql_bounded_read_workers.?.io().userdata;
+    occupied.release();
+    try std.testing.expectEqual(@as(usize, 6), runtime.ptr().laneStats().reserved_workers);
+    _ = try api.sqlExecutionIo();
+    try std.testing.expectEqual(protected, api.sql_bounded_read_workers.?.io().userdata);
+    try std.testing.expectEqual(@as(usize, 18), runtime.ptr().laneStats().reserved_workers);
+    api.deinit();
+    closed = true;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+}
+
+test "SQL bounded read workers refuse insufficient waiting envelopes and unsupported isolation" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    {
+        var api = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr(), .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = true }, .query_waiting = .{ .max_queued_requests = 9, .max_queued_bytes = 8192, .max_wait_ms = 250 } }, source.iface(), null, null);
+        defer api.deinit();
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlExecutionIo());
+        try std.testing.expect(api.sql_workers == null);
+        try std.testing.expect(!api.sqlQueryWaitingEnabled());
+        try std.testing.expectEqual(@as(usize, 6), runtime.ptr().laneStats().reserved_workers);
+    }
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+    {
+        var api = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr(), .runnable_policy = .{ .slots = 3 } }, source.iface(), null, null);
+        defer api.deinit();
+        const control_reservation = runtime.ptr().laneStats().reserved_workers;
+        try std.testing.expectError(error.UnsupportedOperation, api.sqlBoundedReadIo());
+        try std.testing.expect(api.sql_bounded_read_workers == null);
+        try std.testing.expectEqual(control_reservation, runtime.ptr().laneStats().reserved_workers);
+    }
 }
 
 test "native memory HTTP validates route and space without loading a model" {
@@ -20361,7 +24312,7 @@ test "linear merge HTTP accepts scoped media and rejects an out of range mutatio
     };
     const a = std.testing.allocator;
     var fixture = Fixture{};
-    var status = SchemaUpdateStatusSource{};
+    var status = SchemaUpdateStatusSource{ .schema_allocator = a };
     var api_server = ApiHttpServer.init(a, .{}, status.iface(), fixture.reads(), fixture.writes());
     defer api_server.deinit();
     var server: HttpxE2eServer = undefined;

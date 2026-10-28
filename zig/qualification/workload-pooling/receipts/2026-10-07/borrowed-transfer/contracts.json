@@ -1,0 +1,36 @@
+{
+  "base_commit": "94aef4b165",
+  "source_sha256": {
+    "zig/lib/runtime/src/runtime_runnable_abi.zig": "97b15b38dce92cf334a956ec6e15840a003363cb8125ee5885063f9757b873a5",
+    "zig/pkg/antfly/src/api/runnable_owner_execution.zig": "15ac1ce6f5a058dd57d5e99d636e67ebd1def48cfad2ed2eb12322606fc9f2d3"
+  },
+  "native_tests": {
+    "capsules_and_transfer": 7,
+    "protocol_and_imported_abis": 34
+  },
+  "linux_tests": {
+    "capsules_and_transfer": 7,
+    "protocol_and_imported_abis": 34
+  },
+  "linux_image": "sha256:fb3236b6cc7411028d62f76eb418110a6c34e246b9437a9d093d58a53a3e2954",
+  "linux_target": "aarch64-linux-gnu",
+  "linux_limits": {
+    "cpus": 2,
+    "memory_bytes": 1073741824,
+    "memory_and_swap_bytes": 1073741824
+  },
+  "covered": [
+    "Weighted parent class transfer with one operation and unchanged retained bytes",
+    "Protected control progress during child execution",
+    "Original deadline rejection before transfer and on return",
+    "Shutdown failure leaves final capsule/lease cleanup with parent caller",
+    "Malformed borrowed header and demand checks before invoking callbacks",
+    "Double-return/checkpoint after return reject"
+  ],
+  "pending": [
+    "Production SQL/inference callers of borrowed transfer",
+    "Backend CPU team enforcement and worker process demand propagation",
+    "Full API/production qualification of these added declarations/tests",
+    "Broader background scheduling, completion ownership and automatic defaults"
+  ]
+}

@@ -32,6 +32,7 @@ pub const attention_match_snapshot = @import("attention_match_snapshot.zig");
 pub const device_clone = @import("device_clone.zig");
 pub const selection = @import("selection.zig");
 pub const turboquant = @import("turboquant.zig");
+pub const device_memory = @import("device_memory.zig");
 pub const prompt_cache = @import("prompt_cache.zig");
 
 test {

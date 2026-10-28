@@ -1,0 +1,21 @@
+{
+  "merged_main": "ac2d3779ee7052621435a4e14922256e2b5b0735",
+  "merge_commit": "9747313f37fd415a2410e6a4525b820fb5127e7a",
+  "source_sha256": {
+    "zig/pkg/antfly/src/pgwire/server.zig": "d755ca1dd1fda66190de45585d5f3dde7e936542ca8b69b86c1742f3ab8c5b94",
+    "zig/pkg/antfly/src/api/sql_pgwire.zig": "081cee93a8ce193717493f7e028a2b8ddd26e6669b5c874ede7623a869d7d62e",
+    "zig/qualification/workload-pooling/baseline-pgwire-transport.patch": "1943555594158c17649710253651361e5ed44a8feb1c95c28e1fc9b03b8113af",
+    ".github/workflows/zig-workload-pooling-qualification.yml": "b1acec30e58268f56c16db298a6b1520308ff2f45d1fc0dbc689e9c88a6fcc1b"
+  },
+  "tests": {
+    "native_pgwire": 88,
+    "nix_glibc_linux_pgwire": 88,
+    "harness": 14,
+    "selection_auditor": 10,
+    "native_api_pooling": 55
+  },
+  "nix_compiler_sha256": "4818e9e28e752456421034db9229035c165c0e3392bf534421016e79de33d022",
+  "baseline_patch_check_revision": "b79388a7d67f812f46d34c75cabe404836ed2a6a",
+  "fresh_production_matrices_run": false,
+  "merged_api_pooling_build_summary": "Build Summary: 50/50 steps succeeded"
+}

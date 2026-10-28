@@ -1,0 +1,25 @@
+{
+  "pid": 38504,
+  "state": "terminal",
+  "started": 1791402216.3240361,
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-inference-parent-phase-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "6442450944",
+    "--cache-dir",
+    "/private/tmp/antfly-parent-phase-focused-cache",
+    "--summary",
+    "all"
+  ],
+  "source_sha256": {
+    "pkg/inference/src/host/host.zig": "e640ab4b2402c3063023d01862f718586a43f7fd7fbafb4c3eb8dd06ed8b26ae",
+    "pkg/inference/src/execution_control.zig": "caaf6e0a7ff5ab1e9a43d468e9bee7b7563550030a7490d0f1823dd8657ba15b"
+  },
+  "compiler_pid": 38528,
+  "exit_code": 0,
+  "finished": 1791402243.4992151
+}

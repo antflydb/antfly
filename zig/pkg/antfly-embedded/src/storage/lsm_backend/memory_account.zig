@@ -22,11 +22,22 @@ pub const Account = struct {
     refs: std.atomic.Value(usize) = .init(1),
     bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     last_pass: u64 = 0,
+    /// Immutable before publication. A registered owner separately funds this
+    /// header and every charged allocation; backend/root observers must not
+    /// bill that same capacity again. Physical byte counts remain available.
+    independently_funded: bool = false,
 
     pub fn create(backing: std.mem.Allocator) !*Account {
         const self = try backing.create(Account);
         self.* = .{ .backing = backing };
         self.bytes.store(@sizeOf(Account), .monotonic);
+        return self;
+    }
+    /// Caller prepays the header and retains its final reference through all
+    /// payload and accounting-token drops. Never change funding after exposure.
+    pub fn createIndependentlyFunded(backing: std.mem.Allocator) !*Account {
+        const self = try create(backing);
+        self.independently_funded = true;
         return self;
     }
     pub fn retain(self: *Account) *Account {
@@ -46,6 +57,7 @@ pub const Account = struct {
     }
     /// The owning backend serializes accounting passes and generation changes.
     pub fn chargeOnce(self: *Account, pass: u64) u64 {
+        if (self.independently_funded) return 0;
         if (self.last_pass == pass) return 0;
         self.last_pass = pass;
         return self.bytes.load(.acquire);

@@ -35,6 +35,17 @@ pub const storage_backend_erased = @import("antfly_local_sources").storage_backe
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
+    _ = @import("storage/retained_read_registry.zig");
+    _ = @import("api/retained_read_owner.zig");
+    _ = @import("api/retained_read_rpc.zig");
+    _ = @import("api/retained_read_client.zig");
+    _ = @import("api/remote_attempt_client.zig");
+    _ = @import("api/composed_query.zig");
+    _ = @import("api/lake_retained_cut.zig");
+    _ = @import("serverless/artifacts/object_store.zig");
+    _ = @import("api/runnable_read_resources.zig");
+    _ = @import("api/internal_query_owner.zig");
+    _ = @import("api/sql_read_lane.zig");
     _ = @import("api/resolvers.zig");
     _ = @import("api/protected_future.zig");
     _ = @import("api/sql_connection_record.zig");
@@ -42,6 +53,10 @@ test {
     _ = @import("api/kernel_owner_source.zig");
     _ = @import("api/sql_execution.zig");
     _ = @import("api/sql_pgwire.zig");
+    _ = @import("api/remote_read_operation_owner.zig");
+    _ = @import("api/sql_preparation.zig");
+    _ = @import("api/sql_execution.zig");
+    _ = @import("antfly_local_sources").sql_read_fence;
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/table_reads.zig").document_hydration_tests;
