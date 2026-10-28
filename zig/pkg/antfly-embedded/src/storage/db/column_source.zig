@@ -360,17 +360,25 @@ pub const Page = struct {
 /// trees are reset after each preparation and never survive into transport I/O.
 pub const Prepared = struct {
     const Value = union(enum) {
-        string: []const u8,
+        string: struct { bytes: []const u8, encoded_len: usize, plain: bool },
         raw: []const u8,
         fn length(self: @This()) !usize {
             return switch (self) {
-                .string => |v| stringLength(v),
+                .string => |v| v.encoded_len,
                 .raw => |v| v.len,
             };
         }
         pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
             switch (self) {
-                .string => |v| try w.write(v),
+                .string => |v| {
+                    if (v.plain and !w.options.escape_unicode and !w.options.emit_strings_as_arrays) {
+                        try w.beginWriteRaw();
+                        try w.writer.writeByte('"');
+                        try w.writer.writeAll(v.bytes);
+                        try w.writer.writeByte('"');
+                        w.endWriteRaw();
+                    } else try w.write(v.bytes);
+                },
                 .raw => |v| {
                     try w.beginWriteRaw();
                     try w.writer.writeAll(v);
@@ -379,7 +387,10 @@ pub const Prepared = struct {
             }
         }
         fn prepare(a: A, value: std.json.Value, borrow_string: bool) !@This() {
-            if (borrow_string and value == .string and std.unicode.utf8ValidateSlice(value.string)) return .{ .string = value.string };
+            if (borrow_string and value == .string) {
+                const stats = try stringStats(value.string);
+                if (stats.ascii or std.unicode.utf8ValidateSlice(value.string)) return .{ .string = .{ .bytes = value.string, .encoded_len = stats.length, .plain = stats.length == value.string.len + 2 } };
+            }
             return .{ .raw = try std.json.Stringify.valueAlloc(a, value, .{ .emit_null_optional_fields = false }) };
         }
     };
@@ -405,13 +416,32 @@ pub const Prepared = struct {
         return .{ .fields = fields, .encoded_len = self.encoded_len };
     }
     fn stringLength(bytes: []const u8) !usize {
-        var length = try std.math.add(usize, bytes.len, 2);
-        for (bytes) |byte| length = try std.math.add(usize, length, switch (byte) {
-            '"', '\\', 8, 12, '\n', '\r', '\t' => @as(usize, 1),
-            0...7, 11, 14...31 => @as(usize, 5),
-            else => @as(usize, 0),
-        });
-        return length;
+        return (try stringStats(bytes)).length;
+    }
+    /// Size and validate the common ASCII path in one vector pass. Plain
+    /// validated strings can then be copied directly by the wire writer.
+    fn stringStats(bytes: []const u8) !struct { length: usize, ascii: bool } {
+        var extra: usize = 0;
+        var ascii = true;
+        var at: usize = 0;
+        const V = @Vector(32, u8);
+        while (bytes.len - at >= 32) : (at += 32) {
+            const v: V = bytes[at..][0..32].*;
+            ascii = ascii and !@reduce(.Or, v >= @as(V, @splat(0x80)));
+            const controls = v < @as(V, @splat(32));
+            const short = (v == @as(V, @splat(8))) | (v == @as(V, @splat(12))) | (v == @as(V, @splat(10))) | (v == @as(V, @splat(13))) | (v == @as(V, @splat(9)));
+            const escaped = controls | (v == @as(V, @splat('"'))) | (v == @as(V, @splat('\\')));
+            extra = try std.math.add(usize, extra, @popCount(@as(u32, @bitCast(escaped))) + 4 * @as(usize, @popCount(@as(u32, @bitCast(controls & !short)))));
+        }
+        for (bytes[at..]) |byte| {
+            ascii = ascii and byte < 0x80;
+            extra = try std.math.add(usize, extra, switch (byte) {
+                '"', '\\', 8, 12, '\n', '\r', '\t' => @as(usize, 1),
+                0...7, 11, 14...31 => @as(usize, 5),
+                else => @as(usize, 0),
+            });
+        }
+        return .{ .length = try std.math.add(usize, try std.math.add(usize, bytes.len, 2), extra), .ascii = ascii };
     }
     fn init(fields: []const Field) !Prepared {
         var length: usize = 2;
@@ -817,4 +847,40 @@ test "external lake projected contiguous leases outlive producers and sparse sca
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "external lake bounded window profiles prepared string sizing and plain transport match canonical JSON" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "plain", "\"\\\x00\x01\x08\x0c\n\r\t", "é 😀", "" }) |text| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const prepared = try Prepared.Value.prepare(arena.allocator(), .{ .string = text }, true);
+        const actual = try std.json.Stringify.valueAlloc(a, prepared, .{});
+        defer a.free(actual);
+        const expected = try std.json.Stringify.valueAlloc(a, text, .{});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expectEqual(expected.len, try prepared.length());
+        const escaped = try std.json.Stringify.valueAlloc(a, prepared, .{ .escape_unicode = true });
+        defer a.free(escaped);
+        const expected_escaped = try std.json.Stringify.valueAlloc(a, text, .{ .escape_unicode = true });
+        defer a.free(expected_escaped);
+        try std.testing.expectEqualStrings(expected_escaped, escaped);
+    }
+    // Exercise every byte lane and control escape on both sides of the SIMD
+    // boundary. Invalid UTF-8 retains the canonical raw-value fallback.
+    var bytes: [96]u8 = @splat('x');
+    for (0..96) |position| for (0..256) |byte| {
+        bytes[position] = @intCast(byte);
+        const expected = try std.json.Stringify.valueAlloc(a, @as([]const u8, &bytes), .{});
+        defer a.free(expected);
+        if (std.unicode.utf8ValidateSlice(&bytes)) {
+            try std.testing.expectEqual(expected.len, try Prepared.stringLength(&bytes));
+        } else {
+            const value = try Prepared.Value.prepare(a, .{ .string = &bytes }, true);
+            defer if (value == .raw) a.free(value.raw);
+            try std.testing.expectEqual(expected.len, try value.length());
+        }
+        bytes[position] = 'x';
+    };
 }

@@ -99,6 +99,7 @@ fn resetScratchList(comptime T: type, alloc: Allocator, list: *std.ArrayListUnma
 }
 
 const PostingRun = @import("postings_run.zig").Run;
+const SourceCapture = @import("section/source_capture.zig").Capture;
 const PostingRunRange = struct {
     spool: *PostingRun,
     offset: usize,
@@ -580,6 +581,9 @@ pub const BuildTextProfile = struct {
     doc_count: u64 = 0,
     text_field_count: u64 = 0,
     token_count: u64 = 0,
+    source_vectors_captured: u64 = 0,
+    source_vectors_reused: u64 = 0,
+    source_vector_spilled_bytes: u64 = 0,
     term_hit_count: u64 = 0,
     typed_value_count: u64 = 0,
     segment_bytes: u64 = 0,
@@ -992,6 +996,8 @@ fn writeTextSegmentWithScratch(
     defer resource_tracker.release();
     try resource_tracker.adjust(input_estimated_bytes);
 
+    var source_capture = SourceCapture.init(alloc, options.store_source_columns and options.store_document_source, options.postings_run_io, options.postings_run_directory, options.resource_manager);
+    defer source_capture.deinit();
     var postings_spool: ?*PostingRun = null;
     defer if (postings_spool) |spool| spool.deinit();
 
@@ -1098,6 +1104,8 @@ fn writeTextSegmentWithScratch(
                     profile,
                     profile_timings,
                     &scratch,
+                    &source_capture,
+                    text_doc.stored_source,
                 );
                 scratch.hits.clearRetainingCapacity();
                 try spillPendingFields(alloc, &field_builders, options, @intCast(doc_idx + 1), &postings_spool);
@@ -1113,7 +1121,7 @@ fn writeTextSegmentWithScratch(
                 while (end < scratch.field_order.items.len and std.mem.eql(u8, field_name, text_doc.text_fields[scratch.field_order.items[end]].field_name)) : (end += 1) {}
                 _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
                 if (end == start + 1) {
-                    try addSingleTextFieldToBuilders(alloc, doc_alloc, &field_builders, &field_indices, &seg_writer, &analyzer_cache, @intCast(doc_idx), text_doc.text_fields[scratch.field_order.items[start]], default_analyzer, text_analysis, profile, profile_timings, &scratch);
+                    try addSingleTextFieldToBuilders(alloc, doc_alloc, &field_builders, &field_indices, &seg_writer, &analyzer_cache, @intCast(doc_idx), text_doc.text_fields[scratch.field_order.items[start]], default_analyzer, text_analysis, profile, profile_timings, &scratch, &source_capture, text_doc.stored_source);
                     scratch.hits.clearRetainingCapacity();
                 } else {
                     var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
@@ -1125,7 +1133,7 @@ fn writeTextSegmentWithScratch(
                         const tf = text_doc.text_fields[index];
                         if (profile) |p| p.text_field_count +|= 1;
                         const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, tf, default_analyzer, text_analysis);
-                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings);
+                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings, &source_capture, @intCast(doc_idx), tf.source_field orelse tf.field_name, text_doc.stored_source);
                     }
                     const hit_materialize_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
                     scratch.hits.clearRetainingCapacity();
@@ -1189,6 +1197,11 @@ fn writeTextSegmentWithScratch(
                 p.builder_scratch_peak_bytes = @max(p.builder_scratch_peak_bytes, scratch.estimatedMemoryBytes());
             }
         }
+    }
+    if (profile) |p| {
+        p.source_vectors_captured +|= source_capture.captured;
+        p.source_vectors_reused +|= source_capture.reused;
+        if (source_capture.spool) |run| p.source_vector_spilled_bytes +|= run.len();
     }
     var finalize_typed = typed_fields.valueIterator();
     while (finalize_typed.next()) |collector| {
@@ -1290,7 +1303,7 @@ fn writeTextSegmentWithScratch(
             for (seg_writer.fields.items, 0..) |field, i| if (std.mem.eql(u8, field.name, name)) break :blk @as(u16, @intCast(i));
             break :blk try seg_writer.addField(name);
         };
-        producer.* = .{ .state = &build_state, .docs = docs, .order = if (index_sort.len > 0 and !attested) doc_order else &.{}, .field = name, .analysis = text_analysis };
+        producer.* = .{ .state = &build_state, .docs = docs, .order = if (index_sort.len > 0 and !attested) doc_order else &.{}, .field = name, .capture = &source_capture };
         try seg_writer.addSectionBuilder(field_idx, .columnar_stored, .{ .context = producer, .write = SourceColumnProducer.write });
     }
     noteBuildMemorySample(profile, profile_working_set, "rss_after_postings_build");
@@ -1750,9 +1763,12 @@ fn addSingleTextFieldToBuilders(
     profile: ?*BuildTextProfile,
     profile_timings: bool,
     scratch: *TextBuildScratch,
+    source_capture: *SourceCapture,
+    source_root: ?std.json.Value,
 ) !void {
     if (profile) |p| p.text_field_count +|= 1;
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
+    const capture = try source_capture.wants(doc_idx, field.source_field orelse field.field_name, field.text, source_root, analyzer);
     var field_acc = FieldAcc.init(alloc);
     defer field_acc.deinit();
     if (if (field.text.len >= 128) analyzer.tokenStream(field.text) else null) |producer| {
@@ -1764,7 +1780,8 @@ fn addSingleTextFieldToBuilders(
         }
     } else {
         const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
-        const tokens = try analyzer.analyze(doc_alloc, field.text);
+        const tokens = if (capture != null) try analyzer.analyzeWithSourceOffsets(doc_alloc, field.text) else try analyzer.analyze(doc_alloc, field.text);
+        if (capture) |request| try source_capture.record(request, tokens);
         if (profile) |p| {
             if (profile_timings) p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
             p.token_count +|= @intCast(tokens.len);
@@ -1852,7 +1869,7 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
     field.token_offset = try std.math.add(u32, base, count);
     return count;
 }
-fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool) !void {
+fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, source_capture: *SourceCapture, doc: u32, source_field: []const u8, source_root: ?std.json.Value) !void {
     if (if (text.len >= 128) analyzer.tokenStream(text) else null) |stream| {
         const started = if (timings) platform_time.monotonicNs() else 0;
         const existing = fields.getPtr(name);
@@ -1873,7 +1890,9 @@ fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.String
         return;
     }
     const started = if (timings) platform_time.monotonicNs() else 0;
-    const tokens = try analyzer.analyze(a, text);
+    const capture = try source_capture.wants(doc, source_field, text, source_root, analyzer);
+    const tokens = if (capture != null) try analyzer.analyzeWithSourceOffsets(a, text) else try analyzer.analyze(a, text);
+    if (capture) |request| try source_capture.record(request, tokens);
     if (profile) |p| {
         p.token_count +|= @intCast(tokens.len);
         if (timings) p.analyzer_ns +|= platform_time.monotonicNs() - started;
@@ -1946,26 +1965,19 @@ const SourceColumnProducer = struct {
     docs: []const TextDocument,
     order: []const TextIndexSortEntry,
     field: []const u8,
-    analysis: TextAnalysisConfig,
+    capture: *SourceCapture,
     fn write(a: Allocator, raw: *anyopaque, sink: *segment_mod.SegmentSink) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         var writer = try @import("section/source_column.zig").Writer.init(a, sink);
         defer writer.deinit();
         for (0..self.docs.len) |i| {
-            const doc = self.docs[if (self.order.len != 0) self.order[i].doc_index else i];
+            const original = if (self.order.len != 0) self.order[i].doc_index else i;
+            const doc = self.docs[original];
             const value = doc.stored_source.?.object.get(self.field) orelse continue;
             // Input rows remain leased; one encoded value and one raw/compressed
             // field chunk coexist. Reserve that scratch under the build owner.
             try self.state.adjust(writer.retained + 3 *| (@max(@as(u64, @intCast(doc.stored_data.len)), doc.stored_source_bytes) +| 64 * 1024));
-            var analyzers: std.ArrayList(*const analysis_mod.Analyzer) = .empty;
-            defer analyzers.deinit(a);
-            if (value == .string) for (doc.text_fields) |field| {
-                if (!std.mem.eql(u8, field.source_field orelse field.field_name, self.field) or !std.mem.eql(u8, field.text, value.string)) continue;
-                const analyzer = effectiveTextFieldAnalyzer(field, self.analysis);
-                if (!@import("section/source_column.zig").eligibleAnalyzer(analyzer)) continue;
-                if (std.mem.indexOfScalar(*const analysis_mod.Analyzer, analyzers.items, analyzer) == null) try analyzers.append(a, analyzer);
-            };
-            try writer.add(@intCast(i), value, analyzers.items);
+            try writer.addPrepared(@intCast(i), value, try self.capture.variants(@intCast(i), self.field));
             try self.state.adjust(writer.retained + 3 *| (@max(@as(u64, @intCast(doc.stored_data.len)), doc.stored_source_bytes) +| 64 * 1024));
         }
         if (!try writer.finish()) return error.InvalidSegment;
@@ -5184,4 +5196,80 @@ test "observed physical ordering uses signed timestamp keys and releases failed 
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "highlight indexing captures original offsets once across physical bindings without column reanalysis" {
+    const testing = std.testing;
+    if (comptime @import("builtin").os.tag == .freestanding) return;
+    const a = testing.allocator;
+    const text = try a.alloc(u8, 8192);
+    defer a.free(text);
+    @memset(text, '.');
+    @memcpy(text[4090..][0.."needle".len], "needle");
+    var source: std.json.ObjectMap = .empty;
+    defer source.deinit(a);
+    try source.put(a, "body", .{ .string = text });
+    var profile: BuildTextProfile = .{};
+    const bytes = try buildSegmentFromTextWithAnalysisOptions(a, &.{.{
+        .id = "row",
+        .stored_data = "{}",
+        .stored_source = .{ .object = source },
+        .stored_source_bytes = try @import("storage/typed_json.zig").encodedSize(.{ .object = source }),
+        .text_fields = &.{ .{ .field_name = "body", .source_field = "body", .text = text }, .{ .field_name = "_all", .source_field = "body", .text = text } },
+    }}, &analysis_mod.default_analyzer, .{}, .{ .store_source_columns = true, .profile = &profile, .postings_run_io = testing.io });
+    defer a.free(bytes);
+    try testing.expectEqual(@as(u64, 1), profile.source_vectors_captured);
+    try testing.expectEqual(@as(u64, 1), profile.source_vectors_reused);
+    try testing.expect(profile.source_vector_spilled_bytes > 0);
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const column = @import("section/source_column.zig");
+    var cursor = column.Cursor.init((try reader.storedColumnScoped(a, "body")).?);
+    defer cursor.deinit();
+    const stored = (try cursor.text(0)).?;
+    const tokens = (try stored.tokens(a, try column.fingerprint(a, &analysis_mod.default_analyzer), .none)).?;
+    defer tokens.deinit();
+    try testing.expectEqual(@as(usize, 1), tokens.items.len);
+    try testing.expectEqualStrings("needl", tokens.items[0].term);
+    try testing.expectEqual(@as(u32, 4090), tokens.items[0].start_byte);
+    std.debug.print("SOURCE_ANALYSIS captured={d} bindings_reused={d} spilled_bytes={d}\n", .{ profile.source_vectors_captured, profile.source_vectors_reused, profile.source_vector_spilled_bytes });
+}
+
+test "highlight indexing capture follows sorted output ordinals rather than input positions" {
+    const a = std.testing.allocator;
+    const values = try a.alloc(u8, 16384);
+    defer a.free(values);
+    @memset(values, '.');
+    const last = values[0..8192];
+    const first = values[8192..];
+    @memcpy(last[32..][0.."zebra target".len], "zebra target");
+    @memcpy(first[7000..][0.."alpha needle".len], "alpha needle");
+    var roots: [2]std.json.ObjectMap = @splat(.empty);
+    defer for (&roots) |*root| root.deinit(a);
+    try roots[0].put(a, "body", .{ .string = last });
+    try roots[1].put(a, "body", .{ .string = first });
+    const docs = [_]TextDocument{
+        .{ .id = "z", .stored_data = "{}", .stored_source = .{ .object = roots[0] }, .text_fields = &.{.{ .field_name = "body", .source_field = "body", .text = last }} },
+        .{ .id = "a", .stored_data = "{}", .stored_source = .{ .object = roots[1] }, .text_fields = &.{.{ .field_name = "body", .source_field = "body", .text = first }} },
+    };
+    const bytes = try buildSegmentFromTextWithAnalysisOptions(a, &docs, &analysis_mod.simple_analyzer, .{}, .{ .store_source_columns = true, .index_sort = &.{.{ .field = "_id" }} });
+    defer a.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const column = @import("section/source_column.zig");
+    var cursor = column.Cursor.init((try reader.storedColumnScoped(a, "body")).?);
+    defer cursor.deinit();
+    const signature = try column.fingerprint(a, &analysis_mod.simple_analyzer);
+    for ([_][]const u8{ first, last }, [_][]const u8{ "alpha", "zebra" }, [_]u32{ 7000, 32 }, 0..) |expected, term, offset, doc| {
+        const stored = (try cursor.text(@intCast(doc))).?;
+        const text = try stored.read(a, 0, stored.length, .none);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(expected, text);
+        const tokens = (try stored.tokens(a, signature, .none)).?;
+        defer tokens.deinit();
+        const found = for (tokens.items) |token| {
+            if (std.mem.eql(u8, token.term, term)) break token;
+        } else return error.MissingSourceTerm;
+        try std.testing.expectEqual(offset, found.start_byte);
+    }
 }

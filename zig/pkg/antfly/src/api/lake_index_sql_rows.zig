@@ -962,6 +962,7 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
                 begin = end;
             }
             var selected: std.ArrayList(usize) = .empty;
+            defer selected.deinit(a);
             for (root.cover, 0..) |name, i| if (covers(fields, name)) try selected.append(a, i);
             try wave.read(a, .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], selected.items, root.cover.len, owner.reader.pages.cancellation, &owner.reader.remaining_reads);
             for (wave.jobs[0..count], groups[0..count]) |job, group| {
@@ -2805,13 +2806,17 @@ test "external lake covering waves overlap cold blocks retain admission and join
         var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
         defer cache.deinit();
         var wave: CoveringWave = .{};
-        const read = wave.read(.{ .cache = &cache, .scope = @splat(7), .context = .{ .io = std.testing.io } }, backend, &refs, .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled });
+        var covers_: [4]ordered.Reader.Cover = undefined;
+        for (refs, &covers_) |ref, *cover| cover.* = .{ .block = ref, .row = 0 };
+        var reads: u64 = 4 * artifacts.max_block_bytes;
+        const read = wave.read(a, .{ .cache = &cache, .scope = @splat(7), .context = .{ .io = std.testing.io } }, backend, &covers_, &.{0}, 1, .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled }, &reads);
         defer wave.deinit();
         if (mode == 0) {
             try read;
             try std.testing.expect(probe.peak.load(.monotonic) > 1);
-            try std.testing.expectEqual(before + 4 * CoveringWave.lane_bytes, scheduler.pull_bytes);
-            for (wave.jobs, 0..) |job, i| try std.testing.expectEqual(@as(i64, @intCast(i)), (try job.block.?.value.cell(0, 0)).value.integer);
+            try std.testing.expect(wave.retained != 0);
+            try std.testing.expectEqual(before + wave.retained, scheduler.pull_bytes);
+            for (wave.jobs, 0..) |job, i| try std.testing.expectEqual(@as(i64, @intCast(i)), (try job.block.?.block.cell(0, 0)).value.integer);
         } else if (mode == 1) try std.testing.expectError(error.InjectedCoveringReadFailure, read) else try std.testing.expectError(error.Canceled, read);
         try std.testing.expectEqual(@as(usize, 0), probe.current.load(.acquire));
         wave.deinit();

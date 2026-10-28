@@ -22247,7 +22247,8 @@ pub const PreparedHighlights = struct {
         if (row_type) |kind| try context.put(scratch, "_type", kind);
         const Call = struct { binding: Binding, tokens: []const analysis_mod.Token };
         var calls: std.ArrayListUnmanaged(Call) = .empty;
-        var vectors: std.AutoHashMapUnmanaged([32]u8, @import("../../../section/source_column.zig").Text.Vector) = .empty;
+        const VectorKey = struct { signature: [32]u8, group: usize };
+        var vectors: std.AutoHashMapUnmanaged(VectorKey, @import("../../../section/source_column.zig").Text.Vector) = .empty;
         for (self.indexed_queries, 0..) |query, qi| {
             const relevant = for (self.groups) |group| {
                 if (group.query == qi) break true;
@@ -22263,9 +22264,10 @@ pub const PreparedHighlights = struct {
                     .term, .prefix, .wildcard, .regexp, .fuzzy => {},
                     else => return false,
                 };
-                const tokens = vectors.get(binding.signature) orelse load: {
-                    const value = (try source.tokens(scratch, binding.signature, self.control)) orelse return false;
-                    try vectors.put(scratch, binding.signature, value);
+                const vector_key: VectorKey = .{ .signature = binding.signature, .group = binding.group };
+                const tokens = vectors.get(vector_key) orelse load: {
+                    const value = (try highlight_mod.selectStoredTokens(scratch, source, binding.signature, matchers, self.groups[binding.group].program(binding.analyzer), self.control)) orelse return false;
+                    try vectors.put(scratch, vector_key, value);
                     break :load value;
                 };
                 try calls.append(scratch, .{ .binding = binding, .tokens = tokens.items });
@@ -22278,8 +22280,7 @@ pub const PreparedHighlights = struct {
             for (fragments.items) |*fragment| freePendingHighlightFragment(alloc, fragment);
         };
         for (calls.items) |call| {
-            const group = &self.groups[call.binding.group];
-            const found = (try highlight_mod.highlightStored(alloc, scratch, source, call.tokens, group.matchers(call.binding.analyzer), group.program(call.binding.analyzer), @max(self.options.max_fragments, 1), @max(self.options.fragment_size, 1), self.control)) orelse return false;
+            const found = try highlight_mod.highlightSelectedStored(alloc, scratch, source, call.tokens, @max(self.options.max_fragments, 1), @max(self.options.fragment_size, 1), self.control);
             defer highlight_mod.freeFragments(alloc, found);
             try appendFoundHighlightFragments(alloc, &fragments, found, null, 0);
         }

@@ -1944,3 +1944,53 @@ Already projected small fields borrow their column page for shared highlighting;
 large scalar fields retain stored-offset selection. This keeps the native
 result lease path from forcing a second field-major hydration of small projected
 values. The benchmark controls cover both small/wide and large/dense shapes.
+
+### Selective original-offset vectors and shared indexing analysis
+
+Stored-source recipe **v6** (`AFSC0003`, `AFST3`) keeps independently compressed
+64-KiB source pages and replaces flat token vectors with relocatable term
+navigation (`AFOV0001`). A ceiling directory routes exact and prefix matchers to
+compressed dictionary pages of at most 64 terms. Other supported patterns inspect
+the dictionary once per distinct term. Each matching term names independently
+compressed occurrence blocks of at most 1,024 records, containing a signed source
+start delta, span length and original token position as varints. Dictionary and
+navigation payloads use 64-KiB compression frames, including indivisible long
+terms. Query checkpoints run between frames and bounded occurrence batches.
+
+The reader fetches the selected analyzer's navigation and matching occurrence
+blocks. It does not materialize unrelated token records or replay expensive
+patterns for each occurrence. Source-byte spans pass through the shared sorting,
+density and fragment-selection kernels. Exact fields, prefix bounds, keyword and
+substring companions, dynamic routing, missing analyzer fingerprints and unknown
+mappings retain their existing semantics and controlled full-source fallback.
+A request's selected-vector memo includes both analyzer fingerprint and matcher
+group; two queries sharing analysis cannot borrow each other's selection.
+
+Native ingestion captures original offsets during the first eligible indexing
+analysis for each `(document, source field, analyzer fingerprint)`. Capture uses
+a build-owned seekable postings run when native I/O is available; only compressed
+variant locators survive the analysis callback. The private descriptor owns its
+unlinked file and releases it on completion, cancellation or allocation failure.
+Memory-only hosts retain allocator-admitted memory storage. Column writers copy
+captured variants without analyzing source again. Physically reordered documents
+use the same output ordinal for indexing capture and column writing; the input
+permutation selects the matching source value. Append/sorted compaction copies
+relocatable blobs through a bounded 64-KiB buffer. Source bodies, offsets and
+analyzer fingerprints remain authenticated by their enclosing native section.
+The source recipe, native reader protocol and compiled runtime ABI fence this
+layout; old derived publications rebuild through the normal reconciliation path.
+
+Projected scalar strings prepare their canonical encoded length and ASCII status
+in one vector pass. Valid plain strings borrow their result-page lease and write
+directly between JSON quotes, avoiding another escape scan. Escaped strings,
+invalid UTF-8 and nondefault serializer options preserve standard serialization.
+Unicode validation and overflow checks remain in the preparation contract. Final
+response size limits are unchanged.
+
+The native qualification checks selective physical reads, term-level matching,
+exact source spans, prefix boundaries, partial-output cancellation, allocation
+failures, analyzer aliases and private-file ownership. Real Parquet and Iceberg
+E2E coverage includes a large vocabulary with rare exact, prefix, wildcard and
+fuzzy matches after restart with the original source objects unavailable.
+Performance observations belong in `bench/lake/`; their binary/input identities,
+query shapes, execution order and environment qualify any timing claim.

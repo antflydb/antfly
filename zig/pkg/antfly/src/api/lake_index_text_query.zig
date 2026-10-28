@@ -4180,24 +4180,38 @@ test "external lake typed sidecar hydration skips Parquet and owns final source 
     try writer.addSegmentWithId(1, bytes);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var owner: Execution = undefined;
-    owner.navigation = null;
-    owner.arena = arena.allocator();
-    owner.context = .{ .io = std.testing.io };
-    owner.hydration_fields = &.{"body"};
-    owner.result_allocator = a;
+    var server: server_api.ApiHttpServer = undefined;
+    server.lake_query_metrics = .{};
+    var owner: Execution = .{
+        .server = &server,
+        .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{.{ .name = "body", .path = "body", .type = .string }} },
+        .source = undefined,
+        .store = undefined,
+        .domain = @splat(0),
+        .declarations = &.{},
+        .request = .{},
+        .schema_json = "{}",
+        .arena = arena.allocator(),
+        .context = .{ .io = std.testing.io },
+        .hydration_fields = &.{"body"},
+        .result_allocator = a,
+    };
     // No public/native row mapping or source reader exists. A successful
     // result proves the covered body did not open a Parquet hydration cursor.
-    owner.files = .empty;
-    owner.private_files = .empty;
-    owner.private_digests = .empty;
     const pin: search.PinnedTextSource = .{ .snapshot = writer.snapshot(), .name = "body", .text_analysis = .{}, .runtime_schema = null, .stored_projection_fields = &.{"body"} };
     var hits = [_]types.SearchHit{.{ .id = try a.dupe(u8, key), .native_text_doc_id = 0 }};
     defer hits[0].deinit(a);
     try owner.hydrateTypedFromSource(a, &hits, &.{key}, &pin);
-    try std.testing.expectEqualStrings("a needle in the source", hits[0].source_value.?.object.get("body").?.string);
-    try std.testing.expect(hits[0].source_value.?.object.get("unused") == null);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const source = try hits[0].column_source.?.value(&scratch);
+    try std.testing.expectEqualStrings("a needle in the source", source.object.get("body").?.string);
+    try std.testing.expect(source.object.get("unused") == null);
+    try std.testing.expect(hits[0].source_value == null);
     try std.testing.expect(hits[0].stored_data == null);
+    // The wire owner releases column leases before the provider callback.
+    hits[0].column_source.?.deinit();
+    hits[0].column_source = null;
     Execution.releaseDelivery(&owner, &hits);
     try std.testing.expect(hits[0].source_value == null);
 }

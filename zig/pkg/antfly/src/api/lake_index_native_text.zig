@@ -73,10 +73,10 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     }
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
-    // v5 adds independently compressed large text pages and original-offset
-    // vectors fenced by the complete analyzer pipeline fingerprint. Projection
-    // and merge preserve this evidence for fields excluded from text indexing.
-    hash.update("native-lake-text-stored-source-v5");
+    // v6 captures indexing analysis into a paged term directory and independent
+    // occurrence blocks. Analyzer fingerprints fence the evidence; projection
+    // and compaction retain it without reanalysis.
+    hash.update("native-lake-text-stored-source-v6");
     hash.update(&original);
     var digest: [32]u8 = undefined;
     hash.final(&digest);

@@ -2016,8 +2016,15 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     count = 32
     body = "needle " * 9362
     sparse_body = "sparsecase needle " + "." * (8 * 1024 * 1024)
+    vocabulary = " ".join(f"word{i:06d}" for i in range(512)) + " "
+    selective_body = (
+        vocabulary * ((2 * 1024 * 1024) // len(vocabulary))
+    ) + "uniqueneedle"
     rows = pa.table(
-        {"id": list(range(count + 1)), "body": [body] * count + [sparse_body]}
+        {
+            "id": list(range(count + 2)),
+            "body": [body] * count + [sparse_body, selective_body],
+        }
     )
     root = tmp_path / "fixture"
     if source_format == "parquet":
@@ -2125,6 +2132,37 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                     assert len(sparse) == 1
                     assert sparse[0]["_source"] == {"id": count}
                     assert "needle" in sparse[0]["_highlights"]["body"][0]["text"]
+                    # A rare term in a large real vocabulary uses the paged
+                    # dictionary and matching occurrence blocks. All patterns
+                    # retain exact source spans after native reader restart.
+                    for pattern in (
+                        {"match": "uniqueneedle", "field": "body"},
+                        {"prefix": "uniqueneed", "field": "body"},
+                        {"wildcard": "uniqueneed?", "field": "body"},
+                        {"fuzzy": "uniqueneedlf", "field": "body", "fuzziness": 1},
+                    ):
+                        selected = client.query(
+                            {
+                                "request": {
+                                    "full_text_search": pattern,
+                                    "fields": ["id"],
+                                    "highlight": {
+                                        "fields": ["body"],
+                                        "fragment_size": 100,
+                                    },
+                                    "limit": 1,
+                                }
+                            }
+                        )["hits"]["hits"]
+                        assert len(selected) == 1, pattern
+                        assert selected[0]["_source"] == {"id": count + 1}
+                        fragment = selected[0]["_highlights"]["body"][0]
+                        assert "uniqueneedle" in fragment["text"]
+                        assert any(
+                            fragment["text"][span["start"] : span["end"]]
+                            == "uniqueneedle"
+                            for span in fragment["spans"]
+                        )
                     base = {
                         "full_text_search": {"match": "needle", "field": "body"},
                         "highlight": {

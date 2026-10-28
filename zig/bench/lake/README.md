@@ -1482,3 +1482,23 @@ server, retrieves an 8-MiB-field snippet inside a 50-ms budget, compares hidden
 and projected dense fragments, verifies deadline envelopes, and confirms a
 healthy request after cancellation. The Apache product boundary covers 2,557
 source files. Later commits record documentation and measurements only.
+
+### Selective original-offset vectors
+
+`selective_offsets.py LABEL IMMUTABLE_BINARY SOURCE_COMMIT` exercises rare exact,
+prefix, wildcard and fuzzy matches in a 2-MiB real Parquet field with 2,049 distinct
+terms. It records seven warm samples per shape, complete hit digests, frozen
+binary and fixture hashes, and one table-publication/readiness observation. Run
+both binary orders, using the existing E2E environment from the repository root:
+
+```sh
+TZ=UTC zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/selective_offsets.py \
+  LABEL PATH_TO_FROZEN_BINARY SOURCE_COMMIT
+```
+
+Pair it with `hidden_highlights.py`, `highlight_kernels.py` and `source_pages.py`
+for wide-result, dense-occurrence and large sparse-field controls. Stop task-owned
+builds, E2E runs and cache cleanup before timing. A publication observation includes
+admission and readiness polling; it is not an isolated ingestion CPU benchmark.
+The native `SOURCE_OFFSET_SELECT` and `SOURCE_ANALYSIS` probes independently check
+physical selection and reuse rather than inferring those properties from latency.

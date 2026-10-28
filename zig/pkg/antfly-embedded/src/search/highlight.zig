@@ -506,33 +506,68 @@ fn collectMatchSpans(
     return collectProgramSpans(alloc, tokens, matchers, null, spans, poller);
 }
 fn collectProgramSpans(alloc: Allocator, tokens: []const analysis_mod.Token, matchers: []const Matcher, program: ?*const Program, spans: *std.ArrayListUnmanaged(Span), poller: *Poller) !void {
-    // Tiny clause lists are faster as direct byte comparisons. Compiled
-    // lookups bound larger OR/prefix sets without taxing common one-term queries.
     const active_program: ?*const Program = if (matchers.len > 8) program else null;
-    for (tokens) |tok| {
-        // Analyzers may emit several tokens for one surface span (shingles,
-        // n-grams); the surface span is what gets highlighted.
-        if (active_program) |compiled| if (try compiled.matches(tok.term, poller)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
-        for (if (active_program) |compiled| compiled.patterns.items else matchers) |matcher| {
-            try poller.step();
-            switch (matcher) {
-                .term => |term| if (std.mem.eql(u8, tok.term, term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .prefix => |prefix| if (std.mem.startsWith(u8, tok.term, prefix)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .wildcard => |pattern| if (try wildcard_mod.matchControlled(pattern, tok.term, poller.control)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .fuzzy => |fuzzy| {
-                    const prefix_len: usize = fuzzy.prefix_len;
-                    if (tok.term.len < prefix_len or fuzzy.term.len < prefix_len or
-                        !std.mem.eql(u8, tok.term[0..prefix_len], fuzzy.term[0..prefix_len])) continue;
-                    if (try boundedEditDistance(alloc, tok.term, fuzzy.term, fuzzy.max_edits, poller) <= fuzzy.max_edits) {
-                        try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
-                    }
-                },
-                .regexp => |regexp| if (try regexpMatchesTerm(regexp, tok.term, poller)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .contains, .substring_term, .substring_wildcard, .substring_fuzzy, .substring_regexp => {},
-                .literal, .literal_prefix => {},
-            }
+    for (tokens) |tok| if (try matchesToken(alloc, tok.term, matchers, active_program, poller)) {
+        try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
+    };
+}
+inline fn matchesToken(a: Allocator, term: []const u8, matchers: []const Matcher, program: ?*const Program, poller: *Poller) !bool {
+    if (program) |compiled| if (try compiled.matches(term, poller)) return true;
+    for (if (program) |compiled| compiled.patterns.items else matchers) |matcher| {
+        try poller.step();
+        switch (matcher) {
+            .term => |value| if (std.mem.eql(u8, term, value)) return true,
+            .prefix => |prefix| if (std.mem.startsWith(u8, term, prefix)) return true,
+            .wildcard => |pattern| if (try wildcard_mod.matchControlled(pattern, term, poller.control)) return true,
+            .fuzzy => |fuzzy| {
+                const prefix: usize = fuzzy.prefix_len;
+                if (term.len < prefix or fuzzy.term.len < prefix or !std.mem.eql(u8, term[0..prefix], fuzzy.term[0..prefix])) continue;
+                if (try boundedEditDistance(a, term, fuzzy.term, fuzzy.max_edits, poller) <= fuzzy.max_edits) return true;
+            },
+            .regexp => |regexp| if (try regexpMatchesTerm(regexp, term, poller)) return true,
+            else => {},
         }
     }
+    return false;
+}
+/// Compile a borrowed dictionary predicate. Every distinct term is tested once;
+/// occurrence blocks already selected by this predicate need no pattern replay.
+pub fn selectStoredTokens(a: Allocator, source: @import("../section/source_column.zig").Text, signature: [32]u8, matchers: []const Matcher, program: ?*const Program, control: Control) !?@import("../section/source_column.zig").Text.Vector {
+    const Selection = @import("../section/source_column.zig").Text.Selection;
+    const Probe = struct {
+        a: Allocator,
+        matchers: []const Matcher,
+        program: ?*const Program,
+        poller: Poller,
+        fn check(raw: *anyopaque, term: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return matchesToken(self.a, term, self.matchers, self.program, &self.poller);
+        }
+    };
+    var workspace = std.heap.ArenaAllocator.init(a);
+    defer workspace.deinit();
+    const scratch = workspace.allocator();
+    var ranges: std.ArrayList(Selection.Range) = .empty;
+    var bounded = true;
+    for (matchers) |matcher| switch (matcher) {
+        .term => |term| try ranges.append(scratch, .{ .lower = term }),
+        .prefix => |prefix| try ranges.append(scratch, .{ .lower = prefix, .prefix = true }),
+        else => bounded = false,
+    };
+    var probe: Probe = .{ .a = scratch, .matchers = matchers, .program = if (matchers.len > 8) program else null, .poller = .{ .control = control } };
+    return source.selectTokens(a, signature, .{ .ptr = &probe, .matches = Probe.check, .ranges = if (bounded) ranges.items else null }, control);
+}
+pub fn highlightSelectedStored(a: Allocator, scratch: Allocator, source: @import("../section/source_column.zig").Text, selected: []const analysis_mod.Token, count: u32, size: u32, control: Control) ![]Fragment {
+    var arena = std.heap.ArenaAllocator.init(scratch);
+    defer arena.deinit();
+    var poller: Poller = .{ .control = control };
+    try control.check();
+    var spans: std.ArrayListUnmanaged(Span) = .empty;
+    for (selected) |token| {
+        try poller.step();
+        try spans.append(arena.allocator(), .{ .start = token.start_byte, .end = token.end_byte });
+    }
+    return selectFragments(a, arena.allocator(), &spans, .{ .stored = source }, count, size, &poller);
 }
 
 // Dictionary regexp queries feed the whole term to the automaton. The
@@ -1430,6 +1465,16 @@ test "highlight stored original offsets read only winning string pages and prese
             defer freeFragments(alloc, expected);
             const found = (try highlightStored(alloc, alloc, stored, tokens.items, &matchers, null, 1, 23, .none)).?;
             defer freeFragments(alloc, found);
+            const selected = (try selectStoredTokens(alloc, stored, signature, &matchers, null, .none)).?;
+            defer selected.deinit();
+            const selective = try highlightSelectedStored(alloc, alloc, stored, selected.items, 1, 23, .none);
+            defer freeFragments(alloc, selective);
+            try std.testing.expectEqual(expected.len, selective.len);
+            for (expected, selective) |left, right| {
+                try std.testing.expectEqual(left.offset, right.offset);
+                try std.testing.expectEqualStrings(left.text, right.text);
+                try std.testing.expectEqualDeep(left.highlights, right.highlights);
+            }
             try std.testing.expectEqual(expected.len, found.len);
             for (expected, found) |left, right| {
                 try std.testing.expectEqual(left.offset, right.offset);

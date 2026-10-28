@@ -24,9 +24,10 @@ const snappy = @import("../encoding/snappy.zig");
 const View = @import("../segment_source.zig").View;
 const Sink = @import("../segment.zig").SegmentSink;
 const Token = @import("antfly_cancellation").CancellationToken;
+const offsets = @import("source_offsets.zig");
 pub const page_size = 64 * 1024;
-const magic = "AFSC0002";
-const text_magic = "AFST2";
+const magic = "AFSC0003";
+const text_magic = "AFST3";
 pub fn fingerprint(a: A, analyzer: *const analysis.Analyzer) ![32]u8 {
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 1), .char_filters = analyzer.char_filters, .tokenizer = analyzer.tokenizer, .filters = analyzer.filters }, .{});
     defer a.free(bytes);
@@ -55,37 +56,44 @@ pub fn eligibleAnalyzer(analyzer: *const analysis.Analyzer) bool {
     };
     return true;
 }
-fn encodeVector(a: A, raw: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(a);
-    try u32add(a, &out, (raw.len + page_size - 1) / page_size);
-    var at: usize = 0;
-    while (at < raw.len) {
-        const end = @min(raw.len, at + page_size);
-        const encoded = try snappy.encode(a, raw[at..end]);
-        defer a.free(encoded);
-        try u32add(a, &out, encoded.len);
-        try out.appendSlice(a, encoded);
-        at = end;
+pub const Variant = struct { signature: [32]u8, offset: usize, bytes: usize, root_raw: u32, count: u32 };
+pub const Variants = struct { view: View, items: []const Variant };
+/// The standalone writer shares the indexing producer's codec. Native lake
+/// ingestion supplies already captured variants and does not analyze here.
+pub fn writeText(a: A, sink: *Sink, start: usize, text: []const u8, analyzers: []const *const analysis.Analyzer) ![]u8 {
+    var encoded = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer encoded.deinit();
+    var output = encoded.sink();
+    var variants: std.ArrayList(Variant) = .empty;
+    defer variants.deinit(a);
+    for (analyzers) |analyzer| {
+        if (!eligibleAnalyzer(analyzer)) return error.InvalidData;
+        const signature = try fingerprint(a, analyzer);
+        if (for (variants.items) |value| {
+            if (std.mem.eql(u8, &value.signature, &signature)) break true;
+        } else false) continue;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const tokens = try analyzer.analyzeWithSourceOffsets(scratch.allocator(), text);
+        const begin = output.len();
+        const value = try offsets.write(scratch.allocator(), &output, tokens);
+        try variants.append(a, .{ .signature = signature, .offset = begin, .bytes = value.bytes, .root_raw = value.root_raw, .count = value.count });
     }
-    return out.toOwnedSlice(a);
+    return writeTextPrepared(a, sink, start, text, .{ .view = try View.init(.{ .contiguous = encoded.out.items }, 0, encoded.out.items.len), .items = variants.items });
 }
-fn decodeVector(encoded: []const u8, raw: []u8, control: Token) !void {
-    var p: Parser = .{ .bytes = encoded };
-    const count = try p.int(u32);
-    if (count != (raw.len + page_size - 1) / page_size) return error.InvalidData;
+fn copyRange(sink: *Sink, view: View, offset: u64, length: usize) !void {
+    var buffer: [page_size]u8 = undefined;
     var at: usize = 0;
-    while (at < raw.len) {
-        try control.check();
-        const end = @min(raw.len, at + page_size);
-        try snappy.decodeInto(try p.take(try p.int(u32)), raw[at..end]);
-        at = end;
+    while (at < length) {
+        const n = @min(buffer.len, length - at);
+        try view.readInto(offset + at, buffer[0..n]);
+        try sink.appendSlice(buffer[0..n]);
+        at += n;
     }
-    if (p.at != encoded.len) return error.InvalidData;
 }
 /// Writes pages now; the caller stores the small returned descriptor in its
 /// ordinary indexed doc-value stream. All offsets are section-relative.
-pub fn writeText(a: A, sink: *Sink, start: usize, text: []const u8, analyzers: []const *const analysis.Analyzer) ![]u8 {
+pub fn writeTextPrepared(a: A, sink: *Sink, start: usize, text: []const u8, captured: Variants) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     try out.appendSlice(a, text_magic);
@@ -114,40 +122,14 @@ pub fn writeText(a: A, sink: *Sink, start: usize, text: []const u8, analyzers: [
     if (has_continuations) for (text, 0..) |byte, i| if (byte & 0xc0 == 0x80) {
         out.items[bitmap_at + i / 8] |= @as(u8, 1) << @as(u3, @intCast(i % 8));
     };
-    const Variant = struct { analyzer: *const analysis.Analyzer, signature: [32]u8 };
-    var variants: std.ArrayList(Variant) = .empty;
-    defer variants.deinit(a);
-    for (analyzers) |analyzer| {
-        if (!eligibleAnalyzer(analyzer)) return error.InvalidData;
-        const signature = try fingerprint(a, analyzer);
-        const duplicate = for (variants.items) |prior| {
-            if (std.mem.eql(u8, &prior.signature, &signature)) break true;
-        } else false;
-        if (!duplicate) try variants.append(a, .{ .analyzer = analyzer, .signature = signature });
-    }
-    try u32add(a, &out, variants.items.len);
-    for (variants.items) |variant| {
-        const analyzer = variant.analyzer;
+    try u32add(a, &out, captured.items.len);
+    for (captured.items) |variant| {
         try out.appendSlice(a, &variant.signature);
-        var scratch = std.heap.ArenaAllocator.init(a);
-        defer scratch.deinit();
-        const sa = scratch.allocator();
-        const tokens = try analyzer.analyzeWithSourceOffsets(sa, text);
-        var vector: std.ArrayList(u8) = .empty;
-        for (tokens) |token| {
-            if (token.start_byte > token.end_byte or token.end_byte > text.len) return error.InvalidData;
-            try u32add(sa, &vector, token.term.len);
-            try vector.appendSlice(sa, token.term);
-            try u32add(sa, &vector, token.start_byte);
-            try u32add(sa, &vector, token.end_byte);
-            try u32add(sa, &vector, token.position);
-        }
-        const encoded = try encodeVector(sa, vector.items);
         try u64add(a, &out, sink.len() - start);
-        try u32add(a, &out, encoded.len);
-        try u32add(a, &out, vector.items.len);
-        try u32add(a, &out, tokens.len);
-        try sink.appendSlice(encoded);
+        try u32add(a, &out, variant.bytes);
+        try u32add(a, &out, variant.root_raw);
+        try u32add(a, &out, variant.count);
+        try copyRange(sink, captured.view, variant.offset, variant.bytes);
     }
     return out.toOwnedSlice(a);
 }
@@ -209,66 +191,31 @@ pub const Text = struct {
             const offset = std.mem.readInt(u64, entry[32..40], .little);
             const wire = std.mem.readInt(u32, entry[40..44], .little);
             const raw = std.mem.readInt(u32, entry[44..48], .little);
-            if (offset < previous or offset > view.length or wire == 0 or wire > view.length - offset or raw > @as(u64, length) * 64 + 64 or std.mem.readInt(u32, entry[48..52], .little) > raw / 16) return error.InvalidData;
+            if (offset < previous or offset > view.length or wire == 0 or wire > view.length - offset or raw > @as(u64, length) * 64 + 64 or std.mem.readInt(u32, entry[48..52], .little) > length) return error.InvalidData;
             previous = offset + wire;
         }
         return .{ .view = view, .length = length, .pages = pages, .continuations = continuations, .variant_count = variants, .variants = entries };
     }
-    pub const Vector = struct {
-        a: A,
-        bytes: []u8,
-        items: []analysis.Token,
-        pub fn deinit(self: Vector) void {
-            self.a.free(self.items);
-            self.a.free(self.bytes);
-        }
-    };
-    /// Only the requested analyzer vector is fetched. Projection needs just
-    /// page navigation, never these independently compressed token payloads.
+    pub const Vector = offsets.Vector;
+    pub const Selection = offsets.Selection;
+    /// All-token reads remain useful to codec/compaction oracles. Serving passes
+    /// the compiled matcher selection and fetches only matching occurrence blocks.
     pub fn tokens(self: Text, a: A, signature: [32]u8, control: Token) !?Vector {
-        var p: Parser = .{ .bytes = self.variants };
-        var selected: ?[]const u8 = null;
-        var prior: u64 = if (self.pages.len == 0) 8 else last: {
-            const page = self.pages[self.pages.len - 16 ..][0..16];
-            break :last std.mem.readInt(u64, page[0..8], .little) + std.mem.readInt(u32, page[8..12], .little);
-        };
-        for (0..self.variant_count) |_| {
+        return self.selectTokens(a, signature, .{}, control);
+    }
+    pub fn selectTokens(self: Text, a: A, signature: [32]u8, selection: Selection, control: Token) !?Vector {
+        var found: ?[]const u8 = null;
+        for (0..self.variant_count) |i| {
             try control.check();
-            const entry = try p.take(52);
-            const offset = std.mem.readInt(u64, entry[32..40], .little);
-            const wire = std.mem.readInt(u32, entry[40..44], .little);
-            const raw = std.mem.readInt(u32, entry[44..48], .little);
-            const count = std.mem.readInt(u32, entry[48..52], .little);
-            if (offset < prior or offset > self.view.length or wire == 0 or wire > self.view.length - offset or raw > @as(u64, self.length) * 64 + 64 or count > raw / 16) return error.InvalidData;
-            prior = offset + wire;
-            if (std.mem.eql(u8, entry[0..32], &signature)) {
-                if (selected != null) return error.InvalidData;
-                selected = entry;
-            }
+            const entry = self.variants[i * 52 ..][0..52];
+            if (!std.mem.eql(u8, entry[0..32], &signature)) continue;
+            if (found != null) return error.InvalidData;
+            found = entry;
         }
-        if (p.at != p.bytes.len) return error.InvalidData;
-        const entry = selected orelse return null;
-        const encoded = try a.alloc(u8, std.mem.readInt(u32, entry[40..44], .little));
-        defer a.free(encoded);
-        try control.check();
-        try self.view.readInto(std.mem.readInt(u64, entry[32..40], .little), encoded);
-        const bytes = try a.alloc(u8, std.mem.readInt(u32, entry[44..48], .little));
-        errdefer a.free(bytes);
-        try decodeVector(encoded, bytes, control);
-        var vector: Parser = .{ .bytes = bytes };
-        const items = try a.alloc(analysis.Token, std.mem.readInt(u32, entry[48..52], .little));
-        errdefer a.free(items);
-        for (items, 0..) |*token, i| {
-            if (i % 256 == 0) try control.check();
-            const term = try vector.take(try vector.int(u32));
-            const start = try vector.int(u32);
-            const end = try vector.int(u32);
-            const position = try vector.int(u32);
-            if (start > end or end > self.length) return error.InvalidData;
-            token.* = .{ .term = term, .start_byte = start, .end_byte = end, .position = position };
-        }
-        if (vector.at != bytes.len) return error.InvalidData;
-        return .{ .a = a, .bytes = bytes, .items = items };
+        const entry = found orelse return null;
+        const start = std.mem.readInt(u64, entry[32..40], .little);
+        const size = std.mem.readInt(u32, entry[40..44], .little);
+        return try offsets.select(a, try View.init(self.view.source, self.view.offset + start, size), self.length, std.mem.readInt(u32, entry[44..48], .little), std.mem.readInt(u32, entry[48..52], .little), selection, control);
     }
     fn continuation(self: Text, offset: u32) bool {
         return offset < self.length and self.continuations.len != 0 and self.continuations[offset / 8] & (@as(u8, 1) << @as(u3, @intCast(offset % 8))) != 0;
@@ -416,6 +363,13 @@ pub const Writer = struct {
             try typed.encodeBinary(self.a, value);
         try self.append(doc, bytes);
     }
+    pub fn addPrepared(self: *Writer, doc: u32, value: std.json.Value, captured: Variants) !void {
+        const bytes = if (value == .string and value.string.len > 4096 and std.unicode.utf8ValidateSlice(value.string))
+            try writeTextPrepared(self.a, self.sink, self.start, value.string, captured)
+        else
+            try typed.encodeBinary(self.a, value);
+        try self.append(doc, bytes);
+    }
     pub fn copy(self: *Writer, doc: u32, cursor: *Cursor, original: u32) !void {
         if (try cursor.text(original)) |text| {
             if (self.records.items.len != 0 and self.records.items[self.records.items.len - 1].doc >= doc) return error.InvalidData;
@@ -436,11 +390,8 @@ pub const Writer = struct {
             for (0..text.variant_count) |i| {
                 const entry = text.variants[i * 52 ..][0..52];
                 const wire = std.mem.readInt(u32, entry[40..44], .little);
-                const encoded = try self.a.alloc(u8, wire);
-                defer self.a.free(encoded);
-                try text.view.readInto(std.mem.readInt(u64, entry[32..40], .little), encoded);
                 std.mem.writeInt(u64, bytes[variants_at + i * 52 + 32 ..][0..8], self.sink.len() - self.start, .little);
-                try self.sink.appendSlice(encoded);
+                try copyRange(self.sink, text.view, std.mem.readInt(u64, entry[32..40], .little), wire);
             }
             try self.records.append(self.a, .{ .doc = doc, .bytes = bytes });
             self.retained += bytes.len;
@@ -498,40 +449,14 @@ test "highlight native source compaction preserves analyzer vectors and section-
                 const tokens = (try value.tokens(alloc, try fingerprint(alloc, &analysis.simple_analyzer), .none)).?;
                 defer tokens.deinit();
                 try std.testing.expectEqual(@as(usize, 2), tokens.items.len);
-                try std.testing.expectEqualStrings("needle", tokens.items[1].term);
-                try std.testing.expectEqual(@as(u32, 4093), tokens.items[1].start_byte);
+                const needle = for (tokens.items) |token| {
+                    if (std.mem.eql(u8, token.term, "needle")) break token;
+                } else return error.MissingNeedle;
+                try std.testing.expectEqual(@as(u32, 4093), needle.start_byte);
             }
         }
     };
     try Run.run(a, source, text);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ source, text });
-}
-
-test "highlight analyzer vectors check deadlines between bounded decoded blocks" {
-    const a = std.testing.allocator;
-    const raw = try a.alloc(u8, page_size * 4);
-    defer a.free(raw);
-    @memset(raw, 'x');
-    const encoded = try encodeVector(a, raw);
-    defer a.free(encoded);
-    const decoded = try a.alloc(u8, raw.len);
-    defer a.free(decoded);
-    const Stop = struct {
-        calls: usize = 0,
-        fn check(ptr: *const anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
-            self.calls += 1;
-            if (self.calls == 2) return error.DeadlineExceeded;
-        }
-    };
-    var stop: Stop = .{};
-    @memset(decoded, 0);
-    try std.testing.expectError(error.DeadlineExceeded, decodeVector(encoded, decoded, .{ .ptr = &stop, .check_fn = Stop.check }));
-    try std.testing.expectEqual(@as(usize, 2), stop.calls);
-    try std.testing.expectEqualSlices(u8, raw[0..page_size], decoded[0..page_size]);
-    try std.testing.expectEqual(@as(u8, 0), decoded[page_size]);
-    try decodeVector(encoded, decoded, .none);
-    try std.testing.expectEqualSlices(u8, raw, decoded);
-    try std.testing.expectError(error.InvalidData, decodeVector(encoded[0 .. encoded.len - 1], decoded, .none));
 }

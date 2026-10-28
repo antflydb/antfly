@@ -730,10 +730,13 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         const final_entries = try final_reader.nextEntries(oa, 16);
         try std.testing.expectEqual(@as(usize, 2), final_entries.len);
         for (final_entries) |entry| {
-            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, entry.cover.?.block, .none, null);
-            defer a.free(bytes);
-            const block = try local.sql_spill.decodeColumnarBlockInArena(oa, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
-            const value = try block.cell(entry.cover.?.row, 0);
+            const columns = @import("lake_index_cover_columns.zig");
+            const cover = entry.cover.?;
+            var reads: u64 = 16 * 1024 * 1024;
+            var loaded = try columns.load(a, artifacts, cover.block, cover.striped, &.{0}, final_root.cover.len, .none, null, 16 * 1024 * 1024, &reads, null);
+            defer loaded.deinit();
+            try loaded.verify(final_root.domain, cover.row, entry.key[entry.key.len - 16 ..][0..16].*, columns.witness(final_root.domain, entry.key));
+            const value = try loaded.block.cell(cover.row, 0);
             try std.testing.expect(!value.sql_null);
             try std.testing.expectEqualStrings("indexed value", value.value.string);
         }
