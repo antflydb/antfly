@@ -61,6 +61,101 @@ const EntryIndex = struct {
     primary: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     collisions: std.AutoHashMapUnmanaged(u64, CollisionBucket) = .empty,
     collision_capacity_bytes: u64 = 0,
+    primary_allocation: ?Allocation = null,
+    collision_allocation: ?Allocation = null,
+
+    const Allocation = struct {
+        bytes: []u8,
+        alignment: std.mem.Alignment,
+    };
+
+    // Record the allocator's actual backing range rather than duplicating the
+    // standard hash map's private header/layout. A growth can briefly own both
+    // allocations; an allocation failure must preserve the previous receipt.
+    const AllocationObserver = struct {
+        backing: Allocator,
+        previous: ?Allocation,
+        replacement: ?Allocation = null,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const ptr = self.backing.rawAlloc(len, alignment, ret) orelse return null;
+            std.debug.assert(self.replacement == null);
+            self.replacement = .{ .bytes = ptr[0..len], .alignment = alignment };
+            return ptr;
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.previous != null and self.previous.?.bytes.ptr == bytes.ptr) {
+                self.previous = null;
+            } else {
+                std.debug.assert(self.replacement != null and self.replacement.?.bytes.ptr == bytes.ptr);
+                self.replacement = null;
+            }
+            self.backing.rawFree(bytes, alignment, ret);
+        }
+        fn finish(self: *@This()) ?Allocation {
+            std.debug.assert(self.previous == null or self.replacement == null);
+            return self.replacement orelse self.previous;
+        }
+    };
+
+    /// Owns a detached staging index. Each step scans a bounded number of hash
+    /// slots or poisons at most one 16 KiB allocation slice per credit. Iterator
+    /// state contains backing pointers, so moving the owner needs no fixup.
+    pub const Reclaimer = struct {
+        owned: EntryIndex,
+        values: @FieldType(EntryIndex, "collisions").ValueIterator,
+        bucket: ?Allocation = null,
+        offset: usize = 0,
+        complete: bool = false,
+
+        pub fn init(owned: EntryIndex) @This() {
+            return .{ .owned = owned, .values = owned.collisions.valueIterator() };
+        }
+        fn retireAllocation(self: *@This(), allocation: *?Allocation, allocator: Allocator, credits: *usize) bool {
+            const value = allocation.* orelse return true;
+            while (self.offset < value.bytes.len) {
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                const end = @min(value.bytes.len, self.offset + OwnedEntry.Retirement.quantum);
+                @memset(value.bytes[self.offset..end], undefined);
+                self.offset = end;
+            }
+            if (credits.* == 0) return false;
+            credits.* -= 1;
+            allocator.rawFree(value.bytes, value.alignment, @returnAddress());
+            allocation.* = null;
+            self.offset = 0;
+            return true;
+        }
+        pub fn step(self: *@This(), allocator: Allocator, credits: *usize) bool {
+            if (self.complete) return true;
+            while (self.bucket != null or self.values.len != 0) {
+                if (!self.retireAllocation(&self.bucket, allocator, credits)) return false;
+                if (self.values.len == 0) break;
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                // Limit next() even when the remaining map is very sparse.
+                const later = self.values.len - @min(self.values.len, 128);
+                self.values.len -= later;
+                const bucket = self.values.next();
+                self.values.len += later;
+                if (bucket) |value| {
+                    const bytes = std.mem.sliceAsBytes(value.allocatedSlice());
+                    if (bytes.len != 0) self.bucket = .{ .bytes = bytes, .alignment = .of(usize) };
+                }
+            }
+            if (!self.retireAllocation(&self.owned.collision_allocation, allocator, credits)) return false;
+            if (!self.retireAllocation(&self.owned.primary_allocation, allocator, credits)) return false;
+            self.owned = .{};
+            self.complete = true;
+            return true;
+        }
+    };
 
     pub fn deinit(self: *EntryIndex, allocator: Allocator) void {
         var values = self.collisions.valueIterator();
@@ -91,13 +186,17 @@ const EntryIndex = struct {
     }
 
     fn insert(self: *EntryIndex, allocator: Allocator, key_hash: u64, idx: usize) !void {
-        const primary = try self.primary.getOrPut(allocator, key_hash);
+        var primary_observer: AllocationObserver = .{ .backing = allocator, .previous = self.primary_allocation };
+        defer self.primary_allocation = primary_observer.finish();
+        const primary = try self.primary.getOrPut(primary_observer.allocator(), key_hash);
         if (!primary.found_existing) {
             primary.value_ptr.* = idx;
             return;
         }
 
-        const collision = try self.collisions.getOrPut(allocator, key_hash);
+        var collision_observer: AllocationObserver = .{ .backing = allocator, .previous = self.collision_allocation };
+        defer self.collision_allocation = collision_observer.finish();
+        const collision = try self.collisions.getOrPut(collision_observer.allocator(), key_hash);
         if (!collision.found_existing) collision.value_ptr.* = .empty;
         const old_capacity = collision.value_ptr.capacity;
         collision.value_ptr.append(allocator, idx) catch |err| {

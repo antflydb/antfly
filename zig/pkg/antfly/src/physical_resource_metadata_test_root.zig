@@ -7819,7 +7819,7 @@ test "physical cache metadata registered flush publication periodic checkpoint p
     try normalAdmittedPeriodicCheckpoint(.plan_partial);
 }
 
-fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure }) !void {
+fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, partial, concurrent, namespace_erased, docstore, docstore_gate, guarded, staging_spares, cancel_io, cancel_append, pressure, retirement_resume, prepare_reject }) !void {
     const local = @import("antfly_local_sources");
     const lsm = local.storage_lsm_backend_mod;
     const io_mod = local.storage_lsm_backend_storage_io;
@@ -7877,6 +7877,24 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
                 io_mod.NativeSyncTestControl.pause.store(true, .release);
             }
         }
+        var retire_calls: usize = 0;
+        var retire_refused: bool = false;
+        var refused_offset: usize = 0;
+        fn retire(owner: *foreground.Owner, original: read_admission.Port) !void {
+            try original.checkpoint();
+            retire_calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), execution.owner.scheduler.stats().cleanup_runnable_slots);
+            try std.testing.expect(backend.mu.tryLock());
+            backend.mu.unlock();
+            if (owner.input_index) |index| {
+                if (retire_refused) try std.testing.expect(index.offset >= refused_offset);
+                if (selected == .retirement_resume and index.offset > 0 and !retire_refused) {
+                    refused_offset = index.offset;
+                    retire_refused = true;
+                    return error.ResourceBudgetExceeded;
+                }
+            }
+        }
         var calls: std.atomic.Value(usize) = .init(0);
         var joined: std.atomic.Value(usize) = .init(0);
         var injected: std.atomic.Value(bool) = .init(false);
@@ -7893,6 +7911,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
                     io_mod.NativeSyncTestControl.pause.store(true, .release);
                 }
                 if (selected == .partial) io_mod.NativeSyncTestControl.append_failure_after.store(8, .release);
+                if (selected == .prepare_reject) return error.ResourceBudgetExceeded;
             } else if (selected == .accepted_reject) return error.ResourceBudgetExceeded;
         }
         fn abort(original: read_admission.Port) !void {
@@ -7908,6 +7927,10 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     H.backend = handle.ptr();
     H.execution = &state;
     H.calls.store(0, .release);
+    H.retire_calls = 0;
+    H.retire_refused = false;
+    H.refused_offset = 0;
+    foreground.test_retire_hook = H.retire;
     H.joined.store(0, .release);
     H.injected.store(false, .release);
     H.store_gate = .unlocked;
@@ -7923,6 +7946,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
         foreground.Operation.test_hook = null;
         foreground.test_hook = null;
         foreground.test_abort_hook = null;
+        foreground.test_retire_hook = null;
     }
     var seed = try handle.ptr().beginWrite();
     defer seed.abort();
@@ -7930,6 +7954,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     try seed.commit();
     const before = handle.ptr().snapshotWriteStats();
     const retained_before = resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes;
+    const debt_before = handle.ptr().manifest_unpublished_wire_bytes;
     const Worker = struct {
         backend: *lsm.Backend,
         execution: *owners.State,
@@ -7968,6 +7993,13 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
             defer write.abort();
             try write.put(.{}, "first", self.value);
             if (self.selected == .staging_spares) try write.mutable.ordered.prepareEdits(std.testing.allocator, 1);
+            if (self.selected == .retirement_resume or self.selected == .prepare_reject) {
+                for (0..1024) |i| {
+                    var key: [32]u8 = undefined;
+                    const name = try std.fmt.bufPrint(&key, "retired-{d}", .{i});
+                    try write.put(.{}, name, "owned staged value");
+                }
+            }
             try write.commitWithAdmission(original);
         }
     };
@@ -8026,6 +8058,9 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     if (mode == .accepted_reject) {
         try std.testing.expectEqual(@as(?anyerror, error.ResourceBudgetExceeded), worker.failure);
         try std.testing.expect(H.joined.load(.acquire) >= 2);
+    } else if (mode == .prepare_reject) {
+        try std.testing.expectEqual(@as(?anyerror, error.ResourceBudgetExceeded), worker.failure);
+        try std.testing.expectEqual(debt_before, handle.ptr().manifest_unpublished_wire_bytes);
     } else if (mode == .cancel_io or mode == .cancel_append) {
         try std.testing.expectEqual(@as(?anyerror, error.Canceled), worker.failure);
         try std.testing.expect(H.joined.load(.acquire) >= 1);
@@ -8039,7 +8074,7 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     if (mode == .guarded) try std.testing.expectEqual(@as(usize, 0), H.calls.load(.acquire)) else if (mode != .pressure) try std.testing.expect(H.calls.load(.acquire) > 0);
     try std.testing.expect(!handle.ptr().foreground_commit_pending and handle.ptr().active_foreground_preparation == null);
     const after = handle.ptr().snapshotWriteStats();
-    const successful = mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append;
+    const successful = mode != .accepted_reject and mode != .partial and mode != .pressure and mode != .cancel_io and mode != .cancel_append and mode != .prepare_reject;
     try std.testing.expectEqual(before.wal_append_records + @intFromBool(successful), after.wal_append_records);
     try std.testing.expectEqual(before.wal_segment_syncs + @intFromBool(successful and mode == .sync), after.wal_segment_syncs);
     if (successful) try std.testing.expect(resources.resource_manager.sliceStats(.lsm_wal_retention).used_bytes >= retained_before + after.wal_append_bytes - before.wal_append_bytes);
@@ -8047,6 +8082,8 @@ fn foregroundAdmittedCommit(mode: enum { plain, sync, large, accepted_reject, pa
     handle.abandonAfterCrash();
     open = false;
     RegisteredOutputFixture.drain(&resources.resource_manager);
+    if (mode == .retirement_resume) try std.testing.expect(H.retire_refused);
+    if (mode == .retirement_resume or mode == .prepare_reject) try std.testing.expect(H.retire_calls > 1);
     try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
     var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .backend = .{ .read_only = true } });
@@ -8101,4 +8138,47 @@ test "physical cache metadata registered flush publication foreground WAL cancel
 }
 test "physical cache metadata registered flush publication foreground WAL cancellation after accepted append fences possible commit for recovery" {
     try foregroundAdmittedCommit(.cancel_append);
+}
+
+test "physical cache metadata registered flush publication foreground WAL resumes large staging index retirement after refusal" {
+    try foregroundAdmittedCommit(.retirement_resume);
+}
+
+test "physical cache metadata registered flush publication foreground WAL retires rejected staged rows without retaining unpublished debt" {
+    try foregroundAdmittedCommit(.prepare_reject);
+}
+
+test "physical cache metadata registered flush publication staging index growth receipts survive every allocation failure" {
+    const state = @import("antfly_local_sources").storage_lsm_backend_state;
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var staged: state.ActiveMemTable = .{ .ordered_enabled = false };
+            defer {
+                var retirement: @FieldType(state.ActiveMemTable, "index").Reclaimer = .init(staged.index);
+                staged.index = .{};
+                while (true) {
+                    var credits: usize = 1;
+                    if (retirement.step(a, &credits)) break;
+                }
+                staged.deinit(a);
+            }
+            for (0..64) |i| {
+                var key: [32]u8 = undefined;
+                const name = try std.fmt.bufPrint(&key, "staged-{d}", .{i});
+                try staged.upsert(a, .{}, name, "value", false);
+            }
+            // Force the lookup mismatch that a hash collision produces. Keep
+            // real owned entries and run the normal upsert path, including
+            // collision-map growth and bucket-append allocation failures.
+            // The primary map does not grow: each hash is already resident.
+            var values = staged.index.primary.valueIterator();
+            while (values.next()) |idx| {
+                const entry = staged.entries.items[idx.*];
+                idx.* = (idx.* + 1) % 64;
+                try staged.upsert(a, .{}, entry.key, "collision", false);
+            }
+            try std.testing.expectEqual(@as(usize, 64), staged.index.collisions.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

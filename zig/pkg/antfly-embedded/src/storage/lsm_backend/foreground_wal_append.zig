@@ -15,7 +15,8 @@
 
 //! A foreground commit borrows only the caller's explicit lendable execution.
 //! Backend metadata adoption occurs after the exact accepted IO is joined and
-//! its WAL gate released. The producer retains staged input through that call.
+//! its WAL gate released. Publication or rejection transfers staged input to
+//! this owner before the producer returns and releases its transaction.
 const std = @import("std");
 const admission = @import("../../common/read_admission.zig");
 const io = @import("storage_io.zig");
@@ -23,6 +24,7 @@ const wal = @import("wal.zig");
 const state = @import("state.zig");
 const Backend = @import("../lsm_backend.zig").Backend;
 pub var test_hook: ?*const fn (*Owner, admission.Port) anyerror!void = null;
+pub var test_retire_hook: ?*const fn (*Owner, admission.Port) anyerror!void = null;
 pub var test_abort_hook: ?*const fn (admission.Port) anyerror!void = null;
 pub const Publication = struct {
     owner: *Owner,
@@ -42,8 +44,8 @@ pub const Operation = wal.CurrentStateAppend(Publication);
 pub const Owner = struct {
     cpu: state.ActiveMemTable.PublicationPreparation = undefined,
     cpu_live: bool = false,
-    input_index: ?@FieldType(state.ActiveMemTable, "index") = null,
-    input_ordered: ?@FieldType(state.ActiveMemTable, "ordered") = null,
+    input_index: ?@FieldType(state.ActiveMemTable, "index").Reclaimer = null,
+    input_ordered: ?@FieldType(state.ActiveMemTable, "ordered").Reclaimer = null,
     record: []u8 = &.{},
     record_retired: usize = 0,
     grant: ?io.DurabilityResources = null,
@@ -97,6 +99,14 @@ pub const Owner = struct {
             self.lock = null;
         }
     }
+    pub fn takeInput(self: *@This(), incoming: *state.ActiveMemTable) void {
+        std.debug.assert(self.cpu_live and self.input_index == null and self.input_ordered == null);
+        self.cpu.source = .{ .entries = incoming.entries, .arena_owner = incoming.arena_owner };
+        self.cpu.source_owned = true;
+        self.input_index = .init(incoming.index);
+        self.input_ordered = .init(incoming.ordered);
+        incoming.* = .{ .ordered_enabled = false };
+    }
     pub fn retireWithAdmission(self: *@This(), a: std.mem.Allocator, original: ?admission.Port) !void {
         if (self.retired) return;
         if (self.operation) |*operation| {
@@ -112,8 +122,14 @@ pub const Owner = struct {
             self.grant = null;
         }
         if (self.input_ordered) |*index| {
-            if (original) |port| try port.checkpoint();
-            index.deinit(a);
+            while (true) {
+                if (original) |port| {
+                    try port.checkpoint();
+                    if (comptime @import("builtin").is_test) if (test_retire_hook) |hook| try hook(self, port);
+                }
+                var credits: usize = 1;
+                if (index.step(a, &credits)) break;
+            }
             self.input_ordered = null;
         }
         if (self.cpu_live) {
@@ -121,8 +137,14 @@ pub const Owner = struct {
             self.cpu_live = false;
         }
         if (self.input_index) |*index| {
-            if (original) |port| try port.checkpoint();
-            index.deinit(a);
+            while (true) {
+                if (original) |port| {
+                    try port.checkpoint();
+                    if (comptime @import("builtin").is_test) if (test_retire_hook) |hook| try hook(self, port);
+                }
+                var credits: usize = 1;
+                if (index.step(a, &credits)) break;
+            }
             self.input_index = null;
         }
         while (self.record_retired < self.record.len) {

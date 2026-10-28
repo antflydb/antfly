@@ -7580,7 +7580,7 @@ pub const Backend = struct {
     /// The transaction caller owns Backend.mu and its staged input. Only an
     /// explicit lendable scope may take this path; guarded DB publication ports
     /// retain their existing non-lending policy until their phase handoff.
-    pub fn publishMutableWithWalAdmission(self: *Backend, incoming: *ActiveMemTable, original: read_admission.Port) !bool {
+    pub fn publishMutableWithWalAdmission(self: *Backend, incoming: *ActiveMemTable, original: read_admission.Port, retired_without_commit: *bool) !bool {
         try original.checkpoint();
         if (!try original.hasExecutionWait() or (try original.deadlineNs()) == null) return false;
         const owner = self.background_executor.runtime orelse return false;
@@ -7598,6 +7598,16 @@ pub const Backend = struct {
         std.debug.assert(self.active_foreground_preparation == null);
         self.active_foreground_preparation = frame;
         defer self.retireManifestPreparation(frame);
+        // Once the CPU preparation exists it borrows these exact staged rows.
+        // On rejection, move them into its cleanup owner before Runtime's
+        // error path runs. The receipt prevents empty input from being mistaken
+        // for a successful publication when retaining manifest debt.
+        errdefer if (frame.foreground_owner) |work| {
+            if (work.cpu_live) {
+                work.takeInput(incoming);
+                retired_without_commit.* = true;
+            }
+        };
         const started = self.writeStatsNowNs();
         self.mu.unlock();
         const prepared = frame.prepareForeground(self, incoming, original);
@@ -7647,11 +7657,7 @@ pub const Backend = struct {
         }
         // Move staged payloads into the credited retirement owner. The CPU
         // preparation borrowed them only until this fixed ownership receipt.
-        work.cpu.source = .{ .entries = incoming.entries, .arena_owner = incoming.arena_owner };
-        work.cpu.source_owned = true;
-        work.input_index = incoming.index;
-        work.input_ordered = incoming.ordered;
-        incoming.* = .{ .ordered_enabled = false };
+        work.takeInput(incoming);
         return true;
     }
 

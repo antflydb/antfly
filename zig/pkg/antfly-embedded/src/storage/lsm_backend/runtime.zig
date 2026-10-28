@@ -472,10 +472,10 @@ pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
-fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port) !void {
+fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, control: ?read_admission.Port, retired_without_commit: *bool) !void {
     if (incoming.entryCount() == 0) return;
     if (comptime @hasDecl(@TypeOf(backend.*), "publishMutableWithWalAdmission")) if (control) |original| {
-        if (try backend.publishMutableWithWalAdmission(incoming, original)) return;
+        if (try backend.publishMutableWithWalAdmission(incoming, original, retired_without_commit)) return;
     };
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
         var candidate = if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
@@ -5241,6 +5241,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             else
                 lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+            var retired_without_commit = false;
             var release_on_error = true;
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
@@ -5257,7 +5258,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const admission = if (comptime @hasDecl(BackendType, "admitPreparedCommit")) try self.backend.admitPreparedCommit(&self.mutable, &self.bulk_appends, wire_credit) else if (comptime @hasDecl(BackendType, "admitCommit")) try self.backend.admitCommit(&self.mutable, &self.bulk_appends) else {};
             defer if (comptime @hasDecl(BackendType, "admitCommit")) {
                 if (comptime @hasDecl(BackendType, "admitPreparedCommit")) {
-                    if ((self.mutable.entryCount() == 0 and self.bulk_appends.entryCount() == 0) or
+                    if ((!retired_without_commit and self.mutable.entryCount() == 0 and self.bulk_appends.entryCount() == 0) or
                         (if (@hasField(BackendType, "manifest_recovery_required")) self.backend.manifest_recovery_required else false)) admission.retainDebt();
                 }
                 admission.release();
@@ -5273,7 +5274,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control);
+                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -11282,6 +11283,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             else
                 lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+            var retired_without_commit = false;
             var release_on_error = true;
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
@@ -11299,7 +11301,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             const admission = if (comptime @hasDecl(BackendType, "admitPreparedCommit")) try self.backend.admitPreparedCommit(&self.mutable, &self.bulk_appends, wire_credit) else if (comptime @hasDecl(BackendType, "admitCommit")) try self.backend.admitCommit(&self.mutable, &self.bulk_appends) else {};
             defer if (comptime @hasDecl(BackendType, "admitCommit")) {
                 if (comptime @hasDecl(BackendType, "admitPreparedCommit")) {
-                    if ((self.mutable.entryCount() == 0 and self.bulk_appends.entryCount() == 0) or
+                    if ((!retired_without_commit and self.mutable.entryCount() == 0 and self.bulk_appends.entryCount() == 0) or
                         (if (@hasField(BackendType, "manifest_recovery_required")) self.backend.manifest_recovery_required else false)) admission.retainDebt();
                 }
                 admission.release();
@@ -11315,7 +11317,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control);
+                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable, control, &retired_without_commit);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
