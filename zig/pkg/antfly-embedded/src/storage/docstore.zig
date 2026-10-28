@@ -782,7 +782,7 @@ pub const DocStore = struct {
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-            try self.document_revisions.touchValue(self.alloc, key, value);
+            try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -964,7 +964,7 @@ pub const DocStore = struct {
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-                try self.document_revisions.touchValue(self.alloc, key, value);
+                try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -1001,7 +1001,7 @@ pub const DocStore = struct {
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
-                try self.document_revisions.touchValue(self.alloc, key, value);
+                if (self.unordered_bulk_append_puts) try self.document_revisions.touchValue(self.alloc, key, value) else try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
                 try self.artifact_footprint.touch(key, value);
                 // Active tracking requires point updates for bucket counters.
                 // Restore bulk writers publish into a fresh identity; they may

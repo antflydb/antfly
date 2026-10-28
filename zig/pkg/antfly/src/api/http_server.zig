@@ -5309,7 +5309,7 @@ pub const ApiHttpServer = struct {
         }
         fn dispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table: []const u8, body: []const u8, filter: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver);
+            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver, null);
             return result.json;
         }
         fn build(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, value: std.json.Value, deadline: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
@@ -5334,6 +5334,7 @@ pub const ApiHttpServer = struct {
             null,
             execution_deadline_ns,
             cancellation,
+            null,
             null,
             null,
             null,
@@ -14701,6 +14702,7 @@ pub const ApiHttpServer = struct {
             null,
             null,
             null,
+            null,
         );
         return response.json;
     }
@@ -14750,6 +14752,7 @@ pub const ApiHttpServer = struct {
                 response_label,
                 bound_join,
                 resolver,
+                resolver.delivery,
             ) catch |err| switch (err) {
                 error.IndexRebuilding,
                 error.DocIdentityNamespaceMismatch,
@@ -14918,6 +14921,7 @@ pub const ApiHttpServer = struct {
             binding.label,
             if (binding.join) |*join| join else null,
             &resolver,
+            null,
         ) catch |err| {
             if (query_api.isPublicQueryValidationError(err)) return error.InvalidRetrievalAgentRequest;
             return err;
@@ -14937,6 +14941,7 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         catalog_resolver: ?*CatalogQueryResolver,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !query_api.QueryResponse {
         var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
@@ -14959,7 +14964,7 @@ pub const ApiHttpServer = struct {
                 cancellation,
                 response_label,
                 resolver,
-                resolver.delivery,
+                delivery,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.InvalidFilterQueryRequest,
@@ -15139,7 +15144,7 @@ pub const ApiHttpServer = struct {
             return .{ .json = try distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources) };
         }
 
-        const result = self.executePlainPublicTableQuery(
+        const result = self.executePlainPublicTableQueryWithDelivery(
             alloc,
             source,
             table_name,
@@ -15151,6 +15156,7 @@ pub const ApiHttpServer = struct {
             cancellation,
             response_label,
             resolver,
+            delivery,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest,
@@ -15744,7 +15750,12 @@ pub const ApiHttpServer = struct {
             if (try @import("lake_index_text_query.zig").executeWithDelivery(alloc, self, table, query_req.req, lake_request, delivery)) |result| return result;
         }
         if (query_req.req.remote_snapshot != null and query_req.req.native_query_cut == null) return error.InvalidQueryRequest;
-        return (queryWithTransientReadRetry(
+        // Source-program preparation is a physical delivery choice, not a
+        // change to every ordinary public query. Wire consumers keep the native
+        // reader's owned-response shortcut; lake delivery was handled above.
+        const native_delivery = if (delivery) |sink| (if (sink.typed_result != null) sink else null) else null;
+        if (native_delivery != null) try query_req.prepareEncodedDelivery(alloc);
+        return (queryWithTransientReadRetryAndDelivery(
             alloc,
             self.sharedApiIo(),
             source,
@@ -15752,6 +15763,7 @@ pub const ApiHttpServer = struct {
             query_req.req,
             .read_index,
             .{ .resolve = self },
+            native_delivery,
         ) catch |err| switch (err) {
             // Public filter syntax is validated and attributed during request
             // normalization. A later InvalidArgument can originate from any
@@ -15990,6 +16002,22 @@ pub const ApiHttpServer = struct {
         consistency: raft_mod.ReadConsistency,
         missing_index_lifecycle: MissingIndexLifecycle,
     ) !?query_api.QueryResponse {
+        return queryWithTransientReadRetryAndDelivery(alloc, retry_io, source, table_name, req, consistency, missing_index_lifecycle, null);
+    }
+
+    fn queryWithTransientReadRetryAndDelivery(
+        alloc: std.mem.Allocator,
+        retry_io: ?std.Io,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        requested: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+        missing_index_lifecycle: MissingIndexLifecycle,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+    ) !?query_api.QueryResponse {
+        var req = requested;
+        const source_only = if (req.field_projection_plan) |shared| (if (shared.get(req.field_projection_json)) |plan| plan.bindings.len == 0 else false) else false;
+        var source_fallback = false;
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
         const start_ns = retryMonotonicNs(retry_io);
@@ -15999,7 +16027,19 @@ pub const ApiHttpServer = struct {
         while (true) : (attempts += 1) {
             try ensureRequestActive(req.cancellation);
             if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
-            return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
+            return source.queryWithDelivery(alloc, table_name, req, consistency, delivery) catch |err| switch (err) {
+                error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.InvalidArgument => {
+                    if (!source_only or source_fallback) return err;
+                    // Source-only preparation is an optimization, never a
+                    // requirement imposed on older workers. Keep all filters,
+                    // authority, cut, consistency and deadlines on one retry.
+                    source_fallback = true;
+                    req.field_projection_json = &.{};
+                    req.field_projection_plan = null;
+                    req.field_projection_transport = false;
+                    req.defer_stored_projection = false;
+                    continue;
+                },
                 error.IndexGenerationMismatch => {
                     // Release the failed query's entire snapshot before one
                     // fresh attempt. Never retry just a reverse-edge probe:
@@ -22488,6 +22528,12 @@ pub const ApiHttpServer = struct {
         );
     }
 
+    pub fn consumePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, delivery: @import("antfly_local_sources").api_query_response.Delivery) !contextual_operations.OwnedResponse {
+        if (!self.tryAcquireQuery()) return self.queryOverloadedResponse();
+        defer self.releaseQuery();
+        return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, "application/json", identity, cancellation, delivery);
+    }
+
     /// Execute while the caller holds this server's query permit. Transport
     /// adapters use this to retain protocol-specific overload responses
     /// without double-counting application admission.
@@ -22530,9 +22576,15 @@ pub const ApiHttpServer = struct {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 try self_.target.write_fn(self_.target.ptr, bytes);
             }
+            fn consume(raw: *anyopaque, result: @import("antfly_local_sources").api_query_response.ResultView) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                try self_.server.reachQueryResultLifecycle("public.table.query", self_.table_name, 0);
+                const target = self_.target.typed_result.?;
+                try target.consume(target.ptr, result);
+            }
         };
         var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target } else null;
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = true } else null };
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .typed_result = if (value.target.typed_result != null) .{ .ptr = value, .consume = Bridge.consume } else null, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = value.target.typed_result == null } else null };
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
         if (bridge) |*value| value.table_name = binding.physical;
@@ -58110,6 +58162,7 @@ test "api http server executes direct foreign table aggregations through registr
         null,
         null,
         null,
+        null,
     ));
     var unsupported_response = try server.publicQueryOperationErrorResponse("pg_customers", unsupported_body, error.UnsupportedQueryRequest);
     defer unsupported_response.deinit(alloc);
@@ -60293,4 +60346,135 @@ test "httpx inference gateway document authority recovery does not block existin
     const migrated = (try backend.capability().get(a, "documents/legacy")).?;
     defer a.free(migrated);
     try std.testing.expect(migrated.len > 0);
+}
+
+test "httpx inference gateway native delivery preserves retries and source only compatibility" {
+    const a = std.testing.allocator;
+    var parsed = try query_contract.parsePublicQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[\"images.preview\"]}");
+    defer parsed.deinit(a);
+    try parsed.prepareEncodedDelivery(a);
+    const Fake = struct {
+        attempts: usize = 0,
+        legacy: bool = false,
+        expected_prefix: []const u8 = "tenant/",
+        require_prepared: bool = false,
+        allow_wire: bool = false,
+        wire_calls: usize = 0,
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query, .query_with_delivery = queryWithDelivery } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.wire_calls += 1;
+            if (!self.allow_wire) return error.UnexpectedLegacyQuery;
+            try std.testing.expect(req.field_projection_plan == null);
+            try std.testing.expect(req.field_projection_json.len == 0);
+            return try query_contract.encodeQueryResponses(alloc, table, req, .{}, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 });
+        }
+        fn queryWithDelivery(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, delivery: ?@import("antfly_local_sources").api_query_response.Delivery) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings(self.expected_prefix, req.filter_prefix);
+            if (self.require_prepared) {
+                try std.testing.expect(req.field_projection_plan != null);
+                try std.testing.expect(req.field_projection_json.len != 0);
+            }
+            if (self.legacy and req.field_projection_json.len != 0) return error.InvalidQueryRequest;
+            if (self.legacy) {
+                try std.testing.expect(req.field_projection_plan == null);
+                try std.testing.expect(!req.defer_stored_projection);
+            }
+            return try query_contract.encodeQueryResponsesWithDelivery(alloc, table, req, .{}, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, delivery);
+        }
+    };
+    const Sink = struct {
+        count: usize = 0,
+        reject: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, view: @import("antfly_local_sources").api_query_response.ResultView) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            try std.testing.expect(view.result.status == 200);
+            if (self.reject) return error.ConsumerRejected;
+        }
+    };
+    var sink: Sink = .{};
+    const delivery: @import("antfly_local_sources").api_query_response.Delivery = .{ .ptr = &sink, .start_fn = Sink.start, .write_fn = Sink.write, .typed_result = .{ .ptr = &sink, .consume = Sink.consume } };
+    var req = parsed.req;
+    req.filter_prefix = "tenant/";
+    var native: Fake = .{};
+    var direct = (try ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, native.source(), "docs", req, .read_index, .none, delivery)).?;
+    defer direct.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), native.attempts);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    try std.testing.expectEqual(@as(?usize, 0), direct.delivered_bytes);
+    var older: Fake = .{ .legacy = true };
+    sink = .{};
+    var compatible = (try ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, older.source(), "docs", req, .read_index, .none, delivery)).?;
+    defer compatible.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), older.attempts);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    // A consumer failure must not be mistaken for an older worker and replayed.
+    native = .{};
+    sink = .{ .reject = true };
+    try std.testing.expectError(error.QueryDeliveryFailed, ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, native.source(), "docs", req, .read_index, .none, delivery));
+    try std.testing.expectEqual(@as(usize, 1), native.attempts);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    // Named expressions are requested behavior and never a compatibility hint.
+    var named = try query_contract.parsePublicQueryRequest(a, null, "docs", "{\"fields\":[],\"select\":{\"x\":{\"literal\":1}}}");
+    defer named.deinit(a);
+    var named_req = named.req;
+    named_req.filter_prefix = "tenant/";
+    older = .{ .legacy = true };
+    sink = .{};
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, older.source(), "docs", named_req, .read_index, .none, delivery));
+    try std.testing.expectEqual(@as(usize, 1), older.attempts);
+    try std.testing.expectEqual(@as(usize, 0), sink.count);
+
+    const Status = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Status.status } }, null, null);
+    defer server.deinit();
+    // Exercise dispatch, not only its lower-level retry helper. Query-only
+    // bodies and modern search bodies reach different normalization branches.
+    // Both must preserve the admitted native consumer and source preparation.
+    for ([_][]const u8{
+        "{\"query\":{\"bool\":{\"filter\":{\"ids\":[\"a\"]}}},\"fields\":[\"images.preview\",\"revision\",\"permissions\"],\"limit\":1}",
+        "{\"filter_query\":{\"ids\":[\"a\"]},\"fields\":[\"images.preview\",\"revision\",\"permissions\"],\"limit\":1}",
+    }) |body| {
+        native = .{ .expected_prefix = "", .require_prepared = true };
+        sink = .{};
+        var resolver = ApiHttpServer.CatalogQueryResolver{ .arena = a, .delivery = delivery };
+        var dispatched = try server.executePublicTableQueryDispatchWithIdentity(a, native.source(), "docs", body, null, null, null, null, null, null, &resolver, delivery);
+        defer dispatched.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), native.attempts);
+        try std.testing.expectEqual(@as(usize, 1), sink.count);
+        try std.testing.expectEqual(@as(?usize, 0), dispatched.delivered_bytes);
+        // Nested join/retrieval dispatch must retain its owned response even
+        // while sharing catalog state with an outer native consumer.
+        native = .{ .expected_prefix = "", .allow_wire = true };
+        sink = .{};
+        var nested = try server.executePublicTableQueryDispatchWithIdentity(a, native.source(), "docs", body, null, null, null, null, null, null, &resolver, null);
+        defer nested.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), native.wire_calls);
+        try std.testing.expectEqual(@as(usize, 0), native.attempts);
+        try std.testing.expectEqual(@as(usize, 0), sink.count);
+        try std.testing.expect(nested.json.len != 0);
+        try std.testing.expect(nested.delivered_bytes == null);
+    }
 }
