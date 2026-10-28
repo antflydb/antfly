@@ -86,10 +86,21 @@ pub fn writeText(a: A, sink: *Sink, start: usize, text: []const u8, analyzers: [
     if (has_continuations) for (text, 0..) |byte, i| if (byte & 0xc0 == 0x80) {
         out.items[bitmap_at + i / 8] |= @as(u8, 1) << @as(u3, @intCast(i % 8));
     };
-    try u32add(a, &out, analyzers.len);
+    const Variant = struct { analyzer: *const analysis.Analyzer, signature: [32]u8 };
+    var variants: std.ArrayList(Variant) = .empty;
+    defer variants.deinit(a);
     for (analyzers) |analyzer| {
         if (!eligibleAnalyzer(analyzer)) return error.InvalidData;
-        try out.appendSlice(a, &try fingerprint(a, analyzer));
+        const signature = try fingerprint(a, analyzer);
+        const duplicate = for (variants.items) |prior| {
+            if (std.mem.eql(u8, &prior.signature, &signature)) break true;
+        } else false;
+        if (!duplicate) try variants.append(a, .{ .analyzer = analyzer, .signature = signature });
+    }
+    try u32add(a, &out, variants.items.len);
+    for (variants.items) |variant| {
+        const analyzer = variant.analyzer;
+        try out.appendSlice(a, &variant.signature);
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const sa = scratch.allocator();
@@ -431,7 +442,8 @@ test "highlight native source compaction preserves analyzer vectors and section-
     var first = original.sink();
     var writer = try Writer.init(a, &first);
     defer writer.deinit();
-    try writer.add(7, .{ .string = text }, &.{&analysis.simple_analyzer});
+    const alias = analysis.simple_analyzer;
+    try writer.add(7, .{ .string = text }, &.{ &analysis.simple_analyzer, &alias });
     try std.testing.expect(try writer.finish());
     const source = try View.init(.{ .contiguous = original.out.items }, 0, original.out.items.len);
     const Run = struct {
@@ -451,6 +463,7 @@ test "highlight native source compaction preserves analyzer vectors and section-
             defer copied.deinit();
             for ([_]u32{ 2, 0 }) |doc| {
                 const value = (try copied.text(doc)).?;
+                try std.testing.expectEqual(@as(u32, 1), value.variant_count);
                 const raw = try value.read(alloc, 0, value.length, .none);
                 defer alloc.free(raw);
                 try std.testing.expectEqualStrings(expected, raw);
