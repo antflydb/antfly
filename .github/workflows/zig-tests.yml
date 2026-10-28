@@ -170,7 +170,20 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
+
+      - name: Fetch validation diff base
+        env:
+          BASE_SHA: ${{ inputs.base_sha || github.event.merge_group.base_sha || github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -f scripts/ci/fetch_validation_base.py ]]; then
+            python3 scripts/ci/fetch_validation_base.py "$BASE_SHA"
+          else
+            # Older approved PR heads predate this helper. Keep their complete
+            # coverage until they merge main rather than failing or skipping.
+            echo "VALIDATION_FORCE_ALL=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Verify Zig release pins and checksums
         run: python3 scripts/ci/verify_zig_toolchain.py
@@ -227,7 +240,7 @@ jobs:
           HELPER
           chmod +x "$helper"
 
-          if [[ "${{ inputs.full_validation }}" == "true" ]]; then
+          if [[ "${VALIDATION_FORCE_ALL:-false}" == "true" || "${{ inputs.full_validation }}" == "true" ]]; then
             {
               echo "zig_tests=true"
               echo "e2e=true"
@@ -609,7 +622,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: true
 
       - name: Sample ARC runner disk use
@@ -918,7 +931,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: true
 
       - name: Sample ARC runner disk use
@@ -1028,7 +1041,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: true
 
       - name: Sample ARC runner disk use

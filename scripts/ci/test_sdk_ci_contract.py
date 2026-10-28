@@ -93,6 +93,24 @@ class SdkCiContractTests(unittest.TestCase):
         self.assertIn("turbo run test --concurrency=1", check_script)
         self.assertNotIn("turbo run lint typecheck build test", check_script)
 
+    def test_canonical_bundle_is_retained_even_for_sdk_only_failures(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/sdks-ci.yml").read_text()
+        upload = re.search(
+            r"      - name: Upload canonical Antfarm bundle\n(.*?)(?=      - |\Z)",
+            workflow,
+            re.DOTALL,
+        )[1]
+        self.assertIn(
+            "if: always() && hashFiles('ts/apps/antfarm/dist/index.html') != ''", upload
+        )
+        self.assertNotIn("steps.scopes.outputs", upload)
+        self.assertIn("path: ts/apps/antfarm/dist", upload)
+        # Retaining diagnostics must not weaken the generated-bundle assertion.
+        self.assertIn(
+            "diff -qr apps/antfarm/dist ../zig/pkg/antfly/antfarm",
+            (REPO_ROOT / "scripts/ci/check.sh").read_text(),
+        )
+
     def test_vitest_worker_counts_are_bounded(self) -> None:
         packages = (
             "ts/packages/sdk/package.json",

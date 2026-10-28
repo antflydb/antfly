@@ -200,8 +200,8 @@ importers:
         specifier: ^3.6.0
         version: 3.6.0
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@chromatic-com/storybook':
         specifier: ^5.2.1
@@ -253,7 +253,7 @@ importers:
         version: 4.1.9(@vitest/browser@4.1.9)(vitest@4.1.9)
       ai:
         specifier: ^6.0.206
-        version: 6.0.206(zod@4.4.3)
+        version: 6.0.206(zod@4.6.7)
       playwright:
         specifier: ^1.61.0
         version: 1.61.0
@@ -7637,6 +7637,28 @@ packages:
     resolution: {integrity: sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A==}
 
 snapshots:
+
+  '@ai-sdk/gateway@3.0.132(zod@4.6.7)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.10
+      '@ai-sdk/provider-utils': 4.0.29(zod@4.6.7)
+      '@vercel/oidc': 3.2.0
+      zod: 4.6.7
+
+  '@ai-sdk/provider-utils@4.0.29(zod@4.6.7)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.10
+      '@standard-schema/spec': 1.1.0
+      eventsource-parser: 3.1.0
+      zod: 4.6.7
+
+  ai@6.0.206(zod@4.6.7):
+    dependencies:
+      '@ai-sdk/gateway': 3.0.132(zod@4.6.7)
+      '@ai-sdk/provider': 3.0.10
+      '@ai-sdk/provider-utils': 4.0.29(zod@4.6.7)
+      '@opentelemetry/api': 1.9.1
+      zod: 4.6.7
 
   '@adobe/css-tools@4.5.0': {}
 

@@ -59,7 +59,11 @@ def main() -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     ).returncode:
-        subprocess.run(["git", "fetch", "origin", REVISION], cwd=root, check=True)
+        subprocess.run(
+            ["git", "fetch", "--no-tags", "--depth=1", "origin", REVISION],
+            cwd=root,
+            check=True,
+        )
     if previous.exists():
         head = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=previous, text=True
