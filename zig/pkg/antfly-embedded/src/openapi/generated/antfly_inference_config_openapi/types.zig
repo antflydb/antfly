@@ -164,41 +164,6 @@ pub const ChunkResponse = struct {
     cache_hit: bool,
 };
 
-pub const Config = struct {
-    resources: ?antfly_resources_openapi.ResourcesConfig = null,
-    inference: ?RuntimeConfig = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "resources", "resources", false },
-        .{ "inference", "inference", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.resources) |value| {
-            try jw.objectField("resources");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("resources");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.inference) |value| {
-            try jw.objectField("inference");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// A content part for multimodal input (text, image URL, or inline media)
 pub const ContentPart = union(enum) {
     media_content_part: *MediaContentPart,
@@ -1063,6 +1028,41 @@ pub const ImageURL = struct {
 pub const ImageURLContentPart = struct {
     type: []const u8,
     image_url: ImageURL,
+};
+
+pub const InferenceServerConfig = struct {
+    resources: ?antfly_resources_openapi.ResourcesConfig = null,
+    inference: ?RuntimeConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "resources", "resources", false },
+        .{ "inference", "inference", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.resources) |value| {
+            try jw.objectField("resources");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("resources");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.inference) |value| {
+            try jw.objectField("inference");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Runtime Metal and CUDA kernel JIT configuration. Live compilation and GPU qualification run only for models in the configured startup `preload` list, before serving begins. A cold dynamic model load never benchmarks against an in-use GPU: `on` and `shadow` retain bundled kernels, while `required` rejects the load. When runtime JIT is enabled, startup also materializes every vision, audio, and projection session declared by each preloaded model without running media inference. Preload every model that must use runtime-JIT kernels; `required` rejects an empty preload list.

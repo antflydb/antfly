@@ -6,28 +6,26 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.inference_prompt_cache_config_mode import InferencePromptCacheConfigMode
+from ..models.prompt_cache_config_mode import PromptCacheConfigMode
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="InferencePromptCacheConfig")
+T = TypeVar("T", bound="PromptCacheConfig")
 
 
 @_attrs_define
-class InferencePromptCacheConfig:
+class PromptCacheConfig:
     """Native generator prompt KV cache configuration.
 
     Attributes:
-        enabled (bool | Unset): Enable inference-native prompt KV cache reuse for generator requests. On by default; set
-            false to disable. Default: True.
-        mode (InferencePromptCacheConfigMode | Unset): Prompt KV cache implementation. `block_hash` (default) uses hash-
-            addressed
+        enabled (bool | Unset): Enable inference-native prompt KV cache reuse for generator requests. Default: False.
+        mode (PromptCacheConfigMode | Unset): Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
             full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
             opt-in page-aligned compressed radix tree with shared-prefix ownership and
             leaf-only LRU eviction; it is currently qualified for native and Metal
             backends. Eligible Metal requests use eager paged attention; explicit compiled
             generation is incompatible with prompt caching. `simple` keeps the linear-scan
             retained-prefix cache and is only suitable for small caches or debugging.
-             Default: InferencePromptCacheConfigMode.BLOCK_HASH.
+             Default: PromptCacheConfigMode.BLOCK_HASH.
         max_bytes_mb (int | Unset): Node-wide target for live prompt-cache entries. The runtime divides it
             across participating model caches and evicts using estimated metadata
             and logical host/device KV bytes. Backend allocators may retain reusable
@@ -39,8 +37,8 @@ class InferencePromptCacheConfig:
              Default: 300000.
     """
 
-    enabled: bool | Unset = True
-    mode: InferencePromptCacheConfigMode | Unset = InferencePromptCacheConfigMode.BLOCK_HASH
+    enabled: bool | Unset = False
+    mode: PromptCacheConfigMode | Unset = PromptCacheConfigMode.BLOCK_HASH
     max_bytes_mb: int | Unset = 512
     min_tokens: int | Unset = 64
     ttl_ms: int | Unset = 300000
@@ -81,11 +79,11 @@ class InferencePromptCacheConfig:
         enabled = d.pop("enabled", UNSET)
 
         _mode = d.pop("mode", UNSET)
-        mode: InferencePromptCacheConfigMode | Unset
+        mode: PromptCacheConfigMode | Unset
         if isinstance(_mode, Unset):
             mode = UNSET
         else:
-            mode = InferencePromptCacheConfigMode(_mode)
+            mode = PromptCacheConfigMode(_mode)
 
         max_bytes_mb = d.pop("max_bytes_mb", UNSET)
 
@@ -93,7 +91,7 @@ class InferencePromptCacheConfig:
 
         ttl_ms = d.pop("ttl_ms", UNSET)
 
-        inference_prompt_cache_config = cls(
+        prompt_cache_config = cls(
             enabled=enabled,
             mode=mode,
             max_bytes_mb=max_bytes_mb,
@@ -101,8 +99,8 @@ class InferencePromptCacheConfig:
             ttl_ms=ttl_ms,
         )
 
-        inference_prompt_cache_config.additional_properties = d
-        return inference_prompt_cache_config
+        prompt_cache_config.additional_properties = d
+        return prompt_cache_config
 
     @property
     def additional_keys(self) -> list[str]:

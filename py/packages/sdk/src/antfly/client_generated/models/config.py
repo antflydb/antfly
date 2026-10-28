@@ -6,26 +6,25 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.inference_level import InferenceLevel
-from ..models.inference_style import InferenceStyle
+from ..models.level import Level
+from ..models.style import Style
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="InferenceschemasConfig")
+T = TypeVar("T", bound="Config")
 
 
 @_attrs_define
-class InferenceschemasConfig:
-    """Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level
-    `log` object instead.
+class Config:
+    """Logging configuration for Antfly inference services
 
-        Attributes:
-            level (InferenceLevel | Unset): Logging verbosity level Example: info.
-            style (InferenceStyle | Unset): Logging output format style. 'terminal' for colorized console, 'json' for
-                structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent. Example: terminal.
+    Attributes:
+        level (Level | Unset): Logging verbosity level Example: info.
+        style (Style | Unset): Logging output format style. 'terminal' for colorized console, 'json' for structured
+            JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent. Example: terminal.
     """
 
-    level: InferenceLevel | Unset = UNSET
-    style: InferenceStyle | Unset = UNSET
+    level: Level | Unset = UNSET
+    style: Style | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,26 +50,26 @@ class InferenceschemasConfig:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         _level = d.pop("level", UNSET)
-        level: InferenceLevel | Unset
+        level: Level | Unset
         if isinstance(_level, Unset):
             level = UNSET
         else:
-            level = InferenceLevel(_level)
+            level = Level(_level)
 
         _style = d.pop("style", UNSET)
-        style: InferenceStyle | Unset
+        style: Style | Unset
         if isinstance(_style, Unset):
             style = UNSET
         else:
-            style = InferenceStyle(_style)
+            style = Style(_style)
 
-        inferenceschemas_config = cls(
+        config = cls(
             level=level,
             style=style,
         )
 
-        inferenceschemas_config.additional_properties = d
-        return inferenceschemas_config
+        config.additional_properties = d
+        return config
 
     @property
     def additional_keys(self) -> list[str]:

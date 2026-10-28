@@ -1,7 +1,7 @@
 from enum import StrEnum
 
 
-class InferenceA4BResidencyMode(StrEnum):
+class A4BResidencyMode(StrEnum):
     AUTO = "auto"
     RESIDENT = "resident"
     STREAMED = "streamed"

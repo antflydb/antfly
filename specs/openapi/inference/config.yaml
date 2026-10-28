@@ -1438,7 +1438,7 @@ components:
             Idle time-to-live for prompt KV cache entries. Refreshed on every cache
             hit, so only entries left unused for this duration expire.
           default: 300000
-    Config:
+    InferenceServerConfig:
       type: object
       additionalProperties: false
       properties:

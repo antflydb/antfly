@@ -9,26 +9,24 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_content_security_config import InferenceContentSecurityConfig
-    from ..models.inference_credentials import InferenceCredentials
-    from ..models.inference_model_ref import InferenceModelRef
-    from ..models.inference_prompt_cache_config import InferencePromptCacheConfig
-    from ..models.inference_runtime_config_model_strategies import InferenceRuntimeConfigModelStrategies
-    from ..models.inferenceschemas_config import InferenceschemasConfig
+    from ..models.config import Config
+    from ..models.content_security_config import ContentSecurityConfig
+    from ..models.credentials import Credentials
+    from ..models.kernel_jit_config import KernelJitConfig
+    from ..models.model_ref import ModelRef
+    from ..models.prompt_cache_config import PromptCacheConfig
+    from ..models.runtime_config_model_strategies import RuntimeConfigModelStrategies
 
 
-T = TypeVar("T", bound="InferenceRuntimeConfig")
+T = TypeVar("T", bound="RuntimeConfig")
 
 
 @_attrs_define
-class InferenceRuntimeConfig:
+class RuntimeConfig:
     """
     Attributes:
-        max_concurrent_requests (int | Unset): Deprecated compatibility alias for
-            `admission.inference.max_concurrent_requests`. New configurations
-            should use the process-level admission setting. If both spellings
-            are supplied, they must have the same value.
-             Example: 32.
+        http_max_body_mb (int | Unset): Encoded HTTP inference body ceiling in MiB, independent of decoded-media
+            resource policy. Default: 10.
         api_url (str | Unset): URL of an out-of-process Antfly inference service that the Antfly
             server should call for embedding, chunking, reranking, and
             generation. Omit it to use the in-process inference runtime
@@ -53,10 +51,16 @@ class InferenceRuntimeConfig:
 
             Defaults to ~/.antfly/inference/ml.
              Example: ~/.antfly/inference/ml.
-        content_security (InferenceContentSecurityConfig | Unset): Inference merges configured fields over a fail-closed
-            baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the
-            configured size budget.
-        s3_credentials (InferenceCredentials | Unset):
+        content_security (ContentSecurityConfig | Unset): Low-level content download policy. File downloads always
+            require an
+            explicit nonempty `allowed_paths` list. In the generic scraper, omitted
+            `allowed_hosts` for HTTP(S) and `allowed_paths` for S3 do not restrict
+            those sources; explicit empty lists deny them. Consumers may merge this object over a
+            stricter baseline before downloading. Antfly inference does so: omitted
+            or empty inference policies, and omitted inference allowlists, deny
+            HTTP(S), file, and S3 content until explicit allowlists are configured.
+            Do not assume omission has identical policy semantics across consumers.
+        s3_credentials (Credentials | Unset):
         keep_alive (str | Unset): How long to keep models loaded in memory after last use (Ollama-compatible).
             Models are automatically unloaded after this duration of inactivity.
             Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
@@ -70,7 +74,16 @@ class InferenceRuntimeConfig:
              Default: 10. Example: 3.
         pool_size (int | Unset): Legacy compatibility field. The current Zig inference runtime does not
             create per-model pipeline pools from this setting; configuring it has no effect.
-        prompt_cache (InferencePromptCacheConfig | Unset): Native generator prompt KV cache configuration.
+        prompt_cache (PromptCacheConfig | Unset): Native generator prompt KV cache configuration.
+        kernel_jit (KernelJitConfig | Unset): Runtime Metal and CUDA kernel JIT configuration. Live compilation and
+            GPU qualification run only for models in the configured startup
+            `preload` list, before serving begins. A cold dynamic model load never
+            benchmarks against an in-use GPU: `on` and `shadow` retain bundled
+            kernels, while `required` rejects the load. When runtime JIT is enabled,
+            startup also materializes every vision, audio, and projection session
+            declared by each preloaded model without running media inference.
+            Preload every model that must use runtime-JIT kernels; `required`
+            rejects an empty preload list.
         backend_priority (list[str] | Unset): Legacy compatibility field. The current Zig inference runtime selects a
             backend from model metadata, explicit preload settings, and compiled capabilities;
             configuring this list has no effect.
@@ -78,17 +91,19 @@ class InferenceRuntimeConfig:
             excess inference requests in memory and ignores this field.
         request_timeout (str | Unset): Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
             this field; its HTTP listener applies a separate fixed transport timeout.
-        preload (list[InferenceModelRef] | Unset): Models to preload and warm at startup. Generators run a tiny
-            generation
+        preload (list[ModelRef] | Unset): Models to preload and warm at startup. Generators run a tiny generation
             request so native/Metal weights, KV setup, and kernels use the same
             budgeted path as request-time generation. Other model kinds use the
-            best available warm path for that kind.
+            best available warm path for that kind. When runtime kernel JIT is
+            enabled, every vision, audio, and projection session declared by a
+            preloaded model is also loaded without running media inference.
+            Runtime kernel JIT `required` mode rejects an empty preload list.
              Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal', 'format': 'gguf',
             'quantization': 'q4_k'}].
         max_memory_mb (int | Unset): Legacy compatibility field. The current Zig runtime uses explicit host,
             backend, combined, KV, and scratch budgets instead and ignores this field.
-        model_strategies (InferenceRuntimeConfigModelStrategies | Unset): Per-model loading strategy overrides. Maps
-            model names to their loading strategy.
+        model_strategies (RuntimeConfigModelStrategies | Unset): Per-model loading strategy overrides. Maps model names
+            to their loading strategy.
             Models not in this map load on demand. keep_alive controls their idle
             eviction; setting it to "0" disables idle eviction but does not preload or pin them.
 
@@ -104,33 +119,33 @@ class InferenceRuntimeConfig:
             availability is a build-time setting in the current Zig runtime, so
             configuring this field has no effect.
              Default: True.
-        log (InferenceschemasConfig | Unset): Legacy inference-local logging configuration. The current unified Zig
-            runtime ignores it; configure the top-level `log` object instead.
+        log (Config | Unset): Logging configuration for Antfly inference services
     """
 
-    max_concurrent_requests: int | Unset = UNSET
+    http_max_body_mb: int | Unset = 10
     api_url: str | Unset = UNSET
     api_key: str | Unset = UNSET
     models_dir: str | Unset = UNSET
     ml_dir: str | Unset = UNSET
-    content_security: InferenceContentSecurityConfig | Unset = UNSET
-    s3_credentials: InferenceCredentials | Unset = UNSET
+    content_security: ContentSecurityConfig | Unset = UNSET
+    s3_credentials: Credentials | Unset = UNSET
     keep_alive: str | Unset = "5m"
     max_loaded_models: int | Unset = 10
     pool_size: int | Unset = UNSET
-    prompt_cache: InferencePromptCacheConfig | Unset = UNSET
+    prompt_cache: PromptCacheConfig | Unset = UNSET
+    kernel_jit: KernelJitConfig | Unset = UNSET
     backend_priority: list[str] | Unset = UNSET
     max_queue_size: int | Unset = UNSET
     request_timeout: str | Unset = UNSET
-    preload: list[InferenceModelRef] | Unset = UNSET
+    preload: list[ModelRef] | Unset = UNSET
     max_memory_mb: int | Unset = UNSET
-    model_strategies: InferenceRuntimeConfigModelStrategies | Unset = UNSET
+    model_strategies: RuntimeConfigModelStrategies | Unset = UNSET
     allow_downloads: bool | Unset = True
-    log: InferenceschemasConfig | Unset = UNSET
+    log: Config | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        max_concurrent_requests = self.max_concurrent_requests
+        http_max_body_mb = self.http_max_body_mb
 
         api_url = self.api_url
 
@@ -157,6 +172,10 @@ class InferenceRuntimeConfig:
         prompt_cache: dict[str, Any] | Unset = UNSET
         if not isinstance(self.prompt_cache, Unset):
             prompt_cache = self.prompt_cache.to_dict()
+
+        kernel_jit: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.kernel_jit, Unset):
+            kernel_jit = self.kernel_jit.to_dict()
 
         backend_priority: list[str] | Unset = UNSET
         if not isinstance(self.backend_priority, Unset):
@@ -188,8 +207,8 @@ class InferenceRuntimeConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
-        if max_concurrent_requests is not UNSET:
-            field_dict["max_concurrent_requests"] = max_concurrent_requests
+        if http_max_body_mb is not UNSET:
+            field_dict["http_max_body_mb"] = http_max_body_mb
         if api_url is not UNSET:
             field_dict["api_url"] = api_url
         if api_key is not UNSET:
@@ -210,6 +229,8 @@ class InferenceRuntimeConfig:
             field_dict["pool_size"] = pool_size
         if prompt_cache is not UNSET:
             field_dict["prompt_cache"] = prompt_cache
+        if kernel_jit is not UNSET:
+            field_dict["kernel_jit"] = kernel_jit
         if backend_priority is not UNSET:
             field_dict["backend_priority"] = backend_priority
         if max_queue_size is not UNSET:
@@ -231,15 +252,16 @@ class InferenceRuntimeConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_content_security_config import InferenceContentSecurityConfig
-        from ..models.inference_credentials import InferenceCredentials
-        from ..models.inference_model_ref import InferenceModelRef
-        from ..models.inference_prompt_cache_config import InferencePromptCacheConfig
-        from ..models.inference_runtime_config_model_strategies import InferenceRuntimeConfigModelStrategies
-        from ..models.inferenceschemas_config import InferenceschemasConfig
+        from ..models.config import Config
+        from ..models.content_security_config import ContentSecurityConfig
+        from ..models.credentials import Credentials
+        from ..models.kernel_jit_config import KernelJitConfig
+        from ..models.model_ref import ModelRef
+        from ..models.prompt_cache_config import PromptCacheConfig
+        from ..models.runtime_config_model_strategies import RuntimeConfigModelStrategies
 
         d = dict(src_dict)
-        max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
+        http_max_body_mb = d.pop("http_max_body_mb", UNSET)
 
         api_url = d.pop("api_url", UNSET)
 
@@ -250,18 +272,18 @@ class InferenceRuntimeConfig:
         ml_dir = d.pop("ml_dir", UNSET)
 
         _content_security = d.pop("content_security", UNSET)
-        content_security: InferenceContentSecurityConfig | Unset
+        content_security: ContentSecurityConfig | Unset
         if isinstance(_content_security, Unset):
             content_security = UNSET
         else:
-            content_security = InferenceContentSecurityConfig.from_dict(_content_security)
+            content_security = ContentSecurityConfig.from_dict(_content_security)
 
         _s3_credentials = d.pop("s3_credentials", UNSET)
-        s3_credentials: InferenceCredentials | Unset
+        s3_credentials: Credentials | Unset
         if isinstance(_s3_credentials, Unset):
             s3_credentials = UNSET
         else:
-            s3_credentials = InferenceCredentials.from_dict(_s3_credentials)
+            s3_credentials = Credentials.from_dict(_s3_credentials)
 
         keep_alive = d.pop("keep_alive", UNSET)
 
@@ -270,11 +292,18 @@ class InferenceRuntimeConfig:
         pool_size = d.pop("pool_size", UNSET)
 
         _prompt_cache = d.pop("prompt_cache", UNSET)
-        prompt_cache: InferencePromptCacheConfig | Unset
+        prompt_cache: PromptCacheConfig | Unset
         if isinstance(_prompt_cache, Unset):
             prompt_cache = UNSET
         else:
-            prompt_cache = InferencePromptCacheConfig.from_dict(_prompt_cache)
+            prompt_cache = PromptCacheConfig.from_dict(_prompt_cache)
+
+        _kernel_jit = d.pop("kernel_jit", UNSET)
+        kernel_jit: KernelJitConfig | Unset
+        if isinstance(_kernel_jit, Unset):
+            kernel_jit = UNSET
+        else:
+            kernel_jit = KernelJitConfig.from_dict(_kernel_jit)
 
         backend_priority = cast(list[str], d.pop("backend_priority", UNSET))
 
@@ -283,34 +312,34 @@ class InferenceRuntimeConfig:
         request_timeout = d.pop("request_timeout", UNSET)
 
         _preload = d.pop("preload", UNSET)
-        preload: list[InferenceModelRef] | Unset = UNSET
+        preload: list[ModelRef] | Unset = UNSET
         if _preload is not UNSET:
             preload = []
             for preload_item_data in _preload:
-                preload_item = InferenceModelRef.from_dict(preload_item_data)
+                preload_item = ModelRef.from_dict(preload_item_data)
 
                 preload.append(preload_item)
 
         max_memory_mb = d.pop("max_memory_mb", UNSET)
 
         _model_strategies = d.pop("model_strategies", UNSET)
-        model_strategies: InferenceRuntimeConfigModelStrategies | Unset
+        model_strategies: RuntimeConfigModelStrategies | Unset
         if isinstance(_model_strategies, Unset):
             model_strategies = UNSET
         else:
-            model_strategies = InferenceRuntimeConfigModelStrategies.from_dict(_model_strategies)
+            model_strategies = RuntimeConfigModelStrategies.from_dict(_model_strategies)
 
         allow_downloads = d.pop("allow_downloads", UNSET)
 
         _log = d.pop("log", UNSET)
-        log: InferenceschemasConfig | Unset
+        log: Config | Unset
         if isinstance(_log, Unset):
             log = UNSET
         else:
-            log = InferenceschemasConfig.from_dict(_log)
+            log = Config.from_dict(_log)
 
-        inference_runtime_config = cls(
-            max_concurrent_requests=max_concurrent_requests,
+        runtime_config = cls(
+            http_max_body_mb=http_max_body_mb,
             api_url=api_url,
             api_key=api_key,
             models_dir=models_dir,
@@ -321,6 +350,7 @@ class InferenceRuntimeConfig:
             max_loaded_models=max_loaded_models,
             pool_size=pool_size,
             prompt_cache=prompt_cache,
+            kernel_jit=kernel_jit,
             backend_priority=backend_priority,
             max_queue_size=max_queue_size,
             request_timeout=request_timeout,
@@ -331,8 +361,8 @@ class InferenceRuntimeConfig:
             log=log,
         )
 
-        inference_runtime_config.additional_properties = d
-        return inference_runtime_config
+        runtime_config.additional_properties = d
+        return runtime_config
 
     @property
     def additional_keys(self) -> list[str]:

@@ -295,6 +295,7 @@ pub fn addOpenApiSourceSteps(
             .{ "websearch.yaml", "antfly_websearch_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server,client", &.{
+            .{ "./config.yaml", "antfly_inference_config_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
