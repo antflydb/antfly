@@ -1446,7 +1446,7 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
                         }
                         if case == "phrase_selective":
                             request["full_text_search"] = {
-                                "match_phrase": f"control {term}",
+                                "terms": ["control", term],
                                 "field": "body",
                             }
                         if case == "boolean_selective":
@@ -1468,6 +1468,21 @@ def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(
                         assert [
                             h["_source"]["id"] for h in actual["hits"]["hits"]
                         ] == wanted
+                        if case == "phrase_selective":
+                            analyzed = client.query(
+                                {
+                                    "request": dict(
+                                        request,
+                                        full_text_search={
+                                            "match_phrase": f"control {term}",
+                                            "field": "body",
+                                        },
+                                    )
+                                }
+                            )
+                            assert [
+                                h["_source"]["id"] for h in analyzed["hits"]["hits"]
+                            ] == wanted
                         profile = actual["profile"]["sort"]
                         assert profile["ordered_scanned_count"] <= 64, profile
                         assert profile["candidate_count"] <= 64, profile

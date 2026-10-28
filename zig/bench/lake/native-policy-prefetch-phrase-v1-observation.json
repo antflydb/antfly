@@ -42,7 +42,11 @@
     "final-cover",
     "control-cover",
     "control-phrase",
-    "final-phrase"
+    "final-phrase",
+    "control-phrase-terms",
+    "final-phrase-terms",
+    "final-phrase-terms-repeat",
+    "control-phrase-terms-repeat"
   ],
   "native_structural_checks": {
     "decoded_required_value_successful_decodes": 1,
@@ -62,13 +66,170 @@
     "unknown_phrase_ceiling": 10000
   },
   "exact_comparisons": {
-    "paired_pages": 36,
-    "responses": 72,
+    "paired_pages": 60,
+    "responses": 120,
     "complete_hits_sources_scores_and_sort_keys_equal": true,
-    "identical_totals_pairs": 36,
-    "different_total_precision": [],
+    "identical_totals_pairs": 48,
+    "different_total_precision": [
+      {
+        "case": "phrase_terms",
+        "sample": 0,
+        "query_name": "quasar_asc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms",
+        "sample": 0,
+        "query_name": "pulsar_desc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms",
+        "sample": 1,
+        "query_name": "quasar_asc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms",
+        "sample": 1,
+        "query_name": "pulsar_desc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms",
+        "sample": 2,
+        "query_name": "quasar_asc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms",
+        "sample": 2,
+        "query_name": "pulsar_desc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms_reversed_order",
+        "sample": 0,
+        "query_name": "quasar_asc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms_reversed_order",
+        "sample": 0,
+        "query_name": "pulsar_desc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms_reversed_order",
+        "sample": 1,
+        "query_name": "quasar_asc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms_reversed_order",
+        "sample": 1,
+        "query_name": "pulsar_desc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms_reversed_order",
+        "sample": 2,
+        "query_name": "quasar_asc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      },
+      {
+        "case": "phrase_terms_reversed_order",
+        "sample": 2,
+        "query_name": "pulsar_desc",
+        "control": {
+          "value": 64,
+          "relation": "gte"
+        },
+        "final": {
+          "value": 64,
+          "relation": "exact"
+        }
+      }
+    ],
     "totals_oracle": "Source/cover totals must be exact at 256. Phrase totals are independently checked against 64 matches: exact=64 or a valid lower bound between delivered hits and 64. Plan-dependent exact/gte precision may differ.",
-    "application_http_requests": 72,
+    "application_http_requests": 120,
     "all_requests_successful": true,
     "responses_with_multiple_http_attempts": 0
   },
@@ -268,6 +429,138 @@
           "ordered_scanned_count": 0,
           "selected_count": 20,
           "total_us": 5250
+        }
+      }
+    },
+    "phrase_terms": {
+      "pulsar_asc": {
+        "control_median_ns": 467357250,
+        "final_median_ns": 135924833,
+        "control_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 1024,
+          "selected_count": 20,
+          "total_us": 393491
+        },
+        "final_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 0,
+          "selected_count": 20,
+          "total_us": 11242
+        }
+      },
+      "quasar_desc": {
+        "control_median_ns": 328461125,
+        "final_median_ns": 36381792,
+        "control_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 1024,
+          "selected_count": 20,
+          "total_us": 295747
+        },
+        "final_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 0,
+          "selected_count": 20,
+          "total_us": 5803
+        }
+      },
+      "quasar_asc": {
+        "control_median_ns": 57412792,
+        "final_median_ns": 31538125,
+        "control_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 84,
+          "selected_count": 20,
+          "total_us": 43803
+        },
+        "final_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 0,
+          "selected_count": 20,
+          "total_us": 5698
+        }
+      },
+      "pulsar_desc": {
+        "control_median_ns": 59424375,
+        "final_median_ns": 32419666,
+        "control_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 84,
+          "selected_count": 20,
+          "total_us": 45985
+        },
+        "final_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 0,
+          "selected_count": 20,
+          "total_us": 6035
+        }
+      }
+    },
+    "phrase_terms_reversed_order": {
+      "pulsar_asc": {
+        "control_median_ns": 441067125,
+        "final_median_ns": 129149000,
+        "control_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 1024,
+          "selected_count": 20,
+          "total_us": 372062
+        },
+        "final_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 0,
+          "selected_count": 20,
+          "total_us": 10426
+        }
+      },
+      "quasar_desc": {
+        "control_median_ns": 311717208,
+        "final_median_ns": 34814375,
+        "control_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 1024,
+          "selected_count": 20,
+          "total_us": 280708
+        },
+        "final_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 0,
+          "selected_count": 20,
+          "total_us": 5865
+        }
+      },
+      "quasar_asc": {
+        "control_median_ns": 53774458,
+        "final_median_ns": 30727166,
+        "control_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 84,
+          "selected_count": 20,
+          "total_us": 41209
+        },
+        "final_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 0,
+          "selected_count": 20,
+          "total_us": 5685
+        }
+      },
+      "pulsar_desc": {
+        "control_median_ns": 55127583,
+        "final_median_ns": 30469750,
+        "control_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 84,
+          "selected_count": 20,
+          "total_us": 42899
+        },
+        "final_work_medians": {
+          "candidate_count": 64,
+          "ordered_scanned_count": 0,
+          "selected_count": 20,
+          "total_us": 5562
         }
       }
     }
@@ -4824,6 +5117,3122 @@
           }
         }
       ]
+    },
+    "control-phrase-terms": {
+      "source_commit": "c532409d1c86707223cc972594c6a3f9b85849a4",
+      "binary_sha256": "570fc4ae702e343f0339892938a917e0f3f66393b29f182722fa82aa3cc5d22b",
+      "runner_sha256": "768404b152f617c3af277a2bf0a09bc5ba158eb9ffeec14d62115a92a023f22b",
+      "parquet_sha256": "11c83d6012840e5eb8ed3588d41283ef1180858ea8a671fffe599434334f26c2",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "phrase",
+      "phrase_form": "terms",
+      "rows": 8192,
+      "queries": [
+        {
+          "name": "pulsar_asc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "pulsar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "quasar_desc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "quasar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "quasar_asc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "quasar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "pulsar_desc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "pulsar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        }
+      ],
+      "cache_contract": "Three restarts retaining OS/persistent caches and readiness warming; query order is recorded, no empty-cache claim.",
+      "summary": {
+        "pulsar_asc": 467357250,
+        "quasar_desc": 328461125,
+        "quasar_asc": 57412792,
+        "pulsar_desc": 59424375
+      },
+      "report_sha256": "73a10eae812e06c2a61fa4c5828b3473624380a88e08b744328fea25f21d7bc5",
+      "definition_sha256": "ae9f06c5854bbee91e85be77a9858f2be68db0239875ea4939b79303466f0f6e",
+      "samples": [
+        {
+          "sample": 0,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 472302541,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 472242000
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 400683,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 328461125,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 328411625
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 295747,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 55893500,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 55844084
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 42987,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 57386708,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 57342500
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 44460,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 464896875,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 464832667
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 393306,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 328205125,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 328156958
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 295698,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 57412792,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 57370375
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 43803,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 60658333,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 60621708
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 46846,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 467357250,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 467306375
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 393491,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 332770333,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 332725458
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 300549,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 57675250,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 57634375
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 44214,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 59424375,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 59377583
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 45985,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      ]
+    },
+    "final-phrase-terms": {
+      "source_commit": "04c923a48b6f74bced3f86fec21d4072a6007c76",
+      "binary_sha256": "ebc0d9b1ba70235bf00940279f502111973b2aa3656a2e1631db652e9706c87f",
+      "runner_sha256": "768404b152f617c3af277a2bf0a09bc5ba158eb9ffeec14d62115a92a023f22b",
+      "parquet_sha256": "11c83d6012840e5eb8ed3588d41283ef1180858ea8a671fffe599434334f26c2",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "phrase",
+      "phrase_form": "terms",
+      "rows": 8192,
+      "queries": [
+        {
+          "name": "pulsar_asc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "pulsar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "quasar_desc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "quasar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "quasar_asc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "quasar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "pulsar_desc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "pulsar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        }
+      ],
+      "cache_contract": "Three restarts retaining OS/persistent caches and readiness warming; query order is recorded, no empty-cache claim.",
+      "summary": {
+        "pulsar_asc": 135924833,
+        "quasar_desc": 36381792,
+        "quasar_asc": 31538125,
+        "pulsar_desc": 32419666
+      },
+      "report_sha256": "322ea243046fc28ce7b106ad39428c96900f2a245b6fdf00b1c5a2c63d4aa37e",
+      "definition_sha256": "ae9f06c5854bbee91e85be77a9858f2be68db0239875ea4939b79303466f0f6e",
+      "samples": [
+        {
+          "sample": 0,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 141155708,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 141101375
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 11181,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 36426625,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 36376208
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5846,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 31538125,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 31494750
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5698,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 32706042,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 32649125
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 6035,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 135924833,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 135871750
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 11301,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 36381792,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 36339375
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5803,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 32191417,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 32149792
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5679,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 32419666,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 32377958
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 6060,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 134006959,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 133943958
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 11242,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 35821708,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 35775500
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5610,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 31311417,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 31265750
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5758,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 32068666,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 32031042
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5970,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      ]
+    },
+    "final-phrase-terms-repeat": {
+      "source_commit": "04c923a48b6f74bced3f86fec21d4072a6007c76",
+      "binary_sha256": "ebc0d9b1ba70235bf00940279f502111973b2aa3656a2e1631db652e9706c87f",
+      "runner_sha256": "768404b152f617c3af277a2bf0a09bc5ba158eb9ffeec14d62115a92a023f22b",
+      "parquet_sha256": "11c83d6012840e5eb8ed3588d41283ef1180858ea8a671fffe599434334f26c2",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "phrase",
+      "phrase_form": "terms",
+      "rows": 8192,
+      "queries": [
+        {
+          "name": "pulsar_asc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "pulsar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "quasar_desc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "quasar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "quasar_asc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "quasar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "pulsar_desc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "pulsar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        }
+      ],
+      "cache_contract": "Three restarts retaining OS/persistent caches and readiness warming; query order is recorded, no empty-cache claim.",
+      "summary": {
+        "pulsar_asc": 129149000,
+        "quasar_desc": 34814375,
+        "quasar_asc": 30727166,
+        "pulsar_desc": 30469750
+      },
+      "report_sha256": "ce58adb6d1602a188828ee5f9dab7eb2c566bc7f489f5de4ff0fe2e045b2dda2",
+      "definition_sha256": "ae9f06c5854bbee91e85be77a9858f2be68db0239875ea4939b79303466f0f6e",
+      "samples": [
+        {
+          "sample": 0,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 140471958,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 140414417
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 10426,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 36306375,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 36260167
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 6141,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 31241833,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 31197291
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5685,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 31960542,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 31917834
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5956,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 129149000,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 129094292
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 10415,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 33776000,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 33732625
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5503,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 30581000,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 30541459
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5628,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 30469750,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 30432125
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5562,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 127598625,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 127548584
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 10495,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 34814375,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 34777500
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5865,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 30727166,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 30696000
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5764,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 30331125,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 30292208
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "text_postings",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 5528,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      ]
+    },
+    "control-phrase-terms-repeat": {
+      "source_commit": "c532409d1c86707223cc972594c6a3f9b85849a4",
+      "binary_sha256": "570fc4ae702e343f0339892938a917e0f3f66393b29f182722fa82aa3cc5d22b",
+      "runner_sha256": "768404b152f617c3af277a2bf0a09bc5ba158eb9ffeec14d62115a92a023f22b",
+      "parquet_sha256": "11c83d6012840e5eb8ed3588d41283ef1180858ea8a671fffe599434334f26c2",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "phrase",
+      "phrase_form": "terms",
+      "rows": 8192,
+      "queries": [
+        {
+          "name": "pulsar_asc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "pulsar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "quasar_desc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "quasar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "quasar_asc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "quasar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        },
+        {
+          "name": "pulsar_desc",
+          "request": {
+            "full_text_search": {
+              "terms": [
+                "control",
+                "pulsar"
+              ],
+              "field": "body"
+            },
+            "filter_query": {
+              "range": {
+                "path": "/bucket",
+                "gte": 0
+              }
+            },
+            "fields": [
+              "id",
+              "bucket"
+            ],
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              }
+            ],
+            "limit": 20,
+            "profile": true
+          }
+        }
+      ],
+      "cache_contract": "Three restarts retaining OS/persistent caches and readiness warming; query order is recorded, no empty-cache claim.",
+      "summary": {
+        "pulsar_asc": 441067125,
+        "quasar_desc": 311717208,
+        "quasar_asc": 53774458,
+        "pulsar_desc": 55127583
+      },
+      "report_sha256": "de1fef2d6dc9700979e274b2a2c3eebb1486d6f9cbdfd48719e598e1bba21b0c",
+      "definition_sha256": "ae9f06c5854bbee91e85be77a9858f2be68db0239875ea4939b79303466f0f6e",
+      "samples": [
+        {
+          "sample": 0,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 450756417,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 450702083
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 378567,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 323849625,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 323797917
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 292005,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 55515666,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 55470541
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 42603,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 0,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 58005709,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 57966875
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 44970,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 441067125,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 441012125
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 372062,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 311717208,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 311678916
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 280708,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 53774458,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 53733583
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 41209,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 1,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 55043125,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 55004708
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 42582,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "pulsar_asc",
+          "elapsed_ns": 434276208,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 434223875
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 365280,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "quasar_desc",
+          "elapsed_ns": 310502375,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 310464583
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "exact"
+          },
+          "sort_profile": {
+            "plan": "mixed_window_plans",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "mixed_window_plans",
+            "candidate_source": "ordered_lake_index_then_text_windows",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "doc_values_collector",
+            "require_native": false,
+            "sort_lifecycle_state": "mixed_window_plans",
+            "index_sort_coverage": "mixed_window_plans",
+            "candidate_count": 64,
+            "ordered_scanned_count": 1024,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 279184,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "quasar_asc",
+          "elapsed_ns": 53031875,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 52999417
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "e0790d4440af1ce1280490ca5e238ce8264339e6c423fca16e5d904df901f578",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": false
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 40858,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        },
+        {
+          "sample": 2,
+          "query_name": "pulsar_desc",
+          "elapsed_ns": 55127583,
+          "http_requests": [
+            {
+              "method": "POST",
+              "path": "/db/v1/tables/archive_qualification/query",
+              "status": 200,
+              "elapsed_ns": 55089709
+            }
+          ],
+          "hits_count": 20,
+          "complete_hits_sha256": "2eed855581b52573b77dfdc549844c13b515864dfee1cd393922a93418ad160e",
+          "total": {
+            "value": 64,
+            "relation": "gte"
+          },
+          "sort_profile": {
+            "plan": "native_doc_values_top_n",
+            "order_by": [
+              {
+                "field": "bucket",
+                "desc": true
+              },
+              {
+                "field": "_id",
+                "desc": false
+              }
+            ],
+            "cursor": "none",
+            "exactness": "exact",
+            "source": "doc_values_collector",
+            "candidate_source": "ordered_lake_index",
+            "cursor_support": "comparator",
+            "source_load": "source_free",
+            "distributed_behavior": "shard_local_only",
+            "selection_reason": "bounded_ordered_lake_index",
+            "require_native": true,
+            "sort_lifecycle_state": "queryable",
+            "index_sort_coverage": "request_mismatch",
+            "candidate_count": 64,
+            "ordered_scanned_count": 84,
+            "cursor_rejected_count": 0,
+            "selected_count": 20,
+            "total_us": 42899,
+            "distributed_shard_count": 0,
+            "budget_rejection_reason": "",
+            "sort_rejection_reason": "",
+            "sort_rejection_detail": "",
+            "sort_rejection_field": ""
+          }
+        }
+      ]
     }
   },
   "validation": {
@@ -4839,17 +8248,27 @@
       "server_filtered_topk": 35
     },
     "final_prefetch_revalidation_passed": 144,
+    "additional_explicit_and_analyzed_phrase_e2e_passed": 1,
+    "additional_phrase_e2e_seconds": 8.18,
     "real_file_e2e_passed": 37,
     "real_file_e2e_skipped": 0,
     "real_file_e2e_seconds": 297.76,
     "benchmark_tooling_tests": 19,
     "apache_boundary_source_files": 2555,
-    "merged_main": "ff2c66bd7ba63b3ef68d872e30d9ba31e0cf7301"
+    "merged_main": "ff2c66bd7ba63b3ef68d872e30d9ba31e0cf7301",
+    "license_check": true,
+    "formatting_check": true,
+    "whitespace_check": true
+  },
+  "runner_reproduction": {
+    "initial_runner_commit": "edd4b58d59be7b61274de501eab957f413467a96",
+    "final_runner_sha256": "768404b152f617c3af277a2bf0a09bc5ba158eb9ffeec14d62115a92a023f22b",
+    "note": "The final runner adds an optional EXPLICIT_PHRASE_TERMS variant and report annotation. All original measured reports/runner hashes remain retained."
   },
   "notes": [
     "The same-main control uses the pre-refinement merge commit and reversible production-source overrides; its embedded build metadata reports the later worktree revision/dirty overlay. All overrides and the final installed executable were restored before measurement.",
     "The source E2E and benchmark project deterministic incompressible 4 KiB values spanning native transport blocks. Component hint bytes and work counts are distinct from total query memory and physical provider traffic.",
     "Real-provider qualification remains deferred. Slower timing controls and all application retry attempts are retained."
   ],
-  "interpretation": "The initial mixed projection/source timings are close and do not establish an additional large end-to-end latency gain. The analyzed match_phrase control already selects text postings in both executables; its timings do not qualify the new ordered phrase cost decision. Structural cache reuse and bounded source hints are proven separately."
+  "interpretation": "Decoded reuse and bounded selected-source hints have direct native work-count/ownership qualification; mixed projection/source timings are close, including slower controls. Analyzed match_phrase already chooses postings in both executables. Explicit-term phrases exercise ordered driver costing: the opposing-prefix walk falls from 1024 metadata entries to zero. Whole-query medians improve in primary and reversed binary order; favorable-prefix controls also improve. These are shared-host local Debug observations, not Release, empty-cache, provider or full-archive throughput claims."
 }

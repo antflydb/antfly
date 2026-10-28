@@ -1227,3 +1227,41 @@ zero failures and zero leaks. The final source-lookahead owner revalidation pass
 seconds against the final frozen executable, including the incompressible source
 fixture. The benchmark tooling's 19 tests, Apache boundary (2,555 sources), license,
 formatting and whitespace checks pass. Real-provider qualification remains deferred.
+
+
+The explicit-term public phrase form (`terms: ["control", term]`) exercises the
+ordered cost decision. Reproduce that additional comparison with:
+
+```sh
+EXPLICIT_PHRASE_TERMS=1 zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/policy_prefetch.py phrase LABEL /path/to/immutable-antfly SOURCE_COMMIT
+```
+
+Both explicit-term and analyzed forms pass the targeted real-Parquet regression
+in both directions before and after restart. The explicit form preserves the same
+64 text candidates while removing the abandoned metadata prefix: opposing cases
+scan **1,024 → 0** ordered entries; favorable cases scan **84 → 0**.
+
+| Explicit phrase | Control median | Final median | Reversed-order control | Reversed-order final |
+|---|---:|---:|---:|---:|
+| pulsar_asc | 467.36 ms | 135.92 ms | 441.07 ms | 129.15 ms |
+| quasar_desc | 328.46 ms | 36.38 ms | 311.72 ms | 34.81 ms |
+| quasar_asc | 57.41 ms | 31.54 ms | 53.77 ms | 30.73 ms |
+| pulsar_desc | 59.42 ms | 32.42 ms | 55.13 ms | 30.47 ms |
+
+The primary explicit comparison runs control then final; the diagnostic comparison
+reverses that binary order. Each retains three process restarts and all four query
+positions. No build, E2E or cache cleanup from this task overlaps any measured run.
+This qualifies an observed improvement for the explicit-phrase fixture; the mixed
+projection/source controls remain roughly flat. The final runner adds an optional
+phrase-form selector and report annotation; the exact initial runner is retained
+at commit `edd4b58d59be` with its historical report hashes.
+
+Across all ten reports, **60 paired pages / 120 responses preserve complete hits,
+source, scores and sort keys**. All 120 queries use one successful HTTP request
+without application retry. Totals are identical in 48 pairs; in the 12 favorable
+explicit-phrase pairs the valid lower bound `{value: 64, relation: gte}` becomes
+the exact total `{value: 64, relation: exact}`. Every total independently satisfies
+the fixture oracle. The supplemental phrase E2E passes in 8.18 seconds; the other
+36 real-file cases retain their successful full-suite qualification. All initial,
+slower and reversed-order observations remain recorded. Real-provider qualification
+continues to be deferred.

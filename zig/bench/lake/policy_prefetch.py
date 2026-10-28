@@ -41,6 +41,7 @@ sys.modules[spec.name] = bench
 spec.loader.exec_module(bench)
 case, label, executable, source_commit = sys.argv[1:]
 assert case in ("cover", "source", "phrase")
+explicit_phrase = os.environ.get("EXPLICIT_PHRASE_TERMS") == "1"
 binary = Path(executable).resolve()
 base = root / ".benchmark-results/lake/policy-prefetch"
 shared = base / f"input-{case}"
@@ -125,10 +126,11 @@ if case == "phrase":
             (
                 f"{term}_{'desc' if descending else 'asc'}",
                 {
-                    "full_text_search": {
-                        "match_phrase": f"control {term}",
-                        "field": "body",
-                    },
+                    "full_text_search": (
+                        {"terms": ["control", term], "field": "body"}
+                        if explicit_phrase
+                        else {"match_phrase": f"control {term}", "field": "body"}
+                    ),
                     "filter_query": {"range": {"path": "/bucket", "gte": 0}},
                     "fields": ["id", "bucket"],
                     "order_by": [{"field": "bucket", "desc": descending}],
@@ -245,6 +247,11 @@ report = {
     "parquet_sha256": sha(archive),
     "config_sha256": sha(config),
     "case": case,
+    "phrase_form": "terms"
+    if explicit_phrase
+    else "match_phrase"
+    if case == "phrase"
+    else None,
     "rows": count,
     "definition": definition,
     "queries": [{"name": n, "request": q} for n, q, _ in queries],
