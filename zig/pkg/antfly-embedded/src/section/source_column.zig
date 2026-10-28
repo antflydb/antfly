@@ -26,8 +26,8 @@ const Sink = @import("../segment.zig").SegmentSink;
 const Token = @import("antfly_cancellation").CancellationToken;
 const offsets = @import("source_offsets.zig");
 pub const page_size = 64 * 1024;
-const magic = "AFSC0003";
-const text_magic = "AFST3";
+const magic = "AFSC0004";
+const text_magic = "AFST4";
 pub fn fingerprint(a: A, analyzer: *const analysis.Analyzer) ![32]u8 {
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 1), .char_filters = analyzer.char_filters, .tokenizer = analyzer.tokenizer, .filters = analyzer.filters }, .{});
     defer a.free(bytes);
@@ -108,20 +108,27 @@ pub fn writeTextPrepared(a: A, sink: *Sink, start: usize, text: []const u8, capt
         try u32add(a, &out, encoded.len);
         try u32add(a, &out, end - begin);
         try sink.appendSlice(encoded);
+        var bitmap: [page_size / 8]u8 = @splat(0);
+        var present = false;
+        for (text[begin..end], 0..) |byte, i| if (byte & 0xc0 == 0x80) {
+            bitmap[i / 8] |= @as(u8, 1) << @as(u3, @intCast(i % 8));
+            present = true;
+        };
+        if (present) {
+            const raw = bitmap[0 .. (end - begin + 7) / 8];
+            const wire = try snappy.encode(a, raw);
+            defer a.free(wire);
+            try u64add(a, &out, sink.len() - start);
+            try u32add(a, &out, wire.len);
+            try u32add(a, &out, raw.len);
+            try sink.appendSlice(wire);
+        } else {
+            try u64add(a, &out, 0);
+            try u32add(a, &out, 0);
+            try u32add(a, &out, 0);
+        }
         begin = end;
     }
-    var has_continuations = false;
-    for (text) |byte| if (byte & 0xc0 == 0x80) {
-        has_continuations = true;
-        break;
-    };
-    const bitmap_len = if (has_continuations) (text.len + 7) / 8 else 0;
-    try u32add(a, &out, bitmap_len);
-    const bitmap_at = out.items.len;
-    try out.appendNTimes(a, 0, bitmap_len);
-    if (has_continuations) for (text, 0..) |byte, i| if (byte & 0xc0 == 0x80) {
-        out.items[bitmap_at + i / 8] |= @as(u8, 1) << @as(u3, @intCast(i % 8));
-    };
     try u32add(a, &out, captured.items.len);
     for (captured.items) |variant| {
         try out.appendSlice(a, &variant.signature);
@@ -160,7 +167,6 @@ pub const Text = struct {
     view: View,
     length: u32,
     pages: []const u8,
-    continuations: []const u8,
     variants: []const u8,
     variant_count: u32,
     fn parse(view: View, bytes: []const u8) !Text {
@@ -169,20 +175,25 @@ pub const Text = struct {
         const length = try p.int(u32);
         const count = try p.int(u32);
         if (count != (@as(u64, length) + page_size - 1) / page_size) return error.InvalidData;
-        const pages = try p.take(try std.math.mul(usize, count, 16));
+        const pages = try p.take(try std.math.mul(usize, count, 32));
         var previous: u64 = 8;
         for (0..count) |i| {
-            const part = pages[i * 16 ..][0..16];
+            const part = pages[i * 32 ..][0..32];
             const offset = std.mem.readInt(u64, part[0..8], .little);
             const wire = std.mem.readInt(u32, part[8..12], .little);
             const raw = std.mem.readInt(u32, part[12..16], .little);
             if (offset < previous or offset > view.length or wire == 0 or wire > view.length - offset or raw != @min(page_size, @as(u64, length) - i * page_size)) return error.InvalidData;
             previous = offset + wire;
+            const boundary = std.mem.readInt(u64, part[16..24], .little);
+            const boundary_wire = std.mem.readInt(u32, part[24..28], .little);
+            const boundary_raw = std.mem.readInt(u32, part[28..32], .little);
+            if (boundary_wire == 0) {
+                if (boundary != 0 or boundary_raw != 0) return error.InvalidData;
+            } else {
+                if (boundary < previous or boundary > view.length or boundary_wire > view.length - boundary or boundary_raw != (raw + 7) / 8) return error.InvalidData;
+                previous = boundary + boundary_wire;
+            }
         }
-        const n = try p.int(u32);
-        if (n != 0 and n != (@as(u64, length) + 7) / 8) return error.InvalidData;
-        const continuations = try p.take(n);
-        if (n != 0 and (continuations[0] & 1 != 0 or (length % 8 != 0 and continuations[n - 1] >> @as(u3, @intCast(length % 8)) != 0))) return error.InvalidData;
         const variants = try p.int(u32);
         const entries = try p.take(try std.math.mul(usize, variants, 52));
         if (p.at != bytes.len) return error.InvalidData;
@@ -194,7 +205,7 @@ pub const Text = struct {
             if (offset < previous or offset > view.length or wire == 0 or wire > view.length - offset or raw > @as(u64, length) * 64 + 64 or std.mem.readInt(u32, entry[48..52], .little) > length) return error.InvalidData;
             previous = offset + wire;
         }
-        return .{ .view = view, .length = length, .pages = pages, .continuations = continuations, .variant_count = variants, .variants = entries };
+        return .{ .view = view, .length = length, .pages = pages, .variant_count = variants, .variants = entries };
     }
     pub const Vector = offsets.Vector;
     pub const Selection = offsets.Selection;
@@ -204,6 +215,10 @@ pub const Text = struct {
         return self.selectTokens(a, signature, .{}, control);
     }
     pub fn selectTokens(self: Text, a: A, signature: [32]u8, selection: Selection, control: Token) !?Vector {
+        const plan = (try self.planTokens(a, signature, selection, control)) orelse return null;
+        return try plan.materializeOwned(control);
+    }
+    pub fn planTokens(self: Text, a: A, signature: [32]u8, selection: Selection, control: Token) !?offsets.Plan {
         var found: ?[]const u8 = null;
         for (0..self.variant_count) |i| {
             try control.check();
@@ -215,22 +230,7 @@ pub const Text = struct {
         const entry = found orelse return null;
         const start = std.mem.readInt(u64, entry[32..40], .little);
         const size = std.mem.readInt(u32, entry[40..44], .little);
-        return try offsets.select(a, try View.init(self.view.source, self.view.offset + start, size), self.length, std.mem.readInt(u32, entry[44..48], .little), std.mem.readInt(u32, entry[48..52], .little), selection, control);
-    }
-    fn continuation(self: Text, offset: u32) bool {
-        return offset < self.length and self.continuations.len != 0 and self.continuations[offset / 8] & (@as(u8, 1) << @as(u3, @intCast(offset % 8))) != 0;
-    }
-    pub fn floor(self: Text, offset: u32) u32 {
-        var at = offset;
-        var n: u8 = 0;
-        while (at > 0 and self.continuation(at) and n < 3) : (n += 1) at -= 1;
-        return at;
-    }
-    pub fn ceil(self: Text, offset: u32) u32 {
-        var at = offset;
-        var n: u8 = 0;
-        while (at < self.length and self.continuation(at) and n < 3) : (n += 1) at += 1;
-        return at;
+        return try offsets.prepare(a, try View.init(self.view.source, self.view.offset + start, size), self.length, std.mem.readInt(u32, entry[44..48], .little), std.mem.readInt(u32, entry[48..52], .little), selection, control);
     }
     pub fn read(self: Text, a: A, first: u32, end: u32, control: Token) ![]u8 {
         if (first > end or end > self.length) return error.InvalidData;
@@ -247,10 +247,10 @@ pub const Text = struct {
             // cancellation, authentication and joining these advisory reads.
             const through = @min(stop_page, @as(usize, index) + 5);
             while (hinted < through) : (hinted += 1) {
-                const future = self.pages[hinted * 16 ..][0..16];
+                const future = self.pages[hinted * 32 ..][0..16];
                 self.view.source.prefetch(self.view.offset + std.mem.readInt(u64, future[0..8], .little), std.mem.readInt(u32, future[8..12], .little));
             }
-            const entry = self.pages[index * 16 ..][0..16];
+            const entry = self.pages[index * 32 ..][0..16];
             const offset = std.mem.readInt(u64, entry[0..8], .little);
             const n = std.mem.readInt(u32, entry[8..12], .little);
             const encoded = try a.alloc(u8, n);
@@ -267,6 +267,73 @@ pub const Text = struct {
         return out;
     }
 };
+/// Two page-local bitmaps suffice for monotone window starts/ends. A tiny
+/// snippet never admits a bitmap proportional to the complete source value.
+pub const Boundaries = struct {
+    const Slot = struct { page: u32, bytes: []u8, used: u64 };
+    a: A,
+    text: Text,
+    control: Token,
+    slots: [2]?Slot = @splat(null),
+    tick: u64 = 0,
+    reads: usize = 0,
+    pub fn init(a: A, text: Text, control: Token) Boundaries {
+        return .{ .a = @import("../sql/memory_budget.zig").reclaimingAllocator(a), .text = text, .control = control };
+    }
+    pub fn deinit(self: *Boundaries) void {
+        for (self.slots) |slot| if (slot) |value| self.a.free(value.bytes);
+    }
+    fn continuation(self: *Boundaries, offset: u32) !bool {
+        if (offset >= self.text.length) return false;
+        const page = offset / page_size;
+        const entry = self.text.pages[@as(usize, page) * 32 ..][0..32];
+        const wire_len = std.mem.readInt(u32, entry[24..28], .little);
+        if (wire_len == 0) return false;
+        self.tick +|= 1;
+        var oldest: usize = 0;
+        const raw = for (&self.slots, 0..) |*slot, i| {
+            if (slot.*) |*value| {
+                if (value.page == page) {
+                    value.used = self.tick;
+                    break value.bytes;
+                }
+                if (self.slots[oldest] != null and value.used < self.slots[oldest].?.used) oldest = i;
+            } else oldest = i;
+        } else load: {
+            try self.control.check();
+            const encoded = try self.a.alloc(u8, wire_len);
+            defer self.a.free(encoded);
+            try self.text.view.readInto(std.mem.readInt(u64, entry[16..24], .little), encoded);
+            const bytes = try self.a.alloc(u8, std.mem.readInt(u32, entry[28..32], .little));
+            errdefer self.a.free(bytes);
+            try snappy.decodeInto(encoded, bytes);
+            if (page == 0 and bytes[0] & 1 != 0) return error.InvalidData;
+            const length = std.mem.readInt(u32, entry[12..16], .little);
+            if (length % 8 != 0 and bytes[bytes.len - 1] >> @as(u3, @intCast(length % 8)) != 0) return error.InvalidData;
+            if (self.slots[oldest]) |value| self.a.free(value.bytes);
+            self.slots[oldest] = .{ .page = page, .bytes = bytes, .used = self.tick };
+            self.reads += 1;
+            break :load bytes;
+        };
+        const at = offset % page_size;
+        return raw[at / 8] & (@as(u8, 1) << @as(u3, @intCast(at % 8))) != 0;
+    }
+    pub fn floor(self: *Boundaries, offset: u32) !u32 {
+        if (offset > self.text.length) return error.InvalidData;
+        var at = offset;
+        var n: u8 = 0;
+        while (at > 0 and try self.continuation(at) and n < 3) : (n += 1) at -= 1;
+        return at;
+    }
+    pub fn ceil(self: *Boundaries, offset: u32) !u32 {
+        if (offset > self.text.length) return error.InvalidData;
+        var at = offset;
+        var n: u8 = 0;
+        while (at < self.text.length and try self.continuation(at) and n < 3) : (n += 1) at += 1;
+        return at;
+    }
+};
+
 pub const Reader = struct {
     directory: dv.DocValuesReader,
     source: ?View = null,
@@ -376,15 +443,15 @@ pub const Writer = struct {
             const descriptor = (try cursor.directory.get(original)).?;
             const bytes = try self.a.dupe(u8, descriptor);
             errdefer self.a.free(bytes);
-            for (0..text.pages.len / 16) |i| {
-                const page = text.pages[i * 16 ..][0..16];
-                const offset = std.mem.readInt(u64, page[0..8], .little);
-                const wire = std.mem.readInt(u32, page[8..12], .little);
-                const encoded = try self.a.alloc(u8, wire);
-                defer self.a.free(encoded);
-                try text.view.readInto(offset, encoded);
-                std.mem.writeInt(u64, bytes[13 + i * 16 ..][0..8], self.sink.len() - self.start, .little);
-                try self.sink.appendSlice(encoded);
+            for (0..text.pages.len / 32) |i| {
+                const page = text.pages[i * 32 ..][0..32];
+                for ([_]usize{ 0, 16 }) |part| {
+                    const offset = std.mem.readInt(u64, page[part..][0..8], .little);
+                    const wire = std.mem.readInt(u32, page[part + 8 ..][0..4], .little);
+                    if (wire == 0) continue;
+                    std.mem.writeInt(u64, bytes[13 + i * 32 + part ..][0..8], self.sink.len() - self.start, .little);
+                    try copyRange(self.sink, text.view, offset, wire);
+                }
             }
             const variants_at = descriptor.len - text.variants.len;
             for (0..text.variant_count) |i| {
@@ -459,4 +526,45 @@ test "highlight native source compaction preserves analyzer vectors and section-
     try Run.run(a, source, text);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ source, text });
+}
+
+test "highlight paged Unicode boundaries keep large metadata outside tiny snippet admission" {
+    const a = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    const unit = "αβ.🙂\n";
+    try body.ensureTotalCapacity(a, 8 * 1024 * 1024);
+    while (body.items.len + unit.len <= 8 * 1024 * 1024) try body.appendSlice(a, unit);
+    var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = body.items }, &.{});
+    try std.testing.expect(try writer.finish());
+    var budget: @import("../sql/memory_budget.zig") = .{ .backing = a, .limit = 96 * 1024 };
+    {
+        var cursor = Cursor.init(try Reader.init(budget.allocator(), try View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len)));
+        defer cursor.deinit();
+        const stored = (try cursor.text(0)).?;
+        try std.testing.expect(cursor.directory.bytes.len < 8192);
+        var boundaries = Boundaries.init(budget.allocator(), stored, .none);
+        defer boundaries.deinit();
+        for ([_]u32{ 1, page_size - 1, page_size, page_size + 1, 5 * page_size - 1, @intCast(body.items.len - 17) }) |at| {
+            var lower = at;
+            while (lower > 0 and body.items[lower] & 0xc0 == 0x80) lower -= 1;
+            var upper = at;
+            while (upper < body.items.len and body.items[upper] & 0xc0 == 0x80) upper += 1;
+            try std.testing.expectEqual(lower, try boundaries.floor(at));
+            try std.testing.expectEqual(upper, try boundaries.ceil(at));
+        }
+        const first = try boundaries.floor(page_size - 1);
+        const end = try boundaries.ceil(page_size + 17);
+        const snippet = try stored.read(budget.allocator(), first, end, .none);
+        defer budget.allocator().free(snippet);
+        try std.testing.expectEqualStrings(body.items[first..end], snippet);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(snippet));
+        std.debug.print("SOURCE_BOUNDARIES source_bytes={d} descriptor_bytes={d} bitmap_reads={d} peak_bytes={d}\n", .{ body.items.len, cursor.directory.bytes.len, boundaries.reads, budget.peak });
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
 }

@@ -22245,10 +22245,14 @@ pub const PreparedHighlights = struct {
         }
         var context: std.json.ObjectMap = .empty;
         if (row_type) |kind| try context.put(scratch, "_type", kind);
-        const Call = struct { binding: Binding, tokens: []const analysis_mod.Token };
+        const Call = struct { binding: Binding, matches: highlight_mod.StoredMatches };
         var calls: std.ArrayListUnmanaged(Call) = .empty;
         const VectorKey = struct { signature: [32]u8, group: usize };
-        var vectors: std.AutoHashMapUnmanaged(VectorKey, @import("../../../section/source_column.zig").Text.Vector) = .empty;
+        var vectors: std.AutoHashMapUnmanaged(VectorKey, highlight_mod.StoredMatches) = .empty;
+        defer {
+            var values = vectors.valueIterator();
+            while (values.next()) |value| value.deinit();
+        }
         for (self.indexed_queries, 0..) |query, qi| {
             const relevant = for (self.groups) |group| {
                 if (group.query == qi) break true;
@@ -22266,11 +22270,12 @@ pub const PreparedHighlights = struct {
                 };
                 const vector_key: VectorKey = .{ .signature = binding.signature, .group = binding.group };
                 const tokens = vectors.get(vector_key) orelse load: {
-                    const value = (try highlight_mod.selectStoredTokens(scratch, source, binding.signature, matchers, self.groups[binding.group].program(binding.analyzer), self.control)) orelse return false;
+                    var value = (try highlight_mod.prepareStoredMatches(scratch, source, binding.signature, matchers, self.groups[binding.group].program(binding.analyzer), self.control)) orelse return false;
+                    errdefer value.deinit();
                     try vectors.put(scratch, vector_key, value);
                     break :load value;
                 };
-                try calls.append(scratch, .{ .binding = binding, .tokens = tokens.items });
+                try calls.append(scratch, .{ .binding = binding, .matches = tokens });
             }
         }
         var fragments: std.ArrayListUnmanaged(PendingHighlightFragment) = .empty;
@@ -22280,7 +22285,7 @@ pub const PreparedHighlights = struct {
             for (fragments.items) |*fragment| freePendingHighlightFragment(alloc, fragment);
         };
         for (calls.items) |call| {
-            const found = try highlight_mod.highlightSelectedStored(alloc, scratch, source, call.tokens, @max(self.options.max_fragments, 1), @max(self.options.fragment_size, 1), self.control);
+            const found = try highlight_mod.highlightStoredMatches(alloc, scratch, source, call.matches, @max(self.options.max_fragments, 1), @max(self.options.fragment_size, 1), self.control);
             defer highlight_mod.freeFragments(alloc, found);
             try appendFoundHighlightFragments(alloc, &fragments, found, null, 0);
         }

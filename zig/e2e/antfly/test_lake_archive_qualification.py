@@ -2020,10 +2020,11 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     selective_body = (
         vocabulary * ((2 * 1024 * 1024) // len(vocabulary))
     ) + "uniqueneedle"
+    unicode_body = "unicodecase " + "🙂。 " * (1024 * 1024) + " needle"
     rows = pa.table(
         {
-            "id": list(range(count + 2)),
-            "body": [body] * count + [sparse_body, selective_body],
+            "id": list(range(count + 3)),
+            "body": [body] * count + [sparse_body, selective_body, unicode_body],
         }
     )
     root = tmp_path / "fixture"
@@ -2132,6 +2133,40 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                     assert len(sparse) == 1
                     assert sparse[0]["_source"] == {"id": count}
                     assert "needle" in sparse[0]["_highlights"]["body"][0]["text"]
+                    multilingual = client.query(
+                        {
+                            "request": {
+                                "full_text_search": {
+                                    "conjuncts": [
+                                        {"match": "unicodecase", "field": "body"},
+                                        {"match": "needle", "field": "body"},
+                                    ]
+                                },
+                                "fields": ["id"],
+                                "highlight": {"fields": ["body"], "fragment_size": 100},
+                                "limit": 1,
+                                "timeout_ms": 50,
+                            }
+                        }
+                    )["hits"]["hits"]
+                    assert len(multilingual) == 1
+                    assert multilingual[0]["_source"] == {"id": count + 2}
+                    fragment = next(
+                        value
+                        for value in multilingual[0]["_highlights"]["body"]
+                        if "needle" in value["text"]
+                    )
+                    encoded = fragment["text"].encode("utf-8")
+                    assert (
+                        unicode_body.encode("utf-8")[
+                            fragment["offset"] : fragment["offset"] + len(encoded)
+                        ]
+                        == encoded
+                    )
+                    assert any(
+                        encoded[span["start"] : span["end"]] == b"needle"
+                        for span in fragment["spans"]
+                    )
                     # A rare term in a large real vocabulary uses the paged
                     # dictionary and matching occurrence blocks. All patterns
                     # retain exact source spans after native reader restart.

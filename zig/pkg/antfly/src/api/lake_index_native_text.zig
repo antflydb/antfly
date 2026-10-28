@@ -76,7 +76,7 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     // v6 captures indexing analysis into a paged term directory and independent
     // occurrence blocks. Analyzer fingerprints fence the evidence; projection
     // and compaction retain it without reanalysis.
-    hash.update("native-lake-text-stored-source-v6");
+    hash.update("native-lake-text-stored-source-v7");
     hash.update(&original);
     var digest: [32]u8 = undefined;
     hash.final(&digest);

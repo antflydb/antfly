@@ -1947,9 +1947,9 @@ values. The benchmark controls cover both small/wide and large/dense shapes.
 
 ### Selective original-offset vectors and shared indexing analysis
 
-Stored-source recipe **v6** (`AFSC0003`, `AFST3`) keeps independently compressed
+Stored-source recipe **v7** (`AFSC0004`, `AFST4`) keeps independently compressed
 64-KiB source pages and replaces flat token vectors with relocatable term
-navigation (`AFOV0001`). A ceiling directory routes exact and prefix matchers to
+navigation (`AFOV0002`). A ceiling directory routes exact and prefix matchers to
 compressed dictionary pages of at most 64 terms. Other supported patterns inspect
 the dictionary once per distinct term. Each matching term names independently
 compressed occurrence blocks of at most 1,024 records, containing a signed source
@@ -1994,3 +1994,49 @@ E2E coverage includes a large vocabulary with rare exact, prefix, wildcard and
 fuzzy matches after restart with the original source objects unavailable.
 Performance observations belong in `bench/lake/`; their binary/input identities,
 query shapes, execution order and environment qualify any timing claim.
+
+### Dense occurrence streams, Unicode metadata and equivalent bindings
+
+Recipe v7 keeps UTF-8 continuation maps beside their individual 64-KiB source
+pages. A 32-byte descriptor per page names the compressed source and optional
+boundary map; ASCII pages omit the map. Snippet clipping retains two decoded
+maps, each at most 8 KiB, instead of decoding a whole-value bitmap. Sorted and
+append compaction copy both payloads and rebase their descriptors. Metadata and
+payloads retain the enclosing native section's authentication and lifetime.
+
+Offset vectors attest whether input source spans are ordered. Serving prepares
+only matching term/block navigation. Dense ordered selections merge one current
+occurrence block per term into source order, union touching/overlapping spans,
+and retain a sliding density queue. Unordered analyzer output, tiny selections
+and highly diverse matches retain the general vector kernel. No ordered claim
+is inferred from an analyzer name; the writer checks actual emitted spans and
+the reader validates each term's order while consuming it.
+
+Fragment selection is exact. A candidate is determined by its integer unsnapped
+start. UTF-8 clipping changes either endpoint by at most three bytes, so a chosen
+window overlaps fewer than `2 * fragment_size + 20` distinct candidates. Keeping
+`(max_fragments - 1) * (2 * fragment_size + 20) + 1` best candidates preserves all
+winners of the existing greedy selection, including density and offset ties.
+A second bounded replay gathers spans only for those output windows. Candidate
+state depends on requested output size rather than occurrence count. Block
+buffers, density queues and candidate heaps use reclaimable admitted scratch;
+cancellation and allocation failures release partial output and every owner.
+
+Index builds discover repeated `(source field, input bytes, analyzer fingerprint)`
+contributions within each document. Equivalent materialized analyzer bindings
+share immutable tokens and, where eligible, original offsets. Only repeated
+bindings retain an independent analysis region; the last consumer releases it.
+Grouped contributions copy retained term keys before releasing that region, so
+position bases, frequencies, field norms and sorted output identities remain
+unchanged. Unique bindings retain ordinary short-lived scratch. The existing
+allocation-free substring producer keeps its bounded streaming implementation;
+reuse does not materialize its expanded suffix stream. These lifetimes are
+independent of private captured-offset runs, which still outlive analysis only
+through compressed variant locators.
+
+No API options or result-size limits change. Native reader protocol 93 and
+compiled runtime ABI 69 fence the new source layout; older derived text
+publications rebuild through reconciliation. Qualification includes exact
+comparison against the full fragment selector across UTF-8 boundaries, fragment
+counts and sizes, bounded live-memory probes, analyzer aliases, allocation
+failures, cancellation and real Parquet/Iceberg restart without source objects.

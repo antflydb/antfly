@@ -246,20 +246,20 @@ pub fn highlightPrepared(alloc: Allocator, scratch: Allocator, text: []const u8,
 }
 const TextSource = union(enum) {
     text: []const u8,
-    stored: @import("../section/source_column.zig").Text,
+    stored: *@import("../section/source_column.zig").Boundaries,
     fn length(self: TextSource) u32 {
         return switch (self) {
             .text => |s| @intCast(s.len),
-            .stored => |s| s.length,
+            .stored => |s| s.text.length,
         };
     }
-    fn floor(self: TextSource, at: u32) u32 {
+    fn floor(self: TextSource, at: u32) !u32 {
         return switch (self) {
             .text => |s| utf8Floor(s, at),
             .stored => |s| s.floor(at),
         };
     }
-    fn ceil(self: TextSource, at: u32) u32 {
+    fn ceil(self: TextSource, at: u32) !u32 {
         return switch (self) {
             .text => |s| utf8Ceil(s, at),
             .stored => |s| s.ceil(at),
@@ -268,7 +268,7 @@ const TextSource = union(enum) {
     fn read(self: TextSource, a: Allocator, first: u32, end: u32, control: Control) ![]const u8 {
         return switch (self) {
             .text => |s| s[first..end],
-            .stored => |s| try s.read(a, first, end, control),
+            .stored => |s| try s.text.read(a, first, end, control),
         };
     }
 };
@@ -284,7 +284,9 @@ pub fn highlightStored(a: Allocator, scratch: Allocator, source: @import("../sec
     var spans: std.ArrayListUnmanaged(Span) = .empty;
     if (source.length == 0 or count == 0 or matchers.len == 0) return &.{};
     try collectProgramSpans(arena.allocator(), tokens, matchers, program, &spans, &poller);
-    return try selectFragments(a, arena.allocator(), &spans, .{ .stored = source }, count, size, &poller);
+    var boundaries = @import("../section/source_column.zig").Boundaries.init(scratch, source, control);
+    defer boundaries.deinit();
+    return try selectFragments(a, arena.allocator(), &spans, .{ .stored = &boundaries }, count, size, &poller);
 }
 fn selectFragments(alloc: Allocator, temporary: Allocator, spans: *std.ArrayListUnmanaged(Span), source: TextSource, max_fragments: u32, fragment_size: u32, poller: *Poller) ![]Fragment {
     if (spans.items.len == 0) return &.{};
@@ -307,8 +309,8 @@ fn selectFragments(alloc: Allocator, temporary: Allocator, spans: *std.ArrayList
         if (win_end - win_start < frag_size and win_start > 0) {
             win_start = if (win_end >= frag_size) win_end - frag_size else 0;
         }
-        win_start = source.floor(win_start);
-        win_end = source.ceil(win_end);
+        win_start = try source.floor(win_start);
+        win_end = try source.ceil(win_end);
 
         const match_count = try sweep.count(spans.items, win_start, win_end, poller);
         // Clipping at either text boundary can produce identical windows.
@@ -347,7 +349,10 @@ fn selectFragments(alloc: Allocator, temporary: Allocator, spans: *std.ArrayList
         }
     }.cmp);
 
-    const fragments = try alloc.alloc(Fragment, selected.items.len);
+    return renderSelectedFragments(alloc, temporary, spans.items, source, selected.items, poller);
+}
+fn renderSelectedFragments(alloc: Allocator, temporary: Allocator, spans: []const Span, source: TextSource, selected: []const ScoredWindow, poller: *Poller) ![]Fragment {
+    const fragments = try alloc.alloc(Fragment, selected.len);
     var initialized: usize = 0;
     errdefer {
         for (fragments[0..initialized]) |fragment| {
@@ -357,12 +362,12 @@ fn selectFragments(alloc: Allocator, temporary: Allocator, spans: *std.ArrayList
         alloc.free(fragments);
     }
     var span_at: usize = 0;
-    for (selected.items, 0..) |win, fi| {
+    for (selected, 0..) |win, fi| {
         try poller.step();
         var fragment_spans = std.ArrayListUnmanaged(Span).empty;
         defer fragment_spans.deinit(temporary);
-        while (span_at < spans.items.len and spans.items[span_at].end <= win.start) : (span_at += 1) try poller.step();
-        for (spans.items[span_at..]) |span| {
+        while (span_at < spans.len and spans[span_at].end <= win.start) : (span_at += 1) try poller.step();
+        for (spans[span_at..]) |span| {
             try poller.step();
             if (span.start >= win.end) break;
             if (span.start < win.end and span.end > win.start) {
@@ -532,7 +537,7 @@ inline fn matchesToken(a: Allocator, term: []const u8, matchers: []const Matcher
 }
 /// Compile a borrowed dictionary predicate. Every distinct term is tested once;
 /// occurrence blocks already selected by this predicate need no pattern replay.
-pub fn selectStoredTokens(a: Allocator, source: @import("../section/source_column.zig").Text, signature: [32]u8, matchers: []const Matcher, program: ?*const Program, control: Control) !?@import("../section/source_column.zig").Text.Vector {
+fn prepareStoredPlan(a: Allocator, source: @import("../section/source_column.zig").Text, signature: [32]u8, matchers: []const Matcher, program: ?*const Program, control: Control) !?@import("../section/source_offsets.zig").Plan {
     const Selection = @import("../section/source_column.zig").Text.Selection;
     const Probe = struct {
         a: Allocator,
@@ -555,7 +560,35 @@ pub fn selectStoredTokens(a: Allocator, source: @import("../section/source_colum
         else => bounded = false,
     };
     var probe: Probe = .{ .a = scratch, .matchers = matchers, .program = if (matchers.len > 8) program else null, .poller = .{ .control = control } };
-    return source.selectTokens(a, signature, .{ .ptr = &probe, .matches = Probe.check, .ranges = if (bounded) ranges.items else null }, control);
+    return source.planTokens(a, signature, .{ .ptr = &probe, .matches = Probe.check, .ranges = if (bounded) ranges.items else null }, control);
+}
+pub const StoredMatches = union(enum) {
+    vector: @import("../section/source_column.zig").Text.Vector,
+    stream: @import("../section/source_offsets.zig").Plan,
+    pub fn deinit(self: *StoredMatches) void {
+        switch (self.*) {
+            .vector => |value| value.deinit(),
+            .stream => |*value| value.deinit(),
+        }
+    }
+};
+pub fn prepareStoredMatches(a: Allocator, source: @import("../section/source_column.zig").Text, signature: [32]u8, matchers: []const Matcher, program: ?*const Program, control: Control) !?StoredMatches {
+    const plan = (try prepareStoredPlan(a, source, signature, matchers, program, control)) orelse return null;
+    // Tiny and highly diverse matches retain the simpler vector kernel. Dense
+    // monotone postings use bounded source-order merging and fragment state.
+    if (plan.ordered and plan.count >= 4096 and plan.count > plan.terms.len *| 8) return .{ .stream = plan };
+    const vector = try plan.materializeOwned(control);
+    return .{ .vector = vector };
+}
+pub fn selectStoredTokens(a: Allocator, source: @import("../section/source_column.zig").Text, signature: [32]u8, matchers: []const Matcher, program: ?*const Program, control: Control) !?@import("../section/source_column.zig").Text.Vector {
+    const plan = (try prepareStoredPlan(a, source, signature, matchers, program, control)) orelse return null;
+    return try plan.materializeOwned(control);
+}
+pub fn highlightStoredMatches(a: Allocator, scratch: Allocator, source: @import("../section/source_column.zig").Text, matches: StoredMatches, count: u32, size: u32, control: Control) ![]Fragment {
+    return switch (matches) {
+        .vector => |value| highlightSelectedStored(a, scratch, source, value.items, count, size, control),
+        .stream => |*value| streamFragments(a, scratch, source, value, count, size, control, null),
+    };
 }
 pub fn highlightSelectedStored(a: Allocator, scratch: Allocator, source: @import("../section/source_column.zig").Text, selected: []const analysis_mod.Token, count: u32, size: u32, control: Control) ![]Fragment {
     var arena = std.heap.ArenaAllocator.init(scratch);
@@ -567,7 +600,158 @@ pub fn highlightSelectedStored(a: Allocator, scratch: Allocator, source: @import
         try poller.step();
         try spans.append(arena.allocator(), .{ .start = token.start_byte, .end = token.end_byte });
     }
-    return selectFragments(a, arena.allocator(), &spans, .{ .stored = source }, count, size, &poller);
+    var boundaries = @import("../section/source_column.zig").Boundaries.init(scratch, source, control);
+    defer boundaries.deinit();
+    return selectFragments(a, arena.allocator(), &spans, .{ .stored = &boundaries }, count, size, &poller);
+}
+
+const StreamProfile = struct { queue_peak: usize = 0, windows_peak: usize = 0, spans: usize = 0 };
+const SpanStream = struct {
+    iterator: *@import("../section/source_offsets.zig").Iterator,
+    pending: ?Span = null,
+    fn next(self: *SpanStream) !?Span {
+        var result = self.pending orelse if (try self.iterator.next()) |token| Span{ .start = token.start_byte, .end = token.end_byte } else return null;
+        self.pending = null;
+        while (try self.iterator.next()) |token| {
+            const span: Span = .{ .start = token.start_byte, .end = token.end_byte };
+            if (span.start > result.end) {
+                self.pending = span;
+                break;
+            }
+            result.end = @max(result.end, span.end);
+        }
+        return result;
+    }
+};
+// A min-heap by desirability retains only the globally best bounded candidates.
+fn siftWorst(windows: []ScoredWindow, first: usize) void {
+    var at = first;
+    while (at < windows.len / 2) {
+        var child = at * 2 + 1;
+        if (child + 1 < windows.len and betterWindow(windows[child], windows[child + 1])) child += 1;
+        if (!betterWindow(windows[at], windows[child])) break;
+        std.mem.swap(ScoredWindow, &windows[at], &windows[child]);
+        at = child;
+    }
+}
+/// Exact greedy fragment selection with bounded state. Every candidate is
+/// determined by one integer unsnapped start. UTF-8 moves either endpoint at
+/// most three bytes, so one chosen window excludes fewer than 2*size+20 unique
+/// candidates. Keeping (K-1)*(2*size+20)+1 best candidates therefore preserves
+/// every greedy winner, including score/start/end ties; no approximation.
+fn streamFragments(a: Allocator, scratch: Allocator, stored: @import("../section/source_column.zig").Text, plan: *const @import("../section/source_offsets.zig").Plan, count: u32, size: u32, control: Control, profile: ?*StreamProfile) ![]Fragment {
+    if (count == 0 or plan.count == 0 or stored.length == 0) return &.{};
+    const work = @import("../sql/memory_budget.zig").reclaimingAllocator(scratch);
+    var boundaries = @import("../section/source_column.zig").Boundaries.init(work, stored, control);
+    defer boundaries.deinit();
+    const source: TextSource = .{ .stored = &boundaries };
+    var iterator = try @import("../section/source_offsets.zig").Iterator.init(work, plan, control);
+    defer iterator.deinit();
+    var stream: SpanStream = .{ .iterator = &iterator };
+    var poller: Poller = .{ .control = control };
+    const width: u32 = @max(@min(size, stored.length), 1);
+    const capacity = @min(@as(u64, plan.count), (@as(u64, count) - 1) *| (2 * @as(u64, width) + 20) +| 1);
+    var queue: std.ArrayList(Span) = .empty;
+    defer queue.deinit(work);
+    var windows: std.ArrayList(ScoredWindow) = .empty;
+    defer windows.deinit(work);
+    var first: usize = 0;
+    var candidate: usize = 0;
+    var through: usize = 0;
+    var done = false;
+    var previous: ?ScoredWindow = null;
+    while (true) {
+        try poller.step();
+        if (candidate == queue.items.len) {
+            if (try stream.next()) |span| try queue.append(work, span) else break;
+        }
+        const span = queue.items[candidate];
+        const center = span.start + (span.end - span.start) / 2;
+        var start = if (center >= width / 2) center - width / 2 else 0;
+        var end = @min(start + width, stored.length);
+        if (end - start < width and start > 0) start = if (end >= width) end - width else 0;
+        start = try source.floor(start);
+        end = try source.ceil(end);
+        while (first < queue.items.len and queue.items[first].end <= start) : (first += 1) try poller.step();
+        through = @max(first, through);
+        while (true) {
+            while (through < queue.items.len and queue.items[through].start < end) : (through += 1) try poller.step();
+            if (through != queue.items.len or done) break;
+            if (try stream.next()) |next| try queue.append(work, next) else done = true;
+        }
+        const window: ScoredWindow = .{ .start = start, .end = end, .score = @intCast(through - first) };
+        if (previous == null or previous.?.start != start or previous.?.end != end) {
+            if (windows.items.len < capacity) {
+                try windows.append(work, window);
+                var at = windows.items.len - 1;
+                while (at != 0) {
+                    const parent = (at - 1) / 2;
+                    if (!betterWindow(windows.items[parent], windows.items[at])) break;
+                    std.mem.swap(ScoredWindow, &windows.items[parent], &windows.items[at]);
+                    at = parent;
+                }
+            } else if (betterWindow(window, windows.items[0])) {
+                windows.items[0] = window;
+                siftWorst(windows.items, 0);
+            }
+            previous = window;
+        }
+        if (profile) |value| {
+            value.queue_peak = @max(value.queue_peak, queue.items.len);
+            value.windows_peak = @max(value.windows_peak, windows.items.len);
+            value.spans += 1;
+        }
+        candidate += 1;
+        const discard = @min(first, candidate);
+        if (discard >= 512) {
+            std.mem.copyForwards(Span, queue.items, queue.items[discard..]);
+            queue.items.len -= discard;
+            first -= discard;
+            candidate -= discard;
+            through -= discard;
+        }
+    }
+    // The bounded heap is now ranked with the identical greedy overlap rule.
+    var parent = windows.items.len / 2;
+    while (parent != 0) {
+        parent -= 1;
+        try siftWindows(windows.items, windows.items.len, parent, &poller);
+    }
+    var selected: std.ArrayList(ScoredWindow) = .empty;
+    defer selected.deinit(work);
+    var heap_len = windows.items.len;
+    while (heap_len != 0 and selected.items.len < count) {
+        try poller.step();
+        const window = windows.items[0];
+        heap_len -= 1;
+        if (heap_len != 0) {
+            windows.items[0] = windows.items[heap_len];
+            try siftWindows(windows.items, heap_len, 0, &poller);
+        }
+        const overlaps = for (selected.items) |chosen| {
+            if (window.start < chosen.end and window.end > chosen.start) break true;
+        } else false;
+        if (!overlaps) try selected.append(work, window);
+    }
+    try controlledSort(ScoredWindow, work, selected.items, &poller, struct {
+        fn less(_: void, l: ScoredWindow, r: ScoredWindow) bool {
+            return l.start < r.start;
+        }
+    }.less);
+    // Replay only to collect spans intersecting the selected output windows.
+    // The first complete pass has already validated all selected occurrences.
+    try iterator.reset();
+    stream = .{ .iterator = &iterator };
+    var retained: std.ArrayList(Span) = .empty;
+    defer retained.deinit(work);
+    var at: usize = 0;
+    while (try stream.next()) |span| {
+        try poller.step();
+        while (at < selected.items.len and selected.items[at].end <= span.start) at += 1;
+        if (at == selected.items.len) break;
+        if (span.end > selected.items[at].start) try retained.append(work, span);
+    }
+    return renderSelectedFragments(a, work, retained.items, source, selected.items, &poller);
 }
 
 // Dictionary regexp queries feed the whole term to the automaton. The
@@ -1489,4 +1673,70 @@ test "highlight stored original offsets read only winning string pages and prese
     try std.testing.expect(reads.read_bytes < text.len / 4);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ view, text });
+}
+
+test "highlight streaming occurrences exactly preserve greedy windows with bounded memory faults and cancellation" {
+    const a = std.testing.allocator;
+    const column = @import("../section/source_column.zig");
+    const segment = @import("../segment.zig");
+    const view = @import("../segment_source.zig").View;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    for (0..20000) |i| try body.appendSlice(a, if (i % 13 == 0) " other.... " else if (i % 3 == 0) " λ 🙂 " else "needle ");
+    var memory = segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try column.Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = body.items }, &.{&analysis_mod.simple_analyzer});
+    try std.testing.expect(try writer.finish());
+    var cursor = column.Cursor.init(try column.Reader.init(a, try view.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len)));
+    defer cursor.deinit();
+    const stored = (try cursor.text(0)).?;
+    const signature = try column.fingerprint(a, &analysis_mod.simple_analyzer);
+    const matchers = [_]Matcher{ .{ .term = "needle" }, .{ .term = "λ" } };
+    var matches = (try prepareStoredMatches(a, stored, signature, &matchers, null, .none)).?;
+    defer matches.deinit();
+    try std.testing.expect(matches == .stream);
+    const vector = try matches.stream.materialize(a, .none);
+    defer vector.deinit();
+    for ([_]u32{ 1, 2, 3, 8 }) |count| for ([_]u32{ 1, 17, 100, 513 }) |width| {
+        const expected = try highlightSelectedStored(a, a, stored, vector.items, count, width, .none);
+        defer freeFragments(a, expected);
+        var profile: StreamProfile = .{};
+        var budget: @import("../sql/memory_budget.zig") = .{ .backing = a, .limit = 256 * 1024 };
+        const actual = try streamFragments(budget.allocator(), budget.allocator(), stored, &matches.stream, count, width, .none, &profile);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |old, new| {
+            try std.testing.expectEqual(old.offset, new.offset);
+            try std.testing.expectEqualStrings(old.text, new.text);
+            try std.testing.expectEqualSlices(Span, old.highlights, new.highlights);
+        }
+        try std.testing.expect(profile.queue_peak < 2048 + width);
+        try std.testing.expect(profile.windows_peak <= (@as(usize, count) - 1) * (2 * @as(usize, width) + 20) + 1);
+        if (count == 3 and width == 100) std.debug.print("SOURCE_STREAM occurrences={d} queue_peak={d} windows_peak={d} peak_bytes={d}\n", .{ matches.stream.count, profile.queue_peak, profile.windows_peak, budget.peak });
+        freeFragments(budget.allocator(), actual);
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    };
+    const Run = struct {
+        fn run(alloc: Allocator, text: column.Text, plan: *const @import("../section/source_offsets.zig").Plan) !void {
+            const result = try streamFragments(alloc, alloc, text, plan, 1, 17, .none, null);
+            defer freeFragments(alloc, result);
+        }
+    };
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ stored, &matches.stream });
+    const Stop = struct {
+        calls: usize = 0,
+        limit: usize,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == self.limit) return error.DeadlineExceeded;
+        }
+    };
+    for ([_]usize{ 1, 8, 32, 128, 256 }) |limit| {
+        var stop: Stop = .{ .limit = limit };
+        try std.testing.expectError(error.DeadlineExceeded, streamFragments(a, a, stored, &matches.stream, 3, 100, .{ .ptr = &stop, .check_fn = Stop.check }, null));
+    }
 }

@@ -1550,3 +1550,19 @@ binary, including rare exact/prefix/wildcard/fuzzy source spans with original
 objects unavailable after restart. Apache boundary checks cover 2,563 source
 files, and license, lint, formatting and whitespace checks pass. Subsequent
 changes only record evidence and normalize two headers inherited from main.
+
+### Dense streams and page-local Unicode boundaries
+
+`source_refinements.py LABEL IMMUTABLE_BINARY SOURCE_COMMIT` adds two real-Parquet
+controls: a 2-MiB dense field and an 8-MiB variable-width Unicode field with rare
+matches. Both validate complete hits and exact UTF-8 byte spans. Pair it with
+`selective_offsets.py`, `hidden_highlights.py`, `highlight_kernels.py` and
+`source_pages.py`; run old/new followed by new/old without task-owned build,
+E2E or cleanup overlap. Publication readiness observations include indexing and
+polling and must not be presented as isolated analyzer CPU measurements.
+
+The native dense selector oracle compares the stream and vector kernels across
+fragment sizes 1/17/100/513 and counts 1/2/3/8. It also exercises allocation
+failures and cancellation. The Unicode probe admits a tiny snippet from an
+8-MiB source under a 96-KiB limit, including page-boundary clipping. Reuse probes
+verify analyzer-run counts and last-consumer ownership independently of timings.

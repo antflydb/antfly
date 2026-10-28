@@ -24,7 +24,7 @@ const snappy = @import("../encoding/snappy.zig");
 const View = @import("../segment_source.zig").View;
 const Sink = @import("../segment.zig").SegmentSink;
 const Control = @import("antfly_cancellation").CancellationToken;
-const magic = "AFOV0001";
+const magic = "AFOV0002";
 const header_size = 32;
 const block_tokens = 1024;
 const page_terms = 64;
@@ -117,7 +117,9 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
     const next = try a.alloc(u32, tokens.len);
     defer a.free(next);
     @memset(next, std.math.maxInt(u32));
+    var ordered = true;
     for (tokens, 0..) |token, i| {
+        if (i != 0 and (token.start_byte < tokens[i - 1].start_byte or (token.start_byte == tokens[i - 1].start_byte and token.end_byte > tokens[i - 1].end_byte))) ordered = false;
         if (token.start_byte > token.end_byte) return error.InvalidData;
         const entry = try by_term.getOrPut(a, token.term);
         if (!entry.found_existing) {
@@ -192,7 +194,8 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
     std.mem.writeInt(u32, header[16..20], root_ref.wire, .little);
     std.mem.writeInt(u32, header[20..24], root_ref.raw, .little);
     std.mem.writeInt(u32, header[24..28], count, .little);
-    std.mem.writeInt(u32, header[28..32], @intCast(groups.items.len), .little);
+    if (groups.items.len > 0x7fffffff) return error.InvalidData;
+    std.mem.writeInt(u32, header[28..32], @as(u32, @intCast(groups.items.len)) | (if (ordered) @as(u32, 0x80000000) else 0), .little);
     try sink.writeAt(base, &header);
     return .{ .bytes = sink.len() - base, .root_raw = root_ref.raw, .count = count };
 }
@@ -294,7 +297,7 @@ fn read(a: A, view: View, ref: Ref, bound: u64, control: Control) ![]u8 {
     try control.check();
     return raw;
 }
-pub fn select(a: A, view: View, source_length: u32, root_raw: u32, count: u32, selection: Selection, control: Control) !Vector {
+pub fn prepare(a: A, view: View, source_length: u32, root_raw: u32, count: u32, selection: Selection, control: Control) !Plan {
     const work = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
     var h: [header_size]u8 = undefined;
     try control.check();
@@ -323,7 +326,7 @@ pub fn select(a: A, view: View, source_length: u32, root_raw: u32, count: u32, s
         prior_end = ref.offset + ref.wire;
         term_count += ref.count;
     }
-    if (root.at != root.bytes.len or term_count != std.mem.readInt(u32, h[28..32], .little) or term_count > count or (term_count == 0) != (count == 0)) return error.InvalidData;
+    if (root.at != root.bytes.len or term_count != (std.mem.readInt(u32, h[28..32], .little) & 0x7fffffff) or term_count > count or (term_count == 0) != (count == 0)) return error.InvalidData;
     const needed = try selectedPages(work, pages, selection);
     defer if (needed) |bits| work.free(bits);
     try control.check();
@@ -334,7 +337,7 @@ pub fn select(a: A, view: View, source_length: u32, root_raw: u32, count: u32, s
         a.destroy(owner);
     }
     const out = owner.allocator();
-    var items: std.ArrayList(analysis.Token) = .empty;
+    var terms: std.ArrayList(Plan.Term) = .empty;
     previous = null;
     var total: u64 = 0;
     for (pages, 0..) |page, page_index| {
@@ -354,36 +357,193 @@ pub fn select(a: A, view: View, source_length: u32, root_raw: u32, count: u32, s
             if (blocks == 0 or blocks > (p.bytes.len - p.at) / 20) return error.InvalidData;
             const matched = if (selection.matches) |check| try check(selection.ptr.?, term) else true;
             const retained = if (matched) try out.dupe(u8, term) else "";
+            const refs = try out.alloc(Ref, if (matched) blocks else 0);
             var block_end: u64 = header_size;
-            for (0..blocks) |_| {
+            for (0..blocks) |i| {
                 const ref = try p.ref();
                 if (ref.offset < block_end or ref.offset > page.ref.offset or ref.wire == 0 or ref.wire > page.ref.offset - ref.offset or ref.count == 0 or ref.count > block_tokens or ref.raw == 0 or ref.raw > page_bytes) return error.InvalidData;
                 block_end = ref.offset + ref.wire;
                 if (!matched) continue;
                 total += ref.count;
                 if (total > count) return error.InvalidData;
-                const bytes = try read(work, view, ref, page.ref.offset, control);
-                defer work.free(bytes);
-                var block: Parser = .{ .bytes = bytes };
-                var start: i64 = 0;
-                for (0..ref.count) |i| {
-                    if (i % 256 == 0) try control.check();
-                    const delta = try block.variable();
-                    if (delta > @as(u64, std.math.maxInt(u32)) * 2) return error.InvalidData;
-                    start += @as(i64, @intCast(delta >> 1)) ^ -@as(i64, @intCast(delta & 1));
-                    const length = try block.variable();
-                    const position = try block.variable();
-                    if (start < 0 or start > source_length or length > source_length - @as(u64, @intCast(start)) or position > std.math.maxInt(u32)) return error.InvalidData;
-                    try items.append(out, .{ .term = retained, .start_byte = @intCast(start), .end_byte = @intCast(@as(u64, @intCast(start)) + length), .position = @intCast(position) });
-                }
-                if (block.at != bytes.len) return error.InvalidData;
+                refs[i] = ref;
             }
+            if (matched) try terms.append(out, .{ .text = retained, .blocks = refs });
         }
         if (p.at != p.bytes.len or prior == null or !std.mem.eql(u8, prior.?, page.ceiling)) return error.InvalidData;
     }
     if (selection.matches == null and selection.ranges == null and total != count) return error.InvalidData;
-    return .{ .a = a, .owner = owner, .items = try items.toOwnedSlice(out) };
+    return .{ .a = a, .owner = owner, .view = view, .source_length = source_length, .terms = try terms.toOwnedSlice(out), .count = @intCast(total), .ordered = std.mem.readInt(u32, h[28..32], .little) & 0x80000000 != 0 };
 }
+pub fn select(a: A, view: View, source_length: u32, root_raw: u32, count: u32, selection: Selection, control: Control) !Vector {
+    const plan = try prepare(a, view, source_length, root_raw, count, selection, control);
+    return plan.materializeOwned(control);
+}
+/// Immutable term/block navigation, independent of occurrence materialization.
+pub const Plan = struct {
+    pub const Term = struct { text: []const u8, blocks: []const Ref };
+    a: A,
+    owner: *std.heap.ArenaAllocator,
+    view: View,
+    source_length: u32,
+    terms: []const Term,
+    count: u32,
+    ordered: bool,
+    pub fn deinit(self: *Plan) void {
+        self.owner.deinit();
+        self.a.destroy(self.owner);
+    }
+    /// Consume navigation and reuse its region for small vector results.
+    pub fn materializeOwned(self: Plan, control: Control) !Vector {
+        errdefer {
+            self.owner.deinit();
+            self.a.destroy(self.owner);
+        }
+        const out = self.owner.allocator();
+        const work = @import("../sql/memory_budget.zig").reclaimingAllocator(self.a);
+        var items: std.ArrayList(analysis.Token) = .empty;
+        for (self.terms) |term| {
+            var cursor: Occurrences = .{};
+            defer cursor.deinit(work);
+            while (try cursor.next(work, &self, term, control)) |token| try items.append(out, token);
+        }
+        if (items.items.len != self.count) return error.InvalidData;
+        return .{ .a = self.a, .owner = self.owner, .items = try items.toOwnedSlice(out) };
+    }
+    pub fn materialize(self: *const Plan, a: A, control: Control) !Vector {
+        const owner = try a.create(std.heap.ArenaAllocator);
+        owner.* = .init(a);
+        errdefer {
+            owner.deinit();
+            a.destroy(owner);
+        }
+        const out = owner.allocator();
+        var items: std.ArrayList(analysis.Token) = .empty;
+        const work = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
+        for (self.terms) |term| {
+            var cursor: Occurrences = .{};
+            defer cursor.deinit(work);
+            const retained = try out.dupe(u8, term.text);
+            while (try cursor.next(work, self, term, control)) |token| {
+                var value = token;
+                value.term = retained;
+                try items.append(out, value);
+            }
+        }
+        if (items.items.len != self.count) return error.InvalidData;
+        return .{ .a = a, .owner = owner, .items = try items.toOwnedSlice(out) };
+    }
+};
+const Occurrences = struct {
+    block: usize = 0,
+    bytes: []u8 = &.{},
+    parser: Parser = .{ .bytes = &.{} },
+    remaining: u32 = 0,
+    start: i64 = 0,
+    prior: ?analysis.Token = null,
+    fn deinit(self: *Occurrences, a: A) void {
+        a.free(self.bytes);
+        self.* = .{};
+    }
+    fn next(self: *Occurrences, a: A, plan: *const Plan, term: Plan.Term, control: Control) !?analysis.Token {
+        if (self.remaining == 0) {
+            if (self.parser.at != self.parser.bytes.len) return error.InvalidData;
+            if (self.block == term.blocks.len) return null;
+            a.free(self.bytes);
+            self.bytes = &.{};
+            const ref = term.blocks[self.block];
+            self.bytes = try read(a, plan.view, ref, plan.view.length, control);
+            self.parser = .{ .bytes = self.bytes };
+            self.remaining = ref.count;
+            self.start = 0;
+            self.block += 1;
+        }
+        if (self.remaining % 256 == 0) try control.check();
+        const delta = try self.parser.variable();
+        if (delta > @as(u64, std.math.maxInt(u32)) * 2) return error.InvalidData;
+        self.start += @as(i64, @intCast(delta >> 1)) ^ -@as(i64, @intCast(delta & 1));
+        const length = try self.parser.variable();
+        const position = try self.parser.variable();
+        if (self.start < 0 or self.start > plan.source_length or length > plan.source_length - @as(u64, @intCast(self.start)) or position > std.math.maxInt(u32)) return error.InvalidData;
+        self.remaining -= 1;
+        const token: analysis.Token = .{ .term = term.text, .start_byte = @intCast(self.start), .end_byte = @intCast(@as(u64, @intCast(self.start)) + length), .position = @intCast(position) };
+        if (plan.ordered) if (self.prior) |prior| if (token.start_byte < prior.start_byte or (token.start_byte == prior.start_byte and token.end_byte > prior.end_byte)) return error.InvalidData;
+        self.prior = token;
+        return token;
+    }
+};
+/// Restartable source-order merge. Each term retains one compressed-block decode,
+/// not a token array. General unordered analyzer outputs use materialization.
+pub const Iterator = struct {
+    const State = struct { cursor: Occurrences = .{}, current: ?analysis.Token = null };
+    a: A,
+    plan: *const Plan,
+    control: Control,
+    states: []State = &.{},
+    heap: []usize = &.{},
+    len: usize = 0,
+    pub fn init(a: A, plan: *const Plan, control: Control) !Iterator {
+        if (!plan.ordered) return error.InvalidData;
+        var self: Iterator = .{ .a = @import("../sql/memory_budget.zig").reclaimingAllocator(a), .plan = plan, .control = control };
+        errdefer self.deinit();
+        self.states = try self.a.alloc(State, plan.terms.len);
+        @memset(self.states, .{});
+        self.heap = try self.a.alloc(usize, plan.terms.len);
+        try self.reset();
+        return self;
+    }
+    pub fn deinit(self: *Iterator) void {
+        for (self.states) |*state| state.cursor.deinit(self.a);
+        self.a.free(self.states);
+        self.a.free(self.heap);
+    }
+    fn before(self: *const Iterator, l: usize, r: usize) bool {
+        const a = self.states[l].current.?;
+        const b = self.states[r].current.?;
+        if (a.start_byte != b.start_byte) return a.start_byte < b.start_byte;
+        if (a.end_byte != b.end_byte) return a.end_byte > b.end_byte;
+        return l < r;
+    }
+    fn sift(self: *Iterator, first: usize) void {
+        var at = first;
+        while (at < self.len / 2) {
+            var child = at * 2 + 1;
+            if (child + 1 < self.len and self.before(self.heap[child + 1], self.heap[child])) child += 1;
+            if (!self.before(self.heap[child], self.heap[at])) break;
+            std.mem.swap(usize, &self.heap[at], &self.heap[child]);
+            at = child;
+        }
+    }
+    pub fn reset(self: *Iterator) !void {
+        self.len = 0;
+        for (self.states, self.plan.terms, 0..) |*state, term, i| {
+            try self.control.check();
+            state.cursor.deinit(self.a);
+            state.current = try state.cursor.next(self.a, self.plan, term, self.control);
+            if (state.current != null) {
+                self.heap[self.len] = i;
+                self.len += 1;
+            }
+        }
+        var parent = self.len / 2;
+        while (parent != 0) {
+            parent -= 1;
+            self.sift(parent);
+        }
+    }
+    pub fn next(self: *Iterator) !?analysis.Token {
+        if (self.len == 0) return null;
+        const i = self.heap[0];
+        const result = self.states[i].current.?;
+        self.states[i].current = try self.states[i].cursor.next(self.a, self.plan, self.plan.terms[i], self.control);
+        if (self.states[i].current == null) {
+            self.len -= 1;
+            if (self.len != 0) self.heap[0] = self.heap[self.len];
+        }
+        self.sift(0);
+        return result;
+    }
+};
 
 test "highlight source offset dictionary skips unrelated occurrence blocks and bounds allocation failures" {
     const a = std.testing.allocator;

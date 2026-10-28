@@ -56,17 +56,20 @@ pub const Capture = struct {
         if (self.spool) |run| run.deinit();
         self.memory.deinit();
     }
+    pub fn signatureFor(self: *Capture, analyzer: *const analysis.Analyzer) ![32]u8 {
+        return self.signatures.get(analyzer) orelse add: {
+            const bytes = try column.fingerprint(self.a, analyzer);
+            try self.signatures.put(self.a, analyzer, bytes);
+            break :add bytes;
+        };
+    }
     pub fn wants(self: *Capture, doc: u32, field: []const u8, text: []const u8, root: ?std.json.Value, analyzer: *const analysis.Analyzer) !?Request {
         if (!self.active or text.len <= 4096 or !column.eligibleAnalyzer(analyzer)) return null;
         const value = root orelse return null;
         if (value != .object) return null;
         const original = value.object.get(field) orelse return null;
         if (original != .string or !std.mem.eql(u8, original.string, text) or !std.unicode.utf8ValidateSlice(text)) return null;
-        const signature = self.signatures.get(analyzer) orelse add: {
-            const bytes = try column.fingerprint(self.a, analyzer);
-            try self.signatures.put(self.a, analyzer, bytes);
-            break :add bytes;
-        };
+        const signature = try self.signatureFor(analyzer);
         const key: Key = .{ .doc = doc, .field = field };
         if (self.entries.get(key)) |held| for (held.items) |variant| if (std.mem.eql(u8, &variant.signature, &signature)) {
             self.reused += 1;

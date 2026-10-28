@@ -100,6 +100,7 @@ fn resetScratchList(comptime T: type, alloc: Allocator, list: *std.ArrayListUnma
 
 const PostingRun = @import("postings_run.zig").Run;
 const SourceCapture = @import("section/source_capture.zig").Capture;
+const AnalysisReuse = @import("section/analysis_reuse.zig").Cache;
 const PostingRunRange = struct {
     spool: *PostingRun,
     offset: usize,
@@ -581,6 +582,8 @@ pub const BuildTextProfile = struct {
     doc_count: u64 = 0,
     text_field_count: u64 = 0,
     token_count: u64 = 0,
+    shared_analysis_runs: u64 = 0,
+    shared_analysis_reuses: u64 = 0,
     source_vectors_captured: u64 = 0,
     source_vectors_reused: u64 = 0,
     source_vector_spilled_bytes: u64 = 0,
@@ -1064,6 +1067,32 @@ fn writeTextSegmentWithScratch(
         scratch.reset(alloc, options.doc_scratch_retained_bytes);
         const doc_alloc = doc_arena_state.allocator();
 
+        var reuse = AnalysisReuse.init(alloc);
+        defer {
+            if (profile) |p| {
+                p.shared_analysis_runs +|= reuse.analyses;
+                p.shared_analysis_reuses +|= reuse.reuses;
+            }
+            reuse.deinit();
+        }
+        if (text_doc.text_fields.len > 1) {
+            var sources: std.StringHashMapUnmanaged(usize) = .empty;
+            defer sources.deinit(alloc);
+            for (text_doc.text_fields) |field| {
+                const item = try sources.getOrPut(alloc, field.source_field orelse field.field_name);
+                if (!item.found_existing) item.value_ptr.* = 0;
+                item.value_ptr.* += 1;
+            }
+            for (text_doc.text_fields) |field| {
+                const source_field = field.source_field orelse field.field_name;
+                if (sources.get(source_field).? < 2) continue;
+                const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, field, default_analyzer, text_analysis);
+                // Streaming suffix expansion keeps its existing bounded cursor.
+                if (analyzer.tokenStream(field.text) != null) continue;
+                try reuse.note(.{ .field = source_field, .text = field.text, .signature = try source_capture.signatureFor(analyzer) });
+            }
+        }
+
         const stored_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         if (options.store_documents) {
             try seg_writer.addStoredDocFromInput(
@@ -1106,6 +1135,7 @@ fn writeTextSegmentWithScratch(
                     &scratch,
                     &source_capture,
                     text_doc.stored_source,
+                    &reuse,
                 );
                 scratch.hits.clearRetainingCapacity();
                 try spillPendingFields(alloc, &field_builders, options, @intCast(doc_idx + 1), &postings_spool);
@@ -1121,7 +1151,7 @@ fn writeTextSegmentWithScratch(
                 while (end < scratch.field_order.items.len and std.mem.eql(u8, field_name, text_doc.text_fields[scratch.field_order.items[end]].field_name)) : (end += 1) {}
                 _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
                 if (end == start + 1) {
-                    try addSingleTextFieldToBuilders(alloc, doc_alloc, &field_builders, &field_indices, &seg_writer, &analyzer_cache, @intCast(doc_idx), text_doc.text_fields[scratch.field_order.items[start]], default_analyzer, text_analysis, profile, profile_timings, &scratch, &source_capture, text_doc.stored_source);
+                    try addSingleTextFieldToBuilders(alloc, doc_alloc, &field_builders, &field_indices, &seg_writer, &analyzer_cache, @intCast(doc_idx), text_doc.text_fields[scratch.field_order.items[start]], default_analyzer, text_analysis, profile, profile_timings, &scratch, &source_capture, text_doc.stored_source, &reuse);
                     scratch.hits.clearRetainingCapacity();
                 } else {
                     var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
@@ -1133,7 +1163,7 @@ fn writeTextSegmentWithScratch(
                         const tf = text_doc.text_fields[index];
                         if (profile) |p| p.text_field_count +|= 1;
                         const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, tf, default_analyzer, text_analysis);
-                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings, &source_capture, @intCast(doc_idx), tf.source_field orelse tf.field_name, text_doc.stored_source);
+                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings, &source_capture, @intCast(doc_idx), tf.source_field orelse tf.field_name, text_doc.stored_source, &reuse);
                     }
                     const hit_materialize_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
                     scratch.hits.clearRetainingCapacity();
@@ -1765,10 +1795,13 @@ fn addSingleTextFieldToBuilders(
     scratch: *TextBuildScratch,
     source_capture: *SourceCapture,
     source_root: ?std.json.Value,
+    reuse: *AnalysisReuse,
 ) !void {
     if (profile) |p| p.text_field_count +|= 1;
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
     const capture = try source_capture.wants(doc_idx, field.source_field orelse field.field_name, field.text, source_root, analyzer);
+    var shared: ?AnalysisReuse.Lease = null;
+    defer if (shared) |held| held.release();
     var field_acc = FieldAcc.init(alloc);
     defer field_acc.deinit();
     if (if (field.text.len >= 128) analyzer.tokenStream(field.text) else null) |producer| {
@@ -1780,7 +1813,8 @@ fn addSingleTextFieldToBuilders(
         }
     } else {
         const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
-        const tokens = if (capture != null) try analyzer.analyzeWithSourceOffsets(doc_alloc, field.text) else try analyzer.analyze(doc_alloc, field.text);
+        if (reuse.entries.count() != 0) shared = try reuse.acquire(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null);
+        const tokens = if (shared) |held| held.tokens else if (capture != null) try analyzer.analyzeWithSourceOffsets(doc_alloc, field.text) else try analyzer.analyze(doc_alloc, field.text);
         if (capture) |request| try source_capture.record(request, tokens);
         if (profile) |p| {
             if (profile_timings) p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
@@ -1869,7 +1903,7 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
     field.token_offset = try std.math.add(u32, base, count);
     return count;
 }
-fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, source_capture: *SourceCapture, doc: u32, source_field: []const u8, source_root: ?std.json.Value) !void {
+fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, source_capture: *SourceCapture, doc: u32, source_field: []const u8, source_root: ?std.json.Value, reuse: *AnalysisReuse) !void {
     if (if (text.len >= 128) analyzer.tokenStream(text) else null) |stream| {
         const started = if (timings) platform_time.monotonicNs() else 0;
         const existing = fields.getPtr(name);
@@ -1891,7 +1925,9 @@ fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.String
     }
     const started = if (timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc, source_field, text, source_root, analyzer);
-    const tokens = if (capture != null) try analyzer.analyzeWithSourceOffsets(a, text) else try analyzer.analyze(a, text);
+    const shared = if (reuse.entries.count() != 0) try reuse.acquire(.{ .field = source_field, .text = text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null) else null;
+    defer if (shared) |held| held.release();
+    const tokens = if (shared) |held| held.tokens else if (capture != null) try analyzer.analyzeWithSourceOffsets(a, text) else try analyzer.analyze(a, text);
     if (capture) |request| try source_capture.record(request, tokens);
     if (profile) |p| {
         p.token_count +|= @intCast(tokens.len);
@@ -1906,7 +1942,7 @@ fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.String
     }
     const field = slot.value_ptr;
     const base = field.token_offset;
-    for (tokens) |token| try accumulateToken(a, field, token, base, false);
+    for (tokens) |token| try accumulateToken(a, field, token, base, shared != null);
     field.token_offset = try std.math.add(u32, base, @intCast(tokens.len));
     if (timings) {
         if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - accum_started;
@@ -5218,6 +5254,8 @@ test "highlight indexing captures original offsets once across physical bindings
         .text_fields = &.{ .{ .field_name = "body", .source_field = "body", .text = text }, .{ .field_name = "_all", .source_field = "body", .text = text } },
     }}, &analysis_mod.default_analyzer, .{}, .{ .store_source_columns = true, .profile = &profile, .postings_run_io = testing.io });
     defer a.free(bytes);
+    try testing.expectEqual(@as(u64, 1), profile.shared_analysis_runs);
+    try testing.expectEqual(@as(u64, 1), profile.shared_analysis_reuses);
     try testing.expectEqual(@as(u64, 1), profile.source_vectors_captured);
     try testing.expectEqual(@as(u64, 1), profile.source_vectors_reused);
     try testing.expect(profile.source_vector_spilled_bytes > 0);
