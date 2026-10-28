@@ -10423,7 +10423,10 @@ test "capi native memory grouped episodes advance without a waiting write in roo
     const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
     defer a.free(path);
     var root: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &root));
+    // This checks background progress across namespaces, not power-loss
+    // durability. Keep real file I/O without syncing each idle-table setup.
+    const options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .flags = capi.open_flag_no_sync };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &root));
     defer antfly_db_close(root);
     try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_create_table_json(root, .fromSlice("history"), .fromSlice("{}")));
     var table: ?*anyopaque = null;
