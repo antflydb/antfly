@@ -1731,6 +1731,15 @@ test "external lake ordered pulls borrow each execution and retain publication a
                 .revoked => self.revoked = true,
             };
         }
+        fn readFor(raw: *anyopaque, alloc: A, id: []const u8, max: usize, token: Cancellation, context: stores.ReadContext) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, read, .{ raw, alloc, id, max, token }, discard, .{alloc});
+        }
+        fn rangeFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Cancellation, context: stores.ReadContext) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, range, .{ raw, alloc, id, offset, length, token }, discard, .{alloc});
+        }
+        fn discard(bytes: []u8, alloc: A) void {
+            alloc.free(bytes);
+        }
         fn read(raw: *anyopaque, alloc: A, id: []const u8, max: usize, token: Cancellation) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.before();
@@ -1790,7 +1799,9 @@ test "external lake ordered pulls borrow each execution and retain publication a
         var fixture: Fixture = .{ .base = store, .scheduler = &scheduler, .signal = &signal, .case = case, .enabled = during_open };
         var vtable = store.vtable.*;
         vtable.get_bounded_alloc_with_cancellation = Fixture.read;
+        vtable.get_bounded_alloc_for = Fixture.readFor;
         vtable.get_range_alloc_with_cancellation = Fixture.range;
+        vtable.get_range_alloc_for = Fixture.rangeFor;
         var observed = store;
         observed.ptr = &fixture;
         observed.vtable = &vtable;
@@ -2306,6 +2317,12 @@ test "external lake ordered durable run checkpoints compact resume and certify f
         fn rangeCanceled(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, _: Cancellation) ![]u8 {
             return range(raw, alloc, id, offset, len);
         }
+        fn rangeFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, token: Cancellation, _: stores.ReadContext) ![]u8 {
+            return rangeCanceled(raw, alloc, id, offset, len, token);
+        }
+        fn boundedFor(raw: *anyopaque, alloc: A, id: []const u8, len: usize, token: Cancellation, context: stores.ReadContext) ![]u8 {
+            return rangeFor(raw, alloc, id, 0, len, token, context);
+        }
         fn verified(raw: *anyopaque, alloc: A, id: []const u8, _: u64, _: []const u8, offset: u64, len: usize, token: Cancellation) ![]u8 {
             return rangeCanceled(raw, alloc, id, offset, len, token);
         }
@@ -2315,6 +2332,8 @@ test "external lake ordered durable run checkpoints compact resume and certify f
     };
     var vtable = fresh.vtable.*;
     vtable.get_range_alloc = Payloads.range;
+    vtable.get_range_alloc_for = Payloads.rangeFor;
+    vtable.get_bounded_alloc_for = Payloads.boundedFor;
     vtable.get_range_alloc_with_cancellation = Payloads.rangeCanceled;
     vtable.get_verified_range_alloc_with_cancellation = Payloads.verified;
     vtable.get_verified_range_alloc_with_budget = Payloads.budgeted;

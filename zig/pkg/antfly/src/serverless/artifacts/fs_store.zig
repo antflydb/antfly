@@ -856,6 +856,41 @@ pub const FsStore = struct {
         }
         try op.ready();
     }
+    fn boundedFor(raw: *anyopaque, a: Allocator, id: []const u8, maximum: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+        return readFor(raw, a, id, 0, maximum, true, token, context);
+    }
+    fn rangeFor(raw: *anyopaque, a: Allocator, id: []const u8, offset: u64, len: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+        return readFor(raw, a, id, offset, len, false, token, context);
+    }
+    fn readFor(raw: *anyopaque, a: Allocator, id: []const u8, offset: u64, len: usize, bounded: bool, token: CancellationToken, context: ReadContext) ![]u8 {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        var native: Provider.Native = undefined;
+        try native.init(context, token);
+        defer native.deinit();
+        const op = &native.operation;
+        const io = try op.receiver();
+        const wait = op.control();
+        const path = try pathForArtifactIdAlloc(a, self.root_dir, id);
+        defer a.free(path);
+        var rejected = false;
+        const file = try wait.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, closeControlledFile);
+        defer file.close(io);
+        const length = try wait.withWait(std.Io.File.length, .{ file, io });
+        if (bounded and length > len) return error.ArtifactIntegrityMismatch;
+        if (offset > length) return error.InvalidRange;
+        const output = try a.alloc(u8, @intCast(@min(length - offset, len)));
+        errdefer a.free(output);
+        var copied: usize = 0;
+        while (copied < output.len) {
+            try op.ready();
+            const count = @min(output.len - copied, 1024 * 1024);
+            const chunk = output[copied..][0..count];
+            if (try wait.withWait(std.Io.File.readPositionalAll, .{ file, io, chunk, offset + copied }) != count) return error.ShortArtifactRead;
+            copied += count;
+        }
+        try op.ready();
+        return output;
+    }
     fn putFor(raw: *anyopaque, a: Allocator, scope: ?artifact_store.UploadScope, bytes: []const u8, token: CancellationToken, context: ReadContext) !artifact_store.ArtifactMetadata {
         const self: *FsStore = @ptrCast(@alignCast(raw));
         return self.putInScopeFor(a, scope, bytes, token, context);
@@ -881,6 +916,8 @@ pub const FsStore = struct {
         return @import("retained_closure.zig").sealFor(&self.retention, self, token, context);
     }
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .get_bounded_alloc_for = boundedFor,
+        .get_range_alloc_for = rangeFor,
         .verify_content_for = verifyContentFor,
         .put_for = putFor,
         .delete_for = deleteFor,

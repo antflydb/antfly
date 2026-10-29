@@ -58,7 +58,7 @@ pub fn install(source: *Source, store: *Store, publication: local.metadata_lake_
     const context = owner.lease.readContext();
     const token: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |value| .{ .ptr = value.ptr, .is_cancelled_fn = value.is_cancelled_fn } else .none;
     owner.store.implementation.cloud_io = context.io;
-    try owner.store.bindPublication(publication, token);
+    try owner.store.bindPublicationFor(publication, token, context);
     const oa = owner.arena.allocator();
     const owned_root = try std.json.parseFromSliceLeaky(nav.Root, oa, try std.json.Stringify.valueAlloc(oa, root, .{}), .{ .allocate = .alloc_always });
     var reads = cached;

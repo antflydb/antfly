@@ -215,7 +215,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     context = lease.readContext();
     try server.prepareLakeCache();
     store.implementation.cloud_io = context.io;
-    try store.bindPublication(publication, token);
+    try store.bindPublicationFor(publication, token, context);
     const cached: artifacts.CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context };
     // Published metadata can hold only the directory reference. Read the small
     // authenticated declaration document; never expand maintenance contributions.

@@ -32,6 +32,24 @@ pub const Operation = struct {
         try self.check();
         try self.context.ensureActive();
     }
+    pub fn cancellationToken(self: *const Operation) Cancellation {
+        return .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = checkCancellation };
+    }
+    fn checkCancellation(raw: *const anyopaque) !void {
+        try fromConst(raw).check();
+    }
+    pub fn lockAtomic(self: *const Operation, mutex: *std.atomic.Mutex) !void {
+        try self.ready();
+        while (!mutex.tryLock()) {
+            if (self.context.io != null) try self.sleep(1) else {
+                try self.check();
+                if (self.context.execution != null) return error.BackendRuntimeIoUnavailable;
+                std.atomic.spinLoopHint();
+            }
+        }
+        errdefer mutex.unlock();
+        try self.check();
+    }
     fn canceled(raw: *const anyopaque) bool {
         fromConst(raw).check() catch return true;
         return false;

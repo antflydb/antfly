@@ -37,6 +37,8 @@ pub const Reads = struct {
             .seal_closures_for = if (backend.vtable.seal_closures_for != null) seal_closures_for else null,
             .put_for = if (backend.vtable.put_for != null) put_for else null,
             .verify_content_for = if (backend.vtable.verify_content_for != null) verify_content_for else null,
+            .get_bounded_alloc_for = if (backend.vtable.get_bounded_alloc_for != null) get_bounded_alloc_for else null,
+            .get_range_alloc_for = if (backend.vtable.get_range_alloc_for != null) get_range_alloc_for else null,
             .object_store = if (backend.vtable.object_store != null) object_store else null,
             .retention_witness = if (backend.vtable.retention_witness != null) retention_witness else null,
             .retained_closure = if (backend.vtable.retained_closure != null) retained_closure else null,
@@ -99,6 +101,14 @@ pub const Reads = struct {
     fn verify_content_for(raw: *anyopaque, a: A, id: []const u8, byte_len: u64, checksum: []const u8, token: Cancellation, context: stores.ReadContext) !void {
         const self: *Reads = @ptrCast(@alignCast(raw));
         return self.backend.vtable.verify_content_for.?(self.backend.ptr, a, id, byte_len, checksum, token, context) catch |err| return self.failure(err);
+    }
+    fn get_bounded_alloc_for(raw: *anyopaque, a: A, id: []const u8, maximum: usize, token: Cancellation, context: stores.ReadContext) ![]u8 {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.get_bounded_alloc_for.?(self.backend.ptr, a, id, maximum, token, context) catch |err| return self.failure(err);
+    }
+    fn get_range_alloc_for(raw: *anyopaque, a: A, id: []const u8, offset: u64, len: usize, token: Cancellation, context: stores.ReadContext) ![]u8 {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.get_range_alloc_for.?(self.backend.ptr, a, id, offset, len, token, context) catch |err| return self.failure(err);
     }
     fn object_store(raw: *anyopaque) *@import("../serverless/artifacts/object_store.zig").ObjectStore {
         const self: *Reads = @ptrCast(@alignCast(raw));

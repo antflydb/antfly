@@ -285,6 +285,9 @@ pub const ArtifactStore = struct {
     }
 
     pub const VTable = struct {
+        get_bounded_alloc_for: ?*const fn (*anyopaque, Allocator, []const u8, usize, CancellationToken, ReadContext) anyerror![]u8 = null,
+        get_range_alloc_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize, CancellationToken, ReadContext) anyerror![]u8 = null,
+
         verify_content_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, CancellationToken, ReadContext) anyerror!void = null,
         retention_witness_for: ?*const fn (*anyopaque, UploadScope, CancellationToken, ReadContext) anyerror!?RetentionWitness = null,
         retained_closure_for: ?*const fn (*anyopaque, []const u8, CancellationToken, ReadContext) anyerror!bool = null,
@@ -683,13 +686,19 @@ pub const ArtifactStore = struct {
         try cancellation.check();
         const lifetime: ReadCancellation = .{ .context = context, .parent = cancellation };
         const token = lifetime.token();
+        // Only converted providers may lend native CPU at verified physical
+        // boundaries. Explicit legacy wait-only callers retain their contract.
+        const legacy_wait = if (context.execution == null) context.wait else null;
         validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch
             return error.ArtifactIntegrityMismatch;
         const expected_len = std.math.cast(usize, expected_byte_len) orelse
             return error.ArtifactTooLarge;
 
-        if (self.vtable.get_bounded_alloc_with_cancellation != null) {
-            const payload = execution_wait.runOwned(context.wait, ArtifactStore.getBoundedAlloc, .{ self, result_alloc, artifact_id, expected_len, token }, discardPayload, .{result_alloc}) catch |err| {
+        if (self.vtable.get_bounded_alloc_for != null or self.vtable.get_bounded_alloc_with_cancellation != null) {
+            const payload = (if (self.vtable.get_bounded_alloc_for) |call|
+                call(self.ptr, result_alloc, artifact_id, expected_len, token, context)
+            else
+                execution_wait.runOwned(legacy_wait, ArtifactStore.getBoundedAlloc, .{ self, result_alloc, artifact_id, expected_len, token }, discardPayload, .{result_alloc})) catch |err| {
                 try context.checkLifetime();
                 return err;
             };
@@ -701,7 +710,7 @@ pub const ArtifactStore = struct {
         }
 
         {
-            var metadata = execution_wait.runOwned(context.wait, ArtifactStore.statWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, token }, discardMetadata, .{result_alloc}) catch |err| {
+            var metadata = execution_wait.runOwned(legacy_wait, ArtifactStore.statWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, token }, discardMetadata, .{result_alloc}) catch |err| {
                 try context.checkLifetime();
                 return err;
             };
@@ -723,7 +732,7 @@ pub const ArtifactStore = struct {
             return payload;
         }
 
-        const payload = execution_wait.runOwned(context.wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, @as(u64, 0), expected_len, token }, discardPayload, .{result_alloc}) catch |err| {
+        const payload = execution_wait.runOwned(legacy_wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, @as(u64, 0), expected_len, token }, discardPayload, .{result_alloc}) catch |err| {
             try context.checkLifetime();
             return err;
         };
@@ -766,7 +775,19 @@ pub const ArtifactStore = struct {
         try context.ensureActive();
         try cancellation.check();
         const lifetime: ReadCancellation = .{ .context = context, .parent = cancellation };
-        const payload = execution_wait.runOwned(context.wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, offset, len, lifetime.token() }, discardPayload, .{result_alloc}) catch |err| {
+        if (self.vtable.get_range_alloc_for) |call| {
+            const payload = call(self.ptr, result_alloc, artifact_id, offset, len, lifetime.token(), context) catch |err| {
+                try context.checkLifetime();
+                try cancellation.check();
+                return err;
+            };
+            errdefer result_alloc.free(payload);
+            try context.ensureActive();
+            try cancellation.check();
+            return payload;
+        }
+        const legacy_wait = if (context.execution == null) context.wait else null;
+        const payload = execution_wait.runOwned(legacy_wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, offset, len, lifetime.token() }, discardPayload, .{result_alloc}) catch |err| {
             try context.checkLifetime();
             try cancellation.check();
             return err;
@@ -1200,6 +1221,7 @@ test "artifact reads suspend only provider waits and retire payloads on lost aut
         case: Case,
         bytes: []const u8,
         checksum: []const u8,
+        qualified: bool,
         calls: usize = 0,
         controls: usize = 0,
         checkpoints: usize = 0,
@@ -1214,7 +1236,7 @@ test "artifact reads suspend only provider waits and retire payloads on lost aut
         }
         fn provider(self: *@This()) !void {
             self.calls += 1;
-            if (self.case == .unscheduled) {
+            if (self.case == .unscheduled or !self.qualified) {
                 try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
             } else {
                 try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
@@ -1225,6 +1247,9 @@ test "artifact reads suspend only provider waits and retire payloads on lost aut
                 control.finish();
                 self.controls += 1;
             }
+        }
+        fn boundedFor(raw: *anyopaque, a: Allocator, id: []const u8, len: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+            return @import("antfly_local_sources").sql_execution_wait.runOwned(context.wait, bounded, .{ raw, a, id, len, token }, discardPayload, .{a});
         }
         fn bounded(raw: *anyopaque, a: Allocator, _: []const u8, len: usize, token: CancellationToken) ![]u8 {
             const self = from(raw);
@@ -1283,8 +1308,8 @@ test "artifact reads suspend only provider waits and retire payloads on lost aut
         var execution: Runnable.Execution = .{};
         try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
         defer execution.finish();
-        var fixture: Fixture = .{ .scheduler = &scheduler, .execution = &execution, .signal = &signal, .caller = &caller, .case = case, .bytes = &payload, .checksum = &checksum };
-        const vtable: ArtifactStore.VTable = .{ .deinit = Fixture.deinit, .put = Fixture.put, .get_alloc = Fixture.get, .get_range_alloc = Fixture.rawRange, .get_range_alloc_with_cancellation = Fixture.range, .stat = Fixture.stat, .delete = Fixture.delete, .get_bounded_alloc_with_cancellation = if (bounded) Fixture.bounded else null };
+        var fixture: Fixture = .{ .scheduler = &scheduler, .execution = &execution, .signal = &signal, .caller = &caller, .case = case, .qualified = bounded, .bytes = &payload, .checksum = &checksum };
+        const vtable: ArtifactStore.VTable = .{ .deinit = Fixture.deinit, .put = Fixture.put, .get_alloc = Fixture.get, .get_range_alloc = Fixture.rawRange, .get_range_alloc_with_cancellation = Fixture.range, .stat = Fixture.stat, .delete = Fixture.delete, .get_bounded_alloc_for = if (bounded) Fixture.boundedFor else null, .get_bounded_alloc_with_cancellation = if (bounded) Fixture.bounded else null };
         var store: ArtifactStore = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
         var context: ReadContext = .{ .io = std.testing.io, .cancellation = .fromAtomic(&signal) };
         if (case != .unscheduled) {
@@ -1308,7 +1333,7 @@ test "artifact reads suspend only provider waits and retire payloads on lost aut
         }
         const expected_calls: usize = if (case == .source_canceled) 0 else if (bounded) 1 else 2;
         try std.testing.expectEqual(expected_calls, fixture.calls);
-        if (case != .unscheduled) try std.testing.expectEqual(fixture.calls, fixture.controls);
+        if (case != .unscheduled and bounded) try std.testing.expectEqual(fixture.calls, fixture.controls) else try std.testing.expectEqual(@as(usize, 0), fixture.controls);
         execution.finish();
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);

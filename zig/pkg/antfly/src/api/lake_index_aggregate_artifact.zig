@@ -2078,6 +2078,7 @@ test "external lake partitioned cohorts fuse once per block and decline late mis
     denied.get_alloc = Denied.get;
     denied.get_alloc_with_cancellation = Denied.canceled;
     denied.get_bounded_alloc_with_cancellation = Denied.bounded;
+    denied.get_bounded_alloc_for = null;
     left.store.vtable = &denied;
     right.store.vtable = &denied;
     try std.testing.expect(left.cohort != null);
@@ -2188,6 +2189,25 @@ test "external lake aggregate cursors attach each call including lazy roots and 
             try self.parked();
             return self.base.statWithCancellationUsingAllocator(a, id, token);
         }
+        fn rangeFor(raw: *anyopaque, a: A, id: []const u8, offset: u64, len: usize, token: Cancellation, context: ReadContext) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, range, .{ raw, a, id, offset, len, token }, discard, .{a});
+        }
+        fn boundedFor(raw: *anyopaque, a: A, id: []const u8, len: usize, token: Cancellation, context: ReadContext) ![]u8 {
+            // This deterministic provider models stat and range readiness
+            // separately, preserving the cursor's original two-call contract.
+            var metadata = try local.sql_execution_wait.runOwned(context.wait, stat, .{ raw, a, id, token }, discardMetadata, .{a});
+            defer metadata.deinit(a);
+            try context.ensureActive();
+            if (metadata.byte_len != len) return error.ArtifactIntegrityMismatch;
+            return rangeFor(raw, a, id, 0, len, token, context);
+        }
+        fn discard(bytes: []u8, a: A) void {
+            a.free(bytes);
+        }
+        fn discardMetadata(value: stores.ArtifactMetadata, a: A) void {
+            var owned = value;
+            owned.deinit(a);
+        }
         fn range(raw: *anyopaque, a: A, id: []const u8, offset: u64, len: usize, token: Cancellation) ![]u8 {
             const self = from(raw);
             try self.parked();
@@ -2253,6 +2273,8 @@ test "external lake aggregate cursors attach each call including lazy roots and 
         var vtable = base.vtable.*;
         vtable.stat_with_cancellation = Fixture.stat;
         vtable.get_range_alloc_with_cancellation = Fixture.range;
+        vtable.get_range_alloc_for = Fixture.rangeFor;
+        vtable.get_bounded_alloc_for = Fixture.boundedFor;
         const store: stores.ArtifactStore = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
         var factory: Factory = .{ .store = store, .reference = reference, .recipe = recipe, .cached = if (cached) .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } } else null };
         var opening: Execution = .{};
@@ -2406,6 +2428,7 @@ test "external lake aggregate publishers carry authenticated proofs without chil
     const original = store.vtable;
     var denied = original.*;
     denied.get_bounded_alloc_with_cancellation = Check.denied;
+    denied.get_bounded_alloc_for = null;
     store.vtable = &denied;
     // Fresh partitions provide their physical identity and logical slot at the
     // upload boundary. Even a completely cold store needs no child-root GETs.

@@ -1555,3 +1555,67 @@ license headers and the Apache product boundary pass.
 input manifests and retained source snapshots. The native upload/verification
 and retained-closure holder milestone is integrated; the remaining full-design
 work above is still open.
+
+### Generation-map ownership and qualified artifact reads (2026-10-29)
+
+Generation-map readers and writers now take an operation-local execution and
+lifetime context through lookup, capture, flush, finish, vacuum and provider
+proofs. Cold map-page GETs and readiness waits lend the caller's CPU; validation,
+hashing, decoding, partitioning and encoding execute after reentry. Shared
+navigation retains data and flight identities only. Coalesced waiters use their
+own admission and refusal, so a canceled leader cannot lend its authority to a
+waiter or poison the waiter's independent lifetime. Warm lookup still checks
+the supplied execution and rejects a retired owner.
+
+A writer serializes flush/vacuum with a logical ownership flag guarded by short
+mutex sections. Contenders release the mutex and CPU before waiting; provider
+calls and joins retain no shared mutex. This permits independently admitted
+branch children without crossing the scheduler's prohibition on children of a
+protected publication owner. At most eight child descriptors are considered;
+the existing retained-work envelope funds actual fanout. Unfunded branches run
+on the admitted parent after funded children drain. Each child owns execution
+and provider outputs through physical join before parent CPU reentry and root
+installation. Failure after detaching a batch disables completeness; no partial
+root or vacuum cursor escapes a refused operation.
+
+Artifact range and bounded reads have explicit contextual callbacks for native
+files and object providers. Generation lookup completes on admitted CPU before
+the payload provider runs. Native callbacks pin and close their file, bound
+allocation by the expected size, and lend CPU only at physical operations.
+Object callbacks preserve exact generation selectors and original refusal.
+Payload hashing remains on CPU. Opaque legacy callbacks retain native CPU;
+explicit legacy wait-only adapters keep their separate contract. The recovery
+decorator forwards these capabilities and preserves artifact failure provenance.
+Attaching a local execution supplies that owner's existing I/O receiver when
+none was explicit; it never creates a replacement admitted I/O owner.
+
+Normal publication, recent-vector maps, source selection, native runtime cache
+opening, navigation warming, lazy published readers, GC traversal and cloud
+certificate binding pass their own context. The map and navigation owners never
+store request execution capabilities. Caller and writer cancellation compose
+rather than replacing one another. The existing pinned-generation, immutable
+map, retention-certificate and vacuum formats remain unchanged.
+
+Gated version-provider fixtures exercise the public artifact-read/upload path,
+coalescing under independent lifetimes, original cancellation/deadline refusal,
+default-envelope child fanout, query and health progress, joined failure and
+preservation of the old map. These are deterministic readiness/provider
+fixtures, not live-cloud qualification. The wrapped real-Parquet publication,
+pinned-version restart, GC/vacuum and navigation-cache regressions remain part
+of focused verification. Full qualification remains waived.
+
+`cloud-generation-admission-v9.json` records 90/90 successful build steps and
+62/62 execution-lifecycle tests, together with 69/69 artifact-read tests and
+12/12 cloud integration cases. The background and SQL admission targets also
+pass. Formatting, license headers and the Apache product boundary pass.
+The coalescing fixture retains each execution through physical join while
+parking completed workers so they cannot pin a peer's CPU return.
+`cloud-generation-admission-final.json` binds the committed source snapshots
+to the successful run's input hashes. This production milestone is integrated.
+
+The full design remains open. Remaining native metadata/read preparation
+boundaries (including filesystem manifest publication and WAL reads), serial
+graph checkpoints, framework/vendor and registry preparation, mapped-page-fault
+scope and the unresolved file-engine FD recovery gate still require their
+complete production milestones and evidence. This milestone does not qualify
+installed-native or live-cloud operation.

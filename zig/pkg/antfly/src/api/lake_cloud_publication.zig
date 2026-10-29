@@ -24,6 +24,8 @@ const Object = @import("../serverless/artifacts/object_store.zig").ObjectStore;
 const stores = @import("../serverless/artifacts/store.zig");
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const Context = stores.ReadContext;
+const ProviderOps = @import("../serverless/provider_operation.zig");
 fn digestRoot(id: []const u8) [32]u8 {
     var result: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(id, &result, .{});
@@ -43,6 +45,11 @@ pub const Binding = struct {
     previous_roots: []const [32]u8,
     previous_until: u64,
     pub fn initMap(a: A, object: *Object, cloud: catalog.CloudGenerations, token: Token) !Binding {
+        return initMapFor(a, object, cloud, token, .{});
+    }
+    pub fn initMapFor(a: A, object: *Object, cloud: catalog.CloudGenerations, token: Token, context: Context) !Binding {
+        const op: ProviderOps.Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
         try cloud.root.validate();
         try token.check();
         const reader = try a.create(maps.Reader);
@@ -57,15 +64,20 @@ pub const Binding = struct {
         return result;
     }
     pub fn init(a: A, object: *Object, publication: catalog.Publication, token: Token) !?Binding {
+        return initFor(a, object, publication, token, .{});
+    }
+    pub fn initFor(a: A, object: *Object, publication: catalog.Publication, token: Token, context: Context) !?Binding {
+        const op: ProviderOps.Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
         const cloud = publication.cloud_generations orelse return null;
         try publication.validate();
-        var result = try initMap(a, object, cloud, token);
+        var result = try initMapFor(a, object, cloud, token, context);
         errdefer result.deinit();
         var until: u64 = 0;
         if (object.cloud_retention_qualified) if (cloud.certificate) |certificate| {
             const binding = try certificateBinding(a, publication, certificate);
             if (!std.mem.eql(u8, &binding, &certificate.binding)) return error.InvalidCloudRetentionCertificate;
-            const provider_now = try object.client.providerTime(object.bucket, @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn));
+            const provider_now = try providerTime(object, token, context);
             if (provider_now != null and provider_now.? +| 60_000 < certificate.until_ms) {
                 result.roots = try a.dupe([32]u8, certificate.roots);
                 until = certificate.until_ms;
@@ -73,6 +85,7 @@ pub const Binding = struct {
         };
         object.cloud_certified_roots = result.roots;
         object.cloud_certificate_until_ms = until;
+        try op.ready();
         return result;
     }
     pub fn deinit(self: *Binding) void {
@@ -85,6 +98,16 @@ pub const Binding = struct {
         if (self.roots.len != 0) self.a.free(self.roots);
     }
 };
+fn providerTime(object: *Object, token: Token, context: Context) !?u64 {
+    const op: ProviderOps.Operation = .{ .context = context, .cancellation = token };
+    try op.ready();
+    const result = object.client.providerTime(object.bucket, op.token()) catch |err| {
+        try op.check();
+        return err;
+    };
+    try op.ready();
+    return result;
+}
 /// A valid legacy checkpoint can contribute artifacts outside the published
 /// map. Its closure must be bootstrapped even when the publication is complete.
 pub fn seedComplete(seed: ?catalog.Publication, checkpoint: ?catalog.Publication, signature: catalog.Signature, namespace: ?catalog.Digest, fresh: bool) bool {
@@ -98,7 +121,7 @@ pub fn seedComplete(seed: ?catalog.Publication, checkpoint: ?catalog.Publication
 /// its optional certificate budget is exhausted, keep version-qualified records
 /// already observed and retain ordinary required-read/audit semantics.
 pub fn finish(a: A, writer: *maps.Writer, object: *Object, publication: *catalog.Publication, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, table_id: u64, identity: [32]u8, context: local.serverless_query_lake_read_context.Context, token: Token, inherited_certificate: bool) !void {
-    const fresh_provider_now = if (inherited_certificate) try object.client.providerTime(object.bucket, @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)) else null;
+    const fresh_provider_now = if (inherited_certificate) try providerTime(object, token, context) else null;
     const inherit = fresh_provider_now != null and fresh_provider_now.? +| 60_000 < object.cloud_certificate_until_ms;
     if ((!writer.complete or (writer.qualified_retention and !inherit)) and !writer.disabled) {
         // Completeness of exact immutable selectors is independent of optional
@@ -123,19 +146,19 @@ pub fn finish(a: A, writer: *maps.Writer, object: *Object, publication: *catalog
         var vacuum_object = try Object.initWithClientOptions(a, object.client, object.bucket, object.prefix, .{ .read_only = true });
         defer vacuum_object.deinit();
         var vacuum_store = vacuum_object.artifactStore();
-        if (try writer.finish(token)) |flushed| maps.freeRef(writer.a, flushed);
-        vacuum_progress = writer.vacuum(&vacuum_store, cut, vacuum_progress, token) catch blk: {
+        if (try writer.finishFor(token, context)) |flushed| maps.freeRef(writer.a, flushed);
+        vacuum_progress = writer.vacuumFor(&vacuum_store, cut, vacuum_progress, token, context) catch blk: {
             try token.check();
             try context.ensureActive();
             break :blk vacuum_progress;
         };
         writer.vacuum_progress = vacuum_progress;
     }
-    const root = (try writer.finish(token)) orelse return;
+    const root = (try writer.finishFor(token, context)) orelse return;
     defer maps.freeRef(writer.a, root);
     publication.cloud_generations = .{ .root = try maps.cloneRef(a, root), .complete = writer.complete and !writer.disabled, .vacuum = vacuum_progress };
     if (!publication.cloud_generations.?.complete or !writer.qualified_retention or root.retention_until_ms == 0) return;
-    const provider_now = (try object.client.providerTime(object.bucket, @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn))) orelse return;
+    const provider_now = (try providerTime(object, token, context)) orelse return;
     if (provider_now +| 60_000 >= root.retention_until_ms) return;
     var roots: std.ArrayList([32]u8) = .empty;
     defer roots.deinit(a);

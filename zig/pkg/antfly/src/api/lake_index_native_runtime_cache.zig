@@ -181,7 +181,7 @@ pub const Entry = struct {
         self.store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
         self.store_open = true;
         self.store.implementation.cloud_io = context.io;
-        try self.store.bindGenerationMap(cloud, if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none);
+        try self.store.bindGenerationMapFor(cloud, if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none, context);
         if (self.store.cloud_binding) |*binding| binding.reader.cache_allocator = self.budget.allocator();
         if (!std.mem.eql(u8, &self.store.identity, &scope)) return error.ExternalLakeIndexStoreChanged;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = scope, .context = context };

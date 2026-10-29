@@ -27,6 +27,7 @@ pub const Provider = struct {
     stats: usize = 0,
     gets: usize = 0,
     get_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
+    map_put_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     put_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     retention_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     pub fn init(a: A) Provider {
@@ -56,9 +57,19 @@ pub const Provider = struct {
         var c = owner(raw).memory.client();
         return c.makeBucket(bucket);
     }
+    fn invokeHook(value: anytype) !void {
+        try value.call(value.ptr);
+    }
+    fn waitHook(hook: anytype, token: ?os.CancellationToken) !void {
+        if (hook) |value| {
+            const control: @import("httpx").socket.WriteControl = if (token) |held| held.execution_wait orelse .{} else .{};
+            try control.withWait(invokeHook, .{value});
+        }
+    }
     fn put(raw: *anyopaque, a: A, bucket: []const u8, name: []const u8, bytes: []const u8, options: os.PutOptions) !os.PutResult {
         const self = owner(raw);
-        if (self.put_hook) |hook| try hook.call(hook.ptr);
+        try waitHook(self.put_hook, options.cancellation);
+        if (std.mem.startsWith(u8, bytes, "{\"version\":1,\"depth\":")) try waitHook(self.map_put_hook, options.cancellation);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         var c = self.memory.client();
@@ -86,7 +97,7 @@ pub const Provider = struct {
     }
     fn get(raw: *anyopaque, a: A, bucket: []const u8, name: []const u8, options: os.GetOptions) !os.GetResult {
         const self = owner(raw);
-        if (self.get_hook) |hook| try hook.call(hook.ptr);
+        try waitHook(self.get_hook, options.cancellation);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         self.gets += 1;
@@ -174,9 +185,9 @@ pub const Provider = struct {
         errdefer if (token) |value| a.free(value);
         return .{ .entries = try entries.toOwnedSlice(a), .is_truncated = more, .next_continuation_token = token };
     }
-    fn retention(raw: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8, _: ?os.CancellationToken) !?os.VersionRetention {
+    fn retention(raw: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8, token: ?os.CancellationToken) !?os.VersionRetention {
         const self = owner(raw);
-        if (self.retention_hook) |hook| try hook.call(hook.ptr);
+        try waitHook(self.retention_hook, token);
         return if (self.now_ms < self.until_ms) .{ .observed_ms = self.now_ms, .until_ms = self.until_ms } else null;
     }
     fn time(raw: *anyopaque, _: A, _: []const u8, _: ?os.CancellationToken) !?u64 {

@@ -121,17 +121,27 @@ pub const Store = struct {
         return result;
     }
     pub fn bindPublication(self: *Store, publication: local.metadata_lake_index_catalog.Publication, token: @import("antfly_cancellation").CancellationToken) !void {
+        return self.bindPublicationFor(publication, token, .{});
+    }
+    pub fn bindPublicationFor(self: *Store, publication: local.metadata_lake_index_catalog.Publication, token: @import("antfly_cancellation").CancellationToken, context: stores.ReadContext) !void {
+        try context.ensureActive();
+        try token.check();
         if (self.cloud_binding) |*held| {
             const expected = publication.cloud_generations orelse return error.CatalogGenerationChanged;
             if (!std.mem.eql(u8, held.reader.root.?.artifact_id, expected.root.artifact_id) or !std.mem.eql(u8, held.reader.root.?.generation, expected.root.generation)) return error.CatalogGenerationChanged;
             return;
         }
-        self.cloud_binding = try @import("lake_cloud_publication.zig").Binding.init(self.implementation.alloc, &self.implementation, publication, token);
+        self.cloud_binding = try @import("lake_cloud_publication.zig").Binding.initFor(self.implementation.alloc, &self.implementation, publication, token, context);
     }
     pub fn bindGenerationMap(self: *Store, cloud: ?local.metadata_lake_index_catalog.CloudGenerations, token: @import("antfly_cancellation").CancellationToken) !void {
+        return self.bindGenerationMapFor(cloud, token, .{});
+    }
+    pub fn bindGenerationMapFor(self: *Store, cloud: ?local.metadata_lake_index_catalog.CloudGenerations, token: @import("antfly_cancellation").CancellationToken, context: stores.ReadContext) !void {
+        try context.ensureActive();
+        try token.check();
         const selected = cloud orelse return;
         if (self.cloud_binding != null) return error.CatalogGenerationChanged;
-        self.cloud_binding = try @import("lake_cloud_publication.zig").Binding.initMap(self.implementation.alloc, &self.implementation, selected, token);
+        self.cloud_binding = try @import("lake_cloud_publication.zig").Binding.initMapFor(self.implementation.alloc, &self.implementation, selected, token, context);
     }
     /// The Store's address must remain stable while this handle is borrowed.
     pub fn artifactStore(self: *Store) stores.ArtifactStore {

@@ -1538,6 +1538,7 @@ test "external lake seekable text loads touched postings and keeps exact scoring
     vtable.stat = Denied.stat;
     vtable.stat_with_cancellation = null;
     vtable.get_range_alloc = Denied.range;
+    vtable.get_range_alloc_for = null;
     vtable.get_range_alloc_with_cancellation = null;
     var denied = store;
     denied.vtable = &vtable;
@@ -1613,6 +1614,7 @@ test "external lake cold ranked highlights survive restart with no provider byte
     denied.stat = Denied.stat;
     denied.stat_with_cancellation = null;
     denied.get_range_alloc = Denied.range;
+    denied.get_range_alloc_for = null;
     denied.get_range_alloc_with_cancellation = null;
     var first_score: f32 = 0;
     for (0..2) |process| {
@@ -1804,6 +1806,7 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     vtable.stat = Denied.stat;
     vtable.stat_with_cancellation = null;
     vtable.get_range_alloc = Denied.range;
+    vtable.get_range_alloc_for = null;
     vtable.get_range_alloc_with_cancellation = null;
     capability.store.vtable = &vtable;
     source.prefetch(block_bytes * 19, block_bytes);
@@ -1858,6 +1861,7 @@ test "external lake packed text ranges reduce requests and authenticate sparse r
     Observed.corrupt = false;
     var vtable = store.vtable.*;
     vtable.get_range_alloc_with_cancellation = Observed.range;
+    vtable.get_range_alloc_for = null;
     var observed = store;
     observed.vtable = &vtable;
     const output = try a.alloc(u8, bytes.len);
@@ -2013,6 +2017,7 @@ test "external lake physical pack flights share different unit leaders without r
     var provider: Provider = .{ .base = store };
     var vtable = store.vtable.*;
     vtable.get_range_alloc_with_cancellation = Provider.range;
+    vtable.get_range_alloc_for = null;
     var observed = store;
     observed.ptr = &provider;
     observed.vtable = &vtable;
@@ -2229,6 +2234,7 @@ test "external lake required pack reads overlap and return every scheduler reser
     var provider: Provider = .{ .base = store };
     var vtable = store.vtable.*;
     vtable.get_range_alloc_with_cancellation = Provider.range;
+    vtable.get_range_alloc_for = null;
     var observed = store;
     observed.ptr = &provider;
     observed.vtable = &vtable;
@@ -2350,6 +2356,12 @@ test "external lake native text owns required and speculative children through p
             _ = self.controls.fetchAdd(1, .acq_rel);
             return null;
         }
+        fn rangeFor(raw: *anyopaque, a: A, id: []const u8, offset: u64, len: usize, token: Cancellation, context: Context) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, range, .{ raw, a, id, offset, len, token }, discard, .{a});
+        }
+        fn discard(bytes: []u8, a: A) void {
+            a.free(bytes);
+        }
         fn range(raw: *anyopaque, a: A, id: []const u8, offset: u64, len: usize, token: Cancellation) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const stats = self.scheduler.stats();
@@ -2411,6 +2423,7 @@ test "external lake native text owns required and speculative children through p
         }
         var vtable = base.vtable.*;
         vtable.get_range_alloc_with_cancellation = Fixture.range;
+        vtable.get_range_alloc_for = Fixture.rangeFor;
         const store: stores.ArtifactStore = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
         const context = (Context{ .io = std.testing.io, .cancellation = .fromAtomic(&signal) }).withExecution(&execution);
         var capability: Read = .{ .store = store, .cache = if (cached) .{ .cache = &cache, .scope = @splat(8), .context = context } else null, .context = context, .cancellation = .none };

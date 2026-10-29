@@ -64,6 +64,11 @@ pub const Context = struct {
     pub fn withExecution(self: Context, execution: *@import("../../common/runnable_scheduler.zig").Execution) Context {
         var child = self;
         child.execution = execution;
+        // Reuse the local owner's receiver; never create a new physical I/O
+        // owner when attaching an admitted execution. Explicit receivers win.
+        if (child.io == null) if (execution.entry) |entry| {
+            child.io = entry.options.io;
+        };
         child.wait = @import("../../sql/spill.zig").childWait(execution);
         child.checkpoint = .{ .ptr = execution, .check = executionCheckpoint };
         return child;

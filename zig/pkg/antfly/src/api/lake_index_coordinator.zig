@@ -51,7 +51,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     var repair = options.force_rebuild;
     if (current.value.published) |ready| {
         if (current.value.pending == null and std.meta.eql(ready.signature, signature)) {
-            if (!repair and try durableDirectoryAvailable(a, store, ready, cancellation)) return;
+            if (!repair and try durableDirectoryAvailableFor(a, store, ready, cancellation, context)) return;
             repair = true;
         }
     }
@@ -131,9 +131,13 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
 /// obligation; do not mistake a matching definition signature for available
 /// derived storage. Transient provider errors retain the existing obligation.
 fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, cancellation: Cancellation) !bool {
+    return durableDirectoryAvailableFor(a, store, ready, cancellation, .{});
+}
+fn durableDirectoryAvailableFor(a: A, store: *Store, ready: catalog.Publication, cancellation: Cancellation, context: Context) !bool {
+    try context.ensureActive();
     if (ready.namespace == null or ready.reader_protocol != catalog.native_reader_protocol) return false;
     const directory = ready.directory orelse return false;
-    var cloud_binding = try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, &store.implementation, ready, cancellation);
+    var cloud_binding = try @import("lake_cloud_publication.zig").Binding.initFor(std.heap.page_allocator, &store.implementation, ready, cancellation, context);
     defer if (cloud_binding) |*held| held.deinit();
     var handle = store.artifactStore();
     handle.allocator = a;

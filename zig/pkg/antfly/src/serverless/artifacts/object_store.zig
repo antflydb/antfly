@@ -277,12 +277,15 @@ pub const ObjectStore = struct {
         return supported;
     }
     fn generation(self: *ObjectStore, id: []const u8, token: CancellationToken) !?[]u8 {
+        return self.generationFor(id, token, .{});
+    }
+    fn generationFor(self: *ObjectStore, id: []const u8, token: CancellationToken, context: ReadContext) !?[]u8 {
         // Range reads may borrow an arena-owned store. Reclaim selectors after
         // every request rather than retaining one parse per posting block.
         const a = std.heap.page_allocator;
-        var record = if (self.cloud_writer) |writer| try writer.lookup(a, id, token) else null;
+        var record = if (self.cloud_writer) |writer| try writer.lookupFor(a, id, token, context) else null;
         if (record == null) if (self.cloud_reader) |reader| {
-            record = try reader.lookup(a, id, token);
+            record = try reader.lookupFor(a, id, token, context);
         };
         if (record) |*value| {
             defer value.deinit(a);
@@ -291,7 +294,10 @@ pub const ObjectStore = struct {
         return null;
     }
     fn captureGeneration(self: *ObjectStore, id: []const u8, bytes: u64, version: ?[]const u8, token: CancellationToken) !void {
-        if (self.cloud_writer) |writer| try writer.capture(id, bytes, version, token);
+        return self.captureGenerationFor(id, bytes, version, token, .{});
+    }
+    fn captureGenerationFor(self: *ObjectStore, id: []const u8, bytes: u64, version: ?[]const u8, token: CancellationToken, context: ReadContext) !void {
+        if (self.cloud_writer) |writer| try writer.captureFor(id, bytes, version, token, context);
     }
     pub fn artifactStore(self: *ObjectStore) artifact_store.ArtifactStore {
         return .{
@@ -371,7 +377,7 @@ pub const ObjectStore = struct {
         };
         defer result.deinit(self.client.allocator);
         try context.ensureActive();
-        try self.captureGeneration(artifact_id, contents.len, result.version_id, cancellation);
+        try self.captureGenerationFor(artifact_id, contents.len, result.version_id, token, context);
 
         return .{
             .provider_version = if (result.version_id) |version| if (!std.mem.eql(u8, version, "null")) try alloc.dupe(u8, version) else null else null,
@@ -641,7 +647,7 @@ pub const ObjectStore = struct {
         const original = lifetime.token();
         try original.check();
         const outer_wait = if (context.execution == null) context.wait else null;
-        const selected_generation = try self.generation(artifact_id, original);
+        const selected_generation = try self.generationFor(artifact_id, original, context);
         defer if (selected_generation) |selected| std.heap.page_allocator.free(selected);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
@@ -661,7 +667,7 @@ pub const ObjectStore = struct {
                     .sha256_hex => {
                         if (!std.ascii.eqlIgnoreCase(native.value, expected_checksum)) return error.ArtifactIntegrityMismatch;
                         const identity = metadataIdentity(meta) orelse return error.ArtifactIdentityUnavailable;
-                        try self.rememberVerifiedObject(artifact_id, expected_byte_len, identity, meta.version_id, meta.etag);
+                        try self.rememberVerifiedObjectFor(artifact_id, expected_byte_len, identity, meta.version_id, meta.etag, original, context);
                         return;
                     },
                     .sha256_base64 => {
@@ -671,7 +677,7 @@ pub const ObjectStore = struct {
                         const value = std.base64.standard.Encoder.encode(&encoded, &digest);
                         if (!std.mem.eql(u8, native.value, value)) return error.ArtifactIntegrityMismatch;
                         const identity = metadataIdentity(meta) orelse return error.ArtifactIdentityUnavailable;
-                        try self.rememberVerifiedObject(artifact_id, expected_byte_len, identity, meta.version_id, meta.etag);
+                        try self.rememberVerifiedObjectFor(artifact_id, expected_byte_len, identity, meta.version_id, meta.etag, original, context);
                         return;
                     },
                     else => {},
@@ -686,7 +692,7 @@ pub const ObjectStore = struct {
                 if (cached.byte_len == expected_byte_len and std.mem.eql(u8, &cached.identity, &value)) {
                     self.verified_mu.unlock();
                     try original.check();
-                    try self.captureGeneration(artifact_id, expected_byte_len, meta.version_id, original);
+                    try self.captureGenerationFor(artifact_id, expected_byte_len, meta.version_id, original, context);
                     return;
                 }
             }
@@ -725,7 +731,7 @@ pub const ObjectStore = struct {
         if (!std.mem.eql(u8, &actual, expected_checksum)) return error.ArtifactIntegrityMismatch;
         try original.check();
         const value = identity orelse return error.ArtifactIdentityUnavailable;
-        try self.rememberVerifiedObject(artifact_id, expected_byte_len, value, meta.version_id, meta.etag);
+        try self.rememberVerifiedObjectFor(artifact_id, expected_byte_len, value, meta.version_id, meta.etag, original, context);
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
@@ -807,8 +813,11 @@ pub const ObjectStore = struct {
         version_id: ?[]const u8,
         etag: ?[]const u8,
     ) !void {
+        return self.rememberVerifiedObjectFor(artifact_id, byte_len, identity, version_id, etag, .none, .{});
+    }
+    fn rememberVerifiedObjectFor(self: *ObjectStore, artifact_id: []const u8, byte_len: u64, identity: [32]u8, version_id: ?[]const u8, etag: ?[]const u8, token: CancellationToken, context: ReadContext) !void {
         if (version_id == null and etag == null) return error.ArtifactIdentityUnavailable;
-        try self.captureGeneration(artifact_id, byte_len, version_id, .none);
+        try self.captureGenerationFor(artifact_id, byte_len, version_id, token, context);
         const owned_id = try self.alloc.dupe(u8, artifact_id);
         errdefer self.alloc.free(owned_id);
         const owned_version_id = if (version_id) |value| try self.alloc.dupe(u8, value) else null;
@@ -1052,7 +1061,49 @@ pub const ObjectStore = struct {
         const self: *ObjectStore = @ptrCast(@alignCast(raw));
         return self.verifyContentWithContext(id, byte_len, checksum, token, null, context);
     }
+    fn boundedFor(raw: *anyopaque, a: std.mem.Allocator, id: []const u8, maximum: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+        return readFor(raw, a, id, null, maximum, token, context);
+    }
+    fn rangeFor(raw: *anyopaque, a: std.mem.Allocator, id: []const u8, offset: u64, len: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+        return readFor(raw, a, id, offset, len, token, context);
+    }
+    fn readFor(raw: *anyopaque, a: std.mem.Allocator, id: []const u8, offset: ?u64, maximum: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
+        const selected = try self.generationFor(id, token, context);
+        defer if (selected) |value| std.heap.page_allocator.free(value);
+        const key = try keyForArtifactIdAlloc(a, self.prefix, id);
+        defer a.free(key);
+        var client = self.client;
+        client.allocator = a;
+        if (offset != null and maximum == 0) {
+            var metadata = client.statObjectWithOptions(self.bucket, key, .{ .version_id = selected, .cancellation = op.token() }) catch |err| {
+                try op.check();
+                return err;
+            };
+            defer metadata.deinit(a);
+            try op.ready();
+            if (offset.? > metadata.content_length) return error.InvalidRange;
+            return a.alloc(u8, 0);
+        }
+        var result = op.get(&client, self.bucket, key, .{
+            .range = if (offset) |start| .{ .offset = start, .length = maximum } else null,
+            .skip_metadata_probe = true,
+            .max_response_bytes = @max(maximum, 1),
+            .version_id = selected,
+        }) catch |err| {
+            if (offset == null and err == error.ResponseTooLarge) return error.ArtifactIntegrityMismatch;
+            return err;
+        };
+        defer result.deinit(a);
+        const body = result.body;
+        result.body = &.{};
+        return body;
+    }
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .get_bounded_alloc_for = boundedFor,
+        .get_range_alloc_for = rangeFor,
         .verify_content_for = verifyContentFor,
         .delete_for = deleteFor,
         .visit_scoped_uploads_for = visitFor,

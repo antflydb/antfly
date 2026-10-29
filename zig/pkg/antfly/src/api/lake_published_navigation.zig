@@ -137,7 +137,7 @@ const Factory = struct {
         const held_context = self.lease.readContext();
         const token: @import("antfly_cancellation").CancellationToken = if (held_context.cancellation) |value| .{ .ptr = value.ptr, .is_cancelled_fn = value.is_cancelled_fn } else .none;
         try context.ensureActive();
-        try self.store.bindPublication(self.publication, token);
+        try self.store.bindPublicationFor(self.publication, token, if (context.execution) |execution| held_context.withExecution(execution) else held_context);
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = self.cache, .scope = self.store.identity, .context = if (context.execution) |execution| held_context.withExecution(execution) else held_context };
         const pin = @import("lake_index_decoded_metadata.zig").acquire(nav.Root, cached, self.store.artifactStore(), ref, token, nav.load) catch |err| switch (err) {
             error.OutOfMemory, error.SqlMemoryLimitExceeded, error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable => return null,
@@ -161,7 +161,7 @@ const Factory = struct {
         errdefer owner.store.deinit();
         const owned_context = owner.lease.readContext();
         owner.store.implementation.cloud_io = owned_context.io;
-        try owner.store.bindPublication(self.publication, token);
+        try owner.store.bindPublicationFor(self.publication, token, owned_context);
         const oa = owner.arena.allocator();
         const owned_root = try std.json.parseFromSliceLeaky(nav.Root, oa, try std.json.Stringify.valueAlloc(oa, root, .{}), .{ .allocate = .alloc_always });
         var owned_reads = cached;
@@ -235,7 +235,7 @@ fn attachStatistics(a: A, factory: *Factory, source: *Source, context: Context) 
     const binding = source.inventory;
     const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = factory.cache, .scope = factory.store.identity, .context = context };
     const token: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |value| .{ .ptr = value.ptr, .is_cancelled_fn = value.is_cancelled_fn } else .none;
-    try factory.store.bindPublication(factory.publication, token);
+    try factory.store.bindPublicationFor(factory.publication, token, context);
     const pin = try @import("lake_index_decoded_metadata.zig").acquire(nav.Root, cached, factory.store.artifactStore(), ref, token, nav.load);
     var retained = false;
     defer if (!retained) pin.release();
