@@ -79,7 +79,7 @@ server-side page-quality fallback and scanned-table OCR from that client with:
   --base-url s3://docs-bucket \
   --table docs \
   --create-table \
-  --ocr-config-json '{"provider":"antfly","model":"<reader-model>"}' \
+  --ocr-config-json '{"provider":"antfly","model":"lightonai/LightOnOCR-3-0.8B"}' \
   --ocr-render-dpi 150
 ```
 

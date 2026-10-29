@@ -170,7 +170,7 @@ separate; it needs read access to the originals bucket.
 
 The showcase OCR profile uses the CUDA-qualified, revision-pinned LightOnOCR-3-0.8B on shared Antfly
 inference, running Antfly v0.3.0-rc.5 or later. Its native `/read` contract uses
-an image-only prompt, so the extraction producer keeps `prompt_policy: plain`.
+an image-only prompt; the extraction producer sends no prompt to readers.
 The profile requests at most 512 output tokens per page; truncated OCR returns
 an error instead of publishing incomplete text. Dense pages can need a separate
 larger-budget `/generate` workflow. LightOnOCR-3-4B remains a candidate until
