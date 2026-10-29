@@ -676,10 +676,11 @@ Phase 4y delta remains visible as architectural debt.
 
 For subsequent increments:
 
-- `libantfly` has a hard 80 MiB release gate (raised from 60 MiB on
-  2026-10-11 with explicit approval after a native stripped ReleaseFast
-  profile measured 65.97 MiB). Retained linker maps attribute storage and
-  inference code and support investigation of subsequent size growth.
+- `libantfly` has a hard 88 MiB release gate (approved on 2026-10-28 after
+  cleanup consolidation and final-link stripping measured 83.30 MiB). The
+  earlier 80 MiB gate was approved on 2026-10-11 after a 65.97 MiB profile.
+  Retained linker maps attribute storage and inference code and support
+  investigation of subsequent size growth.
 - No single experiment should grow the executable more than approximately 5%
   without an explicit, measured critical-path benefit and approval of the
   cumulative tradeoff.
@@ -1959,3 +1960,13 @@ even when every input archive was stripped. It now drops local symbols with
 `-x` only for stripped products. Real Darwin links verify that private function
 names remain available when unstripped and disappear when stripped; both modes
 retain the public export inventory and executable/shared-library consumers.
+
+The complete baseline-CPU native Darwin library measured 87,473,728 bytes
+(83.42 MiB) after cleanup consolidation but before final-link stripping.
+Applying the strip policy measured 87,350,336 bytes (83.30 MiB); private symbol
+names accounted for only about 0.12 MiB, so this was not the main overage.
+With explicit approval, the complete-library gate is now 88 MiB, leaving
+4.70 MiB (5.6%) above that measured image. Compiler claims, runner resources,
+unwind data, exported features and optimization modes are unchanged. Archive
+failures now report actual bytes/MiB as well as the limit. The production cross
+Darwin gate remains required; this native measurement does not replace it.
