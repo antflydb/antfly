@@ -4198,6 +4198,126 @@ pub const KernelModule = struct {
         return arguments;
     }
 
+    const QuantProjectionLaunch = struct {
+        kernel: []const u8,
+        values_per_block: usize,
+        block_bytes: usize,
+        columns: ?usize,
+        threads: usize,
+        packed_input: bool = false,
+        rows4_kernel: ?[]const u8 = null,
+    };
+
+    inline fn checkProjectionInput(comptime spec: QuantProjectionLaunch, input: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize) driver_mod.Error!void {
+        if (spec.packed_input) {
+            try checkRawBytes(input, try checkedTensorElements(try checkedTensorElements(rows, in_dim / q8_1_values_per_block), q8_1_block_bytes));
+        } else try checkBytes(input, try checkedTensorElements(rows, in_dim));
+    }
+
+    inline fn launchQuantPair(self: *KernelModule, comptime spec: QuantProjectionLaunch, ctx: *context_mod.CudaContext, dst_a: buffer_mod.DeviceBuffer, dst_b: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight_a: buffer_mod.DeviceBuffer, weight_b: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!void {
+        comptime std.debug.assert(spec.columns != null and spec.rows4_kernel == null);
+        const function = @field(self, spec.kernel) orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % spec.values_per_block != 0 or (spec.packed_input and spec.values_per_block != q8_1_values_per_block)) return error.InvalidCudaState;
+        const row_blocks = in_dim / spec.values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), spec.block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkProjectionInput(spec, input, rows, in_dim);
+        try checkRawBytes(weight_a, weight_bytes);
+        try checkRawBytes(weight_b, weight_bytes);
+        const col_tiles = (out_dim + spec.columns.? - 1) / spec.columns.?;
+        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
+        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
+        if (total_tiles == 0) return;
+
+        const family = if (spec.packed_input) "Q8_INPUT_PAIR" else "QUANT_PAIR";
+        var arguments: launch_abi.ArgumentsFor(family) = undefined;
+        arguments.dst_a = dst_a.ptr;
+        arguments.dst_b = dst_b.ptr;
+        @field(arguments, if (spec.packed_input) "q8_input" else "input") = input.ptr;
+        arguments.weight_a = weight_a.ptr;
+        arguments.weight_b = weight_b.ptr;
+        arguments.rows = try toU32(rows);
+        arguments.in_dim = try toU32(in_dim);
+        arguments.out_dim = try toU32(out_dim);
+        var params = launch_abi.fieldsFor(family, &arguments);
+        try launchBlocks(function, ctx, total_tiles, spec.threads, &params);
+    }
+
+    inline fn launchQuantQkv(self: *KernelModule, comptime spec: QuantProjectionLaunch, ctx: *context_mod.CudaContext, dst_q: buffer_mod.DeviceBuffer, dst_k: buffer_mod.DeviceBuffer, dst_v: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight_q: buffer_mod.DeviceBuffer, weight_k: buffer_mod.DeviceBuffer, weight_v: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) driver_mod.Error!void {
+        comptime std.debug.assert(spec.rows4_kernel == null or (spec.columns != null and spec.packed_input));
+        // Row-specialized dispatch historically checks availability only after
+        // admission and empty-output handling. Other adapters check it first.
+        const early_function = if (spec.rows4_kernel == null) @field(self, spec.kernel) orelse return error.CudaKernelUnavailable else null;
+        if (in_dim == 0 or in_dim % spec.values_per_block != 0 or (spec.packed_input and spec.values_per_block != q8_1_values_per_block)) return error.InvalidCudaState;
+        const row_blocks = in_dim / spec.values_per_block;
+        const q_count = try checkedTensorElements(rows, q_out_dim);
+        const kv_count = try checkedTensorElements(rows, kv_out_dim);
+        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), spec.block_bytes);
+        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), spec.block_bytes);
+        try checkBytes(dst_q, q_count);
+        try checkBytes(dst_k, kv_count);
+        try checkBytes(dst_v, kv_count);
+        try checkProjectionInput(spec, input, rows, in_dim);
+        try checkRawBytes(weight_q, q_weight_bytes);
+        try checkRawBytes(weight_k, kv_weight_bytes);
+        try checkRawBytes(weight_v, kv_weight_bytes);
+        const tiles_with_v = if (spec.columns) |columns| blk: {
+            const q_tiles = (q_out_dim + columns - 1) / columns;
+            const kv_tiles = (kv_out_dim + columns - 1) / columns;
+            const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
+            break :blk try checkedTensorElements(tiles_per_row + kv_tiles, 1);
+        } else 0;
+        const total_tiles = if (spec.columns != null) try checkedTensorElements(rows, tiles_with_v) else blk: {
+            const total = try checkedTensorElements(q_count + kv_count, 1);
+            break :blk try checkedTensorElements(total + kv_count, 1);
+        };
+        if (total_tiles == 0) return;
+
+        var arguments = try quantQkvArguments(spec.packed_input, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        const family = if (spec.packed_input) "Q8_INPUT_QKV" else "QUANT_QKV";
+        if (spec.rows4_kernel) |field| {
+            if (rows > 1) if (@field(self, field)) |function| {
+                var params = launch_abi.fieldsFor(family, &arguments);
+                try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, tiles_with_v), spec.threads, &params);
+                return;
+            };
+        }
+        const function = if (spec.rows4_kernel != null) @field(self, spec.kernel) orelse return error.CudaKernelUnavailable else early_function;
+        var params = launch_abi.fieldsFor(family, &arguments);
+        try launchBlocks(function, ctx, total_tiles, spec.threads, &params);
+    }
+
+    inline fn launchQuantArgmax(self: *KernelModule, comptime spec: QuantProjectionLaunch, comptime per_row: bool, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, partial_values: buffer_mod.DeviceBuffer, partial_indices: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight_raw: buffer_mod.DeviceBuffer, suppress_token_ids: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, suppress_count: usize) driver_mod.Error!void {
+        comptime std.debug.assert(!spec.packed_input and spec.columns != null and spec.rows4_kernel == null);
+        const stage1 = @field(self, spec.kernel) orelse return error.CudaKernelUnavailable;
+        const reduce = @field(self, if (per_row) "argmax_reduce_rows_pairs_f32" else "argmax_reduce_pairs_f32") orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % spec.values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / spec.values_per_block;
+        const col_tiles = (out_dim + spec.columns.? - 1) / spec.columns.?;
+        const partial_count = if (per_row) try checkedTensorElements(rows, col_tiles) else col_tiles;
+        try checkRawBytes(dst, if (per_row) try checkedTensorElements(rows, @sizeOf(u32)) else @sizeOf(u32));
+        try checkBytes(partial_values, partial_count);
+        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), spec.block_bytes));
+        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
+        try launchBlocks(stage1, ctx, partial_count, spec.threads, &stage1_params);
+        var dst_ptr = dst.ptr;
+        var col_tiles_u32 = try toU32(col_tiles);
+        if (per_row) {
+            var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
+            try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+        } else {
+            var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &col_tiles_u32 });
+            try launchBlocks(reduce, ctx, 1, f32_tiled_threads, &reduce_params);
+        }
+    }
+
     pub fn launchFillF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -4816,49 +4936,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q8_0_argmax_stage1_tile4 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q8_0_values_per_block;
-        const col_tiles = (out_dim + q8_0_col_tile - 1) / q8_0_col_tile;
-        try checkRawBytes(dst, @sizeOf(u32));
-        try checkBytes(partial_values, col_tiles);
-        try checkRawBytes(partial_indices, try checkedTensorElements(col_tiles, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
-        try launchBlocks(stage1, ctx, col_tiles, q8_0_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&col_tiles_u32),
-        };
-        try launchBlocks(reduce, ctx, 1, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q8_0_argmax_stage1_tile4", .values_per_block = q8_0_values_per_block, .block_bytes = q8_0_block_bytes, .columns = q8_0_col_tile, .threads = q8_0_tiled_threads }, false, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn launchLinearQ4KArgmaxTile4F32(
@@ -4875,49 +4953,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q4_k_argmax_stage1_tile4 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const col_tiles = (out_dim + q4_k_col_tile - 1) / q4_k_col_tile;
-        try checkRawBytes(dst, @sizeOf(u32));
-        try checkBytes(partial_values, col_tiles);
-        try checkRawBytes(partial_indices, try checkedTensorElements(col_tiles, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
-        try launchBlocks(stage1, ctx, col_tiles, q4_k_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&col_tiles_u32),
-        };
-        try launchBlocks(reduce, ctx, 1, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q4_k_argmax_stage1_tile4", .values_per_block = q4_k_values_per_block, .block_bytes = q4_k_block_bytes, .columns = q4_k_col_tile, .threads = q4_k_tiled_threads }, false, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn launchLinearQ8_0ArgmaxRowsTile4F32(
@@ -4934,27 +4970,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q8_0_argmax_rows_stage1_tile4 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q8_0_values_per_block;
-        const col_tiles = (out_dim + q8_0_col_tile - 1) / q8_0_col_tile;
-        const partial_count = try checkedTensorElements(rows, col_tiles);
-        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
-        try checkBytes(partial_values, partial_count);
-        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
-        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
-        try launchBlocks(stage1, ctx, partial_count, q8_0_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
-        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q8_0_argmax_rows_stage1_tile4", .values_per_block = q8_0_values_per_block, .block_bytes = q8_0_block_bytes, .columns = q8_0_col_tile, .threads = q8_0_tiled_threads }, true, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn launchLinearQ4_0ArgmaxRowsTile4F32(
@@ -4971,27 +4987,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q4_0_argmax_rows_stage1_tile4 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const partial_count = try checkedTensorElements(rows, col_tiles);
-        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
-        try checkBytes(partial_values, partial_count);
-        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
-        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
-        try launchBlocks(stage1, ctx, partial_count, q8_0_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
-        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q4_0_argmax_rows_stage1_tile4", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile, .threads = q8_0_tiled_threads }, true, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn launchLinearQ4_0ArgmaxRowsTile16F32(
@@ -5008,27 +5004,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q4_0_argmax_rows_stage1_tile16 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const col_tiles = (out_dim + q4_0_col_tile16 - 1) / q4_0_col_tile16;
-        const partial_count = try checkedTensorElements(rows, col_tiles);
-        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
-        try checkBytes(partial_values, partial_count);
-        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
-        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
-        try launchBlocks(stage1, ctx, partial_count, q8_0_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
-        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q4_0_argmax_rows_stage1_tile16", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile16, .threads = q8_0_tiled_threads }, true, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn hasLinearQ4_0Q8_1ArgmaxE2BPrimitives(self: *const KernelModule) bool {
@@ -5109,27 +5085,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q4_k_argmax_rows_stage1_tile4 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const col_tiles = (out_dim + q4_k_col_tile - 1) / q4_k_col_tile;
-        const partial_count = try checkedTensorElements(rows, col_tiles);
-        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
-        try checkBytes(partial_values, partial_count);
-        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
-        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
-        try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
-        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q4_k_argmax_rows_stage1_tile4", .values_per_block = q4_k_values_per_block, .block_bytes = q4_k_block_bytes, .columns = q4_k_col_tile, .threads = q4_k_tiled_threads }, true, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn launchLinearQ6KArgmaxRowsTile4F32(
@@ -5146,27 +5102,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q6_k_argmax_rows_stage1_tile4 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q6_k_values_per_block;
-        const col_tiles = (out_dim + q4_k_col_tile - 1) / q4_k_col_tile;
-        const partial_count = try checkedTensorElements(rows, col_tiles);
-        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
-        try checkBytes(partial_values, partial_count);
-        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
-        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
-        try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
-        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q6_k_argmax_rows_stage1_tile4", .values_per_block = q6_k_values_per_block, .block_bytes = q6_k_block_bytes, .columns = q4_k_col_tile, .threads = q4_k_tiled_threads }, true, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn launchLinearQ6KArgmaxRowsTile8F32(
@@ -5183,27 +5119,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q6_k_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q6_k_values_per_block;
-        const col_tiles = (out_dim + q6_k_col_tile8 - 1) / q6_k_col_tile8;
-        const partial_count = try checkedTensorElements(rows, col_tiles);
-        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
-        try checkBytes(partial_values, partial_count);
-        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
-        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
-        try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
-        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q6_k_argmax_rows_stage1_tile8", .values_per_block = q6_k_values_per_block, .block_bytes = q6_k_block_bytes, .columns = q6_k_col_tile8, .threads = q4_k_tiled_threads }, true, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn launchLinearQ6KArgmaxRowsTile16F32(
@@ -5220,27 +5136,7 @@ pub const KernelModule = struct {
         out_dim: usize,
         suppress_count: usize,
     ) driver_mod.Error!void {
-        const stage1 = self.linear_q6_k_argmax_rows_stage1_tile16 orelse return error.CudaKernelUnavailable;
-        const reduce = self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q6_k_values_per_block;
-        const col_tiles = (out_dim + q6_k_col_tile16 - 1) / q6_k_col_tile16;
-        const partial_count = try checkedTensorElements(rows, col_tiles);
-        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
-        try checkBytes(partial_values, partial_count);
-        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
-        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
-
-        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
-        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
-        try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
-
-        var dst_ptr = dst.ptr;
-        var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
-        try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+        return self.launchQuantArgmax(.{ .kernel = "linear_q6_k_argmax_rows_stage1_tile16", .values_per_block = q6_k_values_per_block, .block_bytes = q6_k_block_bytes, .columns = q6_k_col_tile16, .threads = q4_k_tiled_threads }, true, ctx, dst, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
     }
 
     pub fn launchLinearQ6KQ8_1F32Tile8E4B(
@@ -12621,24 +12517,7 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q8_0_pair_nobias_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q8_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        const col_tiles = (out_dim + q8_0_col_tile - 1) / q8_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
-        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
-        if (total_tiles == 0) return;
-
-        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
-        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q8_0_tiled_threads, &params);
+        return self.launchQuantPair(.{ .kernel = "linear_q8_0_pair_nobias_f32_tile4", .values_per_block = q8_0_values_per_block, .block_bytes = q8_0_block_bytes, .columns = q8_0_col_tile, .threads = q8_0_tiled_threads }, ctx, dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim);
     }
 
     pub fn launchLinearQ4_0PairNoBiasTile4F32(
@@ -12653,24 +12532,7 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_pair_nobias_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
-        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
-        if (total_tiles == 0) return;
-
-        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
-        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+        return self.launchQuantPair(.{ .kernel = "linear_q4_0_pair_nobias_f32_tile4", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile, .threads = q4_0_tiled_threads }, ctx, dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim);
     }
 
     pub fn launchLinearQ4_0PairNoBiasTile4W4F32(
@@ -12685,24 +12547,7 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_pair_nobias_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
-        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
-        if (total_tiles == 0) return;
-
-        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
-        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+        return self.launchQuantPair(.{ .kernel = "linear_q4_0_pair_nobias_f32_tile4_w4", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile, .threads = q4_0_tiled_threads_w4 }, ctx, dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim);
     }
 
     pub fn launchLinearQ4_0PairNoBiasQ8_1Tile4F32(
@@ -12717,24 +12562,7 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_pair_nobias_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
-        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
-        if (total_tiles == 0) return;
-
-        var arguments = try projectionArguments("Q8_INPUT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .q8_input = input_q8_1, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
-        var params = launch_abi.fieldsFor("Q8_INPUT_PAIR", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+        return self.launchQuantPair(.{ .kernel = "linear_q4_0_pair_nobias_q8_1_f32_tile4", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile, .threads = q4_0_tiled_threads_w4, .packed_input = true }, ctx, dst_a, dst_b, input_q8_1, weight_a, weight_b, rows, in_dim, out_dim);
     }
 
     pub fn launchLinearQ4_0PairNoBiasQ8_1Tile4W8F32(
@@ -12749,24 +12577,7 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_pair_nobias_q8_1_f32_tile4_w8 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        const col_tiles = (out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
-        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
-        if (total_tiles == 0) return;
-
-        var arguments = try projectionArguments("Q8_INPUT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .q8_input = input_q8_1, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
-        var params = launch_abi.fieldsFor("Q8_INPUT_PAIR", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+        return self.launchQuantPair(.{ .kernel = "linear_q4_0_pair_nobias_q8_1_f32_tile4_w8", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile, .threads = q4_0_tiled_threads, .packed_input = true }, ctx, dst_a, dst_b, input_q8_1, weight_a, weight_b, rows, in_dim, out_dim);
     }
 
     pub fn launchLinearQ4_0PairNoBiasQ8_1Tile8F32(
@@ -12781,24 +12592,7 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_pair_nobias_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        const col_tiles = (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
-        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
-        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
-        if (total_tiles == 0) return;
-
-        var arguments = try projectionArguments("Q8_INPUT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .q8_input = input_q8_1, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
-        var params = launch_abi.fieldsFor("Q8_INPUT_PAIR", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+        return self.launchQuantPair(.{ .kernel = "linear_q4_0_pair_nobias_q8_1_f32_tile8", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile8, .threads = q4_0_tiled_threads_w4, .packed_input = true }, ctx, dst_a, dst_b, input_q8_1, weight_a, weight_b, rows, in_dim, out_dim);
     }
 
     pub fn launchLinearQ4_0PairActivationTile4W4F32(
@@ -13361,24 +13155,7 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_pair_nobias_f32_tile8 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        const col_tiles = (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
-        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
-        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
-        if (total_tiles == 0) return;
-
-        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
-        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+        return self.launchQuantPair(.{ .kernel = "linear_q4_0_pair_nobias_f32_tile8", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile8, .threads = q4_0_tiled_threads }, ctx, dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim);
     }
 
     pub fn launchLinearQ4KPairNoBiasTile4F32(
@@ -13393,24 +13170,7 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_k_pair_nobias_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        const col_tiles = (out_dim + q4_k_col_tile - 1) / q4_k_col_tile;
-        const tiles_per_row = try checkedTensorElements(col_tiles, 2);
-        const total_tiles = try checkedTensorElements(rows, tiles_per_row);
-        if (total_tiles == 0) return;
-
-        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
-        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_k_tiled_threads, &params);
+        return self.launchQuantPair(.{ .kernel = "linear_q4_k_pair_nobias_f32_tile4", .values_per_block = q4_k_values_per_block, .block_bytes = q4_k_block_bytes, .columns = q4_k_col_tile, .threads = q4_k_tiled_threads }, ctx, dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim);
     }
 
     pub fn launchLinearQ4KQkvNoBiasTiledF32(
@@ -13428,27 +13188,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_k_qkv_nobias_f32_tiled orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const q_count = try checkedTensorElements(rows, q_out_dim);
-        const kv_count = try checkedTensorElements(rows, kv_out_dim);
-        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_k_block_bytes);
-        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_k_block_bytes);
-        try checkBytes(dst_q, q_count);
-        try checkBytes(dst_k, kv_count);
-        try checkBytes(dst_v, kv_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_q, q_weight_bytes);
-        try checkRawBytes(weight_k, kv_weight_bytes);
-        try checkRawBytes(weight_v, kv_weight_bytes);
-        const total = try checkedTensorElements(q_count + kv_count, 1);
-        const total_with_v = try checkedTensorElements(total + kv_count, 1);
-        if (total_with_v == 0) return;
-
-        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
-        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
-        try launchBlocks(function, ctx, total_with_v, q4_k_tiled_threads, &params);
+        return self.launchQuantQkv(.{ .kernel = "linear_q4_k_qkv_nobias_f32_tiled", .values_per_block = q4_k_values_per_block, .block_bytes = q4_k_block_bytes, .columns = null, .threads = q4_k_tiled_threads }, ctx, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearF32QkvNoBiasTiled(
@@ -13500,30 +13240,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q8_0_qkv_nobias_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q8_0_values_per_block;
-        const q_count = try checkedTensorElements(rows, q_out_dim);
-        const kv_count = try checkedTensorElements(rows, kv_out_dim);
-        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q8_0_block_bytes);
-        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q8_0_block_bytes);
-        try checkBytes(dst_q, q_count);
-        try checkBytes(dst_k, kv_count);
-        try checkBytes(dst_v, kv_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_q, q_weight_bytes);
-        try checkRawBytes(weight_k, kv_weight_bytes);
-        try checkRawBytes(weight_v, kv_weight_bytes);
-        const q_tiles = (q_out_dim + q8_0_col_tile - 1) / q8_0_col_tile;
-        const kv_tiles = (kv_out_dim + q8_0_col_tile - 1) / q8_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
-        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
-        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
-        if (total_tiles == 0) return;
-
-        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
-        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q8_0_tiled_threads, &params);
+        return self.launchQuantQkv(.{ .kernel = "linear_q8_0_qkv_nobias_f32_tile4", .values_per_block = q8_0_values_per_block, .block_bytes = q8_0_block_bytes, .columns = q8_0_col_tile, .threads = q8_0_tiled_threads }, ctx, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearQ4_0QkvNoBiasTile4F32(
@@ -13541,30 +13258,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_qkv_nobias_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const q_count = try checkedTensorElements(rows, q_out_dim);
-        const kv_count = try checkedTensorElements(rows, kv_out_dim);
-        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
-        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_q, q_count);
-        try checkBytes(dst_k, kv_count);
-        try checkBytes(dst_v, kv_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_q, q_weight_bytes);
-        try checkRawBytes(weight_k, kv_weight_bytes);
-        try checkRawBytes(weight_v, kv_weight_bytes);
-        const q_tiles = (q_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const kv_tiles = (kv_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
-        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
-        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
-        if (total_tiles == 0) return;
-
-        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
-        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+        return self.launchQuantQkv(.{ .kernel = "linear_q4_0_qkv_nobias_f32_tile4", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile, .threads = q4_0_tiled_threads }, ctx, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearQ4_0QkvNoBiasTile4W4F32(
@@ -13582,30 +13276,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_qkv_nobias_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const q_count = try checkedTensorElements(rows, q_out_dim);
-        const kv_count = try checkedTensorElements(rows, kv_out_dim);
-        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
-        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_q, q_count);
-        try checkBytes(dst_k, kv_count);
-        try checkBytes(dst_v, kv_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_q, q_weight_bytes);
-        try checkRawBytes(weight_k, kv_weight_bytes);
-        try checkRawBytes(weight_v, kv_weight_bytes);
-        const q_tiles = (q_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const kv_tiles = (kv_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
-        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
-        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
-        if (total_tiles == 0) return;
-
-        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
-        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+        return self.launchQuantQkv(.{ .kernel = "linear_q4_0_qkv_nobias_f32_tile4_w4", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile, .threads = q4_0_tiled_threads_w4 }, ctx, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearQ4_0QkvNoBiasQ8_1Tile4F32(
@@ -13623,30 +13294,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const q_count = try checkedTensorElements(rows, q_out_dim);
-        const kv_count = try checkedTensorElements(rows, kv_out_dim);
-        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
-        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_q, q_count);
-        try checkBytes(dst_k, kv_count);
-        try checkBytes(dst_v, kv_count);
-        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
-        try checkRawBytes(weight_q, q_weight_bytes);
-        try checkRawBytes(weight_k, kv_weight_bytes);
-        try checkRawBytes(weight_v, kv_weight_bytes);
-        const q_tiles = (q_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const kv_tiles = (kv_out_dim + q4_0_col_tile - 1) / q4_0_col_tile;
-        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
-        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
-        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
-        if (total_tiles == 0) return;
-
-        var arguments = try quantQkvArguments(true, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
-        var params = launch_abi.fieldsFor("Q8_INPUT_QKV", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+        return self.launchQuantQkv(.{ .kernel = "linear_q4_0_qkv_nobias_q8_1_f32_tile4", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile, .threads = q4_0_tiled_threads_w4, .packed_input = true }, ctx, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearQ4_0QkvNoBiasQ8_1Tile8F32(
@@ -13664,37 +13312,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const q_count = try checkedTensorElements(rows, q_out_dim);
-        const kv_count = try checkedTensorElements(rows, kv_out_dim);
-        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
-        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_q, q_count);
-        try checkBytes(dst_k, kv_count);
-        try checkBytes(dst_v, kv_count);
-        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
-        try checkRawBytes(weight_q, q_weight_bytes);
-        try checkRawBytes(weight_k, kv_weight_bytes);
-        try checkRawBytes(weight_v, kv_weight_bytes);
-        const q_tiles = (q_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
-        const kv_tiles = (kv_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
-        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
-        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
-        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
-        if (total_tiles == 0) return;
-
-        var arguments = try quantQkvArguments(true, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
-        if (rows > 1) {
-            if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4) |function| {
-                var params = launch_abi.fieldsFor("Q8_INPUT_QKV", &arguments);
-                try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, tiles_with_v), q4_0_tiled_threads_w4, &params);
-                return;
-            }
-        }
-        const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
-        var params = launch_abi.fieldsFor("Q8_INPUT_QKV", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
+        return self.launchQuantQkv(.{ .kernel = "linear_q4_0_qkv_nobias_q8_1_f32_tile8", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile8, .threads = q4_0_tiled_threads_w4, .packed_input = true, .rows4_kernel = "linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4" }, ctx, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearQ4_0QkvNoBiasQ8_1Tile8W8F32(
@@ -13712,30 +13330,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const q_count = try checkedTensorElements(rows, q_out_dim);
-        const kv_count = try checkedTensorElements(rows, kv_out_dim);
-        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
-        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_q, q_count);
-        try checkBytes(dst_k, kv_count);
-        try checkBytes(dst_v, kv_count);
-        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes));
-        try checkRawBytes(weight_q, q_weight_bytes);
-        try checkRawBytes(weight_k, kv_weight_bytes);
-        try checkRawBytes(weight_v, kv_weight_bytes);
-        const q_tiles = (q_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
-        const kv_tiles = (kv_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
-        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
-        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
-        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
-        if (total_tiles == 0) return;
-
-        var arguments = try quantQkvArguments(true, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
-        var params = launch_abi.fieldsFor("Q8_INPUT_QKV", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+        return self.launchQuantQkv(.{ .kernel = "linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile8, .threads = q4_0_tiled_threads, .packed_input = true }, ctx, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearQ4_0QkvNoBiasTile8F32(
@@ -13753,30 +13348,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_qkv_nobias_f32_tile8 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const q_count = try checkedTensorElements(rows, q_out_dim);
-        const kv_count = try checkedTensorElements(rows, kv_out_dim);
-        const q_weight_bytes = try checkedTensorElements(try checkedTensorElements(q_out_dim, row_blocks), q4_0_block_bytes);
-        const kv_weight_bytes = try checkedTensorElements(try checkedTensorElements(kv_out_dim, row_blocks), q4_0_block_bytes);
-        try checkBytes(dst_q, q_count);
-        try checkBytes(dst_k, kv_count);
-        try checkBytes(dst_v, kv_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_q, q_weight_bytes);
-        try checkRawBytes(weight_k, kv_weight_bytes);
-        try checkRawBytes(weight_v, kv_weight_bytes);
-        const q_tiles = (q_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
-        const kv_tiles = (kv_out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8;
-        const tiles_per_row = try checkedTensorElements(q_tiles + kv_tiles, 1);
-        const tiles_with_v = try checkedTensorElements(tiles_per_row + kv_tiles, 1);
-        const total_tiles = try checkedTensorElements(rows, tiles_with_v);
-        if (total_tiles == 0) return;
-
-        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
-        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
-        try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
+        return self.launchQuantQkv(.{ .kernel = "linear_q4_0_qkv_nobias_f32_tile8", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile8, .threads = q4_0_tiled_threads }, ctx, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearBf16WeightF32QkvNoBiasTiled(
@@ -22328,4 +21900,13 @@ test "CUDA GQA launch family matches independent dense and compressed oracles" {
     defer module.unload(&ctx);
     try smokeGqaAttentionF32(std.testing.allocator, &ctx, &module);
     for (0..3) |format| try smokeTurboquantKvFormat(std.testing.allocator, &ctx, &module, @intCast(format));
+}
+
+test "CUDA projection launch descriptors preserve native contracts" {
+    try @import("testing/projection_launch.zig").run(KernelModule, KernelModule);
+}
+
+test "CUDA projection device results and graph replay" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    try @import("testing/projection_launch.zig").device(KernelModule, KernelModule);
 }
