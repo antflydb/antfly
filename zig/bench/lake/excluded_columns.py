@@ -142,8 +142,6 @@ with b.managed_server(
                     ids = [hit["_source"]["id"] for hit in response["hits"]["hits"]]
                     assert ids == expected, (name, ids, expected)
                     source_keys = {"id", "bucket"}
-                    if name != "explicit_narrow_control":
-                        source_keys.update(("_type", "_id"))
                     for hit in response["hits"]["hits"]:
                         assert set(hit["_source"]) == source_keys
                         if "_type" in source_keys:

@@ -3877,6 +3877,9 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
         } else false;
         if (!excluded) try names.append(a, column.path);
     }
+    // Virtual source metadata is opt-in. Wildcards enumerate physical schema
+    // columns; explicit references can request generated identity/type values.
+    for (req.fields) |field| if (std.mem.eql(u8, field, "_id") or std.mem.eql(u8, field, "_type")) try appendHydrationPath(a, table, &names, field);
     // Scalar outputs are independent of the public source mask. Bind once
     // through the same admitted program and include every potential operand;
     // archive column hydration remains a conservative provider fallback.
@@ -3890,6 +3893,11 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
     return names.items;
 }
 fn appendHydrationPath(a: A, table: local.sql_catalog.Table, fields: *std.ArrayList([]const u8), path: []const u8) !void {
+    if (std.mem.eql(u8, path, "_id") or std.mem.eql(u8, path, "_type")) {
+        for (fields.items) |field| if (std.mem.eql(u8, field, path)) return;
+        try fields.append(a, path);
+        return;
+    }
     for (table.columns) |column| {
         if (!projectionMayUse(path, column.path)) continue;
         const present = for (fields.items) |field| {
@@ -4011,6 +4019,7 @@ test "external lake hydration projection narrows includes and retains exclusion 
     try std.testing.expectEqualSlices([]const u8, &.{ "amount", "body", "nested.value" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "*", "-nested.value" } })).?);
     const root_table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{.{ .name = "nested", .path = "nested", .type = .json }} };
     try std.testing.expectEqualSlices([]const u8, &.{"nested"}, (try projectionColumns(arena.allocator(), root_table, .{ .fields = &.{ "*", "-nested.private" } })).?);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "_id", "_type" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "amount", "_id", "_type" } })).?);
     try std.testing.expect((try projectionColumns(arena.allocator(), table, .{})) == null);
     try std.testing.expectEqual(@as(usize, 0), (try projectionColumns(arena.allocator(), table, .{ .include_all_fields = false })).?.len);
     try std.testing.expectEqualSlices([]const u8, &.{"amount"}, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{"amount"}, .defer_stored_projection = true })).?);

@@ -1000,8 +1000,9 @@ fn coveringPage(a: A, scratch: A, table: catalog.Table, block: local.sql_spill.C
         if (!generatedCoveringField(table, field) and !covers(cover, field)) return error.InvalidNativeLakeRowIndex;
         try names.append(scratch, field);
     }
-    if (!covers(names.items, "_id")) try names.append(scratch, "_id");
-    if (generatedCoveringField(table, "_type") and !covers(names.items, "_type")) try names.append(scratch, "_type");
+    // Identity is carried by refs and witnesses, independently of source
+    // columns. Generate virtual metadata only when the caller requested it;
+    // changing the physical hydration path must not change wildcard _source.
     const page = try local.storage_db_types.ColumnSourcePage.native(a, names.items, selected.len);
     errdefer page.release();
     const pa = page.arena.allocator();
@@ -2641,7 +2642,8 @@ test "external lake covering result gathers retain typed values independently of
             try std.testing.expectEqualStrings("covered title", json.object.get("title").?.string);
             try std.testing.expect(json.object.get("missing").? == .null);
             try std.testing.expectEqualStrings("12345678901234567890.0123456789", json.object.get("number").?.string);
-            try std.testing.expectEqualStrings("row", json.object.get("_type").?.string);
+            try std.testing.expect(!json.object.contains("_id"));
+            try std.testing.expect(!json.object.contains("_type"));
             try std.testing.expect(row.page.columns[0].values == .i64);
             try std.testing.expect(row.page.columns[1].values == .bytes);
         }
@@ -2668,7 +2670,7 @@ test "external lake covering results preserve declared type values and nulls wit
         const json = try source.value(&arena);
         const actual = json.object.get("_type").?;
         if (value.sql_null) try std.testing.expect(actual == .null) else try std.testing.expectEqualStrings("story", actual.string);
-        try std.testing.expectEqual(@as(usize, 2), source.page.columns.len);
+        try std.testing.expectEqual(@as(usize, 1), source.page.columns.len);
     }
 }
 

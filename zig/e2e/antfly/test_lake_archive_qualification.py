@@ -1961,6 +1961,7 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                             ["id", "bucket"],
                             ["*", "-wide", "-body"],
                             ["-wide", "-body"],
+                            ["id", "bucket", "_id", "_type"],
                         )
                         for descending in (False, True)
                     ):
@@ -1984,7 +1985,7 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                             hit["_source"]["id"] for hit in response["hits"]["hits"]
                         ] == expected
                         source_keys = {"id", "bucket"}
-                        if fields[0] != "id":
+                        if "_id" in fields:
                             source_keys.update(("_type", "_id"))
                         for hit in response["hits"]["hits"]:
                             assert set(hit["_source"]) == source_keys, hit["_source"]
