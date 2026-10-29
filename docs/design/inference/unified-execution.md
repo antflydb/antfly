@@ -3401,3 +3401,9 @@ and two corrected C/Zig FFN ABI mismatches with real-device regression tests.
 owners for 25 argmax/pair/QKV adapters, unchanged native schedules and public
 signatures, independent original-versus-candidate wire/device/replay checks,
 and the controlled Glowworm host-submission assay.
+
+### AV prepared-slot Metal ternary attention
+
+[The AV register](unified-execution-av-outcomes.md) records shared TL1/TL2
+attention ownership, persistent prepared-weight reuse, the corrected fallback
+output copyback, and original-versus-candidate device and host qualification.
