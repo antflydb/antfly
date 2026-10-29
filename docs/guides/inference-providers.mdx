@@ -96,7 +96,7 @@ Chunking runs in Antfly; any embedder can embed the chunks. Direct endpoint:
 Reads text from page images and documents: OCR and document parsing. Configured
 under `readers`, used by the `reader` enrichment producer and by
 `document_extraction` for scanned pages. Direct endpoint: `/ai/v1/read`.
-[LightOnOCR-3](/docs/guides/lightonocr3) is the recommended local reader.
+[LightOnOCR-3](/docs/guides/models/lightonocr3) is the recommended local reader.
 
 ### Transcriber
 
@@ -118,7 +118,7 @@ the `generator` enrichment producer, retrieval agents, and generated deciders an
 extractors. Generators can be chained so a request falls back to the next
 provider. Direct endpoints: `/ai/v1/generate` and `/ai/v1/chat/completions`. See
 the [Named inference gateway](https://github.com/antflydb/antfly/blob/main/docs/reference/inference-gateway.md)
-for chains, sessions, and tools, and [Provider rate limits](/docs/guides/provider-rate-limits)
+for chains, sessions, and tools, and [Provider rate limits](/docs/guides/providers/rate-limits)
 for quotas.
 
 Server-side agents can call function tools through the Antfly, OpenAI,
@@ -162,4 +162,4 @@ them.
 
 - [Antfly](/docs/guides/providers/antfly): the built-in runtime and its recommended models
 - [Local Model Compatibility](/docs/guides/supported-models): which local artifacts load
-- [Provider rate limits](/docs/guides/provider-rate-limits): request, token, and concurrency budgets
+- [Provider rate limits](/docs/guides/providers/rate-limits): request, token, and concurrency budgets
