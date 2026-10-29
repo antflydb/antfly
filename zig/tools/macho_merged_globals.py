@@ -101,7 +101,7 @@ def restore_merged_global_aliases(data: bytes) -> bytes:
         for _, ordinary, at, kind, description in sorted(entries):
             if not ordinary:
                 in_group = True
-            elif not kind & N_EXT:
+            elif not kind & N_EXT and not description & N_ALT_ENTRY:
                 # A new ordinary local atom ends the preceding aggregate.
                 in_group = False
             elif in_group and not description & N_ALT_ENTRY:

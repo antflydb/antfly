@@ -118,6 +118,17 @@ class MergedGlobals(unittest.TestCase):
         result = restore_merged_global_aliases(data)
         self.assertEqual(N_ALT_ENTRY, struct.unpack_from("<H", result, at + 6)[0])
 
+    def test_existing_private_alias_does_not_end_the_aggregate(self):
+        data, at = macho(
+            [
+                ("__MergedGlobals", 0xE, 1, 0, 0x1040),
+                ("private_alias", 0xE, 1, N_ALT_ENTRY, 0x1050),
+                ("exported_alias", 0xF, 1, 0, 0x1060),
+            ]
+        )
+        result = restore_merged_global_aliases(data)
+        self.assertEqual(N_ALT_ENTRY, struct.unpack_from("<H", result, at + 38)[0])
+
     def test_ordinary_and_non_macho_objects_are_unchanged(self):
         data, _ = macho([("ordinary", 0xF, 1, 0, 0x1050)])
         self.assertIs(data, restore_merged_global_aliases(data))

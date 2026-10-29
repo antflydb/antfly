@@ -4462,9 +4462,36 @@ empty terminal probes at an exact anchor ceiling. All four native retained-cut
 fixtures pass with no leaks across 58 build steps, including durable and pinned
 key batches, duplicates/missing identities, captured visibility and scalar-prefix
 reuse after a live catalog drop. The storage compilation harness passes all 30
-cases. The Go SDK suite, 547 TypeScript SDK tests (one skip), 304 Antfarm tests
-and four new main CI contracts pass. Main is merged through `be8c595518`; the
-Antfarm rebuild after that merge matches the bundled assets byte for byte.
+cases; the expanded post-merge harness passes all 31. The Go SDK suite,
+547 TypeScript SDK tests (one skip), 304 Antfarm tests
+and four new main CI contracts pass. Main is merged through `207cd9ca3b`; the
+rebuilt Antfarm assets match the bundled assets byte for byte.
+
+The membership regression uses a 2,000-row indexed table and explicit anchor
+ceilings. At 256 distinct values, measured runtime work falls from 82,191 to
+16,913 states. The 257- and 400-value cases now visit exactly 257 and 400
+anchors, respectively, instead of falling back to 2,000 primary rows. Correlated
+equality tests assert bounded bulk reads, zero scalar owner probes, duplicate
+outer-input replay and native encounter order. These are deterministic work
+improvements. A subsequent warmed public-API measurement of the sorted multi-read
+binary produced the following local medians (three warmups, seven samples):
+
+| Query | Earlier median | Batched median |
+| --- | ---: | ---: |
+| Property membership, 256 values | 33.965 ms | 5.900 ms |
+| Property membership, 400 values | 15.424 ms | 8.746 ms |
+| Document-key membership, 400 values | 11.941 ms | 7.070 ms |
+| Correlated property equality, 400 inputs | 20.055 ms | 11.694 ms |
+| Document-key point lookup | 0.984 ms | 0.996 ms |
+
+The correlated case charges 38,014 states versus the earlier 19,206: its strict
+bounded index proof and candidate fetch perform separate reads, while bounded
+bulk requests replace individual owner probes. The earlier timing campaign was
+noisy under concurrent compilation, so these separate-run medians are diagnostic
+observations, not controlled latency guarantees. Exact sums, work ceilings,
+128/256/257/400 membership boundaries, incompatible-domain primary fallback,
+large-integer precision, wide projections and SQL overlays also pass through the
+public API with the sorted multi-read implementation.
 
 
 On macOS, embedded-only test composition uses the same native final-link path
@@ -4473,5 +4500,24 @@ exported aliases inside merged data aggregates. The native linker restores those
 alias flags in an adjacent staged entry object, preserving base-relative private
 members while keeping code/data dead-stripping enabled. The compiler object is
 unchanged and the staged object remains beside the executable for debug maps.
-Five binary-format tests cover aliases, ordering, idempotence, ordinary objects,
+Six binary-format tests cover public/private aliases, ordering, idempotence, ordinary objects,
 malformed input and staging; the corrected embedded gate passes 125 tests.
+
+Post-merge qualification also passes the 71-step CLI build, the 66-step/125-test
+embedded gate, 501 core tests, four native graph fixtures without leaks, all 31
+storage compilation contracts, 17 build-wrapper tests, 210 PR/CI contracts and
+five SDK CI contracts. The temporary source-guard diagnostics are removed from
+the implementation.
+
+The distributed enrichment caveat above remains open. Two combined public
+campaigns passed 19 cases but the owner-loss case ended with a durable
+`committed_repair_required` receipt; all three data owners exhausted retries on
+`EnrichmentSourceChanged`. A subsequent campaign again passed the other 19
+cases, but failed earlier during fixture seeding with
+`transaction_outcome_unknown`, before fault injection. Four isolated owner-loss
+runs against the batched binary passed. Those passes do not establish a fix for
+the campaign failure. Source-guard instrumentation did not implicate the
+producer-input generation comparison; no publication fence, retry-safety rule,
+test assertion or deadline was weakened. This is not a completely green public
+campaign, and its underlying catalog/enrichment recovery cause still requires
+diagnosis.
