@@ -38960,11 +38960,13 @@ components:
       properties:
         min_content_chars:
           type: integer
+          x-go-type-skip-optional-pointer: false
           minimum: 0
           default: 50
           description: Pages with fewer meaningful characters are read with OCR.
         garbled_min_words:
           type: integer
+          x-go-type-skip-optional-pointer: false
           minimum: 0
           default: 20
           description: Minimum words before the garbled-text check applies.
@@ -38975,6 +38977,7 @@ components:
           description: Words sampled by the garbled-text check.
         max_single_char_word_ratio:
           type: number
+          x-go-type-skip-optional-pointer: false
           format: double
           minimum: 0
           maximum: 1
@@ -38987,6 +38990,7 @@ components:
           description: Minimum characters for a line to count in the corrupted-line check.
         max_corrupted_line_ratio:
           type: number
+          x-go-type-skip-optional-pointer: false
           format: double
           minimum: 0
           maximum: 1
@@ -38994,6 +38998,7 @@ components:
           description: Maximum ratio of corrupted lines.
         font_corruption_score_threshold:
           type: number
+          x-go-type-skip-optional-pointer: false
           format: double
           minimum: 0
           maximum: 1
@@ -39001,6 +39006,7 @@ components:
           description: Font corruption score at which text is replaced by OCR.
         max_replacement_char_ratio:
           type: number
+          x-go-type-skip-optional-pointer: false
           format: double
           minimum: 0
           maximum: 1
@@ -39353,6 +39359,7 @@ components:
           description: Credential reference used to download the source URL.
         html_strip_tags:
           type: boolean
+          x-go-type-skip-optional-pointer: false
           default: true
           description: Strip HTML markup from HTML sources before storing their text.
         ocr:
