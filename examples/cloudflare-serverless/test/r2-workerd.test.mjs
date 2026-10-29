@@ -28,6 +28,12 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
     import worker, {R2CommitCoordinator as R2Base,CommitCoordinator as LegacyBase,R2ReadRuntime,R2BuildRuntime} from "./worker.js";
     export {R2ReadRuntime,R2BuildRuntime};
     export class R2CommitCoordinator extends R2Base {
+      constructor(ctx,env){
+        // Native coordination must remain independent of the platform SQL/KV
+        // database, including initialization and recovery after actor eviction.
+        for(const key of ["sql","kv"])Object.defineProperty(ctx.storage,key,{get(){throw Error("UnexpectedPlatformDatabaseAccess:"+key);}});
+        super(ctx,env);
+      }
       commitMutations(inputs,deadline){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs,deadline);}
       mutationDiagnostics(){return this.groupSizes??[];}
       openReadView(options){this.views=(this.views??0)+1;return super.openReadView(options);}

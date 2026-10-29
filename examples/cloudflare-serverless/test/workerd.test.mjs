@@ -20,7 +20,7 @@ import { mkdtemp, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-test("workerd persists R2 pages and coordinated commits across restart", { timeout: 180000 }, async () => {
+test("workerd persists R2 pages and coordinated commits across restart", { timeout: 180000 }, async t => {
   const persist = await mkdtemp(join(tmpdir(), "antfly-workerd-"));
   const output = fileURLToPath(new URL("../dist/worker/", import.meta.url));
   const wasm = (await readdir(output)).filter(name => name.endsWith(".wasm"));
@@ -68,8 +68,8 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
         const sent = [];
         const localEnv = { ...env, MAINTENANCE: { async send(value) { sent.push(value); } } };
         if (path === "/test/compaction-limit") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMPACTION_MAX_DOCUMENTS: "0"}, ctx);
-        if (path === "/test/sql-object-pressure") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMMITS: {getByName() {return {async objectCall() {throw new Error("out of memory: SQLITE_NOMEM");}};}}}, ctx);
-        if (path === "/test/sql-pressure") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMMITS: {getByName() {return {async collection() {throw new Error("out of memory: SQLITE_NOMEM");}};}}}, ctx);
+        if (path === "/test/sql-object-pressure") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMMITS: {getByName() {return {async objectCall() {throw new Error("out of memory: SQLITE_NOMEM [test-only injected objectCall failure]");}};}}}, ctx);
+        if (path === "/test/sql-pressure") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMMITS: {getByName() {return {async collection() {throw new Error("out of memory: SQLITE_NOMEM [test-only injected collection failure]");}};}}}, ctx);
         if (path === "/test/reindex") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-reindex", PUBLICATION_RECORDS: "8"}, ctx);
         if (path === "/test/guard") return Response.json(await env.COMMITS.getByName("test-guard").testGuardedProgress());
         if (path === "/test/journal-scale") return Response.json(await env.COMMITS.getByName("test-journal-scale").testJournalScale());
@@ -208,10 +208,18 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
     assert.ok(collected, "GC must finish across coordinator and Worker restarts");
     assert.equal((await call({ op: "search", text: "queued", limit: 1 })).hits[0].doc_id, "queued/0000");
     assert.equal((await call(mutation)).visibility, committed.visibility, "GC must preserve old retry receipts");
-    const sqlPressure = await mf.dispatchFetch("https://example.test/test/sql-pressure", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify({op: "collect"})});
-    assert.equal(sqlPressure.status, 503); assert.equal(sqlPressure.headers.get("Retry-After"), "1");
-    const sqlObjectPressure = await mf.dispatchFetch("https://example.test/test/sql-object-pressure", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify({op: "status"})});
-    assert.equal(sqlObjectPressure.status, 503); assert.equal(sqlObjectPressure.headers.get("Retry-After"), "1");
+    // These are synthetic failures, not SQLite allocation failures in workerd.
+    // Keep the real error code so the production response path is exercised.
+    for (const [operation, endpoint, body] of [
+      ["collection", "sql-pressure", {op: "collect"}],
+      ["objectCall", "sql-object-pressure", {op: "status"}],
+    ]) await t.test(`injected SQLITE_NOMEM in ${operation} returns a retryable 503`, async () => {
+      const response = await mf.dispatchFetch(`https://example.test/test/${endpoint}`, {
+        method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 503);
+      assert.equal(response.headers.get("Retry-After"), "1");
+    });
     let largeJournal;
     for (let i = 0; i < 100; i++) {
       const response = await mf.dispatchFetch("https://example.test/test/journal-scale");

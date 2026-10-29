@@ -268,7 +268,10 @@ SQLite soak did not reproduce it. The compatibility profile retains pressure
 classification/retry handling. The R2 profile removes those application SQL/KV
 queries and their growing frontier tables; this does not claim to fix a
 Cloudflare platform defect. See the
-[native audit and pressure investigation](cloudflare-native-audit.md).
+[native audit and pressure investigation](cloudflare-native-audit.md). The
+[updated memory audit](cloudflare-sqlite-memory.md) distinguishes that historical
+live failure from intentional local fault injection and describes the workerd
+SQL/KV access guard for the native coordinator.
 
 R2 latency and request costs are in the durable write path. Batching amortizes
 them; it does not promise local-SSD acknowledgement latency. Independent commit

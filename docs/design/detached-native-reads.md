@@ -117,9 +117,10 @@ Validation passes all 307 Node tests and all 30 workerd cases, with final focuse
 checks for promotion budgets, ticket reuse, public-field sanitization and combined
 deferred-metrics operation. The native serverless target passes, including 596
 main-population tests with six existing skips and all six focused protocol tests
-without leaks. The full workerd log retains one recovered `SQLITE_NOMEM` diagnostic
-from local platform storage; all cases finish successfully. This is not evidence
-that local emulator memory pressure has been eliminated.
+without leaks. The full workerd log includes the intentional legacy
+`SQLITE_NOMEM` fault injection; all cases finish successfully. Earlier wording
+incorrectly attributed that injection to platform allocation pressure. See the
+[SQLite memory audit](cloudflare-sqlite-memory.md).
 
 All 1,074 older sealed artifacts remain hash-valid. No Cloudflare resources were
 created. The cloud acceptance gate remains unpassed: final-module scale/ANN

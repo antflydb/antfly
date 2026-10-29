@@ -156,8 +156,9 @@ acquire this object-WAL format or automatically enable the cache.
 Final validation passes 316 Node tests, all 31 workerd cases and 603 native
 serverless tests (six existing skips), with no native leaks. The focused native
 read-state target passes all nine tests. Zig formatting and diff checks pass.
-The passing workerd log preserves one recovered local platform `SQLITE_NOMEM`
-diagnostic; emulator memory pressure is not claimed eliminated.
+The passing workerd log includes the intentional legacy `SQLITE_NOMEM`
+fault injection, not an observed emulator allocation failure. See the
+[SQLite memory audit](cloudflare-sqlite-memory.md).
 
 Native regression coverage includes cache identity/lineage/floor checks, failed
 allocation without watermark advancement, bounded warming, atomic projection

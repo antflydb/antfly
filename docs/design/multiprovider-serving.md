@@ -132,8 +132,9 @@ cache contracts and are not a ranking against Antfly.
    disposable resources, retain local evidence and complete authorized cleanup.
 
 The existing local 31% storage-delay read-p95 improvement is not a cloud gate pass.
-The zero-injected-delay regression and recovered local `SQLITE_NOMEM` remain
-recorded in `native-read-state.md`. No thresholds or resource caps are relaxed.
+The zero-injected-delay regression remains recorded in `native-read-state.md`.
+The local `SQLITE_NOMEM` log is intentional fault injection; see the
+[SQLite memory audit](cloudflare-sqlite-memory.md). No thresholds or resource caps are relaxed.
 
 ## Native host controls
 
@@ -224,8 +225,8 @@ Production source `d226557d07` passes 322 Node tests, 31 actual-workerd cases,
 (one live-provider skip) and 158 standalone object-store tests (two live-provider
 skips), with no native leaks. The exact final full WASM SHA-256 is
 `afdf4e9bd1a1ea9ecc8738ce4fa8724f5a28655fcc5a7fd152e452d54def865d`.
-The passing workerd log still contains a recovered local platform
-`SQLITE_NOMEM`; it does not establish that platform memory pressure is solved.
+The passing workerd log contains the intentional legacy `SQLITE_NOMEM`
+fault injection, not a newly observed platform allocation failure.
 
 The committed-source standard-GCS run passes transport conflicts, bootstrap,
 publication, lost-acknowledgement recovery, complete reopen, a second publication,
@@ -301,7 +302,7 @@ real-provider qualification repeats a published-base transform and full reopen.
 
 At production source `257397f236`, the final native suite passes 612 tests with
 seven skips and no failures/leaks; all 328 Node and 31 actual-workerd cases pass.
-The workerd log still records recovered platform `SQLITE_NOMEM`. Rebuilding all
+The workerd log includes the intentional legacy `SQLITE_NOMEM` injection. Rebuilding all
 three native WASM modules produces exactly the hashes from the earlier qualified
 scale/ANN snapshot. The HTTP changes do not alter those emitted modules.
 
@@ -338,8 +339,10 @@ The rebuilt full/compact/observation modules are 7,329,084 bytes each. Their
 SHA-256 hashes are respectively `7946334d2770219463ecfd29913d1254831264dcdbc4e0b1982fd1bd7688b29a`,
 `8bfbe4e89a9ca1d8db9a62c83b14d6748c9ef74213155f4113e47d96b43247b0`,
 and `ff85bfdf0333eb9be8a991b7c291b52380e1bcf14fad0889dd089ba6417b7865`.
-All 330 Node and 31 actual-workerd tests pass. A recovered platform
-`SQLITE_NOMEM` still appears and remains an unresolved live-memory concern.
+All 330 Node and 31 actual-workerd tests pass. The local `SQLITE_NOMEM`
+line comes from the intentional legacy fault-injection endpoint; it was
+previously misclassified as a live memory concern. The older compatibility
+profile did have a distinct live failure (see the [audit](cloudflare-sqlite-memory.md)).
 The engine and the new native collector do not use SQLite.
 
 The final 50,000-document mixed text/vector fixture passes all nine stages:
@@ -410,7 +413,8 @@ fixture, repeated 50,000-row metadata collection, and both frozen ANN corpora
 at probes 8/32/all. ANN read peaks remain 7,208,960 and 5,963,776 linear bytes
 under the 8 MiB reader/request budget; recall and mean GET/byte comparisons
 pass. These are local contract/scale results, not total isolate RSS or cloud
-latency. Recovered platform `SQLITE_NOMEM` remains unresolved.
+latency. The historical compatibility-profile SQLite failure remains
+unreproduced; local injected error output is not a new occurrence.
 
 Provider qualification requires clean committed source before creating a
 bucket and verifies the same clean HEAD afterward. Use
@@ -486,16 +490,18 @@ ANN results by exact closure. The native collector and scale-test body also
 match the batched checkpoint exactly. Final native binary SHA-256 is
 `761cefcb16412ecaf0fd25c1d2dfd97dafbe5ac09b6a085f3edcab607f9786ca`.
 
-The current local Cloudflare proposal is under
+The immutable Cloudflare proposal is under
 `native-gc-batch-lab/cloudflare-root-layout/gate-mvslyh876561/`, built from
 `489e28c436`. Its control bundles remain exactly `c44896ac8c`; all configuration
-is unchanged except local entry paths. Verification passes without copying
-tokens or changing cloud resources/deployments. The earlier local proposal and
-the actual paused deployment at `131a703fed` remain preserved. Copy the final
-proposal into an unsealed runtime directory before any authorized lifecycle
-changes. AWS's fresh default-profile check still returns `NoCredentials`.
-Recovered platform `SQLITE_NOMEM`, the live Cloudflare gate and matched
-colocated provider performance remain open.
+is unchanged except local entry paths. Following explicit token-upload and
+post-test cleanup approval, an operational copy was deployed to the existing
+`antfly-1278-g-mvslyh876561-1-{b,c}` pair and both disposable tokens verified.
+The current candidate is `489e28c436`; the earlier `131a703fed` deployment and
+local proposals remain historical evidence. See the
+[SQLite memory and deployment audit](cloudflare-sqlite-memory.md).
+AWS's fresh default-profile check still returns `NoCredentials`. The historical
+compatibility-profile SQLite failure remains unreproduced. The live Cloudflare
+gate and matched colocated provider performance remain open.
 
 
 The final native 50,000-record repeat passes 32 focused cases with two

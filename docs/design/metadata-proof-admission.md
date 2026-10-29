@@ -101,8 +101,9 @@ read-ahead experiment as a substitute for durable reader/publication protection.
 The current implementation passes all 328 Node tests, including six dedicated
 proof-lifecycle contracts, and all 31 actual-workerd cases. The optimized
 workerd profile asserts that detached proof acquisition actually runs and stays
-within its input allowance. The passing full log retains the previously
-observed local platform `SQLITE_NOMEM`. Latency and cloud qualification remain
+within its input allowance. The passing full log includes an intentional
+legacy `SQLITE_NOMEM` injection, as corrected in the
+[SQLite memory audit](cloudflare-sqlite-memory.md). Latency and cloud qualification remain
 open at this checkpoint; all failed/intermediate proof tests are preserved.
 
 ## Measured selection at source `131a703fed`
