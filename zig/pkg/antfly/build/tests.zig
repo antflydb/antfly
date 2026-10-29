@@ -229,7 +229,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // to check independently of the full API runtime harness.
     const contribution_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "analyzed contributions", "introducer." },
+        .filters = &.{ "analyzed contributions", "introducer.", "bounded merge splits output" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("analyzed-contribution-test", "Verify bounded analysis reuse on the existing document format")

@@ -24988,7 +24988,7 @@ pub const IndexManager = struct {
         }
 
         const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{
-            .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
+            .target_segment_bytes = activeTextMergePolicy().max_segment_size,
             .deleted_docs = deleted_docs,
             .source_map = &source_map,
         }) catch |err| {
