@@ -94,8 +94,8 @@ pub const Page = struct {
             if (index >= self.nulls.len) return error.RowSourceColumnLengthMismatch;
             return self.at(index);
         }
-        fn set(self: *@This(), a: A, cell_index: usize, value: std.json.Value) !void {
-            if (value == .null) {
+        fn set(self: *@This(), a: A, cell_index: usize, value: std.json.Value, sql_null: bool) !void {
+            if (sql_null) {
                 self.nulls[cell_index] = 1;
                 return;
             }
@@ -158,7 +158,12 @@ pub const Page = struct {
     }
     pub fn setNative(self: *Page, row_index: usize, column_index: usize, value: std.json.Value) !void {
         std.debug.assert(!self.native_finished and row_index < self.len);
-        try self.native_builders.?[column_index].set(self.native_allocator.?, row_index, value);
+        try self.setNativeCell(row_index, column_index, value, value == .null);
+    }
+    /// SQL NULL is independent of a non-null JSON scalar containing null.
+    pub fn setNativeCell(self: *Page, row_index: usize, column_index: usize, value: std.json.Value, sql_null: bool) !void {
+        std.debug.assert(!self.native_finished and row_index < self.len);
+        try self.native_builders.?[column_index].set(self.native_allocator.?, row_index, value, sql_null);
     }
     /// Consumes a lease even on allocation failure. No source reader, request
     /// context, or artifact pin is retained: only authenticated decoded bytes.
@@ -1024,4 +1029,24 @@ test "external lake native typed result construction widens heterogeneous values
     try Case.run(std.testing.allocator);
     var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Case.run, .{});
+}
+
+test "external lake native result page keeps JSON null separate from SQL NULL under faults" {
+    const Run = struct {
+        fn run(a: A) !void {
+            const page = try Page.native(a, &.{"json"}, 3);
+            defer page.release();
+            try page.setNativeCell(0, 0, .null, false);
+            try page.setNativeCell(1, 0, .{ .integer = 42 }, false);
+            try page.setNativeCell(2, 0, .null, true);
+            try page.finishNative();
+            try std.testing.expect(!page.columns[0].nulls.isNull(0));
+            try std.testing.expect(!page.columns[0].nulls.isNull(1));
+            try std.testing.expect(page.columns[0].nulls.isNull(2));
+            try std.testing.expect(try page.columns[0].values.encoded.at(0) == .null);
+            try std.testing.expectEqual(@as(i64, 42), (try page.columns[0].values.encoded.at(1)).integer);
+        }
+    };
+    try Run.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

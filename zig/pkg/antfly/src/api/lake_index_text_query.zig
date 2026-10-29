@@ -3843,7 +3843,7 @@ fn projectedHighlightSource(scratch: *std.heap.ArenaAllocator, hit: *const types
     const value = hit.source_value orelse if (hit.column_source) |source| try source.valueForProjection(scratch, .{ .fields = fields, .include_all_fields = false }) else return null;
     for (fields) |field| {
         const found = local.api_json_helpers.extractJsonPathValue(value, field) orelse return null;
-        if (from_columns and std.mem.indexOfScalar(u8, field, '.') == null and found == .string and found.string.len > 4096) return null;
+        if (from_columns and std.mem.indexOfScalar(u8, field, '.') == null and found == .string and found.string.len >= local.section_source_column.offset_min_bytes) return null;
     }
     return value;
 }

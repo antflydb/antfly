@@ -2097,3 +2097,49 @@ large integers, nulls, heterogeneous widening, allocation failures and cleanup.
 Real Parquet/Iceberg restart tests and `bench/lake/typed_results.py` exercise
 public delivery. Keep candidate/block-work and retained-byte measurements
 separate from local Debug timing and provider qualification.
+
+### Exact layout bounds and small-field offset blocks
+
+Stored-source recipe **v9**, native reader protocol **95** and runtime ABI **71**
+fence `AFSC0005` / `AFST5` source columns and `AFOV0004` offset navigation.
+Publication rebuilds the affected native text representation rather than mixing
+old and new offset semantics.
+
+Uniform disjoint occurrences attest a first start, constant stride and constant
+span length. For an ASCII source, fragment candidates have a fixed alignment
+relative to those spans. The reader bounds their exact interior overlap count
+and both clamped edge windows, rather than bounding every possible window
+alignment. This lets equally spaced seven-byte words with an eight-byte stride
+prune exactly as six-byte words with a seven-byte stride do. Variable layouts,
+multiple selected terms and UTF-8 boundary expansion retain the conservative
+spacing bounds and exact scan fallback. No approximate snippet ranking is used.
+
+A diverse ordered vector also contains a source-order lane: independently
+compressed blocks of delta-coded start, length, position and dictionary term ID.
+Their prefix maximum ends support exact seeks even across long overlapping
+spans. Broad selections use that lane instead of decoding one head block per
+selected term. Sparse selections retain inverted occurrence reads; the lane is
+chosen only for at least 64 selected terms covering at least one eighth of the
+source occurrences. Term dictionary navigation remains proportional to the
+selected vocabulary; the fragment kernel retains one occurrence block, bounded
+windows and the output spans. It does not retain a decoded token vector for each
+selected term. Reads and future-block hints use the existing cancellation,
+read-admission and shared source-I/O scheduling paths.
+
+Compatible original strings from 256 bytes through 4 KiB now retain analyzed
+source offsets in an inline source descriptor (`AFSI1`). These descriptors and
+payloads are compressed together in the existing indexed doc-value block, so
+repeated analyzer fingerprints and navigation metadata share block compression.
+No per-small-field remote object or read is introduced. Larger strings retain
+independently readable 64-KiB pages; smaller and unsupported strings retain
+query-time analysis. The 256-byte threshold is an internal cost policy, not a
+public API guarantee. Original UTF-8 bytes, analyzer signatures and compaction
+semantics stay authoritative. Inline descriptors are copied intact during
+compaction and never retain a reader-owned decode past its callback.
+
+Covering-index hydration groups the verified physical rows under one typed
+result page per decoded covering group. Fields are resolved once per group;
+scalar vectors are final result storage, with owned payload bytes and explicit
+row leases. SQL NUMERIC/array normalization, SQL nulls, declared `_type` and
+physical identity witnesses apply before publication to the result page. Pages
+can outlive the covering read wave without retaining its request or reader.

@@ -26,8 +26,11 @@ const Sink = @import("../segment.zig").SegmentSink;
 const Token = @import("antfly_cancellation").CancellationToken;
 const offsets = @import("source_offsets.zig");
 pub const page_size = 64 * 1024;
-const magic = "AFSC0004";
-const text_magic = "AFST4";
+const magic = "AFSC0005";
+const text_magic = "AFST5";
+const inline_magic = "AFSI1";
+/// Below this size ordinary analysis is cheaper than persisting navigation.
+pub const offset_min_bytes = 256;
 pub fn fingerprint(a: A, analyzer: *const analysis.Analyzer) ![32]u8 {
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 1), .char_filters = analyzer.char_filters, .tokenizer = analyzer.tokenizer, .filters = analyzer.filters }, .{});
     defer a.free(bytes);
@@ -94,6 +97,24 @@ fn copyRange(sink: *Sink, view: View, offset: u64, length: usize) !void {
 /// Writes pages now; the caller stores the small returned descriptor in its
 /// ordinary indexed doc-value stream. All offsets are section-relative.
 pub fn writeTextPrepared(a: A, sink: *Sink, start: usize, text: []const u8, captured: Variants) ![]u8 {
+    if (text.len > 4096 or captured.items.len == 0) return writePagedText(a, sink, start, text, captured);
+    // Small fields share compression and repeated analyzer/dictionary metadata
+    // with the enclosing indexed doc-value block. No separate per-row reads.
+    var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var output = memory.sink();
+    try output.appendNTimes(0, 8);
+    const descriptor = try writePagedText(a, &output, 0, text, captured);
+    defer a.free(descriptor);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, inline_magic);
+    try u32add(a, &out, memory.out.items.len);
+    try out.appendSlice(a, memory.out.items);
+    try out.appendSlice(a, descriptor);
+    return out.toOwnedSlice(a);
+}
+fn writePagedText(a: A, sink: *Sink, start: usize, text: []const u8, captured: Variants) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     try out.appendSlice(a, text_magic);
@@ -169,6 +190,17 @@ pub const Text = struct {
     pages: []const u8,
     variants: []const u8,
     variant_count: u32,
+    fn descriptor(view: View, bytes: []const u8) !?Text {
+        if (std.mem.startsWith(u8, bytes, inline_magic)) {
+            if (bytes.len < 9) return error.InvalidData;
+            const length = std.mem.readInt(u32, bytes[5..9], .little);
+            if (length > bytes.len - 9) return error.InvalidData;
+            const payload = bytes[9..][0..length];
+            return try parse(try View.init(.{ .contiguous = payload }, 0, payload.len), bytes[9 + length ..]);
+        }
+        if (!std.mem.startsWith(u8, bytes, text_magic)) return null;
+        return try parse(view, bytes);
+    }
     fn parse(view: View, bytes: []const u8) !Text {
         var p: Parser = .{ .bytes = bytes };
         if (!std.mem.eql(u8, try p.take(5), text_magic)) return error.InvalidData;
@@ -387,8 +419,7 @@ pub const Cursor = struct {
         const bytes = (try self.directory.get(doc)) orelse return null;
         self.chunk = self.directory.chunk;
         self.decode_count = self.directory.decode_count;
-        if (!std.mem.startsWith(u8, bytes, text_magic)) return null;
-        return try Text.parse(self.source orelse return error.InvalidData, bytes);
+        return try Text.descriptor(self.source orelse return error.InvalidData, bytes);
     }
     pub fn get(self: *Cursor, doc: u32) !?[]const u8 {
         self.directory.reader.alloc.free(self.full);
@@ -396,8 +427,7 @@ pub const Cursor = struct {
         const bytes = (try self.directory.get(doc)) orelse return null;
         self.chunk = self.directory.chunk;
         self.decode_count = self.directory.decode_count;
-        if (!std.mem.startsWith(u8, bytes, text_magic)) return bytes;
-        const value = try Text.parse(self.source orelse return error.InvalidData, bytes);
+        const value = (try Text.descriptor(self.source orelse return error.InvalidData, bytes)) orelse return bytes;
         const a = self.directory.reader.alloc;
         const raw = try value.read(a, 0, value.length, self.control);
         defer a.free(raw);
@@ -430,20 +460,24 @@ pub const Writer = struct {
         self.retained += bytes.len;
     }
     pub fn add(self: *Writer, doc: u32, value: std.json.Value, analyzers: []const *const analysis.Analyzer) !void {
-        const bytes = if (value == .string and value.string.len > 4096 and std.unicode.utf8ValidateSlice(value.string))
+        const bytes = if (value == .string and (value.string.len > 4096 or (value.string.len >= offset_min_bytes and analyzers.len != 0)) and std.unicode.utf8ValidateSlice(value.string))
             try writeText(self.a, self.sink, self.start, value.string, analyzers)
         else
             try typed.encodeBinary(self.a, value);
         try self.append(doc, bytes);
     }
     pub fn addPrepared(self: *Writer, doc: u32, value: std.json.Value, captured: Variants) !void {
-        const bytes = if (value == .string and value.string.len > 4096 and std.unicode.utf8ValidateSlice(value.string))
+        const bytes = if (value == .string and (value.string.len > 4096 or captured.items.len != 0) and std.unicode.utf8ValidateSlice(value.string))
             try writeTextPrepared(self.a, self.sink, self.start, value.string, captured)
         else
             try typed.encodeBinary(self.a, value);
         try self.append(doc, bytes);
     }
     pub fn copy(self: *Writer, doc: u32, cursor: *Cursor, original: u32) !void {
+        if (try cursor.directory.get(original)) |descriptor| if (std.mem.startsWith(u8, descriptor, inline_magic)) {
+            _ = try Text.descriptor(cursor.source orelse return error.InvalidData, descriptor);
+            return self.append(doc, try self.a.dupe(u8, descriptor));
+        };
         if (try cursor.text(original)) |text| {
             if (self.records.items.len != 0 and self.records.items[self.records.items.len - 1].doc >= doc) return error.InvalidData;
             const descriptor = (try cursor.directory.get(original)).?;
@@ -573,4 +607,62 @@ test "highlight paged Unicode boundaries keep large metadata outside tiny snippe
         std.debug.print("SOURCE_BOUNDARIES source_bytes={d} descriptor_bytes={d} bitmap_reads={d} peak_bytes={d}\n", .{ body.items.len, cursor.directory.bytes.len, boundaries.reads, budget.peak });
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+test "highlight inline small field offsets share indexed blocks and survive compaction under faults" {
+    const a = std.testing.allocator;
+    const phrase = "<p>running needle é</p> ";
+    const body = try a.alloc(u8, phrase.len * 48);
+    defer a.free(body);
+    for (0..48) |i| @memcpy(body[i * phrase.len ..][0..phrase.len], phrase);
+    const Run = struct {
+        fn run(alloc: A, text: []const u8) !void {
+            var original = @import("../segment.zig").MemorySegmentSink.init(alloc);
+            defer original.deinit();
+            var copied = @import("../segment.zig").MemorySegmentSink.init(alloc);
+            defer copied.deinit();
+            var output = copied.sink();
+            var target = try Writer.init(alloc, &output);
+            defer target.deinit();
+            {
+                var input = original.sink();
+                var writer = try Writer.init(alloc, &input);
+                defer writer.deinit();
+                for (0..4) |i| try writer.add(@intCast(i), .{ .string = text }, &.{ &analysis.html_analyzer, &analysis.simple_analyzer });
+                try std.testing.expect(try writer.finish());
+                var cursor = Cursor.init(try Reader.init(alloc, try View.init(.{ .contiguous = original.out.items }, 0, original.out.items.len)));
+                defer cursor.deinit();
+                for (0..4) |i| {
+                    const descriptor = (try cursor.directory.get(@intCast(i))).?;
+                    try std.testing.expect(std.mem.startsWith(u8, descriptor, inline_magic));
+                    const source = (try cursor.text(@intCast(i))).?;
+                    try std.testing.expect(source.view.source == .contiguous);
+                    const raw = try source.read(alloc, 0, source.length, .none);
+                    defer alloc.free(raw);
+                    try std.testing.expectEqualStrings(text, raw);
+                    for ([_]*const analysis.Analyzer{ &analysis.html_analyzer, &analysis.simple_analyzer }) |analyzer| {
+                        const vector = (try source.tokens(alloc, try fingerprint(alloc, analyzer), .none)).?;
+                        defer vector.deinit();
+                        try std.testing.expect(vector.items.len != 0);
+                    }
+                    try target.copy(@intCast(i), &cursor, @intCast(i));
+                }
+            }
+            try std.testing.expect(try target.finish());
+            // Originals and decoded directory chunks may be gone before reuse.
+            original.deinit();
+            original = @import("../segment.zig").MemorySegmentSink.init(alloc);
+            var cursor = Cursor.init(try Reader.init(alloc, try View.init(.{ .contiguous = copied.out.items }, 0, copied.out.items.len)));
+            defer cursor.deinit();
+            for (0..4) |i| {
+                const source = (try cursor.text(@intCast(i))).?;
+                const vector = (try source.tokens(alloc, try fingerprint(alloc, &analysis.html_analyzer), .none)).?;
+                defer vector.deinit();
+                try std.testing.expectEqual(@as(usize, 144), vector.items.len);
+            }
+        }
+    };
+    try Run.run(a, body);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{body});
 }

@@ -1124,7 +1124,7 @@ fn writeTextSegmentWithScratch(
                 if (sources.get(source_field).? < 2) continue;
                 const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, field, default_analyzer, text_analysis);
                 // Streaming suffix expansion keeps its existing bounded cursor.
-                if (analyzer.tokenStream(field.text) != null) continue;
+                if (analyzer.tokenStream(field.text) != null and !(source_capture.active and field.text.len >= @import("section/source_column.zig").offset_min_bytes and @import("section/source_column.zig").eligibleAnalyzer(analyzer))) continue;
                 try reuse.note(.{ .field = source_field, .text = field.text, .signature = try source_capture.signatureFor(analyzer) });
             }
         }
@@ -1883,7 +1883,7 @@ fn addSingleTextFieldToBuilders(
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
     const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc_idx, field.source_field orelse field.field_name, field.text, source_root, analyzer);
-    const producer = if (field.text.len >= 128) analyzer.tokenStream(field.text) else null;
+    const producer = if (capture == null and field.text.len >= 128) analyzer.tokenStream(field.text) else null;
     var shared: ?AnalysisReuse.Lease = null;
     if (producer == null and reuse.entries.count() != 0) shared = try reuse.acquire(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null);
     defer if (shared) |held| held.release();
@@ -1994,7 +1994,7 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
 fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, source_capture: *SourceCapture, doc: u32, source_field: []const u8, source_root: ?std.json.Value, reuse: *AnalysisReuse, contribution_cache: ?*AnalyzedContributionCache, known_reuse: bool) !void {
     const analysis_started = if (timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc, source_field, text, source_root, analyzer);
-    const producer = if (text.len >= 128) analyzer.tokenStream(text) else null;
+    const producer = if (capture == null and text.len >= 128) analyzer.tokenStream(text) else null;
     const shared = if (producer == null and reuse.entries.count() != 0) try reuse.acquire(.{ .field = source_field, .text = text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null) else null;
     defer if (shared) |held| held.release();
     if (capture == null and shared == null and contribution_cache != null and text.len >= contribution_cache_mod.minimum_input) {

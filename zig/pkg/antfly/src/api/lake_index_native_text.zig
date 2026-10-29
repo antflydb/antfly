@@ -73,10 +73,10 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     }
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
-    // v8 retains paged term navigation and occurrence blocks with authenticated
-    // spacing bounds and prefix-max end offsets. Analyzer fingerprints fence
-    // the evidence; projection and compaction retain it without reanalysis.
-    hash.update("native-lake-text-stored-source-v8");
+    // v9 adds source-order occurrence lanes, candidate-aligned regular-span
+    // certificates and block-compressed inline small-field offsets. Analyzer
+    // fingerprints fence the evidence across projection and compaction.
+    hash.update("native-lake-text-stored-source-v9");
     hash.update(&original);
     var digest: [32]u8 = undefined;
     hash.final(&digest);

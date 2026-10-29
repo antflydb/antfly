@@ -968,14 +968,20 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
             for (wave.jobs[0..count], groups[0..count]) |job, group| {
                 const loaded = job.block.?;
                 const block = loaded.block;
-                for (pending[group.begin..group.end]) |item| {
+                _ = row_arena.reset(.retain_capacity);
+                const sa = row_arena.allocator();
+                const selected_rows = try sa.alloc(u16, group.end - group.begin);
+                const selected_refs = try sa.alloc(local.storage_rowsource_types.RowRef, selected_rows.len);
+                for (pending[group.begin..group.end], selected_rows, selected_refs) |item, *row, *ref| {
                     try owner.read_context.ensureActive();
-                    _ = row_arena.reset(.retain_capacity);
-                    const row = item.entry.cover.row;
-                    if (row >= block.count()) return error.InvalidNativeLakeRowIndex;
-                    try loaded.verify(root.domain, row, item.entry.physical, item.entry.witness);
-                    result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block, row, refs_[item.position], fields);
+                    row.* = item.entry.cover.row;
+                    ref.* = refs_[item.position];
+                    if (row.* >= block.count()) return error.InvalidNativeLakeRowIndex;
+                    try loaded.verify(root.domain, row.*, item.entry.physical, item.entry.witness);
                 }
+                const page = try coveringPage(out, sa, table, block, selected_rows, selected_refs, root.cover, fields);
+                defer page.release();
+                for (pending[group.begin..group.end], 0..) |item, row| result[item.position] = page.row(row);
             }
         }
         transferred = true;
@@ -984,61 +990,44 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
     return null;
 }
 
-fn coveringSource(a: A, scratch: A, table: catalog.Table, root: ordered.Root, block: local.sql_spill.ColumnarBlock, row: u16, ref: local.storage_rowsource_types.RowRef, fields: []const []const u8) !local.storage_db_types.ColumnSource {
-    const rows_ = local.storage_rowsource_types;
-    if (row >= block.count() or block.values.len != root.cover.len) return error.InvalidNativeLakeRowIndex;
-    var columns: std.ArrayList(rows_.ColumnVector) = .empty;
+/// One typed result page per decoded covering group. Payloads are copied into
+/// its arena once; no reader, request, or block lease escapes the gather wave.
+fn coveringPage(a: A, scratch: A, table: catalog.Table, block: local.sql_spill.ColumnarBlock, selected: []const u16, refs_: []const local.storage_rowsource_types.RowRef, cover: []const []const u8, fields: []const []const u8) !*local.storage_db_types.ColumnSourcePage {
+    if (selected.len != refs_.len or block.values.len != cover.len) return error.InvalidNativeLakeRowIndex;
+    var names: std.ArrayList([]const u8) = .empty;
     for (fields) |field| {
-        if (generatedCoveringField(table, field)) continue;
-        // Projection and hidden highlight dependencies can request the same
-        // field. Preserve one physical column, including a declared _type.
-        if (for (columns.items) |column| {
-            if (std.mem.eql(u8, column.name, field)) break true;
-        } else false) continue;
-        const index = for (root.cover, 0..) |name, i| {
+        if (covers(names.items, field)) continue;
+        if (!generatedCoveringField(table, field) and !covers(cover, field)) return error.InvalidNativeLakeRowIndex;
+        try names.append(scratch, field);
+    }
+    if (!covers(names.items, "_id")) try names.append(scratch, "_id");
+    if (generatedCoveringField(table, "_type") and !covers(names.items, "_type")) try names.append(scratch, "_type");
+    const page = try local.storage_db_types.ColumnSourcePage.native(a, names.items, selected.len);
+    errdefer page.release();
+    const pa = page.arena.allocator();
+    // Resolve fields once for the group, then write each final scalar vector.
+    for (names.items, 0..) |field, column| {
+        const index: ?usize = if (generatedCoveringField(table, field)) null else for (cover, 0..) |name, i| {
             if (std.mem.eql(u8, name, field)) break i;
         } else return error.InvalidNativeLakeRowIndex;
-        const cell = try block.cell(row, index);
-        const nulls = try scratch.alloc(u8, 1);
-        nulls[0] = @intFromBool(cell.sql_null);
-        var column: rows_.ColumnVector = .{ .name = field, .nulls = .{ .bytes = nulls }, .values = undefined };
-        const wire: std.json.Value = if (cell.sql_null) .null else if (cell.numeric != null or cell.array != null)
-            try local.sql_runtime.encodeStorageDatum(scratch, cell, try table.column(field), @import("lake_index_aggregate_artifact.zig").max_block_bytes)
-        else
-            cell.value;
-        switch (wire) {
-            .integer => |value| {
-                const values = try scratch.alloc(i64, 1);
-                values[0] = value;
-                column.values = .{ .i64 = values };
-            },
-            .float => |value| {
-                const values = try scratch.alloc(f64, 1);
-                values[0] = value;
-                column.values = .{ .f64 = values };
-            },
-            .bool => |value| {
-                const values = try scratch.alloc(bool, 1);
-                values[0] = value;
-                column.values = .{ .bool = values };
-            },
-            .string => |value| {
-                const values = try scratch.alloc([]const u8, 1);
-                values[0] = value;
-                column.values = .{ .bytes = values };
-            },
-            else => {
-                const values = try scratch.alloc([]const u8, 1);
-                values[0] = try std.json.Stringify.valueAlloc(scratch, wire, .{});
-                column.values = .{ .json = values };
-            },
+        for (selected, refs_, 0..) |physical, ref, row| {
+            if (physical >= block.count()) return error.InvalidNativeLakeRowIndex;
+            var sql_null = false;
+            const wire: std.json.Value = if (index) |i| value: {
+                const cell = try block.cell(physical, i);
+                sql_null = cell.sql_null;
+                if (cell.sql_null) break :value .null;
+                if (cell.numeric != null or cell.array != null) break :value try local.sql_runtime.encodeStorageDatum(pa, cell, try table.column(field), @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+                break :value try local.api_json_helpers.cloneJsonValue(pa, cell.value);
+            } else if (std.mem.eql(u8, field, "_id")) .{ .string = try local.storage_rowsource_identity.allocId(pa, ref) } else .{ .string = "row" };
+            try page.setNativeCell(row, column, wire, sql_null);
         }
-        try columns.append(scratch, column);
     }
-    const identity = try local.storage_rowsource_identity.allocId(scratch, ref);
-    try columns.append(scratch, .{ .name = "_id", .values = .{ .bytes = try scratch.dupe([]const u8, &.{identity}) } });
-    if (generatedCoveringField(table, "_type")) try columns.append(scratch, .{ .name = "_type", .values = .{ .bytes = try scratch.dupe([]const u8, &.{"row"}) } });
-    const page = try local.storage_db_types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = root.source, .snapshot_id = root.snapshot }, .row_refs = &.{ref}, .columns = columns.items }, &.{0});
+    try page.finishNative();
+    return page;
+}
+fn coveringSource(a: A, scratch: A, table: catalog.Table, root: ordered.Root, block: local.sql_spill.ColumnarBlock, row: u16, ref: local.storage_rowsource_types.RowRef, fields: []const []const u8) !local.storage_db_types.ColumnSource {
+    const page = try coveringPage(a, scratch, table, block, &.{row}, &.{ref}, root.cover, fields);
     defer page.release();
     return page.row(0);
 }
@@ -2635,8 +2624,14 @@ test "external lake covering result gathers retain typed values independently of
             var scratch = std.heap.ArenaAllocator.init(alloc);
             var scratch_live = true;
             defer if (scratch_live) scratch.deinit();
-            const row = try coveringSource(alloc, scratch.allocator(), table_, root_, block_, 0, ref_, root_.cover);
+            const page = try coveringPage(alloc, scratch.allocator(), table_, block_, &.{ 0, 0, 0, 0 }, &.{ ref_, ref_, ref_, ref_ }, root_.cover, root_.cover);
+            const row = page.row(3);
+            const first = page.row(0);
             defer row.deinit();
+            defer first.deinit();
+            try std.testing.expect(row.page == first.page);
+            try std.testing.expectEqual(@as(usize, 4), page.len);
+            page.release();
             scratch.deinit();
             scratch_live = false;
             var output = std.heap.ArenaAllocator.init(alloc);

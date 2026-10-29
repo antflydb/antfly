@@ -576,7 +576,7 @@ pub fn prepareStoredMatches(a: Allocator, source: @import("../section/source_col
     const plan = (try prepareStoredPlan(a, source, signature, matchers, program, control)) orelse return null;
     // Tiny and highly diverse matches retain the simpler vector kernel. Dense
     // monotone postings use bounded source-order merging and fragment state.
-    if (plan.ordered and plan.count >= 4096 and plan.count > plan.terms.len *| 8) return .{ .stream = plan };
+    if (plan.ordered and plan.count >= 4096 and (plan.count > plan.terms.len *| 8 or plan.source_blocks.len != 0)) return .{ .stream = plan };
     const vector = try plan.materializeOwned(control);
     return .{ .vector = vector };
 }
@@ -709,7 +709,7 @@ fn streamFragments(a: Allocator, scratch: Allocator, stored: @import("../section
         // This skips the remaining occurrence blocks, without approximation.
         if (visited % 256 == 0 and windows.items.len == capacity) {
             const worst = windows.items[0];
-            if (plan.densityUpper(maximum_width, start, worst.score)) |upper| {
+            if (plan.densityUpper(maximum_width, start, worst.score, stored.boundaryExpansion() == 0)) |upper| {
                 if (!betterWindow(.{ .start = start, .end = end, .score = upper }, worst)) {
                     if (profile) |value| value.pruned = true;
                     break;
@@ -1822,4 +1822,166 @@ test "highlight dense block certificates prune exact greedy winners and seek out
     };
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Faults.run, .{ stored, &plan });
+}
+
+test "highlight candidate aligned regular spans prune stride eight with exact greedy fragments" {
+    const a = std.testing.allocator;
+    const column = @import("../section/source_column.zig");
+    const segment = @import("../segment.zig");
+    const View = @import("../segment_source.zig").View;
+    for ([_][]const u8{ "needle ", "running ", "abcdefgh ", "longerwordxx " }) |word| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(a);
+        for (0..32768) |_| try body.appendSlice(a, word);
+        var memory = segment.MemorySegmentSink.init(a);
+        defer memory.deinit();
+        var sink = memory.sink();
+        var writer = try column.Writer.init(a, &sink);
+        defer writer.deinit();
+        try writer.add(0, .{ .string = body.items }, &.{&analysis_mod.simple_analyzer});
+        try std.testing.expect(try writer.finish());
+        var cursor = column.Cursor.init(try column.Reader.init(a, try View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len)));
+        defer cursor.deinit();
+        const stored = (try cursor.text(0)).?;
+        var plan = (try stored.planTokens(a, try column.fingerprint(a, &analysis_mod.simple_analyzer), .{}, .none)).?;
+        defer plan.deinit();
+        const vector = try plan.materialize(a, .none);
+        defer vector.deinit();
+        for ([_]u32{ 1, 17, 100, 513 }) |width| {
+            const expected = try highlightSelectedStored(a, a, stored, vector.items, 3, width, .none);
+            defer freeFragments(a, expected);
+            var profile: StreamProfile = .{};
+            const actual = try streamFragments(a, a, stored, &plan, 3, width, .none, &profile);
+            defer freeFragments(a, actual);
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |old, new| {
+                try std.testing.expectEqual(old.offset, new.offset);
+                try std.testing.expectEqualStrings(old.text, new.text);
+                try std.testing.expectEqualSlices(Span, old.highlights, new.highlights);
+            }
+            if (width == 100 and std.mem.eql(u8, word, "running ")) {
+                try std.testing.expect(profile.pruned);
+                try std.testing.expect(profile.spans <= 512);
+                try std.testing.expect(profile.block_reads <= 6);
+                std.debug.print("REGULAR_DENSITY occurrences={d} visited={d} blocks={d} exact=true\n", .{ plan.count, profile.spans, profile.block_reads });
+            }
+        }
+    }
+}
+
+test "highlight diverse source lane bounds decoded heads preserves exact results and cancellation" {
+    const a = std.testing.allocator;
+    const column = @import("../section/source_column.zig");
+    const segment = @import("../segment.zig");
+    const View = @import("../segment_source.zig").View;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    for (0..8192) |i| {
+        var buffer: [24]u8 = undefined;
+        try body.appendSlice(a, try std.fmt.bufPrint(&buffer, "term{d:0>5} ", .{i}));
+    }
+    var memory = segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try column.Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = body.items }, &.{&analysis_mod.simple_analyzer});
+    try std.testing.expect(try writer.finish());
+    var cursor = column.Cursor.init(try column.Reader.init(a, try View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len)));
+    defer cursor.deinit();
+    const stored = (try cursor.text(0)).?;
+    var matches = (try prepareStoredMatches(a, stored, try column.fingerprint(a, &analysis_mod.simple_analyzer), &.{.{ .prefix = "term" }}, null, .none)).?;
+    defer matches.deinit();
+    try std.testing.expect(matches == .stream);
+    const vector = try matches.stream.materialize(a, .none);
+    defer vector.deinit();
+    const expected = try highlightSelectedStored(a, a, stored, vector.items, 3, 100, .none);
+    defer freeFragments(a, expected);
+    var budget: @import("../sql/memory_budget.zig") = .{ .backing = a, .limit = 256 * 1024 };
+    var profile: StreamProfile = .{};
+    const actual = try streamFragments(budget.allocator(), budget.allocator(), stored, &matches.stream, 3, 100, .none, &profile);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |old, new| {
+        try std.testing.expectEqual(old.offset, new.offset);
+        try std.testing.expectEqualStrings(old.text, new.text);
+        try std.testing.expectEqualSlices(Span, old.highlights, new.highlights);
+    }
+    try std.testing.expect(profile.block_reads <= 16);
+    std.debug.print("DIVERSE_SOURCE_LANE terms={d} occurrences={d} decoded_blocks={d} kernel_peak={d} exact=true\n", .{ matches.stream.terms.len, matches.stream.count, profile.block_reads, budget.peak });
+    freeFragments(budget.allocator(), actual);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    const Faults = struct {
+        fn run(alloc: Allocator, text: column.Text, plan: *const @import("../section/source_offsets.zig").Plan) !void {
+            const fragments = try streamFragments(alloc, alloc, text, plan, 3, 100, .none, null);
+            defer freeFragments(alloc, fragments);
+        }
+    };
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Faults.run, .{ stored, &matches.stream });
+    const Stop = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 32) return error.DeadlineExceeded;
+        }
+    };
+    var stop: Stop = .{};
+    try std.testing.expectError(error.DeadlineExceeded, streamFragments(a, a, stored, &matches.stream, 3, 100, .{ .ptr = &stop, .check_fn = Stop.check }, null));
+}
+
+test "highlight randomized stored fragment geometry preserves exact greedy output" {
+    const a = std.testing.allocator;
+    const column = @import("../section/source_column.zig");
+    const offsets = @import("../section/source_offsets.zig");
+    const segment = @import("../segment.zig");
+    const View = @import("../segment_source.zig").View;
+    var random = std.Random.DefaultPrng.init(0x9669791307);
+    const rng = random.random();
+    var checked: usize = 0;
+    for (0..24) |seed| {
+        const body = try a.alloc(u8, 4096 * 5 + 64);
+        defer a.free(body);
+        @memset(body, 'x');
+        const tokens = try a.alloc(analysis_mod.Token, 4096);
+        defer a.free(tokens);
+        for (tokens, 0..) |*token, i| {
+            const start: u32 = @intCast(i * 5);
+            const length: u32 = if (seed % 2 == 0) 1 + rng.uintLessThan(u32, 4) else if (i % 37 == 0) 80 else 1 + rng.uintLessThan(u32, 12);
+            token.* = .{ .term = if (i % 7 == 0) "other" else "needle", .start_byte = start, .end_byte = @min(@as(u32, @intCast(body.len)), start + length), .position = @intCast(i) };
+        }
+        var captured = segment.MemorySegmentSink.init(a);
+        defer captured.deinit();
+        var capture_sink = captured.sink();
+        const encoded = try offsets.write(a, &capture_sink, tokens);
+        var memory = segment.MemorySegmentSink.init(a);
+        defer memory.deinit();
+        var sink = memory.sink();
+        var writer = try column.Writer.init(a, &sink);
+        defer writer.deinit();
+        const signature = try column.fingerprint(a, &analysis_mod.simple_analyzer);
+        try writer.addPrepared(0, .{ .string = body }, .{ .view = try View.init(.{ .contiguous = captured.out.items }, 0, captured.out.items.len), .items = &.{.{ .signature = signature, .offset = 0, .bytes = encoded.bytes, .root_raw = encoded.root_raw, .count = encoded.count }} });
+        try std.testing.expect(try writer.finish());
+        var cursor = column.Cursor.init(try column.Reader.init(a, try View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len)));
+        defer cursor.deinit();
+        const stored = (try cursor.text(0)).?;
+        var plan = (try stored.planTokens(a, signature, .{}, .none)).?;
+        defer plan.deinit();
+        const vector = try plan.materialize(a, .none);
+        defer vector.deinit();
+        for ([_]u32{ 1, 2, 5 }) |count| for ([_]u32{ 1, 17, 100, 513 }) |width| {
+            const expected = try highlightSelectedStored(a, a, stored, vector.items, count, width, .none);
+            defer freeFragments(a, expected);
+            const actual = try streamFragments(a, a, stored, &plan, count, width, .none, null);
+            defer freeFragments(a, actual);
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |left, right| {
+                try std.testing.expectEqual(left.offset, right.offset);
+                try std.testing.expectEqualStrings(left.text, right.text);
+                try std.testing.expectEqualSlices(Span, left.highlights, right.highlights);
+            }
+            checked += 1;
+        };
+    }
+    std.debug.print("FRAGMENT_GEOMETRY cases={d} tokens=4096 disjoint_and_crossing=true\n", .{checked});
 }

@@ -2026,10 +2026,13 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     )
     unicode_payload += "." * (8 * 1024 * 1024 - len(unicode_payload.encode("utf-8")))
     unicode_body = "unicodecase " + unicode_payload + " needle"
+    regular_body = "running " * 32768
+    diverse_body = " ".join(f"broad{i:05d}" for i in range(8192)) + " "
     rows = pa.table(
         {
-            "id": list(range(count + 3)),
-            "body": [body] * count + [sparse_body, selective_body, unicode_body],
+            "id": list(range(count + 5)),
+            "body": [body] * count
+            + [sparse_body, selective_body, unicode_body, regular_body, diverse_body],
         }
     )
     root = tmp_path / "fixture"
@@ -2060,7 +2063,7 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
         )
         # Each large scalar stays below the reader's 16-MiB page limit.
         table.append(rows.slice(0, count + 2))
-        table.append(rows.slice(count + 2, 1))
+        table.append(rows.slice(count + 2))
         _export_table(table, root)
         uri = root.as_uri()
     definition = {
@@ -2205,6 +2208,60 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                             == "uniqueneedle"
                             for span in fragment["spans"]
                         )
+                    # Both new kernels work from native artifacts after the
+                    # originals disappear, including after replica restart.
+                    for row_id, pattern, original, term in (
+                        (
+                            count + 3,
+                            {"match": "running", "field": "body"},
+                            regular_body,
+                            "running",
+                        ),
+                        (
+                            count + 4,
+                            {"prefix": "broad", "field": "body"},
+                            diverse_body,
+                            "broad",
+                        ),
+                    ):
+                        request = {
+                            "full_text_search": pattern,
+                            "highlight": {
+                                "fields": ["body"],
+                                "max_fragments": 3,
+                                "fragment_size": 100,
+                            },
+                            "limit": 1,
+                        }
+                        hidden_result = client.query(
+                            {"request": dict(request, fields=["id"])}
+                        )["hits"]["hits"]
+                        projected_result = client.query(
+                            {"request": dict(request, fields=["id", "body"])}
+                        )["hits"]["hits"]
+                        assert len(hidden_result) == len(projected_result) == 1
+                        assert hidden_result[0]["_source"] == {"id": row_id}
+                        assert projected_result[0]["_source"]["body"] == original
+                        assert (
+                            hidden_result[0]["_highlights"]
+                            == projected_result[0]["_highlights"]
+                        )
+                        fragments = hidden_result[0]["_highlights"]["body"]
+                        assert len(fragments) == 3
+                        for fragment in fragments:
+                            assert (
+                                original[
+                                    fragment["offset"] : fragment["offset"]
+                                    + len(fragment["text"])
+                                ]
+                                == fragment["text"]
+                            )
+                            assert all(
+                                fragment["text"][
+                                    span["start"] : span["end"]
+                                ].startswith(term)
+                                for span in fragment["spans"]
+                            )
                     base = {
                         "full_text_search": {"match": "needle", "field": "body"},
                         "highlight": {

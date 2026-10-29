@@ -64,7 +64,7 @@ pub const Capture = struct {
         };
     }
     pub fn wants(self: *Capture, doc: u32, field: []const u8, text: []const u8, root: ?std.json.Value, analyzer: *const analysis.Analyzer) !?Request {
-        if (!self.active or text.len <= 4096 or !column.eligibleAnalyzer(analyzer)) return null;
+        if (!self.active or text.len < column.offset_min_bytes or !column.eligibleAnalyzer(analyzer)) return null;
         const value = root orelse return null;
         if (value != .object) return null;
         const original = value.object.get(field) orelse return null;
