@@ -2403,14 +2403,21 @@ pub const Execution = struct {
     /// resize, park, checkpoint or finish. Physical IO ownership and accepted
     /// durable completion require their separate capabilities.
     pub fn resizeTeam(self: *Execution, slots: usize) !void {
+        return self.resizeTeamWithCheck(slots, null);
+    }
+
+    /// Invocation-local fences remain live while a wider team is queued.
+    /// They do not replace the retained root's original admission authority.
+    pub fn resizeTeamWithCheck(self: *Execution, slots: usize, restriction: ?AdmissionCheck) !void {
         if (self.child_pending) return error.InvalidRunnableTransition;
         if (slots == 0) return error.InvalidRunnableDemand;
         if (self.borrowed != null) return error.UnsupportedOperation;
         const e = if (self.entry) |*entry| entry else return;
+        if (restriction) |fence| try fence.checkpoint();
         const owner = try schedulerFor(e, true);
         try owner.checkAuthority(e);
         try owner.resizeTeam(e, slots);
-        try owner.waitRetained(e);
+        try owner.waitRetainedWithCheck(e, restriction);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
         self.read_sample_ns = self.quantum_start_ns;

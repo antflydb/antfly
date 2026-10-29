@@ -564,3 +564,50 @@ remaining provider mutation/retention boundaries and immutable artifact reads.
 Cross-engine resource gates, including
 the unresolved file-engine descriptor bound, remain open. Full GNU/full
 qualification remains waived; no cloud or all-engine qualification is claimed.
+
+### Maintenance model invocation integration
+
+Managed enrichment restores serial capacity after provider construction. Sparse
+and dense embedding calls, media generation probes and paged media execution
+now bind a synchronous invocation scope to the original maintenance execution.
+Each call admits its configured team and restores its previous width before
+fallback, document encoding or WAL publication. Foreground calls consume their
+existing funded team through the ABI/native adapter without creating a root or
+resizing the ingress owner. The adapter can now expose that borrowed team to the
+existing inference host's worker phase handoff.
+
+The invocation copies the configured provider descriptor and preserves its
+routing, transport, progress and narrower request lifetime. Cached embedder and
+chunk-provider handles never receive stack-scoped execution callbacks; durable
+chunk-provider construction rejects an invocation-bound grant. Lifetime
+polls serialize renewable source/maintenance authority; only the coordinator
+changes CPU ownership. Owned model output is discarded when original authority
+fails after provider return. Genuine provider failures retain the configured
+fallback policy; admission, cancellation, source-lease and narrower-scope
+failures propagate without publishing a derived WAL mutation. Legacy providers
+without contextual callbacks retain their synchronous compatibility behavior
+and do not gain physical-wait control from this integration.
+
+The invocation packet is included in `CatalogService.Scope.retained_bytes`,
+which funds both background roots and preaccepted foreground completion work.
+No request creates a separate executor or persists its grant in a model owner.
+
+Evidence: `serverless-model-invocations-v6-debug.json` and its log in the
+cumulative receipts. A filesystem-backed production enrichment fixture covers
+sparse, dense and media routes with owned and borrowed executions, including
+parked-capacity reuse by queries and protected control, model fallback, rejection
+after owned output allocation, narrower request authority and unchanged cached
+handles. It checks durable WAL advancement and complete root retirement. A separate
+queued-team fixture rejects narrower invocation authority while an unrelated
+owner continues holding the lane needed for admission. The
+existing enrichment, media scan and inference handoff tests provide regression
+coverage. These use deterministic model callbacks and real scheduler/provider
+plumbing; they do not qualify a downloaded model, cloud deployment or the
+installed CLI binary.
+
+The maintenance milestone remains open for physical waits in remote model
+transports, provider/model construction and discovery, asset loading, remaining
+provider mutation/retention and immutable artifact reads, and serial graph
+preparation checkpoints. The original cross-engine resource gates remain open,
+including the file-engine descriptor bound. Full GNU/full qualification remains
+waived.

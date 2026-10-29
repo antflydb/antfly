@@ -822,6 +822,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     inference_owner_control.addImport("antfly_platform", antfly_imports.platform);
     inference_owner_control.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    inference_owner_control.addImport("antfly_document_runs", b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/document_runs.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     inference_owner_admission.addImport("inference_execution_control", inference_owner_control);
     const local_child_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_local_child.zig"),
@@ -4005,7 +4010,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const serverless_execution_tests = b.addTest(.{
         .name = "serverless-execution-tests",
         .root_module = serverless_execution_root,
-        .filters = &.{ "serverless graph metric runtime fanout", "serverless graph metric edge tiles", "serverless bounded graph metric", "serverless vector builder observes cancellation", "serverless execution", "serverless object enrichment writes a stable idempotent WAL identity", "serverless builder publishes and lifecycle-binds configured graph metrics", "serverless lake graph metrics share one bounded HITS execution for a compatible pair", "serverless request deadlines preserve accepted WAL", "fs wal", "fs WAL", "serverless server module compiles", "serverless server starts managed runtime and serves listener requests", "serverless main process memory budget" },
+        .filters = &.{ "serverless sparse enricher", "model aware media serverless chunks use the shared paged provider and retain recipes", "model aware media completed namespace discovers secondary generations through bounded durable scans", "serverless graph metric runtime fanout", "serverless graph metric edge tiles", "serverless bounded graph metric", "serverless vector builder observes cancellation", "serverless execution", "serverless object enrichment writes a stable idempotent WAL identity", "serverless builder publishes and lifecycle-binds configured graph metrics", "serverless lake graph metrics share one bounded HITS execution for a compatible pair", "serverless request deadlines preserve accepted WAL", "fs wal", "fs WAL", "serverless server module compiles", "serverless server starts managed runtime and serves listener requests", "serverless main process memory budget" },
         .max_rss = 8 * 1024 * 1024 * 1024,
     });
     b.step("antfly-serverless-execution-test", "Verify serverless shared scheduler policy, protected health and owning release")

@@ -82,6 +82,9 @@ pub const ExecutionEnvironment = struct {
     /// retain it beyond their durable provider owner. Standalone invocations
     /// may create a call-scoped compatibility client when it is absent.
     http_client: ?*httpx.Client = null,
+    /// Invocation-only borrowed execution. Durable provider constructors leave
+    /// this null; callers may bind it on a synchronous provider view.
+    runnable: @FieldType(RequestContext, "runnable") = null,
 
     pub fn resolveAntflyEndpoint(
         self: ExecutionEnvironment,
@@ -110,6 +113,7 @@ pub const ExecutionEnvironment = struct {
             .io = io,
             .deadline_ns = self.deadline_ns,
             .cancellation = self.cancellation,
+            .runnable = self.runnable,
         };
     }
 

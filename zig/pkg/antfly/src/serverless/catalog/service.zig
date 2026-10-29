@@ -176,9 +176,11 @@ pub const CatalogService = struct {
 
     pub const Scope = struct {
         /// At most three provider views overlap: runtime, publisher, and
-        /// status/publication. Include the builder's primitive view packet.
+        /// status/publication. Include the builder's primitive view packet and
+        /// the joined model invocation's borrowed execution/authority scope.
         pub const retained_bytes = 3 * @sizeOf(Scope) + @sizeOf(builder_mod.Builder) +
-            @sizeOf(manifest_mod.ManifestStore) + @sizeOf(progress_store_mod.ProgressStore) + @sizeOf(wal_mod.WalStore);
+            @sizeOf(manifest_mod.ManifestStore) + @sizeOf(progress_store_mod.ProgressStore) + @sizeOf(wal_mod.WalStore) +
+            @sizeOf(@import("../model_execution.zig").Scope);
         catalog: CatalogService = undefined,
         artifacts: artifacts_mod.ArtifactStore = undefined,
         manifests: manifest_mod.ManifestStore = undefined,

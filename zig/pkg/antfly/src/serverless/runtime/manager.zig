@@ -514,9 +514,13 @@ pub const ManagedRuntime = struct {
             enricher.clearModelChunker();
         }
 
+        // Construction may load/configure a provider; execution below admits
+        // each individual invocation and restores serial scanning/WAL work.
+        try cpu_phase.finish();
         try cancellation.check();
         const enrichment = enricher.runNamespaceWithConfigUntil(namespace, .{
             .batch_size = policy.enrichment_batch_size,
+            .model_cpu_slots = self.runnable_slots,
             .pipeline_version = stage_spec.pipeline_version,
             .stage = stage,
             .model_preference = stage_spec.model_preference,
@@ -535,7 +539,6 @@ pub const ManagedRuntime = struct {
             },
             else => return err,
         };
-        try cpu_phase.finish();
         stats.enriched_namespaces += enrichment.enriched_namespaces;
         stats.enriched_documents += enrichment.enriched_documents;
         stats.enrichment_wal_appends += enrichment.wal_appends;

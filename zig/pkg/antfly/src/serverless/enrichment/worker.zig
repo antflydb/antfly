@@ -59,6 +59,7 @@ pub const rerank_terms_enrichment_version: u32 = 1;
 
 pub const SparseEnricherConfig = struct {
     batch_size: usize = 32,
+    model_cpu_slots: usize = 1,
     /// Bound pending entries considered per pass, including failed documents.
     scan_batch_size: usize = 1024,
     max_source_read_bytes: u64 = 64 * 1024 * 1024,
@@ -194,6 +195,9 @@ pub const SparseEnricher = struct {
     media_checkpoint_interval_ms: u64 = 1000,
     generation_snapshot: ?*MediaGenerationSnapshot = null,
     checkpoint_context: ?media_checkpoint.Context = null,
+    model_maintenance: ?maintenance_cancellation.Token = null,
+    model_authority: CancellationToken = .none,
+    model_cpu_slots: usize = 1,
 
     pub fn init(
         alloc: Allocator,
@@ -338,6 +342,68 @@ pub const SparseEnricher = struct {
         return try self.runNamespaceWithConfig(namespace, .{});
     }
 
+    fn modelScope(self: *SparseEnricher) @import("../model_execution.zig").Scope {
+        return .{ .allocator = self.alloc, .maintenance = self.model_maintenance, .authority = self.model_authority, .slots = self.model_cpu_slots };
+    }
+
+    fn invokeSparse(self: *SparseEnricher, configured: embedder_mod.SparseEmbedder, name: []const u8, text: []const u8) !?embedder_mod.SparseEmbedding {
+        var scope = self.modelScope();
+        defer scope.deinit();
+        const context = try scope.bind(configured.request_context);
+        var embedder = configured;
+        if (embedder.sparse_embed_with_context_fn != null) embedder.request_context = context;
+        var result = embedder.embedSparse(self.alloc, name, text) catch {
+            // Genuine provider failures may fall back. Original admission,
+            // deadline, source and lease failures must survive that policy.
+            try scope.finish();
+            return null;
+        };
+        errdefer result.deinit(self.alloc);
+        try scope.finish();
+        return result;
+    }
+
+    fn invokeDense(self: *SparseEnricher, configured: embedder_mod.DenseEmbedder, name: []const u8, text: []const u8, dims: u32) !?[]f32 {
+        var scope = self.modelScope();
+        defer scope.deinit();
+        const context = try scope.bind(configured.part_request_context);
+        var embedder = configured;
+        if (embedder.dense_embed_with_context_fn != null) embedder.part_request_context = context;
+        const result = embedder.embedDense(self.alloc, name, text, dims) catch {
+            try scope.finish();
+            return null;
+        };
+        errdefer self.alloc.free(result);
+        try scope.finish();
+        return result;
+    }
+
+    fn invokeMediaPage(self: *SparseEnricher, alloc: Allocator, config: chunking.types.Config, input: chunking.inference.RemoteInput, probe: bool) !chunking.inference.ChunkPage {
+        var scope = self.modelScope();
+        defer scope.deinit();
+        // Copy the descriptor; ownership of strings, model and transport stays
+        // with the configured provider. Never deinit this borrowed view.
+        var provider = self.model_chunk_provider orelse chunking.Provider{};
+        const io = provider.execution.io orelse if (self.model_maintenance) |token| token.io else null;
+        const context = try scope.bind(if (io) |value| provider.execution.requestContext(value) else null);
+        if (context) |value| {
+            provider.execution.io = value.io;
+            provider.execution.deadline_ns = value.deadline_ns;
+            provider.execution.cancellation = value.cancellation orelse .none;
+            provider.execution.runnable = value.runnable;
+        }
+        var result = (if (probe)
+            chunking.inference.probeModelPageWithProvider(alloc, config, input, provider)
+        else
+            chunking.inference.chunkPageWithProvider(alloc, config, input, provider)) catch |err| {
+            try scope.finish();
+            return err;
+        };
+        errdefer result.deinit(alloc);
+        try scope.finish();
+        return result;
+    }
+
     pub fn runNamespaceWithConfig(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig) !EnrichmentRunStats {
         return try self.runNamespaceWithConfigUntil(namespace, cfg, null);
     }
@@ -365,11 +431,13 @@ pub const SparseEnricher = struct {
         worker.manifests = &manifests;
         worker.progress = &progress;
         worker.wal = &wal;
+        worker.model_maintenance = cancellation;
+        worker.model_cpu_slots = cfg.model_cpu_slots;
         return worker.runNamespaceWithConfigScoped(namespace, cfg, cancellation);
     }
     fn runNamespaceWithConfigScoped(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig, cancellation: ?maintenance_cancellation.Token) !EnrichmentRunStats {
         try cfg.document_limits.validate();
-        if (cfg.batch_size == 0 or cfg.scan_batch_size == 0 or cfg.max_source_read_bytes == 0) return error.InvalidEnrichmentLimits;
+        if (cfg.batch_size == 0 or cfg.scan_batch_size == 0 or cfg.max_source_read_bytes == 0 or cfg.model_cpu_slots == 0) return error.InvalidEnrichmentLimits;
         try maintenance_cancellation.check(cancellation);
         try cfg.cancellation.check();
         const head = self.progress.getHead(namespace) catch |err| switch (err) {
@@ -379,6 +447,7 @@ pub const SparseEnricher = struct {
         var lease_cache: read_lease.Cache = .{};
         var pin: SourcePin = .{ .progress = self.progress, .namespace = namespace, .version = head, .parent = cancellation, .cancellation = cfg.cancellation, .lease = try lease_cache.acquire(self.progress, namespace, head) };
         try pin.check();
+        self.model_authority = pin.token();
         var manifest = try self.manifests.getAlloc(namespace, head);
         defer manifest.deinit(self.alloc);
         const latest_lsn = try self.wal.latestLsn(namespace);
@@ -804,7 +873,7 @@ fn buildDerivedSparseBodyAlloc(
             .prefer_model => {
                 if (self.sparse_embedder) |embedder| {
                     const embedding_name = self.sparse_embedding_name orelse return EnrichmentError.MissingSparseEmbeddingName;
-                    const sparse = embedder.embedSparse(alloc, embedding_name, projection.text) catch null;
+                    const sparse = try self.invokeSparse(embedder, embedding_name, projection.text);
                     if (sparse) |value| {
                         var owned_sparse = value;
                         defer owned_sparse.deinit(alloc);
@@ -831,7 +900,7 @@ fn buildDerivedSparseBodyAlloc(
             .require_model => {
                 const embedder = self.sparse_embedder orelse return EnrichmentError.RequiredSparseModelUnavailable;
                 const embedding_name = self.sparse_embedding_name orelse return EnrichmentError.MissingSparseEmbeddingName;
-                var sparse = embedder.embedSparse(alloc, embedding_name, projection.text) catch return EnrichmentError.SparseEmbeddingModelFailed;
+                var sparse = (try self.invokeSparse(embedder, embedding_name, projection.text)) orelse return EnrichmentError.SparseEmbeddingModelFailed;
                 defer sparse.deinit(alloc);
                 used_model = true;
                 try appendJSONString(alloc, &out, ",\"sparse_embedding\":{");
@@ -1028,7 +1097,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         const context = self.checkpoint_context orelse return error.InvalidMediaCheckpoint;
         if (!std.mem.eql(u8, &saved.key_digest, &context.key_digest)) return error.InvalidMediaCheckpoint;
         if (input != null) {
-            var probe = try chunking.inference.probeModelPageWithProvider(a, base_config, input.?, self.model_chunk_provider);
+            var probe = try self.invokeMediaPage(a, base_config, input.?, true);
             defer probe.deinit(a);
             if (probe.observedMetadata() != null) {
                 probe_identities = try serverlessOutputResults(scratch, wanted, probe.observedMetadata().?);
@@ -1058,7 +1127,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     const has_output_rows = if (cached_document_outputs) |value| value == .object and value.object.contains("chunks") else false;
     const legacy_rows = document.object.get("chunk_embeddings");
     if (input != null and (has_output_rows or legacy_rows != null)) {
-        var probe = try chunking.inference.probeModelPageWithProvider(a, base_config, input.?, self.model_chunk_provider);
+        var probe = try self.invokeMediaPage(a, base_config, input.?, true);
         defer probe.deinit(a);
         if (self.generation_snapshot) |snapshot| if (probe.observedMetadata() != null) try snapshot.observe(a, probe.observedMetadata() orelse return error.InvalidChunkerResponse);
         if (has_output_rows) {
@@ -1222,7 +1291,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             config.outputs_json = try std.json.Stringify.valueAlloc(scratch, media_outputs.Config{ .boundary_model = consumers.boundary_model, .targets = targets }, .{ .emit_null_optional_fields = false });
         }
 
-        var page = try chunking.inference.chunkPageWithProvider(a, config, input.?, self.model_chunk_provider);
+        var page = try self.invokeMediaPage(a, config, input.?, false);
         defer page.deinit(a);
         for (page.chunks) |chunk| {
             const metadata = chunk.metadata orelse return error.InvalidChunkerResponse;
@@ -1666,7 +1735,7 @@ fn buildDenseEmbeddingAlloc(
         .prefer_model => {
             if (self.chunk_embedder) |embedder| {
                 const embedding_name = self.chunk_embedding_name orelse return EnrichmentError.MissingChunkEmbeddingName;
-                const model_result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch null;
+                const model_result = try self.invokeDense(embedder, embedding_name, text, @intCast(dims));
                 if (model_result) |result| {
                     return .{ .embedding = result, .used_model = true, .used_fallback = false };
                 }
@@ -1685,7 +1754,7 @@ fn buildDenseEmbeddingAlloc(
         .require_model => {
             const embedder = self.chunk_embedder orelse return EnrichmentError.RequiredChunkEmbeddingModelUnavailable;
             const embedding_name = self.chunk_embedding_name orelse return EnrichmentError.MissingChunkEmbeddingName;
-            const result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch return EnrichmentError.ChunkEmbeddingModelFailed;
+            const result = (try self.invokeDense(embedder, embedding_name, text, @intCast(dims))) orelse return EnrichmentError.ChunkEmbeddingModelFailed;
             return .{ .embedding = result, .used_model = true, .used_fallback = false };
         },
     }
@@ -4521,4 +4590,193 @@ test "model aware media serverless completed input accounting survives output gr
         };
     }
     try std.testing.expect(rejected);
+}
+
+const ModelAdmissionProbe = struct {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Context = @import("antfly_inference_execution_context").RequestContext;
+    const Mode = enum { success, provider_failure, lost_lease, narrower_scope };
+    scheduler: *Runnable.Scheduler,
+    mode: Mode,
+    expected_deadline: u64,
+    calls: usize = 0,
+    lost: bool = false,
+    narrower_lost: bool = false,
+    media: ServerlessMediaTestProvider = .{ .fail = false },
+
+    fn original(raw: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.lost) return error.WorkLeaseLost;
+    }
+    fn previous(raw: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.narrower_lost) return error.DeadlineExceeded;
+    }
+    fn progress(_: ?*anyopaque, _: @import("antfly_inference_execution_context").Progress) void {}
+    fn roundTrip(self: *@This(), context: Context) !void {
+        const runtime = @import("antfly_runtime_abi");
+        const borrow = context.runnable orelse return error.MissingModelExecution;
+        try std.testing.expectEqual(@as(usize, 2), borrow.cpu_slots);
+        try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(?u64, self.expected_deadline), context.deadline_ns);
+        const class = try borrow.currentClass();
+        const parked = borrow.park(borrow.context, @backingInt(runtime.runnable_abi.Wait.resource));
+        if (!parked.isOk()) return runtime.error_abi.errorFromStatus(parked);
+        try context.check();
+        try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(self.scheduler, .{ .io = context.io, .allow_wait = false }, .query);
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(self.scheduler, .{ .io = context.io, .allow_wait = false }, .control);
+        health.finish();
+        query.finish();
+        const entered = borrow.enter(borrow.context, @backingInt(class));
+        if (!entered.isOk()) return runtime.error_abi.errorFromStatus(entered);
+        try context.check();
+        self.calls += 1;
+        if (self.mode == .provider_failure) return error.TestModelFailure;
+    }
+    fn rejectAfterOutput(self: *@This()) void {
+        if (self.mode == .lost_lease) self.lost = true;
+        if (self.mode == .narrower_scope) self.narrower_lost = true;
+    }
+    fn sparseLegacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+        return error.LegacyModelPathUsed;
+    }
+    fn denseLegacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+        return error.LegacyModelPathUsed;
+    }
+    fn sparse(raw: *anyopaque, a: Allocator, _: []const u8, _: []const u8, context: Context) !embedder_mod.SparseEmbedding {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.roundTrip(context);
+        try std.testing.expect(context.progress != null);
+        const indices = try a.dupe(u32, &.{1});
+        errdefer a.free(indices);
+        const values = try a.dupe(f32, &.{1});
+        self.rejectAfterOutput();
+        return .{ .indices = indices, .values = values };
+    }
+    fn dense(raw: *anyopaque, a: Allocator, _: []const u8, _: []const u8, dims: u32, context: Context) ![]f32 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.roundTrip(context);
+        try std.testing.expect(context.progress != null);
+        const result = try a.alloc(f32, dims);
+        @memset(result, 1);
+        self.rejectAfterOutput();
+        return result;
+    }
+    fn page(raw: *anyopaque, a: Allocator, name: []const u8, input: chunking.inference.RemoteInput, cfg: chunking.types.Config, context: Context) anyerror!chunking.inference.ChunkPage {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.roundTrip(context) catch |err| {
+            std.debug.print("model media execution control failed: {t}\n", .{err});
+            return err;
+        };
+        const result = ServerlessMediaTestProvider.page(&self.media, a, name, input, cfg, context) catch |err| {
+            std.debug.print("model media fixture output failed: {t}\n", .{err});
+            return err;
+        };
+        self.rejectAfterOutput();
+        return result;
+    }
+};
+
+test "serverless execution model invocations preserve caller teams lifetimes and durable WAL" {
+    const Runnable = ModelAdmissionProbe.Runnable;
+    const Family = enum { sparse, dense, media };
+    const alloc = std.testing.allocator;
+    for (std.enums.values(Family)) |family| {
+        for (std.enums.values(ModelAdmissionProbe.Mode)) |mode| {
+            // Media errors already have their own policy matrix; here verify
+            // original-scope rejection and invocation control on that route.
+            if (family == .media and mode == .provider_failure) continue;
+            for ([_]bool{ false, true }) |borrowed_owner| {
+                var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("model-admission");
+                defer directory.cleanup();
+                var filesystem = try objectstore.FilesystemClient.initWithIo(alloc, directory.path(), std.testing.io);
+                defer filesystem.deinit();
+                const client = filesystem.client();
+                var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, client, "enrichment-artifacts", "tenant");
+                var artifacts = artifact_impl.artifactStore();
+                defer artifacts.deinit();
+                var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, client, "enrichment-manifests", "tenant");
+                var manifests = manifest_impl.manifestStore();
+                defer manifests.deinit();
+                var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, client, "enrichment-progress", "tenant");
+                var progress = progress_impl.progressStore();
+                defer progress.deinit();
+                var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, client, "enrichment-wal", "tenant");
+                var wal = wal_impl.walStore();
+                defer wal.deinit();
+
+                var builder = @import("../build/builder.zig").Builder.init(alloc, &artifacts, &manifests, &progress, &wal);
+                var api = @import("../api/service.zig").Service.init(alloc, &wal, &builder);
+                const batch = [_]api_types.DocumentMutation{.{
+                    .kind = .upsert,
+                    .doc_id = "doc-a",
+                    .body = "{\"text\":\"alpha bravo\"}",
+                }};
+                var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
+                defer ingest.deinit(alloc);
+                var build = try publishEnrichmentFixture(&builder);
+                defer build.deinit(alloc);
+
+                var enricher = SparseEnricher.init(alloc, &artifacts, &manifests, &progress, &wal);
+                defer enricher.deinit();
+                var scheduler = try Runnable.Scheduler.init(.{ .slots = 3 });
+                defer scheduler.close();
+                var execution: Runnable.Execution = .{};
+                defer execution.finish();
+                try execution.startWithSlots(&scheduler, .{ .io = std.testing.io }, if (borrowed_owner) .write else .background, if (borrowed_owner) 2 else 1);
+                var read: @import("../../api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = alloc };
+                const team = try read.team();
+                var bridge = try @import("../../api/runnable_native_borrow.zig").Bridge.init(&team.borrow, alloc);
+                var borrowed: Runnable.Execution = .{};
+                defer borrowed.finish();
+                if (borrowed_owner) try bridge.bind(&borrowed);
+                const deadline = @import("antfly_platform").time.monotonicNs() + 30 * std.time.ns_per_s;
+                var probe: ModelAdmissionProbe = .{ .scheduler = &scheduler, .mode = mode, .expected_deadline = deadline };
+                const previous: ModelAdmissionProbe.Context = .{
+                    .io = std.testing.io,
+                    .deadline_ns = deadline,
+                    .cancellation = .{ .ptr = &probe, .check_fn = ModelAdmissionProbe.previous },
+                    .progress = .{ .ptr = &probe, .update_fn = ModelAdmissionProbe.progress },
+                };
+                if (family == .sparse) try enricher.setSparseEmbedder(.{ .ptr = &probe, .sparse_embed_fn = ModelAdmissionProbe.sparseLegacy, .sparse_embed_with_context_fn = ModelAdmissionProbe.sparse, .request_context = previous }, "model");
+                if (family == .dense) try enricher.setChunkEmbedder(.{ .ptr = &probe, .dense_embed_fn = ModelAdmissionProbe.denseLegacy, .dense_embed_with_context_fn = ModelAdmissionProbe.dense, .part_request_context = previous }, "model", 2);
+                if (family == .media) {
+                    const invocation_provider: chunking.Provider = .{ .execution = .{ .runnable = team.borrow } };
+                    try std.testing.expectError(error.InvalidChunkProvider, invocation_provider.ownExecutionStrings(alloc));
+                    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(ModelAdmissionProbe.page) = null });
+                    try enricher.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "text", .{ .ptr = &probe, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&ModelAdmissionProbe.page), .execution = .{ .io = previous.io, .deadline_ns = previous.deadline_ns, .cancellation = previous.cancellation.? } });
+                }
+                const cfg: SparseEnricherConfig = .{ .batch_size = 4, .model_cpu_slots = 2, .stage = if (family == .sparse) .lexical_sparse else .chunk_embeddings, .model_preference = .prefer_model };
+                const token: maintenance_cancellation.Token = .{ .io = std.testing.io, .deadline_ns = deadline + std.time.ns_per_s, .execution = if (borrowed_owner) &borrowed else &execution, .cooperative = .{ .ptr = &probe, .check_fn = ModelAdmissionProbe.original } };
+                const result = enricher.runNamespaceWithConfigUntil("docs", cfg, token);
+                if (mode == .lost_lease) {
+                    try std.testing.expectError(error.WorkLeaseLost, result);
+                } else if (mode == .narrower_scope) {
+                    try std.testing.expectError(error.Timeout, result);
+                } else {
+                    const stats = result catch |err| {
+                        std.debug.print("model admission family={t} mode={t} borrowed={} err={t}\n", .{ family, mode, borrowed_owner, err });
+                        return err;
+                    };
+                    try std.testing.expectEqual(@as(usize, 1), stats.wal_appends);
+                    try std.testing.expectEqual(@as(usize, 1), if (mode == .provider_failure) stats.fallback_documents else stats.model_documents);
+                }
+                try std.testing.expect(probe.calls > 0);
+                try std.testing.expectEqual(@as(u64, if (mode == .lost_lease or mode == .narrower_scope) 1 else 2), try wal.latestLsn("docs"));
+                if (enricher.sparse_embedder) |embedder| try std.testing.expect(embedder.request_context.?.runnable == null);
+                if (enricher.chunk_embedder) |embedder| try std.testing.expect(embedder.part_request_context.?.runnable == null);
+                if (enricher.model_chunk_provider) |provider| try std.testing.expect(provider.execution.runnable == null);
+                try std.testing.expectEqual(@as(usize, if (borrowed_owner) 2 else 1), scheduler.stats().runnable_slots);
+                borrowed.finish();
+                execution.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
 }

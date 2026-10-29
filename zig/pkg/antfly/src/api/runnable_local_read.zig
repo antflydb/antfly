@@ -26,14 +26,17 @@ pub const Read = struct {
     validation: ?@import("runnable_read_validation.zig").Hook = null,
 
     pub fn team(self: *Read) !abi.Team {
-        const entry = self.execution.entry orelse return error.InvalidRunnableTransition;
-        if (entry.state != .running or entry.children != 0) return error.InvalidRunnableTransition;
-        return .{ .borrow = try self.borrowed(), .maximum_slots = entry.slots, .allocator = self.allocator };
+        if (self.execution.entry) |entry| {
+            if (entry.state != .running or entry.children != 0) return error.InvalidRunnableTransition;
+        } else if (self.execution.borrowed != null) {
+            try self.execution.checkpoint();
+        } else return error.InvalidRunnableTransition;
+        return .{ .borrow = try self.borrowed(), .maximum_slots = try self.execution.retainedSlots(), .allocator = self.allocator };
     }
     fn borrowed(self: *Read) !abi.Borrowed {
         return .{
             .context = self,
-            .cpu_slots = self.execution.entry.?.slots,
+            .cpu_slots = try self.execution.retainedSlots(),
             .parent_class = @intCast(@backingInt(try self.execution.retainedClass())),
             .checkpoint = checkpoint,
             .park = park,

@@ -40,6 +40,9 @@ pub const Provider = struct {
     /// execution context otherwise borrows its strings for one invocation;
     /// durable providers must copy request/catalog-owned routing values.
     pub fn ownExecutionStrings(self: Provider, alloc: std.mem.Allocator) !Provider {
+        // A durable model owner must never capture an invocation's stack
+        // callbacks or keep its caller's CPU grant alive across requests.
+        if (self.execution.runnable != null) return error.InvalidChunkProvider;
         var owned = self;
         // A second durable copy must never alias or free the first copy's
         // ownership bookkeeping. Only the execution slices are treated as

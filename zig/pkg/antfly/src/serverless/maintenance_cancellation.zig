@@ -110,6 +110,11 @@ pub const Token = struct {
     };
 
     pub fn beginCpuPhase(self: Token, slots: usize) !CpuPhase {
+        return self.beginCpuPhaseWithCheck(slots, null);
+    }
+
+    pub fn beginCpuPhaseWithCheck(self: Token, slots: usize, restriction: ?Runnable.AdmissionCheck) !CpuPhase {
+        if (restriction) |fence| try fence.checkpoint();
         if (slots == 0) return error.InvalidRunnableDemand;
         try self.ownerCheckpoint();
         var phase: CpuPhase = .{ .token = self };
@@ -124,7 +129,7 @@ pub const Token = struct {
                 return phase;
             }
             if (slots != phase.previous_slots) {
-                execution.resizeTeam(slots) catch |err| {
+                execution.resizeTeamWithCheck(slots, restriction) catch |err| {
                     try self.check();
                     return err;
                 };
