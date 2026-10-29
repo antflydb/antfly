@@ -846,6 +846,16 @@ pub fn create(b: *std.Build) ?void {
                 ignore=shutil.ignore_patterns(".zig-cache", ".zig-global-cache"),
             )
 
+            # This regression owns a cold local target cache, not a second
+            # compiler bootstrap. Reuse the phase's immutable host toolchain
+            # objects through a private global-cache snapshot. Both checkouts
+            # still own their manifests and survive deletion of the baseline.
+            inherited_global = os.environ.get("ZIG_GLOBAL_CACHE_DIR")
+            if inherited_global and Path(inherited_global).is_dir():
+                measurement.clone_audit_cache(
+                    Path(inherited_global).resolve(), baseline / ".zig-global-cache"
+                )
+
             def build_at(checkout):
                 # Discovery/missing-owner cases below still cover all seven
                 # consumers. One native generated-source consumer exercises
