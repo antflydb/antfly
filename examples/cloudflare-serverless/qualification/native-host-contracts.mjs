@@ -63,7 +63,7 @@ async function start(collection){
  const deadline=performance.now()+30000;
  while(performance.now()<deadline){
   if(spawnFailed||process.exitCode!==null||process.signalCode!==null)throw Error('NativeProcessExitedBeforeReadiness');
-  try{await call('GET','/health',undefined,200,1000);ready=true;break;}catch{await sleep(100);}
+  try{const status=await call('GET','/health',undefined,200,1000);if(status.live===true&&status.ready===true&&status.validated===true){ready=true;break;}}catch{}await sleep(100);
  }
  if(!ready)throw Error('NativeReadinessTimedOut');report.lifecycles.push({collection_enabled:collection,ready:true});return call;
 }

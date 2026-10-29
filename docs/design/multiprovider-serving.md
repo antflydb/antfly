@@ -432,3 +432,16 @@ native and main-integration evidence remains sealed separately. Legacy-prefix
 migration, real S3 access, matched cross-cloud performance and the unchanged
 live Cloudflare gate remain separate requirements. The existing two Cloudflare
 stacks remain paused pending the explicit disposable-token/cleanup authorization.
+
+
+The final module family repeats the proof comparison in both orders. With
+512 documents per tenant and 20/100 ms fixed-bursty binding delays, read/write
+p95 in milliseconds is 1,082/1,250 without proofs versus 556/1,229 with proofs;
+in reverse order it is 1,422/1,437 without versus 843/1,235 with. Zero-delay
+64-document runs vary sharply under concurrent native compilation and host
+contention: 1,841/1,841 without versus 752/750 with in the first order, then
+398/385 without versus 2,565/2,565 with in reverse order. Every exact check
+passes. These noisy local populations do not establish an isolated latency
+baseline or a repeatable all-metric win. Keep detached proofs off; preserve
+both orders and the compilation/resource context rather than selecting the
+favorable delayed result.
