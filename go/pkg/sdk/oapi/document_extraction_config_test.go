@@ -56,3 +56,45 @@ func TestDocumentExtractionConfigPreservesOptionPresence(t *testing.T) {
 		})
 	}
 }
+
+// Exercise the provider-specific constructor as well as the producer union:
+// raw STTConfig round trips bypass AppleSTTConfig's field encoding.
+func TestDocumentExtractionAppleTranscriptionTimestamps(t *testing.T) {
+	for _, tc := range []struct{ name, providerJSON, want string }{
+		{"unset", `{}`, `{"transcription":{"transcriber":{"provider":"apple"}}}`},
+		{"disabled", `{"timestamps":false}`, `{"transcription":{"transcriber":{"provider":"apple","timestamps":false}}}`},
+		{"enabled", `{"timestamps":true}`, `{"transcription":{"transcriber":{"provider":"apple","timestamps":true}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var apple AppleSTTConfig
+			if err := json.Unmarshal([]byte(tc.providerJSON), &apple); err != nil {
+				t.Fatal(err)
+			}
+			transcriber := STTConfig{Provider: STTProviderApple}
+			if err := transcriber.FromAppleSTTConfig(apple); err != nil {
+				t.Fatal(err)
+			}
+			config := DocumentExtractionConfig{
+				Transcription: DocumentExtractionTranscriptionConfig{Transcriber: transcriber},
+			}
+			var union EnrichmentProducerConfig_Config
+			if err := union.FromDocumentExtractionConfig(config); err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(union)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want, got map[string]any
+			if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(encoded, &got); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("Apple transcription changed timestamp option: got %s, want %s", encoded, tc.want)
+			}
+		})
+	}
+}
