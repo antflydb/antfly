@@ -146,7 +146,9 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
             .inference => 8,
             .cli => 3,
         } else switch (unit) {
-            .api_kernel => 5,
+            // Native Zig 0.17 auth qualification (40820082669) peaked at
+            // 6,698,409,984 bytes. Eight GiB retains over 25% headroom.
+            .api_kernel => if (std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0")) 8 else 5,
             .distributed => 5,
             .storage_kernel => 8,
             .enrichment_compute => 2,
@@ -752,4 +754,17 @@ test "native Linux CAPI test reservation covers the measured compiler without co
     try std.testing.expect(claim >= peak + peak / 10);
     try std.testing.expect(claim + 2 * 1024 * 1024 * 1024 <= 20 * 1024 * 1024 * 1024);
     try std.testing.expectEqual(@as(usize, 7 * 1024 * 1024 * 1024), testCompileMaxRss(test_owner_names.capi_contract, linux, linux, .fast, 7 * 1024 * 1024 * 1024));
+}
+
+test "native Linux fast API reservation covers auth qualification peak" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
+    const gib = 1024 * 1024 * 1024;
+    var profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
+    const peak: usize = 6_698_409_984;
+    const claim = runtimeCompileMaxRss(.api_kernel, profile);
+    try std.testing.expect(claim >= peak + peak / 4);
+    try std.testing.expect(claim + runtimeCompileMaxRss(.storage_kernel, profile) <= 20 * gib);
+    try std.testing.expectEqual(5 * gib, runtimeCompileMaxRss(.distributed, profile));
+    profile.optimize = .safe;
+    try std.testing.expectEqual(7 * gib, runtimeCompileMaxRss(.api_kernel, profile));
 }

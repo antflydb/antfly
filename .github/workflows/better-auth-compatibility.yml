@@ -12,7 +12,8 @@ jobs:
       contents: read
       id-token: write
     runs-on: arc-antfly-heavy
-    timeout-minutes: 120
+    # Cold library + server compilation exceeded two hours in run 40820082669.
+    timeout-minutes: 180
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global

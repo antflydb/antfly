@@ -1916,3 +1916,18 @@ accounts for source codegen instead of allowing it to overlap large owners for
 free. No forced single-job mode, larger runner or dropped benchmark contract
 is introduced. These consumer claims are conservative pending isolated peak
 measurements; they are not new measured reductions.
+
+### Native Linux ReleaseFast auth qualification (2026-10-29)
+
+Run `40820082669` (glibc-linked Zig 0.17.0, baseline native x86-64 GNU,
+stripped ReleaseFast, CPU inference) reported API archive peak RSS of
+6,698,409,984 bytes against a 5 GiB claim. Its reservation is now 8 GiB,
+over 25% above the observed peak, while retaining overlap with the 8 GiB
+storage owner within a 20 GiB budget. Other compiler versions, units and
+profiles retain their existing claims. The observed peak came from a failed
+compile and remains a lower bound pending successful qualification.
+
+The same job completed the C API after 82 minutes and reported the API
+archive failure after 111 minutes, then reached its two-hour job limit.
+The auth workflow now allows three hours for the combined cold library and
+server build, without changing runner size or aggregate memory admission.
