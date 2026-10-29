@@ -4575,6 +4575,25 @@ the 256-value case charges 16,914 states (previously 16,913), and the 400-input
 correlated case charges 37,221 (previously 38,014). Full-domain bound validation
 precedes indexed emission, preserving correctness when a later key is oversized.
 
+The follow-up is merged with upstream main through `b6e576b8e5` in
+`1040e6c0a8`. The merge preserves adjacency source touches using upstream
+`MutationWriteBuffers` ownership and regenerates the Go OpenAPI client and
+dashboard assets from the merged sources. Go SDK tests pass; the dashboard
+passes all 304 tests, and the TypeScript SDK passes 547 tests with one
+intentional skip. The 29 build/export contracts also pass, including all
+21 nested build-memory policy cases and executable/shared-library linkage.
+The rebuilt merged CLI passes all 12 strict authenticated HTTP probes and
+the complete property-plan/SQL-overlay regression in 26.20 seconds.
+Competing predicates retain their exact one/two-anchor ceilings, empty
+domains visit zero anchors, and both 1,000-input correlated forms return
+499,500; the fused probe form charges 93,045 states.
+Merged native qualification succeeds in all 148 build steps: 165 graph
+write/recovery cases, five retained-cut/SQL integration cases, 13 transport
+cases (including the staged bulk-read contract), the portable embedded host,
+and the C API catalog/execution gate. All reported native cases have zero
+leaks. The unchanged 504-case core suite and independent callback ABI gate
+reuse their successful cached results. The merged CLI build also succeeds.
+
 The distributed enrichment caveat above remains open. Two combined public
 campaigns passed 19 cases but the owner-loss case ended with a durable
 `committed_repair_required` receipt; all three data owners exhausted retries on
