@@ -43,6 +43,8 @@ pub extern fn antfly_storage_context_create_with_runtime(
 
 /// Borrowed publisher; callbacks and context outlive the storage context.
 /// JSON crosses the compilation boundary, and its producer releases it.
+/// Version 1 carries ContentSecurityConfig; version 2 carries
+/// scraping.RemoteContentSnapshotData, including scoped GCS connections.
 pub const RemoteContentSource = extern struct {
     version: u32 = 1,
     _reserved: u32 = 0,

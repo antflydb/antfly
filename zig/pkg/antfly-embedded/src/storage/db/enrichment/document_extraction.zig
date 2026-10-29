@@ -376,6 +376,15 @@ pub fn remoteContentErrorIsPermanent(err: anyerror) bool {
         error.MissingAccessKeyId,
         error.MissingSecretAccessKey,
         error.InvalidS3Url,
+        error.InvalidGcsUrl,
+        error.GcsConnectionNotFoundOrOutOfScope,
+        error.AmbiguousGcsConnection,
+        error.InvalidConnectionCredentials,
+        error.InvalidRequest,
+        error.Unauthorized,
+        error.AccessDenied,
+        error.FileNotFound,
+        error.PreconditionFailed,
         error.MissingEndpoint,
         error.InvalidHost,
         error.HostNotAllowed,
@@ -439,6 +448,11 @@ test "remote fetch classification retries only transient failures" {
     try std.testing.expect(remoteContentErrorIsPermanent(error.HostNotAllowed));
     try std.testing.expect(remoteContentErrorIsPermanent(error.StreamTooLong));
     try std.testing.expect(remoteContentErrorIsPermanent(error.InvalidFormat));
+    try std.testing.expect(remoteContentErrorIsPermanent(error.AccessDenied));
+    try std.testing.expect(remoteContentErrorIsPermanent(error.PreconditionFailed));
+    try std.testing.expect(remoteContentErrorIsPermanent(error.FileNotFound));
+    try std.testing.expect(!remoteContentErrorIsPermanent(error.RateLimited));
+    try std.testing.expect(!remoteContentErrorIsPermanent(error.RemoteUnavailable));
     try std.testing.expect(!remoteContentErrorIsPermanent(error.ConnectionResetByPeer));
     try std.testing.expect(!remoteContentErrorIsPermanent(error.TimedOut));
 
