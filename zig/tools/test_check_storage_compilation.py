@@ -19,13 +19,18 @@ import importlib.util
 import json
 import os
 import shutil
-import subprocess
 import unittest
 import sys
 import tempfile
 import threading
 from unittest import mock
 from pathlib import Path
+
+try:
+    from .fixture_process import run_fixture_build
+except ImportError:
+    from fixture_process import run_fixture_build
+
 
 SPEC = importlib.util.spec_from_file_location(
     "check_storage_compilation",
@@ -814,7 +819,7 @@ pub fn create(b: *std.Build) ?void {
 """)
 
     def build(self, *args):
-        return subprocess.run(
+        return run_fixture_build(
             [
                 self.zig,
                 "build",
@@ -828,8 +833,6 @@ pub fn create(b: *std.Build) ?void {
             # Fixture-generated sources belong to its own lifetime, even when
             # the caller configures a disposable phase cache for other builds.
             env={**os.environ, "ZIG_LOCAL_CACHE_DIR": str(self.root / ".zig-cache")},
-            text=True,
-            capture_output=True,
             timeout=120,
         )
 
@@ -847,7 +850,7 @@ pub fn create(b: *std.Build) ?void {
                 # Discovery/missing-owner cases below still cover all seven
                 # consumers. One native generated-source consumer exercises
                 # the complete relocation/invalidation lifecycle here.
-                result = subprocess.run(
+                result = run_fixture_build(
                     [
                         self.zig,
                         "build",
@@ -868,8 +871,6 @@ pub fn create(b: *std.Build) ?void {
                         "ZIG_LOCAL_CACHE_DIR": ".zig-cache",
                         "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache",
                     },
-                    capture_output=True,
-                    text=True,
                     timeout=120,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)

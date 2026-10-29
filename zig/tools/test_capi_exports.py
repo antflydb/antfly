@@ -22,7 +22,6 @@ import os
 from pathlib import Path
 import platform
 import shutil
-import signal
 import subprocess
 import tempfile
 import sys
@@ -37,31 +36,10 @@ exports = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exports)
 
 
-def run_fixture_build(command, cwd, timeout=300):
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env={**os.environ, "ZIG_LOCAL_CACHE_DIR": str(cwd / ".zig-cache")},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=os.name == "posix",
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except BaseException:
-        # Stop the owned compiler group before fixture cleanup removes files
-        # its children still use. Killing only the runner leaves those alive.
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif process.poll() is None:
-            process.kill()
-        process.communicate()
-        raise
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+try:
+    from .fixture_process import run_fixture_build
+except ImportError:
+    from fixture_process import run_fixture_build
 
 
 class ExportPolicyTests(unittest.TestCase):
