@@ -69,3 +69,8 @@ test('RPC pin fallback coalesces fenced callers and charges only the physical ow
  assert.equal(rpc,1);assert.equal(admissions.reduce((n,a)=>n+a.physical.rpc_calls,0),1);assert.equal(admissions.filter(a=>a.physical.read_view_lease_join===1).length,15);assert.ok(admissions.every(a=>a.physical.read_admission_fallback_reason==='ReadSnapshotNeedsPin'));
  admissions[0].confirm(fence(7));const cached=await prepareReadAdmission(env,{op:'lookup',required_visibility:fence(7)},new CriticalPath(),views);assert.equal(cached.physical.read_view_lease_hit,1);assert.equal(cached.physical.rpc_calls,0);assert.equal(rpc,1);assert.equal(cache.pending.size,0);
 });
+
+test('retained leases project protocol bytes and reject unchargeable metadata',async()=>{
+ const f=fixture(),view=await f.cache.run(fence(7),'native',()=>({...f.view(),ctx:{promise:Promise.resolve()},extra:new Uint8Array(1024*1024)}));view.lease.ctx={promise:Promise.resolve()};view.entries[0][1].extra=new Uint8Array(1024*1024);assert.equal(f.cache.confirm(view,fence(7)),true);const hit=f.cache.get(fence(7));assert.equal(hit.ctx,undefined);assert.equal(hit.extra,undefined);assert.equal(hit.lease.ctx,undefined);assert.equal(hit.entries[0][1].extra,undefined);assert.ok(f.cache.bytes<32768);
+ f.cache.clear();for(const change of[v=>v.entries[0][1].contentType={length:NaN},v=>v.version='invalid',v=>v.format=99]){const candidate=await f.cache.run(fence(7),'native',()=>f.view());change(candidate);assert.equal(f.cache.confirm(candidate,fence(7)),false);assert.equal(f.cache.bytes,0);}
+});

@@ -148,4 +148,20 @@ queue wait 451 ms (42 group reports). Physical preparation I/O wait had p95
 requests; their percentiles overlap and must not be added. This locates real
 storage work as well as admission pressure. The new hosted comparison adds
 explicit mutation admission, authority and refresh spans before choosing another
-write optimization. Four profiler regressions bring the Node suite to 404 tests.
+write optimization. Five profiler regressions cover private correlation and CLI evidence hashing.
+A further cache-retention regression brings the Node suite to 406 tests.
+
+
+Retained cuts project only the documented view, record and lease fields. Unknown
+properties, including non-cloneable request context and oversized auxiliary
+buffers, are never retained. Malformed versions and content types are ineligible
+for caching. This hardening is subsequent to sealed candidate `543a3ea27a`; it
+must be included in the next hosted candidate rather than retroactively changing
+that candidate's provenance.
+
+A lease cache remains an optimization: Cloudflare does not guarantee that later
+requests reach the same isolate ([runtime documentation](https://developers.cloudflare.com/workers/reference/how-workers-works/)),
+and its Cache API is local to a data center ([Cache API documentation](https://developers.cloudflare.com/workers/runtime-apis/cache/)).
+Therefore local cache-hit improvements cannot establish hosted tail latency.
+Use the measured lease-hit, admission-miss and stronger-fence populations to
+judge whether request distribution or actual storage work dominates next.
