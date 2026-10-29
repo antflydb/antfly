@@ -17,6 +17,7 @@
 const std = @import("std");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const platform = @import("antfly_platform");
+const WriteControl = @import("httpx").socket.WriteControl;
 
 pub const AwsLoginKind = enum { none, console, sso };
 
@@ -203,6 +204,10 @@ pub const VendorCommand = struct {
     executable: []u8,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !VendorCommand {
+        return initWithControl(alloc, io, argv, null);
+    }
+
+    pub fn initWithControl(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8, control: ?WriteControl) !VendorCommand {
         const builtin = @import("builtin");
         const environ: std.process.Environ = switch (builtin.os.tag) {
             .windows => .{ .block = .global },
@@ -214,7 +219,7 @@ pub const VendorCommand = struct {
         };
         var environment = try environ.createMap(alloc);
         errdefer environment.deinit();
-        const executable = try findExecutable(alloc, io, environment.get("PATH") orelse return error.FileNotFound, argv[0]);
+        const executable = try findExecutable(alloc, io, environment.get("PATH") orelse return error.FileNotFound, argv[0], control);
         errdefer alloc.free(executable);
         const owned_argv = try alloc.dupe([]const u8, argv);
         owned_argv[0] = executable;
@@ -228,14 +233,14 @@ pub const VendorCommand = struct {
     }
 };
 
-fn findExecutable(alloc: std.mem.Allocator, io: std.Io, path: []const u8, name: []const u8) ![]u8 {
+fn findExecutable(alloc: std.mem.Allocator, io: std.Io, path: []const u8, name: []const u8, control: ?WriteControl) ![]u8 {
     const separator: u8 = if (@import("builtin").os.tag == .windows) ';' else ':';
     var directories = std.mem.splitScalar(u8, path, separator);
     while (directories.next()) |directory| {
         // Do not search implicit current-directory entries for a credential tool.
         if (directory.len == 0) continue;
         const candidate = try std.fs.path.join(alloc, &.{ directory, name });
-        std.Io.Dir.cwd().access(io, candidate, .{ .execute = true }) catch |err| {
+        (control orelse WriteControl{}).withWait(std.Io.Dir.access, .{ std.Io.Dir.cwd(), io, candidate, std.Io.Dir.AccessOptions{ .execute = true } }) catch |err| {
             alloc.free(candidate);
             switch (err) {
                 error.FileNotFound, error.AccessDenied, error.PermissionDenied => continue,
@@ -248,27 +253,142 @@ fn findExecutable(alloc: std.mem.Allocator, io: std.Io, path: []const u8, name: 
 }
 
 pub fn runVendorCaptured(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8, timeout_ms: u64, cancellation: ?CancellationToken) !std.process.RunResult {
-    var command = try VendorCommand.init(alloc, io, argv);
+    return runVendorCapturedWithControl(alloc, io, argv, timeout_ms, cancellation, null);
+}
+
+pub fn runVendorCapturedWithControl(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8, timeout_ms: u64, cancellation: ?CancellationToken, control: ?WriteControl) !std.process.RunResult {
+    if (timeout_ms == 0) return error.Timeout;
+    const deadline = std.Io.Timestamp.now(io, .awake).toNanoseconds() + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    const bounded = (control orelse WriteControl{}).withDeadline(io, @intCast(@min(deadline, std.math.maxInt(u64))));
+    try bounded.check();
+    var command = try VendorCommand.initWithControl(alloc, io, argv, bounded);
     defer command.deinit();
-    return runCaptured(alloc, io, .{
+    const remaining = deadline - std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    if (remaining <= 0) return error.Timeout;
+    return runCapturedWithControl(alloc, io, .{
         .argv = command.argv,
         .environ_map = &command.environment,
         .stdout_limit = .limited(64 << 10),
         .stderr_limit = .limited(64 << 10),
-    }, timeout_ms, cancellation);
+    }, @intCast(@divFloor(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms)), cancellation, if (control != null) bounded else null);
 }
+
+/// One physical execution worker owns the original CPU grant. Pipe operations
+/// touch fixed storage while parked; output growth/transfer and spawn setup
+/// stay runnable. Cancellation cleanup kills/reaps before retiring that worker.
+fn captureControlled(alloc: std.mem.Allocator, io: std.Io, options: std.process.RunOptions, control: WriteControl) !std.process.RunResult {
+    try control.check();
+    var child = try std.process.spawn(io, .{
+        .exe = options.exe,
+        .argv = options.argv,
+        .cwd = options.cwd,
+        .environ_map = options.environ_map,
+        .expand_arg0 = options.expand_arg0,
+        .progress_node = options.progress_node,
+        .create_no_window = options.create_no_window,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+    var storage: [2]std.Io.Operation.Storage = undefined;
+    var batch: std.Io.Batch = .init(&storage);
+    defer batch.cancel(io);
+    var buffers: [2][16 * 1024]u8 = undefined;
+    var vectors = [2][1][]u8{ .{&buffers[0]}, .{&buffers[1]} };
+    const files = [2]std.Io.File{ child.stdout.?, child.stderr.? };
+    var outputs = [2]std.ArrayList(u8){ .empty, .empty };
+    defer for (&outputs) |*output| output.deinit(alloc);
+    const limits = [2]std.Io.Limit{ options.stdout_limit, options.stderr_limit };
+    for (0..2) |i| batch.addAt(@intCast(i), .{ .file_read_streaming = .{ .file = files[i], .data = &vectors[i] } });
+    var live: usize = 2;
+    while (live != 0) {
+        try control.withWait(std.Io.Batch.awaitConcurrent, .{ &batch, io, options.timeout });
+        while (batch.next()) |operation| {
+            const i: usize = @intCast(operation.index);
+            const n = operation.result.file_read_streaming catch |err| switch (err) {
+                error.EndOfStream => {
+                    live -= 1;
+                    continue;
+                },
+                else => return err,
+            };
+            if (limits[i].toInt()) |limit| if (n > limit -| outputs[i].items.len) return error.StreamTooLong;
+            try outputs[i].appendSlice(alloc, buffers[i][0..n]);
+            batch.addAt(operation.index, .{ .file_read_streaming = .{ .file = files[i], .data = &vectors[i] } });
+        }
+    }
+    // EOF is not process exit: keep the same loan and deadline until waitpid.
+    const term = try control.withWait(std.process.Child.wait, .{ &child, io });
+    const stdout = try outputs[0].toOwnedSlice(alloc);
+    errdefer alloc.free(stdout);
+    const stderr = try outputs[1].toOwnedSlice(alloc);
+    errdefer alloc.free(stderr);
+    try control.check();
+    return .{ .term = term, .stdout = stdout, .stderr = stderr };
+}
+
+/// Publish the process monitor's stop before physical task cancellation. The
+/// same fence governs checked CPU return, including a tighter process timeout.
+const ProcessWait = struct {
+    upstream: WriteControl,
+    stop: @import("antfly_cancellation").Rejection = .{},
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn check(raw: ?*anyopaque) WriteControl.Error!void {
+        const self = from(raw);
+        self.stop.check() catch |err| return if (err == error.Timeout) error.Timeout else error.Canceled;
+        try self.upstream.check();
+    }
+    fn remaining(raw: ?*anyopaque) WriteControl.Error!?u64 {
+        try check(raw);
+        return from(raw).upstream.timeout(null);
+    }
+    fn begin(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        try self.upstream.wait_begin_fn.?(self.upstream.ptr);
+    }
+    fn end(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        try endChecked(raw, self.view());
+    }
+    fn endChecked(raw: ?*anyopaque, ceiling: WriteControl) !void {
+        const self = from(raw);
+        if (self.upstream.wait_end_checked_fn) |finish| return finish(self.upstream.ptr, ceiling);
+        try self.upstream.wait_end_fn.?(self.upstream.ptr);
+    }
+    fn reject(self: *@This(), cause: anyerror) void {
+        _ = @intFromError(self.stop.remember(if (cause == error.Timeout) error.Timeout else error.Canceled));
+    }
+    fn view(self: *@This()) WriteControl {
+        var result = self.upstream;
+        result.ptr = self;
+        result.check_fn = check;
+        result.remaining_ms_fn = remaining;
+        result.wait_begin_fn = if (self.upstream.wait_begin_fn != null) begin else null;
+        result.wait_end_fn = if (self.upstream.wait_end_fn != null) end else null;
+        result.wait_end_checked_fn = if (self.upstream.wait_end_fn != null) endChecked else null;
+        result.protect_reentry = true;
+        return result;
+    }
+};
 
 /// Bound the entire subprocess, including waiting after its output pipes close.
 /// Cancellation kills and reaps the child before freeing its captured output.
 pub fn runCaptured(alloc: std.mem.Allocator, io: std.Io, options: std.process.RunOptions, timeout_ms: u64, cancellation: ?CancellationToken) !std.process.RunResult {
+    return runCapturedWithControl(alloc, io, options, timeout_ms, cancellation, null);
+}
+
+pub fn runCapturedWithControl(alloc: std.mem.Allocator, io: std.Io, options: std.process.RunOptions, timeout_ms: u64, cancellation: ?CancellationToken, execution_wait: ?WriteControl) !std.process.RunResult {
     const Task = struct {
         done: std.Io.Event = .unset,
         result: ?std.process.RunResult = null,
         failure: ?anyerror = null,
 
-        fn execute(self: *@This(), a: std.mem.Allocator, task_io: std.Io, opts: std.process.RunOptions) void {
+        fn execute(self: *@This(), a: std.mem.Allocator, task_io: std.Io, opts: std.process.RunOptions, control: ?WriteControl) void {
             defer self.done.set(task_io);
-            self.result = std.process.run(a, task_io, opts) catch |err| {
+            self.result = (if (control) |wait| captureControlled(a, task_io, opts, wait) else std.process.run(a, task_io, opts)) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -277,8 +397,14 @@ pub fn runCaptured(alloc: std.mem.Allocator, io: std.Io, options: std.process.Ru
     if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
     if (timeout_ms == 0) return error.Timeout;
     const deadline = std.Io.Timestamp.now(io, .awake).toNanoseconds() + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var process_wait: ProcessWait = undefined;
+    const control = if (execution_wait) |wait| blk: {
+        process_wait = .{ .upstream = wait.withDeadline(io, @intCast(@min(deadline, std.math.maxInt(u64)))) };
+        break :blk process_wait.view();
+    } else null;
+    if (control) |wait| try wait.check();
     var task: Task = .{};
-    var future = try io.concurrent(Task.execute, .{ &task, alloc, io, options });
+    var future = try io.concurrent(Task.execute, .{ &task, alloc, io, options, control });
     var transferred = false;
     defer {
         future.cancel(io);
@@ -287,24 +413,41 @@ pub fn runCaptured(alloc: std.mem.Allocator, io: std.Io, options: std.process.Ru
             alloc.free(result.stderr);
         };
     }
-    while (true) {
-        if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-        const remaining = deadline - std.Io.Timestamp.now(io, .awake).toNanoseconds();
-        if (remaining <= 0) return error.Timeout;
-        task.done.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(@min(remaining, 50 * std.time.ns_per_ms)), .clock = .awake } }) catch |err| switch (err) {
-            error.Timeout => continue,
-            else => return err,
-        };
-        future.await(io);
-        if (task.failure) |failure| return failure;
-        transferred = true;
-        return task.result.?;
-    }
+    const Monitor = struct {
+        fn awaitResult(value: *Task, task_io: std.Io, until: i96, token: ?CancellationToken, wait_control: ?WriteControl) !void {
+            while (true) {
+                if (wait_control) |wait| try wait.check();
+                if (token) |cancel| if (cancel.isCancelled()) return error.Cancelled;
+                const remaining = until - std.Io.Timestamp.now(task_io, .awake).toNanoseconds();
+                if (remaining <= 0) return error.Timeout;
+                value.done.waitTimeout(task_io, .{ .duration = .{ .raw = .fromNanoseconds(@min(remaining, 50 * std.time.ns_per_ms)), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return err,
+                };
+                if (value.failure) |failure| return failure;
+                if (wait_control) |wait| try wait.check();
+                if (token) |cancel| try cancel.check();
+                return;
+            }
+        }
+    };
+    Monitor.awaitResult(&task, io, deadline, cancellation, control) catch |cause| {
+        // Publish before the deferred physical cancellation and join.
+        if (control != null) process_wait.reject(cause);
+        return cause;
+    };
+    future.await(io);
+    transferred = true;
+    return task.result.?;
 }
 
 pub fn exportAwsCredentials(alloc: std.mem.Allocator, io: std.Io, profile: []const u8, timeout_ms: u64, cancellation: ?CancellationToken) !std.json.Parsed(AwsExport) {
+    return exportAwsCredentialsWithControl(alloc, io, profile, timeout_ms, cancellation, null);
+}
+
+pub fn exportAwsCredentialsWithControl(alloc: std.mem.Allocator, io: std.Io, profile: []const u8, timeout_ms: u64, cancellation: ?CancellationToken, control: ?WriteControl) !std.json.Parsed(AwsExport) {
     try validateProfile(profile);
-    const result = runVendorCaptured(alloc, io, &.{ "aws", "configure", "export-credentials", "--profile", profile, "--format", "process", "--no-cli-pager", "--no-cli-auto-prompt" }, timeout_ms, cancellation) catch |err| switch (err) {
+    const result = runVendorCapturedWithControl(alloc, io, &.{ "aws", "configure", "export-credentials", "--profile", profile, "--format", "process", "--no-cli-pager", "--no-cli-auto-prompt" }, timeout_ms, cancellation, control) catch |err| switch (err) {
         error.FileNotFound => return error.AwsCliRequired,
         else => return err,
     };
@@ -406,4 +549,30 @@ test "cloud credentials bound subprocess exit and honor cancellation" {
     var canceller = try io.concurrent(Cancel.execute, .{ io, &signal });
     defer canceller.cancel(io);
     try std.testing.expectError(error.Cancelled, runCaptured(std.testing.allocator, io, options, 3_000, CancellationToken.fromAtomic(&signal)));
+}
+
+test "cloud credentials controlled capture drains both pipes and bounds output" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const script = "i=0; while [ $i -lt 2000 ]; do printf 'abcdefghij'; printf 'ABCDEFGHIJ' >&2; i=$((i+1)); done";
+    const options: std.process.RunOptions = .{ .argv = &.{ "/bin/sh", "-c", script }, .stdout_limit = .limited(24000), .stderr_limit = .limited(24000) };
+    const result = try runCapturedWithControl(a, io, options, 5000, null, .{});
+    defer a.free(result.stdout);
+    defer a.free(result.stderr);
+    try std.testing.expectEqual(@as(usize, 20000), result.stdout.len);
+    try std.testing.expectEqual(@as(usize, 20000), result.stderr.len);
+    for (0..2000) |i| {
+        try std.testing.expectEqualStrings("abcdefghij", result.stdout[i * 10 ..][0..10]);
+        try std.testing.expectEqualStrings("ABCDEFGHIJ", result.stderr[i * 10 ..][0..10]);
+    }
+    try std.testing.expect(result.term.success());
+    var limited = options;
+    limited.stdout_limit = .limited(100);
+    try std.testing.expectError(error.StreamTooLong, runCapturedWithControl(a, io, limited, 5000, null, .{}));
+    limited = options;
+    limited.stderr_limit = .limited(100);
+    try std.testing.expectError(error.StreamTooLong, runCapturedWithControl(a, io, limited, 5000, null, .{}));
 }

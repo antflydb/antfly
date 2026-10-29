@@ -981,3 +981,52 @@ follows from these HTTP fixtures. Credential subprocesses, lease renewal,
 remaining maintenance mutation/retention/immutable-artifact boundaries, serial
 graph preparation and original cross-engine gates remain open, including the
 file-engine descriptor recovery bound. The full design remains incomplete.
+
+
+### Credential vendor subprocess execution
+
+AWS configured-profile refresh now forwards the invocation execution wait to
+vendor-command resolution and credential export. PATH access, bounded pipe-read
+waits and process-exit waits lend the existing CPU grant. Spawn setup, output
+buffer growth, JSON parsing and credential publication remain runnable. Fixed
+pipe buffers allow stdout/stderr to drain concurrently without allocating while
+parked; each captured stream retains its existing 64 KiB bound. The process
+budget starts before environment/PATH setup and never renews after that setup.
+
+The process monitor publishes its terminal stop before canceling and joining the
+physical worker. Checked CPU return composes the operation ceiling with the
+original source authority, so both request expiry and a shorter process timeout
+remain Timeout through cancellation cleanup. Physical task cancellation used for
+teardown cannot replace that cause with Canceled. This required an existing
+worktree-local pinned-Zig overlay correction: a failed POSIX child wait retains
+its identifier and pipe ownership for the caller's deferred kill/reap. Successful
+waits still clean up normally; the installed toolchain remains unchanged.
+
+The focused production fixture calls the real AWS CredentialCache profile path,
+reads a real temporary profile file through the supplied Io authority, and
+launches a real local subprocess. Its authority substitutes a deterministic shell
+command for AWS; it does not execute a user's AWS CLI or authenticate to AWS.
+Success, source revocation during a wait, revocation during queued CPU return,
+request deadline and shorter process timeout each run with pipes open and with
+pipes closed before exit. Additional wait/queued-return cases make the authority
+report its source rejection only once, checking that the first cause stays
+published through cleanup. It checks unrelated query and protected-control
+progress, the refresh mutex remaining available, physical child retirement before
+return, publication only on success, and complete root/retained-byte retirement.
+A separate real-process capture check drains both pipes across multiple fixed
+buffers and verifies each output cap rejects independently.
+
+Evidence: `credential-process-waits-v8-focused.json` records the fourteen real
+scheduler/subprocess cases and credential regression suite.
+`credential-process-waits-v9-final.json` records the affected serverless, AWS,
+Google, HTTP, request-lifetime, runtime HTTP-control and worker semantic checks.
+The HTTP TLS fixture uses its existing `ANTFLY_TEST_TLS_PYTHON` override with
+`/opt/homebrew/bin/python3`; Apple's older Python lacks TLS 1.3 support.
+The worktree overlay's four Python preparation tests and Apache boundary check
+also pass. These checks do not rebuild the installed CLI.
+
+Credential vendor export is the production milestone covered here. Vendor-native
+model asset preparation, lease renewal, remaining mutation/retention/immutable-
+artifact boundaries, serial graph preparation, and original cross-engine gates
+remain open, including file-engine descriptor recovery. Full GNU/full
+qualification remains waived; this is not live AWS/cloud/TLS qualification.

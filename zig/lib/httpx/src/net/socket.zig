@@ -104,6 +104,16 @@ pub const WriteControl = struct {
     /// execution grant. Formatting between waits retains runnable capacity.
     wait_begin_fn: ?*const fn (?*anyopaque) anyerror!void = null,
     wait_end_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    /// Preserve operation-local ceilings when returning borrowed CPU capacity.
+    wait_end_checked_fn: ?*const fn (?*anyopaque, WriteControl) anyerror!void = null,
+    /// Physical task cancellation is teardown after check_fn publishes a stop.
+    protect_reentry: bool = false,
+
+    pub fn finishWait(self: WriteControl) !void {
+        if (self.wait_end_checked_fn) |end| return end(self.ptr, self);
+        const end = self.wait_end_fn orelse return error.InvalidOutputWait;
+        try end(self.ptr);
+    }
 
     pub fn withDeadline(self: WriteControl, io: Io, deadline_ns: u64) WriteControl {
         var result = self;
@@ -158,7 +168,7 @@ pub const WriteControl = struct {
         pub fn finish(self: *@This()) !void {
             if (!self.parked) return;
             self.parked = false;
-            try self.control.wait_end_fn.?(self.control.ptr);
+            try self.control.finishWait();
             try self.control.check();
         }
     };
@@ -171,7 +181,7 @@ pub const WriteControl = struct {
             try self.check();
             return result;
         };
-        const end = self.wait_end_fn orelse return error.InvalidOutputWait;
+        if (self.wait_end_fn == null) return error.InvalidOutputWait;
         try begin(self.ptr);
         const result = blk: {
             self.check() catch |err| break :blk @as(anyerror!@typeInfo(@TypeOf(@call(.auto, function, args))).error_union.payload, err);
@@ -179,7 +189,7 @@ pub const WriteControl = struct {
         };
         // Even failed IO must return or reject the loan before the caller
         // performs cleanup. A rejected resume prevents further formatter CPU.
-        try end(self.ptr);
+        try self.finishWait();
         try self.check();
         return result;
     }
@@ -210,7 +220,7 @@ pub const WriteControl = struct {
             };
             break :blk @call(.auto, function, args);
         };
-        if (self.wait_end_fn) |end| end(self.ptr) catch |err| {
+        if (paired) self.finishWait() catch |err| {
             rejected.* = true;
             if (result) |owned| discard(owned, args) else |_| {}
             return err;

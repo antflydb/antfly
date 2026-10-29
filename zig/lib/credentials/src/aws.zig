@@ -550,7 +550,7 @@ fn credentialsFromProfile(alloc: std.mem.Allocator, http: *httpx.Client, filesys
 fn credentialsFromExportedProfile(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, profile: []const u8, context: RequestContext) !Credentials {
     try context.check(http.io);
     const timeout_ms = @min(try context.remainingTimeoutMs(http.io) orelse 30_000, 30_000);
-    var exported = try cloud_credentials.exportAwsCredentials(alloc, filesystem_io orelse http.io, profile, timeout_ms, context.cancellation);
+    var exported = try cloud_credentials.exportAwsCredentialsWithControl(alloc, filesystem_io orelse http.io, profile, timeout_ms, context.cancellation, context.execution_wait);
     defer exported.deinit();
     try context.check(http.io);
     return credentialsFromTemporaryExport(alloc, exported.value, try currentUnixSeconds());

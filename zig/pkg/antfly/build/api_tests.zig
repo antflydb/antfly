@@ -4056,6 +4056,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-asset-provider-wait-test", "Verify asset HTTP/capability waits and independently owned compatibility workers")
         .dependOn(&b.addRunArtifact(asset_provider_wait_tests).step);
 
+    const credential_process_wait_tests = b.addTest(.{
+        .name = "credential-process-wait-tests",
+        .root_module = serverless_execution_root,
+        .filters = &.{"serverless execution credential vendor process waits"},
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-credential-process-wait-test", "Verify vendor credential process waits, source fences and physical retirement")
+        .dependOn(&b.addRunArtifact(credential_process_wait_tests).step);
+
     // Credential libraries are separate modules: consumer filters alone do
     // not discover their allocator, refresh, and shutdown regression tests.
     const google_refresh_root = b.createModule(.{

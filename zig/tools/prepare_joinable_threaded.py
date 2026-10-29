@@ -36,6 +36,17 @@ def replace_once(source: str, old: str, new: str, count: int = 1) -> str:
 
 
 def patch_threaded(source: str) -> str:
+    # A canceled POSIX wait has not reaped the process. Retain its identifier
+    # and pipe ownership for the caller's deferred child.kill, as Windows does.
+    # Unconditional cleanup discards the only kill/reap handle on cancellation.
+    source = replace_once(
+        source,
+        "fn childWaitPosix(child: *process.Child) process.Child.WaitError!process.Child.Term {\n    defer childCleanupPosix(child);",
+        """fn childWaitPosix(child: *process.Child) process.Child.WaitError!process.Child.Term {
+    var wait_failed = false;
+    defer if (!wait_failed) childCleanupPosix(child);
+    errdefer wait_failed = true;""",
+    )
     source = replace_once(
         source,
         "worker_threads: std.atomic.Value(?*Thread),\n",

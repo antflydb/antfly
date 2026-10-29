@@ -219,17 +219,21 @@ pub const HttpWait = struct {
     refusal: @import("antfly_cancellation").Rejection = .{},
 
     pub fn ready(self: *HttpWait) !void {
-        try self.context.check();
-        if (self.failure) |failure| return failure;
         try self.refusal.check();
+        if (self.failure) |failure| return failure;
+        try self.context.check();
     }
     fn from(raw: ?*anyopaque) *HttpWait {
         return @ptrCast(@alignCast(raw.?));
     }
     fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
         // Watchdogs inspect lifetime only, without touching owner state.
-        from(raw).refusal.check() catch return error.Canceled;
-        from(raw).context.check() catch |err| return switch (err) {
+        const self = from(raw);
+        self.refusal.check() catch |err| return switch (err) {
+            error.Timeout, error.DeadlineExceeded => error.Timeout,
+            else => error.Canceled,
+        };
+        self.context.check() catch |err| return switch (self.refusal.remember(err)) {
             error.Timeout, error.DeadlineExceeded => error.Timeout,
             else => error.Canceled,
         };
@@ -243,9 +247,9 @@ pub const HttpWait = struct {
     }
     fn restriction(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         const self = from(raw);
-        self.context.check() catch |err| {
-            self.failure = err;
-            return runtime.error_abi.statusFromError(error.Canceled);
+        self.ready() catch |err| {
+            self.failure = self.failure orelse err;
+            return runtime.error_abi.statusFromError(if (err == error.Timeout or err == error.DeadlineExceeded) error.Timeout else error.Canceled);
         };
         return .ok;
     }
@@ -267,10 +271,38 @@ pub const HttpWait = struct {
         endOwned(raw) catch |err| return from(raw).refusal.remember(err);
     }
     fn endOwned(raw: ?*anyopaque) !void {
+        return endWithControl(raw, from(raw).control());
+    }
+    fn endChecked(raw: ?*anyopaque, ceiling: httpx.socket.WriteControl) !void {
+        endWithControl(raw, ceiling) catch |err| return from(raw).refusal.remember(err);
+    }
+    fn endWithControl(raw: ?*anyopaque, ceiling: httpx.socket.WriteControl) !void {
         const self = from(raw);
         const class = self.saved_class orelse return error.InvalidRunnableTransition;
         self.saved_class = null;
-        self.context.runnable.?.enterChecked(class, &.{ .context = self, .check = restriction }) catch |err| {
+        const Fence = struct {
+            wait: *HttpWait,
+            ceiling: httpx.socket.WriteControl,
+            fn check(pointer: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const fence: *@This() = @ptrCast(@alignCast(pointer));
+                const original = restriction(fence.wait);
+                if (!original.isOk()) return original;
+                fence.ceiling.check() catch |err| {
+                    fence.wait.failure = fence.wait.failure orelse err;
+                    return runtime.error_abi.statusFromError(err);
+                };
+                return .ok;
+            }
+        };
+        var fence: Fence = .{ .wait = self, .ceiling = ceiling };
+        // A process monitor publishes its stop before canceling its physical
+        // task. Preserve that cause through teardown instead of letting the
+        // mechanical Io cancellation replace a deadline with Canceled.
+        const previous = if (ceiling.protect_reentry) self.context.io.swapCancelProtection(.blocked) else null;
+        defer if (previous) |protection| {
+            _ = self.context.io.swapCancelProtection(protection);
+        };
+        self.context.runnable.?.enterChecked(class, &.{ .context = &fence, .check = Fence.check }) catch |err| {
             self.failure = self.failure orelse err;
             try self.ready();
             return err;
@@ -278,6 +310,6 @@ pub const HttpWait = struct {
         try self.ready();
     }
     pub fn control(self: *HttpWait) httpx.socket.WriteControl {
-        return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining, .wait_begin_fn = if (self.context.runnable != null) begin else null, .wait_end_fn = if (self.context.runnable != null) end else null };
+        return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining, .wait_begin_fn = if (self.context.runnable != null) begin else null, .wait_end_fn = if (self.context.runnable != null) end else null, .wait_end_checked_fn = if (self.context.runnable != null) endChecked else null };
     }
 };

@@ -2069,3 +2069,176 @@ test "serverless execution asset providers own HTTP waits capability discovery a
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
 }
+
+test "serverless execution credential vendor process waits preserve publication and physical retirement" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const aws = @import("antfly_credentials").aws;
+    const httpx = @import("httpx");
+    const Context = @import("antfly_inference_execution_context");
+    const Terminal = enum { success, cancel_wait, cancel_return, cancel_once_wait, cancel_once_return, deadline, process_timeout };
+    const Fixture = struct {
+        threaded: std.Io.Threaded,
+        config_path: []const u8,
+        close_pipes: bool,
+        started: std.atomic.Value(bool) = .init(false),
+        waiting_exit: std.atomic.Value(bool) = .init(false),
+        live: std.atomic.Value(usize) = .init(0),
+        retired: std.atomic.Value(usize) = .init(0),
+        fn from(raw: ?*anyopaque) *@This() {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(raw.?));
+            return @fieldParentPtr("threaded", threaded);
+        }
+        fn access(_: ?*anyopaque, _: std.Io.Dir, path: []const u8, _: std.Io.Dir.AccessOptions) std.Io.Dir.AccessError!void {
+            // Test authority resolves only the vendor command, without reading
+            // the user's AWS files or executing an installed credential tool.
+            if (!std.mem.endsWith(u8, path, "/aws")) return error.FileNotFound;
+        }
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, _: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            const fixture = from(raw);
+            const base = fixture.threaded.io();
+            return base.vtable.dirOpenFile(raw, dir, fixture.config_path, options);
+        }
+        fn spawn(raw: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            const fixture = from(raw);
+            if (options.argv.len != 9 or !std.mem.eql(u8, options.argv[1], "configure") or !std.mem.eql(u8, options.argv[2], "export-credentials") or !std.mem.eql(u8, options.argv[4], "fixture-process")) return error.FileNotFound;
+            const body = "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"vendor-access\",\"SecretAccessKey\":\"vendor-secret\",\"SessionToken\":\"vendor-session\",\"Expiration\":\"2030-01-02T03:04:05Z\"}'; ";
+            const argv_open = [_][]const u8{ "/bin/sh", "-c", body ++ "exec /bin/sleep 0.3" };
+            const argv_closed = [_][]const u8{ "/bin/sh", "-c", body ++ "exec 1>&- 2>&-; exec /bin/sleep 0.3" };
+            var adapted = options;
+            adapted.argv = if (fixture.close_pipes) &argv_closed else &argv_open;
+            const base = fixture.threaded.io();
+            const child = try base.vtable.processSpawn(raw, adapted);
+            _ = fixture.live.fetchAdd(1, .acq_rel);
+            fixture.started.store(true, .release);
+            return child;
+        }
+        fn wait(raw: ?*anyopaque, child: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
+            const fixture = from(raw);
+            fixture.waiting_exit.store(true, .release);
+            const base = fixture.threaded.io();
+            const term = try base.vtable.childWait(raw, child);
+            std.debug.assert(child.id == null);
+            _ = fixture.live.fetchSub(1, .acq_rel);
+            _ = fixture.retired.fetchAdd(1, .acq_rel);
+            return term;
+        }
+        fn kill(raw: ?*anyopaque, child: *std.process.Child) void {
+            const fixture = from(raw);
+            const active = child.id != null;
+            const base = fixture.threaded.io();
+            base.vtable.childKill(raw, child);
+            std.debug.assert(child.id == null);
+            if (active) {
+                _ = fixture.live.fetchSub(1, .acq_rel);
+                _ = fixture.retired.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+    const Job = struct {
+        cache: *aws.CredentialCache,
+        client: *httpx.Client,
+        scope: Context.HttpWait,
+        process_timeout_ms: u64 = 5000,
+        revoked: std.atomic.Value(bool) = .init(false),
+        once: bool = false,
+        consumed: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const job: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (job.revoked.load(.acquire) and (!job.once or !job.consumed.swap(true, .acq_rel))) return error.CredentialProcessLeaseLost;
+        }
+        fn perform(job: *@This()) !void {
+            var credentials = try job.cache.getForSourceWithContextAndIo(std.testing.allocator, std.heap.smp_allocator, job.client, job.scope.context.io, "us-east-1", .{ .profile = .{ .name = "fixture-process" } }, aws.RequestContext.init(job.scope.context.io, job.process_timeout_ms, job.scope.context.cancellation).withExecutionWait(job.scope.control()));
+            defer credentials.deinit(std.testing.allocator);
+            try job.scope.ready();
+            try std.testing.expectEqualStrings("vendor-access", credentials.access_key_id);
+        }
+        fn run(job: *@This()) void {
+            defer job.done.store(true, .release);
+            job.scope.context.cancellation = .{ .ptr = job, .check_fn = check };
+            job.perform() catch |err| {
+                job.scope.ready() catch |original| {
+                    job.failure = original;
+                    return;
+                };
+                job.failure = err;
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |close_pipes| for (std.enums.values(Terminal)) |terminal| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config", .data = "[profile fixture-process]\nlogin_session = fixture-session\n" });
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, "config", a);
+        defer a.free(path);
+        var fixture: Fixture = .{ .threaded = .init(a, .{}), .config_path = path, .close_pipes = close_pipes };
+        defer fixture.threaded.deinit();
+        var io = fixture.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.dirAccess = Fixture.access;
+        vtable.dirOpenFile = Fixture.open;
+        vtable.processSpawn = Fixture.spawn;
+        vtable.childWait = Fixture.wait;
+        vtable.childKill = Fixture.kill;
+        io.vtable = &vtable;
+        var client = httpx.Client.init(a, io);
+        defer client.deinit();
+        var cache: aws.CredentialCache = .{};
+        defer cache.deinit(std.heap.smp_allocator);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = io, .retained_bytes = 4096 }, .background, 2);
+        var read: @import("api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = a };
+        var job: Job = .{ .once = terminal == .cancel_once_wait or terminal == .cancel_once_return, .process_timeout_ms = if (terminal == .process_timeout) 150 else 5000, .cache = &cache, .client = &client, .scope = .{ .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + if (terminal == .deadline) @as(u64, 150 * std.time.ns_per_ms) else 5 * std.time.ns_per_s, .runnable = (try read.team()).borrow } } };
+        var future = try io.concurrent(Job.run, .{&job});
+        defer future.cancel(io);
+        const until = @import("antfly_platform").time.monotonicNs() + 3 * std.time.ns_per_s;
+        while (!fixture.started.load(.acquire) or scheduler.stats().runnable_slots != 0 or (close_pipes and !fixture.waiting_exit.load(.acquire))) {
+            if (job.done.load(.acquire)) return job.failure orelse error.CredentialProcessDidNotWait;
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.CredentialProcessKeptCapacity;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        {
+            try std.testing.expect(cache.mutex.tryLock());
+            defer cache.mutex.unlock(io);
+            try std.testing.expect(cache.refreshing);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.live.load(.acquire));
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.startWithSlots(&scheduler, .{ .io = io, .allow_wait = false }, .query, 2);
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        if (terminal == .cancel_wait or terminal == .cancel_once_wait) job.revoked.store(true, .release);
+        if (terminal == .success or terminal == .cancel_return or terminal == .cancel_once_return) {
+            while (scheduler.stats().queued == 0) {
+                if (job.done.load(.acquire)) return job.failure orelse error.CredentialProcessDidNotQueue;
+                if (@import("antfly_platform").time.monotonicNs() >= until) return error.CredentialProcessDidNotQueue;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            if (terminal == .success) query.finish() else job.revoked.store(true, .release);
+        }
+        while (!job.done.load(.acquire)) {
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.CredentialProcessDidNotRetire;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        future.await(io);
+        if (terminal == .success) {
+            if (job.failure) |err| return err;
+        } else try std.testing.expectEqual(if (terminal == .deadline or terminal == .process_timeout) error.Timeout else error.CredentialProcessLeaseLost, job.failure.?);
+        try std.testing.expectEqual(@as(usize, 0), fixture.live.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), fixture.retired.load(.acquire));
+        try std.testing.expectEqual(terminal == .success, cache.cached != null);
+        try std.testing.expect(!cache.refreshing);
+        query.finish();
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
