@@ -1653,3 +1653,13 @@ focused target passes again. Apache boundary checks cover **2,582 source files**
 license, formatting and whitespace checks pass. The validation record preserves
 the initial combined command's test-compilation failure and the successful
 separate rerun instead of treating them as one all-green command.
+
+A final independent main update, `ea7bea940a6a051f0662f87f2a240db2d925726d`,
+merges cleanly as `2bfc6f98872258c3dd75b5647492a61c2b00342e`. It changes the
+page-unit HTTP cursor gate and hierarchy error identity, with no lake
+query/highlight kernel changes. Targeted qualification passes **47 error-transport
+checks and one HTTP hierarchy check**, and both **local/Lite page-unit E2Es**
+pass in 13.60 seconds. The final CLI builds successfully as SHA-256
+`6f551b64a4e423ab4c953eb6b596443661be82d939ee72efdf65ab3d536f338d`, unchanged
+before and after those flow tests. The validation record distinguishes this
+focused merge check from the earlier complete lake-owner and real-file runs.

@@ -103,5 +103,35 @@
     "focused_target_and_cli_build_exit": 0,
     "cli_binary_sha256": "13dabefe664ac0a396b55098468dfc097765731ac53742c1ef498518f4681e4f",
     "e2e_binary": "The complete E2E run above remains bound to the frozen pre-profiling-followup merged executable."
+  },
+  "final_main_merge": {
+    "main_commit": "ea7bea940a6a051f0662f87f2a240db2d925726d",
+    "merge_commit": "2bfc6f98872258c3dd75b5647492a61c2b00342e",
+    "conflicts": false,
+    "delta": "Small independent page-unit HTTP cursor gate and stable hierarchy error identity; no lake query/highlight kernel changes.",
+    "native_http_and_error_transport_executions": [
+      [
+        47,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ]
+    ],
+    "native_and_cli_build_exit": 0,
+    "cli_binary_sha256": "6f551b64a4e423ab4c953eb6b596443661be82d939ee72efdf65ab3d536f338d",
+    "local_and_lite_page_unit_e2e": {
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 13.6,
+      "binary_hash_before_and_after_equal": true
+    },
+    "broader_lake_validation": "The 1,514 owner executions and complete 48-case real-file E2E run above remain bound to their recorded merged runtime. The final independent main delta receives targeted boundary and flow qualification."
   }
 }
