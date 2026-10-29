@@ -128,3 +128,14 @@ all three probe Workers, its DO namespace, R2 bucket/test data, Logpush job and
 both OTLP destinations are absent; the disposable local key was removed. The
 existing account credential remains local. The six reserved trial stacks were
 not deployed and their recovery epochs remain unused.
+
+## Representative database workload
+
+The [October 29 paired rehearsal](cloudflare-paired-rehearsal.md) completed all
+exact data/receipt checks and measured lower candidate latency, while still
+missing both latency targets. Received terminal records identify read admission
+and coordinator fallback as concrete profiling priorities. Bulk canonical export
+failed and remains unqualified. The design records the preserved failures,
+bounded read-only retrieval improvements, tested bulk receiver and the next
+portable serving work; it does not promote the small readiness probe to a full
+gate pass.
