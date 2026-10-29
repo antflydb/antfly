@@ -29,6 +29,10 @@ const CliConfig = struct {
     artifacts_uri: ?[]const u8 = null,
     manifests_uri: ?[]const u8 = null,
     wal_uri: ?[]const u8 = null,
+    indexed_wal: ?bool = null,
+    native_read_state: ?bool = null,
+    wal_document_index: ?bool = null,
+    wal_gc: ?bool = null,
     progress_uri: ?[]const u8 = null,
     catalog_uri: ?[]const u8 = null,
     query_cache_dir: ?[]const u8 = null,
@@ -164,6 +168,10 @@ pub fn runFromIterator(
         .wal_uri = try resolveRequired(init.environ_map, cli.wal_uri, configured_uris.wal, "ANTFLY_SERVERLESS_WAL_URI"),
         .progress_uri = try resolveRequired(init.environ_map, cli.progress_uri, configured_uris.progress, "ANTFLY_SERVERLESS_PROGRESS_URI"),
         .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, configured_uris.catalog, "ANTFLY_SERVERLESS_CATALOG_URI"),
+        .indexed_wal = cli.indexed_wal orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_INDEXED_WAL", false),
+        .native_read_state = cli.native_read_state orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_NATIVE_READ_STATE", false),
+        .wal_document_index = cli.wal_document_index orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_DOCUMENT_INDEX", false),
+        .wal_gc = cli.wal_gc orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_GC", false),
         .s3_options = configured_uris.s3_options,
         .gcs_options = configured_uris.gcs_options,
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
@@ -342,6 +350,22 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--catalog-uri")) {
             cfg.catalog_uri = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--indexed-wal")) {
+            cfg.indexed_wal = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--native-read-state")) {
+            cfg.native_read_state = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wal-document-index")) {
+            cfg.wal_document_index = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wal-gc")) {
+            cfg.wal_gc = try parseBoolArg(args.next() orelse return error.InvalidArguments);
             continue;
         }
         if (std.mem.eql(u8, arg, "--query-cache-dir")) {
@@ -707,6 +731,10 @@ fn printUsage(argv0: []const u8) void {
         \\  --wal-uri <uri>
         \\  --progress-uri <uri>
         \\  --catalog-uri <uri>
+        \\  --indexed-wal <bool> (requires an indexed or empty WAL prefix)
+        \\  --native-read-state <bool>
+        \\  --wal-document-index <bool>
+        \\  --wal-gc <bool> (managed indexed WAL, new prefix only)
         \\  --query-cache-dir <path>
         \\  --query-cache-max-bytes <bytes>
         \\  --manifest-write-version <18>

@@ -218,6 +218,39 @@ pub const Context = struct {
 /// `docs` must be sorted after-images. With no prior root, no mutations, or a
 /// changed fingerprint it must be the full document view. Otherwise only the
 /// distinct mutation IDs are looked up, and `docs` may contain only those IDs.
+const PendingBodies = struct {
+    alloc: Allocator,
+    pages: *page_store.PageStore,
+    items: [8][]const u8 = undefined,
+    length: usize = 0,
+    bytes: usize = 0,
+    seen: [64][32]u8 = undefined,
+    seen_count: usize = 0,
+    seen_next: usize = 0,
+    packed_bodies: std.AutoHashMapUnmanaged([32]u8, facts.BodyPack) = .empty,
+
+    fn add(self: *@This(), body: []const u8, digest: [32]u8) !void {
+        for (self.seen[0..self.seen_count]) |prior| if (std.mem.eql(u8, &prior, &digest)) return;
+        const encoded = try std.math.add(usize, body.len, facts.body_header_bytes);
+        if (self.length == self.items.len or (self.length != 0 and encoded > 1024 * 1024 -| self.bytes)) try self.flush();
+        self.items[self.length] = body;
+        self.length += 1;
+        self.bytes = try std.math.add(usize, self.bytes, encoded);
+        self.seen[self.seen_next] = digest;
+        self.seen_next = (self.seen_next + 1) % self.seen.len;
+        self.seen_count = @min(self.seen.len, self.seen_count + 1);
+    }
+    fn flush(self: *@This()) !void {
+        if (self.length != 0 and self.pages.artifacts.pack_document_bodies and self.bytes + 16 <= facts.max_body_pack_bytes) {
+            var refs_out: [8]facts.BodyRef = undefined;
+            try facts.putBodyPack(self.alloc, self.pages, self.items[0..self.length], refs_out[0..self.length]);
+            for (refs_out[0..self.length]) |ref| try self.packed_bodies.put(self.alloc, ref.digest, ref.pack.?);
+        } else try facts.putBodies(self.alloc, self.pages, self.items[0..self.length]);
+        self.length = 0;
+        self.bytes = 0;
+    }
+};
+
 pub fn publishAlloc(
     alloc: Allocator,
     pages: *page_store.PageStore,
@@ -232,12 +265,24 @@ pub fn publishAlloc(
     var context = try Context.init(alloc, policy, indexes_json);
     defer context.deinit();
     const previous: ?facts.Root = if (source_ref) |ref| try facts.loadRoot(alloc, pages, ref) else null;
+    const saved_pack_pages = pages.pack_pages;
+    const saved_value_prefix = pages.value_prefix;
+    defer {
+        pages.pack_pages = saved_pack_pages;
+        pages.value_prefix = saved_value_prefix;
+    }
+    if (pages.artifacts.canonical_point_bodies or (if (previous) |value| value.canonical_records else false)) {
+        pages.pack_pages = false;
+        pages.value_prefix = null;
+    }
     const rebuild = previous == null or mutations == null or !std.mem.eql(u8, &previous.?.policy_fingerprint, &policy_hash);
     if (!rebuild and mutations.?.len == 0 and previous.?.wal_end_lsn == wal_end_lsn)
         return builder.cloneArtifactRefAlloc(alloc, source_ref.?);
     const source = if (rebuild) facts.Root{ .domain = pages.domain, .policy_fingerprint = policy_hash } else previous.?;
     var cache = tree.Cache{ .alloc = alloc, .underlying = pages.store() };
     defer cache.deinit();
+    var pending = PendingBodies{ .alloc = alloc, .pages = pages };
+    defer pending.packed_bodies.deinit(alloc);
     var replacements = std.ArrayListUnmanaged(facts.Replacement).empty;
     defer replacements.deinit(alloc);
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -246,7 +291,7 @@ pub fn publishAlloc(
         try replacements.ensureTotalCapacity(alloc, docs.len);
         for (docs) |doc| {
             try pages.cancellation.check();
-            replacements.appendAssumeCapacity(.{ .id = doc.doc_id, .value = try makeFact(alloc, pages, cache.store(), previous, doc, &context) });
+            replacements.appendAssumeCapacity(.{ .id = doc.doc_id, .value = try makeFact(alloc, pages, cache.store(), previous, doc, &context, &pending) });
         }
     } else {
         for (mutations.?) |mutation| {
@@ -255,33 +300,44 @@ pub fn publishAlloc(
             if (entry.found_existing) continue;
             const doc = findDocument(docs, mutation.doc_id);
             try replacements.append(alloc, .{ .id = mutation.doc_id, .value = if (doc) |value|
-                try makeFact(alloc, pages, cache.store(), previous, value, &context)
+                try makeFact(alloc, pages, cache.store(), previous, value, &context, &pending)
             else
                 null });
         }
     }
+    try pending.flush();
+    for (replacements.items) |*replacement| if (replacement.value) |*fact| {
+        if (fact.body.pack == null and std.mem.eql(u8, &fact.body.attempt, &pages.attempt)) fact.body.pack = pending.packed_bodies.get(fact.body.digest);
+    };
     var plan = try facts.planAlloc(alloc, cache.store(), source, replacements.items, wal_end_lsn);
     defer plan.deinit();
     const root = try plan.publish(cache.store(), source);
     return facts.publishRoot(alloc, pages, root);
 }
 
-fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, prior: ?facts.Root, doc: materializer.Document, context: *const Context) !facts.Fact {
+fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, prior: ?facts.Root, doc: materializer.Document, context: *const Context, pending: *PendingBodies) !facts.Fact {
     const flags = try context.flags(doc);
     const physical = doc.stored_body orelse doc.body;
     const digest = facts.bodyDigest(physical);
     const old = if (prior) |root| try facts.lookup(alloc, store, root, doc.doc_id) else null;
     const encoded_len = std.math.add(usize, physical.len, facts.body_header_bytes) catch return error.ArtifactTooLarge;
-    const body = if (old != null and old.?.body.bytes == encoded_len and std.mem.eql(u8, &old.?.body.digest, &digest))
+    const eligible = doc.doc_id.len <= 256 and physical.len <= facts.max_inline_body_bytes and doc.stored_body == null and !flags.body_has_dependencies;
+    const canonical = pages.artifacts.canonical_point_bodies and eligible;
+    const body = if (canonical)
+        facts.BodyRef{ .digest = digest, .attempt = pages.attempt, .bytes = encoded_len }
+    else if (old != null and old.?.body.bytes == encoded_len and std.mem.eql(u8, &old.?.body.digest, &digest))
         old.?.body
-    else
-        try facts.putBody(alloc, pages, physical);
+    else queued: {
+        if (doc.stored_body != null or flags.body_has_dependencies) break :queued try facts.putBody(alloc, pages, physical);
+        try pending.add(physical, digest);
+        break :queued facts.BodyRef{ .digest = digest, .attempt = pages.attempt, .bytes = encoded_len };
+    };
     // Recompute the witness from this exact after-image, even when public
     // callers supply enrichment metadata. Its reachability follows the fact.
     const audit_json = if (doc.stored_body == null and !flags.body_has_dependencies) try @import("../enrichment/media_audit.zig").buildAlloc(alloc, doc.body) else null;
     defer if (audit_json) |json| alloc.free(json);
     const audit = if (audit_json) |json| try facts.putBody(alloc, pages, json) else null;
-    return .{ .body = body, .media_audit = audit, .source_input_bytes = doc.source_input_bytes, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
+    return .{ .canonical_body = canonical, .inline_payload = if (canonical or (pages.artifacts.inline_point_bodies and eligible and (if (body.pack) |pack| pack.leaf_records == 0 else true))) physical else null, .body = body, .media_audit = audit, .source_input_bytes = doc.source_input_bytes, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
 }
 
 fn findDocument(docs: []const materializer.Document, id: []const u8) ?materializer.Document {
@@ -334,7 +390,7 @@ pub fn materializeTouchedAlloc(alloc: Allocator, pages: *page_store.PageStore, r
         };
         const id = try alloc.dupe(u8, mutation.doc_id);
         errdefer alloc.free(id);
-        const body = try facts.readBodyAlloc(alloc, pages, fact.body);
+        const body = try facts.readBodyWithStoreAlloc(alloc, pages, cache.store(), fact.body);
         errdefer alloc.free(body);
         try docs.append(alloc, .{ .doc_id = id, .body = body, .source_input_bytes = fact.source_input_bytes, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns });
     }
@@ -352,6 +408,15 @@ pub fn materializeTouchedAlloc(alloc: Allocator, pages: *page_store.PageStore, r
 /// the same authoritative root. Ordinary prediction/publication uses point
 /// lookup instead. Ownership remains caller-local even for a streaming walk.
 pub fn materializeAllAlloc(alloc: Allocator, pages: *page_store.PageStore, root: facts.Root) ![]materializer.Document {
+    return materializeWithSnapshotAlloc(alloc, pages, root, &.{});
+}
+
+/// A verified packed snapshot is a body cache, never the authority for row
+/// membership or revision. Facts select every ID/version and authenticate any
+/// reused body by digest and encoded length; stale/missing entries hydrate.
+pub fn materializeWithSnapshotAlloc(alloc: Allocator, pages: *page_store.PageStore, root: facts.Root, snapshot: []const @import("../document_segment/mod.zig").Entry) ![]materializer.Document {
+    for (snapshot, 0..) |entry, i| if (i != 0 and std.mem.order(u8, snapshot[i - 1].doc_id, entry.doc_id) != .lt) return error.InvalidDocumentSnapshot;
+    var snapshot_index: usize = 0;
     if (!std.mem.eql(u8, &pages.domain, &root.domain)) return error.GraphPageDomainMismatch;
     var cursor = try tree.Cursor.init(alloc, pages.store(), root.page, "", null);
     defer cursor.deinit();
@@ -361,10 +426,15 @@ pub fn materializeAllAlloc(alloc: Allocator, pages: *page_store.PageStore, root:
         docs.deinit(alloc);
     }
     while (try cursor.next()) |record| {
-        const fact = try facts.Fact.decode(record.value);
+        try pages.cancellation.check();
+        const fact = try facts.decodeRecord(record);
+        if (fact.last_lsn > root.wal_end_lsn) return error.InvalidDocumentFact;
+        while (snapshot_index < snapshot.len and std.mem.order(u8, snapshot[snapshot_index].doc_id, record.key) == .lt) snapshot_index += 1;
+        const cached = if (snapshot_index < snapshot.len and std.mem.eql(u8, snapshot[snapshot_index].doc_id, record.key)) snapshot[snapshot_index].body else null;
+        const reusable = if (cached) |body| fact.body.bytes == @as(u64, body.len) + facts.body_header_bytes and std.mem.eql(u8, &fact.body.digest, &facts.bodyDigest(body)) else false;
         const id = try alloc.dupe(u8, record.key);
         errdefer alloc.free(id);
-        const body = try facts.readBodyAlloc(alloc, pages, fact.body);
+        const body = if (reusable) try alloc.dupe(u8, cached.?) else try facts.readRecordBodyAlloc(alloc, pages, record);
         errdefer alloc.free(body);
         try docs.append(alloc, .{ .doc_id = id, .body = body, .source_input_bytes = fact.source_input_bytes, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns });
     }
@@ -579,6 +649,84 @@ test "serverless document facts compiled normalization agrees with existing stat
     }
 }
 
+test "serverless packed body snapshots hydrate only mismatches and facts retain row authority" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/snapshot-facts", .{tmp.sub_path});
+    defer a.free(path);
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const docs = [_]materializer.Document{
+        .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"one\"}"), .last_lsn = 1, .last_timestamp_ns = 10 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"current\"}"), .last_lsn = 2, .last_timestamp_ns = 20 },
+        .{ .doc_id = @constCast("c"), .body = @constCast("{\"text\":\"new\"}"), .last_lsn = 3, .last_timestamp_ns = 30 },
+    };
+    const ref = try publishAlloc(a, &pages, null, &docs, null, .{}, "{}", 3);
+    defer freeRef(a, ref);
+    const root = try facts.loadRoot(a, &pages, ref);
+    const b = (try facts.lookup(a, pages.store(), root, "b")).?;
+    const c = (try facts.lookup(a, pages.store(), root, "c")).?;
+    const Entry = @import("../document_segment/mod.zig").Entry;
+    const snapshot = [_]Entry{
+        .{ .doc_id = @constCast("a"), .body = docs[0].body, .last_lsn = 999, .last_timestamp_ns = 999 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("stale"), .last_lsn = 0, .last_timestamp_ns = 0 },
+        .{ .doc_id = @constCast("z"), .body = @constCast("deleted"), .last_lsn = 0, .last_timestamp_ns = 0 },
+    };
+    const before = reads;
+    const result = try materializeWithSnapshotAlloc(a, &pages, root, &snapshot);
+    defer materializer.freeDocuments(a, result);
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqual(@as(u64, 1), result[0].last_lsn);
+    try std.testing.expectEqualStrings(docs[1].body, result[1].body);
+    try std.testing.expectEqualStrings("c", result[2].doc_id);
+    try std.testing.expectEqual(@as(u64, root.page.?.bytes) + b.body.bytes + c.body.bytes, before - reads);
+}
+
+test "serverless document facts packed after-images reuse bodies and retain shared packs through GC" {
+    const a = std.testing.allocator;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var impl = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "tenant");
+    var artifacts = impl.artifactStore();
+    defer artifacts.deinit();
+    artifacts.pack_document_bodies = true;
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = reads;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("packed-docs"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const docs = [_]materializer.Document{
+        .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"first\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"second\"}"), .last_lsn = 2, .last_timestamp_ns = 2 },
+    };
+    const first = try publishAlloc(a, &pages, null, &docs, null, .{}, "{}", 2);
+    defer freeRef(a, first);
+    const root = try facts.loadRoot(a, &pages, first);
+    const original = (try facts.lookup(a, pages.store(), root, "a")).?;
+    try std.testing.expect(original.body.pack != null);
+    pages.attempt = @splat(2);
+    var changed = docs[0];
+    changed.last_lsn = 3;
+    const second = try publishAlloc(a, &pages, first, &.{changed}, &.{.{ .doc_id = "a", .body = docs[0].body, .kind = .upsert, .lsn = 3, .timestamp_ns = 3 }}, .{}, "{}", 3);
+    defer freeRef(a, second);
+    const next = try facts.loadRoot(a, &pages, second);
+    try std.testing.expectEqual(original.body, (try facts.lookup(a, pages.store(), next, "a")).?.body);
+    var retained = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var keys = retained.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        retained.deinit(a);
+    }
+    try facts.retainRoot(a, &pages, second, &retained);
+    _ = try facts.reclaimRoot(a, &pages, first, &retained);
+    const body = try facts.readBodyAlloc(a, &pages, (try facts.lookup(a, pages.store(), next, "b")).?.body);
+    defer a.free(body);
+    try std.testing.expectEqualStrings(docs[1].body, body);
+}
+
 test "model aware media serverless pending facts retain empty vector failures and configured source fields" {
     const a = std.testing.allocator;
     const policy = catalog.NamespacePolicy{ .chunk_embeddings_enabled = true, .chunk_embeddings_pipeline_version = 2 };
@@ -586,4 +734,99 @@ test "model aware media serverless pending facts retain empty vector failures an
     try std.testing.expect(retry.pending & 4 != 0);
     const initial = try flagsForDocumentAlloc(a, .{ .doc_id = @constCast("doc"), .last_lsn = 0, .last_timestamp_ns = 0, .body = @constCast("{\"text\":\"\",\"clip\":{\"uri\":\"s3://bucket/clip\"}}") }, policy, "{\"dense\":{\"field\":\"clip\",\"embedder\":{\"provider\":\"antfly\"}}}");
     try std.testing.expect(initial.pending & 4 != 0);
+}
+
+test "serverless canonical document facts bodies have one durable copy and resolved audit locators across flag disable and GC" {
+    const a = std.testing.allocator;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var impl = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "canonical");
+    var artifacts = impl.artifactStore();
+    defer artifacts.deinit();
+    artifacts.pack_document_bodies = true;
+    artifacts.canonical_point_bodies = true;
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = reads;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("canonical"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const docs = [_]materializer.Document{
+        .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"first\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"second\"}"), .last_lsn = 2, .last_timestamp_ns = 2 },
+    };
+    const first = try publishAlloc(a, &pages, null, &docs, null, .{}, "{}", 2);
+    defer freeRef(a, first);
+    try std.testing.expectEqual(@as(u32, 12), first.metadata_version);
+    const source = try facts.loadRoot(a, &pages, first);
+    try std.testing.expect(source.canonical_records);
+    const fact = (try facts.lookup(a, pages.store(), source, "a")).?;
+    try std.testing.expect(fact.body.pack.?.leaf_records != 0);
+    const body = try facts.readBodyAlloc(a, &pages, fact.body);
+    defer a.free(body);
+    try std.testing.expectEqualStrings(docs[0].body, body);
+    var missing = fact.body;
+    missing.pack = null;
+    const separate = try missing.identity(pages.domain);
+    try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(&separate));
+    var audit = try facts.mediaCursor(a, pages.store(), source, "", null);
+    defer audit.deinit();
+    const scheduled = try facts.Fact.decode((try audit.next()).?.value);
+    const scheduled_body = try facts.readBodyAlloc(a, &pages, scheduled.body);
+    defer a.free(scheduled_body);
+    try std.testing.expectEqualStrings(docs[0].body, scheduled_body);
+    var invalid = fact.body;
+    invalid.pack.?.offset += 1;
+    try std.testing.expectError(error.InvalidDocumentBody, facts.readBodyAlloc(a, &pages, invalid));
+    // Enrichment descriptors serialize the typed locator and resolve their
+    // canonical source even when no standalone body object exists.
+    const checkpoint = try facts.encodeCheckpointBodyAlloc(a, fact.body, "{\"media_outputs\":{\"text\":\"derived\"}}");
+    defer a.free(checkpoint);
+    var parsed_checkpoint = try facts.parseCheckpointBody(a, checkpoint);
+    defer parsed_checkpoint.deinit();
+    try std.testing.expectEqualDeep(fact.body, parsed_checkpoint.value.base);
+    const resolved_checkpoint = try facts.resolveCheckpointBodyAlloc(a, &pages, checkpoint);
+    defer a.free(resolved_checkpoint);
+    var checkpoint_json = try std.json.parseFromSlice(std.json.Value, a, resolved_checkpoint, .{});
+    defer checkpoint_json.deinit();
+    try std.testing.expectEqualStrings("first", checkpoint_json.value.object.get("text").?.string);
+    try std.testing.expectEqualStrings("derived", checkpoint_json.value.object.get("media_outputs").?.object.get("text").?.string);
+    // Updating one member rewrites its shared leaf. The unchanged member's
+    // logical audit row must resolve through this new primary root, not pin
+    // the obsolete leaf through a physical locator in the scheduling index.
+    var changed = docs;
+    changed[0].body = @constCast("{\"text\":\"replacement\"}");
+    changed[0].last_lsn = 3;
+    pages.attempt = @splat(3);
+    const edited = try publishAlloc(a, &pages, first, &changed, null, .{}, "{}", 3);
+    defer freeRef(a, edited);
+    const edited_root = try facts.loadRoot(a, &pages, edited);
+    const neighbor = (try facts.lookup(a, pages.store(), edited_root, "b")).?;
+    try std.testing.expect(!std.mem.eql(u8, &neighbor.body.pack.?.digest, &fact.body.pack.?.digest));
+    var edited_audit = try facts.mediaCursor(a, pages.store(), edited_root, "", null);
+    defer edited_audit.deinit();
+    const neighbor_row = (try edited_audit.next()).?;
+    try std.testing.expectEqualStrings("b", neighbor_row.key);
+    const neighbor_audit = try facts.Fact.decode(neighbor_row.value);
+    try std.testing.expectEqualDeep(neighbor.body, neighbor_audit.body);
+    // Old pins still read their original body after the new generation exists.
+    const pinned_body = try facts.readBodyAlloc(a, &pages, fact.body);
+    defer a.free(pinned_body);
+    try std.testing.expectEqualStrings(docs[0].body, pinned_body);
+    artifacts.canonical_point_bodies = false;
+    artifacts.inline_point_bodies = true;
+    pages.attempt = @splat(2);
+    const next = try publishAlloc(a, &pages, first, &docs, null, .{}, "{}", 2);
+    defer freeRef(a, next);
+    const after = try facts.loadRoot(a, &pages, next);
+    const found = (try facts.lookup(a, pages.store(), after, "b")).?;
+    const restored = try facts.readBodyAlloc(a, &pages, found.body);
+    defer a.free(restored);
+    try std.testing.expectEqualStrings(docs[1].body, restored);
+    var retained = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var it = retained.keyIterator();
+        while (it.next()) |key| a.free(key.*);
+        retained.deinit(a);
+    }
+    try facts.retainRoot(a, &pages, next, &retained);
+    const id = try found.body.identity(pages.domain);
+    try std.testing.expect(retained.contains(&id));
 }

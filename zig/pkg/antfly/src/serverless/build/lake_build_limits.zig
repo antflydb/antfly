@@ -47,6 +47,7 @@ pub const Limits = struct {
 pub const WorkingSetAllocator = struct {
     backing: std.mem.Allocator,
     live_bytes: usize = 0,
+    peak_live_bytes: usize = 0,
     max_live_bytes: usize,
     limit_exceeded: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
@@ -91,6 +92,7 @@ pub const WorkingSetAllocator = struct {
         if (!self.permitsGrowth(len)) return null;
         const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.live_bytes += len;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return memory;
     }
 
@@ -102,6 +104,7 @@ pub const WorkingSetAllocator = struct {
         if (growth > 0 and !self.permitsGrowth(growth)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
         self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return true;
     }
 
@@ -113,6 +116,7 @@ pub const WorkingSetAllocator = struct {
         if (growth > 0 and !self.permitsGrowth(growth)) return null;
         const remapped = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
         self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return remapped;
     }
 
@@ -243,6 +247,7 @@ test "lake build working-set allocator rejects growth before allocation" {
     try std.testing.expectError(error.OutOfMemory, bounded_alloc.alloc(u8, 1));
     try std.testing.expect(bounded.limit_exceeded);
     try std.testing.expectEqual(@as(usize, 8), bounded.live_bytes);
+    try std.testing.expectEqual(@as(usize, 8), bounded.peak_live_bytes);
 }
 
 test "lake build working-set allocator shares exact accounting across upload workers" {

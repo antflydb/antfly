@@ -20,6 +20,8 @@ const db_core = support.db_core;
 const lite_restore_staging = support.lite.restore_staging;
 const template_remote_host = support.template_remote_host;
 
+pub const object_database = support.object_storage.transactional_store;
+pub const object_commit_log = support.object_storage.immutable_log;
 pub const lsm_storage = support.lsm_storage;
 pub const enrichment_runtime = support.enrichment_runtime;
 pub const enrichment_embedder = support.enrichment_embedder;

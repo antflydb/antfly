@@ -1,0 +1,154 @@
+{
+  "at": 1793064726157,
+  "rows": [
+    {
+      "variant": "approved-control",
+      "kind": "mutation",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/cloudflare-gate-control-transactions/examples/cloudflare-serverless/mutation-groups.mjs",
+      "source_sha256": "608d19abda20691b3b2723aa577e9596869a7b6f83b0ae4058d2f2480d8609c7",
+      "status": 200,
+      "result": [
+        {
+          "label": "a",
+          "context": "a"
+        },
+        {
+          "label": "b",
+          "context": "a"
+        },
+        {
+          "label": "c",
+          "context": "a"
+        }
+      ],
+      "context_matches": false
+    },
+    {
+      "variant": "approved-control",
+      "kind": "actor",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/cloudflare-gate-control-transactions/examples/cloudflare-serverless/runtime-actors.mjs",
+      "source_sha256": "2c73f3c650c83a0cfb9ba7a6ce55c2e99fe18d1ca54e97fd7da3e36ea36ab1e1",
+      "status": 200,
+      "result": [
+        {
+          "label": "a",
+          "context": "a"
+        },
+        {
+          "label": "b",
+          "context": "a"
+        },
+        {
+          "label": "c",
+          "context": "a"
+        }
+      ],
+      "context_matches": false
+    },
+    {
+      "variant": "caller-control",
+      "kind": "mutation",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/fix-cloudflare-gate-control-callers/examples/cloudflare-serverless/mutation-groups.mjs",
+      "source_sha256": "ef050e5e4a46df85c14bcf62c8f4cf0445ec9d968323a32ddf42f851f8417cac",
+      "status": 200,
+      "result": [
+        {
+          "label": "a",
+          "context": "a"
+        },
+        {
+          "label": "b",
+          "context": "b"
+        },
+        {
+          "label": "c",
+          "context": "c"
+        }
+      ],
+      "context_matches": true
+    },
+    {
+      "variant": "caller-control",
+      "kind": "actor",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/fix-cloudflare-gate-control-callers/examples/cloudflare-serverless/runtime-actors.mjs",
+      "source_sha256": "360c74fea3db93d624643cec1deab504d82817059706e9bbd78a1a28f371aacc",
+      "status": 200,
+      "result": [
+        {
+          "label": "a",
+          "context": "a"
+        },
+        {
+          "label": "b",
+          "context": "b"
+        },
+        {
+          "label": "c",
+          "context": "c"
+        }
+      ],
+      "context_matches": true
+    },
+    {
+      "variant": "candidate",
+      "kind": "mutation",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/cloudflare-serverless-1278/examples/cloudflare-serverless/mutation-groups.mjs",
+      "source_sha256": "ef050e5e4a46df85c14bcf62c8f4cf0445ec9d968323a32ddf42f851f8417cac",
+      "status": 200,
+      "result": [
+        {
+          "label": "a",
+          "context": "a"
+        },
+        {
+          "label": "b",
+          "context": "b"
+        },
+        {
+          "label": "c",
+          "context": "c"
+        }
+      ],
+      "context_matches": true
+    },
+    {
+      "variant": "candidate",
+      "kind": "actor",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/cloudflare-serverless-1278/examples/cloudflare-serverless/runtime-actors.mjs",
+      "source_sha256": "b7152578519711a289ca4c46a4ddd851314200c20764c302c46cdb6a067f7e08",
+      "status": 200,
+      "result": [
+        {
+          "label": "a",
+          "context": "a"
+        },
+        {
+          "label": "b",
+          "context": "b"
+        },
+        {
+          "label": "c",
+          "context": "c"
+        }
+      ],
+      "context_matches": true
+    }
+  ],
+  "approved_control_revision": "8a61f42df84ffec2214b1d292e3cdac996cd36e8",
+  "proposed_control_revision": "c44896ac8c13898c549b7896ab633b1b8b25c04c",
+  "patch_sha256": "ff233d14478b5ee6d20acd09d7711529ef53e31f45c41c35a1c2bbc195670600",
+  "native_sha256": {
+    "antfly-serverless.wasm": "563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97",
+    "antfly-serverless-compact.wasm": "789469d743cf69bb9cdcc3e3c59caa4f05663fe4e73958908800d780b1d85f77"
+  },
+  "native_artifacts_unchanged": true,
+  "original_node_tests": {
+    "passed": 90,
+    "failed": 0,
+    "log_sha256": "277b7597bf205f6902f615f907695d32519cd1f538bd548075e1aff0697eb440"
+  },
+  "live_control_changed": false,
+  "replacement_approved": true,
+  "approval": "User: Use corrected control c44896ac8c",
+  "combined_original_control_patch_sha256": "83f830a299e0a5cedc384120f3184d2de5b30c9cb8bdd2658cedc910c76fd382"
+}

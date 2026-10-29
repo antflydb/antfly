@@ -28,9 +28,25 @@ pub const ObjectStore = struct {
     gcs_client: ?*objectstore.Gcs.JsonApiClient = null,
     s3_client: ?*objectstore.S3.Client = null,
     owns_client: bool = true,
+    indexed: ?*@import("indexed_object_store.zig").IndexedObjectStore = null,
+    layout: std.atomic.Value(u8) = .init(0),
     bucket: []u8,
     prefix: []u8,
     mutex: std.atomic.Mutex = .unlocked,
+    const Layout = enum(u8) {
+        legacy = 1,
+        indexed = 2,
+        managed_indexed = 3,
+        indexed_relative = 4,
+        managed_indexed_relative = 5,
+
+        fn managed(self: Layout) bool {
+            return self == .managed_indexed or self == .managed_indexed_relative;
+        }
+        fn relative(self: Layout) bool {
+            return self == .indexed_relative or self == .managed_indexed_relative;
+        }
+    };
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -132,7 +148,131 @@ pub const ObjectStore = struct {
         };
     }
 
+    fn formatKey(self: *ObjectStore) ![]u8 {
+        return if (self.prefix.len == 0) self.alloc.dupe(u8, ".antfly/WAL_FORMAT") else std.fmt.allocPrint(self.alloc, "{s}/.antfly/WAL_FORMAT", .{self.prefix});
+    }
+    fn readLayout(self: *ObjectStore) !?Layout {
+        const key = try self.formatKey();
+        defer self.alloc.free(key);
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 32 }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        if (std.mem.eql(u8, result.body, "antfly-wal:legacy:1")) return .legacy;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed:1")) return .indexed;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed-managed:1")) return .managed_indexed;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed:2")) return .indexed_relative;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed-managed:2")) return .managed_indexed_relative;
+        return error.UnsupportedWalLayout;
+    }
+    fn ensureLayout(self: *ObjectStore, wanted: Layout, create: bool) !void {
+        const cached = self.layout.load(.acquire);
+        if (cached != 0) {
+            if (cached != @backingInt(wanted)) return error.WalLayoutMismatch;
+            return;
+        }
+        if (try self.readLayout()) |selected| {
+            if (selected != wanted) return error.WalLayoutMismatch;
+            self.layout.store(@backingInt(selected), .release);
+            return;
+        }
+        if (!create) return;
+        const key = try self.formatKey();
+        defer self.alloc.free(key);
+        const value = switch (wanted) {
+            .legacy => "antfly-wal:legacy:1",
+            .indexed => "antfly-wal:indexed:1",
+            .managed_indexed => "antfly-wal:indexed-managed:1",
+            .indexed_relative => "antfly-wal:indexed:2",
+            .managed_indexed_relative => "antfly-wal:indexed-managed:2",
+        };
+        var published = self.client.compareAndPut(self.bucket, key, value, null, .{}) catch |err| {
+            // The immutable selection may have committed before an ACK was
+            // lost, or another compatible opener may have selected it first.
+            if (try self.readLayout()) |selected| {
+                if (selected != wanted) return error.WalLayoutMismatch;
+                self.layout.store(@backingInt(selected), .release);
+                return;
+            }
+            return err;
+        };
+        defer published.deinit(self.alloc);
+        self.layout.store(@backingInt(wanted), .release);
+    }
+    pub fn selectLegacy(self: *ObjectStore) !void {
+        try self.ensureLayout(.legacy, false);
+    }
+
+    /// Explicit format selection. Existing legacy WALs must be migrated into a
+    /// new prefix; activation may never silently hide acknowledged records.
+    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, inline_tail: bool = true, managed_collection: bool = false }) !void {
+        if (self.indexed != null) return error.WalAlreadyConfigured;
+        const selected = try self.readLayout();
+        if (selected == .legacy) return error.LegacyWalMigrationRequired;
+        if (options.managed_collection and (selected == .indexed or selected == .indexed_relative)) return error.ManagedWalMigrationRequired;
+        // Version one at an empty prefix deliberately retains its historical
+        // leading-slash keys on S3/GCS. It cannot be reinterpreted as relative
+        // paths, nor can the filesystem validator safely alias those names.
+        if (self.fs_client != null and self.prefix.len == 0 and (selected == .indexed or selected == .managed_indexed)) return error.LegacyIndexedRootMigrationRequired;
+        const managed = options.managed_collection or (selected != null and selected.?.managed());
+        const wanted: Layout = selected orelse if (self.prefix.len == 0)
+            (if (managed) .managed_indexed_relative else .indexed_relative)
+        else
+            (if (managed) .managed_indexed else .indexed);
+        if (wanted.managed() and !@import("indexed_object_store.zig").IndexedObjectStore.managedClockAvailable()) return error.ManagedWalClockUnavailable;
+        if (selected) |layout| self.layout.store(@backingInt(layout), .release);
+        if (selected == null) {
+            var cursor: ?[]u8 = null;
+            defer if (cursor) |value| self.alloc.free(value);
+            const listing_prefix = if (self.prefix.len == 0) try self.alloc.dupe(u8, "") else try std.fmt.allocPrint(self.alloc, "{s}/", .{self.prefix});
+            defer self.alloc.free(listing_prefix);
+            // A deleted current name does not prove a pristine versioned
+            // prefix. Older unbounded readers may still hold historical roots.
+            const pristine = wanted.managed() or wanted.relative();
+            const migration_error = if (wanted.managed()) error.ManagedWalMigrationRequired else error.IndexedWalMigrationRequired;
+            if (pristine and try self.client.supportsObjectVersions(self.bucket, null)) {
+                var versions = try self.client.listObjectVersions(self.bucket, .{ .prefix = listing_prefix, .max_keys = 1 });
+                defer versions.deinit(self.alloc);
+                if (versions.entries.len != 0 or versions.is_truncated) return migration_error;
+            }
+            while (true) {
+                var page = try self.client.listObjects(self.bucket, .{ .prefix = listing_prefix, .continuation_token = cursor, .max_keys = 1000 });
+                defer page.deinit(self.alloc);
+                for (page.entries) |item| {
+                    if (std.mem.endsWith(u8, item.key, "/wal.log")) return error.LegacyWalMigrationRequired;
+                    if (pristine) return migration_error;
+                }
+                if (page.next_continuation_token == null) break;
+                const next = try self.alloc.dupe(u8, page.next_continuation_token orelse return error.InvalidObjectListing);
+                if (cursor) |value| self.alloc.free(value);
+                cursor = next;
+            }
+        }
+        try self.ensureLayout(wanted, true);
+        const indexed = try self.alloc.create(@import("indexed_object_store.zig").IndexedObjectStore);
+        errdefer self.alloc.destroy(indexed);
+        // Relative layout two reserves a nonempty physical prefix even when
+        // the selected logical prefix is the bucket root. Both page tracing
+        // and private GC metadata inherit the same prefix without changing
+        // their domain or naming rules. The immutable marker selects it.
+        const indexed_prefix = if (wanted.relative())
+            (if (self.prefix.len == 0) try self.alloc.dupe(u8, ".antfly/indexed-v2") else try std.fmt.allocPrint(self.alloc, "{s}/.antfly/indexed-v2", .{self.prefix}))
+        else
+            try self.alloc.dupe(u8, self.prefix);
+        defer self.alloc.free(indexed_prefix);
+        indexed.* = try @import("indexed_object_store.zig").IndexedObjectStore.init(self.alloc, self.client, self.bucket, indexed_prefix);
+        indexed.read_state_enabled = options.read_state;
+        indexed.document_index_enabled = options.document_index;
+        indexed.inline_tail_enabled = options.inline_tail;
+        indexed.managed_reads = wanted.managed();
+        self.indexed = indexed;
+    }
     pub fn deinit(self: *ObjectStore) void {
+        if (self.indexed) |value| {
+            value.deinit();
+            self.alloc.destroy(value);
+        }
         if (self.owns_client) self.client.deinit();
         if (self.fs_client) |fs| self.alloc.destroy(fs);
         if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
@@ -146,11 +286,13 @@ pub const ObjectStore = struct {
         return .{
             .allocator = self.alloc,
             .ptr = self,
-            .vtable = &vtable,
+            .vtable = if (self.indexed != null) &indexed_vtable else &vtable,
         };
     }
 
     pub fn append(self: *ObjectStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
+        if (self.indexed) |value| return value.append(namespace, timestamp_ns, payload);
+        try self.ensureLayout(.legacy, true);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -160,7 +302,7 @@ pub const ObjectStore = struct {
         var current = try self.tryReadLog(self.alloc, key);
         defer if (current) |*value| {
             self.alloc.free(value.body);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         const next_lsn: u64 = if (current) |value| (try lastLsn(value.body)) + 1 else 1;
@@ -173,10 +315,8 @@ pub const ObjectStore = struct {
             try self.alloc.dupe(u8, encoded);
         defer self.alloc.free(combined);
 
-        var result = try self.client.putObject(self.bucket, key, combined, .{
+        var result = try self.client.compareAndPut(self.bucket, key, combined, if (current) |value| value.revision else null, .{
             .content_type = "application/octet-stream",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |value| value.etag else null,
         });
         defer result.deinit(self.alloc);
         return next_lsn;
@@ -217,6 +357,11 @@ pub const ObjectStore = struct {
         operation_id: []const u8,
         expected_latest_lsn: ?u64,
     ) !?u64 {
+        if (self.indexed) |value| {
+            if (expected_latest_lsn) |expected| return value.appendIdempotentIfLatest(namespace, timestamp_ns, payload, operation_id, expected);
+            return try value.appendIdempotent(namespace, timestamp_ns, payload, operation_id);
+        }
+        try self.ensureLayout(.legacy, true);
         if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
             return error.InvalidWalOperationId;
         if (payload.len > idempotent_payload_max) return error.WalRecordTooLarge;
@@ -229,7 +374,7 @@ pub const ObjectStore = struct {
         var current = try self.tryReadLog(self.alloc, key);
         defer if (current) |*value| {
             self.alloc.free(value.body);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         if (current) |value| {
@@ -241,7 +386,7 @@ pub const ObjectStore = struct {
             // An update without an ETag would turn the promised conditional
             // append into an unconditional whole-log replacement. Fail closed
             // on providers that omit the version token.
-            if (value.etag == null) return error.MissingObjectEtag;
+            if (value.revision == null) return error.MissingObjectEtag;
         }
 
         const next_lsn: u64 = if (current) |value| (try lastLsn(value.body)) + 1 else 1;
@@ -262,10 +407,8 @@ pub const ObjectStore = struct {
             try self.alloc.dupe(u8, encoded);
         defer self.alloc.free(combined);
 
-        var result = self.client.putObject(self.bucket, key, combined, .{
+        var result = self.client.compareAndPut(self.bucket, key, combined, if (current) |value| value.revision else null, .{
             .content_type = "application/octet-stream",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |value| value.etag else null,
         }) catch |err| switch (err) {
             error.PreconditionFailed => if (expected_latest_lsn != null) return null else return err,
             else => return err,
@@ -275,10 +418,16 @@ pub const ObjectStore = struct {
     }
 
     pub fn readFromAlloc(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
+        if (self.indexed) |value| {
+            var wal = value.walStore();
+            wal.allocator = alloc;
+            return wal.readFromAlloc(namespace, start_lsn);
+        }
+        try self.ensureLayout(.legacy, false);
         const key = try logKeyAlloc(alloc, self.prefix, namespace);
         defer alloc.free(key);
 
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return try alloc.alloc(wal_types.Record, 0),
             else => return err,
         };
@@ -287,9 +436,11 @@ pub const ObjectStore = struct {
     }
 
     pub fn latestLsn(self: *ObjectStore, namespace: []const u8) !u64 {
+        if (self.indexed) |value| return value.latestLsn(namespace);
+        try self.ensureLayout(.legacy, false);
         const key = try logKeyAlloc(self.alloc, self.prefix, namespace);
         defer self.alloc.free(key);
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return 0,
             else => return err,
         };
@@ -298,6 +449,8 @@ pub const ObjectStore = struct {
     }
 
     pub fn truncatePrefix(self: *ObjectStore, namespace: []const u8, keep_from_lsn: u64) !u64 {
+        if (self.indexed) |value| return value.truncatePrefix(namespace, keep_from_lsn);
+        try self.ensureLayout(.legacy, true);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -307,7 +460,7 @@ pub const ObjectStore = struct {
         var current = try self.tryReadLog(self.alloc, key);
         defer if (current) |*value| {
             self.alloc.free(value.body);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
         if (current == null) return 0;
 
@@ -338,17 +491,14 @@ pub const ObjectStore = struct {
         }
 
         if (kept.items.len == 0) {
-            try self.client.deleteObject(self.bucket, key, .{
-                .if_match_etag = current.?.etag,
-            });
+            try self.client.compareAndDelete(self.bucket, key, current.?.revision orelse return error.MissingObjectRevision, .{});
             return removed;
         }
 
         const encoded = try encodeRecordsAlloc(self.alloc, kept.items);
         defer self.alloc.free(encoded);
-        var result = try self.client.putObject(self.bucket, key, encoded, .{
+        var result = try self.client.compareAndPut(self.bucket, key, encoded, current.?.revision orelse return error.MissingObjectRevision, .{
             .content_type = "application/octet-stream",
-            .if_match_etag = current.?.etag,
         });
         defer result.deinit(self.alloc);
         return removed;
@@ -356,19 +506,51 @@ pub const ObjectStore = struct {
 
     const CurrentLog = struct {
         body: []u8,
-        etag: ?[]u8,
+        revision: ?objectstore.ObjectRevision,
     };
 
     fn tryReadLog(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?CurrentLog {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(alloc);
+        const body = try alloc.dupe(u8, result.body);
+        errdefer alloc.free(body);
         return .{
-            .body = try alloc.dupe(u8, result.body),
-            .etag = if (result.metadata.etag) |value| try alloc.dupe(u8, value) else null,
+            .body = body,
+            .revision = if (result.metadata.writeRevision()) |value| try value.clone(alloc) else null,
         };
+    }
+
+    const indexed_vtable: wal_store.WalStore.VTable = blk: {
+        var value = vtable;
+        value.read_snapshot = erasedSnapshot;
+        value.read_point_alloc = erasedPoint;
+        value.read_range_alloc = erasedRange;
+        value.append_batch = erasedUnkeyedBatch;
+        value.append_batch_idempotent = erasedBatch;
+        break :blk value;
+    };
+    fn erasedSnapshot(ptr: *anyopaque, ns: []const u8) !wal_types.ReadSnapshot {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.readSnapshot(ns);
+    }
+    fn erasedPoint(ptr: *anyopaque, a: std.mem.Allocator, ns: []const u8, id: []const u8, range: wal_types.ReadRange) !wal_types.PointRead {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.readPointAlloc(a, ns, id, range);
+    }
+    fn erasedRange(ptr: *anyopaque, a: std.mem.Allocator, ns: []const u8, range: wal_types.ReadRange) ![]wal_types.Record {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.readRangeAlloc(a, ns, range);
+    }
+    fn erasedUnkeyedBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8) !wal_types.BatchResult {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.appendBatch(ns, timestamp, payloads);
+    }
+    fn erasedBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8) !wal_types.BatchResult {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.appendBatchIdempotent(ns, timestamp, payloads, id);
     }
 
     const vtable: wal_store.WalStore.VTable = .{
@@ -436,22 +618,17 @@ pub const ObjectStore = struct {
     }
 };
 
-pub fn encodeRecordAlloc(alloc: std.mem.Allocator, lsn: u64, timestamp_ns: u64, payload: []const u8) ![]u8 {
-    // The high length bit identifies records carrying an operation ID. Keep
-    // newly written legacy records below that boundary so both encodings are
-    // unambiguous to the shared parser.
-    if (payload.len > idempotent_payload_max) return error.WalRecordTooLarge;
-    const buf = try alloc.alloc(u8, 8 + 8 + 4 + payload.len);
-    var pos: usize = 0;
-    std.mem.writeInt(u64, buf[pos..][0..8], lsn, .little);
-    pos += 8;
-    std.mem.writeInt(u64, buf[pos..][0..8], timestamp_ns, .little);
-    pos += 8;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(payload.len), .little);
-    pos += 4;
-    @memcpy(buf[pos..][0..payload.len], payload);
-    return buf;
-}
+const record_codec = @import("record_codec.zig");
+pub const encodeRecordAlloc = record_codec.encodeRecordAlloc;
+pub const idempotent_record_flag = record_codec.idempotent_record_flag;
+pub const idempotent_payload_max = record_codec.idempotent_payload_max;
+pub const encodeIdempotentRecordAlloc = record_codec.encodeIdempotentRecordAlloc;
+pub const encodeRecordsAlloc = record_codec.encodeRecordsAlloc;
+pub const ParsedRecord = record_codec.ParsedRecord;
+pub const parseRecord = record_codec.parseRecord;
+pub const decodeRecordsFromAlloc = record_codec.decodeRecordsFromAlloc;
+pub const lastLsn = record_codec.lastLsn;
+pub const findOperation = record_codec.findOperation;
 
 fn cloneRecordAlloc(alloc: std.mem.Allocator, record: wal_types.Record) !wal_types.Record {
     const payload = try alloc.dupe(u8, record.payload);
@@ -467,143 +644,6 @@ fn cloneRecordAlloc(alloc: std.mem.Allocator, record: wal_types.Record) !wal_typ
     };
 }
 
-pub const idempotent_record_flag: u32 = @as(u32, 1) << 31;
-pub const idempotent_payload_max: usize = idempotent_record_flag - 1;
-
-pub fn encodeIdempotentRecordAlloc(
-    alloc: std.mem.Allocator,
-    lsn: u64,
-    timestamp_ns: u64,
-    payload: []const u8,
-    operation_id: []const u8,
-) ![]u8 {
-    if (payload.len > idempotent_payload_max) return error.WalRecordTooLarge;
-    if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
-        return error.InvalidWalOperationId;
-    const buf = try alloc.alloc(u8, 8 + 8 + 4 + 2 + operation_id.len + payload.len);
-    var pos: usize = 0;
-    std.mem.writeInt(u64, buf[pos..][0..8], lsn, .little);
-    pos += 8;
-    std.mem.writeInt(u64, buf[pos..][0..8], timestamp_ns, .little);
-    pos += 8;
-    std.mem.writeInt(u32, buf[pos..][0..4], idempotent_record_flag | @as(u32, @intCast(payload.len)), .little);
-    pos += 4;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(operation_id.len), .little);
-    pos += 2;
-    @memcpy(buf[pos..][0..operation_id.len], operation_id);
-    pos += operation_id.len;
-    @memcpy(buf[pos..][0..payload.len], payload);
-    return buf;
-}
-
-pub fn encodeRecordsAlloc(alloc: std.mem.Allocator, records: []const wal_types.Record) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    for (records) |record| {
-        const encoded = if (record.operation_id) |operation_id|
-            try encodeIdempotentRecordAlloc(alloc, record.lsn, record.timestamp_ns, record.payload, operation_id)
-        else
-            try encodeRecordAlloc(alloc, record.lsn, record.timestamp_ns, record.payload);
-        defer alloc.free(encoded);
-        try out.appendSlice(alloc, encoded);
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
-pub const ParsedRecord = struct {
-    lsn: u64,
-    timestamp_ns: u64,
-    payload: []const u8,
-    operation_id: ?[]const u8,
-    next_cursor: usize,
-};
-
-pub fn parseRecord(raw: []const u8, start: usize) !ParsedRecord {
-    var cursor = start;
-    if (cursor + 8 + 8 + 4 > raw.len) return error.InvalidWal;
-    const lsn = std.mem.readInt(u64, raw[cursor..][0..8], .little);
-    cursor += 8;
-    const timestamp_ns = std.mem.readInt(u64, raw[cursor..][0..8], .little);
-    cursor += 8;
-    const length_tag = std.mem.readInt(u32, raw[cursor..][0..4], .little);
-    cursor += 4;
-    const idempotent = length_tag & idempotent_record_flag != 0;
-    const payload_len: usize = @intCast(length_tag & ~idempotent_record_flag);
-    var operation_id: ?[]const u8 = null;
-    if (idempotent) {
-        if (cursor + 2 > raw.len) return error.InvalidWal;
-        const operation_id_len = std.mem.readInt(u16, raw[cursor..][0..2], .little);
-        cursor += 2;
-        if (operation_id_len == 0 or cursor + operation_id_len > raw.len) return error.InvalidWal;
-        operation_id = raw[cursor .. cursor + operation_id_len];
-        cursor += operation_id_len;
-    }
-    if (cursor + payload_len > raw.len) return error.InvalidWal;
-    const payload = raw[cursor .. cursor + payload_len];
-    cursor += payload_len;
-    return .{
-        .lsn = lsn,
-        .timestamp_ns = timestamp_ns,
-        .payload = payload,
-        .operation_id = operation_id,
-        .next_cursor = cursor,
-    };
-}
-
-pub fn decodeRecordsFromAlloc(alloc: std.mem.Allocator, raw: []const u8, start_lsn: u64) ![]wal_types.Record {
-    var cursor: usize = 0;
-    var out = std.ArrayListUnmanaged(wal_types.Record).empty;
-    errdefer {
-        for (out.items) |record| {
-            alloc.free(record.payload);
-            if (record.operation_id) |id| alloc.free(id);
-        }
-        out.deinit(alloc);
-    }
-
-    while (cursor < raw.len) {
-        const parsed = try parseRecord(raw, cursor);
-        if (parsed.lsn >= start_lsn) {
-            const payload = try alloc.dupe(u8, parsed.payload);
-            errdefer alloc.free(payload);
-            const operation_id = if (parsed.operation_id) |id| try alloc.dupe(u8, id) else null;
-            errdefer if (operation_id) |id| alloc.free(id);
-            try out.append(alloc, .{
-                .lsn = parsed.lsn,
-                .timestamp_ns = parsed.timestamp_ns,
-                .payload = payload,
-                .operation_id = operation_id,
-            });
-        }
-        cursor = parsed.next_cursor;
-    }
-
-    return try out.toOwnedSlice(alloc);
-}
-
-pub fn lastLsn(raw: []const u8) !u64 {
-    var cursor: usize = 0;
-    var latest: u64 = 0;
-    while (cursor < raw.len) {
-        const parsed = try parseRecord(raw, cursor);
-        latest = parsed.lsn;
-        cursor = parsed.next_cursor;
-    }
-    return latest;
-}
-
-pub fn findOperation(raw: []const u8, operation_id: []const u8) !?ParsedRecord {
-    var cursor: usize = 0;
-    while (cursor < raw.len) {
-        const parsed = try parseRecord(raw, cursor);
-        if (parsed.operation_id) |candidate| {
-            if (std.mem.eql(u8, candidate, operation_id)) return parsed;
-        }
-        cursor = parsed.next_cursor;
-    }
-    return null;
-}
-
 fn logKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
     if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "{s}/wal.log", .{namespace});
     return try std.fmt.allocPrint(alloc, "{s}/{s}/wal.log", .{ prefix, namespace });
@@ -611,6 +651,11 @@ fn logKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const 
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+fn freeRevision(alloc: std.mem.Allocator, revision: objectstore.ObjectRevision) void {
+    var owned = revision;
+    owned.deinit(alloc);
 }
 
 test "serverless objectstore WAL retained record cloning is allocation-failure safe" {
@@ -691,4 +736,270 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless indexed WAL selection preserves transport ownership capabilities and rejects legacy prefixes" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var store = try ObjectStore.initWithClient(a, client, "db", "new");
+    defer store.deinit();
+    try store.enableIndexed(.{ .read_state = true, .document_index = true });
+    var wal = store.walStore();
+    const payload = try @import("../api/codec.zig").encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "one", .body = "value" });
+    defer a.free(payload);
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 1, payload, "operation"));
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 1, payload, "operation"));
+    try std.testing.expectEqual(@as(u64, 1), (try wal.readSnapshot("docs")).?.latest_lsn);
+    const point = try wal.readPointAlloc("docs", "one", .{ .start_lsn = 1, .end_lsn = 1 });
+    defer if (point.record) |record| {
+        a.free(record.payload);
+        if (record.operation_id) |id| a.free(id);
+    };
+    try std.testing.expect(point.indexed);
+    try std.testing.expectEqualStrings(payload, point.record.?.payload);
+    var legacy = try ObjectStore.initWithClient(a, client, "db", "old");
+    defer legacy.deinit();
+    _ = try legacy.append("docs", 1, "acknowledged");
+    try std.testing.expectError(error.LegacyWalMigrationRequired, legacy.enableIndexed(.{}));
+    try std.testing.expectEqual(@as(u64, 1), try legacy.latestLsn("docs"));
+}
+
+test "serverless multiprovider WAL format selection survives lost acknowledgement and bounds reopen" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var backing = memory.client();
+    try backing.makeBucket("db");
+    var faults = objectstore.ScriptedFaultClient.init(a, backing);
+    defer faults.deinit();
+    faults.commitNextPutThenFail(error.InjectedFormatAckLoss);
+    var selected = try ObjectStore.initWithClient(a, faults.client(), "db", "selected");
+    defer selected.deinit();
+    try selected.enableIndexed(.{});
+    var legacy = try ObjectStore.initWithClient(a, backing, "db", "selected");
+    defer legacy.deinit();
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.selectLegacy());
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.latestLsn("docs"));
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.append("docs", 1, "must-not-shadow"));
+    memory.resetOperationCount();
+    var reopened = try ObjectStore.initWithClient(a, backing, "db", "selected");
+    defer reopened.deinit();
+    try reopened.enableIndexed(.{});
+    try std.testing.expectEqual(@as(u64, 2), memory.operationCount()); // bucket + immutable format, no LIST
+    var malformed = try backing.putObject("db", "future/.antfly/WAL_FORMAT", "antfly-wal:future:8", .{});
+    malformed.deinit(a);
+    var future = try ObjectStore.initWithClient(a, backing, "db", "future");
+    defer future.deinit();
+    try std.testing.expectError(error.UnsupportedWalLayout, future.enableIndexed(.{}));
+    try std.testing.expectError(error.UnsupportedWalLayout, future.selectLegacy());
+}
+
+test "serverless multiprovider managed WAL activates only on a new prefix and persists its contract with collection disabled" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var backing = memory.client();
+    try backing.makeBucket("db");
+    var old = try ObjectStore.initWithClient(a, backing, "db", "old");
+    defer old.deinit();
+    try old.enableIndexed(.{});
+    var upgrade = try ObjectStore.initWithClient(a, backing, "db", "old");
+    defer upgrade.deinit();
+    try std.testing.expectError(error.ManagedWalMigrationRequired, upgrade.enableIndexed(.{ .managed_collection = true }));
+    var object = try backing.putObject("db", "unmarked/wal-v1/unknown/HEAD", "unmanaged", .{});
+    object.deinit(a);
+    var unmarked = try ObjectStore.initWithClient(a, backing, "db", "unmarked");
+    defer unmarked.deinit();
+    try std.testing.expectError(error.ManagedWalMigrationRequired, unmarked.enableIndexed(.{ .managed_collection = true }));
+    try std.testing.expectError(error.FileNotFound, backing.getObject("db", "unmarked/.antfly/WAL_FORMAT", .{}));
+
+    var faults = objectstore.ScriptedFaultClient.init(a, backing);
+    defer faults.deinit();
+    faults.commitNextPutThenFail(error.InjectedManagedSelectionAckLoss);
+    var selected = try ObjectStore.initWithClient(a, faults.client(), "db", "managed");
+    defer selected.deinit();
+    try selected.enableIndexed(.{ .managed_collection = true });
+    try std.testing.expect(selected.indexed.?.managed_reads);
+    _ = try selected.append("docs", 1, "alpha");
+    var reopened = try ObjectStore.initWithClient(a, backing, "db", "managed");
+    defer reopened.deinit();
+    // Turning off collection cannot turn off an already persisted contract.
+    try reopened.enableIndexed(.{});
+    try std.testing.expect(reopened.indexed.?.managed_reads);
+    const records = try reopened.indexed.?.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 1 });
+    defer wal_types.freeRecords(a, records);
+    try std.testing.expectEqualStrings("alpha", records[0].payload);
+    var legacy = try ObjectStore.initWithClient(a, backing, "db", "managed");
+    defer legacy.deinit();
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.selectLegacy());
+}
+
+test "serverless multiprovider indexed root selection uses relative version two and preserves receipts" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |managed| {
+        var memory = objectstore.MemoryClient.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("db");
+        var foreign = try client.putObject("db", "foreign", "existing", .{});
+        foreign.deinit(a);
+        var occupied = try ObjectStore.initWithClient(a, client, "db", "");
+        defer occupied.deinit();
+        try std.testing.expectError(if (managed) error.ManagedWalMigrationRequired else error.IndexedWalMigrationRequired, occupied.enableIndexed(.{ .managed_collection = managed }));
+        try std.testing.expectError(error.FileNotFound, client.getObject("db", ".antfly/WAL_FORMAT", .{}));
+        try client.deleteObject("db", "foreign", .{});
+
+        var faults = objectstore.ScriptedFaultClient.init(a, client);
+        defer faults.deinit();
+        faults.commitNextPutThenFail(error.InjectedRootSelectionAckLoss);
+        var selected = try ObjectStore.initWithClient(a, faults.client(), "db", "");
+        defer selected.deinit();
+        try selected.enableIndexed(.{ .managed_collection = managed });
+        try std.testing.expectEqualStrings(".antfly/indexed-v2", selected.indexed.?.prefix);
+        try std.testing.expectEqual(@as(u64, 1), try selected.appendIdempotent("docs", 11, "alpha", "original"));
+        try std.testing.expectEqual(@as(u64, 2), try selected.append("docs", 12, "beta"));
+        var marker = try client.getObject("db", ".antfly/WAL_FORMAT", .{});
+        defer marker.deinit(a);
+        try std.testing.expectEqualStrings(if (managed) "antfly-wal:indexed-managed:2" else "antfly-wal:indexed:2", marker.body);
+
+        var reopened = try ObjectStore.initWithClient(a, client, "db", "");
+        defer reopened.deinit();
+        try reopened.enableIndexed(.{});
+        try std.testing.expectEqual(managed, reopened.indexed.?.managed_reads);
+        try std.testing.expectEqualStrings(".antfly/indexed-v2", reopened.indexed.?.prefix);
+        try std.testing.expectEqual(@as(u64, 1), try reopened.appendIdempotent("docs", 11, "alpha", "original"));
+        const records = try reopened.indexed.?.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 2 });
+        defer wal_types.freeRecords(a, records);
+        try std.testing.expectEqual(@as(usize, 2), records.len);
+        try std.testing.expectEqualStrings("alpha", records[0].payload);
+        try std.testing.expectEqual(@as(u64, 11), records[0].timestamp_ns);
+        try std.testing.expectEqualStrings("beta", records[1].payload);
+        try std.testing.expectError(error.WalLayoutMismatch, reopened.selectLegacy());
+        if (managed) {
+            const Collector = @import("collector.zig").Collector;
+            var now: u64 = std.time.ns_per_s;
+            const Clock = struct {
+                fn read(raw: ?*const anyopaque) u64 {
+                    return @as(*const u64, @ptrCast(@alignCast(raw.?))).*;
+                }
+            };
+            selected.indexed.?.read_clock = .{ .ptr = &now, .now_fn = Clock.read };
+            _ = try selected.indexed.?.truncatePrefix("docs", 2);
+            const collector = try a.create(Collector);
+            defer a.destroy(collector);
+            collector.* = Collector.init(a, selected.indexed.?, std.testing.io);
+            collector.step_interval_ns = 0;
+            var finished = false;
+            for (0..1024) |_| {
+                const result = try collector.step("docs", null);
+                if (result.phase == .waiting) now += Collector.grace_ns;
+                if (result.phase == .finished) {
+                    finished = true;
+                    break;
+                }
+            }
+            try std.testing.expect(finished);
+            var idle = false;
+            for (0..1024) |_| if ((try collector.step("docs", null)).phase == .idle) {
+                idle = true;
+                break;
+            };
+            try std.testing.expect(idle);
+            var jobs = try client.listObjects("db", .{ .prefix = ".antfly/indexed-v2/gc-jobs/", .recursive = true });
+            defer jobs.deinit(a);
+            try std.testing.expectEqual(@as(usize, 0), jobs.entries.len);
+            try std.testing.expectEqual(@as(u64, 1), try reopened.appendIdempotent("docs", 11, "alpha", "original"));
+            const retained = try reopened.indexed.?.readRangeAlloc(a, "docs", .{ .start_lsn = 2, .end_lsn = 2 });
+            defer wal_types.freeRecords(a, retained);
+            try std.testing.expectEqual(@as(usize, 1), retained.len);
+            try std.testing.expectEqualStrings("beta", retained[0].payload);
+        }
+    }
+}
+
+test "serverless multiprovider existing empty prefix version one retains its original cloud keys" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |managed| {
+        var memory = objectstore.MemoryClient.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("db");
+        const marker_body = if (managed) "antfly-wal:indexed-managed:1" else "antfly-wal:indexed:1";
+        var marker = try client.putObject("db", ".antfly/WAL_FORMAT", marker_body, .{});
+        marker.deinit(a);
+        // Reproduce the old layout exactly, including the leading slash and
+        // its authenticated tree domain. Existing data must never be renamed.
+        var old = try @import("indexed_object_store.zig").IndexedObjectStore.init(a, client, "db", "");
+        defer old.deinit();
+        old.managed_reads = managed;
+        try std.testing.expectEqual(@as(u64, 1), try old.appendIdempotent("docs", 11, "alpha", "original"));
+        var reopened = try ObjectStore.initWithClient(a, client, "db", "");
+        defer reopened.deinit();
+        try reopened.enableIndexed(.{});
+        try std.testing.expectEqualStrings("", reopened.indexed.?.prefix);
+        try std.testing.expectEqual(managed, reopened.indexed.?.managed_reads);
+        try std.testing.expectEqual(@as(u64, 1), try reopened.appendIdempotent("docs", 11, "alpha", "original"));
+        try std.testing.expectEqual(@as(u64, 2), try reopened.append("docs", 12, "beta"));
+        const records = try reopened.indexed.?.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 2 });
+        defer wal_types.freeRecords(a, records);
+        try std.testing.expectEqual(@as(usize, 2), records.len);
+        try std.testing.expectEqualStrings("alpha", records[0].payload);
+        var unchanged = try client.getObject("db", ".antfly/WAL_FORMAT", .{});
+        defer unchanged.deinit(a);
+        try std.testing.expectEqualStrings(marker_body, unchanged.body);
+    }
+}
+
+test "serverless multiprovider filesystem root never rewrites a version one selection" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |managed| {
+        var path_buf: [256]u8 = undefined;
+        const path = tmpPath(&path_buf, "old-indexed-root");
+        defer cleanupTmp(path);
+        const uri = try std.fmt.allocPrint(a, "file://{s}", .{std.mem.span(path)});
+        defer a.free(uri);
+        var store = try ObjectStore.initFileUri(a, uri);
+        defer store.deinit();
+        const marker_body = if (managed) "antfly-wal:indexed-managed:1" else "antfly-wal:indexed:1";
+        var marker = try store.client.putObject(store.bucket, ".antfly/WAL_FORMAT", marker_body, .{});
+        marker.deinit(a);
+        try std.testing.expectError(error.LegacyIndexedRootMigrationRequired, store.enableIndexed(.{ .managed_collection = managed }));
+        var unchanged = try store.client.getObject(store.bucket, ".antfly/WAL_FORMAT", .{});
+        defer unchanged.deinit(a);
+        try std.testing.expectEqualStrings(marker_body, unchanged.body);
+    }
+}
+
+test "serverless multiprovider concurrent layout selection cannot create a shadow legacy WAL" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var backing = memory.client();
+    try backing.makeBucket("db");
+    var indexed = try ObjectStore.initWithClient(a, backing, "db", "race");
+    defer indexed.deinit();
+    const Race = struct {
+        store: *ObjectStore,
+        activated: bool = false,
+        fn claim(raw: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.endsWith(u8, key, "/WAL_FORMAT")) return false;
+            self.store.enableIndexed(.{}) catch return true;
+            self.activated = true;
+            return true;
+        }
+    };
+    var race: Race = .{ .store = &indexed };
+    var faults = objectstore.ScriptedFaultClient.init(a, backing);
+    defer faults.deinit();
+    faults.put_filter = .{ .ptr = &race, .matches = Race.claim };
+    var legacy = try ObjectStore.initWithClient(a, faults.client(), "db", "race");
+    defer legacy.deinit();
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.append("docs", 1, "must-not-shadow"));
+    try std.testing.expect(race.activated);
+    try std.testing.expectError(error.FileNotFound, backing.getObject("db", "race/docs/wal.log", .{}));
+    try std.testing.expectEqual(@as(u64, 0), try indexed.latestLsn("docs"));
 }

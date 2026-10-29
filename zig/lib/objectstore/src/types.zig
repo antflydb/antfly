@@ -103,16 +103,44 @@ pub const ObjectChecksumScope = enum {
     response_body,
 };
 
+/// A provider's atomic current-object publication token. An S3 version ID is
+/// not an ETag, and a GCS generation is not an HTTP ETag. Borrowed unless cloned.
+pub const ObjectRevision = union(enum) {
+    etag: []const u8,
+    generation: []const u8,
+
+    pub fn clone(self: ObjectRevision, alloc: Allocator) !ObjectRevision {
+        return switch (self) {
+            .etag => |value| .{ .etag = try alloc.dupe(u8, value) },
+            .generation => |value| .{ .generation = try alloc.dupe(u8, value) },
+        };
+    }
+    pub fn deinit(self: *ObjectRevision, alloc: Allocator) void {
+        switch (self.*) {
+            inline else => |value| alloc.free(value),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const ObjectMetadata = struct {
     bucket: []u8,
     key: []u8,
     etag: ?[]u8 = null,
     version_id: ?[]u8 = null,
+    revision_kind: enum { etag, generation } = .etag,
     checksum: ?ObjectChecksum = null,
     checksum_scope: ObjectChecksumScope = .object,
     content_length: u64,
     content_type: ?[]u8 = null,
     last_modified_unix_ms: ?i64 = null,
+
+    pub fn writeRevision(self: ObjectMetadata) ?ObjectRevision {
+        return switch (self.revision_kind) {
+            .etag => .{ .etag = self.etag orelse return null },
+            .generation => .{ .generation = self.version_id orelse return null },
+        };
+    }
 
     pub fn deinit(self: *ObjectMetadata, alloc: Allocator) void {
         alloc.free(self.bucket);
@@ -139,6 +167,9 @@ pub const VersionRetention = struct {
 };
 
 pub const PutOptions = struct {
+    /// Atomically compare another coordination key with this write. Providers
+    /// without a transactional namespace must reject this capability.
+    guard: ?struct { key: []const u8, etag: []const u8 } = null,
     content_type: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
     if_none_match: bool = false,
@@ -241,6 +272,13 @@ pub const ListObjectVersionsOptions = struct {
 pub const ByteRange = struct {
     offset: u64,
     length: ?u64 = null,
+};
+
+/// Independent writes; a failed batch may leave successful uploads behind.
+pub const PutObjectRequest = struct {
+    key: []const u8,
+    body: []const u8,
+    options: PutOptions = .{},
 };
 
 pub const PutResult = struct {

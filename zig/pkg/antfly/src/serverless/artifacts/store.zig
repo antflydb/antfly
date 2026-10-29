@@ -261,6 +261,10 @@ pub const IoGuard = struct {
     }
 };
 pub const ArtifactStore = struct {
+    /// Opt-in facts v4 body packs. Other profiles continue writing v3 facts.
+    pack_document_bodies: bool = false,
+    inline_point_bodies: bool = false,
+    canonical_point_bodies: bool = false,
     /// The host guarantees that replacement owners resolve the same immutable namespace.
     shared_across_owners: bool = false,
     namespace_identity: ?[32]u8 = null,
@@ -305,6 +309,7 @@ pub const ArtifactStore = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         delete_with_cancellation: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!void = null,
         put_scoped: ?*const fn (*anyopaque, Allocator, UploadScope, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
+        put_scoped_many: ?*const fn (*anyopaque, Allocator, UploadScope, []const []const u8, CancellationToken) anyerror![]ArtifactMetadata = null,
         visit_scoped_uploads: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken) anyerror!void = null,
         reclaim_retired_scoped_inventory: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
         cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
@@ -367,6 +372,53 @@ pub const ArtifactStore = struct {
 
     pub fn put(self: *ArtifactStore, contents: []const u8) !ArtifactMetadata {
         return try self.putWithCancellation(contents, .none);
+    }
+
+    pub fn putScopedMany(self: *ArtifactStore, scope: UploadScope, contents: []const []const u8, cancellation: CancellationToken) ![]ArtifactMetadata {
+        if (contents.len == 0 or contents.len > 8) return error.InvalidObjectBatch;
+        try scope.validate();
+        if (self.upload_scope) |authority| {
+            if (!std.mem.eql(u8, &scope.domain, &authority.domain) or scope.fencingToken() != authority.fencingToken()) return error.InvalidArtifactUploadScope;
+        }
+        try cancellation.check();
+        const batch = self.vtable.put_scoped_many orelse return self.putScopedSerial(scope, contents, cancellation);
+        var phase = try self.beginIo(contents.len);
+        defer phase.abort();
+        const metadata = batch(self.ptr, self.allocator, scope, contents, cancellation) catch |err| switch (err) {
+            // A prior immutable upload may already exist. Authenticate it via
+            // the ordinary single-object path, including partial batch wins.
+            error.PreconditionFailed => {
+                try phase.finish();
+                return self.putScopedSerial(scope, contents, cancellation);
+            },
+            else => return phase.failed(err),
+        };
+        errdefer {
+            for (metadata) |*item| item.deinit(self.allocator);
+            self.allocator.free(metadata);
+        }
+        try phase.finish();
+        if (metadata.len != contents.len) return error.InvalidObjectBatch;
+        for (metadata, contents) |item, bytes| {
+            const id = try scope.artifactId(item.checksum);
+            if (item.byte_len != bytes.len or !std.mem.eql(u8, &id, item.artifact_id)) return error.ArtifactIntegrityMismatch;
+        }
+        try cancellation.check();
+        return metadata;
+    }
+
+    fn putScopedSerial(self: *ArtifactStore, scope: UploadScope, contents: []const []const u8, cancellation: CancellationToken) ![]ArtifactMetadata {
+        const metadata = try self.allocator.alloc(ArtifactMetadata, contents.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (metadata[0..initialized]) |*item| item.deinit(self.allocator);
+            self.allocator.free(metadata);
+        }
+        for (contents, metadata) |bytes, *item| {
+            item.* = try self.putScoped(scope, bytes, cancellation);
+            initialized += 1;
+        }
+        return metadata;
     }
 
     pub fn putScoped(self: *ArtifactStore, scope: UploadScope, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
@@ -459,7 +511,18 @@ pub const ArtifactStore = struct {
                 }
             };
             var failures: [max_upload_batch]?anyerror = @splat(null);
-            if (io) |executor| {
+            if (backend.upload_scope != null and backend.vtable.put_scoped_many != null) {
+                var offset = begin;
+                while (offset < end) {
+                    var stop = offset + 1;
+                    var bytes = contents[offset].len;
+                    while (stop < end and stop - offset < 8 and contents[stop].len <= 1024 * 1024 -| bytes) : (stop += 1) bytes += contents[stop].len;
+                    const batch = backend.putScopedMany(backend.upload_scope.?, contents[offset..stop], cancellation) catch |err| return phase.failed(err);
+                    defer self.allocator.free(batch);
+                    for (batch, completed[offset..stop]) |metadata, *slot| slot.* = metadata;
+                    offset = stop;
+                }
+            } else if (io) |executor| {
                 var group: std.Io.Group = .init;
                 for (begin..end) |index| group.async(executor, Worker.run, .{ &backend, contents[index], cancellation, &completed[index], &failures[index] });
                 group.await(executor) catch |err| {

@@ -1,0 +1,71 @@
+{
+  "at": 1793057170672,
+  "rows": [
+    {
+      "variant": "approved-control",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/cloudflare-gate-control-context/examples/cloudflare-serverless/r2-coordinator-store.mjs",
+      "source_sha256": "7df2f8dabac0a7de4cd29625634b6000e675ef7f394fffdf0a4a6aefb2835592",
+      "status": 200,
+      "result": {
+        "results": [
+          "a",
+          "b",
+          "c"
+        ],
+        "begins": [
+          "a",
+          "a"
+        ]
+      },
+      "context_matches": false
+    },
+    {
+      "variant": "transaction-control",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/cloudflare-gate-control-transactions/examples/cloudflare-serverless/r2-coordinator-store.mjs",
+      "source_sha256": "718bb648c27ac6281ba920d858615720a69368f8bd7b2e4dd5bb5534543636d3",
+      "status": 200,
+      "result": {
+        "results": [
+          "a",
+          "b",
+          "c"
+        ],
+        "begins": [
+          "a",
+          "b"
+        ]
+      },
+      "context_matches": true
+    },
+    {
+      "variant": "candidate",
+      "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/cloudflare-serverless-1278/examples/cloudflare-serverless/r2-coordinator-store.mjs",
+      "source_sha256": "485f3aa230a11d05a491370a9ff6df6a333fe96050bc4f007d8a25fcd7cbb3c5",
+      "status": 200,
+      "result": {
+        "results": [
+          "a",
+          "b",
+          "c"
+        ],
+        "begins": [
+          "a",
+          "b"
+        ]
+      },
+      "context_matches": true
+    }
+  ],
+  "approved_control_revision": "21205a7021370dbb1f2e8df11f5fe2ac15f2cea8",
+  "proposed_control_revision": "8a61f42df84ffec2214b1d292e3cdac996cd36e8",
+  "patch_sha256": "9b01c29c9e74136fe94443b0099e3c0ca0ea9f713151ccce250ed70e9155f313",
+  "native_artifacts_unchanged": true,
+  "live_control_changed": false,
+  "replacement_approved": true,
+  "native_sha256": {
+    "antfly-serverless.wasm": "563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97",
+    "antfly-serverless-compact.wasm": "789469d743cf69bb9cdcc3e3c59caa4f05663fe4e73958908800d780b1d85f77"
+  },
+  "approval": "User: use the corrected control",
+  "combined_original_control_patch_sha256": "f65f5a8deaa1bba82076bbd39a8cd6d9fd99764d36e31856800e5b41ed3569b6"
+}
