@@ -143,11 +143,12 @@ with b.managed_server(
                     assert ids == expected, (name, ids, expected)
                     source_keys = {"id", "bucket"}
                     if name != "explicit_narrow_control":
-                        source_keys.add("_type")
+                        source_keys.update(("_type", "_id"))
                     for hit in response["hits"]["hits"]:
                         assert set(hit["_source"]) == source_keys
                         if "_type" in source_keys:
                             assert hit["_source"]["_type"] == "row"
+                            assert hit["_source"]["_id"] == hit["_id"]
                     samples.append(
                         {
                             "case": name,

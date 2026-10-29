@@ -1985,11 +1985,12 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                         ] == expected
                         source_keys = {"id", "bucket"}
                         if fields[0] != "id":
-                            source_keys.add("_type")
+                            source_keys.update(("_type", "_id"))
                         for hit in response["hits"]["hits"]:
                             assert set(hit["_source"]) == source_keys, hit["_source"]
                             if "_type" in source_keys:
                                 assert hit["_source"]["_type"] == "row"
+                                assert hit["_source"]["_id"] == hit["_id"]
                     sql = client.call(
                         "POST",
                         "/sql",
@@ -2040,7 +2041,7 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     unicode_body = "unicodecase " + unicode_payload + " needle"
     regular_body = "running " * 32768
     diverse_body = " ".join(f"broad{i:05d}" for i in range(8192)) + " "
-    clustered_body = "needle " + "needle other " * 16384
+    clustered_body = "needle " + "needle quark " * 16384
     rows = pa.table(
         {
             "id": list(range(count + 6)),
@@ -2248,7 +2249,7 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                             {
                                 "disjuncts": [
                                     {"match": "needle", "field": "body"},
-                                    {"match": "other", "field": "body"},
+                                    {"match": "quark", "field": "body"},
                                 ]
                             },
                             clustered_body,

@@ -53,7 +53,7 @@ archive = shared / "archive.parquet"
 dense = "running " * 262144
 diverse = " ".join(f"broad{i:05d}" for i in range(20000)) + " "
 sparse = "needle " + "." * 32768
-clustered = "needle " + "needle other " * 16384
+clustered = "needle " + "needle quark " * 16384
 bodies = [dense, diverse, sparse, clustered]
 if not archive.exists():
     pq.write_table(
@@ -107,7 +107,7 @@ queries = {
             {
                 "disjuncts": [
                     {"match": "needle", "field": "body"},
-                    {"match": "other", "field": "body"},
+                    {"match": "quark", "field": "body"},
                 ]
             },
         ),
