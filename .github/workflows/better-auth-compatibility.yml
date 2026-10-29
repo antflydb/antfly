@@ -8,23 +8,59 @@ permissions:
   contents: read
 jobs:
   native:
+    permissions:
+      contents: read
+      id-token: write
     runs-on: arc-antfly-heavy
     timeout-minutes: 120
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          submodules: true
       - uses: ./.github/actions/load-toolchain-policy
         id: toolchain
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+      - name: Install native build tools
+        run: bash scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils file
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+      - name: Prepare compiler cache directories
+        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+      - name: Prepare verified Zig source dependencies
+        uses: ./.github/actions/prepare-zig-dependencies
       - name: Build native test artifacts
         working-directory: zig
-        run: ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache" ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" zig build libantfly antfly -Doptimize=ReleaseFast -j1 --maxrss 30064771072
+        run: >-
+          python3 tools/run_bounded_zig_build.py --zig zig --
+          build --build-file ./build.zig libantfly antfly
+          -Doptimize=ReleaseFast -Dstrip=true -Dcpu=baseline
+          -Dmetal=false -Dcuda=false -j2
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: auth-native
           path: zig/zig-out
           retention-days: 1
+      - name: Remove native compiler cache
+        if: always()
+        run: rm -rf -- "$ZIG_LOCAL_CACHE_DIR"
   compatibility:
     needs: native
     runs-on: ubuntu-latest
@@ -81,7 +117,7 @@ jobs:
             -e BETTER_AUTH_SECRET="ci-only-secret-at-least-thirty-two-characters" \
             -e APP_ORIGIN=http://localhost:13029 antfly-auth-example
           trap 'docker logs antfly-auth-example; docker rm -f antfly-auth-example; docker volume rm auth-example-data' EXIT
-          for attempt in $(seq 1 60); do
+          for ((attempt=0; attempt<60; attempt++)); do
             if curl --fail --silent http://localhost:13029/ > /dev/null; then break; fi
             sleep 1
           done

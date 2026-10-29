@@ -56,7 +56,9 @@ env:
 
 concurrency:
   group: zig-${{ inputs.pr_number || github.ref }}
-  cancel-in-progress: true
+  # Finish an active main qualification; GitHub coalesces pending runs in this
+  # same group. PR heads and merge-queue revisions still supersede old work.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' || inputs.pr_number != '' }}
 
 jobs:
   admission:
@@ -728,7 +730,7 @@ jobs:
       - name: Test build tooling
         working-directory: zig
         run: >-
-          python3 -m unittest
+          python3 -m unittest -v
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
           tools/test_benchmark_lake_archive.py
