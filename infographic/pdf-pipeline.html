@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Antfly PDF Pipeline</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #121a33; --panel2: #18234a; --line: #2a3a6e;
+    --ink: #e8ecff; --muted: #9aa6d4; --dim: #6b78a8;
+    --amber: #ffb547; --teal: #34d6c3; --violet: #a68bff; --rose: #ff6f91; --sky: #5cb8ff; --lime: #a5e65a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #05070f; font-family: "Inter", "Helvetica Neue", Arial, sans-serif; color: var(--ink); }
+  .page {
+    width: 1200px; height: 1600px; margin: 0 auto 40px; padding: 64px 72px 56px;
+    background: radial-gradient(1200px 700px at 85% -10%, #1d2a5c 0%, transparent 60%), var(--bg);
+    position: relative; overflow: hidden; page-break-after: always;
+  }
+  .kicker { font: 600 14px/1 "JetBrains Mono", Menlo, monospace; letter-spacing: .18em; text-transform: uppercase; color: var(--amber); }
+  h1 { font-size: 64px; line-height: 1.02; font-weight: 800; letter-spacing: -.02em; margin: 14px 0 16px; }
+  h2 { font-size: 26px; font-weight: 750; margin-bottom: 12px; letter-spacing: -.01em; }
+  h3 { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+  p, li { font-size: 16px; line-height: 1.5; color: var(--muted); }
+  .lede { font-size: 20px; color: #c3cbef; max-width: 900px; }
+  code, .mono { font-family: "JetBrains Mono", Menlo, monospace; font-size: .88em; color: var(--teal); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 22px 24px; }
+  .grid { display: grid; gap: 20px; }
+  .g2 { grid-template-columns: 1fr 1fr; } .g3 { grid-template-columns: repeat(3, 1fr); } .g4 { grid-template-columns: repeat(4, 1fr); }
+  .stat b { display: block; font-size: 40px; font-weight: 800; letter-spacing: -.02em; color: var(--ink); }
+  .stat span { font-size: 14px; color: var(--muted); }
+  .foot { position: absolute; left: 72px; right: 72px; bottom: 28px; display: flex; justify-content: space-between;
+          font: 500 12px "JetBrains Mono", Menlo, monospace; color: var(--dim); }
+  .tag { display: inline-block; font: 600 12px "JetBrains Mono", Menlo, monospace; padding: 4px 9px; border-radius: 999px;
+         border: 1px solid var(--line); color: var(--muted); margin: 0 6px 6px 0; background: var(--panel2); }
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  td { padding: 8px 6px; border-bottom: 1px solid var(--line); color: var(--muted); vertical-align: top; }
+  td:first-child { color: var(--ink); font-family: "JetBrains Mono", Menlo, monospace; font-size: 13px; }
+  td:last-child { text-align: right; color: var(--amber); font-weight: 700; white-space: nowrap; }
+  ul { padding-left: 18px; } li { margin-bottom: 6px; }
+  .num { display: inline-flex; width: 30px; height: 30px; border-radius: 50%; align-items: center; justify-content: center;
+         font-weight: 800; font-size: 15px; color: #0b1020; margin-right: 10px; flex: none; }
+  .row { display: flex; align-items: flex-start; }
+  svg text { font-family: "Inter", "Helvetica Neue", Arial, sans-serif; }
+</style>
+</head>
+<body>
+
+<!-- ============ PAGE 1: OVERVIEW ============ -->
+<section class="page">
+  <div class="kicker">Antfly · Document enrichment · 1 / 4</div>
+  <h1>From PDF bytes<br>to searchable pages.</h1>
+  <p class="lede">How Antfly turns a PDF into OCR text, chunks and page vectors — without ever buffering the whole document, sharing a mutable parser across threads, or letting one bad page sink the rest.</p>
+
+  <svg width="1056" height="720" viewBox="0 0 1056 720" style="margin-top:34px">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#6b78a8"/></marker>
+    </defs>
+    <!-- spine -->
+    <path d="M528 20 V700" stroke="#2a3a6e" stroke-width="2" stroke-dasharray="4 6"/>
+    <!-- stages -->
+    <g font-size="15">
+      <!-- 1 -->
+      <rect x="20" y="0" width="470" height="70" rx="14" fill="#121a33" stroke="#ffb547"/>
+      <circle cx="528" cy="35" r="16" fill="#ffb547"/><text x="528" y="41" text-anchor="middle" font-weight="800" fill="#0b1020">1</text>
+      <text x="40" y="30" fill="#e8ecff" font-weight="700" font-size="18">Inspect &amp; pick OCR candidates</text>
+      <text x="40" y="54" fill="#9aa6d4">Born-digital pages that pass quality checks never render.</text>
+      <!-- 2 -->
+      <rect x="566" y="88" width="470" height="70" rx="14" fill="#121a33" stroke="#ffb547"/>
+      <circle cx="528" cy="123" r="16" fill="#ffb547"/><text x="528" y="129" text-anchor="middle" font-weight="800" fill="#0b1020">2</text>
+      <text x="586" y="118" fill="#e8ecff" font-weight="700" font-size="18">Parse once, fork per worker</text>
+      <text x="586" y="142" fill="#9aa6d4">Immutable RenderForkTemplate → private readers.</text>
+      <!-- 3 -->
+      <rect x="20" y="176" width="470" height="70" rx="14" fill="#121a33" stroke="#34d6c3"/>
+      <circle cx="528" cy="211" r="16" fill="#34d6c3"/><text x="528" y="217" text-anchor="middle" font-weight="800" fill="#0b1020">3</text>
+      <text x="40" y="206" fill="#e8ecff" font-weight="700" font-size="18">Bounded multi-page render call</text>
+      <text x="40" y="230" fill="#9aa6d4">Request-ordered results, one payload or failure each.</text>
+      <!-- 4 -->
+      <rect x="566" y="264" width="470" height="70" rx="14" fill="#121a33" stroke="#34d6c3"/>
+      <circle cx="528" cy="299" r="16" fill="#34d6c3"/><text x="528" y="305" text-anchor="middle" font-weight="800" fill="#0b1020">4</text>
+      <text x="586" y="294" fill="#e8ecff" font-weight="700" font-size="18">Admission-controlled parallelism</text>
+      <text x="586" y="318" fill="#9aa6d4">min(requested, operator, memory, pages left).</text>
+      <!-- 5 -->
+      <rect x="20" y="352" width="470" height="70" rx="14" fill="#121a33" stroke="#a68bff"/>
+      <circle cx="528" cy="387" r="16" fill="#a68bff"/><text x="528" y="393" text-anchor="middle" font-weight="800" fill="#0b1020">5</text>
+      <text x="40" y="382" fill="#e8ecff" font-weight="700" font-size="18">Fill one render/inference window</text>
+      <text x="40" y="406" fill="#9aa6d4">Item, byte, pixel &amp; working-set caps — never whole-doc.</text>
+      <!-- 6 -->
+      <rect x="566" y="440" width="470" height="70" rx="14" fill="#121a33" stroke="#a68bff"/>
+      <circle cx="528" cy="475" r="16" fill="#a68bff"/><text x="528" y="481" text-anchor="middle" font-weight="800" fill="#0b1020">6</text>
+      <text x="586" y="470" fill="#e8ecff" font-weight="700" font-size="18">Binary media handoff</text>
+      <text x="586" y="494" fill="#9aa6d4">Borrowed RGBA8 / attachments — no base64 JSON.</text>
+      <!-- 7 -->
+      <rect x="20" y="528" width="470" height="70" rx="14" fill="#121a33" stroke="#ff6f91"/>
+      <circle cx="528" cy="563" r="16" fill="#ff6f91"/><text x="528" y="569" text-anchor="middle" font-weight="800" fill="#0b1020">7</text>
+      <text x="40" y="558" fill="#e8ecff" font-weight="700" font-size="18">Execute the native batch</text>
+      <text x="40" y="582" fill="#9aa6d4">LoadedReader.readBatch · batched encoder + KV decoder.</text>
+      <!-- 8 -->
+      <rect x="566" y="616" width="470" height="70" rx="14" fill="#121a33" stroke="#ff6f91"/>
+      <circle cx="528" cy="651" r="16" fill="#ff6f91"/><text x="528" y="657" text-anchor="middle" font-weight="800" fill="#0b1020">8</text>
+      <text x="586" y="646" fill="#e8ecff" font-weight="700" font-size="18">Merge by page_number &amp; persist</text>
+      <text x="586" y="670" fill="#9aa6d4">Quality-gated selection, then units, chunks, vectors.</text>
+    </g>
+    <g font-family="JetBrains Mono, Menlo, monospace" font-size="12" fill="#6b78a8">
+      <text x="20" y="130">PREPARE</text><text x="20" y="146" fill="#ffb547">PreparedDocument</text>
+      <text x="566" y="215">RENDER</text><text x="566" y="231" fill="#34d6c3">zig/lib/pdf</text>
+      <text x="566" y="390">SCHEDULE</text><text x="566" y="406" fill="#a68bff">enrichment_runtime</text>
+      <text x="20" y="655">INFER + PUBLISH</text><text x="20" y="671" fill="#ff6f91">inference Node</text>
+    </g>
+  </svg>
+
+  <div class="grid g4" style="margin-top:26px">
+    <div class="panel stat"><b>~51k</b><span>lines of pure Zig in <code>zig/lib/pdf</code> — parser, fonts, decoders, rasterizer</span></div>
+    <div class="panel stat"><b>8</b><span>pages per default OCR window, matching Florence's native batch</span></div>
+    <div class="panel stat"><b>2,048</b><span>default page ceiling per document (hard max 16,384)</span></div>
+    <div class="panel stat"><b>1</b><span>render window retained per doc (+1 admitted prefetch)</span></div>
+  </div>
+
+  <div class="foot"><span>Source: zig/PDF.md · Bounded document preparation &amp; multimodal inference</span><span>antfly.io</span></div>
+</section>
+
+<!-- ============ PAGE 2: PARSE + RENDER ============ -->
+<section class="page">
+  <div class="kicker" style="color:var(--teal)">Stages 1–4 · Parse &amp; render · 2 / 4</div>
+  <h1>One parse.<br>Many private renderers.</h1>
+  <p class="lede"><code>PdfRenderSession</code> isn't thread-safe — so it isn't shared. It discovers the page tree once, freezes an immutable <code>RenderForkTemplate</code>, and every worker calls <code>Reader.forkForRendering</code> to get its own allocator, caches and graphics state.</p>
+
+  <svg width="1056" height="380" viewBox="0 0 1056 380" style="margin-top:28px">
+    <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#6b78a8"/></marker></defs>
+    <!-- source -->
+    <rect x="0" y="130" width="190" height="120" rx="14" fill="#121a33" stroke="#2a3a6e"/>
+    <text x="95" y="168" text-anchor="middle" fill="#e8ecff" font-weight="700" font-size="17">PDF source</text>
+    <text x="95" y="192" text-anchor="middle" fill="#9aa6d4" font-size="13">source lease</text>
+    <text x="95" y="212" text-anchor="middle" fill="#9aa6d4" font-size="13">SHA-256 digest</text>
+    <path d="M190 190 H250" stroke="#6b78a8" stroke-width="2" marker-end="url(#a2)"/>
+    <!-- template -->
+    <rect x="254" y="80" width="250" height="220" rx="14" fill="#122a33" stroke="#34d6c3" stroke-width="2"/>
+    <text x="379" y="114" text-anchor="middle" fill="#34d6c3" font-weight="800" font-size="17">SHARED · IMMUTABLE</text>
+    <g font-size="14" fill="#c3cbef">
+      <text x="276" y="148">• object tables (xref)</text>
+      <text x="276" y="176">• page-tree structure</text>
+      <text x="276" y="204">• source bytes</text>
+      <text x="276" y="232">• resource descriptions</text>
+      <text x="276" y="260">• frozen lazy caches</text>
+    </g>
+    <!-- forks -->
+    <g>
+      <path d="M504 150 C560 150 560 60 610 60" stroke="#6b78a8" stroke-width="2" fill="none" marker-end="url(#a2)"/>
+      <path d="M504 190 C560 190 560 160 610 160" stroke="#6b78a8" stroke-width="2" fill="none" marker-end="url(#a2)"/>
+      <path d="M504 210 C560 210 560 260 610 260" stroke="#6b78a8" stroke-width="2" fill="none" marker-end="url(#a2)"/>
+      <path d="M504 240 C560 240 560 350 610 350" stroke="#6b78a8" stroke-width="2" fill="none" marker-end="url(#a2)"/>
+    </g>
+    <g font-size="13">
+      <rect x="614" y="32" width="240" height="56" rx="10" fill="#18234a" stroke="#ff6f91"/>
+      <text x="630" y="56" fill="#e8ecff" font-weight="700">worker 0 · page 3</text><text x="630" y="76" fill="#9aa6d4">private reader + heap</text>
+      <rect x="614" y="132" width="240" height="56" rx="10" fill="#18234a" stroke="#ff6f91"/>
+      <text x="630" y="156" fill="#e8ecff" font-weight="700">worker 1 · page 4</text><text x="630" y="176" fill="#9aa6d4">private reader + heap</text>
+      <rect x="614" y="232" width="240" height="56" rx="10" fill="#18234a" stroke="#ff6f91"/>
+      <text x="630" y="256" fill="#e8ecff" font-weight="700">worker 2 · page 7</text><text x="630" y="276" fill="#9aa6d4">private reader + heap</text>
+      <rect x="614" y="322" width="240" height="56" rx="10" fill="#18234a" stroke="#ff6f91"/>
+      <text x="630" y="346" fill="#e8ecff" font-weight="700">worker 3 · page 9</text><text x="630" y="366" fill="#9aa6d4">private reader + heap</text>
+    </g>
+    <text x="874" y="110" fill="#ff6f91" font-weight="800" font-size="14">TASK-LOCAL</text>
+    <g font-size="13" fill="#9aa6d4">
+      <text x="874" y="136">decoded streams</text>
+      <text x="874" y="158">graphics stacks</text>
+      <text x="874" y="180">font mutation</text>
+      <text x="874" y="202">image / transparency</text>
+      <text x="874" y="224">encoder state</text>
+      <text x="874" y="262" fill="#6b78a8">BackendRuntime PDF lane:</text>
+      <text x="874" y="282" fill="#6b78a8">4 workers · queue 8</text>
+      <text x="874" y="302" fill="#6b78a8">512 MiB window scratch</text>
+    </g>
+  </svg>
+
+  <div class="grid g2" style="margin-top:26px">
+    <div class="panel">
+      <h2>What the Zig reader decodes</h2>
+      <h3 style="color:var(--ink)">Stream filters</h3>
+      <div style="margin:8px 0 14px">
+        <span class="tag">FlateDecode</span><span class="tag">LZWDecode</span><span class="tag">ASCII85</span><span class="tag">ASCIIHex</span><span class="tag">RunLength</span><span class="tag">DCT (JPEG)</span><span class="tag">JPX (JPEG 2000)</span><span class="tag">JBIG2</span><span class="tag">CCITTFax</span>
+      </div>
+      <h3 style="color:var(--ink)">Fonts</h3>
+      <div style="margin:8px 0 14px">
+        <span class="tag">Type1 (cleartext + eexec)</span><span class="tag">TrueType</span><span class="tag">CFF</span><span class="tag">OpenType/CFF</span><span class="tag">Type3</span><span class="tag">Type0 composite</span><span class="tag">ToUnicode + ligatures</span>
+      </div>
+      <p>Simple Type1/TrueType fonts stay on one-byte codes even when an oversized ToUnicode codespace suggests otherwise; Type0 keeps multibyte decoding. Image streaming keeps native RGBA plus predictor rows instead of full decoded colour &amp; soft-mask planes — a 98.7 MB decoded image that used to fail the 64 MiB stream limit now renders pixel-exact.</p>
+    </div>
+    <div class="panel">
+      <h2>Every page is priced before it renders</h2>
+      <div class="mono" style="background:#0b1020;border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-size:13.5px;line-height:1.7;color:#c3cbef">
+        page_weight =<br>
+        &nbsp;&nbsp;RGBA output<br>
+        &nbsp;+ resampling scratch<br>
+        &nbsp;+ drawing / compositing scratch<br>
+        &nbsp;+ bounded stream-decode reservation<br>
+        &nbsp;+ encoded PNG estimate<br>
+        &nbsp;+ retained request bytes
+      </div>
+      <p style="margin-top:12px">Estimates are conservative; a hard <code>BudgetedAllocator</code> enforces the truth. A tighter pixel cap <b style="color:var(--ink)">lowers DPI rather than rejecting</b> a page. Scratch pressure only reduces concurrency — it never changes prepared geometry. Each doc records its measured scratch peak + 12.5% as a hint for the next window.</p>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:20px">
+    <table>
+      <tr><td>render_dpi / render_resolution</td><td>Rasterize at requested DPI, then model preprocessing (<code>model_input</code> is opt-in)</td><td>150 · requested_dpi</td></tr>
+      <tr><td>max_rendered_pixels / dimension</td><td>Per-page spatial caps</td><td>40 MP · 4096 px</td></tr>
+      <tr><td>OCR_RENDER_INFLIGHT_PIXELS / BYTES</td><td>One concurrent render wave</td><td>50 MP · 256 MiB</td></tr>
+      <tr><td>OCR_RENDER_PARALLEL_PAGES</td><td>Never derived from CPU count; clamped 1..8</td><td>1</td></tr>
+    </table>
+  </div>
+
+  <div class="foot"><span>zig/lib/pdf/src/{reader,render,render_heap,jbig2}.zig · renderParsedPagesBatchAlloc</span><span>2 / 4</span></div>
+</section>
+
+<!-- ============ PAGE 3: SCHEDULE + INFER ============ -->
+<section class="page">
+  <div class="kicker" style="color:var(--violet)">Stages 5–7 · Windows &amp; inference · 3 / 4</div>
+  <h1>Render the next window<br>while the model reads this one.</h1>
+  <p class="lede">Rendering never races ahead of inference across the whole document. A double-buffered loop overlaps CPU rendering of window N+1 with GPU inference on window N — and the second window must win its own composite memory lease first.</p>
+
+  <svg width="1056" height="250" viewBox="0 0 1056 250" style="margin-top:30px">
+    <text x="0" y="62" fill="#9aa6d4" font-size="15" font-weight="700">CPU render</text>
+    <text x="0" y="142" fill="#9aa6d4" font-size="15" font-weight="700">Model infer</text>
+    <g font-size="14" font-weight="700" fill="#0b1020">
+      <rect x="130" y="36" width="210" height="44" rx="10" fill="#34d6c3"/><text x="235" y="64" text-anchor="middle">window N</text>
+      <rect x="350" y="36" width="210" height="44" rx="10" fill="#34d6c3"/><text x="455" y="64" text-anchor="middle">window N+1</text>
+      <rect x="570" y="36" width="210" height="44" rx="10" fill="#34d6c3"/><text x="675" y="64" text-anchor="middle">window N+2</text>
+      <rect x="790" y="36" width="210" height="44" rx="10" fill="#34d6c3" opacity=".35"/><text x="895" y="64" text-anchor="middle">…</text>
+      <rect x="350" y="116" width="210" height="44" rx="10" fill="#a68bff"/><text x="455" y="144" text-anchor="middle">window N</text>
+      <rect x="570" y="116" width="210" height="44" rx="10" fill="#a68bff"/><text x="675" y="144" text-anchor="middle">window N+1</text>
+      <rect x="790" y="116" width="210" height="44" rx="10" fill="#a68bff"/><text x="895" y="144" text-anchor="middle">window N+2</text>
+    </g>
+    <path d="M130 196 H1000" stroke="#2a3a6e" stroke-width="2"/>
+    <g font-family="JetBrains Mono, Menlo, monospace" font-size="12.5" fill="#6b78a8">
+      <text x="130" y="222">prefetch_batches = 1 (default for OCR + visual embedding)</text>
+      <text x="130" y="242">prefetch_batches = 0 → strict acquire · render · infer · release</text>
+      <text x="620" y="242">&gt;1 → clamped (would recreate whole-doc buffering)</text>
+    </g>
+  </svg>
+
+  <div class="grid g2" style="margin-top:18px">
+    <div class="panel">
+      <h2>Deadlock-free resource order</h2>
+      <div class="row" style="margin:10px 0"><span class="num" style="background:var(--amber)">1</span><p><b style="color:var(--ink)">Document extraction working-set lease</b><br>parse, plan, coordinator state — all budgeted</p></div>
+      <div class="row" style="margin:10px 0"><span class="num" style="background:var(--teal)">2</span><p><b style="color:var(--ink)">Render-window lease</b><br>scratch may be partially granted; output peak required in full</p></div>
+      <div class="row" style="margin:10px 0"><span class="num" style="background:var(--violet)">3</span><p><b style="color:var(--ink)">Inference queue units</b><br>only after the window is ready — never held while waiting on renderers</p></div>
+      <p style="margin-top:6px">Released in reverse. If inference is saturated, rendering simply stops at the admitted window.</p>
+    </div>
+    <div class="panel">
+      <h2>Two-level scheduling</h2>
+      <p><b style="color:var(--ink)">Antfly owns the logical queue.</b> Requests are partitioned by execution compatibility <i>before</i> media is materialized: interleaved <code>A,B,A,B</code> become <code>A,A</code> + <code>B,B</code>. Compatibility = model generation, task, provider scope, prompt/schema, input representation and resource class — not just model name.</p>
+      <p style="margin-top:10px"><b style="color:var(--ink)">The inference node owns physical execution.</b> It fuses eligible work across multiple Antfly clients, admits against the loaded model and device, and dispatches through the task's executor. Borrowed page attachments carry item/source/page identity, so pages from <i>different documents</i> can share one native batch.</p>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:20px">
+    <h2>Inside a native Florence batch</h2>
+    <svg width="1010" height="150" viewBox="0 0 1010 150">
+      <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#6b78a8"/></marker></defs>
+      <g font-size="14">
+        <rect x="0" y="20" width="180" height="90" rx="12" fill="#18234a" stroke="#2a3a6e"/>
+        <text x="90" y="52" text-anchor="middle" fill="#e8ecff" font-weight="700">8 page rasters</text>
+        <text x="90" y="74" text-anchor="middle" fill="#9aa6d4">borrowed RGBA8</text>
+        <text x="90" y="94" text-anchor="middle" fill="#9aa6d4">from ≥1 documents</text>
+        <path d="M180 65 H218" stroke="#6b78a8" stroke-width="2" marker-end="url(#a3)"/>
+        <rect x="222" y="20" width="200" height="90" rx="12" fill="#18234a" stroke="#34d6c3"/>
+        <text x="322" y="52" text-anchor="middle" fill="#e8ecff" font-weight="700">Preprocess</text>
+        <text x="322" y="74" text-anchor="middle" fill="#9aa6d4">decode · resize · normalize</text>
+        <text x="322" y="94" text-anchor="middle" fill="#9aa6d4">outside the model lock</text>
+        <path d="M422 65 H460" stroke="#6b78a8" stroke-width="2" marker-end="url(#a3)"/>
+        <rect x="464" y="20" width="180" height="90" rx="12" fill="#18234a" stroke="#a68bff"/>
+        <text x="554" y="52" text-anchor="middle" fill="#e8ecff" font-weight="700">Batched encoder</text>
+        <text x="554" y="74" text-anchor="middle" fill="#9aa6d4">one forward pass</text>
+        <text x="554" y="94" text-anchor="middle" fill="#9aa6d4">CUDA / Metal</text>
+        <path d="M644 65 H682" stroke="#6b78a8" stroke-width="2" marker-end="url(#a3)"/>
+        <rect x="686" y="20" width="320" height="90" rx="12" fill="#18234a" stroke="#ff6f91"/>
+        <text x="846" y="48" text-anchor="middle" fill="#e8ecff" font-weight="700">Incremental KV decoder</text>
+        <text x="846" y="70" text-anchor="middle" fill="#9aa6d4">mixed-EOS: compact KV to unfinished rows</text>
+        <text x="846" y="92" text-anchor="middle" fill="#9aa6d4">CUDA fused LM-head + argmax</text>
+      </g>
+      <text x="0" y="140" fill="#6b78a8" font-size="13" font-family="JetBrains Mono, Menlo, monospace">fallback ladder: batched KV → full batched decoder → serial reader (documented errors only) · result count must equal image count</text>
+    </svg>
+  </div>
+
+  <div class="foot"><span>enrichment_runtime.zig · LoadedReader.readBatch · pkg/inference/BATCHING.md</span><span>3 / 4</span></div>
+</section>
+
+<!-- ============ PAGE 4: CORRECTNESS + FAILURE ============ -->
+<section class="page">
+  <div class="kicker" style="color:var(--rose)">Stage 8 · Correctness &amp; failure · 4 / 4</div>
+  <h1>OCR has to earn<br>its place on the page.</h1>
+  <p class="lede">Results are joined by <code>page_number</code>, never completion order. A page can't be persisted as OCRed until its output passes validation <i>and</i> beats the embedded text on quality.</p>
+
+  <div class="grid g2" style="margin-top:30px">
+    <div class="panel">
+      <h2>Selection rules</h2>
+      <ul>
+        <li>Empty embedded text can't beat meaningful OCR.</li>
+        <li>Empty, punctuation-only and <b style="color:var(--ink)">prompt-echo</b> OCR is always rejected.</li>
+        <li>A short transcription can't replace substantial embedded content.</li>
+        <li>Both pass quality? <b style="color:var(--ink)">Keep the embedded text</b> — "longer" isn't "better".</li>
+        <li>Quality sampling uses bounded, deterministically offset intervals: a spaced heading can't condemn good body text; a clean prefix can't hide later corruption.</li>
+        <li>Selected-but-weak OCR is flagged <code>ocr_selected_low_quality</code>.</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h2>Three failure classes</h2>
+      <div style="border-left:4px solid var(--amber);padding-left:14px;margin:10px 0 14px">
+        <h3 style="color:var(--amber)">Per-page permanent</h3>
+        <p>Malformed content stream, over-limit page, trivial OCR. Recorded; valid siblings continue.</p>
+      </div>
+      <div style="border-left:4px solid var(--violet);padding-left:14px;margin-bottom:14px">
+        <h3 style="color:var(--violet)">Batch / provider</h3>
+        <p>Count mismatch, unsupported shape. Only that microbatch retries serially — with the reason recorded.</p>
+      </div>
+      <div style="border-left:4px solid var(--rose);padding-left:14px">
+        <h3 style="color:var(--rose)">Systemic retryable</h3>
+        <p>Capacity, shutdown, memory pressure. Cancel <i>and join</i> every render task, then hand back to the durable enrichment worker.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:20px">
+    <h2>"Embed this PDF" is never one implicit vector</h2>
+    <div class="grid g4" style="margin-top:10px;gap:14px">
+      <div style="background:var(--panel2);border-radius:12px;padding:14px"><h3>Text chunks</h3><p>one vector per extracted chunk</p></div>
+      <div style="background:var(--panel2);border-radius:12px;padding:14px"><h3>Page images</h3><p>one visual vector per rendered page</p></div>
+      <div style="background:var(--panel2);border-radius:12px;padding:14px"><h3>Both</h3><p>separate named spaces, never mixed</p></div>
+      <div style="background:var(--panel2);border-radius:12px;padding:14px"><h3>Doc-level</h3><p>only via a named, versioned reducer</p></div>
+    </div>
+    <p style="margin-top:14px">Page-image identity <code>antfly-pdf-page-embedding-v4</code> hashes the source digest &amp; page, DPI &amp; resolution policy, pixel/dimension caps, renderer ceilings, decoder limits, transport, and resolved image transform. Change any of them and staged + published vectors are invalidated. One missing vector fails the whole document attempt — partial responses can't silently shrink what's searchable.</p>
+  </div>
+
+  <div class="grid g4" style="margin-top:20px">
+    <div class="panel stat"><b style="color:var(--lime)">462</b><span>PDF tests passing in Debug and ReleaseFast</span></div>
+    <div class="panel stat"><b style="color:var(--lime)">51/51</b><span>pages, forced-OCR qualification cohort (academic, admin, law) — zero OCR failures</span></div>
+    <div class="panel stat"><b style="color:var(--lime)">0 px</b><span>diff vs. serial reference at 150 DPI (1241×1754) with streaming images</span></div>
+    <div class="panel stat"><b style="color:var(--lime)">12</b><span>required invariants — e.g. a batch must never silently become serial</span></div>
+  </div>
+
+  <div class="foot"><span>Qualification: scripts/bench/pdf/RESULTS-2026-09-09-STREAMING.md (internal engineering checks, not accuracy claims)</span><span>4 / 4</span></div>
+</section>
+
+</body>
+</html>
