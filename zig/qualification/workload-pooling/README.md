@@ -335,12 +335,22 @@ This is joined-restart evidence. Crash/power-loss durability and comparisons
 across all engines require their own runs. This profile checks status progress;
 operator-policy drain testing remains in the existing dedicated profiles.
 
-File-engine qualification remains open. The same changing-write workload exposes
-retained immutable-artifact lease descriptors and intermittent
-`InvalidSourceSnapshot` query failures, reproduced with the cached server from
-before HTTP batch scheduling was integrated. Keep the descriptor-recovery and
-unexpected-server-error gates enabled while completing that production path.
-A passing directory-engine receipt does not qualify the file engine.
+Admission-aware backend batch reads, scoped reads and cursor opening use the
+owning runtime's checked dispatcher, matching ordinary backend reads. Raw Zig
+error identities cannot cross storage archives: contention previously surfaced
+as `InvalidSourceSnapshot` instead of backpressure. Synchronous admission relays
+preserve the caller's original rejection, discard partial values and retire a
+cursor returned after rejection. Focused dispatcher tests cover those paths;
+a native file-engine mixed-load run completed every phase without unexpected
+server errors and with query, write and slow-reader progress.
+
+File-engine qualification remains open. That run still exceeded descriptor
+recovery limits for immutable-artifact leases, so the launcher did not perform
+its restart probe. The unchanged revision also reproduces the retained-cursor
+suite's normalization allocation-determinism and predecision memory-accounting
+failures. Preserve these failures and the existing resource, server-error and
+restart gates while completing the production path. A passing directory-engine
+receipt does not qualify the file engine.
 
 Directory overload/restart has a passing native receipt, but repeatability is
 still open: a repeat of the same binary and semantically identical harness

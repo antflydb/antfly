@@ -431,7 +431,10 @@ pub const ReadScope = struct {
         errdefer @memset(values, null);
         try control.checkpoint();
         if (self.vtable.get_many_sorted_into_with_admission) |read| {
-            try read(self.ptr, keys, buffers, values, control);
+            var relay: read_admission.ErrorRelay = .{};
+            const borrowed = try relay.bind(control);
+            BoundaryAbi.call("get_many_sorted_into_with_admission", self.boundary_dispatch, read, .{ self.ptr, keys, buffers, values, borrowed }) catch |err| return relay.rejection orelse err;
+            if (relay.rejection) |err| return err;
         } else {
             try self.getManySortedWithAdmission(keys, values, control);
             for (buffers, values) |buffer, *value| if (value.*) |bytes| {
@@ -462,7 +465,10 @@ pub const ReadScope = struct {
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         }
         const get_many = self.vtable.get_many_sorted_with_admission orelse return error.ExecutionWaitUnsupported;
-        try get_many(self.ptr, keys, values, control);
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        BoundaryAbi.call("get_many_sorted_with_admission", self.boundary_dispatch, get_many, .{ self.ptr, keys, values, borrowed }) catch |err| return relay.rejection orelse err;
+        if (relay.rejection) |err| return err;
         try control.checkpoint();
     }
 
@@ -707,7 +713,10 @@ pub const ReadTxn = struct {
         try control.checkpoint();
 
         const get_many = self.vtable.get_many_sorted_with_admission orelse return error.ExecutionWaitUnsupported;
-        try get_many(self.ptr, keys, values, control);
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        BoundaryAbi.call("get_many_sorted_with_admission", self.boundary_dispatch, get_many, .{ self.ptr, keys, values, borrowed }) catch |err| return relay.rejection orelse err;
+        if (relay.rejection) |err| return err;
         try control.checkpoint();
     }
 
@@ -718,8 +727,11 @@ pub const ReadTxn = struct {
     pub fn openCursorWithAdmission(self: *ReadTxn, control: read_admission.Port) !Cursor {
         try control.checkpoint();
         const open = self.vtable.open_cursor_with_admission orelse return error.ExecutionWaitUnsupported;
-        var cursor = try open(self.allocator, self.ptr, control);
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        var cursor = BoundaryAbi.call("open_cursor_with_admission", self.boundary_dispatch, open, .{ self.allocator, self.ptr, borrowed }) catch |err| return relay.rejection orelse err;
         errdefer cursor.close();
+        if (relay.rejection) |err| return err;
         try control.checkpoint();
         return cursor;
     }
@@ -811,7 +823,10 @@ pub const ProbeTxn = struct {
         errdefer @memset(values, null);
         try control.checkpoint();
         const get_many = self.vtable.get_many_sorted_with_admission orelse return error.ExecutionWaitUnsupported;
-        try get_many(self.ptr, keys, values, control);
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        BoundaryAbi.call("get_many_sorted_with_admission", self.boundary_dispatch, get_many, .{ self.ptr, keys, values, borrowed }) catch |err| return relay.rejection orelse err;
+        if (relay.rejection) |err| return err;
         try control.checkpoint();
     }
 
@@ -4459,4 +4474,110 @@ test "owned namespace boundary key cursor preserves ignored original errors and 
     Fixture.rejected = false;
     table.begin_owned_key_cursor = null;
     try std.testing.expectError(error.ExecutionWaitUnsupported, store.beginOwnedKeyCursor(a, control));
+}
+
+test "retained metadata read admission dispatches errors and rejects partial foreign results" {
+    const Fixture = struct {
+        cause: anyerror = error.Backpressured,
+        reject_original: bool = false,
+        rejected: bool = false,
+        ignore_rejection: bool = false,
+        closed: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return error.TestOriginalReadRejection;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_original) {
+                self.rejected = true;
+                return error.TestOriginalReadRejection;
+            }
+            return self.cause;
+        }
+        fn fail(raw: *anyopaque, control: read_admission.Port) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            control.waitForProgress() catch |err| {
+                if (!self.ignore_rejection) return err;
+            };
+        }
+        fn many(raw: *anyopaque, _: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+            values[0] = "partial";
+            try fail(raw, control);
+        }
+        fn into(raw: *anyopaque, keys: []const []const u8, _: []const []u8, values: []?[]const u8, control: read_admission.Port) !void {
+            return many(raw, keys, values, control);
+        }
+        fn abort(_: Allocator, _: *anyopaque) void {}
+        fn get(_: *anyopaque, _: []const u8) ![]const u8 {
+            return error.NotFound;
+        }
+        fn cursor(a: Allocator, raw: *anyopaque) !Cursor {
+            return .{ .allocator = a, .ptr = raw, .vtable = &.{ .close = close, .first = entry, .last = entry, .next = entry, .prev = entry, .seek_at_or_after = seek, .seek_at_or_before = seek } };
+        }
+        fn open(a: Allocator, raw: *anyopaque, control: read_admission.Port) !Cursor {
+            try fail(raw, control);
+            return cursor(a, raw);
+        }
+        fn close(_: Allocator, raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+        }
+        fn entry(_: *anyopaque) !?Entry {
+            return null;
+        }
+        fn seek(raw: *anyopaque, _: []const u8) !?Entry {
+            return entry(raw);
+        }
+    };
+    const ReadDispatch = TestForeignDispatch(ReadTxn);
+    const ScopeDispatch = TestForeignDispatch(ReadScope);
+    const ProbeDispatch = TestForeignDispatch(ProbeTxn);
+    ReadDispatch.calls = 0;
+    ScopeDispatch.calls = 0;
+    ProbeDispatch.calls = 0;
+    var state: Fixture = .{};
+    const payload: read_admission.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = Fixture.check, .wait_for_progress = Fixture.wait } };
+    const control = read_admission.Port.init(&payload);
+    var read: ReadTxn = .{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &.{ .abort = Fixture.abort, .get = Fixture.get, .get_many_sorted_with_admission = Fixture.many, .open_cursor = Fixture.cursor, .open_cursor_with_admission = Fixture.open }, .boundary_dispatch = ReadDispatch.dispatch };
+    var scope: ReadScope = .{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &.{ .close = Fixture.abort, .get = Fixture.get, .get_many_sorted_with_admission = Fixture.many, .get_many_sorted_into_with_admission = Fixture.into }, .boundary_dispatch = ScopeDispatch.dispatch };
+    var probe: ProbeTxn = .{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &.{ .abort = Fixture.abort, .get = Fixture.get, .get_many_sorted_with_admission = Fixture.many }, .boundary_dispatch = ProbeDispatch.dispatch };
+    var values: [1]?[]const u8 = undefined;
+    var buffer: [16]u8 = undefined;
+    for ([_]anyerror{ error.Backpressured, error.Canceled, error.DeadlineExceeded }) |cause| {
+        state.cause = cause;
+        try std.testing.expectError(cause, read.getManySortedWithAdmission(&.{"key"}, &values, control));
+        try std.testing.expect(values[0] == null);
+        try std.testing.expectError(cause, scope.getManySortedWithAdmission(&.{"key"}, &values, control));
+        try std.testing.expect(values[0] == null);
+        try std.testing.expectError(cause, scope.getManySortedIntoWithAdmission(&.{"key"}, &.{&buffer}, &values, control));
+        try std.testing.expect(values[0] == null);
+        try std.testing.expectError(cause, probe.getManySortedWithAdmission(&.{"key"}, &values, control));
+        try std.testing.expect(values[0] == null);
+        try std.testing.expectError(cause, read.openCursorWithAdmission(control));
+    }
+    state.reject_original = true;
+    for ([_]bool{ false, true }) |ignore| {
+        state.ignore_rejection = ignore;
+        state.rejected = false;
+        try std.testing.expectError(error.TestOriginalReadRejection, read.getManySortedWithAdmission(&.{"key"}, &values, control));
+        try std.testing.expect(values[0] == null);
+        state.rejected = false;
+        try std.testing.expectError(error.TestOriginalReadRejection, scope.getManySortedWithAdmission(&.{"key"}, &values, control));
+        try std.testing.expect(values[0] == null);
+        state.rejected = false;
+        try std.testing.expectError(error.TestOriginalReadRejection, scope.getManySortedIntoWithAdmission(&.{"key"}, &.{&buffer}, &values, control));
+        try std.testing.expect(values[0] == null);
+        state.rejected = false;
+        try std.testing.expectError(error.TestOriginalReadRejection, probe.getManySortedWithAdmission(&.{"key"}, &values, control));
+        try std.testing.expect(values[0] == null);
+        state.rejected = false;
+        try std.testing.expectError(error.TestOriginalReadRejection, read.openCursorWithAdmission(control));
+    }
+    try std.testing.expectEqual(@as(usize, 10), ReadDispatch.calls);
+    try std.testing.expectEqual(@as(usize, 10), ScopeDispatch.calls);
+    try std.testing.expectEqual(@as(usize, 5), ProbeDispatch.calls);
+    // A provider that ignores cancellation still transfers a cursor; reject
+    // and close it before any failed call can publish that resource.
+    try std.testing.expectEqual(@as(usize, 1), state.closed);
 }
