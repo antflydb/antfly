@@ -99,6 +99,13 @@ const reusedSearch = api.search({
     limit: 10,
 });
 if (api.searchTotalHits(reusedSearch) !== 2) throw new Error("repeated analyzed field search failed");
+const preservedSearch = api.search({
+    full_text_search: { match: { field: "title", text: "hosted" } },
+    limit: 10,
+});
+if (api.searchHits(preservedSearch).map((hit) => hit._id).join(",") !== "doc:a") {
+    throw new Error("text compaction lost published postings or restored deleted postings");
+}
 
 api.close();
 if (api.exports.antfly_embedded_smoke_run() !== 0) {
