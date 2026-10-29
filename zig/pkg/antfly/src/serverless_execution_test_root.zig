@@ -1653,3 +1653,164 @@ test "serverless execution credential refresh owners and waiters lend capacity w
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
 }
+
+test "serverless execution credential file admission preserves cache ownership and caller authority" {
+    const google = @import("antfly_google");
+    const aws = @import("antfly_credentials").aws;
+    const httpx = @import("httpx");
+    const inference = @import("antfly_inference_execution_context");
+    const Family = enum { google, aws };
+    const Job = struct {
+        family: Family,
+        manager: *google.CredentialManager,
+        cache: *aws.CredentialCache,
+        client: *httpx.Client,
+        path: []const u8,
+        wait: inference.HttpWait,
+        gate_at: usize,
+        ends: usize = 0,
+        ready: std.atomic.Value(bool) = .init(false),
+        release: std.Io.Event = .unset,
+        revoked: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        result: ?*google.CachedTokenSource = null,
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.revoked.load(.acquire)) return error.CredentialFileScopeRevoked;
+        }
+        fn cancelled(raw: *const anyopaque) bool {
+            check(raw) catch return true;
+            return false;
+        }
+        fn originalCheck(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.wait.control().check();
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const control = self.wait.control();
+            try control.wait_begin_fn.?(control.ptr);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.ends += 1;
+            if (self.ends == self.gate_at) {
+                // Real filesystem I/O has completed. Hold only its CPU return,
+                // deterministically exercising reentry rather than OS latency.
+                self.ready.store(true, .release);
+                try self.release.waitTimeout(self.wait.context.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            }
+            const control = self.wait.control();
+            try control.wait_end_fn.?(control.ptr);
+        }
+        fn perform(self: *@This()) !void {
+            const a = std.testing.allocator;
+            const control: httpx.socket.WriteControl = .{ .ptr = self, .check_fn = originalCheck, .wait_begin_fn = begin, .wait_end_fn = end };
+            switch (self.family) {
+                .google => self.result = try self.manager.tokenSourceWithControl(self.path, google.default_scope, .{ .deadline_ns = self.wait.context.deadline_ns, .execution_wait = control }),
+                .aws => {
+                    var credentials = try self.cache.getForSourceWithContextAndIo(a, std.heap.smp_allocator, self.client, self.wait.context.io, "us-east-1", .{ .profile = .{ .name = "admission-fixture", .shared_credentials_file = self.path } }, aws.RequestContext.init(self.wait.context.io, 5000, null).withExecutionWait(control));
+                    defer credentials.deinit(a);
+                    try std.testing.expectEqualStrings("file-access", credentials.access_key_id);
+                },
+            }
+            try self.wait.ready();
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.wait.context.cancellation = .{ .ptr = self, .check_fn = check, .is_cancelled_fn = cancelled };
+            self.perform() catch |err| {
+                self.wait.ready() catch |original| {
+                    self.failure = original;
+                    return;
+                };
+                self.failure = err;
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(Family)) |family| for (0..3) |mode| {
+        const reject = mode != 0;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "credentials", .data = if (family == .google)
+            "{\"type\":\"authorized_user\",\"client_id\":\"client\",\"client_secret\":\"secret\",\"refresh_token\":\"refresh\"}"
+        else
+            "[admission-fixture]\naws_access_key_id=file-access\naws_secret_access_key=file-secret\n" });
+        const path = try tmp.dir.realPathFileAlloc(io, "credentials", alloc);
+        defer alloc.free(path);
+        var manager = google.CredentialManager.init(alloc, io);
+        defer manager.deinit();
+        var cache = aws.CredentialCache{};
+        defer cache.deinit(std.heap.smp_allocator);
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var executions: [2]Runnable.Execution = @splat(.{});
+        defer for (&executions) |*execution| execution.finish();
+        var reads: [2]@import("api/runnable_local_read.zig").Read = undefined;
+        var jobs: [2]Job = undefined;
+        var futures: [2]std.Io.Future(void) = undefined;
+        var active: usize = 0;
+        defer for (futures[0..active]) |*future| future.cancel(io);
+        defer for (jobs[0..active]) |*job| job.release.set(io);
+        const count: usize = if (!reject and family == .google) 2 else 1;
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(4));
+        for (0..count) |index| {
+            try executions[index].startWithSlots(&scheduler, .{ .io = io, .retained_bytes = @import("serverless/catalog/service.zig").CatalogService.Scope.retained_bytes }, .background, if (reject) 2 else 1);
+            reads[index] = .{ .execution = &executions[index], .allocator = alloc };
+            jobs[index] = .{ .family = family, .manager = &manager, .cache = &cache, .client = &client, .path = path, .gate_at = if (mode == 2) 2 else 1, .wait = .{ .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .runnable = (try reads[index].team()).borrow } } };
+            futures[index] = try io.concurrent(Job.run, .{&jobs[index]});
+            active += 1;
+            while (!jobs[index].ready.load(.acquire)) {
+                if (jobs[index].done.load(.acquire)) return jobs[index].failure orelse error.CredentialFileDidNotWait;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CredentialFileDidNotWait;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+        try std.testing.expectEqual(count, scheduler.stats().resource_blocked);
+        try std.testing.expect(manager.mutex.tryLock());
+        manager.mutex.unlock(io);
+        try std.testing.expect(cache.mutex.tryLock());
+        cache.mutex.unlock(io);
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        var control: Runnable.Execution = .{};
+        defer control.finish();
+        try control.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        control.finish();
+        for (jobs[0..count]) |*job| job.release.set(io);
+        if (reject) {
+            while (scheduler.stats().queued == 0) {
+                if (jobs[0].done.load(.acquire)) return jobs[0].failure orelse error.CredentialFileReturnDidNotQueue;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CredentialFileReturnDidNotQueue;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            jobs[0].revoked.store(true, .release);
+            while (!jobs[0].done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CredentialFileReturnDidNotReject;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        } else query.finish();
+        for (0..count) |index| {
+            futures[index].await(io);
+            if (reject) try std.testing.expectEqual(error.CredentialFileScopeRevoked, jobs[index].failure.?) else if (jobs[index].failure) |err| return err;
+        }
+        active = 0;
+        if (family == .google) {
+            try std.testing.expectEqual(@as(usize, if (reject) 0 else 1), manager.sources.count());
+            if (!reject) try std.testing.expect(jobs[0].result.? == jobs[1].result.?);
+        } else {
+            try std.testing.expect(!cache.refreshing);
+            if (reject) try std.testing.expect(cache.cached == null);
+        }
+        query.finish();
+        for (&executions) |*execution| execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}

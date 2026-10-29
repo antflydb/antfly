@@ -313,7 +313,7 @@ pub const Provider = struct {
         provider.project_id = if (options.project_id) |value|
             try allocator.dupe(u8, value)
         else
-            (try vertexProjectIdFromConfigAllocWithControl(allocator, options.credentials_path, options.request_control) orelse return error.MissingVertexCredentials);
+            (try vertexProjectIdFromConfigAllocWithIoAndControl(allocator, options.credentials_path, http.io, options.request_control) orelse return error.MissingVertexCredentials);
         provider.location = try allocator.dupe(u8, options.location);
 
         if (options.bearer_token) |token| {
@@ -1148,11 +1148,16 @@ pub fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]con
 }
 
 pub fn vertexProjectIdFromConfigAllocWithControl(alloc: Allocator, credentials_path: ?[]const u8, control: google_auth.RequestControl) !?[]u8 {
+    return vertexProjectIdFromConfigAllocWithIoAndControl(alloc, credentials_path, null, control);
+}
+
+pub fn vertexProjectIdFromConfigAllocWithIoAndControl(alloc: Allocator, credentials_path: ?[]const u8, io: ?std.Io, control: google_auth.RequestControl) !?[]u8 {
     try control.check();
-    if (credentials_path) |path| {
-        return google_auth.projectIdFromFileAlloc(alloc, path) catch null;
-    }
-    return try google_auth.projectIdFromDefaultCredentialsAllocWithControl(alloc, control);
+    if (credentials_path) |path| return google_auth.projectIdFromFileAllocWithIoAndControl(alloc, path, io, control) catch |err| {
+        try control.check();
+        return if (err == error.OutOfMemory) err else null;
+    };
+    return google_auth.projectIdFromDefaultCredentialsAllocWithIoAndControl(alloc, io, control);
 }
 
 fn appendJsonString(

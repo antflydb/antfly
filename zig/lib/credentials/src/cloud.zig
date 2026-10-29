@@ -102,19 +102,25 @@ pub fn awsLoginKindFromConfig(data: []const u8, profile: []const u8) !AwsLoginKi
 
 /// The returned login_profile is owned by the caller.
 pub fn resolveAwsProfile(alloc: std.mem.Allocator, io: std.Io, profile: []const u8) !AwsProfile {
+    return resolveAwsProfileWithControl(alloc, io, profile, null);
+}
+
+pub fn resolveAwsProfileWithControl(alloc: std.mem.Allocator, io: std.Io, profile: []const u8, control: ?@import("httpx").socket.WriteControl) !AwsProfile {
     try validateProfile(profile);
     const path = if (platform.env.getenv("AWS_CONFIG_FILE")) |value| try alloc.dupe(u8, value) else blk: {
         const home = platform.env.getenv("HOME") orelse return .{ .kind = .none, .login_profile = try alloc.dupe(u8, profile), .requires_export = false };
         break :blk try std.fs.path.join(alloc, &.{ home, ".aws", "config" });
     };
     defer alloc.free(path);
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch |err| switch (err) {
+    const data = @import("controlled_file.zig").readAlloc(alloc, io, path, 1 << 20, control) catch |err| switch (err) {
         error.FileNotFound => return .{ .kind = .none, .login_profile = try alloc.dupe(u8, profile), .requires_export = false },
         else => return err,
     };
     defer alloc.free(data);
     var resolved = try awsProfileFromConfig(data, profile);
     resolved.login_profile = try alloc.dupe(u8, resolved.login_profile);
+    errdefer alloc.free(resolved.login_profile);
+    if (control) |wait| try wait.check();
     return resolved;
 }
 

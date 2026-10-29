@@ -54,3 +54,8 @@ test "google module compiles" {
     _ = CachedTokenSource;
     _ = CredentialManager;
 }
+
+pub const configFromFileAllocWithIoAndControl = auth.configFromFileAllocWithIoAndControl;
+pub const configFromEnvWithIoAndControlAlloc = auth.configFromEnvWithIoAndControlAlloc;
+pub const projectIdFromDefaultCredentialsAllocWithIoAndControl = auth.projectIdFromDefaultCredentialsAllocWithIoAndControl;
+pub const projectIdFromFileAllocWithIoAndControl = auth.projectIdFromFileAllocWithIoAndControl;

@@ -692,3 +692,39 @@ remaining mutation/retention/immutable-artifact provider boundaries, and serial
 graph preparation checkpoints. The original cross-engine resource gates remain
 open, including the file-engine descriptor bound. Full GNU/full qualification
 remains waived; the installed CLI was not rebuilt for this increment.
+
+
+### Maintenance credential-file admission
+
+Normal AWS profile, web-identity and ECS authorization-token file reads, Google
+ADC/configuration and external-account subject-token reads, and Vertex project
+lookup now carry the invocation's execution-wait control. The bounded file
+adapter lends CPU only for physical open/read operations; buffer growth and
+credential parsing run after checked CPU return. A descriptor opened before a
+rejected return is closed with its original filesystem authority, and partially
+read buffers remain owned until success or cleanup. Existing credential-file
+size limits remain enforced, including files requiring several bounded reads.
+
+Google credential-source construction runs outside the manager mutex and uses
+the manager's supplied I/O runtime. Concurrent candidates resolve publication
+under the mutex, then dispose the losing candidate after unlocking. Invocation
+controls are never retained in cached sources. Configuration/project discovery
+also checks caller authority before transferring allocated results.
+
+Evidence: `serverless-credential-files-v3-debug.json` and its log in the cumulative
+receipts: 68 serverless integration tests, 31 local partition tests, 17 AWS and
+14 Google library tests pass; native-borrow, inference-owner and cleanup targets
+reuse unchanged successful results. The new production-loader fixture uses real
+temporary credential files with real scheduler admission. Its deterministic gate
+pauses CPU return after actual open/read completion; it does not simulate slow OS
+storage. It proves query/control progress, unlocked Google/AWS caches, one cached
+source for concurrent Google candidates, rejection before cache publication, and
+retirement of all execution roots/retained-byte charges. The bounded-reader test
+covers chunking, exact limits and overflow. No live cloud identity is involved.
+
+The broader maintenance milestone remains open for AWS vendor-process waits,
+provider/model construction and asset loading, lease renewal, remaining mutation/
+retention/immutable-artifact provider boundaries, and serial graph preparation.
+Cross-engine resource qualification, including the original file-engine descriptor
+gate, remains open. Full GNU/full qualification remains waived; the installed CLI
+was not rebuilt for this increment.
