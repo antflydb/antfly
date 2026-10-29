@@ -379,6 +379,12 @@ pub const HttpHandler = struct {
                 .ingest_batch, .ingest_table_batch => api_service.Service.completionRetainedBytes(),
                 else => 0,
             };
+            // WAL acceptance encodes and appends sequentially. Reserve graph
+            // parallelism only for routes that can materialize/build indexes.
+            const runnable_slots = switch (route) {
+                .ingest_batch, .ingest_table_batch => 1,
+                else => if (class == .write) self.write_runnable_slots else 1,
+            };
             execution.startWithSlots(scheduler, .{
                 .io = self.io orelse return error.MissingBackendRuntimeIo,
                 .native_now_ns = @import("antfly_platform").time.monotonicNs,
@@ -386,7 +392,7 @@ pub const HttpHandler = struct {
                 .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
                 .retained_bytes = @as(u64, requestRetainedBytes()) +| req.body.len +| completion_bytes,
                 .allow_wait = class != .control,
-            }, class, if (class == .write) self.write_runnable_slots else 1) catch |err| {
+            }, class, runnable_slots) catch |err| {
                 try guard.checkpoint();
                 return err;
             };
@@ -12910,6 +12916,9 @@ test "serverless request deadlines preserve accepted WAL and pending publication
     var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .cleanup_slots = 1 });
     defer scheduler.close();
     handler.setIo(std.testing.io);
+    // Both WAL endpoints must fit in the one general slot even when builds
+    // require a larger team. Keep original rejection and acceptance checks.
+    handler.write_runnable_slots = 2;
     const namespace_path = try std.fmt.allocPrint(alloc, "/internal/v1/namespaces/{s}/ingest-batch", .{namespace});
     defer alloc.free(namespace_path);
     const Probe = struct {

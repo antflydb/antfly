@@ -575,7 +575,12 @@ test "retained normalization admission cleans partial output and preserves the s
     const Harness = struct {
         fn For(comptime S: type) type {
             return struct {
-                fn run(alloc: std.mem.Allocator, session: *S) !void {
+                fn run(backing: std.mem.Allocator, session: *S) !void {
+                    // Arena growth must exercise mandatory allocate/copy paths;
+                    // opportunistic in-place growth depends on backing addresses
+                    // and cannot define a deterministic OOM inventory.
+                    var stable: @import("storage/lite/test_allocator.zig").NoResizeAllocator = .{ .backing = backing };
+                    const alloc = stable.allocator();
                     var budget: CancelBudget = .{};
                     var adapter = admission.Adapter(*CancelBudget){ .budget = &budget };
                     const payload = adapter.payload();
@@ -992,7 +997,8 @@ test "retained capture admission predecision pressure preserves producer capacit
             var parent = Manager.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
             defer parent.deinit(std.testing.allocator);
             var manager = Manager.ResourceManager.init(.{ .budgets = budgets, .policies = policies, .identity_allocator = std.testing.allocator });
-            defer manager.deinit(std.testing.allocator);
+            var manager_live = true;
+            defer if (manager_live) manager.deinit(std.testing.allocator);
             try manager.installMemoryParent(parent.memoryParentPort());
             var scheduler = try scheduling.Scheduler.init(.{ .slots = 2 });
             var producer: scheduling.Execution = .{};
@@ -1015,7 +1021,7 @@ test "retained capture admission predecision pressure preserves producer capacit
                 .soft, .soft_wait => 12,
                 else => 21,
             });
-            defer manager.observeUsage(.lsm_in_memory_state, &fixture.charged, 0);
+            defer if (manager_live) manager.observeUsage(.lsm_in_memory_state, &fixture.charged, 0);
             const target = if (mode == .parent_busy) &parent.mutex else &manager.mutex;
             var target_held = mode == .child_busy or mode == .parent_busy;
             if (target_held) try std.testing.expect(target.tryLock());
@@ -1062,11 +1068,16 @@ test "retained capture admission predecision pressure preserves producer capacit
                 target_held = false;
             }
             manager.observeUsage(.lsm_in_memory_state, &fixture.charged, 0);
-            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
-            try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+            // Payload retirement leaves the manager's explicitly owned identity
+            // tables charged in both child and parent until actual destruction.
+            try Manager.metadata_fixture.expectUsage(0, &manager, &.{&manager});
+            try Manager.metadata_fixture.expectUsage(0, &parent, &.{ &parent, &manager });
             producer.finish();
             try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
             try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            manager.deinit(std.testing.allocator);
+            manager_live = false;
+            try Manager.metadata_fixture.expectUsage(0, &parent, &.{&parent});
         }
     }
 }

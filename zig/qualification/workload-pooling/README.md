@@ -371,14 +371,41 @@ descriptor-recovery gate still fails. A diagnostic ownership census matched all
 cache sources and five explicit readers, with no callbacks in flight. The source
 cache and live full-text segments retain storage independently of connections;
 this census does not prove process-wide descriptor bounds or qualify the failed
-gate. The unchanged revision also reproduces the retained-cursor suite's
-normalization allocation-determinism and predecision memory-accounting failures.
-Preserve these failures and the existing resource, server-error and restart
-gates while completing the production path. A passing directory-engine receipt
-does not qualify the file engine.
+gate. The retained-cursor suite's two reproduced baseline failures are now
+resolved in their assertions: normalization OOM enumeration disables optional
+in-place allocator growth, and predecision accounting identifies live manager
+metadata before verifying its release at destruction. All 36 retained-admission
+tests pass without skips or leaks; the failing baseline receipts remain available.
+The resource, server-error and restart gates remain unchanged. A passing
+directory-engine receipt does not qualify the file engine.
 
 Directory overload/restart has a passing native receipt, but repeatability is
 still open: a repeat of the same binary and semantically identical harness
 observed warm-up capacity rejections and no successful slow-reader operation
 in the sustained-overload phase. Preserve these gates rather than treating the
 single passing run as stable qualification of the whole design.
+
+
+## Serverless WAL ingress demand
+
+The namespace and table `ingest-batch` routes reserve one runnable CPU for
+sequential encoding and WAL acceptance. Other write routes retain their
+configured build-team width. Original request cancellation, finite protected
+completion, WAL acknowledgement and response retirement remain in the existing
+owning execution path.
+
+The focused serverless gate covers both WAL handlers with only one general
+slot and a configured two-slot build demand, including original rejection
+identity and durable acknowledgement after foreground rejection. The managed
+native listener also exercises automatic defaults and a two-slot general pool
+with a cooperative competing CPU owner, real FsWal ingestion, background
+publication and exact published document reads. The competing owner checkpoints
+so the scheduler can honor age-protected wide maintenance work; permanently
+pinning a synthetic slot correctly caused bounded capacity rejections.
+
+The production server builds and the focused gate passes. These listener tests
+use local filesystem providers; they do not qualify cloud/distributed providers
+or all serverless maintenance waits. Earlier runs also reproduced intermittent
+H2 disconnect retirement beyond the unchanged five-second assertion. Passing
+runs do not resolve that repeatability issue; preserve the failed receipts and
+the original cleanup limit while investigating frame-reader/response retirement.

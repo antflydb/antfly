@@ -239,6 +239,11 @@ test "serverless server module compiles" {
 }
 
 test "serverless server starts managed runtime and serves listener requests" {
+    try managedListenerFixture(false);
+    try managedListenerFixture(true);
+}
+
+fn managedListenerFixture(contended: bool) !void {
     const alloc = std.testing.allocator;
     const serverless_http_client = @import("../serverless_http_client.zig");
     const api_mod = @import("api/mod.zig");
@@ -270,18 +275,25 @@ test "serverless server starts managed runtime and serves listener requests" {
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
+    var cfg: runtime_mod.BootstrapConfig = .{
+        .artifacts_uri = artifacts_uri,
+        .manifests_uri = manifests_uri,
+        .wal_uri = wal_uri,
+        .progress_uri = progress_uri,
+        .catalog_uri = catalog_uri,
+        .query_cache_dir = null,
+        .tick_interval_ms = 1,
+        .role = .combined,
+        .process_memory_limit_bytes = 64 << 20,
+    };
+    if (contended) {
+        cfg.runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .max_bytes = 2 << 20 };
+        cfg.graph_metric_max_parallelism = 2;
+        cfg.max_request_memory_bytes = 8 << 20;
+        cfg.max_retained_memory_bytes = 8 << 20;
+    }
     var server = try ServerlessServer.init(alloc, std.testing.io, .{
-        .bootstrap = .{
-            .artifacts_uri = artifacts_uri,
-            .manifests_uri = manifests_uri,
-            .wal_uri = wal_uri,
-            .progress_uri = progress_uri,
-            .catalog_uri = catalog_uri,
-            .query_cache_dir = null,
-            .tick_interval_ms = 1,
-            .role = .combined,
-            .process_memory_limit_bytes = 64 << 20,
-        },
+        .bootstrap = cfg,
         .listener = .{},
     });
     defer server.deinit();
@@ -336,12 +348,56 @@ test "serverless server starts managed runtime and serves listener requests" {
 
     var client_exec = raft_transport.StdHttpExecutor.init(alloc, .{});
     defer client_exec.deinit();
-    var client = serverless_http_client.ServerlessHttpClient.init(alloc, client_exec.executor());
+    const Observed = struct {
+        inner: raft_transport.RequestExecutor,
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, req: raft_transport.HttpRequest) !raft_transport.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const response = try self.inner.execute(allocator, req);
+            if (response.status >= 400) std.debug.print("managed listener {s}: HTTP {d}: {s}\n", .{ req.uri, response.status, response.body });
+            return response;
+        }
+    };
+    var observed: Observed = .{ .inner = client_exec.executor() };
+    var client = serverless_http_client.ServerlessHttpClient.init(alloc, .{ .ptr = &observed, .vtable = &.{ .execute = Observed.execute } });
     const tables = client.tables();
 
     var ensure = try tables.ensure(base_uri, "docs", 100);
     defer ensure.deinit(alloc);
     try std.testing.expect(ensure.created);
+
+    // Leave one general slot available: ingestion must progress while a
+    // separate request holds the other slot required by graph build teams.
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Competing = struct {
+        execution: *Runnable.Execution,
+        stop: std.atomic.Value(bool) = .init(false),
+        work: std.atomic.Value(usize) = .init(0),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                // A real CPU owner must checkpoint: permanently pinning one
+                // slot would starve the queued two-slot maintenance team and
+                // correctly activate the scheduler's backfill-age protection.
+                for (0..256) |_| std.atomic.spinLoopHint();
+                self.execution.checkpoint() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                _ = self.work.fetchAdd(1, .release);
+            }
+        }
+    };
+    var competing: Runnable.Execution = .{};
+    defer competing.finish();
+    var cpu: Competing = .{ .execution = &competing };
+    var cpu_future: ?std.Io.Future(void) = null;
+    defer if (cpu_future) |*future| future.cancel(std.testing.io);
+    if (contended) {
+        try std.testing.expectEqual(@as(usize, 2), server.stack.handler.write_runnable_slots);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.config.generalSlots());
+        try competing.start(scheduler, .{ .io = std.testing.io }, .query);
+        cpu_future = try std.testing.io.concurrent(Competing.run, .{&cpu});
+    }
 
     const mutations = [_]api_mod.TableIngestMutation{
         try api_mod.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha\"}"),
@@ -354,6 +410,16 @@ test "serverless server starts managed runtime and serves listener requests" {
     defer ingest.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), ingest.start_lsn);
 
+    // The native listener and FsWal acknowledge while another CPU owner and
+    // the configured two-slot maintenance team share this same scheduler.
+    if (cpu_future) |*future| {
+        cpu.stop.store(true, .release);
+        future.await(std.testing.io);
+        cpu_future = null;
+        if (cpu.failure) |err| return err;
+        try std.testing.expect(cpu.work.load(.acquire) > 0);
+    }
+    competing.finish();
     try waitForPublishedTable(tables, base_uri, "docs", 1, publish_wait_attempts);
 
     var query = try tables.queryPublished(base_uri, "docs");
