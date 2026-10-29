@@ -382,7 +382,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_smoke_mod.link_libc = true;
     capi_smoke_mod.addIncludePath(b.path("pkg/antfly-embedded/include"));
     capi_smoke_mod.addCSourceFile(.{
-        .file = b.path("examples/antfly_c_smoke.c"),
+        .file = b.path("pkg/antfly-embedded/tests/capi_smoke.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     const capi_smoke = b.addExecutable(.{

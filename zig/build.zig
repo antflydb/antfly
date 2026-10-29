@@ -1175,7 +1175,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lite_cli_smoke = b.addExecutable(.{
         .name = "antfly-lite-cli-smoke",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/antfly_lite_cli_smoke.zig"),
+            .root_source_file = b.path("pkg/antfly-embedded/tests/lite_cli_smoke.zig"),
             .target = target,
             .optimize = optimize,
         }),
