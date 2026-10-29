@@ -3407,3 +3407,9 @@ and the controlled Glowworm host-submission assay.
 [The AV register](unified-execution-av-outcomes.md) records shared TL1/TL2
 attention ownership, persistent prepared-weight reuse, the corrected fallback
 output copyback, and original-versus-candidate device and host qualification.
+
+### AW prepared-slot Metal ternary FFN
+
+[The AW register](unified-execution-aw-outcomes.md) records reuse of the shared
+ternary slot contract across attention and FFNs, three persistent projection
+weights, retired raw-weight bridges, and explicit single-row fallback admission.
