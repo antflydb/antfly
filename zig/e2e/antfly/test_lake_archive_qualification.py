@@ -1964,7 +1964,10 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                             ["id", "bucket", "_id", "_type"],
                         )
                         for order_field in ("id", "_id")
-                        for descending in (False, True)
+                        # The public _id tiebreaker contract is ascending.
+                        for descending in (
+                            (False, True) if order_field == "id" else (False,)
+                        )
                     ):
                         response = client.query(
                             {
