@@ -35,7 +35,7 @@ const audited_tests = [_][]const u8{
 // relocatable --build-root. The audit overlays share immutable authored C
 // providers, so retain those providers' canonical identities across workers.
 // Mutable Zig sources and generated paths keep their private workspace roots.
-fn authoredCPath(b: *std.Build, path: std.Build.LazyPath) std.Build.LazyPath {
+fn canonicalAuthoredPath(b: *std.Build, path: std.Build.LazyPath) std.Build.LazyPath {
     const relative = switch (path) {
         .src_path => |source| source.owner.root.joinString(b.allocator, source.sub_path) catch @panic("OOM"),
         .dependency => |source| source.dependency.builder.root.joinString(b.allocator, source.sub_path) catch @panic("OOM"),
@@ -43,24 +43,39 @@ fn authoredCPath(b: *std.Build, path: std.Build.LazyPath) std.Build.LazyPath {
     };
     b.dependOnFileMetadata(path);
     const canonical = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, relative, b.allocator) catch |err|
-        std.debug.panic("cannot identify authored audit C input {s}: {t}", .{ relative, err });
+        std.debug.panic("cannot identify authored audit input {s}: {t}", .{ relative, err });
     return b.graph.cwdRelativePath(canonical);
 }
 
-fn retainAuthoredCIdentities(b: *std.Build, modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+// Anonymous schema imports such as ../openapi.yaml lie outside the explicit
+// Zig build root. Zig hashes those paths absolutely, so relocation alone
+// otherwise recompiles the API owner. These overlays share immutable authored
+// schemas; keep their canonical checkout identity just like C providers.
+fn authoredExternalPath(b: *std.Build, path: std.Build.LazyPath) std.Build.LazyPath {
+    switch (path) {
+        .src_path => |source| {
+            if (std.mem.startsWith(u8, source.sub_path, "../")) return canonicalAuthoredPath(b, path);
+        },
+        else => {},
+    }
+    return path;
+}
+
+fn retainAuthoredIdentities(b: *std.Build, modules: *std.AutoHashMap(*std.Build.Module, void)) void {
     var iterator = modules.keyIterator();
     while (iterator.next()) |entry| {
         const module = entry.*;
+        if (module.root_source_file) |path| module.root_source_file = authoredExternalPath(b, path);
         var objects: std.ArrayList(std.Build.Module.LinkObject) = .empty;
         for (module.link_objects.items) |object| switch (object) {
             .c_source_file => |source| {
-                source.file = authoredCPath(b, source.file);
+                source.file = canonicalAuthoredPath(b, source.file);
                 objects.append(b.allocator, object) catch @panic("OOM");
             },
             .c_source_files => |sources| for (sources.files) |file| {
                 const source = b.allocator.create(std.Build.Module.CSourceFile) catch @panic("OOM");
                 source.* = .{
-                    .file = authoredCPath(b, sources.root.path(b, file)),
+                    .file = canonicalAuthoredPath(b, sources.root.path(b, file)),
                     .flags = sources.flags,
                     .language = sources.language,
                 };
@@ -78,7 +93,7 @@ pub fn build(b: *std.Build) void {
     var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     for (b.top_level_steps.values()) |top| profiles.collectSteps(&top.step, &steps, &modules);
-    retainAuthoredCIdentities(b, &modules);
+    retainAuthoredIdentities(b, &modules);
     const check = b.step("check-storage-compilation", "Compile real runtime archives and their owner tests");
     var found: [audited_tests.len]bool = @splat(false);
     var iterator = steps.keyIterator();

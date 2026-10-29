@@ -800,7 +800,8 @@ class StorageCompilationDiscovery(unittest.TestCase):
             raise unittest.SkipTest("Zig is required for build-graph regression tests")
         cls.temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temp.cleanup)
-        cls.root = Path(cls.temp.name)
+        cls.root = Path(cls.temp.name) / "zig"
+        cls.root.mkdir()
         fixtures = cls.root / "tools/fixtures"
         fixtures.mkdir(parents=True)
         source = Path(__file__).parent / "fixtures"
@@ -810,9 +811,12 @@ class StorageCompilationDiscovery(unittest.TestCase):
             "pub export fn _start() void {}\n"
             "pub export fn wWinMainCRTStartup() void {}\n"
             "pub export fn fixtureValue() u32 { return 1; }\n"
+            'pub export fn specLength() usize { return @embedFile("external.yaml").len; }\n'
         )
         shared_c = cls.root / "shared-c"
         shared_c.mkdir()
+        (shared_c / "api.yaml").write_text("openapi: 3.1.0\n")
+        (cls.root.parent / "public.yaml").symlink_to(shared_c / "api.yaml")
         (shared_c / "native.h").write_text("#define FIXTURE_VALUE 9\n")
         (shared_c / "native.c").write_text(
             '#include "native.h"\nint fixture_native(void) { return FIXTURE_VALUE; }\n'
@@ -846,6 +850,7 @@ pub fn create(b: *std.Build) ?void {
             const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
                 .root_source_file = root, .target = target, .optimize = .debug, .strip = true,
             }) });
+            exe.root_module.addAnonymousImport("external.yaml", .{ .root_source_file = b.path("../public.yaml") });
             exe.use_llvm = true;
             exe.root_module.linkLibrary(native);
             exe.entry = .disabled;
@@ -901,6 +906,12 @@ pub fn create(b: *std.Build) ?void {
                 symlinks=True,
             )
 
+            # API archives embed schemas outside the Zig build root. Keep
+            # those immutable authored inputs visible in both source overlays.
+            (baseline.parent / "public.yaml").symlink_to(
+                self.root.parent / "public.yaml"
+            )
+
             # This regression owns a cold local target cache, not a second
             # compiler bootstrap. Reuse the phase's immutable host toolchain
             # objects through a private global-cache snapshot. Both checkouts
@@ -950,6 +961,15 @@ pub fn create(b: *std.Build) ?void {
             output = build_at(clone)
             self.assertIn("cached", output)
             self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
+            # Canonicalizing external schema identities must retain content
+            # invalidation in both workspaces, not just hide relocation misses.
+            schema = self.root / "shared-c/api.yaml"
+            schema.write_text(schema.read_text() + "# schema revision\n")
+            for checkout in (clone, baseline):
+                self.assertRegex(build_at(checkout), r"compile exe .* success")
+                self.assertNotRegex(
+                    build_at(checkout), r"compile (?:exe|lib) .* success"
+                )
             # The clone's new source revision and manifests are private. The
             # original still gets real compiler hits after that revision.
             # Change the tracked generator input, preserving a real source
