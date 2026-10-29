@@ -1982,10 +1982,14 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     try parseTranscriptionOptions(alloc, object, &config);
     config.route_preset = try parseRoutePreset(object);
     config.routes = try parseRoutesAlloc(alloc, object);
-    for (config.routes) |route| {
-        // An OCR route needs a configured reader or generator to run.
-        if (route.extractor_type == .ocr and !config.ocr_enabled) return error.DocumentExtractionModelRequired;
-    }
+    // An explicit OCR or audio route asks for a producer, so it needs one
+    // configured. Presets only detect content: units they route to OCR or
+    // transcription without a producer are marked *_not_configured instead.
+    for (config.routes) |route| switch (route.extractor_type) {
+        .ocr => if (!config.ocr_enabled) return error.DocumentExtractionModelRequired,
+        .audio => if (!config.transcription_enabled) return error.DocumentExtractionModelRequired,
+        else => {},
+    };
     return config;
 }
 
@@ -4865,16 +4869,36 @@ test "document extraction routes image content to pending OCR unit" {
     try std.testing.expectEqualStrings("image", result.units[0].unit_type);
     try std.testing.expectEqualStrings("ocr_pending", result.units[0].method);
     try std.testing.expectEqualStrings("pending_ocr", result.units[0].extraction_status.?);
-
-    // Without a reader the unit is marked rather than left pending forever.
-    var unconfigured = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/image.png", .{});
-    defer unconfigured.deinit(alloc);
-    try std.testing.expectEqualStrings(ocr_not_configured_status, unconfigured.units[0].extraction_status.?);
     try std.testing.expectEqual(@as(usize, 0), result.units[0].text.len);
     try std.testing.expectEqual(@as(u64, 19), result.units[0].byte_length.?);
     try std.testing.expectEqual(@as(usize, 64), result.units[0].source_sha256.?.len);
     try std.testing.expect(!result.units[0].ocr_used);
     try std.testing.expect(!result.units[0].transcript_used);
+
+    // Without a reader the unit is marked rather than left pending forever.
+    var unconfigured = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/image.png", .{});
+    defer unconfigured.deinit(alloc);
+    try std.testing.expectEqualStrings(ocr_not_configured_status, unconfigured.units[0].extraction_status.?);
+}
+
+test "mixed_files preset marks detected audio transcription_not_configured" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "audio/mpeg"),
+        .data = try alloc.dupe(u8, "ID3audio bytes"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var unconfigured = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/audio.mp3", .{});
+    defer unconfigured.deinit(alloc);
+    try std.testing.expectEqualStrings("audio", unconfigured.route_type);
+    try std.testing.expectEqualStrings(transcription_not_configured_status, unconfigured.units[0].extraction_status.?);
+
+    var config = try parseConfig(alloc, "{\"transcription\":{\"transcriber\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-small\"}}}");
+    defer config.deinit(alloc);
+    var configured = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/audio.mp3", config);
+    defer configured.deinit(alloc);
+    try std.testing.expectEqualStrings("pending_transcription", configured.units[0].extraction_status.?);
 }
 
 test "document extraction applies configured audio transcript route" {
@@ -4947,6 +4971,16 @@ test "document extraction runs OCR only when an ocr block names a model" {
     // A model is required, an OCR route needs an ocr block, and removed
     // switches are rejected rather than ignored.
     try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"routes\":[{\"extractor\":{\"type\":\"ocr\"}}]}"));
+    try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"routes\":[{\"extractor\":{\"type\":\"image\"}}]}"));
+    try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"routes\":[{\"extractor\":{\"type\":\"audio\"}}]}"));
+    try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"routes\":[{\"extractor\":{\"type\":\"transcript\"}}]}"));
+    var audio_route = try parseConfig(alloc, "{\"transcription\":{\"transcriber\":{\"provider\":\"apple\"}},\"routes\":[{\"extractor\":{\"type\":\"audio\"}}]}");
+    defer audio_route.deinit(alloc);
+    try std.testing.expect(audio_route.transcription_enabled);
+    // Presets detect content without requesting a producer.
+    var preset = try parseConfig(alloc, "{\"route_preset\":\"mixed_files\"}");
+    defer preset.deinit(alloc);
+    try std.testing.expect(!preset.ocr_enabled and !preset.transcription_enabled);
     try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"ocr\":{}}"));
     try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\"}}}"));
     try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"transcription\":{\"transcriber\":{\"provider\":\"antfly\"}}}"));
