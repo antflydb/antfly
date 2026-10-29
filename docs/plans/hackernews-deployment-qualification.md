@@ -508,7 +508,7 @@ Use the results to prioritize remaining work: publication-wide best-first traver
 if routing or irrelevant posting reads dominate; cross-file compaction if small
 historical files/segments dominate; broader bounded execution if composed or pending
 write paths remain disproportionately expensive. These changes require the ownership,
-GC and conservative bound contracts in `zig/NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md`.
+GC and conservative bound contracts in [native index execution contracts](../../zig/LAKES.md#native-index-execution-contracts).
 
 Release handoff follows the verified PR, not the benchmark binary: human-approved CI
 on the final PR revision, merge, immutable runtime release/image digest, development

@@ -1300,9 +1300,9 @@ validation. Inline retained root formats continue using their existing walkers.
 
 Native execution now includes sparse ordinal intersection, narrowed vector
 residuals, compatible ordered-index top-N, bulk bitmap counts, and normalized
-temporal predicates. [Native lake performance follow-up](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md)
-describes their contracts, differential and E2E validation, fallback shapes,
-and remaining large-archive measurements.
+temporal predicates. [Native index execution contracts](LAKES.md#native-index-execution-contracts)
+describe them; validation history is in the
+[native lake performance log](../docs/design/sql/history/native-lake-performance-log.md).
 
 
 Native sparse recipe v5 stores transactionally maintained physical ordinal maps
@@ -1400,8 +1400,8 @@ Direct ordered-index builds exceeding eight definitions share one union-projecti
 replay across bounded cohorts; its changed-file union preserves incremental seed
 reuse and avoids decoding unchanged files. Publication continues sharing its
 existing replay across native builders. See the
-[performance contracts](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md) for validation and
-remaining archive measurements.
+[native index execution contracts](LAKES.md#native-index-execution-contracts) and
+the [performance log](../docs/design/sql/history/native-lake-performance-log.md).
 
 Paged sparse roots also carry conservative authenticated native ordinal bounds.
 Positive selections reject disjoint segments before opening posting streams,
@@ -2197,3 +2197,40 @@ references (including computed-output dependencies) request generated identity
 independently of the physical access path, matching the provider cursor contract.
 Accepted overlay rows follow the same rules and preserve declared type nulls and
 values; routing defaults never overwrite source data.
+
+## Cloud generations and retention evidence
+
+Cloud publications pin exact provider object versions. An immutable hash-radix
+generation map records the S3 version or GCS generation of every payload, and
+every map edge, including the publication root, pins the map page's own
+generation. Pages hold at most 128 records and 1 MiB; incremental updates rewrite
+only changed radix paths. Maps travel with builder checkpoints, accepted recent
+vector jobs and retained text/vector/SQL cuts, so restarts never depend on mutable
+live names. Readers share authenticated pages through a data-only process pool
+(eight backend/credential scopes, 64 MiB); clients, permissions, deadlines and
+reader leases stay operation-owned. R2 and unversioned backends keep ordinary
+content-verified reads and cannot issue certificates. A backend identity or
+namespace change starts a fresh map.
+
+A retained-closure certificate lets a refresh skip the complete closure audit.
+It binds the reader protocol, backend and credential identity, namespace,
+publication, source inventory, generation-map root and a conservative expiry.
+Reuse requires fresh provider time with a 60-second margin; missing, unsupported
+or expired evidence keeps the complete audit. The filesystem backend supplies
+namespace witnesses from directory inode, ctime and mtime plus a durable
+destructive-mutation epoch. Proofs cap at 4,096 namespaces, 1 MiB of metadata and
+64 pending roots.
+
+Certificate-based audit bypass for cloud stores is off by default
+(`lake_indexes.cloud_generations.qualified_retention: false`). Exact version reads
+and durable maps work without it. Enabling it requires S3 objects with non-null
+versions under COMPLIANCE retention, or GCS objects with positive generations
+under Locked retention; governance mode, revocable holds and plain versioning are
+insufficient. Operators must qualify actual provider retention enforcement before
+enabling it. Antfly never creates or changes bucket policies.
+
+Cloud GC enumerates historical versions, including names hidden by newer versions
+or delete markers, and deletes only exact versions absent from every live closure.
+Map pages are reachability roots. Completed collections persist a paged mark set,
+and vacuum then removes unmarked map records, visiting at most four radix leaves
+per pass with a durable cursor.

@@ -1,0 +1,34 @@
+---
+title: Jev (TypeSafe)
+description: TypeSafe's Jev decision models as Antfly deciders
+---
+
+The `jev` provider answers typed decisions with TypeSafe's Jev models.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Decider | Text, images | Model defaults to `jev-latest`; 2–10 score levels |
+
+Images are sent as multipart parts, following TypeSafe's SDK. Embedding
+similarity decisions are not available with Jev.
+
+## Credentials
+
+`api_key`, defaulting to `TYPESAFE_API_KEY`. The endpoint defaults to
+`https://api.typesafe.ai/v1/systemone`.
+
+## Example
+
+```json
+{
+  "deciders": {
+    "triage": { "provider": "jev", "api_key": "${secret:typesafe.api_key}" }
+  }
+}
+```
+
+## Related
+
+- [Typed decisions](https://github.com/antflydb/antfly/blob/main/docs/reference/decisions.md)

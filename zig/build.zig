@@ -294,7 +294,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lite_rs_tests = embedded.run_lite_rs_tests;
     const run_lite_ts_tests = embedded.run_lite_ts_tests;
     const run_lite_go_example = embedded.run_lite_go_example;
-    const run_lite_go_retrieval_template = embedded.run_lite_go_retrieval_template;
     const run_cabi_packaging_tests = embedded.run_cabi_packaging_tests;
     const run_capi_tests = embedded.run_capi_tests;
 
@@ -1175,7 +1174,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lite_cli_smoke = b.addExecutable(.{
         .name = "antfly-lite-cli-smoke",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/antfly_lite_cli_smoke.zig"),
+            .root_source_file = b.path("pkg/antfly-embedded/tests/lite_cli_smoke.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1202,7 +1201,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     lite_test_step.dependOn(&run_lite_rs_tests.step);
     lite_test_step.dependOn(&run_lite_ts_tests.step);
     lite_test_step.dependOn(&run_lite_go_example.step);
-    lite_test_step.dependOn(&run_lite_go_retrieval_template.step);
     lite_test_step.dependOn(&run_antfly_lite_cli_smoke.step);
     lite_test_step.dependOn(&run_cabi_packaging_tests.step);
     lite_test_step.dependOn(&run_capi_tests.step);

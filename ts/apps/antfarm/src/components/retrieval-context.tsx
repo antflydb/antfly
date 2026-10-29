@@ -1,5 +1,6 @@
 import {
-  Label,
+  Field,
+  FieldLabel,
   Select,
   SelectContent,
   SelectItem,
@@ -33,8 +34,8 @@ export function RetrievalContextBar({ searchable = false }: { searchable?: boole
   return (
     <AIWorkflowContextBar>
       <div className="grid min-w-0 flex-1 gap-3 sm:grid-cols-2">
-        <div className="min-w-0 space-y-1.5">
-          <Label htmlFor="workflow-table">Table</Label>
+        <Field className="min-w-0 gap-1.5">
+          <FieldLabel htmlFor="workflow-table">Table</FieldLabel>
           <Select
             value={selectedTable}
             onValueChange={setSelectedTable}
@@ -53,9 +54,11 @@ export function RetrievalContextBar({ searchable = false }: { searchable?: boole
               ))}
             </SelectContent>
           </Select>
-        </div>
-        <div className="min-w-0 space-y-1.5">
-          <Label htmlFor="workflow-index">{searchable ? "Search index" : "Embedding index"}</Label>
+        </Field>
+        <Field className="min-w-0 gap-1.5">
+          <FieldLabel htmlFor="workflow-index">
+            {searchable ? "Search index" : "Embedding index"}
+          </FieldLabel>
           <Select
             value={indexes.includes(selectedIndex) ? selectedIndex : ""}
             onValueChange={setSelectedIndex}
@@ -74,7 +77,7 @@ export function RetrievalContextBar({ searchable = false }: { searchable?: boole
               ))}
             </SelectContent>
           </Select>
-        </div>
+        </Field>
       </div>
       {!selectedTable ? (
         <p className="text-sm text-muted-foreground">

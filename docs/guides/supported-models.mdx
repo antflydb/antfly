@@ -17,7 +17,7 @@ tags: [inference, models, embedding, reranking, generation, gguf]
 - Which thoroughly tested models should I start with?
 </Questions>
 
-Antfly enriches your data with OCR, transcription, chunking, embedding, extraction, reranking, and generation. Each of those can run on a model inside Antfly or on a provider you connect, such as OpenAI, Gemini, Vertex AI, Bedrock, Cohere, Cloudflare, Ollama, or Apple's native frameworks on macOS. This page covers the local side: which model to start with for each job, and what it means when Antfly refuses to load one.
+Antfly enriches your data with OCR, transcription, chunking, embedding, extraction, reranking, and generation. Each of those can run on a model inside Antfly or on a [provider you connect](/docs/guides/inference-providers), such as OpenAI, Gemini, Vertex AI, Bedrock, Cohere, Cloudflare, Ollama, or Apple's native frameworks on macOS. This page covers the local side: which model to start with for each job, and what it means when Antfly refuses to load one.
 
 Compatibility is a property of the artifact and the Antfly build, not of a repository name. Before loading weights, Antfly checks the bundle contract, the architecture runtime, required sidecars, GGUF tensor names and encodings, available backends, and resource admission.
 
@@ -42,7 +42,7 @@ Each entry carries a `compatibility` field with one of the three states below.
 | Multimodal (text + image + audio) | `antflydb/clipclap` | |
 | Chunking | `fixed_bert` (built in) | `mirth/chonky_mmbert_small_multilingual_1` |
 | Entity, relation, and structured extraction | `antflydb/gliner2-base-v1` | `fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d` (qualified FP32 native/Metal/CUDA profiles) |
-| Document reading and OCR | [`lightonai/LightOnOCR-3-0.8B`](/docs/guides/lightonocr3) | `lightonai/LightOnOCR-3-4B` for harder pages; `antflydb/Florence-2-base` or `monkt/paddleocr-onnx` for small CPU footprints; [Apple Vision](/docs/guides/apple-native-ocr) on macOS; any vision-capable generator |
+| Document reading and OCR | [`lightonai/LightOnOCR-3-0.8B`](/docs/guides/lightonocr3) | `lightonai/LightOnOCR-3-4B` for harder pages; `antflydb/Florence-2-base` or `monkt/paddleocr-onnx` for small CPU footprints; [Apple Vision](/docs/guides/providers/apple) on macOS; any vision-capable generator |
 | Transcription | `openai/whisper-tiny` | |
 | Local multimodal generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
 
@@ -82,7 +82,7 @@ Provider-specific overrides are rarely needed. When they are, keep them under th
 
 The older flat `query_input_type`, `document_input_type`, and `query_instruction` fields remain read-compatible but are deprecated.
 
-Hosted generation providers (OpenAI and Gemini/Vertex), Ollama, and Antfly's generator endpoint are configured separately and are outside this matrix.
+Hosted and Ollama models are configured through their [providers](/docs/guides/inference-providers) and are outside this page.
 
 ## The Three Compatibility States
 
@@ -181,5 +181,6 @@ A non-zero `missing_required_tensors` count means the architecture was recognize
 ## Next Steps
 
 - [Antfly Inference](/docs/guides/inference): pulling, storing, and configuring the models this page certifies
+- [Inference Components and Providers](/docs/guides/inference-providers): hosted providers for each component
 - [Quickstart](/docs/guides/quickstart): the verified embedder, reranker, and generator in one end-to-end run
 - The [models browser](/inference): every model in the registry with descriptions and sizes
