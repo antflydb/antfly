@@ -1663,3 +1663,110 @@ pass in 13.60 seconds. The final CLI builds successfully as SHA-256
 `6f551b64a4e423ab4c953eb6b596443661be82d939ee72efdf65ab3d536f338d`, unchanged
 before and after those flow tests. The validation record distinguishes this
 focused merge check from the earlier complete lake-owner and real-file runs.
+
+
+### Exact block pruning and direct typed result construction
+
+Stored-source recipe v8, native reader protocol 94 and runtime ABI 70 add
+producer-attested term spacing and block prefix-maximum ends. Eligible disjoint
+dense streams stop when no future window can improve the retained candidate
+heap. Overlapping spans retain the complete scan; fragment replay seeks to its
+output intervals. Selected occurrence reads use the existing source-owned I/O
+queue. A final refinement reserves hints for future reads, avoiding a hint just
+before the foreground read of the same block. This remains optional advisory I/O;
+cloud-latency benefits require provider qualification.
+
+Native result builders allocate final scalar vectors directly and widen only
+heterogeneous columns. Projected highlighting materializes only its own field
+dependencies. The native nullable-i64 probe retains **297,120 bytes** for 32,768
+cells, with a **297,144-byte** allocation peak and zero live bytes after release,
+under 512 KiB. The old intermediate JSON matrix alone required 1,835,008 bytes,
+before final vectors and page overhead. This is a result-page allocation probe,
+not a complete query/process memory measurement. A separate 40,001-byte unrelated
+JSON column stays encoded while highlight dependencies are checked under 64 KiB.
+
+The [block/delivery observation](dense-blocks-typed-results-v1-observation.json)
+retains **528 measured HTTP requests** across six runners in both binary orders.
+All complete-result digests, runner hashes and Parquet input hashes match across
+runs. The control `cbc97c3a12a47c41ecc7dfb8a930f792406df2cb` and measured runtime
+`fac8914a2508a3dff901c79d4f7731c846c43dfa` share main
+`d35a1ef33ef01482e593f892e3f534b780cc19bc`. Frozen executable SHA-256 values are
+`738ad162c2a10de6bece40ac9b6b38cef5fd6b5d8180eee003aeb9e0441c28ca` and
+`9a537e5dcfa2e6b9dc563190813df2c1ed50adba4ce58adb664c8d3cc226a9dc`.
+
+Warm local Debug medians, milliseconds:
+
+| Shape | Old → new, primary | Old → new, reverse |
+| --- | ---: | ---: |
+| Dense 2-MiB source | 85.14 → 11.09 | 92.75 → 10.38 |
+| Variable-width Unicode 8-MiB source | 10.66 → 10.28 | 11.54 → 10.15 |
+| 64 projected integer columns, 256 hits | 274.05 → 261.90 | 279.83 → 247.22 |
+| One projected integer column, 256 hits | 56.85 → 60.83 | 56.50 → 55.47 |
+| Rare fuzzy match | 11.07 → 12.88 | 11.84 → 11.35 |
+| Hidden eight-field highlighting, 256 hits | 290.78 → 289.41 | 289.55 → 307.30 |
+| Dense 128-KiB source | 15.22 → 12.64 | 14.34 → 11.94 |
+| Sparse 32-KiB source | 10.15 → 11.39 | 9.57 → 11.27 |
+
+Dense 2-MiB latency falls **87.0–88.8%**; 64-column delivery falls **4.4–11.7%**.
+Small controls include regressions up to **1.80 ms (16.3%)** in the rare-term
+cohort and **1.70 ms (17.7%)** in the kernel cohort. Hidden-wide highlighting is
+6.1% slower in the reverse pass. Keep every point and qualify these observations;
+there is no universal latency improvement. Seven samples per dense/Unicode,
+rare-term and typed-delivery point, three per other point/order. The shared host
+had separate-worktree build activity before comparison; no task-owned build,
+E2E or cleanup overlaps the 24 runs. Publication admission/readiness polling is
+one observation per run and does not isolate indexing CPU. No Release,
+remote-provider, empty-cache or archive-scale claim follows from these timings.
+
+Reproduce with `source_refinements.py`, `typed_results.py`,
+`selective_offsets.py`, `source_pages.py`, `highlight_kernels.py` and
+`hidden_highlights.py`, each taking `LABEL IMMUTABLE_BINARY SOURCE_COMMIT`.
+Use old/new then new/old execution blocks and compare all hit/input/runner hashes.
+`typed_results.py` independently writes 256 Parquet rows with 1/8/64 nullable
+integer columns and checks exact wire values above `2^53`. A corrected fixture
+smoke run overlaps native verification; its timings are discarded.
+
+The exact selector oracle visits **512 of 32,769 occurrences** and decodes six
+blocks while matching the full selector across widths and fragment counts.
+The selective-read oracle grows from 37,343 to 38,897 encoded bytes and from
+814 to 1,206 read bytes: each block reference adds four wire bytes and each term
+adds eight. This storage/read tradeoff remains visible alongside the dense gain.
+Before the final advisory-prefetch/main refinement, full native owners pass
+**535 integration and 495 frontier cases**, each with a **247-case shared
+partition**, zero skips/failures/leaks. These are 1,524 overlapping executions.
+All **48 real Parquet/Iceberg E2Es pass in one run** in 365.33 seconds. The later
+selected-term-head extension separately passes 61 shared and 13 API checks.
+Final main/prefetch verification is recorded separately from these frozen runs.
+
+
+The [final merge qualification](dense-blocks-postmerge-validation.json) records
+main `981ce6733db455e72ef401d82e7f32b1225a03e2`, merged as
+`70dfea22e16d72fee24cefc3292dd11e8c284823`, and runtime
+`cd092741073cd361b169fa89052df9543c6e45a5`. Its frozen CLI SHA-256 is
+`511ddb065d231e6542bfa871e43e85ff374fbd23cec06ae905ec9c29d502f34b`.
+The future-read-only refinement passes **61 shared plus 13 API cases**. Main's
+compaction/contribution target passes **75 cases plus nine wrappers**; its optional
+substring benchmark is skipped. The first combined invocation's API selection
+audit rejected a compaction filter belonging to the contribution target; the
+corrected API invocation passes with zero failures, leaks or skips. The CLI
+step completes, and the frozen executable passes all **three final real-file
+flows** in 22.05 seconds: dense Parquet highlighting, dense Iceberg highlighting
+and wide native source-column delivery. These are focused checks of the later
+main/advisory-I/O changes, separate from the earlier full owner and 48-case runs.
+License, Apache boundary (2,582 source files), lint, formatting and whitespace
+checks pass. Cache GC is invoked; its active-native-build guard skips cleanup.
+
+A separate staged comparison retains another **492 measured HTTP requests**
+across five runners and both orders, comparing the earlier `fac8914a25` executable
+with the final main/future-read-only executable. All successful result oracles,
+input hashes and runner hashes agree. It includes the independent main update,
+so it cannot isolate the prefetch refinement. Final dense 2-MiB medians are
+**11.06 and 10.80 ms**. Some small controls are slower: one reverse-order sparse
+2-KiB point is **10.72 → 13.78 ms (28.6%)**, while that primary point is
+**12.18 → 11.78 ms**. Nullable integer delivery is 0.9–5.5% slower than the prior
+refinement in this staged comparison. Every sample is retained; there is no
+additional validated warm-latency win from the prefetch refinement. Its concrete
+benefit is avoiding advisory scheduling of the next required foreground read.
+The local Debug/shared-host qualifications above continue to apply. Across both
+comparisons, all **48 structured HTTP 504 outcomes** carry `query_timeout`; other
+sampled deadline outcomes return the expected results.
