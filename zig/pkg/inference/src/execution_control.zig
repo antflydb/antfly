@@ -33,6 +33,7 @@ threadlocal var synchronous_checkpoint: ?SynchronousCheckpoint = null;
 threadlocal var synchronous_checkpoint_depth: usize = 0;
 threadlocal var checking_synchronous_checkpoint: bool = false;
 threadlocal var waiting_synchronous_resource: bool = false;
+threadlocal var synchronous_refusal: ?anyerror = null;
 
 pub const CheckpointScope = struct {
     pub fn hasCurrent() bool {
@@ -41,6 +42,7 @@ pub const CheckpointScope = struct {
 
     previous: ?SynchronousCheckpoint,
     previous_waiting: bool,
+    previous_refusal: ?anyerror,
     depth: usize,
     thread: if (@import("builtin").single_threaded) void else std.Thread.Id,
     active: bool = true,
@@ -52,7 +54,7 @@ pub const CheckpointScope = struct {
         waiting_synchronous_resource = false;
         synchronous_checkpoint_depth += 1;
         synchronous_checkpoint = checkpoint;
-        return .{ .previous = previous, .previous_waiting = previous_waiting, .depth = synchronous_checkpoint_depth, .thread = if (comptime @import("builtin").single_threaded) {} else std.Thread.getCurrentId() };
+        return .{ .previous = previous, .previous_waiting = previous_waiting, .previous_refusal = synchronous_refusal, .depth = synchronous_checkpoint_depth, .thread = if (comptime @import("builtin").single_threaded) {} else std.Thread.getCurrentId() };
     }
 
     pub fn deinit(self: *CheckpointScope) void {
@@ -60,12 +62,14 @@ pub const CheckpointScope = struct {
         std.debug.assert(self.active and self.depth == synchronous_checkpoint_depth and !waiting_synchronous_resource);
         synchronous_checkpoint = self.previous;
         waiting_synchronous_resource = self.previous_waiting;
+        synchronous_refusal = self.previous_refusal;
         synchronous_checkpoint_depth -= 1;
         self.active = false;
     }
 };
 
 fn checkSynchronousCheckpoint() !void {
+    if (synchronous_refusal) |err| return err;
     if (checking_synchronous_checkpoint or waiting_synchronous_resource) return;
     const checkpoint = synchronous_checkpoint orelse return;
     checking_synchronous_checkpoint = true;
@@ -85,7 +89,10 @@ pub const ResourceWait = struct {
         const checkpoint = synchronous_checkpoint orelse return .{};
         const begin = checkpoint.wait_begin_fn orelse return .{};
         try checkSynchronousCheckpoint();
-        try begin(checkpoint.context);
+        begin(checkpoint.context) catch |err| {
+            synchronous_refusal = err;
+            return err;
+        };
         waiting_synchronous_resource = true;
         return .{ .checkpoint = checkpoint, .scope_depth = synchronous_checkpoint_depth };
     }
@@ -95,9 +102,35 @@ pub const ResourceWait = struct {
         std.debug.assert(waiting_synchronous_resource and self.scope_depth == synchronous_checkpoint_depth);
         self.checkpoint = null;
         waiting_synchronous_resource = false;
-        try checkpoint.wait_end_fn.?(checkpoint.context);
+        checkpoint.wait_end_fn.?(checkpoint.context) catch |err| {
+            synchronous_refusal = err;
+            return err;
+        };
     }
 };
+
+/// These adapters lend only the physical operation. The calling task retains
+/// allocation/parsing and closes newly acquired resources if reentry refuses.
+pub fn physicalWait(comptime operation: anytype, args: anytype) anyerror!@typeInfo(@TypeOf(@call(.auto, operation, args))).error_union.payload {
+    var wait = try ResourceWait.init();
+    const result = @call(.auto, operation, args) catch |err| {
+        try wait.finish();
+        return err;
+    };
+    try wait.finish();
+    return result;
+}
+
+pub fn ownedPhysicalWait(comptime operation: anytype, args: anytype, comptime discard: anytype) anyerror!@typeInfo(@TypeOf(@call(.auto, operation, args))).error_union.payload {
+    var wait = try ResourceWait.init();
+    const result = @call(.auto, operation, args) catch |err| {
+        try wait.finish();
+        return err;
+    };
+    errdefer discard(result, args);
+    try wait.finish();
+    return result;
+}
 
 /// Stable phases shared by API, enrichment, model loading, pipelines, and
 /// backends. Progress is advisory; cancellation and deadlines are mandatory.
@@ -969,4 +1002,35 @@ test "LightOnOCR3 execution lane cleanup survives cancellation of its owning Io 
     cancel_task = null;
     try std.testing.expect(done.load(.acquire));
     try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
+}
+
+test "runnable execution physical wait refusal survives optional and nested scopes" {
+    const Probe = struct {
+        discarded: usize = 0,
+        calls: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {
+            return error.PhysicalReturnDenied;
+        }
+        fn acquire(self: *@This()) !u8 {
+            self.calls += 1;
+            return 1;
+        }
+        fn discard(_: u8, args: anytype) void {
+            args[0].discarded += 1;
+        }
+    };
+    var probe: Probe = .{};
+    var scope = CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+    defer if (scope.active) scope.deinit();
+    try std.testing.expectError(error.PhysicalReturnDenied, ownedPhysicalWait(Probe.acquire, .{&probe}, Probe.discard));
+    try std.testing.expectEqual(@as(usize, 1), probe.discarded);
+    var nested = CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+    try std.testing.expectError(error.PhysicalReturnDenied, physicalWait(Probe.acquire, .{&probe}));
+    nested.deinit();
+    try std.testing.expectError(error.PhysicalReturnDenied, (InferenceExecutionControl{}).check());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    scope.deinit();
+    try (InferenceExecutionControl{}).check();
 }

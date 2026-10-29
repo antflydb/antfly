@@ -935,6 +935,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-inference-owner-handoff-test", "Run real shared-owner inference handoff and model-lock control progress contracts")
         .dependOn(&b.addRunArtifact(inference_owner_tests).step);
+    const model_file_module = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/model_file_owner_test_support.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    model_file_module.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    model_file_module.addImport("antfly_platform", antfly_imports.platform);
+    model_file_module.addImport("antfly_document_runs", inference_owner_control.import_table.get("antfly_document_runs").?);
+    const file_owner_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_file_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    file_owner_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    file_owner_root.addImport("antfly_local_sources", inference_owner_sources);
+    file_owner_root.addImport("inference_model_file", model_file_module);
+    const file_owner_tests = b.addTest(.{ .name = "model-file-owner-tests", .root_module = file_owner_root, .filters = &.{"native model files"}, .max_rss = 2 * 1024 * 1024 * 1024 });
+    b.step("antfly-inference-file-owner-test", "Verify physical native model file I/O through real API-owned grants")
+        .dependOn(&b.addRunArtifact(file_owner_tests).step);
     const http_cleanup_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_http_cleanup_test_root.zig"),
         .target = target,

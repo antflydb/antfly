@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const execution = @import("../execution_control.zig");
 
 pub const link_libc = builtin.link_libc;
 
@@ -148,13 +149,16 @@ pub const MmapRegion = struct {
         const fd = try openReadOnlyZ(path_z);
         errdefer closeFd(fd);
 
-        const size = fileSizeFromFd(fd) catch return error.StatFailed;
+        const size = fileSizeFromFd(fd) catch {
+            try (execution.InferenceExecutionControl{}).check();
+            return error.StatFailed;
+        };
         if (size == 0) {
             return error.EmptyFile;
         }
         if (size > max_bytes) return error.FileTooLarge;
 
-        const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+        const mapped = try execution.ownedPhysicalWait(mapReadOnly, .{ fd, size }, discardMapping);
         return .{ .data = mapped, .fd = fd };
     }
 
@@ -299,7 +303,10 @@ pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usi
 
     var total: usize = 0;
     while (total < size) {
-        const n = readAt(fd, buf[total..], total) catch break;
+        const n = readAt(fd, buf[total..], total) catch {
+            try (execution.InferenceExecutionControl{}).check();
+            break;
+        };
         if (n == 0) break;
         total += n;
     }
@@ -370,8 +377,7 @@ pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentit
     return fileIdentityFromFd(allocator, fd);
 }
 
-fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !FileIdentity {
-    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+fn identityStatFromFd(fd: std.posix.fd_t) !std.os.linux.Statx {
     const linux = std.os.linux;
     var statx = std.mem.zeroes(linux.Statx);
     while (true) {
@@ -385,6 +391,12 @@ fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !FileIde
             else => return error.StatFailed,
         }
     }
+    return statx;
+}
+
+fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !FileIdentity {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const statx = try execution.physicalWait(identityStatFromFd, .{fd});
     if (!statx.mask.SIZE or !statx.mask.INO or !statx.mask.MTIME) return error.StatFailed;
     const sample_bytes: usize = @intCast(@min(statx.size, file_identity_sample_bytes));
     const sample = try allocator.alloc(u8, sample_bytes);
@@ -432,7 +444,7 @@ pub fn mmapFileWithIdentity(allocator: std.mem.Allocator, path: []const u8) !Mma
     const identity = try fileIdentityFromFd(allocator, fd);
     if (identity.size == 0) return error.EmptyFile;
     const size = std.math.cast(usize, identity.size) orelse return error.FileTooLarge;
-    const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+    const mapped = try execution.ownedPhysicalWait(mapReadOnly, .{ fd, size }, discardMapping);
     return .{
         .region = .{ .data = mapped, .fd = fd },
         .identity = identity,
@@ -477,7 +489,10 @@ fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
     var total: usize = 0;
     while (total < buf.len) {
         const read_off = try std.math.add(u64, offset, total);
-        const n = readAt(fd, buf[total..], read_off) catch break;
+        const n = readAt(fd, buf[total..], read_off) catch {
+            try (execution.InferenceExecutionControl{}).check();
+            break;
+        };
         if (n == 0) break;
         total += n;
     }
@@ -659,6 +674,10 @@ pub fn renameNoReplace(allocator: std.mem.Allocator, old_path: []const u8, new_p
 }
 
 fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
+    return execution.physicalWait(fileSizeFromFdRaw, .{fd});
+}
+
+fn fileSizeFromFdRaw(fd: std.posix.fd_t) !usize {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         while (true) {
@@ -691,11 +710,26 @@ fn statSize(stat: c.struct_stat) std.c.off_t {
 const Advice = enum { sequential, random, dont_need };
 
 fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
+    return execution.ownedPhysicalWait(openReadOnlyZRaw, .{path_z}, discardOpenedFd);
+}
+
+fn openReadOnlyZRaw(path_z: [:0]const u8) !std.posix.fd_t {
     // std.posix.openatZ preserves actionable failures such as AccessDenied,
     // NotDir, and descriptor exhaustion while still retrying EINTR. Flattening
     // every failure to FileNotFound makes callers misreport operational faults
     // as absent model metadata.
     return std.posix.openatZ(std.posix.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
+}
+
+fn discardOpenedFd(fd: std.posix.fd_t, _: anytype) void {
+    closeFd(fd);
+}
+
+fn mapReadOnly(fd: std.posix.fd_t, size: usize) ![]align(std.heap.page_size_min) u8 {
+    return std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+}
+fn discardMapping(bytes: []align(std.heap.page_size_min) u8, _: anytype) void {
+    std.posix.munmap(bytes);
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
@@ -708,6 +742,10 @@ fn closeFd(fd: std.posix.fd_t) void {
 }
 
 fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
+    return execution.physicalWait(readAtRaw, .{ fd, buf[0..@min(buf.len, 1024 * 1024)], offset });
+}
+
+fn readAtRaw(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
     // Prefer the raw Linux syscall even in libc-linked builds so the hot
     // prefetch/read path can distinguish and retry EINTR deterministically.
     if (builtin.os.tag == .linux) {
@@ -888,4 +926,89 @@ test "prefetchFile reads every byte with bounded workers" {
             try std.testing.expectEqual(std.math.clamp(workers, 1, 8), result.workers);
         }
     }
+}
+
+test "model file physical waits retain descriptors and reject metadata fallback" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try alloc.alloc(u8, 3 * 1024 * 1024 + 17);
+    defer alloc.free(data);
+    @memset(data, 71);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model", .data = data });
+    const path = try tmp.dir.realPathFileAlloc(io, "model", alloc);
+    defer alloc.free(path);
+    const Probe = struct {
+        running: bool = true,
+        ends: usize = 0,
+        reject_at: usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+            self.running = false;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.running);
+            self.ends += 1;
+            if (self.ends == self.reject_at) return error.ModelFileReturnDenied;
+            self.running = true;
+        }
+    };
+    const Fds = struct {
+        fn count() !usize {
+            var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, if (builtin.os.tag == .linux) "/proc/self/fd" else "/dev/fd", .{ .iterate = true });
+            defer dir.close(std.testing.io);
+            var iterator = dir.iterate();
+            var count_: usize = 0;
+            while (try iterator.next(std.testing.io)) |_| count_ += 1;
+            return count_;
+        }
+    };
+    // The actual descriptor set must recover after open, stat and read return
+    // refusals. Allocation leak checks also cover the partially filled buffer.
+    for (1..4) |reject_at| {
+        const before = try Fds.count();
+        var probe: Probe = .{ .reject_at = reject_at };
+        var scope = execution.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+        defer if (scope.active) scope.deinit();
+        try std.testing.expectError(error.ModelFileReturnDenied, readFileMax(alloc, path, data.len));
+        try std.testing.expect(!fileExists(alloc, path));
+        try std.testing.expectError(error.ModelFileReturnDenied, (execution.InferenceExecutionControl{}).check());
+        try std.testing.expectEqual(reject_at, probe.ends);
+        scope.deinit();
+        try std.testing.expectEqual(before, try Fds.count());
+    }
+    var probe: Probe = .{ .reject_at = 0 };
+    var scope = execution.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+    defer scope.deinit();
+    const read = try readFileMax(alloc, path, data.len);
+    defer alloc.free(read);
+    try std.testing.expectEqualSlices(u8, data, read);
+    try std.testing.expectEqual(@as(usize, 6), probe.ends);
+    try std.testing.expectError(error.FileTooLarge, readFileMax(alloc, path, data.len - 1));
+    const region = try readRegion(alloc, path, 1024 * 1024 - 3, 1024 * 1024 + 9);
+    defer alloc.free(region);
+    try std.testing.expectEqualSlices(u8, data[1024 * 1024 - 3 .. 2 * 1024 * 1024 + 6], region);
+}
+
+/// Test the production file path through the API owner's real grant without
+/// compiling a second copy of the native checkpoint TLS in the consumer.
+pub fn testFilePhysicalOwnership(alloc: std.mem.Allocator, path: []const u8, mapped: bool, context: *anyopaque, check: *const fn (*anyopaque) anyerror!void, park: *const fn (*anyopaque) anyerror!void, enter: *const fn (*anyopaque) anyerror!void) !u64 {
+    if (!builtin.is_test) @compileError("test only");
+    var scope = execution.CheckpointScope.init(.{ .context = context, .check_fn = check, .wait_begin_fn = park, .wait_end_fn = enter });
+    defer scope.deinit();
+    if (mapped) {
+        var region = try MmapRegion.init(alloc, path);
+        defer region.deinit();
+        return @as(u64, region.data[0]) + region.data[region.data.len - 1];
+    }
+    const bytes = try readFile(alloc, path);
+    defer alloc.free(bytes);
+    return @as(u64, bytes[0]) + bytes[bytes.len - 1];
 }

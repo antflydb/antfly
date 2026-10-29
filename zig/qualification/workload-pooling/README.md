@@ -778,3 +778,41 @@ remaining mutation/retention/immutable-artifact boundaries, and serial graph
 preparation remain open. Cross-engine resource gates, including the original
 file-engine descriptor bound, remain open. The installed CLI is not rebuilt by
 these focused tests.
+
+
+### Physical native model-file waits
+
+The shared native `c_file` path now returns CPU around descriptor open, size/stat
+queries, bounded positional reads, and read-only mapping syscalls. Reads advance
+in at most 1 MiB chunks. Path/buffer allocation, size checks, hashing, parsing and
+mapped-data consumption retain the loader's CPU grant. Newly opened descriptors
+and mappings are disposed if checked CPU return rejects them; partially read
+buffers and existing descriptors retain their cleanup owners.
+
+Physical-return refusal remains sticky within the synchronous checkpoint scope,
+including nested scopes, so optional metadata fallback cannot turn a stopped
+loader into fresh work. Scope teardown restores the previous invocation state.
+Model/composite construction failure paths replay the owning control before
+publishing an error. Mapping stat failures preserve the original admission cause
+rather than collapsing it into `StatFailed`.
+
+Evidence: `native-model-file-waits-v5-debug.json` in the cumulative integration
+receipts. Six selected native tests include actual local model/composite
+construction with physical-wait callbacks, refusal before resident admission,
+descriptor recovery after open/stat/read refusal, exact chunked reads, limits,
+and nested refusal propagation. The separate real-owner fixture drives the
+production reader and mapper through actual scheduler capsules: queries and
+control work run at each loan boundary, original width and retained bytes return
+on success, and all roots retire after cancellation at open/stat/read-or-map
+return. Its gates are deterministic around real temporary-file operations; this
+is not a slow-disk latency or throughput measurement. The production worker
+entry also passes its semantic compile check.
+
+This closes the shared local file-syscall path within the maintenance milestone.
+Mapped page faults, parallel prefetch ownership and other backend-specific I/O
+remain outside this evidence. Downloads use a separate pull entry and still need
+admission plus physical network/disk wait integration. Credential subprocesses,
+lease renewal, other maintenance provider boundaries and graph preparation
+checkpoints remain open, along with the original cross-engine resource gates
+(including file-engine descriptor recovery). Full GNU/full qualification remains
+waived; the installed CLI is not rebuilt by these focused tests.

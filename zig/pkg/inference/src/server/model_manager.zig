@@ -7543,6 +7543,10 @@ pub const ModelManager = struct {
         defer execution.finish();
         var active = LoadFlightControl{ .flight = &task.flight.load_state };
         const assets = manager.loadCompositeAssetsUncached(task.model_dir, task.paths, task.preferred_backends, task.key, task.flight.runtime_id, task.flight.model_type, task.kind, active.control()) catch |err| {
+            active.control().check() catch |original| {
+                manager.finishCompositeAssetsLoadFlight(task.flight, null, original);
+                return;
+            };
             manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
             return;
         };
@@ -8376,6 +8380,10 @@ pub const ModelManager = struct {
             task.flight.runtime_id,
             load_control.control(),
         ) catch |err| {
+            load_control.control().check() catch |original| {
+                manager.finishLoadFlight(task.flight, null, original);
+                return;
+            };
             manager.finishLoadFlight(task.flight, null, err);
             return;
         };
@@ -15960,7 +15968,7 @@ test "model aware media host index cache pressure releases idle leases before pr
 
 test "coordinated model and composite loaders own independent execution admission" {
     const Family = enum { model, composite };
-    const Mode = enum { success, success_without_control, reject_start, reject_completion };
+    const Mode = enum { success, success_without_control, reject_start, reject_completion, reject_io };
     const Probe = struct {
         mode: Mode,
         caller: std.Thread.Id,
@@ -15969,6 +15977,26 @@ test "coordinated model and composite loaders own independent execution admissio
         checks: std.atomic.Value(usize) = .init(0),
         active: std.atomic.Value(bool) = .init(false),
         thread: std.Thread.Id = undefined,
+        scope: execution_control_mod.CheckpointScope = undefined,
+        running: bool = false,
+        physical_waits: usize = 0,
+        fn cpuCheck(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running and self.active.load(.acquire));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+        }
+        fn park(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try cpuCheck(raw);
+            self.running = false;
+            self.physical_waits += 1;
+        }
+        fn enter(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.running);
+            if (self.mode == .reject_io) return error.ModelIoReturnDenied;
+            self.running = true;
+        }
         fn begin(raw: *anyopaque, _: std.Io, _: load_execution.Key, bytes: usize, control: load_execution.ExecutionControl) !*anyopaque {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(self.caller != std.Thread.getCurrentId());
@@ -15980,10 +16008,13 @@ test "coordinated model and composite loaders own independent execution admissio
             if (self.mode == .reject_start) return error.ResourceTemporarilyUnavailable;
             try std.testing.expect(!self.active.swap(true, .acq_rel));
             self.thread = std.Thread.getCurrentId();
+            self.running = true;
+            self.scope = execution_control_mod.CheckpointScope.init(.{ .context = self, .check_fn = cpuCheck, .wait_begin_fn = park, .wait_end_fn = enter });
             return self;
         }
         fn checkpoint(_: *anyopaque, raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            try (InferenceExecutionControl{}).check();
             try std.testing.expect(self.active.load(.acquire));
             try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
             _ = self.checks.fetchAdd(1, .release);
@@ -15992,6 +16023,7 @@ test "coordinated model and composite loaders own independent execution admissio
         fn finish(_: *anyopaque, raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             std.debug.assert(self.thread == std.Thread.getCurrentId());
+            self.scope.deinit();
             std.debug.assert(self.active.swap(false, .acq_rel));
             _ = self.finishes.fetchAdd(1, .release);
         }
@@ -16025,7 +16057,7 @@ test "coordinated model and composite loaders own independent execution admissio
             if (mode == .success or mode == .success_without_control) {
                 var handle = try result;
                 handle.retire();
-            } else try std.testing.expectError(if (mode == .reject_start) error.ResourceTemporarilyUnavailable else error.CpuReturnDenied, result);
+            } else try std.testing.expectError(if (mode == .reject_start) error.ResourceTemporarilyUnavailable else if (mode == .reject_io) error.ModelIoReturnDenied else error.CpuReturnDenied, result);
             try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
         } else {
             const result = manager.acquireCompositeRuntime(root, &.{}, .whisper_metadata, control);
@@ -16034,7 +16066,7 @@ test "coordinated model and composite loaders own independent execution admissio
                 try std.testing.expectEqual(@as(usize, 99), handle.get().decoder_config.max_length);
                 handle.release();
             } else {
-                try std.testing.expectError(if (mode == .reject_start) error.ResourceTemporarilyUnavailable else error.CpuReturnDenied, result);
+                try std.testing.expectError(if (mode == .reject_start) error.ResourceTemporarilyUnavailable else if (mode == .reject_io) error.ModelIoReturnDenied else error.CpuReturnDenied, result);
                 try std.testing.expectEqual(@as(usize, 0), manager.composite_assets.count());
             }
         }
@@ -16042,8 +16074,9 @@ test "coordinated model and composite loaders own independent execution admissio
         try std.testing.expect(!probe.active.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), probe.begins.load(.acquire));
         try std.testing.expectEqual(@as(usize, if (mode == .reject_start) 0 else 1), probe.finishes.load(.acquire));
-        try std.testing.expectEqual(@as(usize, if (mode == .reject_start) 0 else 1), probe.checks.load(.acquire));
-        if (mode == .reject_start) {
+        try std.testing.expectEqual(@as(usize, if (mode == .reject_start or mode == .reject_io) 0 else 1), probe.checks.load(.acquire));
+        if (mode != .reject_start) try std.testing.expect(probe.physical_waits > 0);
+        if (mode == .reject_start or mode == .reject_io) {
             try std.testing.expect(manager.resource_domain == null);
         } else if (mode == .reject_completion) {
             try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
