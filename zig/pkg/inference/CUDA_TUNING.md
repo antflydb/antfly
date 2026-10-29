@@ -1554,7 +1554,11 @@ their existing admission and ownership contracts.
 and independent FFmpeg decoded-pixel hashes. CUDA tests compare selected YUV420
 pixels exactly, switch codecs at the same geometry, and check cancellation and
 reservation cleanup. HEVC/AV1 require NVDEC support on the deployment GPU; the
-portable MP4 reader still defaults to AVC/JPEG. Gemma4's sampler is unchanged.
+portable MP4 reader still defaults to AVC/JPEG. Before backend selection,
+contract pixel accounting takes the maximum across viable portable and CUDA
+tracks, including mixed-codec MP4 files. `hev1` may supply its parameter sets
+in timed samples; `hvc1` requires them in its decoder configuration.
+Gemma4's sampler is unchanged.
 
 AAC-LC in M4A/MP4 or ADTS, and HE-AAC v1/v2 in M4A, use the existing native CPU
 audio decoder before the CUDA audio encoder. They do not use NVDEC. Qualification

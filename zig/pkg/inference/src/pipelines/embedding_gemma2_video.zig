@@ -904,13 +904,38 @@ pub fn inspectPixelsWithSampling(bytes: []const u8, control: Control, sampling: 
         }
         return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
     };
+    if (sampling == .reference) {
+        // Readers choose the first track supported by their route. A portable
+        // AVC/MJPEG track can follow a larger HEVC/AV1 track selected by CUDA.
+        // Charge the maximum across both viable routes before backend selection.
+        const adapter = control.imageWorkControl();
+        const clip = @import("../ops/cuda/video.zig").inspectEmbedding(bounded.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch |err| {
+            try control.check();
+            if (err == error.OutOfMemory) return if (bounded.denied) error.MemoryBudgetExceeded else err;
+            // CUDA has a narrower envelope than portable decoding (including
+            // WebM/TS, MJPEG, and higher-depth AVC). Execution validates its route.
+            return plan.pixels;
+        };
+        return @max(plan.pixels, @as(u64, clip.width) * clip.height * clip.frames);
+    }
     return plan.pixels;
 }
 
 test "embeddinggemma2 video contract pixel inspection admits CUDA MP4 codecs without portable decoding" {
-    inline for (.{ "hevc-hvc1.mp4", "hevc-hev1.mp4", "av1.mp4" }) |name| {
+    inline for (.{ "hevc-hvc1.mp4", "hevc-hev1.mp4", "hevc-hev1-inband.mp4", "av1.mp4" }) |name| {
         try std.testing.expectEqual(@as(u64, 4 * 192 * 192), try inspectPixels(@embedFile("../testdata/video/codecs/" ++ name), .{}));
     }
+}
+
+test "embeddinggemma2 video contract pixels cover CUDA track before smaller portable track" {
+    const bytes = @embedFile("../testdata/video/codecs/hevc-avc-tracks.mp4");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    const portable = try inspectPlan(std.testing.allocator, bytes, .{}, .reference, &pool, false);
+    const cuda = try @import("../ops/cuda/video.zig").inspectEmbedding(std.testing.allocator, bytes, .{});
+    try std.testing.expectEqual(@as(u64, 32 * 32), portable.pixels);
+    try std.testing.expectEqual(@as(u64, 4 * 192 * 192), @as(u64, cuda.width) * cuda.height * cuda.frames);
+    try std.testing.expectEqual(@as(u64, 4 * 192 * 192), try inspectPixels(bytes, .{}));
+    try std.testing.expectError(error.Timeout, inspectPixels(bytes, .{ .deadline_ns = 0 }));
 }
 
 /// Geometry-derived share of a prepaid execution reservation. Counts maximum

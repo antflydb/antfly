@@ -424,7 +424,7 @@ const Parser = struct {
                     },
                     .hevc => {
                         config = configuration orelse return error.MalformedMedia;
-                        try validateHvcc(config);
+                        try validateHvcc(config, b.typ == tag("hvc1"));
                         nal_len = @as(u3, @intCast(config[21] & 3)) + 1;
                     },
                     .av1 => {
@@ -442,7 +442,7 @@ const Parser = struct {
     }
 };
 
-fn validateHvcc(config: []const u8) !void {
+fn validateHvcc(config: []const u8, require_parameter_sets: bool) !void {
     if (config.len < 23 or config[0] != 1) return error.MalformedMedia;
     var cursor: usize = 23;
     var parameter_sets: u3 = 0;
@@ -471,7 +471,9 @@ fn validateHvcc(config: []const u8) !void {
             if (kind >= 32 and kind <= 34) parameter_sets |= @as(u3, 1) << @as(u2, @intCast(kind - 32));
         }
     }
-    if (cursor != config.len or parameter_sets != 7) return error.MalformedMedia;
+    // hev1 may carry any or all parameter sets in timed samples. hvc1
+    // requires a complete decoder configuration before those samples.
+    if (cursor != config.len or (require_parameter_sets and parameter_sets != 7)) return error.MalformedMedia;
 }
 
 fn validateAv1c(config: []const u8) !void {
@@ -526,17 +528,32 @@ test "mp4 HEVC configuration bounds parameter arrays and rejects truncated NALs"
         config[cursor + 5] = kind << 1;
         config[cursor + 6] = 1;
     }
-    try validateHvcc(&config);
-    for (0..config.len) |len| try std.testing.expectError(error.MalformedMedia, validateHvcc(config[0..len]));
+    try validateHvcc(&config, true);
+    for (0..config.len) |len| try std.testing.expectError(error.MalformedMedia, validateHvcc(config[0..len], true));
     var bad = config;
     bad[23] = 0x80 | 33;
-    try std.testing.expectError(error.MalformedMedia, validateHvcc(&bad));
+    try std.testing.expectError(error.MalformedMedia, validateHvcc(&bad, true));
     bad = config;
     bad[25] = 17;
-    try std.testing.expectError(error.ResourceLimitExceeded, validateHvcc(&bad));
+    try std.testing.expectError(error.ResourceLimitExceeded, validateHvcc(&bad, true));
     bad = config;
     bad[29] = 0;
-    try std.testing.expectError(error.MalformedMedia, validateHvcc(&bad));
+    try std.testing.expectError(error.MalformedMedia, validateHvcc(&bad, true));
+}
+
+test "mp4 HEVC inband configuration permits missing parameter sets only for hev1" {
+    var config: [23]u8 = @splat(0);
+    config[0] = 1;
+    config[21] = 3;
+    try validateHvcc(&config, false);
+    try std.testing.expectError(error.MalformedMedia, validateHvcc(&config, true));
+    for (0..config.len) |len| try std.testing.expectError(error.MalformedMedia, validateHvcc(config[0..len], false));
+    var partial = config ++ [_]u8{ 32, 0, 1, 0, 2, 64, 1 };
+    partial[22] = 1;
+    try validateHvcc(&partial, false);
+    try std.testing.expectError(error.MalformedMedia, validateHvcc(&partial, true));
+    partial[29] = 0;
+    try std.testing.expectError(error.MalformedMedia, validateHvcc(&partial, false));
 }
 
 test "mp4 AV1 configuration bounds OBUs and excludes untimed frame payloads" {

@@ -6,6 +6,14 @@ HEVC/AV1 files are rejection controls. `hevc-aac.mp4` carries the same HEVC
 pictures with AAC audio: video embedding ignores the audio track, while an
 explicit audio request decodes it.
 
+`hevc-hev1-inband.mp4` supplies VPS/SPS/PPS only in timed samples, with no
+parameter arrays in `hvcC`. `hevc-avc-tracks.mp4` places the four-second
+192x192 HEVC track before a one-second 32x32 AVC track. Contract preflight
+must charge at least the HEVC track's pixels even though portable inspection
+selects the smaller AVC track. Both fixtures participate in CUDA pixel parity,
+codec switching, and cancellation checks. Their receipt rows record their
+own generator hash and FFmpeg library versions.
+
 `receipt.json` records file hashes, PyAV/FFmpeg versions, generation source hash,
 all reference presentation timestamps, and independent FFmpeg YUV420 hashes for
 the frames selected at 1 FPS with a 32-frame cap. The video pattern and AAC-LC

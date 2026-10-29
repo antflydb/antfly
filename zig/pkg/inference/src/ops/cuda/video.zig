@@ -150,7 +150,7 @@ test "embeddinggemma2 video HEVC AV1 and AVC NVDEC pixels match independent FFmp
             self.count += 1;
         }
     };
-    for (0..2) |_| inline for (.{ "h264.mp4", "hevc-hvc1.mp4", "av1.mp4", "hevc-hev1.mp4", "hevc-aac.mp4", "h264.mp4" }) |name| {
+    for (0..2) |_| inline for (.{ "h264.mp4", "hevc-hvc1.mp4", "av1.mp4", "hevc-hev1.mp4", "hevc-hev1-inband.mp4", "hevc-avc-tracks.mp4", "hevc-aac.mp4", "h264.mp4" }) |name| {
         const expected = for (parsed.value.videos) |entry| {
             if (std.mem.eql(u8, entry.path, name)) break entry;
         } else return error.TestUnexpectedResult;

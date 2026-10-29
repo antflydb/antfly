@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Generate synthetic codec inputs and independent FFmpeg decode receipts.
 
 Requires av==16.0.1. PyAV/FFmpeg is qualification tooling, never a runtime
@@ -25,12 +38,12 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def video(path, encoder, tag, depth=8, duration=4):
+def video(path, encoder, tag, depth=8, duration=4, size=192, inband=False):
     rate = 4 if duration == 4 else 1
     frame_count = duration * rate
     with av.open(str(path), "w", format="mp4") as output:
         stream = output.add_stream(encoder, rate=rate)
-        stream.width = stream.height = 192
+        stream.width = stream.height = size
         stream.pix_fmt = "yuv420p" if depth == 8 else "yuv420p10le"
         ctx = stream.codec_context
         ctx.codec_tag = tag
@@ -42,14 +55,15 @@ def video(path, encoder, tag, depth=8, duration=4):
             ctx.options = {
                 "preset": "ultrafast",
                 "crf": "18",
-                "x265-params": "log-level=error:pools=none:frame-threads=1:bframes=2",
+                "x265-params": "log-level=error:pools=none:frame-threads=1:bframes=2"
+                + (":repeat-headers=1" if inband else ""),
             }
         elif encoder == "libx264":
             ctx.options = {"preset": "ultrafast", "crf": "18", "bf": "2"}
         else:
             ctx.options = {"cpu-used": "8", "crf": "18", "lag-in-frames": "0"}
         for index in range(frame_count):
-            frame = av.VideoFrame(192, 192, "yuv420p")
+            frame = av.VideoFrame(size, size, "yuv420p")
             frame.pts, frame.time_base = index, Fraction(1, rate)
             frame.color_range, frame.colorspace = 1, 1
             for plane_index, plane in enumerate(frame.planes):
@@ -69,6 +83,83 @@ def video(path, encoder, tag, depth=8, duration=4):
                 output.mux(packet)
         for packet in stream.encode():
             output.mux(packet)
+
+
+def inband_hevc(path):
+    """Keep the hvcC format fields, with VPS/SPS/PPS supplied only by samples."""
+    with av.open(str(path)) as source:
+        stream = source.streams.video[0]
+        config = stream.codec_context.extradata
+        packet = next(packet for packet in source.demux(stream) if packet.size)
+        payload = bytes(packet)
+        length_bytes = (config[21] & 3) + 1
+        kinds = set()
+        cursor = 0
+        while cursor < len(payload):
+            size = int.from_bytes(payload[cursor : cursor + length_bytes], "big")
+            cursor += length_bytes
+            kinds.add((payload[cursor] >> 1) & 63)
+            cursor += size
+        if not {32, 33, 34}.issubset(kinds):
+            raise ValueError(
+                "in-band fixture must carry VPS/SPS/PPS in its first sample"
+            )
+    data = bytearray(path.read_bytes())
+    start = data.index(b"hvcC" + config) - 4
+    old_size = int.from_bytes(data[start : start + 4], "big")
+    if old_size != len(config) + 8 or old_size < 39:
+        raise ValueError("expected a complete bounded hvcC box")
+    data[start : start + 4] = (31).to_bytes(4, "big")
+    data[start + 30] = 0  # numOfArrays = 0
+    # Preserve every parent size and sample offset by replacing the removed
+    # arrays with a sibling free box inside the sample entry.
+    data[start + 31 : start + 35] = (old_size - 31).to_bytes(4, "big")
+    data[start + 35 : start + 39] = b"free"
+    path.write_bytes(data)
+
+
+def mux_video_tracks(first_path, second_path, output_path):
+    with (
+        av.open(str(first_path)) as first,
+        av.open(str(second_path)) as second,
+        av.open(str(output_path), "w", format="mp4") as output,
+    ):
+        packets = []
+        for source in (first, second):
+            stream = source.streams.video[0]
+            target = output.add_stream_from_template(stream)
+            for packet in source.demux(stream):
+                if packet.dts is not None:
+                    packets.append((packet.dts * packet.time_base, packet, target))
+        for _, packet, target in sorted(packets, key=lambda row: row[0]):
+            packet.stream = target
+            output.mux(packet)
+
+
+def additional_video_fixtures(output, duration=4):
+    inband = output / "hevc-hev1-inband.mp4"
+    video(inband, "libx265", "hev1", duration=duration, inband=True)
+    inband_hevc(inband)
+    thumbnail = output / ".avc-thumbnail.mp4"
+    try:
+        video(thumbnail, "libx264", "avc1", duration=1, size=32)
+        mixed = output / "hevc-avc-tracks.mp4"
+        mux_video_tracks(output / "hevc-hvc1.mp4", thumbnail, mixed)
+    finally:
+        thumbnail.unlink(missing_ok=True)
+    return [
+        {
+            "path": path.name,
+            "sha256": sha(path),
+            "generator_sha256": sha(Path(__file__)),
+            "pyav": av.__version__,
+            "libraries": av.library_versions,
+            "bit_depth": 8,
+            "accepted": True,
+            **video_receipt(path),
+        }
+        for path in (inband, mixed)
+    ]
 
 
 def audio(path, container, pattern="tone", speech_path=None):
@@ -261,6 +352,9 @@ def main():
                 **video_receipt(path),
             }
         )
+    receipt["videos"].extend(
+        additional_video_fixtures(args.output, args.duration_seconds)
+    )
     for name, container in (("aac-lc.m4a", "ipod"), ("aac-lc.aac", "adts")):
         path = args.output / name
         audio(path, container)
