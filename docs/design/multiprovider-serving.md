@@ -445,3 +445,16 @@ passes. These noisy local populations do not establish an isolated latency
 baseline or a repeatable all-metric win. Keep detached proofs off; preserve
 both orders and the compilation/resource context rather than selecting the
 favorable delayed result.
+
+
+A local replacement proposal for the existing paused diagnostic pair is prepared
+under `native-gc-batch-lab/cloudflare-final/gate-mvslyh876561/`. Its approved
+`c44896ac8c` control bundles are byte-identical to the current control; only the
+candidate is rebuilt from committed source `322ac77832` with the final module
+family. All four configurations match the paused deployments apart from local
+entry paths, and sealed-run verification passes for both sides. No credential
+files were copied, no cloud resources were created and no deployment changed.
+The actual candidate deployment therefore remains the earlier `131a703fed`.
+After explicit authorization, copy the immutable proposal to an unsealed runtime
+directory before installing the approved disposable tokens or changing lifecycle
+state; keep the sealed proposal and prior deployments' evidence intact.
