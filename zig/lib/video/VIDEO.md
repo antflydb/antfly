@@ -525,7 +525,7 @@ producer ownership and cancellation boundaries are unchanged. Cache admission
 failure retains bounded preparation; cache reclamation cannot invalidate active
 CPU borrowers or Metal commands. These mechanisms establish reuse and bounded
 lifetimes; speed comparisons require the pinned per-case performance gate in
-[the model guide](../../../docs/guides/embeddinggemma2.md#per-case-performance-gate).
+[the model guide](../../../docs/design/inference/history/embeddinggemma2/2026-10-22-model-guide-and-qualification.md#per-case-performance-gate).
 
 ### CUDA decoder cache accounting
 

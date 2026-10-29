@@ -14230,7 +14230,8 @@ paths:
     post:
       summary: Read text from images (OCR/document understanding)
       description: >
-        Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+        Reads text from images and documents with a local reader model. OCR and document-reading tasks
+        can also run on a vision-capable generator or a connected provider.
 
 
         ## Models
@@ -14241,11 +14242,13 @@ paths:
         Use the `/ai/v1/models` endpoint to list available models.
 
 
-        - **TrOCR**: Pure OCR for printed/handwritten text
+        - **Florence-2**: OCR, captioning, and visual question answering
+
+        - **PaddleOCR**: Text detection and recognition with page-space regions
+
+        - **LightOnOCR-3**: Document OCR to Markdown
 
         - **Donut**: Document understanding with structured output (receipts, forms)
-
-        - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
 
         - **Pix2Struct**: Visual question answering with natural-language prompts
 
@@ -15295,7 +15298,7 @@ paths:
 
         - Vision2Seq models from `models_dir/readers/`
 
-        - TrOCR, Donut, Florence-2 for OCR and document understanding
+        - Florence-2, PaddleOCR, LightOnOCR-3, Donut, Pix2Struct, and Moondream for OCR and document understanding
 
 
         ## Transcribers
@@ -51031,7 +51034,7 @@ components:
         model:
           type: string
           description: Name of reader model from models_dir/readers/
-          example: microsoft/trocr-base-printed
+          example: antflydb/Florence-2-base
         retain_artifact:
           type: boolean
           default: false
@@ -51063,8 +51066,6 @@ components:
           type: string
           description: >
             Optional task prompt for document understanding models.
-
-            - TrOCR: Not used (pure OCR)
 
             - Donut CORD: "<s_cord-v2>" for receipt parsing
 

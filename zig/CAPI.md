@@ -116,7 +116,7 @@ handlers:
 | `antfly_inference_list_models_json` | `GET /models` |
 
 For decision question types, answer semantics, and SQL providers, see the
-[typed decision guide](../docs/guides/decisions.md).
+[typed decision guide](../docs/reference/decisions.md).
 
 - Images and audio go inline in the JSON, as base64 or `data:` URIs.
 - The `_json` calls return complete responses. To stream,

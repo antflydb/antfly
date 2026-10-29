@@ -101,7 +101,7 @@ request controls take precedence over the shared client's timeout and
 cancellation defaults. Malformed successful vision responses are upstream
 failures, reported as HTTP 502 by document endpoints.
 
-See [declarative document models](declarative-document-models.md) for whole PDF,
+See [declarative document models](../design/declarative-document-models.md) for whole PDF,
 slide and receipt sources and bounded reading/extraction policies. The provider
 wire types are generated from pinned official model schemas; transport fixtures
 exercise the adapters without consuming live model credits. Live model quality

@@ -5,7 +5,7 @@ server). Named question and answer arrays, `input`, `choices`, `levels` and
 predicate `probability` follow the [OpenAI Decisions conventions](https://developers.openai.com/api/docs/guides/decisions).
 Antfly adds embedding similarity answers, multi-choice selection and text
 batches. Supported hosted providers also accept multimodal evidence; see the
-[gateway decision contract](../reference/inference-gateway.md#public-contracts)
+[gateway decision contract](inference-gateway.md#public-contracts)
 for provider and method restrictions. Native trained/embedding decisions and the
 browser surface retain their text restrictions. Choice values are strings and
 every question needs a unique name. See the [decision schema](../../specs/openapi/ai/decision.yaml).
@@ -28,7 +28,7 @@ antfly standalone --config antfly.json
 
 There is no enablement CLI flag. Without this setting, public execution returns
 HTTP 403 even when models are installed. See the
-[public execution policy](../reference/inference-gateway.md#public-execution-policy).
+[public execution policy](inference-gateway.md#public-execution-policy).
 This prerequisite applies to database API nodes on this source version; the
 independent `antfly inference run` listener and older stable releases have their
 own policies.
@@ -102,7 +102,7 @@ it does not imply shared model computation or lower billed token usage.
 
 ## Embedding similarity and multi-choice
 
-[EmbeddingGemma 2](embeddinggemma2.md) advertises `embedding_similarity` and
+[EmbeddingGemma 2](../guides/embeddinggemma2.md) advertises `embedding_similarity` and
 supports `choice` and `multi_choice`. Answers include
 `decision_method: "embedding_similarity"`, `similarity_metric: "cosine"` and
 `similarities: [{value, similarity}]`. Raw cosine values range from -1 to 1;
@@ -199,5 +199,5 @@ predicates require trained deciders. A database handle alone does not configure
 SQL providers.
 
 Validate quality, thresholds and resource limits on your workload before
-deployment. Preparation and limits are in [Laya](laya.md) and
-[EmbeddingGemma 2](embeddinggemma2.md).
+deployment. Preparation and limits are in [Laya](../guides/laya.md) and
+[EmbeddingGemma 2](../guides/embeddinggemma2.md).
