@@ -5137,7 +5137,7 @@ export interface paths {
         put?: never;
         /**
          * Read text from images, documents, or audio
-         * @description Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+         * @description Reads text from images and documents with a local reader model. OCR and document-reading tasks can also run on a vision-capable generator or a connected provider.
          *
          *     Audio input uses an audio-capable generator such as Gemma 4. Supported video
          *     containers are transcribed from their audio track. Results report truncation;
@@ -5148,9 +5148,10 @@ export interface paths {
          *     Models are auto-discovered from `models_dir/readers/` at startup.
          *     Use the `/ai/v1/models` endpoint to list available models.
          *
-         *     - **TrOCR**: Pure OCR for printed/handwritten text
+         *     - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+         *     - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+         *     - **PaddleOCR**: Text detection and recognition with page-space regions
          *     - **Donut**: Document understanding with structured output (receipts, forms)
-         *     - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
          *     - **Pix2Struct**: Visual question answering with natural-language prompts
          *     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened fields
          *
@@ -5584,7 +5585,7 @@ export interface paths {
          *     ## Readers
          *
          *     - Vision2Seq models from `models_dir/readers/`
-         *     - TrOCR, Donut, Florence-2 for OCR and document understanding
+         *     - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document understanding
          *
          *     ## Transcribers
          *
@@ -23241,7 +23242,7 @@ export interface components {
         InferenceReadRequest: {
             /**
              * @description Reader model from models_dir/readers/, or an audio-capable generator from models_dir/generators/ for audio inputs.
-             * @example microsoft/trocr-base-printed
+             * @example lightonai/LightOnOCR-3-0.8B
              */
             model: string;
             /** @description Base64-encoded audio or a data URI, mutually exclusive with images and documents. Supports audio tracks in MP4/MOV and WebM containers. Uses an audio-capable generator from models_dir/generators/ such as Gemma 4. Returns transcript text without word timestamps or speaker labels; video frames are not captioned. Use a registered document reader with an audio binding for planning, fallback, verification, artifact retention, and durable jobs. */
@@ -23266,7 +23267,6 @@ export interface components {
             images?: components["schemas"]["InferenceImageURL"][];
             /**
              * @description Optional task prompt for document understanding models.
-             *     - TrOCR: Not used (pure OCR)
              *     - Donut CORD: "<s_cord-v2>" for receipt parsing
              *     - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
              *     - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning

@@ -23,7 +23,7 @@ class InferenceReadRequest:
 
         Attributes:
             model (str): Reader model from models_dir/readers/, or an audio-capable generator from models_dir/generators/
-                for audio inputs. Example: microsoft/trocr-base-printed.
+                for audio inputs. Example: lightonai/LightOnOCR-3-0.8B.
             audio (str | Unset): Base64-encoded audio or a data URI, mutually exclusive with images and documents. Supports
                 audio tracks in MP4/MOV and WebM containers. Uses an audio-capable generator from models_dir/generators/ such as
                 Gemma 4. Returns transcript text without word timestamps or speaker labels; video frames are not captioned. Use
@@ -38,7 +38,6 @@ class InferenceReadRequest:
                 - URLs (if content_security allows)
                  Example: [{'url': 'data:image/png;base64,iVBORw0KGgo...'}].
             prompt (str | Unset): Optional task prompt for document understanding models.
-                - TrOCR: Not used (pure OCR)
                 - Donut CORD: "<s_cord-v2>" for receipt parsing
                 - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
                 - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning

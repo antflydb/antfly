@@ -103,7 +103,8 @@ def sync_detailed(
 ) -> Response[InferenceError | InferenceReadResponse | InferenceTransientCapacityError]:
     """Read text from images, documents, or audio
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
 
     Audio input uses an audio-capable generator such as Gemma 4. Supported video
     containers are transcribed from their audio track. Results report truncation;
@@ -114,9 +115,10 @@ def sync_detailed(
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -183,7 +185,8 @@ def sync(
 ) -> InferenceError | InferenceReadResponse | InferenceTransientCapacityError | None:
     """Read text from images, documents, or audio
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
 
     Audio input uses an audio-capable generator such as Gemma 4. Supported video
     containers are transcribed from their audio track. Results report truncation;
@@ -194,9 +197,10 @@ def sync(
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -258,7 +262,8 @@ async def asyncio_detailed(
 ) -> Response[InferenceError | InferenceReadResponse | InferenceTransientCapacityError]:
     """Read text from images, documents, or audio
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
 
     Audio input uses an audio-capable generator such as Gemma 4. Supported video
     containers are transcribed from their audio track. Results report truncation;
@@ -269,9 +274,10 @@ async def asyncio_detailed(
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -336,7 +342,8 @@ async def asyncio(
 ) -> InferenceError | InferenceReadResponse | InferenceTransientCapacityError | None:
     """Read text from images, documents, or audio
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
 
     Audio input uses an audio-capable generator such as Gemma 4. Supported video
     containers are transcribed from their audio track. Results report truncation;
@@ -347,9 +354,10 @@ async def asyncio(
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields

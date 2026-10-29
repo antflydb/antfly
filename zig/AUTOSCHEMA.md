@@ -88,7 +88,7 @@ personalized PageRank (engine gap 2) -> `graph_metric_rerank` blend (shipped)
 ## Stage 1: LLM Triple Extraction
 
 Two `generator` asset enrichments, one per extraction pass, following the
-forced-tool-call pattern proven in `examples/epstein/main.go`
+forced-tool-call pattern proven in [`examples/epstein/main.go`](https://github.com/antflydb/antfly/blob/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein/main.go)
 (`tool_output: "arguments"`, pinned `tool_choice`, `additionalProperties:
 false`, enum-constrained relation types). Each emits one `extraction_graph`
 artifact; the graph index merges them via its ordered `sources` array (up to
@@ -255,7 +255,7 @@ One shape note from implementation: `source_artifact` is required and
 singular per resolver, so the events/catch-all pair above is declared per
 artifact in practice — a labeled `event` resolver plus a catch-all where an
 artifact carries both classes, each with its own `resolution_artifact` (see
-`examples/epstein/autoschema.go` for the working three-resolver layout over
+[`examples/epstein/autoschema.go`](https://github.com/antflydb/antfly/blob/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein/autoschema.go) for the working three-resolver layout over
 two artifacts). Everything downstream — durable edge artifacts, generation
 binding, visibility inheritance, replay, split/merge — is the existing
 autograph machinery, unchanged.
@@ -459,7 +459,7 @@ Missing for HippoRAG2/AutoSchemaKG-style retrieval:
 | 3 | Retrieval-agent seeding/rerank orchestration + wire-layer plumbing | DONE: `seed_nodes`+`damping` on `graph_metric`/`graph_metric_rerank` wire shapes; personalized top-k and rerank readers; serverless and cross-shard personalized requests fail closed (422); the retrieval agent auto-seeds a fresh rerank from literal graph-search start keys and degrades to unseeded when none resolve |
 | 4 | Promoter upserts trigger enrichments on entity/event tables | Lite regression verifies recursive Compiler → Software → Computing promotion/enrichment, mixed artifact/field edges, and durable producer failure reporting; a separate real-model Lite regression covers configured models_dir → extraction → entity promotion → seeded PPR |
 | 5 | Resolver routing-by-label | DONE: `labels` on `GraphResolverConfig`; labeled siblings disjoint (admission), catch-alls skip sibling-claimed labels at runtime, `{{ hash }}` key-template helper for event keys |
-| 6 | Positional (id-less) extractor payloads | DONE: GLiNER2.5 boundary payloads carry no per-entity ids and reference entities via each relation's `entity_index`; `pkg/antfly-embedded/resolver` assigns id-less mentions their decimal array position as the local id, and the graph materializer resolves `entity_index` endpoints through the injected `_entities` resolution map under the same identity (`graphArtifactEntityAtIndex` + runtime mirror). `examples/dogfood` (Lite) and the `kg_gliner_v1` lane in `examples/epstein` build on this |
+| 6 | Positional (id-less) extractor payloads | DONE: GLiNER2.5 boundary payloads carry no per-entity ids and reference entities via each relation's `entity_index`; `pkg/antfly-embedded/resolver` assigns id-less mentions their decimal array position as the local id, and the graph materializer resolves `entity_index` endpoints through the injected `_entities` resolution map under the same identity (`graphArtifactEntityAtIndex` + runtime mirror). `examples/antfly-docs-knowledge-base` builds on this |
 | 7 | Lite resolver registration | DONE: native Lite handles register a graph config's inline `resolvers` array on `antfly_db_add_index_json` (add/update only, mirroring nested-enrichment registration); resolution and atomic cross-table promotion run locally; `runUntilIdle` drains all named tables to a fixed point, including recursive taxonomy enrichment. AddIndex is all-or-nothing: a rejected admission or partial enrichment/resolver registration restores the pre-call catalog |
 | 8 | Convergent identity layer | DONE: label-free `entity/{{ slug _entity.text }}` keys (label rides the document), possessive-stripping slug, compositional `event/{{ hash _entity.event_identity }}` event keys (participants + predicate, computed in pkg/antfly-embedded/resolver, degrades to sentence text; requires at least one participant so a bare predicate never becomes a corpus-wide hub), `min_confidence` mention-admission floor on GraphResolverConfig. Participants compose their CANONICAL keys: the resolution runtime injects sibling resolutions (same-batch overlay + committed artifacts) and a committed resolution re-drives its source for the other resolvers, so entity merges re-key the events they touch. The entity-event and event-event passes are folded into ONE `kg_events_v1` pass so every event mention carries the participants its identity needs — a participant-less event-event pass would mint sentence-keyed nodes disconnected from the participates_in topology |
 | 9 | Cross-table traversal | DONE: self-table `target_table` tags canonicalize away (`TraversalRules.owning_table` locally, `canonicalizeTable` in the local MATCH readers); the direct storage entry points (embedded Lite) and the server executors expand THROUGH cross-table nodes — the API read source proves snapshot completeness for single-group tables and threads the scope down the executor vtables; the distributed coordinator fans an entity-tagged frontier across the SOURCE table's groups (owner-scoped entity-sourced rows) in addition to the tagged table's route, for expansion, weighted paths, and incoming probes. `paths.zig` keys identity by table. See Stage 2 |
@@ -468,7 +468,7 @@ Missing for HippoRAG2/AutoSchemaKG-style retrieval:
 
 ## Phases
 
-1. **Prototype (config only).** Extend `examples/epstein` with the
+1. **Prototype (config only).** Extend the former [`examples/epstein`](https://github.com/antflydb/antfly/tree/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein) (now superseded by `examples/grepstein`) with the
    extraction tool schemas and an `events` resolver; port and evaluate the
    reference prompts against local 8B-class models. Exit criterion: triple
    precision/recall on a labeled sample comparable to the paper's 88%+ F1.

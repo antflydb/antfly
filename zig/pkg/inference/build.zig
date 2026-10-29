@@ -1884,6 +1884,52 @@ pub fn build(b: *std.Build) void {
     const audio_test_step = b.step("test-audio", "Run shared audio tests");
     audio_test_step.dependOn(&run_audio_tests.step);
 
+    // Qualify model frontends without compiling the complete model registry.
+    // The main inference owner already runs the pipeline tests; explicitly
+    // include the independent generic FFT reference in the default gate too.
+    const frontend_step = b.step("test-whisper-frontend", "Check FFT and BLAS Whisper reference features and CLAP isolation");
+    const frontend_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pipelines/audio.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{ "Whisper", "whisper", "blas log-mel", "clap" },
+    });
+    frontend_tests.root_module.addImport("build_options", build_options_mod);
+    frontend_tests.root_module.addImport("inference_audio", inference_audio_mod);
+    frontend_tests.root_module.addImport("antfly_platform", configured_platform_mod);
+    configureNativeTool(b, frontend_tests, target, enable_system_blas, blas_root, false);
+    frontend_step.dependOn(&b.addRunArtifact(frontend_tests).step);
+    const frontend_fft_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_module_test_root.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = link_libc,
+        }),
+        .filters = &.{"Whisper"},
+    });
+    @import("antfly_media").support.attach(b, frontend_fft_tests.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
+    const run_frontend_fft = b.addRunArtifact(frontend_fft_tests);
+    frontend_step.dependOn(&run_frontend_fft.step);
+    if (suite.selected_test_filters.len == 0) default_test_step.dependOn(&run_frontend_fft.step);
+
+    // The TNS regression is optimization-sensitive: run it in ReleaseFast even
+    // when the surrounding suite uses Debug or ReleaseSafe.
+    const audio_tns_tests = b.addTest(.{
+        .name = "audio-tns-optimized-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/src/aacplus/tns_test.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = .fast,
+        }),
+    });
+    const run_audio_tns_tests = b.addRunArtifact(audio_tns_tests);
+    b.step("test-audio-tns", "Run optimized AAC TNS arithmetic regressions").dependOn(&run_audio_tns_tests.step);
+    audio_test_step.dependOn(&run_audio_tns_tests.step);
+    default_test_step.dependOn(&run_audio_tns_tests.step);
+
     const audio_open_corpus = b.addExecutable(.{
         .name = "audio_open_corpus",
         .root_module = b.createModule(.{
@@ -2196,7 +2242,10 @@ pub fn build(b: *std.Build) void {
     audio_module_tests_all.root_module.link_libc = true;
     const run_audio_codecs = b.addRunArtifact(audio_module_tests_all);
     audio_module_test_step.dependOn(&run_audio_codecs.step);
-    b.step("test-audio-codecs", "Run the complete shared audio codec suite").dependOn(&run_audio_codecs.step);
+    audio_module_test_step.dependOn(&run_audio_tns_tests.step);
+    const audio_codec_test_step = b.step("test-audio-codecs", "Run the complete shared audio codec suite");
+    audio_codec_test_step.dependOn(&run_audio_codecs.step);
+    audio_codec_test_step.dependOn(&run_audio_tns_tests.step);
 
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{

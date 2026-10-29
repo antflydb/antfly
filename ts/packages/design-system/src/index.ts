@@ -1,4 +1,4 @@
-// Primitives (shadcn/ui, new-york style)
+// Primitives (shadcn/ui, radix-vega style)
 
 export * from "./components/brand/anty";
 export * from "./components/brand/cta";
@@ -19,6 +19,7 @@ export * from "./components/compound/dashboard-page";
 export * from "./components/compound/data-table";
 export * from "./components/compound/empty-state";
 export * from "./components/compound/file-upload";
+export * from "./components/compound/highlighted-code-block";
 export * from "./components/compound/layout";
 export * from "./components/compound/multi-select";
 export * from "./components/compound/page-header";
@@ -42,19 +43,26 @@ export * from "./components/ui/card";
 export * from "./components/ui/carousel";
 export * from "./components/ui/chart";
 export * from "./components/ui/checkbox";
+export * from "./components/ui/code-block";
 export * from "./components/ui/collapsible";
 export * from "./components/ui/command";
 export * from "./components/ui/context-menu";
 export * from "./components/ui/dialog";
 export * from "./components/ui/drawer";
 export * from "./components/ui/dropdown-menu";
+export * from "./components/ui/empty";
+export * from "./components/ui/field";
 export * from "./components/ui/form";
 export * from "./components/ui/hover-card";
 export * from "./components/ui/input";
 export * from "./components/ui/input-group";
 export * from "./components/ui/input-otp";
+export * from "./components/ui/item";
+export * from "./components/ui/kbd";
 export * from "./components/ui/label";
 export * from "./components/ui/menubar";
+export * from "./components/ui/message";
+export * from "./components/ui/message-scroller";
 export * from "./components/ui/navigation-menu";
 export * from "./components/ui/pagination";
 export * from "./components/ui/popover";
@@ -68,6 +76,7 @@ export * from "./components/ui/sheet";
 export * from "./components/ui/skeleton";
 export * from "./components/ui/slider";
 export * from "./components/ui/sonner";
+export * from "./components/ui/spinner";
 export * from "./components/ui/status-dot";
 export * from "./components/ui/switch";
 export * from "./components/ui/table";
@@ -76,9 +85,12 @@ export * from "./components/ui/textarea";
 export * from "./components/ui/toggle";
 export * from "./components/ui/toggle-group";
 export * from "./components/ui/tooltip";
+export * from "./components/ui/trace";
 
 // Hooks
+export { useHighlightedCode } from "./hooks/use-highlighted-code";
 export { useIsMobile } from "./hooks/use-mobile";
 
 // Utilities
-export { cn } from "./lib/utils";
+export { highlightCode, loadHighlighter } from "./lib/highlighter";
+export { type ClassValue, cn } from "./lib/utils";

@@ -1,7 +1,7 @@
 "use client";
 
+import { Check, ChevronDown } from "lucide-react";
 import * as React from "react";
-import { ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -144,15 +144,16 @@ function SwitcherItem({
         onSelect?.(val);
         setOpen(false);
       }}
-      className={cn("flex items-center gap-2.5", className)}
+      className={cn("flex items-center gap-2", className)}
       {...props}
     >
-      <span
-        aria-hidden
-        className={cn("size-1.5 shrink-0", selected ? "bg-primary" : "bg-transparent")}
-      />
       {icon && <span className="shrink-0 text-muted-foreground [&>svg]:size-4">{icon}</span>}
       <span className="flex-1 truncate">{children}</span>
+      <Check
+        aria-hidden
+        className={cn("size-3.5 shrink-0 text-foreground", selected ? "opacity-100" : "opacity-0")}
+        strokeWidth={2.5}
+      />
     </CommandItem>
   );
 }

@@ -15,8 +15,8 @@ task selects the native API. Apple configurations do not accept a model name.
 SDKs and the generator
 selector have been regenerated/updated.
 
-See [the native provider guide](../guides/apple-native-ocr.mdx) for current
-configuration, bounds, and verification. On macOS 27.0.1 / SDK 27, real OCR and
+See [the Apple provider guide](../guides/providers/apple.mdx) for current
+configuration and bounds; verification commands are below. On macOS 27.0.1 / SDK 27, real OCR and
 file transcription work, including phrase/word timestamps. Foundation Models
 initially reported `modelNotReady`, then became available without an Antfly
 settings change. Real text generation, history recall, and byte bounds passed.
@@ -376,3 +376,46 @@ accuracy on scanned documents, prove other sandbox/daemon environments, or verif
 the future Swift bridge. The main remaining uncertainty is newer framework
 behavior in Antfly's CLI and Lite host environments, not the existence of provider
 extension points.
+
+## Verification commands
+
+Run from `zig/`:
+
+```bash
+zig build apple-bridge-loader-test lib-readers-test lib-generating-test lib-transcribing-test \
+  antfly-apple-provider-test apple-pdf-ocr-test \
+  -Dapple-providers=true -Dmetal=false -j2
+zig build lib-readers-check lib-generating-check lib-transcribing-check \
+  -Dtarget=x86_64-linux-gnu -Dmetal=false
+```
+
+The native tests recognize a generated invoice image through encoded, borrowed
+RGBA, and inline data URI paths. The scanned PDF qualification uses real Vision
+OCR and checks exact text, page bounds, and grounding spans. They require access
+to macOS Vision services; restrictive process sandboxes may prevent recognition.
+The cross-build check verifies that disabled Linux readers compile without Apple
+frameworks. `scripts/apple-provider-probe.swift` also provides an independent
+Vision smoke test and can regenerate the image fixture with `--write-fixture`.
+
+The speech fixture checks exact text and phrase/word timestamps. Generation tests
+exercise configuration, cancellation, and the model's readiness error; when the
+model is available they also check real output and its byte limit. On the macOS 27 test machine, Foundation Models initially reported
+`modelNotReady`, then became available. Real generation, role-preserving history
+recall, and output-limit enforcement passed once the OS model was ready. The standalone C driver
+`scripts/apple-intelligence-probe.c` can query availability or exercise the same
+Swift C ABI independently of Antfly.
+
+To probe the installed Lite library from a separate C host, run from the repository
+root after building `capi`:
+
+```bash
+xcrun clang -DANTFLY_APPLE_HOSTED_PROBE scripts/apple-intelligence-probe.c \
+  -o /tmp/antfly-apple-hosted-probe
+ANTFLY_APPLE_HOST_LIBRARY="$PWD/zig/zig-out/lib/libantfly.dylib" \
+  /tmp/antfly-apple-hosted-probe
+```
+
+The default operation reports generation and speech availability. This exercises
+sidecar discovery from `libantfly`, independently of the probe executable's
+location. The same host probe has been qualified with real generation and file
+transcription on macOS 27.

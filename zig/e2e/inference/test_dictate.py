@@ -175,6 +175,7 @@ def test_dictate_rejects_invalid_options_before_transcribing(api):
 
 @pytest.mark.multimodal
 @pytest.mark.slow
+@pytest.mark.inference_model("generator")
 def test_dictate_cleanup_rewrites_transcript(api):
     """With a generator the response carries cleaned text and real usage."""
     audio = base64.b64encode(_WHISPER_QUALITY_WAV.read_bytes()).decode()
@@ -212,6 +213,7 @@ def test_dictate_cleanup_rewrites_transcript(api):
 @pytest.mark.multimodal
 @pytest.mark.slow
 @pytest.mark.streaming
+@pytest.mark.inference_model("generator")
 def test_dictate_streams_transcript_then_deltas_then_completion(api):
     """Streaming emits transcript, delta, completed, then [DONE]."""
     audio = base64.b64encode(_WHISPER_QUALITY_WAV.read_bytes()).decode()

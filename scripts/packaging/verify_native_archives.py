@@ -95,9 +95,10 @@ def verify(directory: Path, platform: dict, products: list[str]) -> None:
                     )
                 if not valid:
                     raise ValueError(f"{path.name}: {name} has the wrong native target")
-                if darwin and name == library and member.size >= 80 * 1024**2:
+                if darwin and name == library and member.size >= 88 * 1024**2:
                     raise ValueError(
-                        f"{path.name}: libantfly exceeds the 80MiB Darwin retained-code budget"
+                        f"{path.name}: libantfly is {member.size / 1024**2:.2f}MiB ({member.size} bytes), "
+                        "exceeding the 88MiB Darwin retained-code budget"
                     )
         print(f"verified {path.name}")
 

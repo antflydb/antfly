@@ -90,7 +90,7 @@ func TestCorpusPilotStopsBeforeOpeningLaterPDF(t *testing.T) {
 		t.Fatalf("records=%d", len(records))
 	}
 	loc := records[0].Document["metadata"].(map[string]any)["source_locator"].(map[string]any)
-	if loc["first"] != float64(1) || loc["last"] != float64(2) {
+	if loc["first"] != json.Number("1") || loc["last"] != json.Number("2") {
 		t.Fatalf("range=%v", loc)
 	}
 	cfg := testCorpusConfig(t, state)
@@ -362,6 +362,62 @@ func TestCorpusTruncatedManifestIsNotEOF(t *testing.T) {
 	var record corpusRecord
 	if _, err := readCorpusLine(bufio.NewReader(strings.NewReader(`{"id":"partial"}`)), &record); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestCorpusManifestPreservesArchiveNanosecondsAndPageOffsets(t *testing.T) {
+	archive := createTestZip(t, map[string][]byte{"document.pdf": createMultiPagePDF(4)})
+	stamp := time.Unix(0, 1792906979419410749)
+	if err := os.Chtimes(archive, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(t.TempDir(), "state")
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "doj-06=" + archive, "--pages-per-record", "2"}); err != nil {
+		t.Fatal(err)
+	}
+	records := testCorpusRecords(t, state)
+	if len(records) != 2 {
+		t.Fatalf("prepared %d records", len(records))
+	}
+	metadata := records[1].Document["metadata"].(map[string]any)
+	raw, err := json.Marshal(metadata["source_locator"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loc sourceLocator
+	if err := json.Unmarshal(raw, &loc); err != nil {
+		t.Fatal(err)
+	}
+	if loc.Modified != mustStat(t, archive).ModTime().UnixNano() {
+		t.Fatalf("archive timestamp changed during manifest decoding: %d", loc.Modified)
+	}
+	if citation, page := corpusPageCitation("s3://bucket/document.pdf", metadata, 2); page != 4 || citation != "s3://bucket/document.pdf#page=4" {
+		t.Fatalf("lost original page offset: %s (%d)", citation, page)
+	}
+	store := newCorpusStore(testCorpusConfig(t, state))
+	defer store.Close()
+	if err := warmCorpusPageWindows(store, filepath.Join(state, "records.ndjson")); err != nil {
+		t.Fatalf("unchanged prepared archive rejected: %v", err)
+	}
+	reader, err := store.open(loc)
+	if err != nil {
+		t.Fatalf("unchanged archive could not be opened for publication: %v", err)
+	}
+	reader.Close()
+	changed := stamp.Add(time.Second)
+	if err := os.Chtimes(archive, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	if reader, err := store.open(loc); err == nil {
+		reader.Close()
+		t.Fatal("changed archive passed the revision guard")
+	}
+}
+
+func TestCorpusManifestRejectsTrailingJSON(t *testing.T) {
+	var record corpusRecord
+	if _, err := readCorpusLine(bufio.NewReader(strings.NewReader("{\"id\":\"first\"} {\"id\":\"second\"}\n")), &record); err == nil {
+		t.Fatal("multiple JSON values were accepted as one manifest record")
 	}
 }
 func TestCorpusExtractorModelUsesRegisteredIdentifier(t *testing.T) {

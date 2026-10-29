@@ -1,0 +1,54 @@
+{
+  "mode": "evidence-only",
+  "sources": [
+    {
+      "id": "owner",
+      "content": "Mira Chen owns operations and handles shipment escalation.",
+      "metadata": {
+        "source": "orchard-handbook",
+        "section": "operations",
+        "_antfly": {
+          "score": 0.032786883413791656,
+          "index_scores": {
+            "full_text": 1.7894153594970703,
+            "vectors": 0.5719418525695801
+          },
+          "rerank_score": 0.8933724164962769,
+          "rerank_index": 0
+        }
+      }
+    },
+    {
+      "id": "apples",
+      "content": "Apples are stored in the cool orchard warehouse.",
+      "metadata": {
+        "source": "orchard-handbook",
+        "section": "storage",
+        "_antfly": {
+          "score": 0.016129031777381897,
+          "index_scores": {
+            "vectors": 0.5130307078361511
+          },
+          "rerank_score": 0.0007593991467729211,
+          "rerank_index": 1
+        }
+      }
+    },
+    {
+      "id": "shipment",
+      "content": "The Q3 shipment target is 120 crates.",
+      "metadata": {
+        "source": "orchard-handbook",
+        "section": "shipments",
+        "_antfly": {
+          "score": 0.01587301678955555,
+          "index_scores": {
+            "vectors": 0.4994693994522095
+          },
+          "rerank_score": 0.0005738298641517758,
+          "rerank_index": 2
+        }
+      }
+    }
+  ]
+}

@@ -297,8 +297,12 @@ export function bindAntflyEmbeddedApi(exports) {
 
     function searchTotalHits(result) {
         if (Array.isArray(result?.responses) && result.responses.length > 0) {
-            if (result.responses[0]?.hits?.total != null) {
-                return result.responses.reduce((sum, response) => sum + (response.hits?.total ?? 0), 0);
+            if (result.responses[0]?.hits?.total != null || Array.isArray(result.responses[0]?.hits?.hits)) {
+                return result.responses.reduce((sum, response) => {
+                    const total = response.hits?.total;
+                    const value = typeof total === "number" ? total : total?.value;
+                    return sum + (typeof value === "number" ? value : (response.hits?.hits?.length ?? 0));
+                }, 0);
             }
             return result.responses.length;
         }

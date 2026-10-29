@@ -837,7 +837,7 @@ func warmCorpusPageWindows(store *corpusStore, manifest string) error {
 		if err := json.Unmarshal(encoded, &loc); err != nil {
 			return err
 		}
-		total, _ := metadata["original_pages"].(float64)
+		total, _ := corpusMetadataNumber(metadata["original_pages"])
 		if loc.First > 0 && (loc.First != 1 || loc.Last != int(total)) {
 			if err := store.preparePageWindow(loc); err != nil {
 				var invalid *corpusPDFWindowError

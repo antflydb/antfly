@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Schema-aware execution inside an admitted, managed model session. CUDA
-//! groups compatible inputs into bounded physical batches; native and Metal
-//! retain their qualified serial request execution.
+//! Schema-aware execution inside an admitted, managed model session. CUDA and
+//! Metal group compatible inputs into bounded physical batches; native retains
+//! its qualified serial request execution.
 //! Output is buffered atomically and independently bounded across all inputs.
 const std = @import("std");
 const wire = @import("extraction_v2.zig");
@@ -198,7 +198,7 @@ fn workspaceGeometryFor(backend: compute.BackendKind, allocator: Allocator, conf
 /// Contiguous compatible items share one forward pass without reordering results.
 /// The same preparation/planning routine runs before qualification and execution.
 fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, items: []const wire.Item, options: Options) !processor.PreparedBatch {
-    const limit = if (backend == .cuda) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
+    const limit = if (backend == .cuda or backend == .metal) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
     if (limit == 0 or items.len == 0) return error.ResourceLimitExceeded;
     var count: usize = 1;
     while (count < @min(limit, items.len) and items[count].options.long_document.mode != .window and std.meta.eql(items[0].options, items[count].options)) : (count += 1) {}
@@ -974,7 +974,7 @@ test "boundary qualification quiet geometry releases every failed allocation" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, QualificationGeometryTest.exercise, .{.success});
 }
 
-test "CUDA boundary request groups distinct ragged inputs within physical limits" {
+test "GPU boundary request groups distinct ragged inputs within physical limits" {
     const a = std.testing.allocator;
     var request = try wire.parseJson(a,
         \\{"schema_version":2,"model":"geometry-only","schema":{"entities":["person"]},"inputs":[{"content":"Ada"},{"content":"Ada visited 東京 with Grace"},{"content":"last","options":{"word_splitter":"char"}}]}
@@ -1005,9 +1005,24 @@ test "CUDA boundary request groups distinct ragged inputs within physical limits
     var bounded = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
     defer bounded.deinit();
     try std.testing.expectEqual(@as(usize, 1), bounded.samples.len);
-    var serial = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, .{});
+    var metal = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, .{});
+    defer metal.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metal.samples.len);
+    try std.testing.expectEqualSlices(i64, group.input_ids, metal.input_ids);
+    try std.testing.expectEqualSlices(i64, group.attention_mask, metal.attention_mask);
+    var metal_bounded = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer metal_bounded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metal_bounded.samples.len);
+    var serial = try prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, .{});
     defer serial.deinit();
     try std.testing.expectEqual(@as(usize, 1), serial.samples.len);
+    var geometry_options = Options{ .identity = .{ .backbone = .small, .precision = .fp32, .weight = artifact.Digest.of("geometry weight"), .sidecars = @splat(artifact.Digest.of("geometry sidecar")) } };
+    var tail = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items[2..], geometry_options);
+    defer tail.deinit();
+    const peak = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, geometry_options);
+    try std.testing.expectEqual(@max(metal.input_ids.len, tail.input_ids.len), peak);
+    geometry_options.engine.limits.max_batch = 1;
+    try std.testing.expect(peak > try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, geometry_options));
 }
 
 test "CUDA boundary managed Multi-Decide batches windows and recovers after cancellation" {

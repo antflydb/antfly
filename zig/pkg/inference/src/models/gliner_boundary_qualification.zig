@@ -285,19 +285,19 @@ const fastino_gliner25_base_v1_features = Features.initMany(&.{
 
 // Exact min/max observed by the geometry-measuring test cited above: the
 // ten canonical fixtures, the shortest and longest reviewed short requests,
-// and examples/dogfood's real production schema (11 entities, 6 relations)
+// and examples/antfly-docs-knowledge-base's real production schema (11 entities, 6 relations)
 // against both its own short repro text and a realistic 107-word/610-byte
 // corpus paragraph (zig/ENRICHMENTS.md). The wider schema alone roughly
 // doubles padded_sequence_tokens versus the earlier 3-entity/2-relation
 // rows at the same document length (56 -> 118), which is why this bound
 // widened well past the document-length increase alone. A document needing
-// more than this measured single-window range -- most of examples/dogfood's
+// more than this measured single-window range -- most of examples/antfly-docs-knowledge-base's
 // longer design-doc sections -- still requires long-document windowing,
 // which remains unqualified (.long_document is not in the feature set
 // above) and correctly fails closed with UnsupportedGlinerBoundaryRuntime.
 //
 // Lower bounds re-measured 2026-09-19 (same geometry test, two added cases):
-// examples/dogfood's smallest real section, zig/SCHEMA.md's "Related Docs"
+// examples/antfly-docs-knowledge-base's smallest real section, zig/SCHEMA.md's "Related Docs"
 // list as docsaf emits it ("TODO.mdSERVERLESS.md": 20 bytes, 5 splitter
 // words, 6 window words, 110 padded tokens with the dogfood schema), and a
 // one-character document ("a": 1 byte, 1 word, 2 window words, 103 padded
@@ -345,7 +345,7 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    source.entity_index/target.entity_index, score) with no head/tail
 //    fields, on both backends.
 //  - Geometry: measured directly against the pinned tokenizer/planner (no
-//    model weights) over the real examples/dogfood production schema (11
+//    model weights) over the real examples/antfly-docs-knowledge-base production schema (11
 //    entities, 6 relations) against the same short fixtures as the
 //    single-window row above, three real repository sections spanning the
 //    corpus-wide range this file's long-document section documents (95th
@@ -371,7 +371,7 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    up to 29 windows at 1024 words each versus up to 8 at 4096 -- everything
 //    else the two sweeps measured overlaps). This also qualifies the
 //    request_items dimension up to the single reviewed value of 1: a request
-//    batching more than one document into one call (examples/dogfood never
+//    batching more than one document into one call (examples/antfly-docs-knowledge-base never
 //    does this, but the inference server's generic "extract" task capability
 //    advertisement did, until this same change fixed
 //    resolvedExecutorBatchImplementation in server/server.zig to stop
@@ -387,7 +387,7 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 // This is a SEPARATE row from fastino_gliner25_base_v1's single-window row
 // above, not a widening of it: the two rows require disjoint features
 // (.single_window vs .long_document) and this row's feature set covers
-// exactly examples/dogfood's real schema shape (entities + relations only;
+// exactly examples/antfly-docs-knowledge-base's real schema shape (entities + relations only;
 // no entity attributes, classification, records, or JointIE have been
 // measured through this merge path), so a request for any of those task
 // types together with long-document windowing still correctly fails closed.
@@ -400,7 +400,7 @@ const fastino_gliner25_base_v1_long_document_features = Features.initMany(&.{
 // Union of the exact min/max observed at window_words=1024 and
 // window_words=4096 across every case in the long-document geometry test
 // cited above (the two short single-window-shaped fixtures, still requested
-// with long_document.mode=window since examples/dogfood requests it
+// with long_document.mode=window since examples/antfly-docs-knowledge-base requests it
 // unconditionally -- see index_config.go's knowledgeGraphIndexJSON -- plus
 // the three real multi-window sections and the two synthetic 130KB/182KB
 // documents). A document needing more than this measured range --
@@ -412,7 +412,7 @@ const fastino_gliner25_base_v1_long_document_features = Features.initMany(&.{
 // Lower bounds re-measured 2026-09-19 with the same two tiny documents as
 // the single-window row above (SCHEMA.md "Related Docs": 20 bytes / 5 words
 // / 6 window words / 110 padded tokens; one character: 1 / 1 / 2 / 103),
-// still requested with long_document.mode=window as examples/dogfood does,
+// still requested with long_document.mode=window as examples/antfly-docs-knowledge-base does,
 // at both window sizes. Verified end to end on native and Metal by the
 // corpus-minimum provider tests in server/gliner_boundary_service_test.zig.
 const fastino_gliner25_base_v1_long_document_lengths = LengthContract{
@@ -494,7 +494,7 @@ const fastino_gliner25_base_v1_fp16_encoder = bundle.Identity{
 };
 
 // Long-document windowed execution for fastino_gliner25_base_v1_fp16_encoder,
-// reviewed 2026-09-19. examples/dogfood requests windowing unconditionally
+// reviewed 2026-09-19. examples/antfly-docs-knowledge-base requests windowing unconditionally
 // (index_config.go's knowledgeGraphIndexJSON), and essentially every real
 // section its corpus produces needs it (section 3/9's LengthContract),
 // so a single-window-only fp16 row cannot serve real dogfood traffic.
@@ -771,7 +771,19 @@ fn cudaBatchEntries() [2 + family_profiles.len]Entry {
     for (cudaMultilingualEntries(), 2..) |entry, i| entries[i] = cudaBatchEntry(entry);
     return entries;
 }
-const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries());
+// Metal FP32 batches use the same bounded per-item profiles as serial serving.
+// Keep reduced precision, Multi-Decide and long-document requests independent.
+pub const metal_batch_items: usize = 8;
+fn metalBatchEntries() [2 + family_profiles.len]Entry {
+    var entries: [2 + family_profiles.len]Entry = undefined;
+    entries[0] = base_production_entries[1];
+    entries[1] = transformersWrapperEntries()[1];
+    for (family_profiles, 2..) |profile, i|
+        entries[i] = .{ .identity = fastino_gliner25_multi_v1, .backend = .metal, .features = profile.features, .lengths = profile.lengths };
+    for (&entries) |*entry| entry.lengths.request_items = .{ .min = 2, .max = metal_batch_items };
+    return entries;
+}
+const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries() ++ metalBatchEntries());
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -1375,4 +1387,26 @@ test "CUDA boundary batch rows preserve per-item limits and exclude long documen
     var long = composed_window_lengths;
     long.request_items = Range.exact(2);
     try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(fastino_gliner25_base_v1, .cuda, composed_window_features, long));
+}
+
+test "Metal boundary FP32 batch rows retain per-item geometry and reject unqualified profiles" {
+    for (metalBatchEntries()) |entry| {
+        for ([_]u32{ 2, 4, 8 }) |n| {
+            var lengths = entry.lengths;
+            lengths.request_items = Range.exact(n);
+            try require(entry.identity, .metal, entry.features, lengths);
+        }
+        var lengths = entry.lengths;
+        lengths.request_items = Range.exact(9);
+        try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(entry.identity, .metal, entry.features, lengths));
+        lengths.request_items = Range.exact(2);
+        lengths.padded_sequence_tokens = Range.exact(1_000_000);
+        try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(entry.identity, .metal, entry.features, lengths));
+    }
+    var lengths = fastino_gliner25_base_v1_lengths;
+    lengths.request_items = Range.exact(2);
+    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(fastino_gliner25_base_v1_fp16_encoder, .metal, fastino_gliner25_base_v1_features, lengths));
+    var long = composed_window_lengths;
+    long.request_items = Range.exact(2);
+    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(fastino_gliner25_base_v1, .metal, composed_window_features, long));
 }

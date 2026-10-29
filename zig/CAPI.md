@@ -116,7 +116,7 @@ handlers:
 | `antfly_inference_list_models_json` | `GET /models` |
 
 For decision question types, answer semantics, and SQL providers, see the
-[typed decision guide](../docs/guides/decisions.md).
+[typed decision guide](../docs/reference/decisions.md).
 
 - Images and audio go inline in the JSON, as base64 or `data:` URIs.
 - The `_json` calls return complete responses. To stream,
@@ -308,6 +308,68 @@ the gate and validates before adoption. Foreground refresh defers allocator
 conversion, reclamation, and historical index backfill to that owner. Lease-scoped publication
 fences new read pins until page reuse and checkpoint publication finish; temporary
 lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
+
+After a native writer publishes to a revision-4 Lite file, its last clean close
+lets an in-flight allocator proof finish and publishes a checked certificate
+when the inode and checkpoints still match. It does not cancel and restart that
+walk. If no proof started, close may bootstrap a file of at most 4 MiB; larger
+files and legacy revision-3 files do not start a shutdown proof. A failed or
+canceled walk is never restarted at close. Close can wait for an existing proof,
+but never launches a second large scan. The walk and reader teardown run outside
+both publication locks. Subsequent processes inherit a valid certificate before opening index
+sources. Owners that make no publications require no new proof at close.
+Queued replay and storage maintenance recheck shutdown after acquiring the
+owner gate. A historical proof attempt does not keep queued maintenance alive.
+
+Before admitting a mutation, native writers with a nonempty unverified free pool
+complete or join the detached allocator proof. Admission releases the owner gate
+and path lease while waiting, then refreshes and revalidates the current tip.
+Before using a verified pool, admission also waits for an active proof to finish
+closing its reader fence. An uncertain publication returns `OutcomeUnknown`
+before starting a proof, or before adopting one if the outcome became uncertain
+during the scan. Admission never rescans an unchanged uncertain checkpoint.
+This applies without a storage limit: a large request must not append its whole
+volume while a completed proof waits for the same gate. Empty unbounded pools
+retain append-first admission, pure queries do not demand reuse proof, and
+verified pools require no graph walk. Bounded owners also retain their capacity
+admission and proof-reader fence.
+
+Storage intent is separate from API locking. Materialized SQL compiles its
+schema-independent statement once before admission, then reuses that plan for
+execution. Handle registry references are pinned before preparation, so close
+waits for accepted requests and their allocation refunds. Preparation charges
+actual live allocator bytes to a shared 256 MiB cap on the canonical path gate
+(or the root handle for directory storage). This includes plans waiting for the
+writer gate and survives serving-runtime replacement. Small requests can still
+prepare concurrently; a request that exceeds shared headroom reports SQLSTATE
+`53200` and releases its partial allocations. Refunds admit subsequent requests;
+errors inside a transaction retain the usual failed-transaction semantics.
+Plan teardown runs outside the API/path gates while registry pins protect its
+shared admission owner. SELECT and nonexecuting EXPLAIN retain exclusive session access
+without demanding allocator verification. Streaming cursors accept SELECT only;
+describe and session creation also use read-only storage intent. DML, DDL, and
+COMMIT request mutation admission. EXPLAIN ANALYZE accepts read-only SELECT
+only; mutating plans are rejected without allocator admission.
+
+Pending append-only proof lineage survives reopening an identical unchecked
+generation on the same inode. This does not enable reuse early: the original
+fenced proof must complete before foreground writes can reuse pages. Foreign
+publication and inode replacement still invalidate inheritance.
+
+Directory marker sweep progress belongs to the connection owner and survives
+foreground runtime replacement, including turns when allocator verification is
+busy. Each turn still examines at most 64 directory entries and preserves locked
+live markers. The focused regression set is:
+
+```sh
+cd zig
+zig build capi-test -Dembedded-only=true \
+  -Dtest-filter='capi native short lived writers' \
+  -Dtest-filter='capi native unbounded writer admits reusable pool' \
+  -Dtest-filter='capi native marker sweep' \
+  -Dtest-filter='capi native allocator proof survives close' \
+  -Dtest-filter='capi native close bounds proof work'
+```
 
 Entity curation commits policy to the destination namespace before returning.
 `antfly_db_resolver_curation_json` and `antfly_db_render_resolver_key_json`
