@@ -158,13 +158,13 @@ func qualifyCorpus(client *http.Client, tableURL, state string) (extractionQuali
 		if artifact.Attempted == nil || artifact.Failed == nil || *artifact.Attempted < 0 || *artifact.Failed < 0 || *artifact.Failed > *artifact.Attempted {
 			return q, fmt.Errorf("%s: OCR coverage is unknown or invalid", record.ID)
 		}
+		q.OCRAttempted += *artifact.Attempted
+		q.OCRFailed += *artifact.Failed
 		if *artifact.Failed != 0 {
 			return q, fmt.Errorf("%s: %d OCR pages failed; index readiness does not establish extraction coverage", record.ID, *artifact.Failed)
 		}
 		q.Records++
 		q.Pages += *artifact.Units
-		q.OCRAttempted += *artifact.Attempted
-		q.OCRFailed += *artifact.Failed
 	}
 	if q.Records == 0 {
 		return q, fmt.Errorf("empty extraction inventory")

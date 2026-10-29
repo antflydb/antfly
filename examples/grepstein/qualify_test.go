@@ -70,6 +70,9 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 			}))
 			defer server.Close()
 			q, err := qualifyCorpus(server.Client(), server.URL+"/tables/corpus", state)
+			if problem == "ocr_failed" && (q.OCRFailed != 1 || q.OCRAttempted != 2) {
+				t.Fatalf("failed OCR counts were hidden: %+v", q)
+			}
 			if problem != "" {
 				if err == nil || q.Complete {
 					t.Fatalf("incomplete extraction accepted: %+v", q)
