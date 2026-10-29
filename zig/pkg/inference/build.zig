@@ -347,6 +347,26 @@ pub fn build(b: *std.Build) void {
     const quant_kernel_codegen_step = b.step("quant-kernel-codegen", "Verify dev-generated quant kernel sources are fresh");
     quant_kernel_codegen_step.dependOn(&quant_kernel_codegen_check.step);
 
+    // Tile kernels (prototype, src/tile/): one Zig description lowered to
+    // CPU @Vector code, Metal and CUDA. Host-only; no GPU needed.
+    const tile_kernel_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = workflow_ctx.path("src/tile/tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    b.step("test-tile-kernels", "Check tile kernel lowerings against the scalar reference").dependOn(&b.addRunArtifact(tile_kernel_tests).step);
+    const tile_kernel_codegen_exe = b.addExecutable(.{
+        .name = "antfly-tile-kernel-codegen",
+        .root_module = b.createModule(.{
+            .root_source_file = workflow_ctx.path("src/tile/codegen_main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const tile_kernel_codegen_run = workflow_ctx.addRunArtifact(tile_kernel_codegen_exe);
+    tile_kernel_codegen_run.addPassthruArgs();
+    b.step("tile-kernel-codegen", "Verify (or --write) sources rendered from tile kernels").dependOn(&tile_kernel_codegen_run.step);
+
     const metal_unavailable_message = "Metal quant kernel evidence targets require a macOS target with xcrun/Metal; no Metal runtime evidence was run.";
     const quant_kernel_metal_check_step = b.step("quant-kernel-metal-check", "Compile generated and promoted Metal quant kernels");
     var quant_kernel_metal_artifact_check_step: ?*std.Build.Step = null;

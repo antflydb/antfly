@@ -686,3 +686,48 @@ test "device grammar state follows ruleWindow token by token" {
     try std.testing.expectEqual(@as(u32, 64), off[1]);
     try std.testing.expectEqual(@as(u32, 64), off[2]);
 }
+
+test "tile-generated logits statistics match hostLogitsStats" {
+    // The tile RowReduce in src/tile/whisper_logits.zig is the single source
+    // for the generated CPU, Metal and CUDA kernels; keep it on this contract.
+    const tile = @import("../tile/tile.zig");
+    const tile_cpu = @import("../tile/cpu.zig");
+    const tile_whisper = @import("../tile/whisper_logits.zig");
+    const k = tile_whisper.kernel;
+
+    var prng = std.Random.DefaultPrng.init(0x5747_a7e5);
+    const rng = prng.random();
+    const vocab = 51_865;
+    const logits = try std.testing.allocator.alloc(f32, vocab);
+    defer std.testing.allocator.free(logits);
+    for (0..20) |_| {
+        // No -inf here: hostLogitsStats (like the hand-written Metal kernel)
+        // turns a leading -inf into a NaN sum; the tile reducer skips it.
+        for (logits) |*v| v.* = (rng.float(f32) - 0.5) * 30;
+        const ts_begin: u32 = 50_364;
+        const ts_min = ts_begin + rng.uintLessThan(u32, 200);
+        const suppress = [_]i32{ 1, 2, 7, 50_257, -1, @intCast(ts_min) };
+        const params: ops.WhisperLogitsParams = .{
+            .out_dim = vocab,
+            .suppress_count = suppress.len,
+            .ts_begin = ts_begin,
+            .text_allowed = rng.uintLessThan(u32, 2),
+            .ts_min = ts_min,
+            .ts_max = ts_min + rng.uintLessThan(u32, 1000),
+            .eot = 50_257 + rng.uintLessThan(u32, 2),
+            .probe_id = 50_362,
+        };
+        const host = hostLogitsStats(logits, params, &suppress);
+        const no_grammar: [8]u32 = @splat(0);
+        const args = tile_whisper.args(logits, params, &suppress, &no_grammar);
+        const states = tile_cpu.RowReduce(k, 8).run(&args);
+        var record: [16]f32 = undefined;
+        tile.writeRecord(k, &states, &record);
+        // Argmax value/id pairs are exact; log-sum-exp max exact, sum to f32 accuracy.
+        for (0..8) |i| try std.testing.expectEqual(@as(u32, @bitCast(host[i])), @as(u32, @bitCast(record[i])));
+        for ([_]usize{ stats_all_max, stats_ts_max, stats_raw_max }) |i| {
+            try std.testing.expectEqual(host[i], record[i]);
+            try std.testing.expectApproxEqRel(host[i + 1], record[i + 1], 1e-4);
+        }
+    }
+}

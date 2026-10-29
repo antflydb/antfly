@@ -738,6 +738,14 @@
    }
   },
   {
+   "name": "antfly_tile_whisper_logits_partials",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_logits_partials.metal"
+   }
+  },
+  {
    "name": "antfly_video_position",
    "family": "other",
    "generated": false,
