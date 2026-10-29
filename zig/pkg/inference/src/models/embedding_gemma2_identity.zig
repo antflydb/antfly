@@ -141,7 +141,7 @@ pub fn signature(a: std.mem.Allocator, io: std.Io, directory: []const u8, weight
     for (0..sidecars.len + 1) |i| {
         const path = try receipt.resolveContainedArtifactPath(a, io, directory, if (i == sidecars.len) std.fs.path.basename(weights) else sidecars[i]);
         defer a.free(path);
-        const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+        const stat = try @import("../util/admitted_file.zig").stat(io, path, .{});
         hash.update(std.mem.asBytes(&stat.inode));
         hash.update(std.mem.asBytes(&stat.size));
         const mtime: i128 = stat.mtime.toNanoseconds();

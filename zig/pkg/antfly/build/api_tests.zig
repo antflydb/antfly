@@ -952,7 +952,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     file_owner_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
     file_owner_root.addImport("antfly_local_sources", inference_owner_sources);
     file_owner_root.addImport("inference_model_file", model_file_module);
-    const file_owner_tests = b.addTest(.{ .name = "model-file-owner-tests", .root_module = file_owner_root, .filters = &.{"native model files"}, .max_rss = 2 * 1024 * 1024 * 1024 });
+    const file_owner_tests = b.addTest(.{ .name = "model-file-owner-tests", .root_module = file_owner_root, .filters = &.{ "native model files", "native model artifact receipts" }, .max_rss = 2 * 1024 * 1024 * 1024 });
     b.step("antfly-inference-file-owner-test", "Verify physical native model file I/O through real API-owned grants")
         .dependOn(&b.addRunArtifact(file_owner_tests).step);
     const http_cleanup_root = b.createModule(.{

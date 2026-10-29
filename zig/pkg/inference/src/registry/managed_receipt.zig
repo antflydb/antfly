@@ -17,6 +17,7 @@ const std = @import("std");
 
 pub const in_progress_filename = ".antfly-download-in-progress";
 pub const plan_filename = ".antfly-download-plan.json";
+const admitted_file = @import("../util/admitted_file.zig");
 pub const complete_filename = ".antfly-download-complete.json";
 pub const max_receipt_bytes = 16 * 1024 * 1024;
 pub const max_artifact_count = 64 * 1024;
@@ -83,18 +84,15 @@ pub fn verifyValidatedArtifactSha256(
 ) !void {
     if (expected_hex.len != 64) return error.ChecksumMismatch;
 
-    var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
+    var file = try admitted_file.open(io, artifact.canonical_path);
     defer file.close(io);
-    const stat = try file.stat(io);
+    const stat = try @import("../execution_control.zig").physicalWait(std.Io.File.stat, .{ file, io });
     if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = file.readStreaming(io, &.{buf[0..]}) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
-        };
+        const n = try admitted_file.read(file, io, &buf);
         if (n == 0) break;
         hasher.update(buf[0..n]);
     }
@@ -115,7 +113,7 @@ fn managedPath(allocator: std.mem.Allocator, dest_dir: []const u8, filename: []c
 }
 
 fn pathPresent(dir: std.Io.Dir, io: std.Io, path: []const u8) !bool {
-    dir.access(io, path, .{}) catch |err| switch (err) {
+    admitted_file.access(dir, io, path) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -170,9 +168,7 @@ fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
 }
 
 fn realPathAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    const sentinel_path = try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
-    defer allocator.free(sentinel_path);
-    return try allocator.dupe(u8, sentinel_path);
+    return admitted_file.realPathAlloc(allocator, io, path);
 }
 
 /// Resolve the parent of a requested file without resolving the final path
@@ -199,7 +195,7 @@ pub fn resolveRegularFilePath(
 ) ![]u8 {
     const canonical_path = try realPathAlloc(allocator, io, path);
     errdefer allocator.free(canonical_path);
-    const stat = try std.Io.Dir.cwd().statFile(io, canonical_path, .{ .follow_symlinks = false });
+    const stat = try admitted_file.stat(io, canonical_path, .{ .follow_symlinks = false });
     if (stat.kind != .file) return error.InvalidModelArtifactKind;
     return canonical_path;
 }
@@ -231,7 +227,7 @@ pub fn resolveContainedArtifactPath(
     defer allocator.free(canonical_root);
     const canonical_path = try resolveContainedArtifactFromCanonicalRoot(allocator, io, canonical_root, relative_path);
     errdefer allocator.free(canonical_path);
-    const stat = try std.Io.Dir.cwd().statFile(io, canonical_path, .{ .follow_symlinks = false });
+    const stat = try admitted_file.stat(io, canonical_path, .{ .follow_symlinks = false });
     if (stat.kind != .file) return error.InvalidModelArtifactKind;
     return canonical_path;
 }
@@ -269,12 +265,7 @@ fn loadValidatedSource(
         .completion => complete_path,
         .plan => plan_path,
     };
-    const receipt_json = cwd.readFileAlloc(
-        io,
-        receipt_path,
-        allocator,
-        .limited(max_receipt_bytes),
-    ) catch |err| switch (err) {
+    const receipt_json = admitted_file.readAlloc(allocator, io, receipt_path, max_receipt_bytes) catch |err| switch (err) {
         error.FileNotFound => {
             if (source == .plan or
                 try publicationBlockedPaths(cwd, io, in_progress_path, plan_path))
@@ -339,7 +330,7 @@ fn loadValidatedSource(
             else => return err,
         };
         errdefer allocator.free(canonical_path);
-        const stat = try cwd.statFile(io, canonical_path, .{ .follow_symlinks = false });
+        const stat = try admitted_file.stat(io, canonical_path, .{ .follow_symlinks = false });
         if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
 
         artifacts[index] = .{

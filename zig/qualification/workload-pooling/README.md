@@ -1030,3 +1030,55 @@ model asset preparation, lease renewal, remaining mutation/retention/immutable-
 artifact boundaries, serial graph preparation, and original cross-engine gates
 remain open, including file-engine descriptor recovery. Full GNU/full
 qualification remains waived; this is not live AWS/cloud/TLS qualification.
+
+
+### Native model artifact identity and planning I/O
+
+Native model identity, managed receipt validation, tokenizer-planning digests,
+EmbeddingGemma metadata signatures and KV file identities now lend the existing
+synchronous execution grant during supplied-Io access, canonicalization, opens,
+stats, reads and legacy digest-memo writes. Allocation, JSON parsing, hashing,
+identity comparison and cache publication remain runnable. Receipt/path limits,
+contained-symlink checks, checksum verification and generation comparisons stay
+in force. Successful opens are owned until checked return; rejected return closes
+the descriptor before propagating the original source failure. Read buffers are
+fixed at 64 KiB during physical waits; dynamic buffer growth happens after return.
+
+Optional metadata and legacy memo fallbacks recheck the sticky original execution
+refusal before treating failed I/O as absent data. A failed memo write may remain
+an optional optimization failure, but rejected CPU return cannot publish the
+in-memory digest cache. KV identity now snapshots and publishes under its short
+cache mutex while hashing outside it. The existing cancellable execution lane
+coordinates cold validators; canceled validation releases the lane so another
+caller can retry. Cache/model mutexes in these audited identity paths are released
+before filesystem operations and checked CPU reentry.
+
+The real API-owner scheduler fixture loads a managed receipt and verifies its
+actual artifact checksum. It checks query/control progress at every loan, restores
+the original two-slot grant on success, and rejects every physical return in
+separate runs. Each run recovers the process descriptor count, retires retained
+bytes and releases its root. The fixture uses a real temporary artifact; it does
+not load a downloaded model or exercise cloud storage. Native ModelManager tests
+call the production model-identity, tokenizer-planning and KV identity paths over
+multi-buffer fixture files. Every physical return can be refused, with original
+error replay and no rejected identity cache publication. Loaded KV digest-cache
+cases also assert the cache mutex is available at every physical wait, release
+the validation lane on every refusal, retry successfully, and reuse the warm
+digest. No backend session is constructed by that cache fixture. These deterministic
+refusal tests supplement the real scheduler-owner integration.
+
+Evidence: `artifact-preparation-v4-final.json` records the focused native suite,
+actual API-owner file/receipt integration and production worker semantic check.
+All 33 selected native tests passed without skips; the build completed all 32
+steps. The Apache product boundary and staged license-header checks pass.
+`artifact-preparation-final.json` binds the tested input hashes to the committed
+source snapshots. The filters are compile-time filters, avoiding an unrelated
+full native/GNU qualification build.
+
+The milestone covers native artifact identity and planning I/O. It does not prove
+that mapped-page faults, vendor framework preparation, GPU construction or every
+model registry/download operation lend capacity. Those paths still require
+explicit audit and qualification. Lease renewal, remaining maintenance provider
+boundaries, serial graph preparation and original cross-engine gates (including
+file-engine descriptor recovery) remain open. Full GNU/full qualification remains
+waived, and the installed CLI is not rebuilt by the focused checks.

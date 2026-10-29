@@ -21,6 +21,7 @@
 const std = @import("std");
 const lightonocr3_reader = @import("../readers/lightonocr3.zig");
 const execution_control_mod = @import("../execution_control.zig");
+const admitted_file = @import("../util/admitted_file.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const load_execution = @import("executor_microbatch.zig");
 const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -963,7 +964,8 @@ fn componentDependencySignature(
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (dependencies) |path| {
         updateComponentPlanKeySlice(&hash, path);
-        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+        const stat = admitted_file.stat(io, path, .{}) catch {
+            try (InferenceExecutionControl{}).check();
             hash.update("missing");
             continue;
         };
@@ -978,7 +980,8 @@ fn componentDependencySignature(
         const canonical_ctime_ns: i128 = ctime_ns;
         hash.update(std.mem.asBytes(&canonical_mtime_ns));
         hash.update(std.mem.asBytes(&canonical_ctime_ns));
-        const final_stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+        const final_stat = admitted_file.stat(io, path, .{}) catch {
+            try (InferenceExecutionControl{}).check();
             hash.update("changed-during-read");
             continue;
         };
@@ -2360,7 +2363,10 @@ const LegacyArtifactDigestCache = struct {
         mutex.unlock();
         const memo_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.antfly-sha256-cache", .{artifact.canonical_path});
         defer std.heap.page_allocator.free(memo_path);
-        const memo_bytes = std.Io.Dir.cwd().readFileAlloc(io, memo_path, std.heap.page_allocator, .limited(1024)) catch null;
+        const memo_bytes = admitted_file.readAlloc(std.heap.page_allocator, io, memo_path, 1024) catch blk: {
+            try control.check();
+            break :blk null;
+        };
         defer if (memo_bytes) |bytes| std.heap.page_allocator.free(bytes);
         if (memo_bytes) |bytes| {
             if (std.json.parseFromSlice(Entry, std.heap.page_allocator, bytes, .{})) |memo| {
@@ -2375,16 +2381,13 @@ const LegacyArtifactDigestCache = struct {
             } else |_| {}
         }
         if (builtin.is_test and forbid_hashing_for_test) return error.UnexpectedModelRehash;
-        var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
+        var file = try admitted_file.open(io, artifact.canonical_path);
         defer file.close(io);
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         var buffer: [64 * 1024]u8 = undefined;
         while (true) {
             try control.check();
-            const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
-                error.EndOfStream => 0,
-                else => return err,
-            };
+            const count = try admitted_file.read(file, io, &buffer);
             if (count == 0) break;
             hasher.update(buffer[0..count]);
         }
@@ -2393,7 +2396,10 @@ const LegacyArtifactDigestCache = struct {
         if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, &.{artifact.canonical_path}))) return error.ModelArtifactsChanging;
         const memo = std.json.Stringify.valueAlloc(std.heap.page_allocator, Entry{ .signature = signature, .digest = result }, .{}) catch null;
         defer if (memo) |bytes| std.heap.page_allocator.free(bytes);
-        if (memo) |bytes| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = memo_path, .data = bytes }) catch {};
+        if (memo) |bytes| admitted_file.write(io, memo_path, bytes) catch {
+            try control.check();
+        };
+        try control.check();
         spinLock(&mutex);
         defer mutex.unlock();
         entries[next] = .{ .signature = signature, .digest = result };
@@ -2574,7 +2580,7 @@ fn chunkPlanningSnapshotWithControl(a: std.mem.Allocator, io: std.Io, manifest: 
         if (manifest.gguf_path) |gguf| if (std.mem.eql(u8, path, gguf)) {
             const canonical = try managed_receipt.resolveRegularFilePath(a, io, path);
             defer a.free(canonical);
-            const stat = try std.Io.Dir.cwd().statFile(io, canonical, .{});
+            const stat = try admitted_file.stat(io, canonical, .{});
             embedded_tokenizer_digest = try LegacyArtifactDigestCache.digestWithControl(io, .{
                 .path = std.fs.path.basename(path),
                 .canonical_path = canonical,
@@ -2585,16 +2591,13 @@ fn chunkPlanningSnapshotWithControl(a: std.mem.Allocator, io: std.Io, manifest: 
         };
         hash.update(std.fs.path.basename(path));
         hash.update(&.{0});
-        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        var file = try admitted_file.open(io, path);
         defer file.close(io);
         var file_hash = std.crypto.hash.sha2.Sha256.init(.{});
         var buffer: [64 * 1024]u8 = undefined;
         while (true) {
             try control.check();
-            const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
-                error.EndOfStream => 0,
-                else => return err,
-            };
+            const count = try admitted_file.read(file, io, &buffer);
             if (count == 0) break;
             file_hash.update(buffer[0..count]);
         }
@@ -2653,6 +2656,7 @@ pub const LoadedModel = struct {
     native_kv_artifact_digest: ?[32]u8 = null,
     native_kv_tokenizer_contract: ?native_kv_identity.TokenizerContract = null,
     native_kv_identity_mutex: std.atomic.Mutex = .unlocked,
+    native_kv_identity_lane: execution_control_mod.ExecutionLane = .{},
     embedding_identity: ?[64]u8 = null,
     embedding_validation: ?@import("../models/embedding_gemma2_identity.zig").SnapshotValidation = null,
     embedding_identity_mutex: std.atomic.Mutex = .unlocked,
@@ -2746,6 +2750,36 @@ pub const LoadedModel = struct {
     /// retired model while new requests load a fresh session.
     retired: bool = false,
 
+    fn nativeKvArtifactDigest(self: *LoadedModel, expected_generation: [32]u8, control: InferenceExecutionControl) !struct { digest: [32]u8, cached: bool } {
+        var active = control;
+        if (active.io == null) active.io = self.executor_io orelse std.Options.debug_io;
+        try active.lock(&self.native_kv_identity_mutex);
+        const previous = self.native_kv_artifact_digest;
+        self.native_kv_identity_mutex.unlock();
+        if (previous) |digest| return .{ .digest = digest, .cached = true };
+        const lease = try self.native_kv_identity_lane.acquire(active);
+        defer lease.release();
+        try active.lock(&self.native_kv_identity_mutex);
+        const refreshed = self.native_kv_artifact_digest;
+        self.native_kv_identity_mutex.unlock();
+        if (refreshed) |digest| return .{ .digest = digest, .cached = true };
+        var files = try NativeKvFiles.init(self.allocator, self.model_dir, self.manifest);
+        defer files.deinit();
+        const Callback = struct {
+            active: InferenceExecutionControl,
+            fn check(raw: ?*anyopaque) !void {
+                const callback: *@This() = @ptrCast(@alignCast(raw.?));
+                try callback.active.check();
+            }
+        };
+        var callback: Callback = .{ .active = active };
+        const digest = try native_kv_identity.hashFiles(std.Io.Dir.cwd(), active.io.?, &files.entries, expected_generation, "antfly.gemma4.loaded-bundle-v1", .{ .context = &callback, .check_fn = Callback.check });
+        try active.lock(&self.native_kv_identity_mutex);
+        self.native_kv_artifact_digest = digest;
+        self.native_kv_identity_mutex.unlock();
+        return .{ .digest = digest, .cached = false };
+    }
+
     /// Caller owns a loaded-model handle for this entire operation. Identity is
     /// cached only in this loaded generation, never in a user-writable memo.
     /// The pre-load generation marker ties the content hash to admitted weights
@@ -2756,27 +2790,10 @@ pub const LoadedModel = struct {
         if (config.family != .gemma or !config.usesGemma4Channels() or config.gemma4_mtp_assistant) return error.UnsupportedKvIdentity;
         const expected_generation = self.native_kv_asset_generation orelse return error.UnsupportedKvIdentity;
         const tokenizer_contract = self.native_kv_tokenizer_contract orelse return error.UnsupportedKvIdentity;
-        if (control) |active| try active.lock(&self.native_kv_identity_mutex) else platform.sync.lockYielding(&self.native_kv_identity_mutex);
-        defer self.native_kv_identity_mutex.unlock();
-        if (control) |active| try active.check();
         const identity_started = std.Io.Timestamp.now(self.executor_io orelse std.Options.debug_io, .awake);
-        const identity_cache_hit = self.native_kv_artifact_digest != null;
-        if (self.native_kv_artifact_digest == null) {
-            var files = try NativeKvFiles.init(self.allocator, self.model_dir, self.manifest);
-            defer files.deinit();
-            const Callback = struct {
-                active: ?InferenceExecutionControl,
-                fn check(raw: ?*anyopaque) !void {
-                    const self_callback: *@This() = @ptrCast(@alignCast(raw.?));
-                    if (self_callback.active) |active| try active.check();
-                }
-            };
-            var callback: Callback = .{ .active = control };
-            const digest = try native_kv_identity.hashFiles(std.Io.Dir.cwd(), self.executor_io orelse std.Options.debug_io, &files.entries, expected_generation, "antfly.gemma4.loaded-bundle-v1", .{ .context = &callback, .check_fn = Callback.check });
-            if (control) |active| try active.check();
-            self.native_kv_artifact_digest = digest;
-        }
-        const artifacts_digest = self.native_kv_artifact_digest.?;
+        const artifact = try self.nativeKvArtifactDigest(expected_generation, control orelse .{});
+        const identity_cache_hit = artifact.cached;
+        const artifacts_digest = artifact.digest;
         const identity: runtime.kv.attention_match_checkpoint.Identity = .{
             // Conservative full-bundle content binding includes weight and
             // tokenizer sidecars; filenames and inode metadata are excluded.
@@ -8802,7 +8819,10 @@ pub const ModelManager = struct {
             if (!man.usesGgufWeights()) break :native_generation null;
             var files = NativeKvFiles.init(self.allocator, model_dir, man) catch break :native_generation null;
             defer files.deinit();
-            break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
+            break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch {
+                try (control orelse InferenceExecutionControl{}).check();
+                break :native_generation null;
+            };
         };
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
         const resolution_revision = try modelIdentity(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man);
@@ -16082,4 +16102,121 @@ test "coordinated model and composite loaders own independent execution admissio
             try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
         }
     };
+}
+
+test "model artifact preparation keeps identity and planning checks on CPU across every file return" {
+    const Probe = struct {
+        running: bool = true,
+        ends: usize = 0,
+        reject_at: usize,
+        model: ?*LoadedModel = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            if (self.model) |model| {
+                try std.testing.expect(model.native_kv_identity_mutex.tryLock());
+                model.native_kv_identity_mutex.unlock();
+            }
+            self.running = false;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.running);
+            self.ends += 1;
+            if (self.ends == self.reject_at) return error.ArtifactReturnDenied;
+            self.running = true;
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = try a.alloc(u8, 192 * 1024 + 7);
+    defer a.free(body);
+    @memset(body, 'a');
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = body });
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &hash, .{});
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .version = 2, .artifacts = &.{.{ .path = "model.safetensors", .size = body.len, .sha256 = &hex }} }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const tokenizer = try tmp.dir.realPathFileAlloc(io, "tokenizer.json", a);
+    defer a.free(tokenizer);
+    const manifest: manifest_mod.ModelManifest = .{ .allocator = a, .tokenizer_json_path = tokenizer };
+    const expected_identity = try modelIdentity(a, io, root, manifest);
+    const expected_planning = try chunkPlanningSnapshot(a, io, manifest, expected_identity);
+    const Family = enum { identity, planning, kv, kv_loaded };
+    const kv_entries = [_]native_kv_identity.FileArtifact{.{ .role = "tokenizer", .path = tokenizer, .max_bytes = body.len }};
+    const kv_generation = try native_kv_identity.fileGeneration(std.Io.Dir.cwd(), io, &kv_entries);
+    const expected_kv = try native_kv_identity.hashFiles(std.Io.Dir.cwd(), io, &kv_entries, kv_generation, "fixture", .{});
+    const weights = try tmp.dir.realPathFileAlloc(io, "model.safetensors", a);
+    defer a.free(weights);
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    const loaded_manifest: manifest_mod.ModelManifest = .{ .allocator = a, .gguf_path = weights, .tokenizer_json_path = tokenizer };
+    var files = try NativeKvFiles.init(a, root, loaded_manifest);
+    defer files.deinit();
+    const loaded_generation = try native_kv_identity.fileGeneration(std.Io.Dir.cwd(), io, &files.entries);
+    const expected_loaded = try native_kv_identity.hashFiles(std.Io.Dir.cwd(), io, &files.entries, loaded_generation, "antfly.gemma4.loaded-bundle-v1", .{});
+    for (std.enums.values(Family)) |family| {
+        var total: usize = 1;
+        var reject_at: usize = 0;
+        while (reject_at <= total) : (reject_at += 1) {
+            LegacyArtifactDigestCache.entries = @splat(null);
+            tmp.dir.deleteFile(io, "model.safetensors.antfly-sha256-cache") catch |err| if (err != error.FileNotFound) return err;
+            // Only immutable artifact fields are used by this production cache
+            // method; no backend session is constructed by the fixture.
+            var model: LoadedModel = .{ .manifest = loaded_manifest, .hf_tok = null, .sp_tok = null, .session = undefined, .session_manager = &manager.session_manager, .model_manager = &manager, .model_dir = root, .allocator = a, .executor_io = io, .prompt_prefix_cache = undefined, .native_generation_graph_cache = undefined };
+            var probe: Probe = .{ .reject_at = reject_at, .model = if (family == .kv_loaded) &model else null };
+            var scope = execution_control_mod.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+            defer if (scope.active) scope.deinit();
+            const result: anyerror![32]u8 = switch (family) {
+                .planning => blk: {
+                    const snapshot = chunkPlanningSnapshot(a, io, manifest, expected_identity) catch |err| break :blk err;
+                    break :blk snapshot.digest;
+                },
+                .identity => modelIdentity(a, io, root, manifest),
+                .kv_loaded => blk: {
+                    const artifact = model.nativeKvArtifactDigest(loaded_generation, .{}) catch |err| break :blk err;
+                    try std.testing.expect(!artifact.cached);
+                    break :blk artifact.digest;
+                },
+                .kv => native_kv_identity.hashFiles(std.Io.Dir.cwd(), io, &kv_entries, kv_generation, "fixture", .{}),
+            };
+            if (reject_at == 0) {
+                const actual = try result;
+                try std.testing.expectEqualSlices(u8, switch (family) {
+                    .planning => &expected_planning.digest,
+                    .identity => &expected_identity,
+                    .kv => &expected_kv,
+                    .kv_loaded => &expected_loaded,
+                }, &actual);
+                total = probe.ends;
+                try std.testing.expect(total > 5);
+            } else {
+                try std.testing.expectError(error.ArtifactReturnDenied, result);
+                try std.testing.expectError(error.ArtifactReturnDenied, (InferenceExecutionControl{}).check());
+                try std.testing.expectEqual(reject_at, probe.ends);
+                try std.testing.expect(model.native_kv_artifact_digest == null);
+                if (family == .identity) for (LegacyArtifactDigestCache.entries) |entry| try std.testing.expect(entry == null);
+            }
+            scope.deinit();
+            try std.testing.expect(!model.native_kv_identity_lane.owned);
+            if (family == .kv_loaded) {
+                const retry = try model.nativeKvArtifactDigest(loaded_generation, .{});
+                try std.testing.expectEqual(reject_at == 0, retry.cached);
+                const warm = try model.nativeKvArtifactDigest(loaded_generation, .{});
+                try std.testing.expect(warm.cached);
+                try std.testing.expectEqualSlices(u8, &expected_loaded, &warm.digest);
+            }
+        }
+    }
 }
