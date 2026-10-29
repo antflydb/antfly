@@ -280,180 +280,140 @@ extern "C" __global__ void termite_linear_f16_weight_f32_tiled(
     if (tid == 0u) dst[global] = partial[0];
 }
 
-extern "C" __global__ void termite_argmax_last_row_f32(
-    unsigned int* dst,
-    const float* input,
-    unsigned int rows,
-    unsigned int dim
-) {
-    __shared__ float best_values[256];
-    __shared__ unsigned int best_indices[256];
-    unsigned int tid = threadIdx.x;
-    unsigned int row = rows == 0u ? 0u : rows - 1u;
+// tile-codegen:begin argmax family (do not edit; run: zig build tile-kernel-codegen -- --write)
+static __device__ __forceinline__ bool antfly_tile_suppressed(unsigned int token, const int* ids, unsigned int count) {
+    for (unsigned int j = 0; j < count; ++j) { const int id = ids[j]; if (id >= 0 && (unsigned int)id == token) return true; }
+    return false;
+}
+extern "C" __global__ void termite_argmax_last_row_f32(unsigned int* dst, const float* input, unsigned int rows, unsigned int dim) {
+    const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x;
+    __shared__ float sh_vals[256];
+    __shared__ unsigned int sh_ids[256];
+    const unsigned int row = rows == 0u ? 0u : rows - 1u;
     const float* row_ptr = input + row * dim;
-    float best_value = -3.402823466e+38f;
-    unsigned int best_index = 0u;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float value = row_ptr[i];
-        if (value > best_value || (value == best_value && i < best_index)) {
-            best_value = value;
-            best_index = i;
-        }
-    }
-    best_values[tid] = best_value;
-    best_indices[tid] = best_index;
+    float best = -3.402823466e+38f; unsigned int best_idx = 0u;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = row_ptr[i]; const unsigned int idx = i; if (v > best || (v == best && idx < best_idx)) { best = v; best_idx = idx; } }
+    sh_vals[tid] = best; sh_ids[tid] = best_idx;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            float other_value = best_values[tid + stride];
-            unsigned int other_index = best_indices[tid + stride];
-            if (other_value > best_values[tid] || (other_value == best_values[tid] && other_index < best_indices[tid])) {
-                best_values[tid] = other_value;
-                best_indices[tid] = other_index;
-            }
-        }
+    for (unsigned int stride = tpg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { const float other = sh_vals[tid + stride]; const unsigned int other_idx = sh_ids[tid + stride]; if (other > sh_vals[tid] || (other == sh_vals[tid] && other_idx < sh_ids[tid])) { sh_vals[tid] = other; sh_ids[tid] = other_idx; } }
         __syncthreads();
     }
-    if (tid == 0u) dst[0] = best_indices[0];
+    if (tid == 0u) dst[0] = sh_ids[0];
 }
-
-extern "C" __global__ void termite_argmax_rows_f32(
-    unsigned int* dst,
-    const float* input,
-    unsigned int row_start,
-    unsigned int row_count,
-    unsigned int dim
-) {
-    __shared__ float best_values[256];
-    __shared__ unsigned int best_indices[256];
-    unsigned int tid = threadIdx.x;
-    unsigned int row_local = blockIdx.x;
+extern "C" __global__ void termite_argmax_rows_f32(unsigned int* dst, const float* input, unsigned int row_start, unsigned int row_count, unsigned int dim) {
+    const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x;
+    __shared__ float sh_vals[256];
+    __shared__ unsigned int sh_ids[256];
+    const unsigned int row_local = blockIdx.x;
     if (row_local >= row_count) return;
     const float* row_ptr = input + (row_start + row_local) * dim;
-    float best_value = -3.402823466e+38f;
-    unsigned int best_index = 0u;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float value = row_ptr[i];
-        if (value > best_value || (value == best_value && i < best_index)) {
-            best_value = value;
-            best_index = i;
-        }
-    }
-    best_values[tid] = best_value;
-    best_indices[tid] = best_index;
+    float best = -3.402823466e+38f; unsigned int best_idx = 0u;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = row_ptr[i]; const unsigned int idx = i; if (v > best || (v == best && idx < best_idx)) { best = v; best_idx = idx; } }
+    sh_vals[tid] = best; sh_ids[tid] = best_idx;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            float other_value = best_values[tid + stride];
-            unsigned int other_index = best_indices[tid + stride];
-            if (other_value > best_values[tid] || (other_value == best_values[tid] && other_index < best_indices[tid])) {
-                best_values[tid] = other_value;
-                best_indices[tid] = other_index;
-            }
-        }
+    for (unsigned int stride = tpg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { const float other = sh_vals[tid + stride]; const unsigned int other_idx = sh_ids[tid + stride]; if (other > sh_vals[tid] || (other == sh_vals[tid] && other_idx < sh_ids[tid])) { sh_vals[tid] = other; sh_ids[tid] = other_idx; } }
         __syncthreads();
     }
-    if (tid == 0u) dst[row_local] = best_indices[0];
+    if (tid == 0u) dst[row_local] = sh_ids[0];
 }
-
-extern "C" __global__ void termite_argmax_rows_suppress_f32(
-    unsigned int* dst,
-    const float* input,
-    const int* suppress_token_ids,
-    unsigned int row_start,
-    unsigned int row_count,
-    unsigned int dim,
-    unsigned int suppress_count
-) {
-    __shared__ float best_values[256];
-    __shared__ unsigned int best_indices[256];
-    unsigned int tid = threadIdx.x;
-    unsigned int row_local = blockIdx.x;
+extern "C" __global__ void termite_argmax_rows_suppress_f32(unsigned int* dst, const float* input, const int* suppress_token_ids, unsigned int row_start, unsigned int row_count, unsigned int dim, unsigned int suppress_count) {
+    const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x;
+    __shared__ float sh_vals[256];
+    __shared__ unsigned int sh_ids[256];
+    const unsigned int row_local = blockIdx.x;
     if (row_local >= row_count) return;
     const float* row_ptr = input + (row_start + row_local) * dim;
-    float best_value = -3.402823466e+38f;
-    unsigned int best_index = 0u;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        bool suppressed = false;
-        for (unsigned int j = 0; j < suppress_count; ++j) {
-            int token_id = suppress_token_ids[j];
-            if (token_id >= 0 && (unsigned int)token_id == i) {
-                suppressed = true;
-                break;
-            }
-        }
-        if (suppressed) continue;
-        float value = row_ptr[i];
-        if (value > best_value || (value == best_value && i < best_index)) {
-            best_value = value;
-            best_index = i;
-        }
-    }
-    best_values[tid] = best_value;
-    best_indices[tid] = best_index;
+    float best = -3.402823466e+38f; unsigned int best_idx = 0u;
+    for (unsigned int i = tid; i < dim; i += tpg) { if (antfly_tile_suppressed(i, suppress_token_ids, suppress_count)) continue; const float v = row_ptr[i]; const unsigned int idx = i; if (v > best || (v == best && idx < best_idx)) { best = v; best_idx = idx; } }
+    sh_vals[tid] = best; sh_ids[tid] = best_idx;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            float other_value = best_values[tid + stride];
-            unsigned int other_index = best_indices[tid + stride];
-            if (other_value > best_values[tid] || (other_value == best_values[tid] && other_index < best_indices[tid])) {
-                best_values[tid] = other_value;
-                best_indices[tid] = other_index;
-            }
-        }
+    for (unsigned int stride = tpg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { const float other = sh_vals[tid + stride]; const unsigned int other_idx = sh_ids[tid + stride]; if (other > sh_vals[tid] || (other == sh_vals[tid] && other_idx < sh_ids[tid])) { sh_vals[tid] = other; sh_ids[tid] = other_idx; } }
         __syncthreads();
     }
-    if (tid == 0u) dst[row_local] = best_indices[0];
+    if (tid == 0u) dst[row_local] = sh_ids[0];
 }
-
-extern "C" __global__ void termite_argmax_last_row_suppress_f32(
-    unsigned int* dst,
-    const float* input,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int dim,
-    unsigned int suppress_count
-) {
-    __shared__ float best_values[256];
-    __shared__ unsigned int best_indices[256];
-    unsigned int tid = threadIdx.x;
-    unsigned int row = rows == 0u ? 0u : rows - 1u;
+extern "C" __global__ void termite_argmax_last_row_suppress_f32(unsigned int* dst, const float* input, const int* suppress_token_ids, unsigned int rows, unsigned int dim, unsigned int suppress_count) {
+    const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x;
+    __shared__ float sh_vals[256];
+    __shared__ unsigned int sh_ids[256];
+    const unsigned int row = rows == 0u ? 0u : rows - 1u;
     const float* row_ptr = input + row * dim;
-    float best_value = -3.402823466e+38f;
-    unsigned int best_index = 0u;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        bool suppressed = false;
-        for (unsigned int j = 0; j < suppress_count; ++j) {
-            int token_id = suppress_token_ids[j];
-            if (token_id >= 0 && (unsigned int)token_id == i) {
-                suppressed = true;
-                break;
-            }
-        }
-        if (suppressed) continue;
-        float value = row_ptr[i];
-        if (value > best_value || (value == best_value && i < best_index)) {
-            best_value = value;
-            best_index = i;
-        }
-    }
-    best_values[tid] = best_value;
-    best_indices[tid] = best_index;
+    float best = -3.402823466e+38f; unsigned int best_idx = 0u;
+    for (unsigned int i = tid; i < dim; i += tpg) { if (antfly_tile_suppressed(i, suppress_token_ids, suppress_count)) continue; const float v = row_ptr[i]; const unsigned int idx = i; if (v > best || (v == best && idx < best_idx)) { best = v; best_idx = idx; } }
+    sh_vals[tid] = best; sh_ids[tid] = best_idx;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            float other_value = best_values[tid + stride];
-            unsigned int other_index = best_indices[tid + stride];
-            if (other_value > best_values[tid] || (other_value == best_values[tid] && other_index < best_indices[tid])) {
-                best_values[tid] = other_value;
-                best_indices[tid] = other_index;
-            }
-        }
+    for (unsigned int stride = tpg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { const float other = sh_vals[tid + stride]; const unsigned int other_idx = sh_ids[tid + stride]; if (other > sh_vals[tid] || (other == sh_vals[tid] && other_idx < sh_ids[tid])) { sh_vals[tid] = other; sh_ids[tid] = other_idx; } }
         __syncthreads();
     }
-    if (tid == 0u) dst[0] = best_indices[0];
+    if (tid == 0u) dst[0] = sh_ids[0];
 }
-
+extern "C" __global__ void termite_argmax_reduce_rows_pairs_f32(unsigned int* dst, const float* partial_values, const unsigned int* partial_indices, unsigned int rows, unsigned int col_tiles) {
+    const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x;
+    __shared__ float warp_vals[8];
+    __shared__ unsigned int warp_ids[8];
+    const unsigned int lane = tid & 31u; const unsigned int warp = tid >> 5;
+    const unsigned int row = blockIdx.x;
+    float best = -3.402823466e+38f; unsigned int best_idx = 0xffffffffu;
+    if (row < rows) { const unsigned int base = row * col_tiles; for (unsigned int i = tid; i < col_tiles; i += tpg) { const unsigned int idx = partial_indices[base + i]; if (idx == 0xffffffffu) continue; const float v = partial_values[base + i]; if (v > best || (v == best && idx < best_idx)) { best = v; best_idx = idx; } } }
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        const float other = __shfl_down_sync(0xffffffffu, best, offset); const unsigned int other_idx = __shfl_down_sync(0xffffffffu, best_idx, offset);
+        if (other_idx != 0xffffffffu && (other > best || (other == best && other_idx < best_idx))) { best = other; best_idx = other_idx; }
+    }
+    if (lane == 0u) { warp_vals[warp] = best; warp_ids[warp] = best_idx; }
+    __syncthreads();
+    if (tid == 0u && row < rows) {
+        float final_value = -3.402823466e+38f; unsigned int final_idx = 0xffffffffu; const unsigned int warp_count = tpg >> 5;
+        #pragma unroll
+        for (unsigned int w = 0u; w < 8u; ++w) { if (w >= warp_count) continue; const float other = warp_vals[w]; const unsigned int other_idx = warp_ids[w]; if (other_idx != 0xffffffffu && (other > final_value || (other == final_value && other_idx < final_idx))) { final_value = other; final_idx = other_idx; } }
+        dst[row] = final_idx == 0xffffffffu ? 0u : final_idx;
+    }
+}
+extern "C" __global__ void termite_argmax_reduce_rows_pairs_f32_w16(unsigned int* dst, const float* partial_values, const unsigned int* partial_indices, unsigned int rows, unsigned int col_tiles) {
+    const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x;
+    __shared__ float warp_vals[16];
+    __shared__ unsigned int warp_ids[16];
+    const unsigned int lane = tid & 31u; const unsigned int warp = tid >> 5;
+    const unsigned int row = blockIdx.x;
+    float best = -3.402823466e+38f; unsigned int best_idx = 0xffffffffu;
+    if (row < rows) { const unsigned int base = row * col_tiles; for (unsigned int i = tid; i < col_tiles; i += tpg) { const unsigned int idx = partial_indices[base + i]; if (idx == 0xffffffffu) continue; const float v = partial_values[base + i]; if (v > best || (v == best && idx < best_idx)) { best = v; best_idx = idx; } } }
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        const float other = __shfl_down_sync(0xffffffffu, best, offset); const unsigned int other_idx = __shfl_down_sync(0xffffffffu, best_idx, offset);
+        if (other_idx != 0xffffffffu && (other > best || (other == best && other_idx < best_idx))) { best = other; best_idx = other_idx; }
+    }
+    if (lane == 0u) { warp_vals[warp] = best; warp_ids[warp] = best_idx; }
+    __syncthreads();
+    if (tid == 0u && row < rows) {
+        float final_value = -3.402823466e+38f; unsigned int final_idx = 0xffffffffu; const unsigned int warp_count = tpg >> 5;
+        #pragma unroll
+        for (unsigned int w = 0u; w < 16u; ++w) { if (w >= warp_count) continue; const float other = warp_vals[w]; const unsigned int other_idx = warp_ids[w]; if (other_idx != 0xffffffffu && (other > final_value || (other == final_value && other_idx < final_idx))) { final_value = other; final_idx = other_idx; } }
+        dst[row] = final_idx == 0xffffffffu ? 0u : final_idx;
+    }
+}
+extern "C" __global__ void termite_argmax_reduce_pairs_f32(unsigned int* dst, const float* partial_values, const unsigned int* partial_indices, unsigned int count) {
+    const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x;
+    __shared__ float warp_vals[8];
+    __shared__ unsigned int warp_ids[8];
+    const unsigned int lane = tid & 31u; const unsigned int warp = tid >> 5;
+    float best = -3.402823466e+38f; unsigned int best_idx = 0xffffffffu;
+    for (unsigned int i = tid; i < count; i += tpg) { const unsigned int idx = partial_indices[i]; if (idx == 0xffffffffu) continue; const float v = partial_values[i]; if (v > best || (v == best && idx < best_idx)) { best = v; best_idx = idx; } }
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        const float other = __shfl_down_sync(0xffffffffu, best, offset); const unsigned int other_idx = __shfl_down_sync(0xffffffffu, best_idx, offset);
+        if (other_idx != 0xffffffffu && (other > best || (other == best && other_idx < best_idx))) { best = other; best_idx = other_idx; }
+    }
+    if (lane == 0u) { warp_vals[warp] = best; warp_ids[warp] = best_idx; }
+    __syncthreads();
+    if (tid == 0u) {
+        float final_value = -3.402823466e+38f; unsigned int final_idx = 0xffffffffu; const unsigned int warp_count = tpg >> 5;
+        #pragma unroll
+        for (unsigned int w = 0u; w < 8u; ++w) { if (w >= warp_count) continue; const float other = warp_vals[w]; const unsigned int other_idx = warp_ids[w]; if (other_idx != 0xffffffffu && (other > final_value || (other == final_value && other_idx < final_idx))) { final_value = other; final_idx = other_idx; } }
+        dst[0] = final_idx == 0xffffffffu ? 0u : final_idx;
+    }
+}
+// tile-codegen:end argmax family
 __device__ __forceinline__ float termite_mtp_load_preproject_weight(
     const void* weight,
     unsigned int index,
@@ -1483,7 +1443,7 @@ extern "C" __global__ void termite_rms_norm_f32(float* dst, const float* input, 
     __syncthreads();
     for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
     const float inv = rsqrtf(shmem[0] / float(dim) + eps);
-    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = input[base + i] * inv * weight[i]; }
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; dst[base + i] = v * inv * weight[i]; }
 }
 extern "C" __global__ void termite_rms_norm_f32_bf16(float* dst, unsigned short* dst_bf16, const float* input, const float* weight, unsigned int rows, unsigned int dim, float eps) {
     const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
@@ -1497,7 +1457,7 @@ extern "C" __global__ void termite_rms_norm_f32_bf16(float* dst, unsigned short*
     __syncthreads();
     for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
     const float inv = rsqrtf(shmem[0] / float(dim) + eps);
-    for (unsigned int i = tid; i < dim; i += tpg) { const float y0 = input[base + i] * inv * weight[i]; dst[base + i] = y0; dst_bf16[base + i] = termite_f32_to_bf16(y0); }
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; const float y0 = v * inv * weight[i]; dst[base + i] = y0; dst_bf16[base + i] = termite_f32_to_bf16(y0); }
 }
 extern "C" __global__ void termite_rms_norm_add_f32(float* dst, const float* input, const float* weight, const float* residual, unsigned int rows, unsigned int dim, float eps) {
     const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
@@ -1511,7 +1471,7 @@ extern "C" __global__ void termite_rms_norm_add_f32(float* dst, const float* inp
     __syncthreads();
     for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
     const float inv = rsqrtf(shmem[0] / float(dim) + eps);
-    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = input[base + i] * inv * weight[i] + residual[base + i]; }
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; dst[base + i] = v * inv * weight[i] + residual[base + i]; }
 }
 extern "C" __global__ void termite_rms_norm_add_f32_bf16(float* dst, unsigned short* dst_bf16, const float* input, const float* weight, const float* residual, unsigned int rows, unsigned int dim, float eps) {
     const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
@@ -1525,7 +1485,7 @@ extern "C" __global__ void termite_rms_norm_add_f32_bf16(float* dst, unsigned sh
     __syncthreads();
     for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
     const float inv = rsqrtf(shmem[0] / float(dim) + eps);
-    for (unsigned int i = tid; i < dim; i += tpg) { const float y0 = input[base + i] * inv * weight[i] + residual[base + i]; dst[base + i] = y0; dst_bf16[base + i] = termite_f32_to_bf16(y0); }
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; const float y0 = v * inv * weight[i] + residual[base + i]; dst[base + i] = y0; dst_bf16[base + i] = termite_f32_to_bf16(y0); }
 }
 extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(float* dst, const float* input, const float* weight, const float* residual, const float* scalar, unsigned int rows, unsigned int dim, float eps) {
     const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
@@ -1539,7 +1499,7 @@ extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(float* dst, const
     __syncthreads();
     for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
     const float inv = rsqrtf(shmem[0] / float(dim) + eps);
-    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = input[base + i] * inv * weight[i] * scalar[0] + residual[base + i]; }
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; dst[base + i] = v * inv * weight[i] * scalar[0] + residual[base + i]; }
 }
 extern "C" __global__ void termite_rms_norm_add_output_scale_f32(float* dst, const float* input, const float* weight, const float* residual, const float* scalar, unsigned int rows, unsigned int dim, float eps) {
     const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
@@ -1553,7 +1513,7 @@ extern "C" __global__ void termite_rms_norm_add_output_scale_f32(float* dst, con
     __syncthreads();
     for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
     const float inv = rsqrtf(shmem[0] / float(dim) + eps);
-    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = (input[base + i] * inv * weight[i] + residual[base + i]) * scalar[0]; }
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; dst[base + i] = (v * inv * weight[i] + residual[base + i]) * scalar[0]; }
 }
 extern "C" __global__ void termite_rms_norm_bare_f32(float* dst, const float* input, unsigned int rows, unsigned int dim, float eps) {
     const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
@@ -1567,7 +1527,7 @@ extern "C" __global__ void termite_rms_norm_bare_f32(float* dst, const float* in
     __syncthreads();
     for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
     const float inv = rsqrtf(shmem[0] / float(dim) + eps);
-    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = input[base + i] * inv; }
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; dst[base + i] = v * inv; }
 }
 extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(float* first, float* second, float* third, const float* input, const float* first_weight, const float* second_weight, const float* third_weight, unsigned int rows, unsigned int dim, float eps) {
     const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
@@ -1581,7 +1541,7 @@ extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(float* first, 
     __syncthreads();
     for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
     const float inv = rsqrtf(shmem[0] / float(dim) + eps);
-    for (unsigned int i = tid; i < dim; i += tpg) { first[base + i] = input[base + i] * inv * first_weight[i]; second[base + i] = input[base + i] * inv * second_weight[i]; third[base + i] = input[base + i] * inv * third_weight[i]; }
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; first[base + i] = v * inv * first_weight[i]; second[base + i] = v * inv * second_weight[i]; third[base + i] = v * inv * third_weight[i]; }
 }
 // tile-codegen:end rms_norm family
 
@@ -1655,95 +1615,42 @@ extern "C" __global__ void termite_gemma4_a4b_parallel_ffn_post_residual_f32(
     }
 }
 
-extern "C" __global__ void termite_layer_norm_f32(
-    float* dst,
-    const float* input,
-    const float* gamma,
-    const float* beta,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+// tile-codegen:begin layer_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_layer_norm_f32(float* dst, const float* input, const float* gamma, const float* beta, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[512];
     if (row >= rows) return;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    unsigned int tid = threadIdx.x;
-    __shared__ float sums[256];
-    __shared__ float sumsq[256];
-
-    float local_sum = 0.0f;
-    float local_sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        local_sum += x;
-        local_sumsq += x * x;
-    }
-    sums[tid] = local_sum;
-    sumsq[tid] = local_sumsq;
+    float sum = 0.0f;
+    float sq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v; sq += v * v; }
+    shmem[tid] = sum; shmem[256u + tid] = sq;
     __syncthreads();
-
-    for (unsigned int stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            sums[tid] += sums[tid + stride];
-            sumsq[tid] += sumsq[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    float mean = sums[0] / (float)dim;
-    float var = fmaxf(sumsq[0] / (float)dim - mean * mean, 0.0f);
-    float inv = rsqrtf(var + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        dst[base + i] = (x - mean) * inv * gamma[i] + beta[i];
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) { shmem[tid] += shmem[tid + stride]; shmem[256u + tid] += shmem[256u + tid + stride]; } __syncthreads(); }
+    const float mean = shmem[0] / float(dim);
+    const float var = fmaxf(shmem[256u] / float(dim) - mean * mean, 0.0f);
+    const float inv = rsqrtf(var + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; dst[base + i] = (v - mean) * inv * gamma[i] + beta[i]; }
 }
-
-extern "C" __global__ void termite_add_layer_norm_f32(
-    float* dst,
-    const float* a,
-    const float* b,
-    const float* gamma,
-    const float* beta,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_add_layer_norm_f32(float* dst, const float* a, const float* b, const float* gamma, const float* beta, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[512];
     if (row >= rows) return;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    unsigned int tid = threadIdx.x;
-    __shared__ float sums[256];
-    __shared__ float sumsq[256];
-
-    float local_sum = 0.0f;
-    float local_sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = a[base + i] + b[base + i];
-        local_sum += x;
-        local_sumsq += x * x;
-    }
-    sums[tid] = local_sum;
-    sumsq[tid] = local_sumsq;
+    float sum = 0.0f;
+    float sq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = a[base + i] + b[base + i]; sum += v; sq += v * v; }
+    shmem[tid] = sum; shmem[256u + tid] = sq;
     __syncthreads();
-
-    for (unsigned int stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            sums[tid] += sums[tid + stride];
-            sumsq[tid] += sumsq[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    float mean = sums[0] / (float)dim;
-    float var = fmaxf(sumsq[0] / (float)dim - mean * mean, 0.0f);
-    float inv = rsqrtf(var + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = a[base + i] + b[base + i];
-        dst[base + i] = (x - mean) * inv * gamma[i] + beta[i];
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) { shmem[tid] += shmem[tid + stride]; shmem[256u + tid] += shmem[256u + tid + stride]; } __syncthreads(); }
+    const float mean = shmem[0] / float(dim);
+    const float var = fmaxf(shmem[256u] / float(dim) - mean * mean, 0.0f);
+    const float inv = rsqrtf(var + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = a[base + i] + b[base + i]; dst[base + i] = (v - mean) * inv * gamma[i] + beta[i]; }
 }
-
+// tile-codegen:end layer_norm family
 extern "C" __global__ void termite_elementwise_f32(
     float* dst,
     const float* a,
@@ -21226,181 +21133,6 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
                 warp_partial[tid][3] +
                 warp_partial[tid][4];
         }
-    }
-}
-
-extern "C" __global__ void termite_argmax_reduce_rows_pairs_f32(
-    unsigned int* dst,
-    const float* partial_values,
-    const unsigned int* partial_indices,
-    unsigned int rows,
-    unsigned int col_tiles
-) {
-    __shared__ float warp_best_values[8];
-    __shared__ unsigned int warp_best_indices[8];
-    unsigned int row = blockIdx.x;
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    float best_value = -3.402823466e+38f;
-    unsigned int best_index = 0xffffffffu;
-    if (row < rows) {
-        unsigned int base = row * col_tiles;
-        for (unsigned int i = tid; i < col_tiles; i += blockDim.x) {
-            unsigned int index = partial_indices[base + i];
-            if (index == 0xffffffffu) continue;
-            float value = partial_values[base + i];
-            if (value > best_value || (value == best_value && index < best_index)) {
-                best_value = value;
-                best_index = index;
-            }
-        }
-    }
-    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
-        float other_value = __shfl_down_sync(0xffffffffu, best_value, offset);
-        unsigned int other_index = __shfl_down_sync(0xffffffffu, best_index, offset);
-        if (other_index != 0xffffffffu &&
-            (other_value > best_value || (other_value == best_value && other_index < best_index))) {
-            best_value = other_value;
-            best_index = other_index;
-        }
-    }
-    if (lane == 0u) {
-        warp_best_values[warp] = best_value;
-        warp_best_indices[warp] = best_index;
-    }
-    __syncthreads();
-    if (tid == 0u && row < rows) {
-        float final_value = -3.402823466e+38f;
-        unsigned int final_index = 0xffffffffu;
-        unsigned int warp_count = blockDim.x >> 5;
-        #pragma unroll
-        for (unsigned int w = 0u; w < 8u; ++w) {
-            if (w >= warp_count) continue;
-            float other_value = warp_best_values[w];
-            unsigned int other_index = warp_best_indices[w];
-            if (other_index != 0xffffffffu &&
-                (other_value > final_value || (other_value == final_value && other_index < final_index))) {
-                final_value = other_value;
-                final_index = other_index;
-            }
-        }
-        dst[row] = final_index == 0xffffffffu ? 0u : final_index;
-    }
-}
-
-extern "C" __global__ void termite_argmax_reduce_rows_pairs_f32_w16(
-    unsigned int* dst,
-    const float* partial_values,
-    const unsigned int* partial_indices,
-    unsigned int rows,
-    unsigned int col_tiles
-) {
-    __shared__ float warp_best_values[16];
-    __shared__ unsigned int warp_best_indices[16];
-    unsigned int row = blockIdx.x;
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    float best_value = -3.402823466e+38f;
-    unsigned int best_index = 0xffffffffu;
-    if (row < rows) {
-        unsigned int base = row * col_tiles;
-        for (unsigned int i = tid; i < col_tiles; i += blockDim.x) {
-            unsigned int index = partial_indices[base + i];
-            if (index == 0xffffffffu) continue;
-            float value = partial_values[base + i];
-            if (value > best_value || (value == best_value && index < best_index)) {
-                best_value = value;
-                best_index = index;
-            }
-        }
-    }
-    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
-        float other_value = __shfl_down_sync(0xffffffffu, best_value, offset);
-        unsigned int other_index = __shfl_down_sync(0xffffffffu, best_index, offset);
-        if (other_index != 0xffffffffu &&
-            (other_value > best_value || (other_value == best_value && other_index < best_index))) {
-            best_value = other_value;
-            best_index = other_index;
-        }
-    }
-    if (lane == 0u) {
-        warp_best_values[warp] = best_value;
-        warp_best_indices[warp] = best_index;
-    }
-    __syncthreads();
-    if (tid == 0u && row < rows) {
-        float final_value = -3.402823466e+38f;
-        unsigned int final_index = 0xffffffffu;
-        unsigned int warp_count = blockDim.x >> 5;
-        #pragma unroll
-        for (unsigned int w = 0u; w < 16u; ++w) {
-            if (w >= warp_count) continue;
-            float other_value = warp_best_values[w];
-            unsigned int other_index = warp_best_indices[w];
-            if (other_index != 0xffffffffu &&
-                (other_value > final_value || (other_value == final_value && other_index < final_index))) {
-                final_value = other_value;
-                final_index = other_index;
-            }
-        }
-        dst[row] = final_index == 0xffffffffu ? 0u : final_index;
-    }
-}
-
-extern "C" __global__ void termite_argmax_reduce_pairs_f32(
-    unsigned int* dst,
-    const float* partial_values,
-    const unsigned int* partial_indices,
-    unsigned int count
-) {
-    __shared__ float warp_best_values[8];
-    __shared__ unsigned int warp_best_indices[8];
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    float best_value = -3.402823466e+38f;
-    unsigned int best_index = 0xffffffffu;
-    for (unsigned int i = tid; i < count; i += blockDim.x) {
-        unsigned int index = partial_indices[i];
-        if (index == 0xffffffffu) continue;
-        float value = partial_values[i];
-        if (value > best_value || (value == best_value && index < best_index)) {
-            best_value = value;
-            best_index = index;
-        }
-    }
-    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
-        float other_value = __shfl_down_sync(0xffffffffu, best_value, offset);
-        unsigned int other_index = __shfl_down_sync(0xffffffffu, best_index, offset);
-        if (other_index != 0xffffffffu &&
-            (other_value > best_value || (other_value == best_value && other_index < best_index))) {
-            best_value = other_value;
-            best_index = other_index;
-        }
-    }
-    if (lane == 0u) {
-        warp_best_values[warp] = best_value;
-        warp_best_indices[warp] = best_index;
-    }
-    __syncthreads();
-    if (tid == 0u) {
-        float final_value = -3.402823466e+38f;
-        unsigned int final_index = 0xffffffffu;
-        unsigned int warp_count = blockDim.x >> 5;
-        #pragma unroll
-        for (unsigned int w = 0u; w < 8u; ++w) {
-            if (w >= warp_count) continue;
-            float other_value = warp_best_values[w];
-            unsigned int other_index = warp_best_indices[w];
-            if (other_index != 0xffffffffu &&
-                (other_value > final_value || (other_value == final_value && other_index < final_index))) {
-                final_value = other_value;
-                final_index = other_index;
-            }
-        }
-        dst[0] = final_index == 0xffffffffu ? 0u : final_index;
     }
 }
 

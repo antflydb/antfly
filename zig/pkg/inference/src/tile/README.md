@@ -59,25 +59,39 @@ default baseline x86-64 target (no AVX/FMA) is about 15x slower.
 failure). The model kernels are generated for Metal and CUDA but no runtime
 launches them yet; the OpenCL harness is the host-side reference for doing so.
 
-## Production RMSNorm family (`rms_norm.zig`)
+## Production kernel families (`rms_norm.zig`, `argmax.zig`)
 
-The 17 Metal RMSNorm kernels in `metal_kernels.m` and the 8 in
-`inference_cuda_kernels.cu` come from one table of descriptions and one
-renderer, written into marker-delimited regions
-(`tile-codegen:begin/end rms_norm family`). Names, buffer slots, params
-structs and CUDA argument order are unchanged, so host dispatch is
-untouched.
+Three production families in `metal_kernels.m` and
+`inference_cuda_kernels.cu` come from tables of descriptions, written into
+marker-delimited regions (`tile-codegen:begin/end <family> family`):
 
-Both backends are checked against the previous hand-written kernels on the
-CPU, with no GPU: each script compiles the old and new sources as C++
-against a small shim, runs every block with one OS thread per GPU thread
-(real barriers, and `simd_sum` on Metal) over a grid of shapes and block
-sizes, and requires bit-identical outputs, plus an f64 reference check.
+| Family | Metal | CUDA | Source |
+| --- | --- | --- | --- |
+| `rms_norm` | 17 | 8 | `rms_norm.zig` (`kernels`) |
+| `layer_norm` | 9 | 2 | `rms_norm.zig` (`layer_norm_kernels`) |
+| `argmax` | 7 | 7 | `argmax.zig` |
+
+Names, buffer slots, params structs and CUDA argument order are unchanged,
+so host dispatch is untouched.
+
+`scripts/tile/check_kernels.py` checks a family against the previous
+hand-written kernels on the CPU, with no GPU: it compiles the old and new
+sources as C++ against a small Metal or CUDA shim, runs every block with one
+OS thread per GPU thread (real barriers, emulated `simd_sum` and shuffles)
+over the shapes in `scripts/tile/kernel_specs.py`, and requires
+bit-identical outputs. Argmax inputs force ties, NaN, `-inf` and "no
+candidate" ids.
 
 ```sh
-python scripts/tile/check_metal_rms_norm.py <old metal_kernels.m> <new metal_kernels.m>
-python scripts/tile/check_cuda_rms_norm.py <old inference_cuda_kernels.cu> <new inference_cuda_kernels.cu>
+python3 -I scripts/tile/check_kernels.py <metal|cuda> <family> <old file> <new file>
+CHECK_FLAGS="-O2 -march=native -ffp-contract=fast" python3 -I scripts/tile/check_kernels.py ...
 ```
+
+To hand another family to the generator: describe it, then run
+`scripts/tile/adopt_kernels.py <family> <kernels...>` (removes the
+hand-written kernels and leaves an empty region), add the region to
+`codegen_main.zig`, `zig build tile-kernel-codegen -- --write`, add a spec,
+and check against the old file.
 
 Changing CUDA source means regenerating the checked-in PTX/fatbin/cubin
 with the pinned toolkit (CUDA 13.2, V13.2.86). Without a local install, the
