@@ -15,6 +15,7 @@
 
 // Deployment authority changes once during an explicitly frozen migration.
 // It is not a per-transaction HEAD and never sits in the write hot path.
+import{readLeasePolicy,validReadLeasePolicy}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs";
 import {callR2Binding} from "../../zig/lib/objectstore/wasm/r2.mjs";
 export async function openAuthority(env, mode, {allowRetired = false, allowExistingSqlite = false, allowCreate = true} = {}) {
   const namespace = env.ANTFLY_INCARNATION;
@@ -32,7 +33,7 @@ export async function openAuthority(env, mode, {allowRetired = false, allowExist
       if (mode === "r2" || !allowExistingSqlite) prefixes.push(`antfly/wal-v1/${id}/`, `antfly/manifests/${namespace}/`);
       for (const prefix of prefixes) if ((await callR2Binding(()=>env.DATABASE.list({prefix,limit:1}))).objects.length) throw new Error("CoordinatorMigrationRequired");
     }
-    descriptor = {format:1,namespace,mode,storage_id: mode === "r2" ? env.COORDINATOR_STORAGE_ID ?? namespace : null};
+    descriptor = {format:1,namespace,mode,storage_id: mode === "r2" ? env.COORDINATOR_STORAGE_ID ?? namespace : null,...(mode==="r2"&&env.FENCED_READ_LEASES!=="false"?{read_lease_policy:readLeasePolicy}:{})};
     const written = await callR2Binding(()=>env.DATABASE.put(key, JSON.stringify(descriptor), {onlyIf:{etagDoesNotMatch:"*"},httpMetadata:{contentType:"application/json"}}));
     if (written) return {key, descriptor, etag:written.etag};
     object = await callR2Binding(()=>env.DATABASE.get(key));
@@ -40,6 +41,7 @@ export async function openAuthority(env, mode, {allowRetired = false, allowExist
   }
   if (object.size > 4096) throw new Error("CoordinatorAuthorityInvalid");
   descriptor = await callR2Binding(()=>object.json());
+  if(descriptor.read_lease_policy!=null&&!validReadLeasePolicy(descriptor.read_lease_policy))throw Error("CoordinatorAuthorityInvalid");
   if (descriptor.format !== 1 || descriptor.namespace !== namespace) throw new Error("CoordinatorAuthorityInvalid");
   if (descriptor.mode !== mode) {
     if (!(mode === "r2" && descriptor.mode === "sqlite" && env.COORDINATOR_MIGRATION_REQUIRED === "true" && env.LEGACY_COMMITS) && !(mode === "sqlite" && descriptor.mode === "r2" && allowRetired)) throw new Error("CoordinatorAuthorityMismatch");
