@@ -5111,7 +5111,7 @@ fn buildGraphSegmentBoundedAlloc(
     limits: GraphBuildLimits,
 ) !GraphSegmentBuildResult {
     var bridge = maintenance_cancellation.GraphBridge{ .maintenance = maintenance };
-    const cancellation = bridge.token();
+    const cancellation = bridge.ownerToken();
     try cancellation.check();
     if (!include_graph) return .{ .payload = null, .edge_count = 0 };
     if (docs.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;

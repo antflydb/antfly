@@ -116,6 +116,7 @@ pub const graph_graph = @import("graph/graph.zig");
 pub const graph_metric_cost = @import("graph/metric_cost.zig");
 pub const graph_metric_rerank = @import("graph/metric_rerank.zig");
 pub const graph_metrics = @import("graph/metrics.zig");
+pub const graph_preparation = @import("graph/preparation.zig");
 pub const graph_node_admission = @import("graph/node_admission.zig");
 pub const graph_node_identity = @import("graph/node_identity.zig");
 pub const graph_path_weight_diagnostic = @import("graph/path_weight_diagnostic.zig");

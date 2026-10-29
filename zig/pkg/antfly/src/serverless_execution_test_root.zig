@@ -19,6 +19,13 @@ const std = @import("std");
 const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
 const handler_mod = @import("serverless/api/http_handler.zig");
 
+// Keep focused graph builds reachable independently of unrelated listener tests.
+test "serverless execution graph preparation production paths are reachable" {
+    _ = @import("serverless/build/lake_graph_metric.zig");
+    _ = @import("serverless/build/builder.zig");
+    _ = @import("serverless/graph_segment/page_topology.zig");
+}
+
 test "serverless execution default queues preserve cancellation deadlines and protected health" {
     const Mode = enum { coarse_cancel, coarse_deadline, runnable_cancel };
     const Job = struct {

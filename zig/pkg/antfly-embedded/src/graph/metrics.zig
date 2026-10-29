@@ -18,6 +18,7 @@
 //! be used by embedded and immutable lake-native graph implementations.
 
 const std = @import("std");
+const preparation = @import("preparation.zig");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metric_cost = @import("metric_cost.zig");
@@ -88,7 +89,10 @@ pub const Topology = struct {
         requirements: TopologyRequirements,
         cancellation: CancellationToken,
     ) !Topology {
-        return initFromSourceAlloc(alloc, node_count, edges.len, SliceEdges{ .edges = edges }, requirements, cancellation);
+        return initAllocControlled(alloc, node_count, edges, requirements, .{ .cancellation = cancellation });
+    }
+    pub fn initAllocControlled(alloc: Allocator, node_count: usize, edges: []const Edge, requirements: TopologyRequirements, control: preparation.Control) !Topology {
+        return initFromSourceControlled(alloc, node_count, edges.len, SliceEdges{ .edges = edges }, requirements, control);
     }
 
     const SliceEdges = struct {
@@ -113,7 +117,10 @@ pub const Topology = struct {
         requirements: TopologyRequirements,
         cancellation: CancellationToken,
     ) !Topology {
-        try cancellation.check();
+        return initFromSourceControlled(alloc, node_count, edge_count, source, requirements, .{ .cancellation = cancellation });
+    }
+    pub fn initFromSourceControlled(alloc: Allocator, node_count: usize, edge_count: usize, source: anytype, requirements: TopologyRequirements, control: preparation.Control) !Topology {
+        try control.check();
         if (node_count > std.math.maxInt(u32) or edge_count > std.math.maxInt(u32))
             return error.GraphMetricBuildBudgetExceeded;
         const offset_count = std.math.add(usize, node_count, 1) catch
@@ -129,7 +136,7 @@ pub const Topology = struct {
         var census = source;
         var edge_index: usize = 0;
         while (census.next()) |edge| : (edge_index += 1) {
-            if (edge_index % 4096 == 0) try cancellation.check();
+            if (edge_index % 4096 == 0) try control.check();
             if (edge_index == edge_count) return error.InvalidGraphMetricEdge;
             if (@as(usize, edge.source) >= node_count or @as(usize, edge.target) >= node_count)
                 return error.InvalidGraphMetricEdge;
@@ -138,7 +145,7 @@ pub const Topology = struct {
         }
         if (edge_index != edge_count) return error.InvalidGraphMetricEdge;
         for (1..offset_count) |i| {
-            if (i % 4096 == 0) try cancellation.check();
+            if (i % 4096 == 0) try control.check();
             if (has_incoming) incoming_offsets[i] = std.math.add(u32, incoming_offsets[i], incoming_offsets[i - 1]) catch
                 return error.GraphMetricBuildBudgetExceeded;
             if (has_outgoing) outgoing_offsets[i] = std.math.add(u32, outgoing_offsets[i], outgoing_offsets[i - 1]) catch
@@ -158,7 +165,7 @@ pub const Topology = struct {
             var fill = source;
             edge_index = 0;
             while (fill.next()) |edge| : (edge_index += 1) {
-                if (edge_index % 4096 == 0) try cancellation.check();
+                if (edge_index % 4096 == 0) try control.check();
                 if (edge_index == edge_count or edge.source >= node_count or edge.target >= node_count) return error.InvalidGraphMetricEdge;
                 if (owns_incoming_sources) {
                     const incoming_position = incoming_cursors[edge.target];
@@ -231,6 +238,10 @@ const Participants = struct {
         if (self.active) if (self.control) |control| control.abandon(control.ptr);
     }
 };
+
+fn preparationControl(options: Options) preparation.Control {
+    return .{ .cancellation = options.cancellation, .checkpoint = if (options.participants) |participant| .{ .ptr = participant.ptr, .check = participant.checkpoint } else null };
+}
 
 fn ownerCheckpoint(options: Options) !void {
     try options.cancellation.check();
@@ -362,7 +373,7 @@ fn admitWork(kind: metric_cost.Kind, node_count: usize, edge_count: usize, itera
 pub fn degreeAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, options: Options) !Result {
     try validateInputBoundsAndOptions(node_count, edges.len, options);
     try admitWork(.degree, node_count, edges.len, 1, options.max_work_items);
-    var topology = try Topology.initAllocFor(alloc, node_count, edges, .degree, options.cancellation);
+    var topology = try Topology.initAllocControlled(alloc, node_count, edges, .degree, preparationControl(options));
     defer topology.deinit(alloc);
     return try degreeTopologyAlloc(alloc, topology, options);
 }
@@ -567,7 +578,7 @@ fn fillTiledAdjacency(
 pub fn pageRankAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, options: Options) !Result {
     try validateInputBoundsAndOptions(node_count, edges.len, options);
     try admitWork(.pagerank, node_count, edges.len, options.max_iterations, options.max_work_items);
-    var topology = try Topology.initAllocFor(alloc, node_count, edges, .pagerank, options.cancellation);
+    var topology = try Topology.initAllocControlled(alloc, node_count, edges, .pagerank, preparationControl(options));
     defer topology.deinit(alloc);
     return try pageRankTopologyAlloc(alloc, topology, options);
 }
@@ -663,7 +674,7 @@ pub fn personalizedPageRankAlloc(
 ) !Result {
     try validateInputBoundsAndOptions(node_count, edges.len, options);
     try admitWork(.pagerank, node_count, edges.len, options.max_iterations, options.max_work_items);
-    var topology = try Topology.initAllocFor(alloc, node_count, edges, .pagerank, options.cancellation);
+    var topology = try Topology.initAllocControlled(alloc, node_count, edges, .pagerank, preparationControl(options));
     defer topology.deinit(alloc);
     return try personalizedPageRankTopologyAlloc(alloc, topology, seed_ordinals, options);
 }
@@ -723,7 +734,7 @@ fn addTeleportAndDelta(
 pub fn eigenvectorAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, options: Options) !Result {
     try validateInputBoundsAndOptions(node_count, edges.len, options);
     try admitWork(.eigenvector, node_count, edges.len, options.max_iterations, options.max_work_items);
-    var topology = try Topology.initAllocFor(alloc, node_count, edges, .eigenvector, options.cancellation);
+    var topology = try Topology.initAllocControlled(alloc, node_count, edges, .eigenvector, preparationControl(options));
     defer topology.deinit(alloc);
     return try eigenvectorTopologyAlloc(alloc, topology, options);
 }
@@ -756,7 +767,7 @@ pub fn eigenvectorTopologyAlloc(alloc: Allocator, topology: Topology, options: O
 pub fn hitsAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, options: Options) !HitsResult {
     try validateInputBoundsAndOptions(node_count, edges.len, options);
     try admitWork(.hits, node_count, edges.len, options.max_iterations, options.max_work_items);
-    var topology = try Topology.initAllocFor(alloc, node_count, edges, .hits, options.cancellation);
+    var topology = try Topology.initAllocControlled(alloc, node_count, edges, .hits, preparationControl(options));
     defer topology.deinit(alloc);
     return try hitsTopologyAlloc(alloc, topology, options);
 }
@@ -1481,5 +1492,29 @@ test "serverless graph metric edge tiles split hubs with deterministic bounded r
                 for (output, 0..) |value, i| try std.testing.expectEqual(@as(f64, @floatFromInt(offsets[i + 1] - offsets[i])), value);
             }
         }
+    }
+}
+
+test "serverless bounded graph metric preparation sorting preserves canonical order and refuses interrupted output" {
+    const Probe = struct {
+        checks: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks == 3) return error.Canceled;
+        }
+    };
+    var values: [8193]u32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @intCast((i * 7919) % 997);
+    var expected = values;
+    std.mem.sort(u32, &expected, {}, std.sort.asc(u32));
+    var probe: Probe = .{};
+    try std.testing.expectError(error.Canceled, preparation.sort(u32, &values, {}, std.sort.asc(u32), .{ .ptr = &probe, .check_fn = Probe.check }));
+    try preparation.sort(u32, &values, {}, std.sort.asc(u32), .none);
+    try std.testing.expectEqualSlices(u32, &expected, &values);
+    for (0..33) |length| {
+        for (values[0..length], 0..) |*value, i| value.* = @intCast(length - i);
+        try preparation.sort(u32, values[0..length], {}, std.sort.asc(u32), .none);
+        try std.testing.expect(std.sort.isSorted(u32, values[0..length], {}, std.sort.asc(u32)));
     }
 }

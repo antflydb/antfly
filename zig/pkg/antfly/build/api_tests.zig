@@ -4056,6 +4056,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-serverless-execution-test", "Verify serverless shared scheduler policy, protected health and owning release")
         .dependOn(&b.addRunArtifact(serverless_execution_tests).step);
 
+    // Same production root, without unrelated provider/listener qualification.
+    const graph_preparation_tests = b.addTest(.{
+        .name = "graph-preparation-tests",
+        .root_module = serverless_execution_root,
+        .filters = &.{ "serverless execution graph", "serverless bounded graph metric", "serverless paged topology", "serverless ordinal graph builder", "serverless graph metric", "serverless lake graph metrics", "serverless packed topology matches", "serverless builder publishes and lifecycle-binds configured graph metrics" },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-graph-preparation-test", "Verify production graph preparation yields, preserves results and cleans up refused work")
+        .dependOn(&b.addRunArtifact(graph_preparation_tests).step);
+
     const asset_provider_wait_tests = b.addTest(.{
         .name = "asset-provider-wait-tests",
         .root_module = serverless_execution_root,

@@ -204,6 +204,23 @@ pub const GraphBridge = struct {
         try checkpoint(raw);
     }
 
+    /// Synchronous CPU preparation only. Never lend this token to providers
+    /// or parallel workers, whose cancellation checks must remain passive.
+    pub fn ownerToken(self: *GraphBridge) CancellationToken {
+        if (self.maintenance == null) return .none;
+        return .{ .ptr = self, .check_fn = ownerCheck };
+    }
+    fn ownerCheck(raw: *const anyopaque) !void {
+        try checkpoint(raw);
+        const self: *GraphBridge = @ptrCast(@alignCast(@constCast(raw)));
+        // No bridge mutex spans checked CPU reentry or lease renewal.
+        self.maintenance.?.ownerCheckpoint() catch |err| {
+            try checkpoint(raw);
+            return err;
+        };
+        try checkpoint(raw);
+    }
+
     pub fn token(self: *GraphBridge) CancellationToken {
         if (self.maintenance == null) return .none;
         return .{ .ptr = self, .check_fn = checkpoint, .is_cancelled_fn = isCancelled };

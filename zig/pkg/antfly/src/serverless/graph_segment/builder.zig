@@ -17,6 +17,7 @@
 //! of degree; only integer edges survive between input documents/batches.
 const std = @import("std");
 const wire = @import("packed.zig");
+const preparation = @import("antfly_local_sources").graph_preparation;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const edge_type = @import("antfly_local_sources").graph_edge_type;
 const Allocator = std.mem.Allocator;
@@ -41,14 +42,18 @@ const Dictionary = struct {
         return ordinal;
     }
 
-    fn orderAlloc(self: *const @This(), alloc: Allocator) ![]u32 {
+    fn orderAlloc(self: *const @This(), alloc: Allocator, cancellation: CancellationToken) ![]u32 {
         const order = try alloc.alloc(u32, self.values.count());
-        for (order, 0..) |*value, i| value.* = @intCast(i);
-        std.mem.sort(u32, order, self.values.keys(), struct {
+        errdefer alloc.free(order);
+        for (order, 0..) |*value, i| {
+            if (i % 4096 == 0) try cancellation.check();
+            value.* = @intCast(i);
+        }
+        try preparation.sort(u32, order, self.values.keys(), struct {
             fn less(keys: []const []const u8, a: u32, b: u32) bool {
                 return std.mem.order(u8, keys[a], keys[b]) == .lt;
             }
-        }.less);
+        }.less, cancellation);
         return order;
     }
 };
@@ -107,23 +112,27 @@ pub const Builder = struct {
     /// including table-qualified duplicate endpoints and input permutations.
     pub fn encodeAlloc(self: *const @This(), max_bytes: usize, cancellation: CancellationToken) ![]u8 {
         try cancellation.check();
-        const node_order = try self.nodes.orderAlloc(self.alloc);
+        const node_order = try self.nodes.orderAlloc(self.alloc, cancellation);
         defer self.alloc.free(node_order);
-        const type_order = try self.kinds.orderAlloc(self.alloc);
+        const type_order = try self.kinds.orderAlloc(self.alloc, cancellation);
         defer self.alloc.free(type_order);
-        const table_order = try self.tables.orderAlloc(self.alloc);
+        const table_order = try self.tables.orderAlloc(self.alloc, cancellation);
         defer self.alloc.free(table_order);
-        const node_map = try invert(self.alloc, node_order);
+        const node_map = try invert(self.alloc, node_order, cancellation);
         defer self.alloc.free(node_map);
-        const type_map = try invert(self.alloc, type_order);
+        const type_map = try invert(self.alloc, type_order, cancellation);
         defer self.alloc.free(type_map);
-        const table_map = try invert(self.alloc, table_order);
+        const table_map = try invert(self.alloc, table_order, cancellation);
         defer self.alloc.free(table_map);
         var local_edges: usize = 0;
-        for (self.edges.items) |edge| local_edges += @intFromBool(edge.table == wire.no_table);
+        for (self.edges.items, 0..) |edge, i| {
+            if (i % 4096 == 0) try cancellation.check();
+            local_edges += @intFromBool(edge.table == wire.no_table);
+        }
         var size: usize = wire.header_len;
         for ([_]*const Dictionary{ &self.nodes, &self.kinds, &self.tables }) |dict| {
-            for (dict.values.keys()) |key| {
+            for (dict.values.keys(), 0..) |key, i| {
+                if (i % 256 == 0) try cancellation.check();
                 _ = std.math.cast(u32, key.len) orelse return error.GraphSegmentTooLarge;
                 size = std.math.add(usize, size, std.math.add(usize, key.len, 4) catch return error.GraphSegmentTooLarge) catch return error.GraphSegmentTooLarge;
             }
@@ -148,7 +157,10 @@ pub const Builder = struct {
             }
         }
         var routing_extra: usize = 0;
-        for (counts) |count| routing_extra = std.math.add(usize, routing_extra, wire.typeRunReservation(count[0], count[1], self.kinds.values.count())) catch return error.GraphSegmentTooLarge;
+        for (counts, 0..) |count, i| {
+            if (i % 4096 == 0) try cancellation.check();
+            routing_extra = std.math.add(usize, routing_extra, wire.typeRunReservation(count[0], count[1], self.kinds.values.count())) catch return error.GraphSegmentTooLarge;
+        }
         size = std.math.add(usize, size, try wire.topologyExtensionSize(self.kinds.values.keys(), self.nodes.values.count(), local_edges, body_len, routing_extra)) catch return error.GraphSegmentTooLarge;
         if (size > max_bytes) return error.GraphSegmentTooLarge;
         const positions = try self.alloc.alloc([2]usize, node_order.len);
@@ -163,7 +175,8 @@ pub const Builder = struct {
         put(bytes, &pos, @intCast(type_order.len));
         put(bytes, &pos, @intCast(self.nodeCount()));
         inline for (.{ .{ &self.tables, table_order }, .{ &self.nodes, node_order }, .{ &self.kinds, type_order } }) |pair| {
-            for (pair[1]) |i| {
+            for (pair[1], 0..) |i, ordinal| {
+                if (ordinal % 4096 == 0) try cancellation.check();
                 const key = pair[0].values.keys()[i];
                 put(bytes, &pos, @intCast(key.len));
                 @memcpy(bytes[pos..][0..key.len], key);
@@ -196,7 +209,7 @@ pub const Builder = struct {
                 const end = positions[node][direction];
                 const start = end - @as(usize, counts[node][direction]) * wire.edge_len;
                 const records = std.mem.bytesAsSlice([wire.edge_len]u8, bytes[start..end]);
-                std.mem.sort([wire.edge_len]u8, records, {}, wireEdgeLess);
+                try preparation.sort([wire.edge_len]u8, records, {}, wireEdgeLess, cancellation);
             }
         }
         try wire.finishEncoding(self.alloc, bytes, body_len, wire.topologyDirectorySize(self.kinds.values.keys(), self.nodes.values.count(), body_len + local_edges * 8, routing_extra), routing_extra, cancellation);
@@ -224,9 +237,13 @@ fn wireEdgeLess(_: void, a: [wire.edge_len]u8, b: [wire.edge_len]u8) bool {
     return std.mem.readInt(u32, a[12..16], .little) < std.mem.readInt(u32, b[12..16], .little);
 }
 
-fn invert(alloc: Allocator, order: []const u32) ![]u32 {
+fn invert(alloc: Allocator, order: []const u32, cancellation: CancellationToken) ![]u32 {
     const result = try alloc.alloc(u32, order.len);
-    for (order, 0..) |old, new| result[old] = @intCast(new);
+    errdefer alloc.free(result);
+    for (order, 0..) |old, new| {
+        if (new % 4096 == 0) try cancellation.check();
+        result[old] = @intCast(new);
+    }
     return result;
 }
 

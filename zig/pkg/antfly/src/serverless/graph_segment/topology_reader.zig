@@ -17,6 +17,7 @@
 //! Scratch and retained data scale with selected edges/endpoints. Unrelated
 //! node strings are visited only within the touched dictionary pages.
 const std = @import("std");
+const preparation = @import("antfly_local_sources").graph_preparation;
 const Allocator = std.mem.Allocator;
 const wire = @import("packed.zig");
 const artifacts = @import("../artifacts/store.zig");
@@ -137,7 +138,7 @@ pub const Context = struct {
         if (requested_slots == 0 or requested_slots > 8) return error.InvalidGraphSegment;
         if (source.metadata_version == page_graph.Root.metadata_version) {
             var writes: u64 = 0;
-            var pages: page_store.PageStore = .{ .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = remaining, .remaining_write_bytes = &writes };
+            var pages: page_store.PageStore = .{ .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = remaining, .remaining_write_bytes = &writes, .read_context = store.write_context orelse .{} };
             return .{
                 .reader = .{ .alloc = alloc, .store = store, .source = source, .cancellation = cancellation, .remaining = remaining, .cache = cache },
                 .paged_root = pages.loadRoot(alloc, source) catch |err| switch (err) {
@@ -194,7 +195,7 @@ pub const Context = struct {
     pub fn selectedPageEdgeCount(self: *Context, alloc: Allocator, filter: anytype) !u64 {
         const root = self.paged_root orelse return error.InvalidGraphRoot;
         var writes: u64 = 0;
-        var pages: page_store.PageStore = .{ .domain = root.domain, .artifacts = self.reader.store, .cancellation = self.reader.cancellation, .remaining_read_bytes = self.reader.remaining, .remaining_write_bytes = &writes };
+        var pages: page_store.PageStore = .{ .domain = root.domain, .artifacts = self.reader.store, .cancellation = self.reader.cancellation, .read_context = self.reader.store.write_context orelse .{}, .remaining_read_bytes = self.reader.remaining, .remaining_write_bytes = &writes };
         var cache: page_tree.Cache = .{ .alloc = alloc, .underlying = pages.store() };
         defer cache.deinit();
         if (filter.mode == .all) return page_graph.topologyEdgeCount(alloc, cache.store(), root, null);
@@ -427,6 +428,12 @@ pub fn readOracleAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source
 }
 
 pub fn readPreparedAlloc(alloc: Allocator, context: *Context, configs: anytype, limits: anytype, cancellation: CancellationToken) !?Topology {
+    return readPreparedControlledAlloc(alloc, context, configs, limits, .{ .cancellation = cancellation });
+}
+
+pub fn readPreparedControlledAlloc(alloc: Allocator, context: *Context, configs: anytype, limits: anytype, control: preparation.Control) !?Topology {
+    const cancellation = control.token();
+    try control.check();
     if (context.paged_root) |root| {
         var requested: std.ArrayListUnmanaged([]const u8) = .empty;
         defer requested.deinit(alloc);
@@ -439,10 +446,10 @@ pub fn readPreparedAlloc(alloc: Allocator, context: *Context, configs: anytype, 
             try requested.appendSlice(alloc, config.edge_filter.types);
         }
         var writes: u64 = 0;
-        var pages: page_store.PageStore = .{ .domain = root.domain, .artifacts = context.reader.store, .cancellation = cancellation, .remaining_read_bytes = context.reader.remaining, .remaining_write_bytes = &writes };
+        var pages: page_store.PageStore = .{ .domain = root.domain, .artifacts = context.reader.store, .cancellation = control.cancellation, .read_context = context.reader.store.write_context orelse .{}, .remaining_read_bytes = context.reader.remaining, .remaining_write_bytes = &writes };
         var cache: page_tree.Cache = .{ .alloc = alloc, .underlying = pages.store() };
         defer cache.deinit();
-        return page_topology.readAlloc(alloc, cache.store(), root, if (all) null else requested.items, limits.max_nodes, limits.max_edges) catch |err| switch (err) {
+        return page_topology.readControlledAlloc(alloc, cache.store(), root, if (all) null else requested.items, limits.max_nodes, limits.max_edges, control) catch |err| switch (err) {
             error.ArtifactReadBudgetExceeded => return error.GraphMetricBuildBudgetExceeded,
             else => return err,
         };
@@ -529,9 +536,10 @@ pub fn readPreparedAlloc(alloc: Allocator, context: *Context, configs: anytype, 
             unique += 1;
         }
     } else {
-        std.mem.sort(u32, endpoints, {}, std.sort.asc(u32));
+        try preparation.sort(u32, endpoints, {}, std.sort.asc(u32), cancellation);
         try cancellation.check();
-        for (endpoints) |ordinal| {
+        for (endpoints, 0..) |ordinal, i| {
+            if (i % 4096 == 0) try cancellation.check();
             if (unique != 0 and endpoints[unique - 1] == ordinal) continue;
             endpoints[unique] = ordinal;
             unique += 1;

@@ -5639,3 +5639,30 @@ and verifies exact HTTP/pgwire postimages across joined shutdown/reopen. This
 closes that profile's descriptor-recovery gate. It does not qualify other process
 envelopes or complete the full design. Receipts are
 `generation-handle-pool-native-file-v1.json` and `-v2.json`.
+
+
+### Graph preparation shares the existing execution owner
+
+Graph publication now checkpoints its original execution during topology census,
+CSR construction, endpoint and dictionary sorting, projection, metric output
+planning, and encoding. The page-root publication callers carry this control
+through selected topology preparation. Artifact page reads retain the existing
+read context; provider and numerical worker cancellation tokens remain passive.
+Interruptible in-place sorting adds no source-wide scratch allocation. Refusal
+unwinds caller-owned output without publishing partial orderings.
+
+Run `zig build antfly-graph-preparation-test -Dcuda=true -Doptimize=Debug -j1`
+from `zig/` using the supported platform toolchain. This focused production root
+includes graph publication, numerical team ownership, projection and output
+admission, selective topology, reuse, warm starts, and allocation failure cases.
+A 32,768-node / 131,072-edge public payload build queues a query behind its sole
+ordinary CPU slot, yields to that query, and produces the same encoded metric
+as serial execution. Cancellation, deadline, and lease-loss refusal preserve
+the existing execution owner; paged topology preparation refuses every actual
+checkpoint with the leak-checking allocator.
+
+This is deterministic integration with the native scheduler and production graph
+functions. It does not establish deployed HTTP latency, cloud-provider throughput,
+or mapped-page-fault qualification. Model/framework/download preparation and the
+remaining cross-engine qualification remain part of the broader objective. The
+existing full GNU qualification waiver remains in effect.
