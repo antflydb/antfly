@@ -161,7 +161,8 @@ separate; it needs read access to the originals bucket.
 ./grepstein publish --state ./grepstein-corpus --bucket antfly-showcases-originals
 # Set ANTFLY_API_KEY securely to a write key for this instance/table.
 ./grepstein load --state ./grepstein-corpus --url "$ANTFLY_URL" \
-  --create-table --num-shards 4 --reader-config lightonocr-reader.example.json \
+  --create-table --num-shards 4 --source-connection "$GCS_SOURCE_CONNECTION" \
+  --reader-config lightonocr-reader.example.json \
   --inference-url "$ANTFLY_INFERENCE_URL" \
   --inference-secret antfly.antfly_inference.api_key
 ./grepstein wait --url "$ANTFLY_URL"
@@ -222,16 +223,22 @@ truncated/blocked model completions and preserve all final Vertex text parts. In
 publication can be rerun. Keep the state and immutable source snapshots for
 recovery. No local source server is required after publication.
 
-V1 uses Antfly's **existing S3-compatible remote-content reader against GCS's
-XML endpoint**: source rows use `s3://BUCKET/objects/sha256/...`. They are GCS
-objects, not AWS objects. Configure a bucket-scoped GCS HMAC read credential in
-Colony's existing S3 provider connection, endpoint `storage.googleapis.com`, SSL
-enabled, with `buckets: ["antfly-showcases-originals"]`. Colony already publishes
-these credentials to Antfly's secret store and hot-reloaded remote-content
-configuration. Keep HMAC material out of manifests, index configs, and Pulumi
-state. Self-hosted deployments configure that same bucket-scoped `remote_content.s3`
-entry with secret references. Direct `gs://` remote artifact fetching is not added
-by this example; the existing GCS source connector uses the JSON API separately.
+Native artifact reads use `gs://BUCKET/objects/sha256/...?generation=GENERATION`
+through an existing `connections` entry with protocol `gcs`, capability
+`content.fetch`, an exact bucket allowlist and prefix `objects/sha256`.
+Set `GCS_SOURCE_CONNECTION` to that runtime connection name. In Cloud, configure
+the existing instance GCS provider connection with Google Workload Identity,
+read-only access, the bucket and prefix; Colony seals this selector and publishes
+the scoped runtime connection. Grant only the instance's Kubernetes Workload
+Identity principal `roles/storage.objectViewer` on the originals bucket.
+Self-hosting uses the same canonical connection with ADC or a keystore-backed
+Google credential source. A bare `gs://` URL never enables ambient access.
+No HMAC keys or organization-policy exceptions are required.
+
+This native artifact transport is new in this PR and requires the next published
+Antfly release containing it; rc.6 has GCS external-I/O support but does not route
+artifact downloads through it. Keep the corpus private and staged until the
+released runtime passes generation, scope and real-PDF OCR qualification.
 
 `load` defaults to full text only and resumes durable batches against the exact
 manifest, endpoint, table identity, and extraction configuration. Reuse the same

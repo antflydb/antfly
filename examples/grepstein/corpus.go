@@ -426,8 +426,9 @@ func printCorpusJSON(value any) error {
 }
 
 type corpusIndexOptions struct {
-	Embedder        map[string]any
-	InferenceSecret string
+	Embedder         map[string]any
+	InferenceSecret  string
+	SourceConnection string
 }
 
 func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string, graph, semantic bool, overrides ...corpusIndexOptions) (map[string]any, error) {
@@ -484,6 +485,9 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 		"source": map[string]any{"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"},
 		"ocr":    ocr,
 	}}
+	if options.SourceConnection != "" {
+		producer["config"].(map[string]any)["credentials"] = options.SourceConnection
+	}
 	producerJSON, err := json.Marshal(producer)
 	if err != nil {
 		return nil, err
@@ -633,6 +637,7 @@ func corpusLoadCmd(args []string) error {
 	graph := flags.Bool("graph", false, "Create relation graph; run corpus graph after extraction (requires extractor inference)")
 	inference := flags.String("inference-url", "", "Server-reachable Antfly inference URL for OCR, embeddings and relation extraction")
 	inferenceSecret := flags.String("inference-secret", "", "Server keystore key name for the selected inference endpoint (never a credential value)")
+	sourceConnection := flags.String("source-connection", "", "Existing content.fetch external-I/O connection name for remote source reads")
 	model := flags.String("embedding-model", DefaultEmbeddingModel, fmt.Sprintf("Embedding model (%d dimensions; use embedder-config for another dimension)", DefaultEmbeddingDims))
 	embedderPath := flags.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
@@ -672,7 +677,7 @@ func corpusLoadCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, corpusIndexOptions{Embedder: embedder, InferenceSecret: *inferenceSecret})
+	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, corpusIndexOptions{Embedder: embedder, InferenceSecret: *inferenceSecret, SourceConnection: *sourceConnection})
 	if err != nil {
 		return err
 	}

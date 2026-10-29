@@ -222,10 +222,12 @@ func publishLocator(client *http.Client, store *corpusStore, bucket string, loc 
 	if err != nil {
 		return "", "", err
 	}
-	// GCS's XML/S3 endpoint is an existing Antfly remote-content transport.
-	// Hash-addressed keys + create-only writes prevent an unpinned latest read
-	// from changing underneath extraction. The GCS generation remains evidence.
-	return "s3://" + bucket + "/" + key, digest + ":" + object.Generation, nil
+	// Pin the exact generation as well as the content-addressed name. Native
+	// fetching uses the instance's scoped GCS connection and Workload Identity.
+	if !validGCSGeneration(object.Generation) {
+		return "", "", fmt.Errorf("GCS returned an invalid generation")
+	}
+	return "gs://" + bucket + "/" + key + "?generation=" + object.Generation, digest + ":" + object.Generation, nil
 }
 
 type gcsObject struct {
@@ -236,6 +238,18 @@ type gcsObject struct {
 
 func putGCS(client *http.Client, bucket, key, mime string, source io.Reader, size int64, md5sum string) (gcsObject, error) {
 	var object gcsObject
+	metadataURL := "https://storage.googleapis.com/storage/v1/b/" + url.PathEscape(bucket) + "/o/" + url.PathEscape(key)
+	// Resume without retransmitting existing immutable objects. A matching name
+	// alone is insufficient: verify generation, size and checksum on every reuse.
+	existing, err := client.Get(metadataURL)
+	if err != nil {
+		return object, err
+	}
+	if existing.StatusCode != http.StatusNotFound {
+		defer existing.Body.Close()
+		return checkedGCSObject(existing, size, md5sum)
+	}
+	existing.Body.Close()
 	endpoint := "https://storage.googleapis.com/upload/storage/v1/b/" + url.PathEscape(bucket) + "/o?uploadType=media&ifGenerationMatch=0&name=" + url.QueryEscape(key)
 	req, err := http.NewRequest("POST", endpoint, source)
 	if err != nil {
@@ -249,19 +263,24 @@ func putGCS(client *http.Client, bucket, key, mime string, source io.Reader, siz
 	}
 	if resp.StatusCode == http.StatusPreconditionFailed {
 		resp.Body.Close()
-		resp, err = client.Get("https://storage.googleapis.com/storage/v1/b/" + url.PathEscape(bucket) + "/o/" + url.PathEscape(key))
+		resp, err = client.Get(metadataURL)
 		if err != nil {
 			return object, err
 		}
 	}
 	defer resp.Body.Close()
+	return checkedGCSObject(resp, size, md5sum)
+}
+
+func checkedGCSObject(resp *http.Response, size int64, md5sum string) (gcsObject, error) {
+	var object gcsObject
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return object, fmt.Errorf("GCS HTTP %d", resp.StatusCode)
 	}
-	if err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&object); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&object); err != nil {
 		return object, err
 	}
-	if object.Generation == "" || object.Size != strconv.FormatInt(size, 10) || object.MD5 != md5sum {
+	if !validGCSGeneration(object.Generation) || object.Size != strconv.FormatInt(size, 10) || object.MD5 != md5sum {
 		return object, fmt.Errorf("GCS object integrity mismatch")
 	}
 	return object, nil

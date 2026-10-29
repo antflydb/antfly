@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -149,6 +150,9 @@ func TestGCSCreateOnlyRetriesVerifyExistingObject(t *testing.T) {
 		if r.URL.Host != "storage.googleapis.com" {
 			t.Fatal("credential destination changed")
 		}
+		if requests == 1 {
+			return response(404, ""), nil
+		}
 		if r.Method == "POST" {
 			if r.URL.Query().Get("ifGenerationMatch") != "0" {
 				t.Fatal("upload may overwrite originals")
@@ -162,7 +166,7 @@ func TestGCSCreateOnlyRetriesVerifyExistingObject(t *testing.T) {
 		return response(200, fmt.Sprintf(`{"generation":"42","size":%q,"md5Hash":%q}`, fmt.Sprint(len(data)), checksum)), nil
 	})}
 	object, err := putGCS(client, "private-bucket", "objects/key.txt", "text/plain", bytes.NewReader(data), int64(len(data)), sum)
-	if err != nil || object.Generation != "42" || requests != 2 {
+	if err != nil || object.Generation != "42" || requests != 3 {
 		t.Fatalf("retry: %v %v", object, err)
 	}
 	bad = true
@@ -180,6 +184,12 @@ func TestCloudProjectionPublishesTextAndUsesExistingSourceJobs(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "page.json"), data, 0600)
 	uploaded := 0
 	client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.Method == "GET" {
+			if !strings.HasPrefix(r.URL.Path, "/storage/v1/b/derived/o/grep/v1/revision/doj-01-a/") {
+				t.Fatal("unscoped metadata lookup")
+			}
+			return response(404, ""), nil
+		}
 		uploaded++
 		if r.Method != "POST" || !strings.HasPrefix(r.URL.Query().Get("name"), "grep/v1/revision/doj-01-a/") {
 			t.Fatal("unscoped projection")
@@ -372,7 +382,7 @@ func TestStoredSnapshotCannotBeReusedAfterCorruption(t *testing.T) {
 
 func TestOriginalPDFProxyConservesRangeAndCredentialBoundaries(t *testing.T) {
 	t.Setenv("ANTFLY_API_KEY", "read-key")
-	source := "s3://private-originals/objects/sha256/" + strings.Repeat("a", 64) + ".pdf#page=3"
+	source := "gs://private-originals/objects/sha256/" + strings.Repeat("a", 64) + ".pdf?generation=123#page=3"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer read-key" {
 			t.Error("missing Antfly authentication")
@@ -383,7 +393,7 @@ func TestOriginalPDFProxyConservesRangeAndCredentialBoundaries(t *testing.T) {
 	reads := 0
 	storage := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
 		reads++
-		if r.URL.Host != "storage.googleapis.com" || r.Header.Get("Authorization") != "" || r.Header.Get("Range") != "bytes=0-4" {
+		if r.URL.Host != "storage.googleapis.com" || r.Header.Get("Authorization") != "" || r.Header.Get("Range") != "bytes=0-4" || r.URL.Query().Get("generation") != "123" {
 			t.Fatal("PDF credential or range boundary changed")
 		}
 		result := response(206, "%PDF-")
@@ -468,5 +478,50 @@ func TestVertexOCRProfilePinsModelAndCompatibleLocation(t *testing.T) {
 	reader := producer.Config.OCR.Config
 	if reader.Model != "gemini-3.8-flash" || reader.Location != "global" || reader.MaxTokens != 32768 {
 		t.Fatalf("OCR profile must persist its model, location and output budget: %+v", reader)
+	}
+}
+
+func TestNativeOriginalLocatorsRequireAnExactGenerationAndBucket(t *testing.T) {
+	base := "gs://private-originals/objects/sha256/" + strings.Repeat("a", 64) + ".pdf"
+	for _, suffix := range []string{"", "?generation=", "?generation=0", "?generation=01", "?generation=18446744073709551616", "?generation=1&generation=2", "?generation=1&token=secret", "?generation=%31", "?generation=+1"} {
+		u, err := url.Parse(base + suffix)
+		if err == nil && validOriginalLocator(u, "private-originals") {
+			t.Fatalf("unsafe locator accepted: %s", suffix)
+		}
+	}
+	u, _ := url.Parse(base + "?generation=1793305553268935#page=42")
+	if !validOriginalLocator(u, "private-originals") || validOriginalLocator(u, "other-bucket") {
+		t.Fatal("generation or bucket boundary lost")
+	}
+}
+
+func TestSourceConnectionIsNativeProducerConfiguration(t *testing.T) {
+	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "", "", false, false, corpusIndexOptions{SourceConnection: "cloud-gcs-originals"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enrichments := indexes[corpusTextIndex].(map[string]any)["enrichments"].([]any)
+	raw := enrichments[0].(map[string]any)["producer_json"].(string)
+	var producer map[string]any
+	if err := json.Unmarshal([]byte(raw), &producer); err != nil {
+		t.Fatal(err)
+	}
+	if producer["config"].(map[string]any)["credentials"] != "cloud-gcs-originals" {
+		t.Fatal("source connection not passed to native extraction")
+	}
+}
+
+func TestGCSPublicationResumeVerifiesWithoutRetransmission(t *testing.T) {
+	client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.Method != "GET" {
+			t.Fatal("existing verified object was retransmitted")
+		}
+		return response(200, `{"generation":"42","size":"4","md5Hash":"expected"}`), nil
+	})}
+	if _, err := putGCS(client, "bucket", "objects/hash.pdf", "application/pdf", nil, 4, "expected"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := putGCS(client, "bucket", "objects/hash.pdf", "application/pdf", nil, 5, "expected"); err == nil {
+		t.Fatal("reused object with different size")
 	}
 }
