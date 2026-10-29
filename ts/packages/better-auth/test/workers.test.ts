@@ -200,6 +200,81 @@ describe("Workers structured Antfly auth adapter", () => {
     ).rejects.toThrow();
     expect(await f.auth.api.getSession({ headers: headers(signin) })).toBeNull();
   });
+  it("matches SQL nullable exclusion semantics for reads and conditional writes", async () => {
+    const f = await fixture();
+    const db = workersAdapter(f.store)(f.options);
+    const now = new Date();
+    for (const [name, image] of [
+      ["null", null],
+      ["missing", undefined],
+      ["allowed", "allowed.png"],
+      ["blocked", "blocked.png"],
+    ] as const) {
+      await db.create({
+        model: "user",
+        data: {
+          name,
+          email: `${name}@example.test`,
+          emailVerified: false,
+          createdAt: now,
+          updatedAt: now,
+          ...(image === undefined ? {} : { image }),
+        },
+      });
+    }
+    const names = async (
+      operator: "eq" | "ne" | "in" | "not_in",
+      value: string | string[] | null
+    ) =>
+      (
+        await db.findMany<{ name: string }>({
+          model: "user",
+          where: [{ field: "image", operator, value }],
+        })
+      )
+        .map((row) => row.name)
+        .sort();
+    expect(await names("eq", null)).toEqual(["missing", "null"]);
+    expect(await names("ne", null)).toEqual(["allowed", "blocked"]);
+    expect(await names("ne", "blocked.png")).toEqual(["allowed"]);
+    expect(await names("not_in", ["blocked.png"])).toEqual(["allowed"]);
+    expect(await names("in", [])).toEqual([]);
+    expect(await names("not_in", [])).toEqual(["allowed", "blocked", "missing", "null"]);
+    const rows = new WorkersAuthRows(f.options);
+    for (const [operator, expected] of [
+      ["in", ["allowed"]],
+      ["not_in", []],
+    ] as const) {
+      const found = await f.store.transaction((tx) =>
+        rows.find(tx, "user", [
+          {
+            field: "image",
+            operator,
+            value: ["allowed.png", null],
+            connector: "AND",
+            mode: "sensitive",
+          },
+        ])
+      );
+      expect(found.map((row) => row.name).sort()).toEqual(expected);
+    }
+    expect(
+      await db.updateMany({
+        model: "user",
+        where: [{ field: "image", operator: "ne", value: "blocked.png" }],
+        update: { name: "changed" },
+      })
+    ).toBe(1);
+    expect(await names("eq", null)).toEqual(["missing", "null"]);
+    expect(
+      await db.deleteMany({
+        model: "user",
+        where: [{ field: "image", operator: "not_in", value: ["blocked.png"] }],
+      })
+    ).toBe(1);
+    expect(await db.count({ model: "user" })).toBe(3);
+    expect(await names("eq", null)).toEqual(["missing", "null"]);
+  });
   it("fails closed on schema changes, missing schema and unknown commit outcomes", async () => {
     const f = await fixture(),
       db = workersAdapter(f.store)(f.options);

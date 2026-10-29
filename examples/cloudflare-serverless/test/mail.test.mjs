@@ -265,3 +265,44 @@ test("mail responses forward separate renewal and clearing cookies without expos
   assert.equal(signedOut.status, 401);
   assert.deepEqual(signedOut.headers.getSetCookie(), [cookies[1]]);
 });
+
+test("recovery sweeps visit healthy mailboxes after actor or queue failures and retry durable intent", async () => {
+  for (const failure of ["actor", "queue"]) {
+    const broken = crypto.randomUUID(), healthy = crypto.randomUUID();
+    const inbound = crypto.randomUUID(), outbound = crypto.randomUUID();
+    const visited = [], hints = [];
+    let failing = true;
+    const env = {
+      AUTH_SERVICE: { mailboxes: async () => [broken, healthy] },
+      MAILBOXES: { getByName: (mailbox) => ({ pending: async () => {
+        visited.push(mailbox);
+        if (failing && mailbox === broken && failure === "actor")
+          throw Error("CoordinatorRecovering");
+        return { inbound: [inbound], outbound: [outbound], publish: true };
+      } }) },
+      MAIL_QUEUE: { send: async (value) => {
+        if (failing && value.mailbox === broken && failure === "queue")
+          throw Error("QueueUnavailable");
+        hints.push(value);
+      } },
+    };
+    await assert.rejects(worker.scheduled(null, env), (error) =>
+      error instanceof AggregateError && error.message === "MailboxRecoveryFailed" &&
+      error.errors.length === 1
+    );
+    assert.deepEqual(visited, [broken, healthy]);
+    assert.deepEqual(hints, [
+      { mailbox: healthy, kind: "ingest", id: inbound },
+      { mailbox: healthy, kind: "send", id: outbound },
+      { mailbox: healthy, kind: "publish" },
+    ]);
+    failing = false;
+    hints.length = 0;
+    await worker.scheduled(null, env);
+    assert.deepEqual(hints.filter((hint) => hint.mailbox === broken), [
+      { mailbox: broken, kind: "ingest", id: inbound },
+      { mailbox: broken, kind: "send", id: outbound },
+      { mailbox: broken, kind: "publish" },
+    ]);
+  }
+});

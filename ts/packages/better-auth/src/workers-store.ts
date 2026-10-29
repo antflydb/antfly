@@ -139,13 +139,20 @@ function match(row: Row, where: Where[] = []): boolean {
         yes = a === b;
         break;
       case "ne":
-        yes = a !== b;
+        // Explicit null comparisons are IS [NOT] NULL; comparisons with a
+        // non-null value exclude NULL, matching the SQL adapter.
+        yes = b === null ? a !== null : a !== null && a !== b;
         break;
       case "in":
       case "not_in":
         if (!Array.isArray(b)) throw Error("Invalid membership");
-        yes = b.includes(a);
-        if (w.operator === "not_in") yes = !yes;
+        // Empty membership matches the SQL adapter's constant FALSE/TRUE.
+        // Otherwise NULL never matches IN, and a NULL member prevents NOT IN
+        // from being true for any nonmatching value.
+        yes =
+          w.operator === "in"
+            ? a !== null && b.includes(a)
+            : b.length === 0 || (a !== null && !b.includes(null) && !b.includes(a));
         break;
       case "contains":
         yes = typeof a === "string" && a.includes(String(b));

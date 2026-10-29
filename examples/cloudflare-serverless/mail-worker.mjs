@@ -196,11 +196,20 @@ export default {
     }
   },
   async scheduled(_controller, env) {
+    const failures = [];
     for (const mailbox of await env.AUTH_SERVICE.mailboxes()) {
-      const pending = await actor(env, mailbox).pending(mailbox);
-      for (const id of pending.inbound) await hint(env, mailbox, "ingest", id);
-      for (const id of pending.outbound) await hint(env, mailbox, "send", id);
-      if (pending.publish) await hint(env, mailbox, "publish");
+      try {
+        const pending = await actor(env, mailbox).pending(mailbox);
+        for (const id of pending.inbound) await hint(env, mailbox, "ingest", id);
+        for (const id of pending.outbound) await hint(env, mailbox, "send", id);
+        if (pending.publish) await hint(env, mailbox, "publish");
+      } catch (error) {
+        failures.push(error);
+      }
     }
+    // Visit the entire page before reporting failures. Durable pending intents
+    // remain available for later sweeps; one unavailable actor cannot starve its
+    // healthy neighbors, and operators still see an unsuccessful invocation.
+    if (failures.length) throw new AggregateError(failures, "MailboxRecoveryFailed");
   },
 };
