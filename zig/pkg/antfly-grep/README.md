@@ -5032,3 +5032,16 @@ CPU/latency gains vary by case, with increases retained in the report. These are
 warm synthetic whole-server comparisons against an older main revision on one
 shared host. They do not establish universal or zero-cost behavior. Document
 format and canonical ABI remain unchanged.
+
+
+The [query-read follow-up](../../../docs/design/antfly-grep.md#measured-query-read-optimizations-after-1263)
+qualifies required-ID owner routing and projection preparation against the merge
+of #1263. Five alternating 50-read trials on a shared M4 Max reduce eight-shard
+clustered-ID read CPU about 79–85% and spread-ID read CPU about 41–49%, with equal
+values, scores and counts. Initial short-run latency and other controls vary;
+these are warm synthetic measurements, not universal guarantees. Canonical
+fingerprinting avoids a payload-sized allocation using a fixed 4 KiB buffer.
+Range-batch admission and direct parent media allocation experiments were left
+out after their CPU/memory gains failed to hold consistently. The design includes
+both experimental sets, final controls, hashes and reproduction commands. Raw
+JSON reports/logs stay ignored. Public query syntax and ASCH25 remain unchanged.

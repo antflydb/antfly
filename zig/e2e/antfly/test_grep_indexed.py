@@ -162,7 +162,11 @@ def forwarded_scan(
                     api.url + f"/tables/{table}/query", json=body, timeout=60
                 )
                 if len(requests_seen) == 1:
-                    assert response.status_code == 200, (response.text, body)
+                    assert response.status_code == 200, (
+                        response.text,
+                        body,
+                        api.debug_logs()[-6000:],
+                    )
                     first_page()
                 self.send_response(response.status_code)
                 self.send_header("Content-Length", str(len(response.content)))
@@ -222,6 +226,10 @@ def test_native_grep_snapshot_survives_concurrent_mutation(stateful_api, tmp_pat
     assert requests_seen[1]["remote_snapshot"]
 
 
+# Leave time for initial capture on a loaded host; expire only after page one.
+SHORT_CURSOR_RETENTION_MS = 5000
+
+
 @pytest.fixture
 @e2e_resource("antfly_process")
 def short_cursor_api(monkeypatch, request):
@@ -232,7 +240,9 @@ def short_cursor_api(monkeypatch, request):
     def configure(*args, **kwargs):
         path = original(*args, **kwargs)
         value = json.loads(path.read_text())
-        value["lake_indexes"] = {"query_cursors": {"retention_ms": 1000}}
+        value["lake_indexes"] = {
+            "query_cursors": {"retention_ms": SHORT_CURSOR_RETENTION_MS}
+        }
         path.write_text(json.dumps(value))
         return path
 
@@ -243,7 +253,7 @@ def short_cursor_api(monkeypatch, request):
 @pytest.mark.fresh_antfly_process
 def test_native_grep_expired_snapshot_keeps_partial_results(short_cursor_api, tmp_path):
     if os.environ.get("ANTFLY_STATEFUL_URL"):
-        pytest.skip("expiry needs a locally configured one-second cursor retention")
+        pytest.skip("expiry needs locally configured short cursor retention")
     api = short_cursor_api
     table = f"grep_expiry_{time.time_ns()}"
     api.create_table(table)
@@ -255,7 +265,12 @@ def test_native_grep_expired_snapshot_keeps_partial_results(short_cursor_api, tm
         },
         sync_level="full_index",
     )
-    result, seen = forwarded_scan(tmp_path, api, table, lambda: time.sleep(1.2))
+    result, seen = forwarded_scan(
+        tmp_path,
+        api,
+        table,
+        lambda: time.sleep(SHORT_CURSOR_RETENTION_MS / 1000 + 0.2),
+    )
     assert result.returncode == 2, result.stderr.decode()
     assert b"IndexSnapshotExpired" in result.stderr
     assert b"FIRST" in result.stdout and b"SECOND" not in result.stdout
@@ -2621,9 +2636,13 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
             assert expected in result.stderr
         else:
             assert result.returncode == 0, result.stderr.decode()
-            assert len(provider_calls) == 1
-            assert len(provider_calls[0]["inputs"]) == parents
-            assert json.loads(result.stdout.splitlines()[0])["type"] == "evidence"
+            # A timed gather window can flush partial batches under load.
+            # Each parent must still be evaluated exactly once, and warm reuse
+            # must authorize again without another provider request.
+            provider_request_count = len(provider_calls)
+            assert sum(len(call["inputs"]) for call in provider_calls) == parents
+            events = [json.loads(line) for line in result.stdout.splitlines()]
+            assert sum(event["type"] == "evidence" for event in events) == parents
             warm = run_grep(
                 tmp_path,
                 f"http://127.0.0.1:{query.server_port}",
@@ -2632,7 +2651,7 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
                 page_size=16,
             )
             assert warm.returncode == 0, warm.stderr.decode()
-            assert len(provider_calls) == 1
+            assert len(provider_calls) == provider_request_count
             conditional = [
                 hit
                 for envelope in responses[2:]

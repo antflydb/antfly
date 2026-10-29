@@ -1613,3 +1613,184 @@ catalog passed. The merged native query/provider/gateway run passed all 76 build
 steps, including 208 query contracts, 31 provider cases and 67 gateway cases with
 no failures or leaks. The numerical tables above continue to identify the actual
 measured `0826126861ed` runtime; they are not measurements of this newer merge.
+
+### Measured query-read optimizations after #1263
+
+The follow-up keeps the public `fields` / `select` / `params` contract and ASCH25
+format. It narrows physical routing and reduces projection preparation work;
+it adds no persisted index or authorization cache.
+
+For point-shaped filtered queries, a mandatory positive document-ID clause can
+prove that only some owners can contribute. The router captures its catalog
+snapshot first; single-owner tables skip the proof. It follows conjunctions and
+required Boolean arms. Optional, negative and disjunctive arms cannot alone
+justify pruning. At most 256 IDs are used; each is nonempty, at most 4 KiB and
+contains no NUL. Other shapes use ordinary routing. Original predicates and scoring inputs reach selected
+owners unchanged. Retained pagination covers and ranked, graph and aggregate
+shapes retain their existing routing. A mismatched topology/catalog fence causes
+retry, rather than combining snapshots. The proof stays local to this routing
+call; it does not add request hint fields or rewrite logical membership.
+
+Projection preparation owns one encoded extent. Transport decoding parses it
+once, validates the request and streams the canonical fingerprint through a
+fixed 4 KiB stack buffer. The parsed-number canonical form and exact encoded-input
+ownership witness remain unchanged. The returned transport still has independent
+ownership. A buffer is necessary: streaming every short JSON write directly to
+SHA-256 avoided allocation but made the small-plan hash phase slower.
+
+The isolated ReleaseFast benchmark alternates an allocating reference, an
+unbuffered streaming control and buffered streaming for five trials, 128 hashes
+per trial. All modes require identical SHA-256 values and balanced tracked
+allocations. With 64 source-field entries, median reference → buffered encoding
+and hash time is 1.403 → 1.315 µs for a 64-byte parameter and 205.767 → 200.219 µs
+for a 256 KiB parameter. Allocator byte volume is 2,844 → 0 and 398,156 → 0. The
+unbuffered small-plan control is 3.385 µs. This measures the encoding/hash phase,
+not parsing, full plan/query latency, stack memory or process RSS.
+
+Reproduce from `zig/` with pinned Zig 0.17.0:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig run -O ReleaseFast \
+  tools/bench_projection_fingerprint.zig
+```
+
+The final runtime candidate is `e1a0289e9aaa102135bce29e284e4b89456a4704` and the baseline is
+`f2b7b76d57d2b51bf78171dcef3e8c0ccc582ffa`, the merge of #1263. Both use
+`-Doptimize=ReleaseFast -Dstrip=true -j2` and Zig 0.17.0 on the same M4 Max host
+(macOS 27.0.1, 14 cores). Raw per-run data, source/binary/driver hashes and host
+metadata remain ignored under `output/projection-followup/`. No raw JSON reports
+or logs are added to the repository. Historical tables above use different
+revisions and build settings; they are separate evidence.
+
+
+Final paired runs use the exact reduced candidate, with output values, scores and
+counts checked for equality. Each set has five alternating trials. Initial sets
+use five reads per phase; the longer routing repeats use 50. The table includes
+both sets: latency was inconsistent in the initial short runs, including slower
+clustered-ID reads despite lower CPU. The longer runs improve routing CPU in all
+five paired rounds for both layouts. This establishes a warm-workload resource
+saving, rather than a guarantee for every query or host.
+
+| Reads/phase | Eight-shard workload | Elapsed ms, baseline → candidate | Server CPU ms | Sampled RSS MiB |
+|---|---|---:|---:|---:|
+| 5 | clustered IDs, full | 1.939 → 2.675 | 2.707 → 1.384 | 189.219 → 165.797 |
+| 5 | clustered IDs, conditional | 1.978 → 2.457 | 2.970 → 1.429 | 189.422 → 165.875 |
+| 5 | spread IDs, full | 8.400 → 8.949 | 6.033 → 4.199 | 229.266 → 205.906 |
+| 5 | spread IDs, conditional | 12.784 → 9.379 | 10.998 → 6.314 | 234.078 → 207.406 |
+| 50 | clustered IDs, full | 2.363 → 1.188 | 3.056 → 0.626 | 189.812 → 166.500 |
+| 50 | clustered IDs, conditional | 2.610 → 1.283 | 3.430 → 0.701 | 190.266 → 166.234 |
+| 50 | spread IDs, full | 2.555 → 2.067 | 4.287 → 2.367 | 221.078 → 198.234 |
+| 50 | spread IDs, conditional | 3.788 → 2.900 | 7.266 → 3.745 | 214.836 → 199.484 |
+
+The longer ordinary-read clustered case is 2.255 → 0.339 ms CPU (85.0% less);
+the spread ordinary case is 3.437 → 2.018 ms (41.3% less). Clustered conditional
+reads use 79.6% less CPU; spread conditional reads use 48.5% less. These gains
+come from fewer owner executions. They do not make matching, authorization,
+snapshot capture, transport or output free.
+
+Controls retain the actual costs around the optimized paths. CPU percentages
+below are observations from the initial five-read final matrix; positive means
+more candidate CPU. Ingestion and metadata-write controls vary substantially
+although this patch changes read routing/preparation. Payload-dominated and
+single-owner paths do not show a universal speedup. In particular, the 1 MiB
+conditional case adds 0.712 ms CPU, and the small64 ordinary case adds 0.068 ms.
+No tolerance threshold turns those observations into wins.
+
+| Workload | Full computed CPU ms | Conditional CPU ms | Ordinary CPU change | Ingest CPU change | Metadata-write CPU change |
+|---|---:|---:|---:|---:|---:|
+| 8 × 256 KiB ASCII | 5.923 → 5.745 | 1.034 → 1.016 | +0.1% | -1.6% | -5.6% |
+| 8 × 1 MiB ASCII | 23.226 → 23.141 | 1.724 → 2.436 | -2.1% | +24.2% | -4.7% |
+| tiny values, 64 outputs | 2.189 → 1.664 | 2.094 → 1.758 | +4.8% | -6.7% | -6.1% |
+| escaped values | 15.900 → 16.120 | 0.939 → 0.932 | -6.1% | -5.3% | -3.0% |
+| one shard, residual | 1.319 → 0.577 | 1.030 → 0.665 | +1.7% | -25.9% | -5.4% |
+| eight shards, clustered IDs | 2.707 → 1.384 | 2.970 → 1.429 | -65.9% | -11.4% | +23.5% |
+| eight shards, spread IDs | 6.033 → 4.199 | 10.998 → 6.314 | -34.6% | -29.2% | -0.5% |
+
+The identity-only 64-document controls keep payload bytes out of the response.
+The 1 MiB case is 4.623 → 4.088 ms CPU and 5.577 → 4.918 ms elapsed, with sampled
+RSS 430.3 → 443.7 MiB; the 16 KiB control is 2.025 → 1.989 ms CPU. The final
+candidate does not contain the experimental range-based batch admission, so
+these observations cannot qualify that rejected optimization. Alias-control CPU
+changes range from −16.5% to +0.3%, with most cases near parity; large payload
+formatting still dominates preparation cost.
+
+Model-free media controls retain the original allocation ownership. Every
+request reaches `ModelRequired` after verification, with no provider execution.
+The final candidate has no repeatable large-media improvement to claim.
+
+| Media workload | Elapsed ms | Server CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| tiny_shared_duplicates | 0.783 → 0.960 | 1.221 → 1.386 | 154.125 → 154.234 |
+| medium_shared_duplicates | 1.578 → 1.731 | 1.995 → 1.385 | 157.703 → 158.328 |
+| large_shared_duplicates | 11.081 → 11.028 | 10.576 → 10.679 | 189.531 → 188.516 |
+| large_distinct_unique | 5.790 → 6.069 | 13.561 → 14.047 | 216.516 → 216.719 |
+| large_distinct_unique_eight | 10.049 → 10.368 | 26.162 → 26.089 | 253.234 → 254.797 |
+| large_512_distinct_unique_eight | 47.837 → 48.103 | 87.422 → 87.683 | 416.844 → 416.297 |
+
+The reduced runtime passes all 91 debug native build steps (including 210 query
+contracts, logical-field, catalog, provider and gateway suites) and all 71
+ReleaseFast build steps. HTTP validation passes 57 cases; seven optional profile
+cases are skipped. The one-second expiry fixture was fragile before first-page
+capture on a loaded host; it now allows five seconds, then deliberately waits
+past that lease before page two. Timed decision coalescing may produce partial
+batches, so the visual test checks exact input/evidence totals and no additional
+warm provider requests, rather than assuming one call within a 20 ms window.
+Both initially failing cases passed independently before these fixture changes;
+the corrected full suite also passes. Product source/binary hashes are unchanged
+by the fixture fixes. Boundary, storage-control, formatting and Python lint checks
+pass. Raw reports and logs remain untracked.
+
+Build the pinned baseline and candidate in their own worktrees with the recorded
+compiler/flags, then reproduce from the candidate repository root:
+
+```sh
+mkdir -p output/projection-followup
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_source_projection.py \
+  /path/to/candidate/antfly --baseline /path/to/baseline/antfly \
+  --workload small --shards 8 --residual-filter --documents 8 \
+  --rounds 5 --queries-per-phase 50 --metadata-updates 2 \
+  --output output/projection-followup/routing.json
+# Repeat with --id-layout spread --documents 64.
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_projection_batches.py \
+  /path/to/candidate/antfly --baseline /path/to/baseline/antfly \
+  --documents 64 --value-bytes 1048576 --rounds 5 --queries-per-phase 5 \
+  --output output/projection-followup/batches.json
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_media_materialization.py \
+  /path/to/candidate/antfly --baseline /path/to/baseline/antfly \
+  --workload large_512_distinct_unique_eight --rounds 5 --queries-per-phase 5 \
+  --output output/projection-followup/media.json
+```
+
+The final candidate executable SHA-256 is
+`bf32f93d94e6d47fa3bcadd5274299ebbcf9b40a3fa16d07fc74fbe68208ecb7`;
+the baseline is `226502864fa6b790b5c0938d8cdedfa8e8d49cee765ea1b7dd2b0ac6d0ce1469`.
+
+Two additional experiments were measured and left out of the final implementation:
+
+- Admitting source batches by selected range/reconstruction bytes instead of whole
+  source bytes reduced CPU 17.2% in the initial 64-document, 1 MiB-payload run.
+  The repeat was 2.0% slower. That is insufficient evidence for the extra default
+  batching/selection machinery. The reproduction driver keeps identity-only
+  warmup and score/count/value equality checks for future work.
+- Allocating concurrent media payloads directly in the parent request arena saved
+  a copy, but changed allocator ownership/lifetimes. For eight distinct 512×512
+  images, initial median CPU was 90.68 → 86.93 ms and sampled RSS 323.6 → 414.1 MiB.
+  The repeat was 159.23 → 141.35 ms and 311.5 → 399.3 MiB. Four-image and shared-mask
+  controls also varied. That memory tradeoff does not justify the change as a
+  default; the existing child-scratch/completion-copy ownership remains.
+
+These experimental runs used `1540395365e5218d1c7cde656b354195d5cbb28e`, not the
+final reduced candidate. Initial and repeat reports are retained separately.
+Host load changed substantially between sets, so absolute times across sets
+must not be combined. Five alternating rounds with five reads each compare
+paired binaries within each set. CPU is whole-process CPU including background
+work; RSS is sampled, not allocation volume or a hard peak bound. These tests
+measure warm synthetic storage and model-free materialization, not inference
+quality, provider billing, cold/distributed storage or cross-host guarantees.
+
+The source benchmark exposes shard count, clustered/spread IDs and a neutral
+residual predicate so routing cost is separate from predicate evaluation cost.
+Distributed row-profile logs may be incomplete at the coordinator; functional
+output, score and total-count equality is checked independently. The media driver
+can select workloads, including eight 512×512 images, and stops at `ModelRequired`
+after source authorization, revision, digest, MIME, byte and pixel checks.
