@@ -493,7 +493,7 @@ pub fn litePhysicalIndexConfigJson(
 /// dense_vector/sparse_vector: `indexesJsonNeedsAssetProducer`/
 /// `indexesJsonHasGeneratedEnrichment` recursively scan the whole merged
 /// object for a nested `"kind":"asset","producer_json":...}` object (see
-/// examples/dogfood's knowledgeGraphIndexJSON, which declares the graph
+/// examples/antfly-docs-knowledge-base's knowledgeGraphIndexJSON, which declares the graph
 /// index's extractor exactly that way, under an "artifact" key inside the
 /// graph index's own config), so a graph/full_text/algebraic index must not
 /// be filtered out here even though `managed_embedder.zig`'s embedder

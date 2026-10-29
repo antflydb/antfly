@@ -23,7 +23,7 @@ import (
 )
 
 // TestIndexConfigsAreAccepted verifies that the three raw index JSON payloads
-// dogfood builds (full_text, chunk_vectors, knowledge) are accepted by
+// the example builds (full_text, chunk_vectors, knowledge) are accepted by
 // antfly_db_add_index_json against a real libantfly, without running any
 // inference. It does not exercise ingest or query.
 func TestIndexConfigsAreAccepted(t *testing.T) {
@@ -204,7 +204,8 @@ func TestEntityKeyCandidates(t *testing.T) {
 }
 
 // TestDocumentationCorpus verifies that the consolidated paths still ingest
-// living docs, proposed work, and historical evidence with distinct kinds.
+// guides, reference, living design docs, proposed work, and historical
+// evidence with distinct kinds.
 func TestDocumentationCorpus(t *testing.T) {
 	repo := t.TempDir()
 	fixtures := map[string]string{
@@ -214,6 +215,9 @@ func TestDocumentationCorpus(t *testing.T) {
 		"docs/operations/http-runtime/history/checkpoint.md": "work-log",
 		"docs/reference/licensing/history/validation.md":     "work-log",
 		"docs/plans/operator.md":                             "plan",
+		"docs/introduction.mdx":                              "guide",
+		"docs/guides/lite.mdx":                               "guide",
+		"docs/reference/ttl.md":                              "reference",
 	}
 	for path := range fixtures {
 		full := filepath.Join(repo, path)

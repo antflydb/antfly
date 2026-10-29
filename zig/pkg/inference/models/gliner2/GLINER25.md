@@ -128,7 +128,7 @@ follow from how these bounds were measured:
 - Bounds are schema-shape-specific. The schema's entity/relation vocabulary
   is encoded ahead of the document, so a narrower schema can produce a
   `padded_sequence_tokens` value below a row's floor and be refused even for a
-  "shorter" request. Rows were measured with `examples/dogfood`'s
+  "shorter" request. Rows were measured with `examples/antfly-docs-knowledge-base`'s
   11-entity/6-relation schema.
 - The single-window and long-document rows require disjoint features
   (`.single_window` vs `.long_document`), so neither can borrow the other's
@@ -136,7 +136,7 @@ follow from how these bounds were measured:
 - Geometry depends only on the tokenizer and schema, so `fp16_encoder` rows
   reuse the fp32 `LengthContract`s unchanged (re-measured byte-for-byte
   against the converted bundle).
-- The corpus floor (`document_bytes >= 1`) covers `examples/dogfood`'s
+- The corpus floor (`document_bytes >= 1`) covers `examples/antfly-docs-knowledge-base`'s
   smallest real section (`zig/SCHEMA.md`'s 20-byte "Related Docs" after link
   stripping) and a one-character document.
 
@@ -201,7 +201,7 @@ independent of document length.
   elements) are separate cumulative safety caps; a document inside the
   reviewed geometry can still fail closed with
   `error.LongDocumentWorkLimitExceeded`.
-- `examples/dogfood` requests `"long_document":{"mode":"window"}` for every
+- `examples/antfly-docs-knowledge-base` requests `"long_document":{"mode":"window"}` for every
   section; the wire default mode is `.reject`.
 
 ### Long-document geometry evidence
@@ -319,7 +319,7 @@ Single-process, one request in flight, real dogfood schema with windowing,
 on the 40-section corpus sample (32 sections of 1–8 KB, 8 of 20–40 KB):
 fp32 Metal ~2.7 sections/s, fp32 native ~0.49 sections/s. HTTP and
 in-process (`Node.extractDirect`) measure the same within noise; the lower
-rate seen during a full `examples/dogfood` ingest was attributed to
+rate seen during a full `examples/antfly-docs-knowledge-base` ingest was attributed to
 contention with concurrent embedding on the one Metal device and to the
 embedded worker's process hop, not to the extraction path. CPU direct-core latency versus pinned Fastino
 CPU is recorded in the [CPU benchmark runs](../../../../../docs/design/inference/history/gliner2/gliner25-cpu-benchmark-runs.md).
@@ -388,7 +388,7 @@ These are the exact digests compiled into `gliner_boundary_qualification.zig`'s
 
 #### Follow-up: fp16-encoder long-document qualification and corpus-shaped throughput
 
-Reviewed 2026-09-20. `examples/dogfood` requests `long_document.mode=window`
+Reviewed 2026-09-20. `examples/antfly-docs-knowledge-base` requests `long_document.mode=window`
 for every section and essentially every real section needs it, so the
 single-window fp16 row above cannot serve real traffic on its own. The
 long-document row for `fastino_gliner25_base_v1_fp16_encoder` (native and

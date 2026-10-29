@@ -20,7 +20,7 @@ import (
 	"fmt"
 )
 
-// Artifact and index names used throughout dogfood. Kept as constants so the
+// Artifact and index names used throughout this example. Kept as constants so the
 // ingest, query, entity, and status commands all agree on the same wiring.
 const (
 	// relationsArtifact is the generated extraction-relation asset stream that
@@ -34,10 +34,9 @@ const (
 	// yields doc --mentions--> entity provenance edges.
 	entityResolutionArtifact = "entities_resolution_v1"
 
-	// entitiesTable is the nominal home table for promoted canonical
-	// entities. Embedded Lite has no cross-table entity sink, so promotion
-	// stays pending (harmless; see promotionStageStats), but resolution --
-	// which is what edge canonicalization needs -- completes locally.
+	// entitiesTable is the table the resolver promotes canonical entity
+	// documents into. Both Lite and the server require it to exist before
+	// ingestion, so ingest creates it first.
 	entitiesTable = "entities"
 
 	// mentionEdgeType connects each ingested section to the canonical
@@ -48,7 +47,7 @@ const (
 	// zig/pkg/antfly/src/api/full_text_indexes.zig's
 	// default_full_text_index_name constant: current libantfly builds
 	// auto-provision full_text_index_v0 on Create, matching the full server;
-	// dogfood only adds it explicitly as a fallback for older builds.
+	// the example only adds it explicitly as a fallback for older builds.
 	fullTextIndexName   = "full_text_index_v0"
 	chunkVectorsIndex   = "chunk_vectors"
 	knowledgeGraphIndex = "knowledge"
@@ -58,7 +57,7 @@ const (
 )
 
 // entityLabels and relationLabels define the GLiNER2.5 extraction schema used
-// to build the knowledge graph over dogfood's own design docs and work log.
+// to build the knowledge graph over Antfly's own docs and work log.
 var (
 	entityLabels = []string{
 		"component", "subsystem", "file", "test", "invariant",
@@ -90,7 +89,7 @@ func addIndexEnvelope(name, kind string, config any) ([]byte, error) {
 	return out, nil
 }
 
-// schemaJSON returns the SetSchemaJSON body for dogfood's single document
+// schemaJSON returns the SetSchemaJSON body for this example's single document
 // type: one row per markdown section (design doc or work-log entry).
 func schemaJSON() []byte {
 	schema := map[string]any{
@@ -115,7 +114,7 @@ func schemaJSON() []byte {
 }
 
 // fullTextIndexJSON returns the smallest explicit default full-text index over
-// the section body. dogfood always checks IndexesJSON before adding this: the
+// the section body. the example always checks IndexesJSON before adding this: the
 // Lite C ABI does not auto-provision a default full-text index the way a
 // managed Antfly table does (confirmed against the "full_text_index_v0"
 // hosted-profile capi test in zig/pkg/antfly/src/capi/db.zig, which adds the

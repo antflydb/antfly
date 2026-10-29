@@ -1,4 +1,4 @@
-module github.com/antflydb/antfly/examples/dogfood
+module github.com/antflydb/antfly/examples/antfly-docs-knowledge-base
 
 go 1.26.0
 

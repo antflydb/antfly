@@ -10,9 +10,12 @@ Web application examples live in [`ts/examples`](../ts/examples/).
 
 | Example | Language | What it shows |
 |---|---|---|
-| [docsaf](docsaf/) | Go | Sync documents from local files, Git, S3, Google Drive, and the web; Antfly does extraction, chunking, and embedding |
+| [antfly-docs-knowledge-base](antfly-docs-knowledge-base/) | Go | Ingest Antfly's docs with docsaf into Lite or a server; chunking, embeddings, a GLiNER knowledge graph, hybrid search, graph traversal, and backups |
 | [postgres-sync](postgres-sync/) | Go | Real-time Postgres JSONB sync with LISTEN/NOTIFY and the Linear Merge API |
 | [pinecone-migration](pinecone-migration/) | Python | Move existing vectors from Pinecone into Antfly |
+
+To sync documents from Git, S3, Google Drive, or the web without writing code,
+use the [docsaf CLI](../go/pkg/docsaf/README.md).
 
 For change data capture without a daemon, see
 [Stream PostgreSQL into Antfly](../docs/guides/cdc-replication.mdx), which uses
@@ -26,21 +29,21 @@ logical replication managed by Antfly.
 | [grepstein](grepstein/) | Go | Public-records showcase: PDF reading and OCR, full-text, semantic, and graph enrichment, and grep over a GCS-backed corpus on Antfly Cloud |
 | [hackernews](hackernews/) | Python | Historical Hacker News search over GCS Parquet with Antfly index artifacts, including deployment tooling; qualification records are in [`docs/operations/hackernews/history`](../docs/operations/hackernews/history/) |
 
-## Embedded (Antfly Lite)
+## Embedded (Antfly Lite) and agent memory
 
 | Example | Language | What it shows |
 |---|---|---|
-| [antfly-lite-go](antfly-lite-go/) | Go | Open a `.aflite` database in-process, read and write documents, and export a portable `.afb` backup |
-| [antfly-lite-retrieval-go](antfly-lite-retrieval-go/) | Go | Local retrieval template: schema, full-text, dense, and hybrid search with caller-supplied embeddings |
-| [dogfood](dogfood/) | Go | Ingest Antfly's own docs into Lite and build a knowledge graph with GLiNER extraction |
-| [native-memory](native-memory/) | Python | The `/memory/v1` evidence and temporal policy over HTTP or the embedded SDK, with no model |
+| [antfly-docs-knowledge-base](antfly-docs-knowledge-base/) | Go | The same knowledge base on an embedded `.aflite` file, plus a model-free `smoke` command for the embedded API |
+| [native-memory](native-memory/) | README | The `/memory/v1` native memory API, and the Codex integration that builds on it |
 
-The Lite examples need `libantfly`: run `zig build capi` in `zig/` first.
+The Lite examples need `libantfly`: run `zig build capi` in `zig/` first. The
+[Lite guide](../docs/guides/lite.mdx) has a minimal Go program.
 
 ## Testing
 
 ```bash
-(cd examples/docsaf && GOWORK=off GOEXPERIMENT=simd go test ./...)
+# Requires libantfly (zig build capi)
+(cd examples/antfly-docs-knowledge-base && GOWORK=off GOEXPERIMENT=simd go test ./...)
 
 # Requires Postgres
 export POSTGRES_URL="postgresql://postgres:postgres@localhost:5432/postgres"
