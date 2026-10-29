@@ -154,6 +154,9 @@ their original output order. Different execution options start another
 physical group. Token and aggregate-work ceilings can split a group further.
 Resident Metal workspace admission uses the maximum physical `batch *
 padded_sequence_tokens` across those groups before execution starts.
+The per-model admission lock also prevents queued requests from reserving
+duplicate device scratch. Preprocessing runs before this lock, and waiting
+requests remain cancellable.
 
 `GLiNER production Metal distinct input batches` tests the public HTTP path
 with exact pinned checkpoints, distinct inputs and schemas, 2/4/8 items,
@@ -164,6 +167,16 @@ endpoint captures, and extended short/long profiles. Decide additionally
 exercises 9-, 17-, and 128-item requests using bounded physical groups.
 Boundary batch discovery remains conservative because windowed requests have
 an independent one-item contract.
+
+`GLiNER production Metal batch lifecycle` covers base, multilingual-v1 and
+DeBERTa Decide through real HTTP sockets. It requires two simultaneously
+admitted, tokenized batches before execution, cancels a queued batch with a
+TCP reset, and checks repeated retryable capacity denials followed by successful
+retries. Results must retain singleton parity and restore request leases.
+The pressure check fills the scratch admission ledger using a separate owner's
+reservation without allocating equivalent physical RAM. Run these checks with
+`-Doptimize=ReleaseFast` and compile-time filter
+`-Dtest-filter='GLiNER production Metal'`.
 
 ### Long-document execution
 

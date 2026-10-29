@@ -11348,13 +11348,13 @@ pub const Node = struct {
         } else 0;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
         const effective = control orelse InferenceExecutionControl{};
-        // A waiting CUDA boundary request cannot use the session workspace
+        // A waiting GPU boundary request cannot use the session workspace
         // yet. Admit its device ceiling only when it reaches the front of the
         // model queue; otherwise concurrent waiters reserve duplicate device
         // capacity and fail before the already-serialized execution can drain.
         // This is distinct from the execution/provider lock: admission may
         // evict other models and must remain outside those locks.
-        const admission_mutex = if (backend == .cuda) &loaded.gliner_boundary_admission_lock else null;
+        const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try effective.lock(mutex);
         defer if (admission_mutex) |mutex| mutex.unlock();
         while (true) {
@@ -11533,12 +11533,12 @@ pub const Node = struct {
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
 
-        // CUDA batches reserve their complete physical workspace only at the
+        // GPU batches reserve their complete physical workspace only at the
         // front of the model lane. Concurrent waiters retain bounded host state,
         // without each reserving another batch's otherwise serialized workspace.
-        const cuda_admission = if (backend == .cuda) &loaded.gliner_boundary_admission_lock else null;
-        if (cuda_admission) |mutex| try (control orelse InferenceExecutionControl{}).lock(mutex);
-        defer if (cuda_admission) |mutex| mutex.unlock();
+        const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
+        if (admission_mutex) |mutex| try (control orelse InferenceExecutionControl{}).lock(mutex);
+        defer if (admission_mutex) |mutex| mutex.unlock();
 
         // Metal work is admitted like the boundary route: a GPU run budget
         // and a process-wide backend-scratch lease, acquired before the
