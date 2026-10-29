@@ -28791,6 +28791,7 @@ pub const DB = struct {
         try self.startResolverReplayRuntimesIfConfigured();
         if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
         self.startArtifactRepairMetadataWorkerIfNeeded();
+        self.independent_maintenance.notify();
         return generation;
     }
 
