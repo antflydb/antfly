@@ -88,7 +88,7 @@ personalized PageRank (engine gap 2) -> `graph_metric_rerank` blend (shipped)
 ## Stage 1: LLM Triple Extraction
 
 Two `generator` asset enrichments, one per extraction pass, following the
-forced-tool-call pattern proven in `examples/epstein/main.go`
+forced-tool-call pattern proven in [`examples/epstein/main.go`](https://github.com/antflydb/antfly/blob/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein/main.go)
 (`tool_output: "arguments"`, pinned `tool_choice`, `additionalProperties:
 false`, enum-constrained relation types). Each emits one `extraction_graph`
 artifact; the graph index merges them via its ordered `sources` array (up to
@@ -255,7 +255,7 @@ One shape note from implementation: `source_artifact` is required and
 singular per resolver, so the events/catch-all pair above is declared per
 artifact in practice — a labeled `event` resolver plus a catch-all where an
 artifact carries both classes, each with its own `resolution_artifact` (see
-`examples/epstein/autoschema.go` for the working three-resolver layout over
+[`examples/epstein/autoschema.go`](https://github.com/antflydb/antfly/blob/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein/autoschema.go) for the working three-resolver layout over
 two artifacts). Everything downstream — durable edge artifacts, generation
 binding, visibility inheritance, replay, split/merge — is the existing
 autograph machinery, unchanged.
@@ -468,7 +468,7 @@ Missing for HippoRAG2/AutoSchemaKG-style retrieval:
 
 ## Phases
 
-1. **Prototype (config only).** Extend `examples/epstein` with the
+1. **Prototype (config only).** Extend the former [`examples/epstein`](https://github.com/antflydb/antfly/tree/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein) (now superseded by `examples/grepstein`) with the
    extraction tool schemas and an `events` resolver; port and evaluate the
    reference prompts against local 8B-class models. Exit criterion: triple
    precision/recall on a labeled sample comparable to the paper's 88%+ F1.
