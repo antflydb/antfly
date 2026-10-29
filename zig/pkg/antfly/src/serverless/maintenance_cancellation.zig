@@ -37,7 +37,9 @@ pub const Token = struct {
         var result = self;
         result.provider_context = value;
         result.io = value.io orelse self.io;
-        if (result.execution == null or (result.execution.?.entry == null and result.execution.?.borrowed == null)) result.execution = value.execution;
+        // A provided execution remains authoritative after it retires. Only
+        // an explicitly absent capability may inherit the provider's owner.
+        if (result.execution == null) result.execution = value.execution;
         if (value.deadline_ns) |deadline| result.deadline_ns = if (self.deadline_ns) |original| @min(original, deadline) else deadline;
         return result;
     }

@@ -14211,6 +14211,19 @@ test "http handler honors public serverless sync levels on table batch writes" {
             return .{ .ptr = ptr, .vtable = &self.lease_vtable };
         }
 
+        fn acquireFor(ptr: *anyopaque, namespace: []const u8, owner: []const u8, now: u64, ttl: u64, context: Lease.Context) !?Lease.Acquisition {
+            try context.ensureActive();
+            const fs: *FsProgressStore = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("fs", fs);
+            if (self.denied_acquisitions > 0) {
+                self.denied_acquisitions -= 1;
+                return null;
+            }
+            var base = fs.progressStore();
+            const provider = try base.workLeaseProvider();
+            return provider.withContext(context).acquire(namespace, owner, now, ttl);
+        }
+
         fn acquire(ptr: *anyopaque, namespace: []const u8, owner: []const u8, now: u64, ttl: u64) !?Lease.Acquisition {
             const fs: *FsProgressStore = @ptrCast(@alignCast(ptr));
             const self: *@This() = @fieldParentPtr("fs", fs);
@@ -14230,6 +14243,7 @@ test "http handler honors public serverless sync levels on table batch writes" {
     defer progress_store.deinit();
     progress_fixture.lease_vtable = (try progress_store.workLeaseProvider()).vtable.*;
     progress_fixture.lease_vtable.acquire = ContendedProgress.acquire;
+    progress_fixture.lease_vtable.acquire_for = ContendedProgress.acquireFor;
     var progress_vtable = progress_store.vtable.*;
     progress_vtable.work_lease_provider = ContendedProgress.leaseProvider;
     progress_store.vtable = &progress_vtable;

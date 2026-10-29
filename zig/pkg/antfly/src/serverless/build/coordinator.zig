@@ -214,14 +214,17 @@ pub const BackgroundPublisher = struct {
                 continue;
             }
 
+            var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
             var held_lease: ?work_lease.HeldLease = null;
             var held_bootstrap_lease: ?work_lease.HeldBootstrapLease = null;
             // Bootstrap and established publications use the same durable
             // HEAD coordination record and monotonically increasing fence.
             if (self.lease_provider) |provider| {
+                lease_bridge.maintenance = cancellation.withContext(provider.context);
+                const scoped_provider = provider.withContext(lease_bridge.readContext());
                 if (status.head_version == 0) {
                     held_bootstrap_lease = try work_lease.acquireBootstrapHeld(
-                        provider,
+                        scoped_provider,
                         self.io,
                         namespace.name,
                         self.lease_owner_id orelse return error.MissingLeaseOwner,
@@ -234,7 +237,7 @@ pub const BackgroundPublisher = struct {
                     if (held_bootstrap_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
                 } else {
                     held_lease = try work_lease.acquireHeld(
-                        provider,
+                        scoped_provider,
                         self.io,
                         namespace.name,
                         self.lease_owner_id orelse return error.MissingLeaseOwner,

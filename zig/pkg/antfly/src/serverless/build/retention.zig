@@ -133,7 +133,8 @@ pub const Pruner = struct {
         var nonce: [16]u8 = undefined;
         io.random(&nonce);
         const owner = std.fmt.bytesToHex(&nonce, .lower);
-        var barrier = (try work_lease.acquireHeld(provider, io, namespace, &owner, 30 * std.time.ns_per_s)) orelse {
+        var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = (cancellation orelse maintenance_cancellation.Token{ .io = io }).withContext(provider.context) };
+        var barrier = (try work_lease.acquireHeld(provider.withContext(lease_bridge.readContext()), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse {
             var result = try self.noopResult(namespace, 0, false);
             result.work_lease_conflict = true;
             return result;
@@ -1200,15 +1201,26 @@ test "serverless retention resumes artifact cleanup after cancellation" {
     var requested = std.atomic.Value(bool).init(false);
     const CancelAfterFirstDelete = struct {
         requested: *std.atomic.Value(bool),
-        checkpoints: usize = 0,
+        artifacts: *artifacts_mod.ArtifactStore,
+        ids: [2][]const u8,
 
         fn checkpoint(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.checkpoints += 1;
-            if (self.checkpoints == 6) self.requested.store(true, .release);
+            // Cancellation follows an observable durable deletion rather
+            // than the number of preflight/provider lifetime checkpoints.
+            for (self.ids) |id| {
+                const bytes = self.artifacts.getAlloc(id) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        self.requested.store(true, .release);
+                        return error.Canceled;
+                    },
+                    else => return err,
+                };
+                self.artifacts.allocator.free(bytes);
+            }
         }
     };
-    var cancel_state = CancelAfterFirstDelete{ .requested = &requested };
+    var cancel_state = CancelAfterFirstDelete{ .requested = &requested, .artifacts = &artifacts, .ids = .{ first_artifact.artifact_id, second_artifact.artifact_id } };
     const token = (maintenance_cancellation.Token{
         .io = std.testing.io,
         .requested = &requested,

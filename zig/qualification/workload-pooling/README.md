@@ -1371,3 +1371,70 @@ The affected lake admission, source-pin renewal, opening, text retirement,
 SQL startup and metadata provider checks pass. `index-reader-renewal-final.json`
 binds every committed source file to the tested inputs and exact snapshots.
 License headers and the Apache product boundary pass.
+
+### Contextual work-lease acquisition and release (2026-10-29)
+
+Work-lease providers now carry execution and original lifetime authority through
+acquisition, validation and release, including bootstrap leases. Contextual
+attempts have a five-second ceiling clamped to the original deadline. An
+admitted provider lacking the required callback fails explicitly rather than
+running its legacy callback outside scheduling. Explicit unadmitted callers
+retain the legacy entry points; disabled scheduling explicitly carries no
+execution capability. Retired execution handles continue to fail closed.
+
+The background publisher, managed compaction/enrichment, catalog builds,
+builder/compactor entry points and retention barrier now bind the caller's
+maintenance token and any existing provider context before acquiring a lease.
+Their held lease retains that borrowed context through renewal shutdown and
+conditional release. Cancellation stops and joins renewal before attempting
+release; denied release does not create fresh authority or unadmitted work.
+Any retained durable lease remains bounded by its existing TTL and exact token.
+An uncertain acquisition likewise grants no usable publication capability.
+
+Native filesystem access shares one contextual lease transaction for acquire,
+validate, renew and release. Encoding/parsing retain CPU; physical operations
+use the existing protected publication-return guard while holding a namespace
+lock. Renewal children reuse their protected control return capacity. Kernel
+lock acquisition polls the actual lock with bounded, cancellation-aware CPU
+loans instead of entering an uninterruptible blocking flock. Conditional HEAD
+replacement preserves monotonically increasing tokens, file synchronization,
+atomic rename and directory synchronization. Object-backed progress and direct
+object lease stores forward the same context through the physical provider
+adapter without modifying shared client state.
+
+Real native and filesystem object-provider fixtures stall file synchronization
+for normal/bootstrap acquisition and release. They verify CPU loans, unrelated
+query/health progress, joining after cancellation, exact-token validation and
+replacement-owner protection. A contested native kernel lock proves completion
+before the external owner unlocks, for cancellation, original deadline and the
+default five-second attempt bound. The real catalog publication path checks
+acquisition/release CPU loans with protected return capacity; managed runtime,
+compaction, enrichment, retention resumption and public sync levels remain
+covered by the focused target. Memory-backed retention cancellation now follows
+an actual deletion rather than a checkpoint count. The manifest-pin fixture
+registers its near-expiry reader after setup with its provider barrier armed,
+and the model-quota fixture tests fair progress within its existing deadline
+instead of assuming a sampled free CPU stays reserved for its probe.
+
+The full design remains open. Remaining maintenance progress/listing/retention
+and immutable-artifact provider boundaries, metadata holder integration,
+preparation paths and cross-engine recovery gates (including the unresolved
+file-engine FD recovery gate) remain. Full qualification remains waived; local
+filesystem and deterministic fixture evidence does not qualify live cloud or
+installed native CLI behavior.
+
+A maintenance token's provided execution stays authoritative after retirement;
+a provider context cannot replace it with another live execution. The regression
+case distinguishes explicit disabled scheduling from a closed admitted owner,
+including context inheritance from a live provider.
+
+Evidence: `work-lease-admission-v11-final.json` records 70/70 successful steps,
+24/24 tests in the combined lifecycle artifact, successful background execution
+and SQL lake admission targets, and unchanged inputs. The combined target uses
+the exact concatenation of the existing lease and read-pin filter sets, retaining
+both earlier entry points while avoiding duplicate compilation and execution.
+`work-lease-admission-final.json` binds committed bytes to the tested sources.
+License headers, formatting and the Apache product boundary pass. The earlier
+cache-file failure and observed removal of the entire worktree cache are
+recorded in `work-lease-cache-removal.json`; the final run reuses the rebuilt
+worktree-local cache.

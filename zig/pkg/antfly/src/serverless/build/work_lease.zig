@@ -42,7 +42,18 @@ pub const Provider = struct {
         result.context = context;
         return result;
     }
+    /// Bound a physical provider attempt even when a background pass has no
+    /// explicit deadline. Each attempt still inherits every original fence.
+    fn attemptContext(original: Context) Context {
+        var bounded = original;
+        const ceiling = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+        bounded.deadline_ns = @min(original.deadline_ns orelse ceiling, ceiling);
+        return bounded;
+    }
     pub const VTable = struct {
+        acquire_for: ?*const fn (*anyopaque, []const u8, []const u8, u64, u64, Context) anyerror!?Acquisition = null,
+        validate_for: ?*const fn (*anyopaque, []const u8, []const u8, u64, u64, Context) anyerror!void = null,
+        release_for: ?*const fn (*anyopaque, []const u8, []const u8, u64, Context) anyerror!bool = null,
         renew_for: ?*const fn (*anyopaque, []const u8, []const u8, u64, u64, u64, Context) anyerror!u64 = null,
         acquire: *const fn (
             *anyopaque,
@@ -105,6 +116,12 @@ pub const Provider = struct {
         if (namespace.len == 0) return error.InvalidLeaseNamespace;
         if (owner_id.len == 0) return error.InvalidLeaseOwner;
         if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        if (self.context) |original| {
+            const context = attemptContext(original);
+            try context.ensureActive();
+            if (self.vtable.acquire_for) |call| return call(self.ptr, namespace, owner_id, now_unix_ns, ttl_ns, context);
+            if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;
+        }
         return try self.vtable.acquire(
             self.ptr,
             namespace,
@@ -121,6 +138,12 @@ pub const Provider = struct {
         fencing_token: u64,
         now_unix_ns: u64,
     ) !void {
+        if (self.context) |original| {
+            const context = attemptContext(original);
+            try context.ensureActive();
+            if (self.vtable.validate_for) |call| return call(self.ptr, namespace, owner_id, fencing_token, now_unix_ns, context);
+            if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;
+        }
         try self.vtable.validate(
             self.ptr,
             namespace,
@@ -136,6 +159,12 @@ pub const Provider = struct {
         owner_id: []const u8,
         fencing_token: u64,
     ) !bool {
+        if (self.context) |original| {
+            const context = attemptContext(original);
+            try context.ensureActive();
+            if (self.vtable.release_for) |call| return call(self.ptr, namespace, owner_id, fencing_token, context);
+            if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;
+        }
         return try self.vtable.release(
             self.ptr,
             namespace,
@@ -153,7 +182,8 @@ pub const Provider = struct {
         ttl_ns: u64,
     ) !u64 {
         if (ttl_ns == 0) return error.InvalidLeaseTtl;
-        if (self.context) |context| {
+        if (self.context) |original| {
+            const context = attemptContext(original);
             try context.ensureActive();
             if (self.vtable.renew_for) |renew_for| return renew_for(self.ptr, namespace, owner_id, fencing_token, now_unix_ns, ttl_ns, context);
             if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;
@@ -178,6 +208,12 @@ pub const Provider = struct {
         if (namespace.len == 0) return error.InvalidLeaseNamespace;
         if (owner_id.len == 0) return error.InvalidLeaseOwner;
         if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        if (self.context) |original| {
+            const context = attemptContext(original);
+            try context.ensureActive();
+            if (self.vtable.acquire_for) |call| return call(self.ptr, namespace, owner_id, now_unix_ns, ttl_ns, context);
+            if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;
+        }
         return try self.vtable.acquire_bootstrap(
             self.ptr,
             namespace,
@@ -193,6 +229,12 @@ pub const Provider = struct {
         owner_id: []const u8,
         fencing_token: u64,
     ) !bool {
+        if (self.context) |original| {
+            const context = attemptContext(original);
+            try context.ensureActive();
+            if (self.vtable.release_for) |call| return call(self.ptr, namespace, owner_id, fencing_token, context);
+            if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;
+        }
         return try self.vtable.release_bootstrap(
             self.ptr,
             namespace,
@@ -210,7 +252,8 @@ pub const Provider = struct {
         ttl_ns: u64,
     ) !u64 {
         if (ttl_ns == 0) return error.InvalidLeaseTtl;
-        if (self.context) |context| {
+        if (self.context) |original| {
+            const context = attemptContext(original);
             try context.ensureActive();
             if (self.vtable.renew_for) |renew_for| return renew_for(self.ptr, namespace, owner_id, fencing_token, now_unix_ns, ttl_ns, context);
             if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;

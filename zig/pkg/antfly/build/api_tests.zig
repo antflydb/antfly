@@ -4065,10 +4065,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-asset-provider-wait-test", "Verify asset HTTP/capability waits and independently owned compatibility workers")
         .dependOn(&b.addRunArtifact(asset_provider_wait_tests).step);
 
+    const read_pin_filters = [_][]const u8{ "serverless execution manifest pins", "serverless execution held lease", "serverless execution model invocations preserve", "serverless sparse enricher can", "serverless sparse enricher idles", "serverless builder publishes first manifest", "serverless builder retries interrupted publication", "serverless execution managed metadata" };
+    const lease_filters = [_][]const u8{ "serverless execution held lease", "serverless execution managed metadata", "serverless execution model quota wait", "serverless publication errors distinguish retryable authority", "serverless managed runtime publishes and prunes", "serverless managed runtime compacts head", "serverless managed runtime targets request-driven enrichment", "serverless background publisher publishes once", "serverless retention resumes artifact cleanup", "http handler honors public serverless sync levels on table batch writes" };
     const read_pin_renewal_tests = b.addTest(.{
         .name = "read-pin-renewal-tests",
         .root_module = serverless_execution_root,
-        .filters = &.{ "serverless execution manifest pins", "serverless execution held lease", "serverless execution model invocations preserve", "serverless sparse enricher can", "serverless sparse enricher idles", "serverless builder publishes first manifest", "serverless builder retries interrupted publication", "serverless execution managed metadata" },
+        .filters = &read_pin_filters,
         .max_rss = 16 * 1024 * 1024 * 1024,
     });
     b.step("antfly-read-pin-renewal-test", "Verify shared manifest renewal, passive checks and joined provider cleanup")
@@ -4077,11 +4079,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lease_renewal_tests = b.addTest(.{
         .name = "lease-renewal-tests",
         .root_module = serverless_execution_root,
-        .filters = &.{ "serverless execution held lease", "serverless execution managed metadata", "serverless execution model quota wait", "serverless publication errors distinguish retryable authority" },
+        .filters = &lease_filters,
         .max_rss = 16 * 1024 * 1024 * 1024,
     });
-    b.step("antfly-lease-renewal-test", "Verify admitted work-lease renewal, passive watchdogs and physical cleanup")
+    b.step("antfly-lease-renewal-test", "Verify contextual work-lease acquisition, renewal, release and production maintenance callers")
         .dependOn(&b.addRunArtifact(lease_renewal_tests).step);
+
+    // Keep the existing entry points and run their exact combined coverage
+    // once for changes that affect the complete maintenance lease lifecycle.
+    const work_lease_lifecycle_tests = b.addTest(.{
+        .name = "work-lease-lifecycle-tests",
+        .root_module = serverless_execution_root,
+        .filters = &(read_pin_filters ++ lease_filters),
+        .max_rss = 16 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-work-lease-lifecycle-test", "Verify the combined work-lease, read-pin and production maintenance lifecycle")
+        .dependOn(&b.addRunArtifact(work_lease_lifecycle_tests).step);
 
     const credential_process_wait_tests = b.addTest(.{
         .name = "credential-process-wait-tests",

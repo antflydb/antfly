@@ -266,10 +266,13 @@ pub const ManagedRuntime = struct {
                 try pass.ownerCheckpoint();
                 if (self.cfg.compaction_enabled) {
                     if (status.compaction_recommended) {
+                        var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = pass };
                         var held_lease: ?build_mod.work_lease.HeldLease = null;
                         if (self.work_lease_provider) |provider| {
+                            lease_bridge.maintenance = pass.withContext(provider.context);
+                            const scoped_provider = provider.withContext(lease_bridge.readContext());
                             held_lease = try build_mod.work_lease.acquireHeld(
-                                provider,
+                                scoped_provider,
                                 self.io,
                                 namespace.name,
                                 self.work_lease_owner_id orelse return error.MissingLeaseOwner,
@@ -435,9 +438,14 @@ pub const ManagedRuntime = struct {
         };
         const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(stage) orelse return false;
 
+        var maintenance = self.cancellationToken();
+        maintenance.cooperative = cancellation;
+        maintenance.execution = execution orelse if (catalog.progress.context) |context| context.execution else null;
+        var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = maintenance };
         var held_lease: ?build_mod.work_lease.HeldLease = null;
         if (self.work_lease_provider) |provider| {
-            held_lease = try build_mod.work_lease.acquireHeld(provider, self.io, namespace, self.work_lease_owner_id orelse return error.MissingLeaseOwner, self.work_lease_ttl_ns);
+            lease_bridge.maintenance = maintenance.withContext(provider.context);
+            held_lease = try build_mod.work_lease.acquireHeld(provider.withContext(lease_bridge.readContext()), self.io, namespace, self.work_lease_owner_id orelse return error.MissingLeaseOwner, self.work_lease_ttl_ns);
             if (held_lease == null) {
                 stats.enrichment_conflicts += 1;
                 stats.work_lease_conflicts += 1;
@@ -448,9 +456,6 @@ pub const ManagedRuntime = struct {
         defer if (held_lease) |*lease| {
             _ = lease.release() catch {};
         };
-        var maintenance = self.cancellationToken();
-        maintenance.cooperative = cancellation;
-        maintenance.execution = execution orelse if (catalog.progress.context) |context| context.execution else null;
         if (held_lease) |*lease| maintenance = try lease.cancellation(maintenance);
         try self.chargeWork(.enrichment_round, 1);
         try maintenance.check();

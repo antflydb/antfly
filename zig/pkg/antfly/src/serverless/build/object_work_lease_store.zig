@@ -430,6 +430,22 @@ pub const ObjectWorkLeaseStore = struct {
         };
     }
 
+    pub fn acquireFor(ptr: *anyopaque, namespace: []const u8, owner: []const u8, now: u64, ttl: u64, context: work_lease.Context) !?work_lease.Acquisition {
+        var scoped = fromContext(ptr, context);
+        return scoped.acquire(namespace, owner, now, ttl);
+    }
+    pub fn validateFor(ptr: *anyopaque, namespace: []const u8, owner: []const u8, token: u64, now: u64, context: work_lease.Context) !void {
+        var scoped = fromContext(ptr, context);
+        return scoped.validate(namespace, owner, token, now);
+    }
+    pub fn releaseFor(ptr: *anyopaque, namespace: []const u8, owner: []const u8, token: u64, context: work_lease.Context) !bool {
+        var scoped = fromContext(ptr, context);
+        return scoped.release(namespace, owner, token);
+    }
+    fn fromContext(ptr: *anyopaque, context: work_lease.Context) ObjectWorkLeaseStore {
+        const original: *ObjectWorkLeaseStore = @ptrCast(@alignCast(ptr));
+        return .{ .alloc = original.alloc, .client = original.client, .bucket = original.bucket, .prefix = original.prefix, .operation = .{ .context = context } };
+    }
     pub fn renewFor(ptr: *anyopaque, namespace: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64, context: work_lease.Context) !u64 {
         const original: *ObjectWorkLeaseStore = @ptrCast(@alignCast(ptr));
         var view: ObjectWorkLeaseStore = .{ .alloc = original.alloc, .client = original.client, .bucket = original.bucket, .prefix = original.prefix, .operation = .{ .context = context } };
@@ -437,6 +453,9 @@ pub const ObjectWorkLeaseStore = struct {
     }
 
     const vtable: work_lease.Provider.VTable = .{
+        .acquire_for = acquireFor,
+        .validate_for = validateFor,
+        .release_for = releaseFor,
         .renew_for = renewFor,
         .acquire = erasedAcquire,
         .validate = erasedValidate,

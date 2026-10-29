@@ -374,7 +374,9 @@ pub const Builder = struct {
             var owner_bytes: [16]u8 = undefined;
             io.random(&owner_bytes);
             const owner = std.fmt.bytesToHex(&owner_bytes, .lower);
-            var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse
+            const provider = try self.progress.workLeaseProvider();
+            var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = (cancellation orelse maintenance_cancellation.Token{ .io = io }).withContext(provider.context) };
+            var held = (try work_lease.acquireHeld(provider.withContext(lease_bridge.readContext()), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse
                 return error.WorkLeaseLost;
             defer _ = held.release() catch false;
             return self.publishNamespaceWithMetricAndPlanGuardedUntil(namespace, vector_metric, plan, held.guard(), try held.cancellation(cancellation orelse .{ .io = io }));

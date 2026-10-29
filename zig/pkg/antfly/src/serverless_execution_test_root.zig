@@ -953,6 +953,8 @@ test "serverless execution managed metadata borrows provider waits and preserves
         execution: *Runnable.Execution,
         scheduler: *Runnable.Scheduler,
         waits: std.atomic.Value(usize) = .init(0),
+        acquisition_waits: std.atomic.Value(usize) = .init(0),
+        release_waits: std.atomic.Value(usize) = .init(0),
         lost: std.atomic.Value(bool) = .init(false),
         saw_renewal: std.atomic.Value(bool) = .init(false),
         reject_return: bool = false,
@@ -971,6 +973,10 @@ test "serverless execution managed metadata borrows provider waits and preserves
                 else => return err,
             };
             _ = self.waits.fetchAdd(1, .acq_rel);
+            if (self.scheduler.stats().control_children == 0) {
+                const counter = if (self.saw_renewal.load(.acquire)) &self.release_waits else &self.acquisition_waits;
+                _ = counter.fetchAdd(1, .acq_rel);
+            }
         }
         fn authority(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1045,9 +1051,15 @@ test "serverless execution managed metadata borrows provider waits and preserves
         try std.testing.expectEqual(@as(usize, 1), records.len);
         try std.testing.expect(probe.waits.load(.acquire) > before);
         const token: maintenance.Token = .{ .io = std.testing.io, .execution = &execution, .cooperative = .{ .ptr = &probe, .check_fn = Probe.original } };
+        probe.acquisition_waits.store(0, .release);
+        probe.release_waits.store(0, .release);
         var publication = try catalog.buildNamespace("docs");
-        try std.testing.expect(probe.saw_renewal.load(.acquire));
         defer publication.deinit(catalog.alloc);
+        if (reserved_return) {
+            try std.testing.expect(probe.acquisition_waits.load(.acquire) != 0);
+            try std.testing.expect(probe.release_waits.load(.acquire) != 0);
+        }
+        try std.testing.expect(probe.saw_renewal.load(.acquire));
         try std.testing.expect(publication.published);
         var second = try stack.api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 2, .mutations = &.{.{ .kind = .upsert, .doc_id = "b", .body = "{\"body\":\"beta\"}" }} });
         defer second.deinit(stack.api.alloc);
@@ -1467,7 +1479,10 @@ test "serverless execution model quota wait lends capacity and never releases an
         }
         var query: Runnable.Execution = .{};
         defer query.finish();
-        try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        // The quota waiter periodically reacquires CPU to inspect readiness.
+        // Sampling its parked state does not reserve that CPU for this test.
+        // Verify fair progress within the existing observation deadline.
+        try query.start(&scheduler, .{ .io = io, .deadline_ns = @intCast(@max(0, until.nanoseconds)) }, .query);
         var control: Runnable.Execution = .{};
         defer control.finish();
         try control.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
@@ -2456,17 +2471,12 @@ test "serverless execution manifest pins share renewal and join blocked provider
         var canceled = std.atomic.Value(bool).init(false);
         const parent: maintenance.Token = .{ .io = io, .execution = &execution, .requested = &canceled };
         var worker: renewal_mod.Renewal = .{};
-        try worker.start(parent, &fixture, Fixture.renew, 20 * std.time.ns_per_ms, time.realtimeNs() + 10 * std.time.ns_per_s, io);
+        try worker.start(parent, &fixture, Fixture.renew, 800 * std.time.ns_per_ms, time.realtimeNs() + 10 * std.time.ns_per_s, io);
         defer worker.stop();
         var shared = parent;
         shared.renewals = &worker;
         progress.context = (Context{ .io = io }).withExecution(&execution);
-        const age = read_lease.duration_ns - 2 * std.time.ns_per_s;
-        // Existing durable rights near their renewal margin, without waiting
-        // ten minutes. The acquisition and subsequent refresh use real stores.
-        const initial = try read_lease.acquireAt(&progress, "docs", 1, time.realtimeNs() - age, time.authorityNs() - age);
         var pin: Pin = .{ .progress = &progress, .namespace = "docs", .version = 1, .parent = shared };
-        try pin.start(initial);
         defer pin.deinit();
         // Nested graph scopes must reuse the worker instead of consuming the
         // small reserved control-child pool on every nesting level.
@@ -2478,7 +2488,7 @@ test "serverless execution manifest pins share renewal and join blocked provider
         };
         const other_lease = try read_lease.acquireAt(&progress, "docs", 2, time.realtimeNs(), time.authorityNs());
         for (&nested) |*item| {
-            item.* = .{ .progress = &progress, .namespace = "docs", .version = 2, .parent = if (count == 0) shared else pin.maintenanceToken() };
+            item.* = .{ .progress = &progress, .namespace = "docs", .version = 2, .parent = if (count == 0) shared else nested[count - 1].maintenanceToken() };
             try item.start(other_lease);
             count += 1;
         }
@@ -2495,7 +2505,13 @@ test "serverless execution manifest pins share renewal and join blocked provider
         try std.testing.expectError(error.InvalidRunnableTransition, read.team());
         ordinary.finish();
         try std.testing.expectEqual(@as(usize, 1), execution.entry.?.control_children);
+        // Register the near-expiry pin after setup, with the barrier armed.
+        // Otherwise the live worker can refresh it before the test installs
+        // its barrier and correctly skip every later provider write.
+        const age = read_lease.duration_ns - 2 * std.time.ns_per_s;
+        const initial = try read_lease.acquireAt(&progress, "docs", 1, time.realtimeNs() - age, time.authorityNs() - age);
         fixture.armed.store(true, .release);
+        try pin.start(initial);
         try execution.park(.resource_blocked);
         const until = time.monotonicNs() + 3 * std.time.ns_per_s;
         defer fixture.release.set(io);
@@ -2573,4 +2589,273 @@ test "serverless execution manifest pins share renewal and join blocked provider
         progress.context = .{ .io = io };
         _ = try read_lease.acquireAt(&progress, "unadmitted", 1, time.realtimeNs(), time.authorityNs());
     };
+}
+
+test "serverless execution held lease acquisition and release loan CPU through physical providers" {
+    const leases = @import("serverless/build/work_lease.zig");
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const FsProgress = @import("serverless/catalog/fs_progress_store.zig").FsProgressStore;
+    const ObjectLease = @import("serverless/build/object_work_lease_store.zig").ObjectWorkLeaseStore;
+    const objectstore = @import("objectstore");
+    const Fixture = struct {
+        threaded: std.Io.Threaded,
+        armed: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.Io.Event = .unset,
+        fn sync(raw: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(raw.?));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            const io = threaded.io();
+            if (self.armed.swap(false, .acq_rel)) {
+                self.entered.store(true, .release);
+                self.release.waitUncancelable(io);
+            }
+            return io.vtable.fileSync(raw, file);
+        }
+    };
+    const Job = struct {
+        provider: leases.Provider,
+        io: std.Io,
+        bootstrap: bool,
+        releasing: bool,
+        token: u64 = 0,
+        cause: ?anyerror = null,
+        acquired: ?leases.Acquisition = null,
+        released: bool = false,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            if (self.releasing) {
+                self.released = (if (self.bootstrap) self.provider.releaseBootstrap("docs", "one", self.token) else self.provider.release("docs", "one", self.token)) catch |err| {
+                    self.cause = err;
+                    return;
+                };
+            } else {
+                self.acquired = (if (self.bootstrap) self.provider.acquireBootstrap("docs", "one", leases.nowUnixNs(self.io), 30 * std.time.ns_per_s) else self.provider.acquire("docs", "one", leases.nowUnixNs(self.io), 30 * std.time.ns_per_s)) catch |err| {
+                    self.cause = err;
+                    return;
+                };
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |objects| for ([_]bool{ false, true }) |bootstrap_lease| for ([_]bool{ false, true }) |releasing| for ([_]bool{ false, true }) |cancel| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(root);
+        var fixture: Fixture = .{ .threaded = .init(a, .{}) };
+        defer fixture.threaded.deinit();
+        var io = fixture.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.fileSync = Fixture.sync;
+        io.vtable = &vtable;
+        var native = try FsProgress.init(a, root);
+        defer native.deinit();
+        var filesystem = try objectstore.FilesystemClient.initWithIo(a, root, io);
+        defer filesystem.deinit();
+        var store = try ObjectLease.initWithClient(a, filesystem.client(), "leases", "");
+        defer store.deinit();
+        var progress = native.progressStore();
+        const provider = if (objects) store.provider() else try progress.workLeaseProvider();
+        const initial = if (releasing) (try provider.acquire("docs", "one", leases.nowUnixNs(io), 30 * std.time.ns_per_s)).? else null;
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .publication_slots = 1, .read_isolation = false });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = io }, .background);
+        defer execution.finish();
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var bridge: maintenance.GraphBridge = .{ .maintenance = .{ .io = io, .execution = &execution, .requested = &canceled } };
+        var job: Job = .{ .provider = provider.withContext(bridge.readContext()), .io = io, .bootstrap = bootstrap_lease, .releasing = releasing, .token = if (initial) |value| value.fencing_token else 0 };
+        fixture.armed.store(true, .release);
+        var task = try io.concurrent(Job.run, .{&job});
+        defer {
+            fixture.release.set(io);
+            task.cancel(io);
+        }
+        const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (!fixture.entered.load(.acquire)) {
+            if (job.done.load(.acquire)) return job.cause orelse error.TestUnexpectedResult;
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(!job.done.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        var unrelated: Runnable.Execution = .{};
+        try unrelated.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        unrelated.finish();
+        var health: Runnable.Execution = .{};
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        if (cancel) {
+            canceled.store(true, .release);
+            try io.sleep(.fromMilliseconds(3), .awake);
+            try std.testing.expect(!job.done.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        }
+        fixture.release.set(io);
+        task.await(io);
+        if (cancel) {
+            try std.testing.expectEqual(error.Canceled, job.cause.?);
+            // A rejected attempt may have durable effects. It must be joined
+            // before a later incarnation takes ownership, and an old token
+            // must never release that replacement.
+            const replacement = (try provider.acquire("docs", "replacement", leases.nowUnixNs(io) + 31 * std.time.ns_per_s, 30 * std.time.ns_per_s)).?;
+            try std.testing.expect(replacement.fencing_token > job.token);
+            if (releasing) try std.testing.expect(!try provider.release("docs", "one", job.token));
+            try provider.validate("docs", "replacement", replacement.fencing_token, leases.nowUnixNs(io));
+            try std.testing.expect(try provider.release("docs", "replacement", replacement.fencing_token));
+        } else {
+            if (job.cause) |err| return err;
+            if (releasing) {
+                try std.testing.expect(job.released);
+                try std.testing.expectError(error.WorkLeaseLost, provider.validate("docs", "one", job.token, leases.nowUnixNs(io)));
+            } else {
+                const acquired = job.acquired orelse return error.TestUnexpectedResult;
+                try job.provider.validate("docs", "one", acquired.fencing_token, leases.nowUnixNs(io));
+                try std.testing.expect(try job.provider.release("docs", "one", acquired.fencing_token));
+            }
+        }
+    };
+}
+
+test "serverless execution held lease contested native locks honor original cancellation and deadline" {
+    const leases = @import("serverless/build/work_lease.zig");
+    const FsProgress = @import("serverless/catalog/fs_progress_store.zig").FsProgressStore;
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const Fixture = struct {
+        threaded: std.Io.Threaded,
+        attempts: std.atomic.Value(usize) = .init(0),
+        fn tryLock(raw: ?*anyopaque, file: std.Io.File, lock: std.Io.File.Lock) std.Io.File.LockError!bool {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(raw.?));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            _ = self.attempts.fetchAdd(1, .acq_rel);
+            return threaded.io().vtable.fileTryLock(raw, file, lock);
+        }
+    };
+    const Job = struct {
+        provider: leases.Provider,
+        io: std.Io,
+        token: u64,
+        releasing: bool,
+        cause: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            if (self.releasing) {
+                _ = self.provider.release("docs", "one", self.token) catch |err| {
+                    self.cause = err;
+                    return;
+                };
+            } else {
+                _ = self.provider.acquire("docs", "two", leases.nowUnixNs(self.io), 30 * std.time.ns_per_s) catch |err| {
+                    self.cause = err;
+                    return;
+                };
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    const Mode = enum { deadline, canceled, default_timeout };
+    for ([_]bool{ false, true }) |releasing| for (std.enums.values(Mode)) |mode| {
+        if (releasing and mode == .default_timeout) continue;
+        const cancel = mode == .canceled;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(root);
+        var fixture: Fixture = .{ .threaded = .init(a, .{}) };
+        defer fixture.threaded.deinit();
+        var io = fixture.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.fileTryLock = Fixture.tryLock;
+        io.vtable = &vtable;
+        var native = try FsProgress.init(a, root);
+        defer native.deinit();
+        var progress = native.progressStore();
+        const provider = try progress.workLeaseProvider();
+        const initial = (try provider.acquire("docs", "one", leases.nowUnixNs(io), 30 * std.time.ns_per_s)).?;
+        const lock_path = try std.fs.path.join(a, &.{ root, "docs", ".progress.lock" });
+        defer a.free(lock_path);
+        const lock = try std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_write });
+        defer lock.close(io);
+        try lock.lock(io, .exclusive);
+        defer lock.unlock(io);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .publication_slots = 1, .read_isolation = false });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = io }, .background);
+        defer execution.finish();
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var bridge: maintenance.GraphBridge = .{ .maintenance = .{
+            .io = io,
+            .execution = &execution,
+            .requested = &canceled,
+            .deadline_ns = if (mode == .default_timeout) null else @import("antfly_platform").time.monotonicNs() + if (cancel) @as(u64, 2 * std.time.ns_per_s) else 100 * std.time.ns_per_ms,
+        } };
+        var job: Job = .{ .provider = provider.withContext(bridge.readContext()), .io = io, .token = initial.fencing_token, .releasing = releasing };
+        var task = try io.concurrent(Job.run, .{&job});
+        defer task.cancel(io);
+        const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, if (mode == .default_timeout) 7 else 3) * std.time.ns_per_s;
+        while (fixture.attempts.load(.acquire) == 0) {
+            if (job.done.load(.acquire)) return job.cause orelse error.TestUnexpectedResult;
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        if (cancel) canceled.store(true, .release);
+        while (!job.done.load(.acquire)) {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.NativeLeaseWaitIgnoredOriginalLifetime;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        // Completion precedes unlocking the real kernel lock. No abandoned
+        // flock thread, lock ownership or pending mutation may survive it.
+        task.await(io);
+        try std.testing.expectEqual(if (cancel) error.Canceled else error.DeadlineExceeded, job.cause.?);
+        try std.testing.expect(fixture.attempts.load(.acquire) > 0);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().publication_runnable_slots);
+    };
+}
+
+test "serverless execution held lease disabled scheduling and retired execution stay distinct" {
+    const leases = @import("serverless/build/work_lease.zig");
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const FsProgress = @import("serverless/catalog/fs_progress_store.zig").FsProgressStore;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var native = try FsProgress.init(a, root);
+    defer native.deinit();
+    var progress = native.progressStore();
+    const base = try progress.workLeaseProvider();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    // Disabled maintenance explicitly carries no execution capability.
+    var bridge: maintenance.GraphBridge = .{ .maintenance = .{ .io = std.testing.io, .requested = &canceled } };
+    const context = bridge.readContext();
+    try std.testing.expect(context.execution == null and context.wait == null);
+    const provider = base.withContext(context);
+    const acquired = (try provider.acquire("docs", "one", leases.nowUnixNs(std.testing.io), 30 * std.time.ns_per_s)).?;
+    try provider.validate("docs", "one", acquired.fencing_token, leases.nowUnixNs(std.testing.io));
+    try std.testing.expect(try provider.release("docs", "one", acquired.fencing_token));
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, provider.acquire("docs", "one", leases.nowUnixNs(std.testing.io), 30 * std.time.ns_per_s));
+
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 3 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .background);
+    execution.finish();
+    // Building a new provider view after close must retain the invalid owner;
+    // an empty retired handle cannot become an unadmitted maintenance pass.
+    var retired: maintenance.GraphBridge = .{ .maintenance = .{ .io = std.testing.io, .execution = &execution } };
+    const invalid = base.withContext(retired.readContext());
+    try std.testing.expectError(error.InvalidRunnableTransition, invalid.acquire("retired", "one", leases.nowUnixNs(std.testing.io), 30 * std.time.ns_per_s));
+    var live: Runnable.Execution = .{};
+    try live.start(&scheduler, .{ .io = std.testing.io }, .background);
+    defer live.finish();
+    var live_bridge: maintenance.GraphBridge = .{ .maintenance = .{ .io = std.testing.io, .execution = &live } };
+    var inherited: maintenance.GraphBridge = .{ .maintenance = retired.maintenance.?.withContext(live_bridge.readContext()) };
+    const still_invalid = base.withContext(inherited.readContext());
+    try std.testing.expectError(error.InvalidRunnableTransition, still_invalid.acquire("retired", "one", leases.nowUnixNs(std.testing.io), 30 * std.time.ns_per_s));
 }

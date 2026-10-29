@@ -799,12 +799,30 @@ pub const ObjectProgressStore = struct {
         return .{ .ptr = ptr, .vtable = &lease_vtable };
     }
 
+    fn leaseAcquireFor(ptr: *anyopaque, ns: []const u8, owner: []const u8, now: u64, ttl: u64, context: Context) !?work_lease.Acquisition {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        var borrowed = self.borrowedLeaseStore();
+        return ObjectWorkLeaseStore.acquireFor(&borrowed, ns, owner, now, ttl, context);
+    }
+    fn leaseValidateFor(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, context: Context) !void {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        var borrowed = self.borrowedLeaseStore();
+        return ObjectWorkLeaseStore.validateFor(&borrowed, ns, owner, token, now, context);
+    }
+    fn leaseReleaseFor(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, context: Context) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        var borrowed = self.borrowedLeaseStore();
+        return ObjectWorkLeaseStore.releaseFor(&borrowed, ns, owner, token, context);
+    }
     fn leaseRenewFor(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64, context: Context) !u64 {
         const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
         var borrowed = self.borrowedLeaseStore();
         return ObjectWorkLeaseStore.renewFor(&borrowed, ns, owner, token, now, ttl, context);
     }
     const lease_vtable: work_lease.Provider.VTable = .{
+        .acquire_for = leaseAcquireFor,
+        .validate_for = leaseValidateFor,
+        .release_for = leaseReleaseFor,
         .renew_for = leaseRenewFor,
         .acquire = leaseAcquire,
         .validate = leaseValidate,
