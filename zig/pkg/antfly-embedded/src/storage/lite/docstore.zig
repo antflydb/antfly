@@ -3311,6 +3311,9 @@ pub const Txn = struct {
             return self.scratch.allocator();
         }
 
+        pub fn rangeReadMode(_: *@This()) @import("../backend_erased.zig").RangeReadMode {
+            return .selected_read;
+        }
         pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
             if (requests.len > 64) return error.InvalidBatch;
             const a = self.resultAllocator();

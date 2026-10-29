@@ -4435,7 +4435,7 @@ pub const AntflyApiHandler = struct {
         ctx: *httpx.Context,
         identity: ?AuthenticatedIdentity,
         fn port(self: *@This()) inference_gateway.source_media.Port {
-            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany };
+            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany, .lookup_owned = lookupOwned };
         }
         fn at(value: std.json.Value, path: []const u8) ?std.json.Value {
             var current = value;
@@ -4450,6 +4450,39 @@ pub const AntflyApiHandler = struct {
             return (try lookupMany(raw, a, &.{reference}))[0];
         }
         fn lookupMany(raw: *anyopaque, a: std.mem.Allocator, references: []const inference_gateway.source_media.Reference) ![]const []const u8 {
+            var lease = try lookupOwned(raw, a, references);
+            defer lease.deinit();
+            if (lease.owner == null) return lease.urls;
+            const copied = try a.alloc([]const u8, lease.urls.len);
+            for (lease.urls, 0..) |url, i| {
+                // Multiple independently checked references can share a field.
+                // Preserve that sharing across the allocator-owned fallback.
+                copied[i] = for (lease.urls[0..i], 0..) |prior, j| {
+                    if (prior.ptr == url.ptr and prior.len == url.len) break copied[j];
+                } else try a.dupe(u8, url);
+            }
+            return copied;
+        }
+        const MediaPayloads = struct {
+            allocator: std.mem.Allocator,
+            backing: @import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator,
+            arenas: [128]std.heap.ArenaAllocator = undefined,
+            count: usize = 0,
+            fn release(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                for (self.arenas[0..self.count]) |*arena| arena.deinit();
+                const a = self.allocator;
+                a.destroy(self);
+            }
+            fn append(self: *@This()) !std.mem.Allocator {
+                if (self.count == self.arenas.len) return error.InferenceRequestTooLarge;
+                const arena = &self.arenas[self.count];
+                self.count += 1;
+                arena.* = .init(self.backing.allocator());
+                return arena.allocator();
+            }
+        };
+        fn lookupOwned(raw: *anyopaque, a: std.mem.Allocator, references: []const inference_gateway.source_media.Reference) !inference_gateway.source_media.PayloadLease {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const now = @import("antfly_platform").time.monotonicNs();
             // One shared deadline for the whole materialization, not per image.
@@ -4460,16 +4493,17 @@ pub const AntflyApiHandler = struct {
             var total_bytes: usize = 0;
             for (references) |reference| total_bytes +|= std.base64.standard.Encoder.calcSize(reference.byte_length);
             if (runtime == null or groups.len <= 1 or total_bytes < 64 * 1024) {
-                for (groups) |group| try self.lookupGroup(a, references, group, deadline, output);
-                return output;
+                for (groups) |group| try self.lookupGroup(a, references, group, deadline, output, a);
+                return .{ .urls = output };
             }
             const io = runtime.?;
             const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
-            var backing: scheduler.LockedAllocator = .{ .backing = SQLMemoryBudget.reclaimingAllocator(a) };
-            // Rolling completions can overlap parent copies and child scratch.
-            // Both allocator paths serialize through the same quota lock.
-            var parent: scheduler.LockedAllocator = .{ .backing = a, .shared_mutex = &backing.mutex };
-            const parent_alloc = parent.allocator();
+            // Stable lease state outlives the rolling jobs and their scratch.
+            // Payload arenas move to the consumer; only parsing scratch is freed
+            // at completion. Both retain the original request budget chain.
+            const payloads = try a.create(MediaPayloads);
+            payloads.* = .{ .allocator = a, .backing = .{ .backing = SQLMemoryBudget.reclaimingAllocator(a) } };
+            errdefer MediaPayloads.release(payloads);
             var ready: std.Io.Event = .unset;
             var jobs: [4]MediaGroupJob = @splat(.{});
             defer for (&jobs) |*job| if (job.active) {
@@ -4486,7 +4520,7 @@ pub const AntflyApiHandler = struct {
                     if (job.task) |*task| task.await(io);
                     job.task = null;
                     if (job.failure) |err| return err;
-                    for (job.group.references.items) |slot| output[slot] = try parent_alloc.dupe(u8, job.output.?[slot]);
+                    for (job.group.references.items) |slot| output[slot] = job.output.?[slot];
                     job.arena.deinit();
                     job.active = false;
                     active_bytes -= job.estimated_bytes;
@@ -4499,7 +4533,7 @@ pub const AntflyApiHandler = struct {
                     var estimate: usize = 64 * 1024;
                     for (group.references.items) |slot| estimate +|= std.base64.standard.Encoder.calcSize(references[slot].byte_length) *| 2;
                     if (estimate > byte_limit -| active_bytes and active_bytes != 0) break;
-                    job.* = .{ .active = true, .owner = self, .arena = .init(backing.allocator()), .references = references, .group = group, .deadline = deadline, .io = io, .ready = &ready, .estimated_bytes = estimate };
+                    job.* = .{ .active = true, .owner = self, .arena = .init(payloads.backing.allocator()), .payload_allocator = try payloads.append(), .references = references, .group = group, .deadline = deadline, .io = io, .ready = &ready, .estimated_bytes = estimate };
                     active_bytes += estimate;
                     next += 1;
                     job.task = if (estimate <= byte_limit)
@@ -4520,12 +4554,13 @@ pub const AntflyApiHandler = struct {
                 };
                 if (!finished) try ready.wait(io);
             }
-            return output;
+            return .{ .urls = output, .owner = payloads, .release = MediaPayloads.release };
         }
         const MediaGroupJob = struct {
             active: bool = false,
             owner: *GatewaySources = undefined,
             arena: std.heap.ArenaAllocator = undefined,
+            payload_allocator: std.mem.Allocator = undefined,
             references: []const inference_gateway.source_media.Reference = &.{},
             group: inference_gateway.source_media.Group = .{},
             deadline: u64 = 0,
@@ -4546,7 +4581,7 @@ pub const AntflyApiHandler = struct {
                     self.failure = err;
                     return;
                 };
-                self.owner.lookupGroup(a, self.references, self.group, self.deadline, self.output.?) catch |err| {
+                self.owner.lookupGroup(a, self.references, self.group, self.deadline, self.output.?, self.payload_allocator) catch |err| {
                     self.failure = err;
                 };
             }
@@ -4554,6 +4589,7 @@ pub const AntflyApiHandler = struct {
         const MediaResult = struct {
             ctx: ?*httpx.Context = null,
             a: std.mem.Allocator,
+            payload_allocator: ?std.mem.Allocator = null,
             references: []const inference_gateway.source_media.Reference,
             group: inference_gateway.source_media.Group,
             output: [][]const u8,
@@ -4686,7 +4722,7 @@ pub const AntflyApiHandler = struct {
                     if (owned[field_slot] == null) {
                         if (value.string.len > 32 * 1024 * 1024 -| self.retained) return error.InferenceRequestTooLarge;
                         self.retained += value.string.len;
-                        owned[field_slot] = try self.a.dupe(u8, value.string);
+                        owned[field_slot] = try (self.payload_allocator orelse self.a).dupe(u8, value.string);
                     }
                     self.output[slot] = owned[field_slot].?;
                 }
@@ -4696,7 +4732,7 @@ pub const AntflyApiHandler = struct {
                 if (self.seen != expected) return error.InferenceSourceUnavailable;
             }
         };
-        fn lookupGroup(self: *@This(), a: std.mem.Allocator, references: []const inference_gateway.source_media.Reference, group: inference_gateway.source_media.Group, deadline: u64, output: [][]const u8) !void {
+        fn lookupGroup(self: *@This(), a: std.mem.Allocator, references: []const inference_gateway.source_media.Reference, group: inference_gateway.source_media.Group, deadline: u64, output: [][]const u8, payload_allocator: std.mem.Allocator) !void {
             if (self.ctx.isCancellationRequested()) return error.Canceled;
             var legacy = false;
             const flat = group.requiresFlatValues();
@@ -4743,7 +4779,7 @@ pub const AntflyApiHandler = struct {
                         return context.isCancellationRequested();
                     }
                 }.cancelled };
-                var collector: MediaResult = .{ .ctx = self.ctx, .a = a, .references = references, .group = group, .output = output, .wire = .empty, .legacy = legacy, .flat = flat };
+                var collector: MediaResult = .{ .ctx = self.ctx, .a = a, .payload_allocator = payload_allocator, .references = references, .group = group, .output = output, .wire = .empty, .legacy = legacy, .flat = flat };
                 // Representation choice only: small groups retain the cheaper
                 // owned-wire path. Declared sizes never authorize or validate
                 // content; actual wire/source and decoded limits apply in both.
@@ -20973,4 +21009,27 @@ test "httpx inference gateway typed consumers retain errors and legacy original 
     consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
     try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &.{ source_views[0], source_views[0] } }));
     try std.testing.expectEqual(error.InferenceUpstreamUnavailable, consumer.failure.?);
+}
+
+test "httpx inference gateway payload lease outlives rolling scratch and refunds budget" {
+    var budget: SQLMemoryBudget = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
+    const a = budget.allocator();
+    const Payloads = AntflyApiHandler.GatewaySources.MediaPayloads;
+    const payloads = try a.create(Payloads);
+    payloads.* = .{ .allocator = a, .backing = .{ .backing = SQLMemoryBudget.reclaimingAllocator(a) } };
+    var lease: inference_gateway.source_media.PayloadLease = .{ .owner = payloads, .release = Payloads.release };
+    errdefer lease.deinit();
+    for (0..8) |i| {
+        var scratch = std.heap.ArenaAllocator.init(payloads.backing.allocator());
+        const source = try scratch.allocator().alloc(u8, 16384);
+        @memset(source, @intCast(i));
+        const output = try payloads.append();
+        const value = try output.dupe(u8, source);
+        scratch.deinit();
+        try std.testing.expectEqual(@as(u8, @intCast(i)), value[0]);
+        try std.testing.expectEqual(@as(u8, @intCast(i)), value[value.len - 1]);
+    }
+    try std.testing.expect(budget.live > 8 * 16384);
+    lease.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
 }

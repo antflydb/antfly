@@ -26,6 +26,18 @@ pub const Port = struct {
     /// permission, membership and the expected revision in the SAME query.
     lookup: *const fn (*anyopaque, A, Reference) anyerror![]const u8,
     lookup_many: ?*const fn (*anyopaque, A, []const Reference) anyerror![]const []const u8 = null,
+    /// Optional move-owned payloads. The consumer releases the lease before its
+    /// allocator/budget dies, after the last provider read of the resolved input.
+    lookup_owned: ?*const fn (*anyopaque, A, []const Reference) anyerror!PayloadLease = null,
+};
+pub const PayloadLease = struct {
+    urls: []const []const u8 = &.{},
+    owner: ?*anyopaque = null,
+    release: ?*const fn (*anyopaque) void = null,
+    pub fn deinit(self: *PayloadLease) void {
+        if (self.release) |release| release(self.owner.?);
+        self.* = .{};
+    }
 };
 const Selected = struct { part: *V, reference: Reference };
 // Guard data before typed cloning or fixed-depth encoders. Recursion is bounded
@@ -65,7 +77,14 @@ fn collect(a: A, value: V, selected: *std.ArrayList(Selected)) !void {
     }
 }
 pub fn resolve(a: A, request: V, port: ?Port) !void {
-    if (request != .object) return;
+    // Compatibility callers require allocator-owned values after this function.
+    var copying = port;
+    if (copying) |*value| value.lookup_owned = null;
+    var lease = try resolveOwned(a, request, copying);
+    lease.deinit();
+}
+pub fn resolveOwned(a: A, request: V, port: ?Port) !PayloadLease {
+    if (request != .object) return .{};
     var selected: std.ArrayList(Selected) = .empty;
     defer selected.deinit(a);
     if (request.object.get("input")) |input| try collect(a, input, &selected);
@@ -75,7 +94,7 @@ pub fn resolve(a: A, request: V, port: ?Port) !void {
         };
     }
     if (request.object.get("messages")) |messages| try collect(a, messages, &selected);
-    if (selected.items.len == 0) return;
+    if (selected.items.len == 0) return .{};
     try validateDepth(request, 0);
     const authorized = port orelse return error.InferenceSourceUnsupported;
     var bytes: usize = 0;
@@ -114,11 +133,13 @@ pub fn resolve(a: A, request: V, port: ?Port) !void {
             try references.append(a, item.reference);
         }
     }
-    const urls = if (authorized.lookup_many) |batch| try batch(authorized.ptr, a, references.items) else sequential: {
+    var lease: PayloadLease = if (authorized.lookup_owned) |owned| try owned(authorized.ptr, a, references.items) else .{ .urls = if (authorized.lookup_many) |batch| try batch(authorized.ptr, a, references.items) else sequential: {
         const output = try a.alloc([]const u8, references.items.len);
         for (references.items, output) |reference, *url| url.* = try authorized.lookup(authorized.ptr, a, reference);
         break :sequential output;
-    };
+    } };
+    errdefer lease.deinit();
+    const urls = lease.urls;
     if (urls.len != references.items.len) return error.InferenceSourceMismatch;
     // Decode/inspect a distinct payload once per request. Matching references
     // still independently check digest, MIME, byte count and their pixel limit.
@@ -147,6 +168,7 @@ pub fn resolve(a: A, request: V, port: ?Port) !void {
         _ = item.part.object.swapRemove("source");
         try item.part.object.put(a, "image_url", .{ .string = urls[slot] });
     }
+    return lease;
 }
 const Verified = struct { bytes: usize, digest: [64]u8, mime: []const u8, pixels: u64 };
 fn verify(a: A, reference: Reference, url: []const u8) !void {
@@ -209,6 +231,36 @@ test "httpx inference gateway source references validate all locators before aut
     const rendered = try std.json.Stringify.valueAlloc(temp, value, .{});
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"source\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "data:image/png;base64,") != null);
+    // Leased values stay alive through consumption, then release exactly once.
+    const Owned = struct {
+        url: []const u8,
+        releases: usize = 0,
+        urls: [1][]const u8 = undefined,
+        fn lookup(raw: *anyopaque, _: A, refs: []const Reference) !PayloadLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), refs.len);
+            self.urls[0] = self.url;
+            return .{ .urls = &self.urls, .owner = self, .release = release };
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+    var owned: Owned = .{ .url = fake.url };
+    const owned_port: Port = .{ .ptr = &owned, .lookup = Fake.lookup, .lookup_owned = Owned.lookup };
+    const leased_value = try std.json.parseFromSliceLeaky(V, temp, body, .{});
+    var lease = try resolveOwned(temp, leased_value, owned_port);
+    try std.testing.expectEqual(@as(usize, 0), owned.releases);
+    const leased_parts = leased_value.object.get("inputs").?.array.items[0].object.get("input").?.array.items[0].object.get("content").?.array.items;
+    for (leased_parts) |part| try std.testing.expect(part.object.get("image_url").?.string.ptr == fake.url.ptr);
+    lease.deinit();
+    lease.deinit();
+    try std.testing.expectEqual(@as(usize, 1), owned.releases);
+    owned.url = "invalid";
+    const failed_lease = try std.json.parseFromSliceLeaky(V, temp, body, .{});
+    try std.testing.expectError(error.InferenceSourceMismatch, resolveOwned(temp, failed_lease, owned_port));
+    try std.testing.expectEqual(@as(usize, 2), owned.releases);
     fake.allowed = false;
     const denied = try std.json.parseFromSliceLeaky(V, temp, body, .{});
     try std.testing.expectError(error.Forbidden, resolve(temp, denied, port));

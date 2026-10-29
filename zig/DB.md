@@ -532,6 +532,26 @@ Evidence:
 - Production HTTP server construction selects the process request allocator
   internally; request-allocator injection is test-only.
 
+### Selected Range Ownership
+
+Read scopes distinguish whole-value retention, selected copies from a complete
+point value, and native selected-range I/O. The native LSM reader and cursor
+adapter copy selected spans; Lite reads selected ranges. Range-shaped methods
+alone do not prove that physical reads or retained buffers are small.
+
+Selected LSM reads use a temporary point-result owner under storage working-set
+admission. Complete values and block pins retire after each document; returned
+spans use the caller's allocation budget and remain valid until scope reset or
+close. Ordinary full-value reads keep their ownership contract. Revision proofs,
+directories and primary bytes come from the same pinned transaction.
+
+Projection windows share a bounded plan between admission and execution,
+including explicit selected-read and full-read decisions. Estimates include
+coalesced spans, reconstruction and setup; logical work still charges original
+source sizes. Whole-value readers check cancellation between documents. Native
+selected I/O keeps its bounded batch walk; other scanners retain their existing
+physical-work limits. These limits do not bound backend caches or process RSS.
+
 ## Write Contract
 
 `DB.batch()` is document-first.

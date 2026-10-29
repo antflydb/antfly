@@ -3655,6 +3655,45 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 return getFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, &self.last_l0_group_index, &self.read_hint, &self.held_blocks, &self.held_values, self.allocator, p.namespace, key);
             }
 
+            pub fn rangeReadMode(_: *@This()) backend_erased.RangeReadMode {
+                return .selected_copy;
+            }
+
+            pub fn getRanges(self: *@This(), key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+                if (ranges.len != output.len) return error.InvalidBatch;
+                if (ranges.len == 0) return;
+                // Pins and any complete point-result copy belong to one
+                // temporary storage working-set owner, never the output scope.
+                var work = PointReadScratch.init(self.parent.backend);
+                defer work.deinit();
+                var temporary: @This() = .{ .parent = self.parent, .allocator = work.allocator(), .last_l0_group_index = self.last_l0_group_index };
+                defer temporary.close();
+                const value = temporary.get(key) catch |err| return work.failure(err);
+                self.last_l0_group_index = temporary.last_l0_group_index;
+                const Owner = @This();
+                const Copy = struct {
+                    owner: *Owner,
+                    bytes: []const u8,
+                    pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
+                        return copyPointValue(ctx.owner.parent.backend, ctx.owner.allocator, &ctx.owner.held_values, ctx.bytes[begin..][0..len]);
+                    }
+                };
+                try @import("../value_ranges.zig").read(value.len, ranges, output, Copy{ .owner = self, .bytes = value });
+            }
+            pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
+                if (requests.len > 64) return error.InvalidBatch;
+                for (requests, 0..) |request, i| {
+                    if (request.ranges.len != request.output.len or request.ranges.len > @import("../value_ranges.zig").maximum_ranges) return error.InvalidBatch;
+                    if (i != 0 and std.mem.order(u8, requests[i - 1].key, request.key) == .gt) return error.InvalidBatch;
+                }
+                for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+            }
+            pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+                var output: [1][]const u8 = undefined;
+                try self.getRanges(key, &.{.{ .offset = offset, .length = length }}, &output);
+                return output[0];
+            }
+
             pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
                 if (keys.len != values.len) return error.InvalidBatch;
                 @memset(values, null);

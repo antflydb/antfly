@@ -26354,3 +26354,44 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
     try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
     metadata.limit = std.math.maxInt(usize);
 }
+
+test "logical value native LSM ranges retain selected copies and release payload pins" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |cache_enabled| {
+        var backing = storage_io.MemoryStorage.init(a);
+        defer backing.deinit();
+        var backend = try Backend.open(a, "/selected-range-ownership", .{ .storage = backing.storage(), .flush_threshold = 1, .table_block_compression = .none, .local_block_cache_enabled = cache_enabled });
+        defer backend.close();
+        var store = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer store.deinit();
+        const body = try a.alloc(u8, 32768);
+        defer a.free(body);
+        @memset(body, 'x');
+        var write = try store.beginWrite();
+        try write.put("a", body);
+        const other = try a.dupe(u8, body);
+        defer a.free(other);
+        @memset(other, 'y');
+        try write.put("b", other);
+        try write.commit();
+        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+        defer read.abort();
+        var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 8192 };
+        var scope = try read.openReadScope(result_budget.allocator());
+        defer scope.close();
+        try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, scope.rangeReadMode());
+        const first = try scope.getRange("a", 0, 16);
+        const second = try scope.getRange("b", 32752, 16);
+        try std.testing.expectEqual(@as(usize, 0), scope.held_blocks.items.len);
+        try std.testing.expect(scope.held_values.items.len > 0);
+        while (backend.run_block_cache.items.len != 0) {
+            const cached = backend.run_block_cache.items[0];
+            backend.evictCachedRunBlocksForRun(cached.path, cached.run_id);
+        }
+        try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", first);
+        try std.testing.expectEqualStrings("yyyyyyyyyyyyyyyy", second);
+        try std.testing.expectError(error.EndOfStream, scope.getRange("a", 32768, 1));
+        scope.reset();
+        try std.testing.expect(result_budget.live < 8192);
+    }
+}

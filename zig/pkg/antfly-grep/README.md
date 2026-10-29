@@ -5041,7 +5041,15 @@ clustered-ID read CPU about 79–85% and spread-ID read CPU about 41–49%, with
 values, scores and counts. Initial short-run latency and other controls vary;
 these are warm synthetic measurements, not universal guarantees. Canonical
 fingerprinting avoids a payload-sized allocation using a fixed 4 KiB buffer.
-Range-batch admission and direct parent media allocation experiments were left
+Earlier range-batch admission and direct parent media allocation experiments were left
 out after their CPU/memory gains failed to hold consistently. The design includes
 both experimental sets, final controls, hashes and reproduction commands. Raw
 JSON reports/logs stay ignored. Public query syntax and ASCH25 remain unchanged.
+
+
+The [selected-range ownership design](../../../docs/design/antfly-grep.md#selected-range-ownership-and-shared-window-plans)
+separates retained output from physical I/O cost. Native LSM range results retain
+selected copies while temporary whole-value results retire after each document.
+Projection windows reuse both selected-read and full-read plans. Gateway media
+jobs transfer request-local payload leases while releasing query scratch at
+completion; repeated references to one field can share the retained bytes.

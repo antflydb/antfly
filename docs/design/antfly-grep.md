@@ -1806,3 +1806,123 @@ and gained the complete required preamble. The numerical tables above remain
 measurements of the explicitly pinned executables, rather than a new build
 of the later main merge. Full merged-head CI still requires the repository's
 maintainer approval signal.
+
+### Selected-range ownership and shared window plans
+
+Range-shaped APIs do not by themselves prove a small working set. The generic
+cursor adapter previously copied complete values into its scope before slicing
+ranges; admission based only on selected lengths could therefore retain many
+whole large documents. The cursor adapter now copies only coalesced selected
+spans while its current cursor value is borrowed. Those owned spans remain valid
+across subsequent seeks and until scope reset/close. Engine caches and the
+cursor's current value retain their existing ownership and limits.
+
+Read scopes explicitly distinguish whole-value retention, copying selected spans
+from a borrowed whole value, and native selected-range I/O. The native LSM reader
+and cursor adapter retain selected copies; the native Lite reader performs
+selected-range I/O. Unknown adapters default to conservative whole-value admission. Cursor-backed
+windows check cancellation between whole-document reads; native selected I/O
+retains its batched range walk. Existing document scanners keep their physical
+work windows when copying selected spans still requires reading whole values.
+The capability is internal runtime metadata.
+
+For capable scopes, selected output windows reuse a single revision-bound range
+plan for both admission and execution. Unplanned, selected and full-read choices
+are distinct states, so full-read fallbacks are cached too. Parent selections
+subsume descendants.
+The admission estimate includes coalesced span bytes (including bounded gaps),
+reconstructed values, escaped ancestor keys and field/range/value headers.
+Windows admit at most 64 documents and target 1 MiB of planned work, with a
+separate selected-range setup limit. Copy-backed scopes also retain a separate
+1 MiB original-value work window; only native selected I/O can admit by selected
+bytes alone. Oversized copy-backed documents keep the single-document path and
+are rejected before allocating a batch plan. Cached selections store pointers,
+so scalar and full-read fallbacks do not copy an inline range plan for every row. Actual request allocation quotas remain
+in force; this target is not an RSS bound or an estimate of backend cache/page
+footprints. Full-source, missing-authority, old/unsupported and nonselective
+reads retain the existing full-read fallback and accounting. Source revisions,
+range digests and authorization still determine correctness.
+
+The regression suite checks overlap elimination, missing selections, full-read
+fallback and range-plan reuse. A cursor test restricts its allocator to 8 KiB
+while reading selected spans from a 32 KiB value and changes the borrowed source
+on each seek. This proves that selected reads neither require retaining the
+whole value nor return views invalidated by a later cursor move.
+
+The native LSM range reader releases temporary full-value copies and block pins
+after each document, retaining only packed selected spans in the output scope.
+Temporary point results use the existing storage working-set admission owner;
+selected outputs retain the caller allocation budget. Full-value `get` and
+`getManySorted` keep their original ownership contract.
+
+### Owned gateway media payloads
+
+The public inference gateway can consume a request-local media payload lease.
+The ordinary source lookup, row authorization, revision/identity binding and
+content verification still run for every distinct source claim. The lease
+changes allocation ownership only; it grants no authority and is never cached
+across requests.
+
+Concurrent source groups allocate retained strings in separate payload arenas.
+Each rolling job continues to use a reclaiming scratch arena for query delivery,
+JSON parsing and selector evaluation. Completion transfers string views, frees
+scratch immediately and retains only the payload arenas. One stable allocator
+lock serializes allocation through the original request budget chain. The
+consumer releases the lease after its last provider read, before the request
+arena and budget leave scope; error and verification paths release it too.
+Batch items release their own leases rather than accumulating them across the
+batch. Synchronous and streaming providers complete input consumption before
+returning from the bounded gateway executor.
+
+Allocator-owned lookup remains available. Its completion copy preserves pointer
+sharing for independently checked references to the same stored field. Identical
+source claims are already deduplicated before lookup; equal byte contents from
+separate documents do not share read authorization.
+
+Unlike allocating outputs directly in the parent request arena, this ownership
+model makes payload buffers individually reclaimable after consumption. It
+eliminates concurrent completion copies without retaining each job's parsing
+scratch. Small/sequential groups retain their existing allocator-owned path.
+
+Qualification compares the exact previous PR head with the candidate,
+using the same main merge, compiler and release flags. It uses
+alternating rounds and exact source verification before `ModelRequired`.
+The media matrix includes shared fields, distinct images, skewed sizes and
+repeated row/field references with independent pixel limits. Provider billing
+and inference quality are outside these model-free measurements. Raw reports,
+logs and binary manifests remain ignored under `output/projection-followup/`.
+
+
+### Qualification-driven admission correction
+
+The first ownership candidate (`006c424f5579dd282e25285f0321bf11d0ec8be9cf57b4facd65a908414a7946`)
+was compared against the exact previous PR runtime at `c1666f8859`, using baseline
+`5c47279a8f37f8ef4a682fa64425cee0f839469a801cff7d681326f96ebd3e1d`.
+Both included main `207cd9ca3b` and used identical Zig 0.17.0 stripped ReleaseFast
+flags. Five alternating rounds cover nine media cases, scalar projections,
+nested object/array projections, wide outputs and escaped values. Scalar repeats
+use 100 requests per round; nested controls use 50. Exact outputs, identities,
+scores and total counts agree; media stops after content verification at
+`ModelRequired`.
+
+This candidate did not establish general query throughput gains. Repeated
+64-document scalar reads cost 3.094 → 3.142 ms CPU for 1 MiB values and
+1.459 → 1.502 ms for 16 KiB values. Nested 1 MiB values cost
+3.412 → 3.574 ms. Large ordinary-source CPU changed direction between the
+initial and longer run (13.331 → 14.067 ms, then 13.119 → 12.544 ms).
+Eight distinct 512×512 images improved 103.729 → 95.937 ms CPU, but most
+media cases were approximately flat. Repeated 256×256 references improved
+11.652 → 11.281 ms CPU; repeated 512×512 references were flat.
+Sampled RSS and process footprint differ substantially under host memory
+compression and reclamation, so these observations do not prove an RSS bound
+or universal allocation savings.
+
+The planner was corrected before final qualification: avoid allocating a
+64-row plan before rejecting oversized copy-backed input, store cached plans
+by pointer, and preserve an independent original-byte window for copied
+ranges. This also prevents a small selected-output estimate from widening
+whole-value I/O and delaying cancellation or first delivery. Native selected
+I/O retains selection-based admission. The ownership tests establish bounded
+retention and lifetimes independently of these throughput measurements.
+The initial reports remain separate from final merged-tree qualification;
+none of these numbers describe the corrected executable.

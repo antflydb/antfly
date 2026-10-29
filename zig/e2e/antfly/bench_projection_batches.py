@@ -37,6 +37,12 @@ def main():
     p.add_argument("--documents", type=int, default=64)
     p.add_argument("--value-bytes", type=int, default=1048576)
     p.add_argument("--rounds", type=int, default=5)
+    p.add_argument(
+        "--metadata-shape",
+        choices=("scalar", "nested"),
+        default="scalar",
+        help="nested projects an object with arrays in addition to scalar receipt fields",
+    )
     p.add_argument("--queries-per-phase", type=int, default=5)
     args = p.parse_args()
     if not (
@@ -57,6 +63,12 @@ def main():
         }
         for i in range(args.documents)
     }
+    if args.metadata_shape == "nested":
+        for i, document in enumerate(documents.values()):
+            document["metadata"]["details"] = {
+                "owners": [{"id": j, "role": "viewer"} for j in range(8)],
+                "labels": ["code", "docs", f"document-{i}"],
+            }
     corpus = hashlib.sha256()
     for key, document in documents.items():
         corpus.update(json.dumps([key, document], sort_keys=True).encode())
@@ -96,7 +108,11 @@ def main():
                         ).raise_for_status()
                     query = {
                         "query": {"bool": {"filter": {"ids": list(documents)}}},
-                        "fields": ["metadata.revision", "metadata.allowed"],
+                        "fields": (
+                            ["metadata"]
+                            if args.metadata_shape == "nested"
+                            else ["metadata.revision", "metadata.allowed"]
+                        ),
                         "limit": args.documents,
                     }
                     seed = {
@@ -136,7 +152,7 @@ def main():
                         assert {h["_id"] for h in hits} == set(documents)
                         for hit in hits:
                             assert hit["_source"] == {
-                                "metadata": {"revision": "r1", "allowed": True}
+                                "metadata": documents[hit["_id"]]["metadata"]
                             }
                             values = hit["_computed"]
                             assert (
@@ -201,13 +217,14 @@ def main():
     report = {
         "schema_version": 1,
         "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "scope": "Identity-only warmup then conditional hits; no large payload output, no model; one shard; shared host; CPU whole process, RSS sampled",
+        "scope": "Identity-only warmup then conditional hits; metadata shape distinguishes scalar receipts from nested object/array reconstruction. No large payload output or model; one shard; shared host; CPU whole process, RSS sampled",
         "platform": platform.platform(),
         "cpu_count": os.cpu_count(),
         "rounds": args.rounds,
         "queries_per_phase": args.queries_per_phase,
         "documents": args.documents,
         "value_bytes": args.value_bytes,
+        "metadata_shape": args.metadata_shape,
         "corpus_sha256": corpus.hexdigest(),
         "output_sha256": expected_hash,
         "binaries": {k: file_info(v) for k, v in binaries.items()},

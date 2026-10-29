@@ -45,6 +45,8 @@ WORKLOADS = [
     ("large_distinct_unique_eight", 256, False, False, 8),
     ("skewed_distinct_eight", 512, False, False, 8),
     ("large_512_distinct_unique_eight", 512, False, False, 8),
+    ("large_distinct_repeated_refs", 256, False, False, 4),
+    ("large_512_distinct_repeated_refs", 512, False, False, 4),
 ]
 
 
@@ -106,6 +108,17 @@ def main():
                         },
                     }
                 )
+            if name.endswith("repeated_refs"):
+                # Same row/field, independently checked limits: canonical source
+                # dedup must retain each claim, while storage/output can share.
+                references = [
+                    {
+                        **part,
+                        "source": {**part["source"], "max_pixels": size * size + j},
+                    }
+                    for part in references
+                    for j in range(2 if size == 512 else 4)
+                ]
             request = {"input": [{"role": "user", "content": references}]}
             corpora[name] = hashlib.sha256(
                 json.dumps(documents, sort_keys=True).encode()

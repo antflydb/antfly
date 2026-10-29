@@ -392,7 +392,8 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     var execution = options;
     execution.attachments = payload.attachments;
     const request = payload.value;
-    try source_media.resolve(a, request, execution.source_port);
+    var media_lease = try source_media.resolveOwned(a, request, execution.source_port);
+    defer media_lease.deinit();
     if (request != .object) return error.InvalidInferenceRequest;
     if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
