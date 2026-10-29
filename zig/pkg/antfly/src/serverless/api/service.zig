@@ -76,6 +76,13 @@ pub const Service = struct {
         return result;
     }
 
+    /// The owning public-batch task has already reserved and activated the
+    /// finite durable lifetime. Reuse it without a second task or admission.
+    pub fn ingestBatchInCompletion(self: *Service, req: api_types.IngestBatchRequest, execution: *Runnable.Execution) !api_types.IngestBatchResult {
+        _ = try execution.completionRemainingNs();
+        return self.ingestBatchControlled(req, .none, execution);
+    }
+
     const IngestCompletion = struct {
         service: *Service,
         request: api_types.IngestBatchRequest,

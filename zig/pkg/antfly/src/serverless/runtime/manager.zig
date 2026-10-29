@@ -219,33 +219,34 @@ pub const ManagedRuntime = struct {
                 .io = self.io,
                 .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
                 .retained_bytes = @sizeOf(Runnable.Execution),
-            }, .background, self.runnable_slots) catch |err| {
+            }, .background, 1) catch |err| {
                 try pass.check();
                 return err;
             };
             try pass.check();
+            pass.execution = &execution;
         }
-        try lockAtomicWithCancellation(&self.run_mu, bridge.token());
+        try pass.lock(&self.run_mu);
         defer self.run_mu.unlock();
 
         var stats = RuntimeRunStats{};
         if (self.cfg.publish_enabled) {
             try self.chargeWork(.publish_round, 1);
-            const publish_stats = try self.publisher.runOnceWithCancellation(bridge.token());
+            const publish_stats = try self.publisher.runOnceWithMaintenance(pass);
             stats.published_namespaces = publish_stats.published_namespaces;
             stats.publish_budget_rejected_namespaces = publish_stats.budget_rejected_namespaces;
             stats.publish_head_conflicts = publish_stats.head_conflicts;
             stats.work_lease_conflicts += publish_stats.lease_conflicts;
             stats.work_lease_takeovers += publish_stats.lease_takeovers;
         }
-        try self.cancellationCheckpoint();
+        try pass.ownerCheckpoint();
 
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         for (namespaces) |namespace| {
             try cancellation.check();
-            try self.cancellationCheckpoint();
+            try pass.ownerCheckpoint();
             const policy = self.catalog.getPolicy(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -255,10 +256,10 @@ pub const ManagedRuntime = struct {
                 else => return err,
             };
             defer status.deinit(self.alloc);
-            if (!try self.enrichNamespaceWithStatus(namespace.name, policy, status, cancellation, &stats)) continue;
+            if (!try self.enrichNamespaceWithStatus(namespace.name, policy, status, cancellation, pass.execution, &stats)) continue;
 
             if (self.compactor) |*compactor| {
-                try self.cancellationCheckpoint();
+                try pass.ownerCheckpoint();
                 if (self.cfg.compaction_enabled) {
                     if (status.compaction_recommended) {
                         var held_lease: ?build_mod.work_lease.HeldLease = null;
@@ -313,7 +314,7 @@ pub const ManagedRuntime = struct {
             }
 
             if (self.cfg.prune_enabled) {
-                try self.cancellationCheckpoint();
+                try pass.ownerCheckpoint();
                 try self.chargeWork(.prune_round, 1);
                 var result = self.pruner.pruneNamespaceUntil(
                     namespace.name,
@@ -346,17 +347,28 @@ pub const ManagedRuntime = struct {
         namespace: []const u8,
         cancellation: CancellationToken,
     ) !RuntimeRunStats {
+        return self.runNamespaceMaterializationWithExecution(namespace, cancellation, null);
+    }
+
+    pub fn runNamespaceMaterializationWithExecution(
+        self: *ManagedRuntime,
+        namespace: []const u8,
+        cancellation: CancellationToken,
+        execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution,
+    ) !RuntimeRunStats {
         if (!self.supportsSynchronousMaterialization()) return error.MaterializationUnavailable;
         if (namespace.len == 0) return error.InvalidNamespace;
-        try cancellation.check();
-        try lockAtomicWithCancellation(&self.run_mu, cancellation);
+        var pass = self.cancellationToken();
+        pass.cooperative = cancellation;
+        pass.execution = execution;
+        try pass.lock(&self.run_mu);
         defer self.run_mu.unlock();
 
         const policy = try self.catalog.getPolicy(namespace);
         var status = try self.catalog.buildStatus(namespace);
         defer status.deinit(self.alloc);
         var stats = RuntimeRunStats{};
-        if (!try self.enrichNamespaceWithStatus(namespace, policy, status, cancellation, &stats)) {
+        if (!try self.enrichNamespaceWithStatus(namespace, policy, status, cancellation, null, &stats)) {
             return error.MaterializationUnavailable;
         }
         try cancellation.check();
@@ -394,6 +406,7 @@ pub const ManagedRuntime = struct {
         policy: catalog_mod.NamespacePolicy,
         status: catalog_mod.BuildStatus,
         cancellation: CancellationToken,
+        execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution,
         stats: *RuntimeRunStats,
     ) !bool {
         try cancellation.check();
@@ -429,9 +442,12 @@ pub const ManagedRuntime = struct {
         };
         var maintenance = self.cancellationToken();
         maintenance.cooperative = cancellation;
+        maintenance.execution = execution;
         if (held_lease) |*lease| maintenance = lease.cancellation(maintenance);
         try self.chargeWork(.enrichment_round, 1);
         try maintenance.check();
+        var cpu_phase = try maintenance.beginCpuPhase(self.runnable_slots);
+        defer cpu_phase.deinit();
 
         const maybe_table_record = self.catalog.getTableForNamespaceAlloc(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -507,6 +523,7 @@ pub const ManagedRuntime = struct {
             },
             else => return err,
         };
+        try cpu_phase.finish();
         stats.enriched_namespaces += enrichment.enriched_namespaces;
         stats.enriched_documents += enrichment.enriched_documents;
         stats.enrichment_wal_appends += enrichment.wal_appends;

@@ -59,6 +59,7 @@ pub const BuildOptions = struct {
     provenance: Provenance = .{},
     io: ?std.Io = null,
     max_parallelism: usize = 1,
+    execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution = null,
     topology_requirements: ?metrics.TopologyRequirements = null,
     topology_checksum: [32]u8 = @splat(0),
     /// Optional current-ordinal vectors recovered from the last compatible
@@ -72,6 +73,7 @@ pub const BuildOptions = struct {
 pub const ComputeRuntime = struct {
     io: ?std.Io = null,
     max_parallelism: usize = 1,
+    execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution = null,
 
     pub fn validate(self: ComputeRuntime) !void {
         if (self.max_parallelism == 0 or self.max_parallelism > max_compute_parallelism) return error.InvalidGraphMetricBuildOptions;
@@ -761,6 +763,7 @@ fn publishPreparedComputationsAlloc(
             .provenance = provenance,
             .io = runtime.io,
             .max_parallelism = runtime.max_parallelism,
+            .execution = runtime.execution,
             .topology_requirements = group_requirements,
             .topology_checksum = topology_checksums[first],
         };
@@ -2598,9 +2601,20 @@ fn buildFromProjectionAlloc(alloc: Allocator, projection: Projection, options: B
     return buildAdmittedProjectionAlloc(alloc, projection, options);
 }
 
+fn beginKernelPhase(options: BuildOptions) !?@import("../maintenance_cancellation.zig").Token.CpuPhase {
+    const execution = options.execution orelse return null;
+    return try (@import("../maintenance_cancellation.zig").Token{
+        .io = options.io orelse return error.MissingBackendRuntimeIo,
+        .cooperative = options.cancellation,
+        .execution = execution,
+    }).beginCpuPhase(options.max_parallelism);
+}
+
 fn buildAdmittedProjectionAlloc(alloc: Allocator, projection: Projection, options: BuildOptions) !BuildResult {
     const kernel_options = kernelOptions(options);
     const topology = projection.topology orelse return error.InvalidGraphMetricBuildOptions;
+    var phase = try beginKernelPhase(options);
+    defer if (phase) |*owner| owner.deinit();
     var result = switch (options.config.kind) {
         .degree => try metrics.degreeTopologyAlloc(alloc, topology, kernel_options),
         .pagerank => try metrics.pageRankTopologyAlloc(alloc, topology, kernel_options),
@@ -2614,6 +2628,7 @@ fn buildAdmittedProjectionAlloc(alloc: Allocator, projection: Projection, option
         },
     };
     defer result.deinit(alloc);
+    if (phase) |*owner| try owner.finish();
     return try encodeMetricResultAlloc(alloc, projection.node_ids.items, options, result);
 }
 
@@ -2652,8 +2667,11 @@ fn publishHitsPairFromProjectionAlloc(
     try chargeKernelWork(first_options, projection);
 
     const topology = projection.topology orelse return error.InvalidGraphMetricBuildOptions;
+    var phase = try beginKernelPhase(first_options);
+    defer if (phase) |*owner| owner.deinit();
     var pair = try metrics.hitsTopologyAlloc(alloc, topology, kernelOptions(first_options));
     defer pair.deinit(alloc);
+    if (phase) |*owner| try owner.finish();
     const first_scores = if (first_options.config.kind == .hits_authority) pair.authorities else pair.hubs;
     const second_scores = if (second_config.kind == .hits_authority) pair.authorities else pair.hubs;
     const first_result = metrics.Result{ .scores = first_scores, .iterations_completed = pair.iterations_completed, .converged = pair.converged, .delta = pair.delta };
@@ -4050,7 +4068,27 @@ test "serverless lake graph metrics share one bounded HITS execution for a compa
     };
     // 604 HITS kernel work items plus sixteen projection/filter work items.
     const limits = Limits{ .max_work_items = 620, .max_total_work_items = 620 };
-    const published = try publishManyFromGraphArtifactOracleAlloc(alloc, &artifacts, "graph", source, &configs, .none, limits, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Probe = struct {
+        scheduler: *Runnable.Scheduler,
+        saw_team: std.atomic.Value(bool) = .init(false),
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.scheduler.stats().runnable_slots == 2) self.saw_team.store(true, .release);
+        }
+    };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .cleanup_slots = 1 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .background);
+    var probe: Probe = .{ .scheduler = &scheduler };
+    var requests: [2]PublicationRequest = undefined;
+    for (&requests, configs) |*request, config| request.* = .{ .graph_index_name = "graph", .source_graph = source, .config = config, .provenance = .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 } };
+    var budget: graph_metric_policy.Budget = .{ .limits = limits };
+    const published = try publishRequestsOracleAlloc(alloc, &artifacts, &requests, .{ .ptr = &probe, .check_fn = Probe.check }, limits, &budget, .{ .io = std.testing.io, .max_parallelism = 2, .execution = &execution });
+    try std.testing.expect(probe.saw_team.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -4484,4 +4522,67 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "serverless execution graph kernels own their team and restore serial encoding on success and rejection" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Probe = struct {
+        scheduler: *Runnable.Scheduler,
+        reject_parallel: bool,
+        saw_team: std.atomic.Value(bool) = .init(false),
+        saw_serial_after: std.atomic.Value(bool) = .init(false),
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.scheduler.stats().runnable_slots == 2) {
+                self.saw_team.store(true, .release);
+                if (self.reject_parallel) return error.WorkLeaseLost;
+            } else if (self.saw_team.load(.acquire)) self.saw_serial_after.store(true, .release);
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var graph: graph_segment.Builder = .{ .alloc = alloc };
+    defer graph.deinit();
+    try graph.addEdge("a", "b", "cites", 1, null);
+    const payload = try graph.encodeAlloc(1 << 20, .none);
+    defer alloc.free(payload);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    const id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ artifact_store.sha256_artifact_id_prefix, checksum });
+    defer alloc.free(id);
+    const source: artifact_ref.ArtifactRef = .{ .kind = .graph_segment, .name = "graph", .artifact_id = id, .checksum = &checksum, .byte_len = payload.len };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .cleanup_slots = 1 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = io }, .background);
+    for ([_]bool{ false, true, false }) |reject| {
+        var probe: Probe = .{ .scheduler = &scheduler, .reject_parallel = reject };
+        const options: BuildOptions = .{
+            .graph_index_name = "graph",
+            .config = .{ .name = "pagerank" },
+            .source_graph = source,
+            .io = io,
+            .max_parallelism = 2,
+            .execution = &execution,
+            .cancellation = .{ .ptr = &probe, .check_fn = Probe.check },
+        };
+        if (reject) {
+            try std.testing.expectError(error.WorkLeaseLost, buildFromGraphPayloadAlloc(alloc, payload, options));
+        } else {
+            var built = try buildFromGraphPayloadAlloc(alloc, payload, options);
+            defer built.deinit(alloc);
+            var decoded = try metric_segment.decodeAlloc(alloc, built.payload);
+            defer decoded.deinit(alloc);
+            try std.testing.expect(decoded.score("b").? > decoded.score("a").?);
+            try std.testing.expect(probe.saw_serial_after.load(.acquire));
+        }
+        try std.testing.expect(probe.saw_team.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    }
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

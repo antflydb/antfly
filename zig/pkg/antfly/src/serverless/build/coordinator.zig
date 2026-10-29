@@ -145,6 +145,16 @@ pub const BackgroundPublisher = struct {
         return self.runOnceWithToken(.{ .io = self.io, .requested = &self.stop_requested, .cooperative = cancellation });
     }
 
+    pub fn runOnceWithMaintenance(self: *BackgroundPublisher, parent: maintenance_cancellation.Token) !PublishRunStats {
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = parent };
+        return self.runOnceWithToken(.{
+            .io = self.io,
+            .requested = &self.stop_requested,
+            .cooperative = bridge.token(),
+            .execution = parent.execution,
+        });
+    }
+
     /// Both the standalone publisher and managed runtime honor pending-tail
     /// deadlines even when their normal maintenance poll is much longer.
     pub fn nextWakeDelayMs(self: *BackgroundPublisher, poll_ms: u64) u64 {
@@ -154,7 +164,7 @@ pub const BackgroundPublisher = struct {
     }
 
     fn runOnceWithToken(self: *BackgroundPublisher, cancellation: maintenance_cancellation.Token) !PublishRunStats {
-        try self.run_mutex.lock(self.io);
+        try cancellation.lock(&self.run_mutex);
         defer self.run_mutex.unlock(self.io);
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
@@ -163,7 +173,7 @@ pub const BackgroundPublisher = struct {
         self.budget_backoff.beginPass();
         self.coalescing.beginPass();
         for (namespaces) |namespace| {
-            try cancellation.check();
+            try cancellation.ownerCheckpoint();
             self.coalescing.touch(namespace.name);
             const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
             // Eligibility precedes all document loading and impact prediction.

@@ -426,3 +426,41 @@ the complete focused serverless binary pass all five lifecycle cases and the
 managed ingestion/publication checks. Published-read polling may observe
 retryable capacity responses before success within its existing retry bound.
 The failed baseline and native socket/stack diagnostics remain available.
+
+
+## Serverless maintenance execution phases
+
+Managed orchestration now starts with one background CPU. Waiting for the
+runtime or publisher mutex returns CPU on the same execution and executor;
+reentry precedes the next lock attempt, so queued CPU never retains that lock.
+Synchronous public-batch materialization borrows the request's existing producer
+capability for these waits and its bounded retry sleeps.
+
+The original maintenance authority survives namespace leases and graph-source
+protection. Owner-only publication checkpoints remain separate from parallel
+cancellation checks. Graph kernels grow the existing team before joined work
+and restore its previous width before encoding/publication, including compatible
+HITS pairs and rejected computation. Enrichment retains its configured stage
+width pending finer provider/model integration.
+
+Public batches reserve their bounded completion task and metadata before
+possible WAL acceptance. The task borrows the existing request executor and
+execution; the physical WAL reuses its activated completion. Optional sync waits
+retain the original narrower sync restriction and leave terminal-response time
+inside the finite completion. Foreground rejection and scheduler close after
+acceptance preserve the committed/pending response. This introduces no new
+per-request executor or independent scheduler root.
+
+The focused native gate exercises real HTTP ingestion and `full_index` batches,
+filesystem WAL/publication, and exact published postimages. A work-cost probe
+checks one-CPU orchestration with a configured two-CPU build width. The native
+page-graph builder verifies authority propagation through leases and publication;
+separate legacy-payload/kernel fixtures cover shared HITS work, serial restoration
+and healthy reuse after rejection. Background and request-borrowed mutex tests
+preserve original rejection while a competing request owns all general CPU.
+
+This is an integrated CPU-phase and synchronous-caller increment. Admission
+around physical provider I/O, finer joined-kernel participant scheduling, and
+model/provider waits remain required to complete the maintenance milestone.
+Local filesystem evidence does not qualify remote/cloud providers or all engines;
+the existing full-qualification waiver and failed file-engine resource gate remain.

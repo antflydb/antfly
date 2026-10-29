@@ -298,6 +298,27 @@ fn managedListenerFixture(contended: bool) !void {
     });
     defer server.deinit();
     const scheduler = &server.stack.runnable_scheduler.?;
+    const PhaseProbe = struct {
+        scheduler: *@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler,
+        observed: std.atomic.Value(bool) = .init(false),
+        fn charge(raw: *anyopaque, _: runtime_mod.manager.RuntimeWorkKind, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            while (!self.scheduler.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.scheduler.mutex.unlock();
+            var entry = self.scheduler.entries;
+            while (entry) |owner| : (entry = owner.all_next) {
+                if (owner.class == .background and owner.state == .running) {
+                    try std.testing.expectEqual(@as(usize, 1), owner.slots);
+                    self.observed.store(true, .release);
+                    return;
+                }
+            }
+            return error.MaintenanceOwnerMissing;
+        }
+    };
+    var phase_probe: PhaseProbe = .{ .scheduler = scheduler };
+    if (contended) server.stack.runtime.setWorkCostPort(.{ .ptr = &phase_probe, .charge_fn = PhaseProbe.charge });
+
     try std.testing.expectEqual(@as(@TypeOf(scheduler.config.capacity_mode), .fixed), scheduler.config.capacity_mode);
     try std.testing.expect(scheduler.config.max_bytes <= 2 << 20);
     try std.testing.expectEqual(@as(usize, 1), scheduler.config.cleanup_slots);
@@ -426,9 +447,27 @@ fn managedListenerFixture(contended: bool) !void {
     defer query.deinit();
     try std.testing.expectEqual(@as(u64, 1), query.value.version);
     try std.testing.expectEqualStrings("docs", query.value.table_name);
+    if (contended) try std.testing.expect(phase_probe.observed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), query.value.documents.len);
     try std.testing.expectEqualStrings("doc-a", query.value.documents[0].doc_id);
     try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", query.value.documents[0].body);
+
+    const batch_uri = try std.fmt.allocPrint(alloc, "{s}/tables/docs/batch", .{base_uri});
+    defer alloc.free(batch_uri);
+    var batch = try client_exec.executor().execute(alloc, .{
+        .method = .POST,
+        .uri = batch_uri,
+        .content_type = "application/json",
+        .body = "{\"inserts\":{\"doc-b\":{\"body\":\"beta\"}},\"sync_level\":\"full_index\"}",
+    });
+    defer batch.deinit(alloc);
+    if (batch.status != 201) std.debug.print("native public batch HTTP {d}: {s}\n", .{ batch.status, batch.body });
+    try std.testing.expectEqual(@as(u16, 201), batch.status);
+    var updated = try tables.queryPublished(base_uri, "docs");
+    defer updated.deinit();
+    try std.testing.expectEqual(@as(usize, 2), updated.value.documents.len);
+    try std.testing.expectEqualStrings("doc-b", updated.value.documents[1].doc_id);
+    try std.testing.expectEqualStrings("{\"body\":\"beta\"}", updated.value.documents[1].body);
 }
 
 test "serverless server query-only role rejects maintenance routes but serves reads" {

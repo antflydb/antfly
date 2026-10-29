@@ -862,3 +862,85 @@ test "serverless execution response conversion retires partial allocations" {
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
+
+test "serverless execution maintenance mutex wait lends CPU and preserves original rejection" {
+    const manager = @import("serverless/runtime/manager.zig");
+    const Job = struct {
+        runtime: *manager.ManagedRuntime,
+        request_driven: bool,
+        owner: Runnable.Execution = .{},
+        canceled: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            if (requested(raw)) return error.CatalogGenerationChanged;
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled.load(.acquire);
+        }
+        fn perform(self: *@This()) !void {
+            const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .check_fn = check };
+            if (self.request_driven) {
+                var completion = try @import("api/runnable_write_team.zig").Completion.init(&self.owner, std.testing.allocator);
+                const team = try completion.team();
+                const parent = try team.borrow.producerParent();
+                var bridge = try @import("api/runnable_native_borrow.zig").Bridge.init(&parent, std.testing.allocator);
+                var execution: Runnable.Execution = .{};
+                defer execution.finish();
+                try bridge.bind(&execution);
+                _ = try self.runtime.runNamespaceMaterializationWithExecution("docs", cancellation, &execution);
+            } else _ = try self.runtime.runOnceWithCancellation(cancellation);
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.perform() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |request_driven| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .max_wait_ms = 2000 });
+        defer scheduler.close();
+        var runtime: manager.ManagedRuntime = .{
+            .alloc = std.testing.allocator,
+            .io = io,
+            .cfg = .{},
+            // No provider may be touched before this held mutex is rejected.
+            .catalog = undefined,
+            .publisher = undefined,
+            .pruner = undefined,
+            .enricher = @as(@import("serverless/enrichment/mod.zig").SparseEnricher, undefined),
+            .runnable_scheduler = &scheduler,
+            .runnable_slots = 2,
+        };
+        try std.testing.expect(runtime.run_mu.tryLock());
+        defer runtime.run_mu.unlock();
+        var job: Job = .{ .runtime = &runtime, .request_driven = request_driven };
+        defer job.owner.finish();
+        if (request_driven) try job.owner.startWithSlots(&scheduler, .{ .io = io, .cancellation = .{ .ptr = &job, .requested = Job.requested } }, .write, 2);
+        var future = try io.concurrent(Job.run, .{&job});
+        defer future.cancel(io);
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (scheduler.stats().resource_blocked == 0) {
+            if (job.done.load(.acquire)) return job.failure orelse error.MaintenanceDidNotWait;
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.MaintenanceDidNotWait;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        var foreground: Runnable.Execution = .{};
+        defer foreground.finish();
+        try foreground.startWithSlots(&scheduler, .{ .io = io }, .query, 2);
+        job.canceled.store(true, .release);
+        future.await(io);
+        try std.testing.expectEqual(error.CatalogGenerationChanged, job.failure.?);
+        // A borrowed scope never retires its request parent's reservation.
+        if (request_driven) {
+            try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+            job.owner.finish();
+        }
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        foreground.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}

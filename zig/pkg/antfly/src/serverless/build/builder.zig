@@ -199,7 +199,7 @@ pub const Builder = struct {
             .expected_head = expected,
             .candidate_version = candidate_version,
         });
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         return try compareAndSwapHeadGuarded(
             self.progress,
             namespace,
@@ -398,7 +398,7 @@ pub const Builder = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const targets = plan.targets;
         var head = try self.loadCurrentHeadManifestAlloc(namespace);
         defer head.deinit(self.alloc);
@@ -417,7 +417,7 @@ pub const Builder = struct {
 
         const records = try self.wal.readFromAlloc(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         const applicable_records = try applicableWalRecordsForHeadAlloc(self.alloc, records, current_head);
         defer self.alloc.free(applicable_records);
@@ -523,7 +523,7 @@ pub const Builder = struct {
         else
             try allocMutationEntriesFromRecords(self.alloc, applicable_records);
         defer segment_mod.freeEntries(self.alloc, mutation_entries);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         const mutation_artifact = if (inline_document_rebase)
             null
@@ -538,7 +538,7 @@ pub const Builder = struct {
             var owned = artifact;
             owned.deinit(self.alloc);
         };
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         // The normalized page plan is the graph impact oracle. Do not parse
         // before/after JSON here and then parse it again during publication.
@@ -546,7 +546,7 @@ pub const Builder = struct {
         defer freeMaterializerMutations(self.alloc, materialized.mutations);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.base_documents);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         const document_ref = blk: {
             if (materialized.partial) {
@@ -562,7 +562,7 @@ pub const Builder = struct {
             break :blk try artifactRefFromMetadataAlloc(self.alloc, .document_segment, artifact);
         };
         defer freeArtifactRef(self.alloc, document_ref);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
         const text_refs = try buildTextArtifactRefsForMaterializedDocsAllocUntil(
@@ -576,7 +576,7 @@ pub const Builder = struct {
             cancellation,
         );
         defer freeArtifactRefs(self.alloc, text_refs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const sparse_refs = try buildSparseArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
@@ -588,7 +588,7 @@ pub const Builder = struct {
             cancellation,
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const vector_refs = try buildVectorArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
@@ -603,7 +603,7 @@ pub const Builder = struct {
             cancellation,
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
         const graph_refs = try buildGraphArtifactRefsFromImpactAllocUntil(
@@ -620,7 +620,7 @@ pub const Builder = struct {
             cancellation,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const graph_metric_specs = if (targets.include_graph)
             try graph_metric_config.parseIndexSpecsAlloc(self.alloc, plan.table_definition.indexes_json)
         else
@@ -647,7 +647,7 @@ pub const Builder = struct {
                 .{},
             );
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const document_base_version = if (!inline_document_rebase) blk: {
             if (current_manifest) |current| {
                 if (findArtifactIndex(current, .document_segment) != null) {
@@ -699,7 +699,7 @@ pub const Builder = struct {
         defer manifest.deinit(self.alloc);
         try publishDocumentFactsForManifest(self.alloc, self.artifacts, &manifest, current_manifest, materialized.documents, materialized.mutations, publication_guard, cancellation);
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         try stampPublicationFence(&manifest, publication_guard);
         const published_version = try putManifestForPublication(
@@ -735,7 +735,7 @@ pub const Builder = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         var manifest = try manifest_mod.cloneManifest(self.alloc, current);
         defer manifest.deinit(self.alloc);
         manifest.version = std.math.add(u64, current_head, 1) catch return error.ManifestVersionExhausted;
@@ -782,7 +782,7 @@ pub const Builder = struct {
         cancellation: ?maintenance_cancellation.Token,
         consumed_record: ?wal_mod.Record,
     ) !BuildResult {
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         var manifest = reconcile: {
             if (current) |prior| if (plan.external_source_plan) |external_plan| {
                 if (externalSourceDescriptorMatchesManifest(external_plan, prior))
@@ -801,7 +801,7 @@ pub const Builder = struct {
         }
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         try stampPublicationFence(&manifest, publication_guard);
         const published_version = try putManifestForPublication(
             self.manifests,
@@ -850,7 +850,7 @@ pub const Builder = struct {
         cancellation: ?maintenance_cancellation.Token,
         consumed_record: ?wal_mod.Record,
     ) !BuildResult {
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const targets = plan.targets;
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
@@ -883,7 +883,7 @@ pub const Builder = struct {
             break :blk try artifactRefFromMetadataAlloc(self.alloc, .document_segment, document_artifact);
         };
         defer freeArtifactRef(self.alloc, document_ref);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
@@ -916,7 +916,7 @@ pub const Builder = struct {
             );
         };
         defer freeArtifactRefs(self.alloc, text_refs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         const sparse_sources = try search_sources.listSparseSourcesAlloc(self.alloc, targets.published_search_sources);
         defer search_sources.freeSparseSourceDescriptors(self.alloc, sparse_sources);
@@ -948,7 +948,7 @@ pub const Builder = struct {
             cancellation,
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         const vector_refs = try buildVectorArtifactRefsForRepublishAlloc(
             self.alloc,
@@ -962,7 +962,7 @@ pub const Builder = struct {
             cancellation,
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
@@ -984,7 +984,7 @@ pub const Builder = struct {
             cancellation,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const graph_metric_specs = if (targets.include_graph)
             try graph_metric_config.parseIndexSpecsAlloc(self.alloc, plan.table_definition.indexes_json)
         else
@@ -1024,7 +1024,7 @@ pub const Builder = struct {
             plan.derived_output_actions,
         );
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
 
         const wal_end_lsn = if (consumed_record) |record| record.lsn else current.wal_end_lsn;
         var manifest = try buildCompactedManifestFromRefsAlloc(
@@ -1057,7 +1057,7 @@ pub const Builder = struct {
         }
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         try stampPublicationFence(&manifest, publication_guard);
         const published_version = try putManifestForPublication(
             self.manifests,
@@ -1171,7 +1171,7 @@ pub const Builder = struct {
         if (records.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
         var input_bytes: usize = 0;
         for (records) |record| {
-            try maintenance_cancellation.check(cancellation);
+            try maintenance_cancellation.ownerCheckpoint(cancellation);
             input_bytes = std.math.add(usize, input_bytes, record.payload.len) catch return error.LakeSidecarBuildBudgetExceeded;
             if (input_bytes > limits.max_input_bytes) return error.LakeSidecarBuildBudgetExceeded;
         }
@@ -1223,7 +1223,7 @@ pub const Builder = struct {
         defer query_mod.freeMaterializedDocuments(self.alloc, built_documents.documents);
         if (built_documents.documents.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
         for (built_documents.documents) |doc| {
-            try maintenance_cancellation.check(cancellation);
+            try maintenance_cancellation.ownerCheckpoint(cancellation);
             input_bytes = std.math.add(usize, input_bytes, doc.body.len) catch return error.LakeSidecarBuildBudgetExceeded;
             if (input_bytes > limits.max_input_bytes) return error.LakeSidecarBuildBudgetExceeded;
         }
@@ -4369,7 +4369,7 @@ pub const GraphSourceProtection = struct {
     }
 
     pub fn token(self: *GraphSourceProtection, io: std.Io) maintenance_cancellation.Token {
-        return .{ .io = io, .cooperative = .{ .ptr = self, .check_fn = check } };
+        return .{ .io = io, .cooperative = .{ .ptr = self, .check_fn = check }, .execution = if (self.parent) |parent| parent.execution else null };
     }
 
     fn check(ptr: *const anyopaque) !void {
@@ -4759,6 +4759,7 @@ pub fn buildGraphMetricArtifactRefsAlloc(
     return try lake_graph_metric.publishRequestsWithPriorAlloc(alloc, artifacts, requests.items, if (current) |manifest| manifest.artifacts else &.{}, cancellation, graph_metric_limits, &graph_metric_budget, .{
         .io = io,
         .max_parallelism = if (io == null) 1 else max_parallelism,
+        .execution = if (maintenance) |token| token.execution else null,
     });
 }
 
@@ -7031,6 +7032,24 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
         .table_definition = .{ .indexes_json = indexes_json },
     };
     var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Probe = struct {
+        scheduler: *Runnable.Scheduler,
+        saw_team: std.atomic.Value(bool) = .init(false),
+        saw_serial_after: std.atomic.Value(bool) = .init(false),
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.scheduler.stats().runnable_slots == 2) self.saw_team.store(true, .release) else if (self.saw_team.load(.acquire)) self.saw_serial_after.store(true, .release);
+        }
+    };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .cleanup_slots = 1 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .background);
+    var probe: Probe = .{ .scheduler = &scheduler };
+    builder.setIo(std.testing.io);
+    try builder.setGraphMetricMaxParallelism(2);
 
     const first_mutation = try api_codec.encodeMutationAlloc(alloc, .{
         .kind = .upsert,
@@ -7039,8 +7058,21 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     });
     defer alloc.free(first_mutation);
     _ = try wal_store.append("docs", 100, first_mutation);
-    var first_result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    var first_result = try builder.publishNamespaceWithMetricAndPlanGuardedUntil("docs", .cosine, plan, null, .{
+        .io = std.testing.io,
+        .execution = &execution,
+        .cooperative = .{ .ptr = &probe, .check_fn = Probe.check },
+    });
     defer first_result.deinit(alloc);
+    try std.testing.expect(probe.saw_team.load(.acquire));
+    try std.testing.expect(probe.saw_serial_after.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    // Continue the existing compatibility/recovery matrix without a managed
+    // execution; the first publication above exercises the owning path.
+    builder.setIo(null);
     var first = try manifest_store.getAlloc("docs", 1);
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 1), first.stats.graph_segment_count);
