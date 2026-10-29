@@ -591,7 +591,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native short lived writers",
         "capi native marker sweep",
         "capi native unbounded writer admits reusable pool before a large request",
-        "capi native allocator proof survives close",
+        "capi native allocator proof",
         "capi native close bounds proof work",
         "capi native text queries",
         "capi native replacement wait",
@@ -672,6 +672,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_test_step = b.step("capi-test", "Run C API tests");
     capi_test_step.dependOn(&run_capi_tests.step);
+    // Share the exact contract executable while allowing focused API
+    // regressions to avoid compiling unrelated resolver replay fixtures.
+    b.step("capi-contract-test", "Run hermetic C API contracts without resolver replay suites")
+        .dependOn(&run_capi_tests.step);
+    // Physical C API regressions can build their existing implementation owner
+    // directly. The ordinary gate still audits and runs both partitions.
+    @import("../antfly/test_partitions.zig").installLocalArtifact(b, capi_tests.executable, "capi-contract-owner-test-build", "Build physical C API contract tests without consumer discovery", "capi-contract-owner-tests");
 
     // Resolver and scorer are owned by embedded storage. Run their pure tests
     // in embedded CI as well as the compatibility lib-* test targets.

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
+import errno
 import json
 import os
 import platform
@@ -554,7 +555,16 @@ def clone_audit_cache(
     def copy(source_file, destination_file):
         relative = Path(source_file).relative_to(source)
         if relative.parts[0] in {"o", "p"} and not relative.name.endswith(".lock"):
-            os.link(source_file, destination_file)
+            try:
+                os.link(source_file, destination_file)
+            except OSError as err:
+                if err.errno != errno.EXDEV:
+                    raise
+                # CI phase caches can live on a PVC while fixture temporary
+                # directories live on the runner filesystem. Copy immutable
+                # bytes once across that boundary instead of bootstrapping the
+                # compiler again. Same-volume worker snapshots still hard-link.
+                return shutil.copy2(source_file, destination_file)
             return str(destination_file)
         return shutil.copy2(source_file, destination_file)
 

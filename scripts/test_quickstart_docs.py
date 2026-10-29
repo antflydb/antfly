@@ -282,14 +282,14 @@ def main() -> int:
         "full_text_index_v0",
         "antfly index wait --table wikipedia",
         "--until source-covered=10%",
-        "Articles can produce multiple chunks",
+        "counts are per chunk, so they can exceed the article count",
         "## Troubleshooting",
         "standalone inference paths",
         "--inference-host-budget-mb 8192",
         "--no-streaming",
-        "antfly agents query-builder --table wikipedia",
+        "antfly agents query-builder",
         "--max-internal-iterations 8",
-        "Add `--execute`",
+        "[SDKs](/docs/reference/sdks)",
     )
     for token in required:
         if token not in source:
@@ -347,10 +347,10 @@ def main() -> int:
         "client.RetrievalAgent(ctx",
         "DerivedCoveragePolicyPartial",
     ):
-        if token not in source or token not in go_example:
-            fail(
-                f"Go documentation and compile-checked example must both contain {token!r}"
-            )
+        # The quickstart links to the SDKs instead of repeating their examples.
+        # Keep the standalone, compile-checked Go example on the supported API.
+        if token not in go_example:
+            fail(f"compile-checked Go example must contain {token!r}")
 
     print("quickstart documentation checks passed")
     return 0

@@ -841,3 +841,6 @@ pub const storage_db_group_source_transfer = @import("storage/db/group_source_tr
 pub const storage_db_enrichment_media_output = @import("storage/db/enrichment/media_output.zig");
 
 pub const storage_db_enrichment_media_output_counts = @import("storage/db/enrichment/media_output_counts.zig");
+
+pub const storage_db_field_projection_source = @import("storage/db/field_projection_source.zig");
+pub const storage_source_value_identity = @import("storage/source_value_identity.zig");
