@@ -937,7 +937,8 @@ pub const CatalogService = struct {
             return self.buildNamespaceGuardedUntil(namespace, held.guard(), try held.cancellation(cancellation orelse .{ .io = io }));
         }
         var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
-        const protected = protection.token(io);
+        defer protection.deinit();
+        const protected = try protection.token(io);
         var bridge = maintenance_cancellation.GraphBridge{ .maintenance = protected };
         var scoped = self.artifacts.*;
         scoped.upload_scope = .{ .domain = graph_page_store.PageStore.namespaceDomain(namespace), .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io) };

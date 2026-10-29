@@ -4056,6 +4056,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-asset-provider-wait-test", "Verify asset HTTP/capability waits and independently owned compatibility workers")
         .dependOn(&b.addRunArtifact(asset_provider_wait_tests).step);
 
+    const read_pin_renewal_tests = b.addTest(.{
+        .name = "read-pin-renewal-tests",
+        .root_module = serverless_execution_root,
+        .filters = &.{ "serverless execution manifest pins", "serverless execution held lease", "serverless execution model invocations preserve", "serverless sparse enricher can", "serverless sparse enricher idles", "serverless builder publishes first manifest", "serverless builder retries interrupted publication", "serverless execution managed metadata" },
+        .max_rss = 16 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-read-pin-renewal-test", "Verify shared manifest renewal, passive checks and joined provider cleanup")
+        .dependOn(&b.addRunArtifact(read_pin_renewal_tests).step);
+
     const lease_renewal_tests = b.addTest(.{
         .name = "lease-renewal-tests",
         .root_module = serverless_execution_root,

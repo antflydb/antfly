@@ -2392,3 +2392,185 @@ test "serverless execution held lease renewals own control work and keep watchdo
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
 }
+
+test "serverless execution manifest pins share renewal and join blocked provider callbacks" {
+    const renewal_mod = @import("serverless/build/lease_renewal.zig");
+    const read_lease = @import("serverless/manifest/read_lease.zig");
+    const Pin = @import("serverless/manifest/read_pin.zig").Pin;
+    const FsProgress = @import("serverless/catalog/fs_progress_store.zig").FsProgressStore;
+    const ObjectProgress = @import("serverless/catalog/object_progress_store.zig").ObjectProgressStore;
+    const objectstore = @import("objectstore");
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
+    const time = @import("antfly_platform").time;
+    const Mode = enum { success, canceled, expired, detach };
+    const Fixture = struct {
+        threaded: std.Io.Threaded,
+        armed: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        detached: std.atomic.Value(bool) = .init(false),
+        release: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn sync(raw: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(raw.?));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            if (self.armed.swap(false, .acq_rel)) {
+                self.entered.store(true, .release);
+                try self.release.wait(threaded.io());
+            }
+            return threaded.io().vtable.fileSync(raw, file);
+        }
+        fn renew(_: *anyopaque, _: Context) !u64 {
+            return time.realtimeNs() + 10 * std.time.ns_per_s;
+        }
+        fn detach(self: *@This(), pin: *Pin) void {
+            pin.deinit();
+            self.detached.store(true, .release);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |objects| for (std.enums.values(Mode)) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(root);
+        var fixture: Fixture = .{ .threaded = .init(a, .{}) };
+        defer fixture.threaded.deinit();
+        var io = fixture.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.fileSync = Fixture.sync;
+        io.vtable = &vtable;
+        var native = try FsProgress.init(a, root);
+        defer native.deinit();
+        var filesystem = try objectstore.FilesystemClient.initWithIo(a, root, io);
+        defer filesystem.deinit();
+        var object_progress = try ObjectProgress.initWithClient(a, filesystem.client(), "pins", "");
+        defer object_progress.deinit();
+        var progress = if (objects) object_progress.progressStore() else native.progressStore();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = io, .retained_bytes = 65536 }, .background, 2);
+        var canceled = std.atomic.Value(bool).init(false);
+        const parent: maintenance.Token = .{ .io = io, .execution = &execution, .requested = &canceled };
+        var worker: renewal_mod.Renewal = .{};
+        try worker.start(parent, &fixture, Fixture.renew, 20 * std.time.ns_per_ms, time.realtimeNs() + 10 * std.time.ns_per_s, io);
+        defer worker.stop();
+        var shared = parent;
+        shared.renewals = &worker;
+        progress.context = (Context{ .io = io }).withExecution(&execution);
+        const age = read_lease.duration_ns - 2 * std.time.ns_per_s;
+        // Existing durable rights near their renewal margin, without waiting
+        // ten minutes. The acquisition and subsequent refresh use real stores.
+        const initial = try read_lease.acquireAt(&progress, "docs", 1, time.realtimeNs() - age, time.authorityNs() - age);
+        var pin: Pin = .{ .progress = &progress, .namespace = "docs", .version = 1, .parent = shared };
+        try pin.start(initial);
+        defer pin.deinit();
+        // Nested graph scopes must reuse the worker instead of consuming the
+        // small reserved control-child pool on every nesting level.
+        var nested: [8]Pin = undefined;
+        var count: usize = 0;
+        defer while (count > 0) {
+            count -= 1;
+            nested[count].deinit();
+        };
+        const other_lease = try read_lease.acquireAt(&progress, "docs", 2, time.realtimeNs(), time.authorityNs());
+        for (&nested) |*item| {
+            item.* = .{ .progress = &progress, .namespace = "docs", .version = 2, .parent = if (count == 0) shared else pin.maintenanceToken() };
+            try item.start(other_lease);
+            count += 1;
+        }
+        // A renewal child is independent of the model CPU team. Ordinary
+        // children still prevent resizing until their physical join.
+        try execution.resizeTeam(1);
+        try execution.resizeTeam(2);
+        var read: @import("api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = a };
+        try std.testing.expectEqual(@as(usize, 2), (try read.team()).borrow.cpu_slots);
+        var ordinary: Runnable.Execution = .{};
+        defer ordinary.finish();
+        try ordinary.reserveChild(&execution, io, 4096);
+        try std.testing.expectError(error.InvalidRunnableTransition, execution.resizeTeam(1));
+        try std.testing.expectError(error.InvalidRunnableTransition, read.team());
+        ordinary.finish();
+        try std.testing.expectEqual(@as(usize, 1), execution.entry.?.control_children);
+        fixture.armed.store(true, .release);
+        try execution.park(.resource_blocked);
+        const until = time.monotonicNs() + 3 * std.time.ns_per_s;
+        defer fixture.release.set(io);
+        while (!fixture.entered.load(.acquire)) {
+            try pin.check();
+            if (time.monotonicNs() >= until) return error.PinRenewalDidNotEnterProvider;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        const calls = fixture.calls.load(.acquire);
+        for (0..64) |_| try pin.token().check();
+        try std.testing.expectEqual(calls, fixture.calls.load(.acquire));
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.startWithSlots(&scheduler, .{ .io = io, .allow_wait = false }, .query, 2);
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        var detach: ?std.Io.Future(void) = null;
+        defer if (detach) |*future| future.cancel(io);
+        if (mode == .detach) {
+            detach = try io.concurrent(Fixture.detach, .{ &fixture, &pin });
+            try io.sleep(.fromMilliseconds(10), .awake);
+            try std.testing.expect(!fixture.detached.load(.acquire));
+        }
+        if (mode == .canceled) canceled.store(true, .release);
+        if (mode == .expired) pin.authority_deadline.store(time.authorityNs(), .release);
+        fixture.release.set(io);
+        if (mode == .success) {
+            while (pin.unix_deadline.load(.acquire) <= initial.unix_deadline) {
+                try pin.check();
+                if (time.monotonicNs() >= until) return error.PinRenewalDidNotPublish;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try pin.check();
+            // Retirement prevents new rights, but does not revoke a live pin
+            // before its renewal margin. A failed source must not poison an
+            // independent reader registered on the same control worker.
+            try std.testing.expect(try progress.compareAndSwapManifestGcFloor("docs", null, 2));
+            try pin.check();
+            pin.unix_deadline.store(time.realtimeNs() + 2 * std.time.ns_per_s, .release);
+            pin.authority_deadline.store(time.authorityNs() + 2 * std.time.ns_per_s, .release);
+            while (true) {
+                pin.check() catch |err| {
+                    try std.testing.expectEqual(error.ManifestVersionRetired, err);
+                    break;
+                };
+                if (time.monotonicNs() >= until) return error.PinRetirementWasNotObserved;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try nested[0].check();
+        } else if (mode == .canceled) {
+            try std.testing.expectError(error.Canceled, pin.check());
+        } else if (mode == .expired) {
+            try std.testing.expectError(error.ManifestReadLeaseExpired, pin.check());
+        } else {
+            detach.?.await(io);
+            detach = null;
+            try std.testing.expect(fixture.detached.load(.acquire));
+        }
+        // Unregister children before their parent check token can retire.
+        while (count > 0) {
+            count -= 1;
+            nested[count].deinit();
+        }
+        pin.deinit();
+        worker.stop();
+        query.finish();
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        // Unadmitted callers supply Io without an execution capability.
+        // Binding an empty execution would correctly fail closed instead.
+        progress.context = .{ .io = io };
+        _ = try read_lease.acquireAt(&progress, "unadmitted", 1, time.realtimeNs(), time.authorityNs());
+    };
+}

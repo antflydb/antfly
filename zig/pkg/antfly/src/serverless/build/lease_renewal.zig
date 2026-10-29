@@ -22,6 +22,49 @@ const Context = @import("antfly_local_sources").serverless_query_lake_read_conte
 const platform = @import("antfly_platform");
 const Rejection = @import("antfly_cancellation").Rejection;
 
+/// Intrusive registration owned by a joined source scope. Detach removes it
+/// before waiting for the one in-flight callback, so no callback outlives it.
+pub const Registration = struct {
+    owner: ?*Renewal = null,
+    next: ?*Registration = null,
+    ptr: *anyopaque = undefined,
+    callback: *const fn (*anyopaque, Context) anyerror!void = undefined,
+    generation: u64 = 0,
+    busy: std.atomic.Value(bool) = .init(false),
+    idle: std.Io.Event = .is_set,
+    refusal: Rejection = .{},
+
+    pub fn check(self: *const Registration) !void {
+        try self.refusal.check();
+    }
+    pub fn stop(self: *Registration) void {
+        const owner = self.owner orelse return;
+        platform.sync.lockYielding(&owner.registry_mutex);
+        var link = &owner.registrations;
+        while (link.* != self) link = &link.*.?.next;
+        link.* = self.next;
+        owner.registration_count -= 1;
+        const busy = self.busy.load(.acquire);
+        self.owner = null;
+        owner.registry_mutex.unlock();
+        // Cleanup may run after refusal. Park an extant grant before joining;
+        // failed reentry remains terminal and never manufactures new authority.
+        var restore: ?Runnable.Class = null;
+        if (busy) {
+            if (owner.parent.execution) |execution| {
+                const class = execution.retainedClass() catch null;
+                if (class) |value| {
+                    if (execution.park(.resource_blocked)) |_| {
+                        restore = value;
+                    } else |_| {}
+                }
+            }
+            self.idle.waitUncancelable(owner.parent.io);
+            if (restore) |class| owner.parent.execution.?.enter(class) catch {};
+        }
+    }
+};
+
 pub const Renewal = struct {
     parent: maintenance.Token = undefined,
     clock_io: std.Io = undefined,
@@ -37,7 +80,56 @@ pub const Renewal = struct {
     ready: std.Io.Event = .unset,
     activate: std.Io.Event = .unset,
     future: ?std.Io.Future(void) = null,
+    registry_mutex: std.atomic.Mutex = .unlocked,
+    registrations: ?*Registration = null,
+    registration_count: usize = 0,
+    registration_generation: u64 = 0,
 
+    pub fn attach(self: *Renewal, registration: *Registration, ptr: *anyopaque, callback: *const fn (*anyopaque, Context) anyerror!void) !void {
+        try self.check();
+        platform.sync.lockYielding(&self.registry_mutex);
+        defer self.registry_mutex.unlock();
+        if (registration.owner != null or self.registration_count >= 64) return error.SchedulerFull;
+        registration.ptr = ptr;
+        registration.callback = callback;
+        registration.next = self.registrations;
+        registration.generation = self.registration_generation;
+        registration.owner = self;
+        self.registrations = registration;
+        self.registration_count += 1;
+    }
+    fn runRegistrations(self: *Renewal, call_context: Context) void {
+        platform.sync.lockYielding(&self.registry_mutex);
+        self.registration_generation +%= 1;
+        const generation = self.registration_generation;
+        self.registry_mutex.unlock();
+        while (true) {
+            platform.sync.lockYielding(&self.registry_mutex);
+            var cursor = self.registrations;
+            while (cursor) |item| : (cursor = item.next) {
+                if (item.generation != generation) break;
+            }
+            const item = cursor orelse {
+                self.registry_mutex.unlock();
+                return;
+            };
+            item.generation = generation;
+            item.idle.reset();
+            item.busy.store(true, .release);
+            self.registry_mutex.unlock();
+            if (item.check()) |_| {
+                item.callback(item.ptr, call_context) catch |err| {
+                    _ = @intFromError(item.refusal.remember(err));
+                };
+            } else |_| {}
+            // Detach observes busy under this mutex. Publish the event before
+            // unlocking, then never touch the borrowed registration again.
+            platform.sync.lockYielding(&self.registry_mutex);
+            item.busy.store(false, .release);
+            item.idle.set(self.parent.io);
+            self.registry_mutex.unlock();
+        }
+    }
     pub fn active(self: *const Renewal) bool {
         return self.future != null;
     }
@@ -134,7 +226,9 @@ pub const Renewal = struct {
             try self.parent.io.sleep(.fromNanoseconds(@intCast(interval)), .awake);
             try self.check();
             if (scheduled) try self.execution.enterWithCheck(.control, .{ .context = self, .check = fence });
-            _ = try self.renew(self.context(if (scheduled) &self.execution else null));
+            const call_context = self.context(if (scheduled) &self.execution else null);
+            _ = try self.renew(call_context);
+            self.runRegistrations(call_context);
             if (scheduled) try self.execution.park(.resource_blocked);
         }
     }

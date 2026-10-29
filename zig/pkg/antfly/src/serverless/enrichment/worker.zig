@@ -78,36 +78,7 @@ pub const SparseEnricherConfig = struct {
     media_checkpoint_interval_ms: u64 = 1000,
 };
 
-const SourcePin = struct {
-    progress: *catalog_mod.ProgressStore,
-    namespace: []const u8,
-    version: u64,
-    parent: ?maintenance_cancellation.Token,
-    cancellation: CancellationToken,
-    lease: read_lease.Lease,
-    cache: read_lease.Cache = .{},
-
-    fn check(self: *SourcePin) !void {
-        try maintenance_cancellation.check(self.parent);
-        try self.cancellation.check();
-        try self.lease.check();
-        if (self.lease.unix_deadline -| @import("antfly_platform").time.realtimeNs() < read_lease.reuse_min_ns)
-            self.lease = try self.cache.acquire(self.progress, self.namespace, self.version);
-    }
-
-    fn token(self: *SourcePin) CancellationToken {
-        const Callbacks = struct {
-            fn run(ptr: *const anyopaque) !void {
-                try @as(*SourcePin, @ptrCast(@alignCast(@constCast(ptr)))).check();
-            }
-            fn canceled(ptr: *const anyopaque) bool {
-                run(ptr) catch return true;
-                return false;
-            }
-        };
-        return .{ .ptr = self, .check_fn = Callbacks.run, .is_cancelled_fn = Callbacks.canceled };
-    }
-};
+const SourcePin = @import("../manifest/read_pin.zig").Pin;
 
 const DerivedBodyResult = struct {
     body: ?[]u8 = null,
@@ -445,7 +416,12 @@ pub const SparseEnricher = struct {
             else => return err,
         };
         var lease_cache: read_lease.Cache = .{};
-        var pin: SourcePin = .{ .progress = self.progress, .namespace = namespace, .version = head, .parent = cancellation, .cancellation = cfg.cancellation, .lease = try lease_cache.acquire(self.progress, namespace, head) };
+        var fallback = if (cancellation == null and (self.progress.context == null or self.progress.context.?.io == null)) std.Io.Threaded.init(self.alloc, .{}) else null;
+        defer if (fallback) |*value| value.deinit();
+        const pin_io = if (cancellation) |parent| parent.io else if (self.progress.context) |context| context.io orelse fallback.?.io() else fallback.?.io();
+        var pin: SourcePin = .{ .progress = self.progress, .namespace = namespace, .version = head, .parent = (cancellation orelse maintenance_cancellation.Token{ .io = pin_io }).withContext(self.progress.context), .cancellation = cfg.cancellation };
+        try pin.start(try lease_cache.acquire(self.progress, namespace, head));
+        defer pin.deinit();
         try pin.check();
         self.model_authority = pin.token();
         var manifest = try self.manifests.getAlloc(namespace, head);

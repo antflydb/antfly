@@ -96,12 +96,13 @@ pub const Compactor = struct {
             return self.compactHeadGuardedUntil(namespace, held.guard(), try held.cancellation(cancellation orelse .{ .io = io }));
         }
         var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
+        defer protection.deinit();
         var scoped_artifacts = self.artifacts.*;
         scoped_artifacts.upload_scope = .{
             .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(namespace),
             .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io),
         };
-        const protected = protection.token(io);
+        const protected = try protection.token(io);
         var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = protected };
         var manifests = self.manifests.*;
         var progress = self.progress.*;

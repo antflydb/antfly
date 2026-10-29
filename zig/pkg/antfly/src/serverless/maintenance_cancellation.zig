@@ -30,6 +30,7 @@ pub const Token = struct {
     checkpoint_ptr: ?*anyopaque = null,
     checkpoint_fn: ?*const fn (*anyopaque) anyerror!void = null,
     provider_context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
+    renewals: ?*@import("build/lease_renewal.zig").Renewal = null,
 
     pub fn withContext(self: Token, context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context) Token {
         const value = context orelse return self;

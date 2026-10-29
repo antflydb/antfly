@@ -1153,3 +1153,59 @@ mutation/retention/immutable-artifact provider boundaries still need their full
 scheduling audit. Vendor framework/registry download preparation, serial graph
 preparation and original cross-engine recovery gates (including file-engine
 FD recovery) remain open. Full GNU/full qualification remains waived.
+
+
+### Maintenance manifest source pins (2026-10-29)
+
+Enrichment and graph publication now hold joined source-pin scopes. Their
+model/watchdog/parallel checks only inspect cached authority and sticky failures;
+they never renew a pin or mutate the owner's CPU grant. A work-lease renewal
+worker accepts bounded, intrusive source registrations, so nested graph scopes
+share its protected control child. A scope without a parent renewal worker owns
+one and propagates it to its children. Detachment removes a registration before
+joining its in-flight callback; the callback completes its event publication
+under the registry lock before the scope can retire.
+
+Renewal checks both existing Unix and suspend-inclusive source deadlines before
+and after provider I/O. The retirement floor still brackets durable monotonic pin
+publication. A retired version may use its existing rights, but cannot renew
+those rights; one source's refusal does not poison independent registered readers.
+Native filesystem pin reads/CAS use supplied Io, bounded numeric reads, namespace
+file locking, atomic replacement and file/directory sync. Object-backed pin
+reads/CAS use the existing physical provider adapters and conditional ETags.
+Formatting, allocation and parsing remain runnable. Ordinary native CAS callers
+reserve return CPU while retaining the namespace lock; renewal children use
+their already protected control return lane.
+
+The model-invocation integration exposed a scheduler dependency: protected
+control children must not prevent the parent's ordinary CPU team from resizing.
+Per-parent control-child accounting permits that resize while ordinary children
+still require a join. Original lifetime, byte ownership and parent retirement
+checks remain in force. Synchronous unadmitted callers whose Io cannot create
+concurrent tasks use a joined local timer executor; original source cancellation
+and physical provider Io remain authoritative. Admitted callers never take that
+fallback.
+
+Focused verification uses real native and object-backed filesystem providers
+with deterministic sync barriers. It covers passive checks, unrelated query and
+health progress, cancellation, expiry during I/O, physical callback detachment,
+eight nested source scopes, retirement and independent-reader failure isolation.
+Normal builder, compactor and enrichment callers are exercised separately,
+including native and opaque model teams and durable WAL checks. This is local
+provider integration, not live-cloud or slow-disk performance qualification.
+
+The broader read-protection milestone remains open: external lake snapshot
+heartbeats still need shared admitted renewal and joined cleanup. Query/catalog
+read-pin acquisition paths, initial work-lease acquisition/release, remaining
+maintenance provider boundaries and the previously documented cross-engine
+recovery gates still need their remaining audits. Full GNU/full qualification
+remains waived.
+
+Evidence: `read-pin-renewal-v7-final.json` records the six passing production,
+serverless execution, native/opaque owner, SQL team and cleanup targets, with
+unchanged source inputs. `read-pin-renewal-v9-unadmitted.json` separately verifies
+unadmitted callers through native and object-backed pin acquisition. All
+production source hashes match the broad run; only this regression case
+was added afterward. `read-pin-renewal-final.json` binds
+these source bytes to the committed snapshots. Licensing and Apache boundary
+checks pass. No full qualification or live-cloud claim is made.

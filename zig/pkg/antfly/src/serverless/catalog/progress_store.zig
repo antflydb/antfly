@@ -190,6 +190,9 @@ pub const ProgressStore = struct {
     context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        get_manifest_gc_floor_for: ?*const fn (*anyopaque, []const u8, Context) anyerror!?u64 = null,
+        get_manifest_read_deadline_for: ?*const fn (*anyopaque, []const u8, u64, Context) anyerror!?u64 = null,
+        cas_manifest_read_deadline_for: ?*const fn (*anyopaque, []const u8, u64, ?u64, u64, Context) anyerror!bool = null,
         cas_head_for: ?*const fn (*anyopaque, []const u8, ?u64, u64, ?PublicationFence, Context) anyerror!bool = null,
         get_head_for: ?*const fn (*anyopaque, []const u8, CancellationToken, Context) anyerror!u64 = null,
         work_lease_provider: ?*const fn (*anyopaque) work_lease.Provider = null,
@@ -288,6 +291,7 @@ pub const ProgressStore = struct {
     /// Record it before removing content so interrupted GC cannot resurrect
     /// partially deleted history when the retention policy increases.
     pub fn getManifestGcFloor(self: *ProgressStore, namespace: []const u8) !?u64 {
+        if (self.context) |context| if (self.vtable.get_manifest_gc_floor_for) |get| return get(self.ptr, namespace, context);
         return try self.vtable.get_manifest_gc_floor(self.ptr, namespace);
     }
 
@@ -299,12 +303,14 @@ pub const ProgressStore = struct {
     /// version. Publish before checking MANIFEST_GC_FLOOR; collectors advance
     /// that floor before reading deadlines. An unsupported backend fails closed.
     pub fn getManifestReadDeadline(self: *ProgressStore, namespace: []const u8, version: u64) !?u64 {
+        if (self.context) |context| if (self.vtable.get_manifest_read_deadline_for) |get| return get(self.ptr, namespace, version, context);
         const get = self.vtable.get_manifest_read_deadline orelse return error.ManifestReadLeasesUnsupported;
         return get(self.ptr, namespace, version);
     }
 
     pub fn compareAndSwapManifestReadDeadline(self: *ProgressStore, namespace: []const u8, version: u64, expected: ?u64, deadline: u64) !bool {
         if (expected) |prior| if (deadline < prior) return false;
+        if (self.context) |context| if (self.vtable.cas_manifest_read_deadline_for) |cas| return cas(self.ptr, namespace, version, expected, deadline, context);
         const cas = self.vtable.compare_and_swap_manifest_read_deadline orelse return error.ManifestReadLeasesUnsupported;
         return cas(self.ptr, namespace, version, expected, deadline);
     }

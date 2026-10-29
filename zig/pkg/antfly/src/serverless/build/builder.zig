@@ -380,12 +380,13 @@ pub const Builder = struct {
             return self.publishNamespaceWithMetricAndPlanGuardedUntil(namespace, vector_metric, plan, held.guard(), try held.cancellation(cancellation orelse .{ .io = io }));
         }
         var protection = try GraphSourceProtection.init(self.progress, namespace, cancellation);
+        defer protection.deinit();
         var scoped_artifacts = self.artifacts.*;
         scoped_artifacts.upload_scope = .{
             .domain = graph_page_store.PageStore.namespaceDomain(namespace),
             .attempt = try graphPublicationAttempt(publication_guard, namespace, io),
         };
-        const protected = protection.token(io);
+        const protected = try protection.token(io);
         var upload_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = protected };
         if (protected.execution != null) scoped_artifacts.write_context = upload_bridge.readContext();
         var scoped_manifests = self.manifests.*;
@@ -1176,7 +1177,8 @@ pub const Builder = struct {
         defer if (fallback) |*value| value.deinit();
         const io = if (parent_cancellation) |token| token.io else self.io orelse fallback.?.io();
         var protection = try GraphSourceProtection.initAt(self.progress, namespace, current.version, parent_cancellation);
-        const cancellation = protection.token(io);
+        defer protection.deinit();
+        const cancellation = try protection.token(io);
         var cancellation_bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
 
         const start_lsn = current.wal_end_lsn + 1;
@@ -4368,7 +4370,7 @@ pub const GraphSourceProtection = struct {
     progress: *catalog_mod.ProgressStore,
     namespace: []const u8,
     version: u64,
-    cache: graph_read_lease.Cache = .{},
+    pin: ?@import("../manifest/read_pin.zig").Pin = null,
 
     pub fn init(progress: *catalog_mod.ProgressStore, namespace: []const u8, parent: ?maintenance_cancellation.Token) !GraphSourceProtection {
         const version = progress.getHead(namespace) catch |err| switch (err) {
@@ -4383,21 +4385,21 @@ pub const GraphSourceProtection = struct {
         return .{ .parent = parent, .lease = try cache.acquire(progress, namespace, version), .progress = progress, .namespace = namespace, .version = version };
     }
 
-    pub fn token(self: *GraphSourceProtection, io: std.Io) maintenance_cancellation.Token {
-        return .{ .io = io, .cooperative = .{ .ptr = self, .check_fn = check }, .execution = if (self.parent) |parent| parent.execution else null };
-    }
-
-    fn check(ptr: *const anyopaque) !void {
-        const self: *GraphSourceProtection = @ptrCast(@alignCast(@constCast(ptr)));
-        try maintenance_cancellation.check(self.parent);
-        if (self.lease) |lease| {
-            // Renew only existing live rights, after validating the writer's
-            // authority. A fenced owner cannot reacquire a retired source.
-            try lease.check();
-            const now = @import("antfly_platform").time.realtimeNs();
-            if (lease.unix_deadline -| now < graph_read_lease.reuse_min_ns)
-                self.lease = try self.cache.acquire(self.progress, self.namespace, self.version);
+    pub fn token(self: *GraphSourceProtection, io: std.Io) !maintenance_cancellation.Token {
+        const parent = (self.parent orelse maintenance_cancellation.Token{ .io = io }).withContext(self.progress.context);
+        if (self.lease) |initial| {
+            if (self.pin == null) {
+                self.pin = .{ .progress = self.progress, .namespace = self.namespace, .version = self.version, .parent = parent };
+                errdefer self.pin = null;
+                try self.pin.?.start(initial);
+            }
+            return self.pin.?.maintenanceToken();
         }
+        return parent;
+    }
+    pub fn deinit(self: *GraphSourceProtection) void {
+        if (self.pin) |*pin| pin.deinit();
+        self.pin = null;
     }
 };
 

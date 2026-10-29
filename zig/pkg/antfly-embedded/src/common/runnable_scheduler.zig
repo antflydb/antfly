@@ -240,6 +240,7 @@ pub const Entry = struct {
     /// until this entry's owning finish, including stopped and blocked work.
     parent: ?*Entry = null,
     children: usize = 0,
+    control_children: usize = 0,
     class: Class,
     read_lane: ReadLane = .general,
     read_transition_budget: ?ReadTransitionBudget = null,
@@ -1100,6 +1101,7 @@ pub const Scheduler = struct {
         try self.submitLocked(child, now, parent.completion_active, initially_blocked);
         child.parent = parent;
         parent.children += 1;
+        if (child.protected_control_child) parent.control_children += 1;
         self.metrics.child_operations += 1;
     }
 
@@ -1380,14 +1382,15 @@ pub const Scheduler = struct {
         self.dispatch();
         e.waited = e.state == .queued;
     }
-    /// Change a running capsule's CPU team demand. Call only after joining all
-    /// children of the old team. Growth relinquishes the old grant and queues
+    /// Change a running capsule's CPU team demand. Join ordinary children of
+    /// the old team first. Protected control children own independent CPU and
+    /// may continue renewing through a team resize. Growth queues
     /// the full demand fairly; count/bytes stay reserved through denied reentry.
     pub fn resizeTeam(self: *Scheduler, e: *Entry, slots: usize) !void {
         const now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.state != .running or e.children != 0 or (e.publication_active and slots != 1)) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or e.children != e.control_children or (e.publication_active and slots != 1)) return error.InvalidRunnableTransition;
         const capacity = self.capacityFor(e, e.class);
         if (slots == 0 or slots > capacity) return error.InvalidRunnableDemand;
         if (e.cpu_borrow_budget != null and slots != 1) return error.InvalidRunnableTransition;
@@ -1897,6 +1900,10 @@ pub const Scheduler = struct {
         if (e.parent) |parent| {
             std.debug.assert(parent.scheduler == self and parent.children != 0);
             parent.children -= 1;
+            if (e.protected_control_child) {
+                std.debug.assert(parent.control_children != 0);
+                parent.control_children -= 1;
+            }
             self.metrics.child_operations -= 1;
             e.parent = null;
         }
@@ -2086,6 +2093,18 @@ pub const Execution = struct {
         owner.lock();
         defer owner.mutex.unlock();
         return entry.slots;
+    }
+
+    /// A team borrow excludes ordinary child workers. Independent protected
+    /// controls may renew concurrently; inspect their accounting under the
+    /// owner lock because those tasks can physically retire asynchronously.
+    pub fn checkTeamBorrow(self: *Execution) !void {
+        if (self.borrowed != null) return self.checkpoint();
+        const entry = if (self.entry) |*value| value else return error.InvalidRunnableTransition;
+        const owner = entry.scheduler orelse return error.InvalidRunnableTransition;
+        owner.lock();
+        defer owner.mutex.unlock();
+        if (entry.state != .running or entry.children != entry.control_children) return error.InvalidRunnableTransition;
     }
 
     pub fn retainedClass(self: *const Execution) !Class {

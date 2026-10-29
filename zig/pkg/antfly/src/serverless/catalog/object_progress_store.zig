@@ -296,6 +296,56 @@ pub const ObjectProgressStore = struct {
         return try self.compareAndSwap(key, expected, watermark);
     }
 
+    fn pinKey(self: *ObjectProgressStore, namespace: []const u8, version: u64) ![]u8 {
+        const leaf = try std.fmt.allocPrint(self.alloc, "READ_PINS/{d}", .{version});
+        defer self.alloc.free(leaf);
+        return keyAlloc(self.alloc, self.prefix, namespace, leaf);
+    }
+    fn readPinValue(self: *ObjectProgressStore, key: []const u8, context: Context) !?CurrentValue {
+        const operation: Provider.Operation = .{ .context = context };
+        var result = operation.get(&self.client, self.bucket, key, .{ .max_response_bytes = 1024 }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        return .{ .value = try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10), .etag = if (result.metadata.etag) |value| try self.alloc.dupe(u8, value) else null };
+    }
+    fn floorFor(raw: *anyopaque, namespace: []const u8, context: Context) !?u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        const key = try keyAlloc(self.alloc, self.prefix, namespace, "MANIFEST_GC_FLOOR");
+        defer self.alloc.free(key);
+        const value = try self.readPinValue(key, context);
+        defer if (value) |current| if (current.etag) |etag| self.alloc.free(etag);
+        return if (value) |current| current.value else null;
+    }
+    fn pinFor(raw: *anyopaque, namespace: []const u8, version: u64, context: Context) !?u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        const key = try self.pinKey(namespace, version);
+        defer self.alloc.free(key);
+        const value = try self.readPinValue(key, context);
+        defer if (value) |current| if (current.etag) |etag| self.alloc.free(etag);
+        return if (value) |current| current.value else null;
+    }
+    fn casPinFor(raw: *anyopaque, namespace: []const u8, version: u64, expected: ?u64, deadline: u64, context: Context) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        if (expected) |prior| if (deadline < prior) return false;
+        const key = try self.pinKey(namespace, version);
+        defer self.alloc.free(key);
+        const current = try self.readPinValue(key, context);
+        defer if (current) |value| if (value.etag) |etag| self.alloc.free(etag);
+        if ((if (current) |value| value.value else null) != expected) return false;
+        if (current) |value| if (value.etag == null) return error.MissingObjectEtag;
+        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{deadline});
+        defer self.alloc.free(payload);
+        const operation: Provider.Operation = .{ .context = context };
+        var result = operation.put(&self.client, self.bucket, key, payload, .{ .content_type = "text/plain", .if_none_match = current == null, .if_match_etag = if (current) |value| value.etag else null }) catch |err| switch (err) {
+            error.PreconditionFailed => return false,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        return true;
+    }
+
     pub fn getManifestGcFloor(self: *ObjectProgressStore, namespace: []const u8) !?u64 {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "MANIFEST_GC_FLOOR");
         defer self.alloc.free(key);
@@ -701,6 +751,9 @@ pub const ObjectProgressStore = struct {
     }
 
     const vtable: progress_store.ProgressStore.VTable = .{
+        .get_manifest_gc_floor_for = floorFor,
+        .get_manifest_read_deadline_for = pinFor,
+        .cas_manifest_read_deadline_for = casPinFor,
         .get_head_for = getHeadFor,
         .cas_head_for = casHeadFor,
         .work_lease_provider = erasedWorkLeaseProvider,

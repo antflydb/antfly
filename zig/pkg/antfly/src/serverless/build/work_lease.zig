@@ -265,7 +265,9 @@ pub const HeldLease = struct {
 
     pub fn cancellation(self: *HeldLease, token: maintenance_cancellation.Token) !maintenance_cancellation.Token {
         try self.renewal.start(token.withContext(self.provider.context), self, renewOwned, self.ttl_ns, self.acquisition.expires_at_unix_ns, self.io);
-        return self.renewal.parent.withCheckpoint(self, erasedMaintenanceCheckpoint);
+        var result = self.renewal.parent.withCheckpoint(self, erasedMaintenanceCheckpoint);
+        result.renewals = &self.renewal;
+        return result;
     }
     fn renewOwned(raw: *anyopaque, context: Context) !u64 {
         const self: *HeldLease = @ptrCast(@alignCast(raw));
@@ -365,7 +367,9 @@ pub const HeldBootstrapLease = struct {
 
     pub fn cancellation(self: *HeldBootstrapLease, token: maintenance_cancellation.Token) !maintenance_cancellation.Token {
         try self.renewal.start(token.withContext(self.provider.context), self, renewOwned, self.ttl_ns, self.acquisition.expires_at_unix_ns, self.io);
-        return self.renewal.parent.withCheckpoint(self, erasedMaintenanceCheckpoint);
+        var result = self.renewal.parent.withCheckpoint(self, erasedMaintenanceCheckpoint);
+        result.renewals = &self.renewal;
+        return result;
     }
     fn renewOwned(raw: *anyopaque, context: Context) !u64 {
         const self: *HeldBootstrapLease = @ptrCast(@alignCast(raw));
