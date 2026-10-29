@@ -3213,7 +3213,33 @@ pub const LockMode = enum {
     internal_reader,
 };
 
+/// One immutable-generation data descriptor shared by internal artifact readers.
+/// Each NativeFile still owns its header, caches and logical checkpoint. The
+/// registry retains the receiver through the final physical close.
+pub const SharedReadHandle = struct {
+    allocator: Allocator,
+    file: std.Io.File,
+    references: std.atomic.Value(usize) = .init(1),
+    pub fn create(allocator: Allocator, io: std.Io, path: []const u8) !*SharedReadHandle {
+        const self = try allocator.create(SharedReadHandle);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .file = (try openDataFile(io, path, .internal_reader, false)).file };
+        return self;
+    }
+    pub fn retain(self: *SharedReadHandle) void {
+        std.debug.assert(self.references.fetchAdd(1, .monotonic) != 0);
+    }
+    pub fn release(self: *SharedReadHandle, io: std.Io) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        self.file.close(io);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const OpenOptions = struct {
+    /// Only internal read-only views may share a descriptor. The supplied
+    /// handle is retained independently of the caller through NativeFile.close.
+    shared_reader: ?*SharedReadHandle = null,
     externally_locked: bool = false,
     /// Internal data-reader coordination. The caller holds the path-writer
     /// lease for every publication; coordinated readers never inspect old
@@ -4092,6 +4118,7 @@ pub const NativeFile = struct {
     borrowed_io: ?std.Io = null,
     path: []u8,
     file: std.Io.File,
+    shared_reader: ?*SharedReadHandle = null,
     writer_lock_file: ?std.Io.File = null,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
@@ -4209,6 +4236,7 @@ pub const NativeFile = struct {
         owner: ?*OwnedIo,
         borrowed_io: ?std.Io,
     ) !NativeFile {
+        if (opts.shared_reader != null and (!opts.read_only or !opts.internal_reader or opts.externally_locked)) return error.InvalidArgument;
         const resource_lifetime = if (borrowed_io != null) (if (opts.resource_manager) |manager| manager.retainLifetime() else null) else null;
         errdefer if (resource_lifetime) |value| value.release();
         const io = borrowed_io orelse owner.?.io();
@@ -4223,9 +4251,11 @@ pub const NativeFile = struct {
         }
         errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
 
-        const opened_file = try openDataFile(io, path, if (opts.read_only) (if (opts.internal_reader or opts.externally_locked) .internal_reader else .reader) else .writer, opts.wait_for_reader_lock);
-        const file = opened_file.file;
-        errdefer file.close(io);
+        const file = if (opts.shared_reader) |shared| acquired: {
+            shared.retain();
+            break :acquired shared.file;
+        } else (try openDataFile(io, path, if (opts.read_only) (if (opts.internal_reader or opts.externally_locked) .internal_reader else .reader) else .writer, opts.wait_for_reader_lock)).file;
+        errdefer if (opts.shared_reader) |shared| shared.release(io) else file.close(io);
 
         var header_bytes: [header_size]u8 = undefined;
         try readHeaderExactAt(file, io, &header_bytes);
@@ -4241,6 +4271,7 @@ pub const NativeFile = struct {
             .borrowed_io = borrowed_io,
             .path = owned_path,
             .file = file,
+            .shared_reader = opts.shared_reader,
             .writer_lock_file = writer_lock_file,
             .externally_locked = opts.externally_locked,
             .reader_coordinator = opts.reader_coordinator,
@@ -4413,7 +4444,7 @@ pub const NativeFile = struct {
         if (self.writer_lock_file) |lock_file| {
             lock_file.close(io);
         }
-        self.file.close(io);
+        if (self.shared_reader) |shared| shared.release(io) else self.file.close(io);
         self.allocator.free(self.path);
         if (self.owned_io) |owner| owner.destroy();
         if (self.resource_lifetime) |value| value.release();

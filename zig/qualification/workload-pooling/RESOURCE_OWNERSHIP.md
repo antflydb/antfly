@@ -5609,3 +5609,33 @@ in the combined focused suite, 28 owner/client boundary tests and all 156 native
 build steps. The archive matches 4,412 current public sources; its independent
 ReleaseSafe consumer passed 25 compile checks. See
 `native-prepared-catalog-lease-v1-verified.json`. Full Linux qualification is waived.
+
+### Artifact generation descriptor sharing
+
+A writable Lite artifact registry owns one locked marker inode. Each artifact
+keeps its original 32-hex lease key and marker name; those marker names are hard
+links to the registry's locked inode. Independent sweep descriptors still fail
+to claim live aliases. The registry anchor uses a separate owner prefix, and
+bounded marker sweeping removes unlocked anchors after a crash. Closing one
+artifact removes its own name without unlocking another artifact's lease.
+
+Internal readers share one reference-counted data descriptor per Store generation.
+Each NativeFile view retains its own decoded header, checkpoint and caches. Only
+internal read-only opens accept a shared handle. Registry cache ownership ends
+at generation retirement or Store detach; live artifact views retain independent
+references through their physical close. Fenced external/read-only Store readers
+keep their existing independent lock ownership.
+
+The registry's I/O and resource manager outlive its last view. Callback detachment
+and joining precede cache-owner retirement, and generation adoption fences new
+opens before releasing the old generation's cached handle. Existing retired-inode
+accounting still transfers between live states until the last one closes. Warm
+logical source caches retain their existing admission and eviction behavior.
+
+The updated native CLI passes the original macOS file-engine overload/restart
+profile twice on the same binary. Each run completes 1,840 offered operations,
+recovers descriptors from 23 to 23 against the unchanged allowance of eight,
+and verifies exact HTTP/pgwire postimages across joined shutdown/reopen. This
+closes that profile's descriptor-recovery gate. It does not qualify other process
+envelopes or complete the full design. Receipts are
+`generation-handle-pool-native-file-v1.json` and `-v2.json`.

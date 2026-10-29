@@ -1683,3 +1683,47 @@ and registry preparation, mapped-page-fault scope, and the unresolved file-engin
 FD recovery gate still require completed production milestones. Full GNU
 qualification remains waived; installed-native and live-cloud qualification are
 not claimed here.
+
+### File-engine artifact descriptor recovery (2026-10-29)
+
+Native writable artifact sources now share physical data descriptors by Store
+generation and one locked marker inode per registry. Every logical source keeps
+its own header, checkpoint, cache, lease alias and original 32-hex marker name;
+marker names are hard links to the registry's locked inode. Existing and external
+orphan sweepers still cannot claim a live alias. Bounded marker sweeping also
+removes unlocked registry anchors after crashes. The .aflite wire format and
+logical source-cache admission/eviction policy are unchanged.
+
+Each NativeFile view retains a shared read-handle reference. Generation retirement
+or Store detach releases the registry's cached reference; active artifact views
+retain their old inode through their physical close. Store-owned I/O and resource
+accounting outlive the final view. Fenced external/read-only readers retain their
+independent lock semantics. Shared handles are accepted only by internal read-only
+views, with invalid opens refused before writer admission or allocation.
+
+`generation-handle-pool-v2-regressions.json` records 117/117 successful build steps,
+36/36 retained-cursor tests and 46/46 Lite artifact/reclamation/vacuum tests with
+no skips or leaks, including 64 simultaneous logical sources sharing two physical
+handles, live orphan-sweep protection, generation isolation and cold reads after
+owner shutdown. The updated CLI was built from the same tested native sources.
+The unchanged qualification harness passes 37 tests; its manifest equality proof
+is retained in `generation-handle-pool-harness.json`.
+
+The original macOS file-engine overload/restart manifest passes twice on that
+same CLI binary: `generation-handle-pool-native-file-v1.json` and `-v2.json` each
+complete 1,840 offered operations. Both recover from 23 baseline descriptors to
+23 after client retirement, against the unchanged allowance of eight and recovery
+interval of three seconds. Both server incarnations exit successfully and both
+HTTP and pgwire restore the same 4,096-byte postimage and exact integer
+9007199254740993 after joined shutdown/reopen. Historical failed receipts, which
+recovered from 25 to 63 descriptors, remain unchanged. The file-engine descriptor
+recovery gate is closed for this profile; this is not a wider performance or
+process-resource envelope claim.
+
+`generation-handle-pool-final.json` binds the committed source snapshots, focused
+build, CLI hash, unchanged manifest and both successful native receipts. The
+production descriptor-sharing milestone is integrated. The full goal remains
+open: serial graph checkpoint preparation, framework/vendor and registry
+preparation, mapped-page-fault scope and wider cross-engine/deployment evidence
+still require their complete production milestones. Full GNU qualification
+remains waived.

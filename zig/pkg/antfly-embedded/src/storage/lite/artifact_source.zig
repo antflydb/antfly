@@ -33,6 +33,9 @@ pub const Registry = struct {
     path: []u8,
     store: ?*docs.Store,
     publication_guard: ?std.Io.File = null,
+    marker_owner: ?std.Io.File = null,
+    marker_owner_path: ?[]u8 = null,
+    readers: ?*GenerationReader = null,
     mutex: std.Io.Mutex = .init,
     callbacks_done: std.Io.Event = .is_set,
     callbacks: usize = 0,
@@ -40,6 +43,12 @@ pub const Registry = struct {
     first: ?*State = null,
     retired_bytes: std.atomic.Value(u64) = .init(0),
     owned_resources: ?struct { manager: *@import("../resource_manager.zig").ResourceManager, allocator: Allocator } = null,
+
+    const GenerationReader = struct {
+        generation: u64,
+        handle: *native.SharedReadHandle,
+        next: ?*GenerationReader = null,
+    };
 
     pub fn create(allocator: Allocator, store: *docs.Store) !*Registry {
         const self = try allocator.create(Registry);
@@ -71,6 +80,12 @@ pub const Registry = struct {
         std.debug.assert(self.callbacks == 0);
         std.debug.assert(self.retired_bytes.load(.acquire) == 0);
         const owner = self.io_owner;
+        self.releaseReaderOwners(null);
+        if (self.marker_owner) |marker| marker.close(self.io());
+        if (self.marker_owner_path) |path| {
+            deleteMarker(self.io(), path);
+            self.allocator.free(path);
+        }
         owner.join();
         if (self.publication_guard) |guard| guard.close(std.Io.Threaded.global_single_threaded.io());
         const resources = self.owned_resources;
@@ -102,6 +117,7 @@ pub const Registry = struct {
         while (it) |state| : (it = state.next) {
             if (state.resources_closed.load(.acquire)) self.releaseClosedClaimAssumeLocked(state);
         }
+        self.releaseReaderOwners(null);
     }
 
     pub fn releaseOwner(self: *Registry) void {
@@ -185,6 +201,7 @@ pub const Registry = struct {
             state.retired_claim = bytes;
             _ = self.retired_bytes.fetchAdd(bytes, .acq_rel);
         };
+        self.releaseReaderOwners(generation);
     }
 
     pub fn releaseReaderFence(self: *Registry, generation: u64) void {
@@ -220,6 +237,51 @@ pub const Registry = struct {
         state.retired_claim = 0;
     }
 
+    // Caller holds registry mutex, or owns the final registry reference.
+    fn releaseReaderOwners(self: *Registry, generation: ?u64) void {
+        var link = &self.readers;
+        while (link.*) |entry| {
+            if (generation != null and entry.generation != generation.?) {
+                link = &entry.next;
+                continue;
+            }
+            link.* = entry.next;
+            entry.handle.release(self.io());
+            self.allocator.destroy(entry);
+        }
+    }
+    fn acquireReader(self: *Registry, generation: u64) !*native.SharedReadHandle {
+        const runtime = self.io();
+        self.mutex.lockUncancelable(runtime);
+        var item = self.readers;
+        while (item) |entry| : (item = entry.next) if (entry.generation == generation) {
+            entry.handle.retain();
+            self.mutex.unlock(runtime);
+            return entry.handle;
+        };
+        self.mutex.unlock(runtime);
+        // The Store's generation fence pins the path through this open.
+        // Duplicate candidates retire outside the shared bookkeeping lock.
+        const created = try self.allocator.create(GenerationReader);
+        errdefer self.allocator.destroy(created);
+        const handle = try native.SharedReadHandle.create(self.allocator, runtime, self.path);
+        errdefer handle.release(runtime);
+        self.mutex.lockUncancelable(runtime);
+        item = self.readers;
+        while (item) |entry| : (item = entry.next) if (entry.generation == generation) {
+            entry.handle.retain();
+            self.mutex.unlock(runtime);
+            handle.release(runtime);
+            self.allocator.destroy(created);
+            return entry.handle;
+        };
+        created.* = .{ .generation = generation, .handle = handle, .next = self.readers };
+        self.readers = created;
+        handle.retain();
+        self.mutex.unlock(runtime);
+        return handle;
+    }
+
     fn createMarker(self: *Registry, path: []const u8) !std.Io.File {
         const runtime = self.io();
         // File locks alone do not serialize callers sharing one descriptor.
@@ -229,7 +291,20 @@ pub const Registry = struct {
         const guard = self.publication_guard orelse return error.ReadOnly;
         try guard.lock(runtime, .exclusive);
         defer guard.unlock(runtime);
-        return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
+        if (self.marker_owner == null) {
+            var identity: [16]u8 = undefined;
+            try runtime.randomSecure(&identity);
+            const name = try std.fmt.allocPrint(self.allocator, ".aflite-lease-owner-{s}", .{std.fmt.bytesToHex(identity, .lower)});
+            defer self.allocator.free(name);
+            const owner_path = try std.fs.path.join(self.allocator, &.{ std.fs.path.dirname(self.path) orelse ".", name });
+            errdefer self.allocator.free(owner_path);
+            self.marker_owner = try std.Io.Dir.cwd().createFile(runtime, owner_path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
+            self.marker_owner_path = owner_path;
+        }
+        // Every existing per-artifact marker name still guards its exact
+        // catalog alias. Hard links let one locked inode protect all names.
+        try std.Io.Dir.hardLink(std.Io.Dir.cwd(), self.marker_owner_path.?, std.Io.Dir.cwd(), path, runtime, .{});
+        return self.marker_owner.?;
     }
 
     pub fn open(self: *Registry, key: []const u8) !Source {
@@ -255,14 +330,13 @@ pub const Registry = struct {
         errdefer a.free(marker_path);
         const reader_fenced = owner.read_only or owner.artifact_reader_fence;
         const marker: ?std.Io.File = if (reader_fenced) null else try self.createMarker(marker_path);
-        errdefer if (marker) |file| {
-            file.close(runtime);
-            std.Io.Dir.cwd().deleteFile(runtime, marker_path) catch {};
-        };
+        errdefer if (marker != null) deleteMarker(runtime, marker_path);
         // Writable roots are protected by the catalog reference. Read-only
         // sources use the established external-reader lock, since they cannot
         // publish a lease and external writers must not reuse their pages.
-        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .reader_coordinator = owner.file.reader_coordinator, .no_sync = true });
+        const shared = if (reader_fenced) null else try self.acquireReader(owner.assessment_generation);
+        defer if (shared) |handle| handle.release(runtime);
+        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .shared_reader = shared, .reader_coordinator = owner.file.reader_coordinator, .no_sync = true });
         errdefer reader.close();
         reader.page_cache_enabled.store(false, .monotonic);
         var capture = Capture{ .allocator = a, .key = key, .lease_key = lease_key };
@@ -342,10 +416,9 @@ const State = struct {
         self.cache.?.deinit();
         self.cache = null;
         self.reader.close();
-        if (self.marker) |marker| {
-            marker.close(self.registry.io());
+        if (self.marker != null) {
             self.marker = null;
-            std.Io.Dir.cwd().deleteFile(self.registry.io(), self.marker_path) catch {};
+            deleteMarker(self.registry.io(), self.marker_path);
         }
         self.resources_closed.store(true, .release);
     }
@@ -576,7 +649,8 @@ pub const MarkerSweep = struct {
                 return;
             };
             if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, marker_prefix)) continue;
-            const id = entry.name[marker_prefix.len..];
+            const suffix = entry.name[marker_prefix.len..];
+            const id = if (std.mem.startsWith(u8, suffix, "owner-")) suffix["owner-".len..] else suffix;
             if (id.len != 32) continue;
             var valid = true;
             for (id) |byte| if (!std.ascii.isHex(byte)) {
@@ -593,6 +667,12 @@ pub const MarkerSweep = struct {
         }
     }
 };
+
+fn deleteMarker(io: std.Io, path: []const u8) void {
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
 
 // This persistent inode is deliberately outside the UUID marker namespace.
 // Never unlink it: replacing its inode could split cross-process coordination.
@@ -672,4 +752,95 @@ test "lite persistent mapped lease publication excludes cross-root marker sweepi
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, marker_path, .{}));
     try std.testing.expect(try probe.tryLock(io, .exclusive));
     probe.unlock(io);
+}
+
+test "lite artifact sources share physical handles while preserving independent leases" {
+    const a = std.testing.allocator;
+    const runtime = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/pooled-artifacts.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = runtime, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var indexes = @import("index_storage.zig").Store.init(a, &store);
+    const bytes: [64 * 1024]u8 = @splat(71);
+    try indexes.storage().writeFileAbsolute("/artifact", &bytes);
+    var sources: [64]Source = undefined;
+    var count: usize = 0;
+    defer for (sources[0..count]) |*source| source.close();
+    for (&sources) |*source| {
+        source.* = try store.openArtifactSource("/artifact");
+        count += 1;
+    }
+    const registry = store.artifact_registry.?;
+    const shared = registry.readers.?.handle;
+    try std.testing.expect(registry.readers.?.next == null);
+    try std.testing.expectEqual(@as(usize, 65), shared.references.load(.acquire));
+    try std.testing.expectError(error.InvalidArgument, native.NativeFile.openWithIo(a, runtime, path, .{ .shared_reader = shared }));
+    try std.testing.expectError(error.InvalidArgument, native.NativeFile.openWithIo(a, runtime, path, .{ .read_only = true, .shared_reader = shared }));
+    try std.testing.expectEqual(@as(usize, 65), shared.references.load(.acquire));
+    var state = registry.first;
+    var visited: usize = 0;
+    while (state) |current| : (state = current.next) {
+        try std.testing.expectEqual(shared.file.handle, current.reader.file.handle);
+        try std.testing.expectEqual(registry.marker_owner.?.handle, current.marker.?.handle);
+        _ = try std.Io.Dir.cwd().statFile(runtime, current.marker_path, .{});
+        visited += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 64), visited);
+    // Another descriptor cannot claim any hard-linked alias while the single
+    // registry marker remains locked. The bounded sweeps keep every live root.
+    var sweep: SweepCursor = .{};
+    try std.testing.expectEqual(@as(usize, 0), try cleanupOrphans(&store.file, &sweep));
+    var markers: MarkerSweep = .{};
+    defer markers.deinit(runtime);
+    try markers.run(&store.file);
+    try markers.run(&store.file);
+    for (sources[0..count], 0..) |source, i| {
+        var result: [128]u8 = undefined;
+        try source.readInto(i, &result);
+        try std.testing.expectEqualSlices(u8, bytes[i..][0..result.len], &result);
+    }
+    for (sources[0..count]) |*source| source.close();
+    count = 0;
+    try std.testing.expect(registry.first == null);
+    try std.testing.expectEqual(@as(usize, 1), shared.references.load(.acquire));
+}
+
+test "lite artifact sources share only their generation and retain cold reads after owner close" {
+    const a = std.testing.allocator;
+    const runtime = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/pooled-generations.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = runtime, .reclamation = .{ .enabled = false } });
+    var open = true;
+    defer if (open) store.close();
+    store.maintenance_start_suppressed = true;
+    var indexes = @import("index_storage.zig").Store.init(a, &store);
+    const first: [64 * 1024]u8 = @splat(42);
+    const second: [64 * 1024]u8 = @splat(93);
+    try indexes.storage().writeFileAbsolute("/artifact", &first);
+    var old = try store.openArtifactSource("/artifact");
+    defer old.close();
+    const old_state: *State = @ptrCast(@alignCast(old.ranges.ptr));
+    const old_handle = old_state.reader.shared_reader.?;
+    try indexes.storage().writeFileAbsolute("/artifact", &second);
+    _ = try store.vacuum();
+    try std.testing.expectEqual(@as(usize, 1), old_handle.references.load(.acquire));
+    var fresh = try store.openArtifactSource("/artifact");
+    defer fresh.close();
+    const fresh_state: *State = @ptrCast(@alignCast(fresh.ranges.ptr));
+    try std.testing.expect(old_handle != fresh_state.reader.shared_reader.?);
+    try std.testing.expect(old_state.reader.file.handle != fresh_state.reader.file.handle);
+    store.close();
+    open = false;
+    var result: [128]u8 = undefined;
+    try old.readInto(3000, &result);
+    try std.testing.expectEqualSlices(u8, first[3000..][0..result.len], &result);
+    try fresh.readInto(3000, &result);
+    try std.testing.expectEqualSlices(u8, second[3000..][0..result.len], &result);
 }
