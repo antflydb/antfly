@@ -3373,3 +3373,10 @@ from unproven family goals and from device-kernel source accounting.
 [The AQ register](unified-execution-aq-outcomes.md) tracks implementation of the
 large-win audit, beginning with a layout- and order-preserving 462-entry Metal
 pipeline lifecycle owner and separately qualifying the remaining family work.
+
+### AR projection ownership and model-aware preparation
+
+[The AR register](unified-execution-ar-outcomes.md) records grouped projection
+ownership, shared Metal FFN phases, required/optional pipeline preparation,
+constructor cleanup and proven unreachable shader retirement. It separates host
+source, device source, compiled images, startup and model performance results.

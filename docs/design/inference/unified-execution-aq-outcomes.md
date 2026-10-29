@@ -135,7 +135,7 @@ owner. It is not safe to replace this with call forwarding alone.
 Evidence: `.benchmark-assets/1166/aq-campaign/decoder/`, including the original
 source, formatted standalone prototype, exact-phase overlap and rejection.
 
-## CUDA attention launch preparation: implemented; device validation queued
+## CUDA attention launch preparation: implemented and device validated
 
 This family removes **8,528 maintained production bytes**, including migrated
 call sites. Six dense, device-scalar, generated and physical-paged attention launchers now
@@ -154,9 +154,10 @@ Static comparison confirms all **191 argument slots across nine launch tuples**
 retain their original order. Host checks pass for dense/scalar/paged extents, overflow, short buffers,
 mutable wire addresses and the non-device-scalar generated-route guard.
 Both-backend compilation, Linux ARM64 CUDA test compilation and generated-source
-freshness pass. CUDA numerical, compressed-format, paged-prefill and graph-replay
-checks are queued on Glowworm behind unrelated GPU work; their status will be
-recorded after execution, without treating skips as passes.
+freshness pass. Glowworm device validation now passes **44/44 tests, zero skips,
+failures or leaks**, including all six named numerical, compressed-format,
+paged-prefill, preflight and graph-replay cases. The retained binary and receipt
+are hash-verified in `cuda/device-verified.json`.
 
 Evidence: `.benchmark-assets/1166/aq-campaign/cuda/`. Final whole-campaign
 source accounting includes all replacement metadata and excludes tests,
