@@ -10942,7 +10942,10 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
     defer cache.deinit();
     var lease = try cache.adoptOwned(url, null, .{ .content_type = try alloc.dupe(u8, "application/pdf"), .data = try alloc.dupe(u8, source) });
     defer lease.deinit();
-    for ([_][]const u8{ "{}", "{\"etag\":\"revision-one\"}" }) |config_json| {
+    for ([_][]const u8{
+        "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+        "{\"etag\":\"revision-one\",\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+    }) |config_json| {
         const producer_json = try std.fmt.allocPrint(alloc, "{{\"type\":\"document_extraction\",\"config\":{s}}}", .{config_json});
         defer alloc.free(producer_json);
         const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .doc_key = "source", .index_name = "reader", .artifact_name = "reader", .source_field = "url", .producer_json = producer_json };
