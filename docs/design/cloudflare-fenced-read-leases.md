@@ -129,3 +129,23 @@ Local closure: `examples/cloudflare-serverless/dist/qualification/fenced-read-le
 and test logs). The Cloudflare comparison is a separate fresh proposal,
 `gate-mvu6mu7h7d17`, with the approved control unchanged. Its outcome must be
 recorded independently; these local measurements do not pass the hosted gate.
+
+### Private writer profiling
+
+`profile-paired-rehearsal.mjs REPORT CAPTURE_DIR OUTPUT --all-roles` also profiles
+writer, reader and builder records. It maps logical application traces from
+matched physical HTTP attempts to their workload phases, then measures those
+logs in private native records. Conflicting trace classifications are excluded;
+a terminal containing multiple phases contributes no duplicated CPU/wall sample.
+Unmatched resource failures and truncation remain visible. This association is
+for profiling and does not replace canonical provider identity or completeness.
+The profiler can consume hash-verified captures referenced by the driver report.
+
+Applied to the preceding sealed rehearsal, candidate writer preparation had p95
+1,747 ms (25 spans), native finalization 1,012 ms (25 spans), and coordinator
+queue wait 451 ms (42 group reports). Physical preparation I/O wait had p95
+1,831 ms (25 reports). These counts are groups/spans, not independent client
+requests; their percentiles overlap and must not be added. This locates real
+storage work as well as admission pressure. The new hosted comparison adds
+explicit mutation admission, authority and refresh spans before choosing another
+write optimization. Four profiler regressions bring the Node suite to 404 tests.
