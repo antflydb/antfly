@@ -26,12 +26,13 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v7";
+const adapter_version = "antfly-documents-v8";
 const durable = @import("durable.zig");
 
 pub const ReadRequest = struct {
     model: []const u8,
     retain_artifact: bool = false,
+    audio: ?[]const u8 = null,
     documents: ?[]const sources.Input = null,
     images: ?[]const struct { url: []const u8 } = null,
     prompt: ?[]const u8 = null,
@@ -58,18 +59,19 @@ pub fn Service(comptime Node: type) type {
             model: []const u8,
             operation: c.Operation,
             provider: c.Provider,
+            input: @FieldType(c.Binding, "input"),
             fn from(binding: c.Binding) DependencyKey {
-                return .{ .model = binding.model, .operation = binding.operation, .provider = binding.provider };
+                return .{ .model = binding.model, .operation = binding.operation, .provider = binding.provider, .input = binding.input };
             }
             const Context = struct {
                 pub fn hash(_: @This(), key: DependencyKey) u64 {
                     var h = std.hash.Wyhash.init(0);
-                    h.update(&.{ @backingInt(key.operation), @backingInt(key.provider) });
+                    h.update(&.{ @backingInt(key.operation), @backingInt(key.provider), @backingInt(key.input) });
                     h.update(key.model);
                     return h.final();
                 }
                 pub fn eql(_: @This(), left: DependencyKey, right: DependencyKey) bool {
-                    return left.operation == right.operation and left.provider == right.provider and std.mem.eql(u8, left.model, right.model);
+                    return left.operation == right.operation and left.provider == right.provider and left.input == right.input and std.mem.eql(u8, left.model, right.model);
                 }
             };
         };
@@ -165,7 +167,7 @@ pub fn Service(comptime Node: type) type {
                 };
             }
             fn snapshot(self: *const Graph, binding: c.Binding) ?c.Snapshot {
-                for (self.snapshots.items) |item| if (item.binding.operation == binding.operation and std.mem.eql(u8, item.binding.model, binding.model)) return item;
+                for (self.snapshots.items) |item| if (item.binding.operation == binding.operation and item.binding.input == binding.input and std.mem.eql(u8, item.binding.model, binding.model)) return item;
                 return null;
             }
             fn readScope(self: *const Graph, key: Key) ?ReadScope {
@@ -255,12 +257,14 @@ pub fn Service(comptime Node: type) type {
             defer arena.deinit();
             const a = arena.allocator();
             const request = try std.json.parseFromSliceLeaky(ReadRequest, a, bytes, .{ .duplicate_field_behavior = .@"error" });
+            const forms = @as(usize, @intFromBool(request.images != null)) + @intFromBool(request.documents != null) + @intFromBool(request.audio != null);
+            if (forms != 1) return error.InvalidDocumentSource;
             if (request.max_tokens) |tokens| if (tokens < 1 or tokens > 1024) return error.InvalidMaxTokens;
             const key = Key{ .name = request.model, .operation = definition_operation };
             const known_definition = if (snapshot) |graph| graph.get(key) else null;
             const definition_bytes = if (known_definition == null) try node.documentDefinition(a, request.model, definition_operation) else null;
             const def: c.Definition = if (known_definition) |known| known else if (definition_bytes) |data| (try c.Definition.parse(a, data)).value else .{
-                .models = try a.dupe(c.Binding, &.{.{ .name = "reader", .model = request.model, .operation = .read }}),
+                .models = try a.dupe(c.Binding, &.{.{ .name = "reader", .model = request.model, .operation = .read, .input = if (request.audio != null or (request.documents != null and request.documents.?.len > 0 and sources.isAudioMediaType(request.documents.?[0].media_type))) .audio else .image }}),
                 .read = .{ .reader = "reader" },
             };
             try def.validate();
@@ -294,15 +298,23 @@ pub fn Service(comptime Node: type) type {
             run.control = owned_run.control;
             if (shared == null) try pinDurableGraph(a, run, key, def, graph);
             const completed_before = run.usage.completed_pages;
-            if ((request.images != null) == (request.documents != null)) return error.InvalidDocumentSource;
             var inputs = std.ArrayList(sources.Input).empty;
             if (request.documents) |documents| {
                 try inputs.appendSlice(a, documents);
+            } else if (request.audio) |audio| {
+                if (audio.len == 0) return error.InvalidDocumentSource;
+                const url = if (@import("antfly_scraping").data_uri.hasScheme(audio)) audio else try std.fmt.allocPrint(a, "data:application/octet-stream;base64,{s}", .{audio});
+                try inputs.append(a, .{ .id = "audio-0", .url = url, .media_type = "" });
             } else for (request.images.?, 0..) |img, i| {
                 // MIME is verified from the actual bytes after download.
                 try inputs.append(a, .{ .id = try std.fmt.allocPrint(a, "image-{d}", .{i}), .url = img.url, .media_type = "" });
             }
             if (inputs.items.len == 0 or inputs.items.len > run.limits.max_sources -| run.source_count) return error.InvalidDocumentSource;
+            const audio_reader = (try def.binding(def.read.?.reader, .read)).input == .audio;
+            for (inputs.items) |input| {
+                const audio_source = if (input.media_type.len > 0) sources.isAudioMediaType(input.media_type) else request.audio != null;
+                if (audio_reader != audio_source) return error.DocumentCapabilityMismatch;
+            }
             if (attached == null) for (inputs.items, 0..) |input, i| for (inputs.items[0..i]) |prior| if (std.mem.eql(u8, input.id, prior.id)) return error.DuplicateDocumentSource;
             const response_limit = @min(def.budget.max_output_bytes, run.limits.max_output_bytes);
             const decoration = if (request.retain_artifact) @import("artifacts.zig").response_overhead else 0;
@@ -326,7 +338,7 @@ pub fn Service(comptime Node: type) type {
                 else if (attached) |attachments| attachments.images[source_index].bytes else (try node.documentDownload(source_alloc, input.url, source_limits.max_source_bytes, control)).data;
                 if (source_bytes.len > source_limits.max_source_bytes) return error.DocumentSourceLimitExceeded;
                 run.source_bytes += source_bytes.len;
-                if (input.media_type.len == 0) input.media_type = image.inferenceMimeEssenceForFormat(image.detectFormat(source_bytes)) orelse return error.UnsupportedDocumentFormat;
+                if (input.media_type.len == 0) input.media_type = if (request.audio != null) try sources.audioMime(source_bytes) else image.inferenceMimeEssenceForFormat(image.detectFormat(source_bytes)) orelse return error.UnsupportedDocumentFormat;
                 var source = sources.Source.init(source_alloc, input, source_bytes, source_limits, run.control) catch |err| {
                     try run.control.check();
                     return err;
@@ -534,7 +546,10 @@ pub fn Service(comptime Node: type) type {
                 const definition: ?c.Definition = if (graph.get(key)) |known| known else if (try node.documentDefinition(a, binding.model, binding.operation)) |bytes| (try c.Definition.parse(a, bytes)).value else null;
                 if (definition) |child| {
                     switch (binding.operation) {
-                        .read => if (child.read == null) return error.DocumentCapabilityMismatch,
+                        .read => {
+                            const read_plan = child.read orelse return error.DocumentCapabilityMismatch;
+                            if ((try child.binding(read_plan.reader, .read)).input != binding.input) return error.DocumentCapabilityMismatch;
+                        },
                         .extract => if (child.extract == null) return error.DocumentCapabilityMismatch,
                         .decide => return error.DocumentCapabilityMismatch,
                     }
@@ -769,8 +784,8 @@ pub fn Service(comptime Node: type) type {
             defer capture.deinit();
             defer run.cost_capture = capture.parent;
             const before = run.usage;
-            const included_raster = self.rendered == null and !self.rendered_cost_restored and !std.mem.eql(u8, binding.model, "antfly/native-document");
-            if (!std.mem.eql(u8, binding.model, "antfly/native-document")) try self.ensureRendered(run);
+            const included_raster = self.source.parsed != .audio and self.rendered == null and !self.rendered_cost_restored and !std.mem.eql(u8, binding.model, "antfly/native-document");
+            if (self.source.parsed != .audio and !std.mem.eql(u8, binding.model, "antfly/native-document")) try self.ensureRendered(run);
             const Context = struct {
                 raw: *anyopaque,
                 binding: c.Binding,
@@ -812,6 +827,44 @@ pub fn Service(comptime Node: type) type {
                 const native = self.native_page orelse try self.source.analyzeWithRegionLimit(a, self.number, run.limits.max_regions, run.control);
                 return .{ .model = binding.model, .origin = .native, .text = native.native_text, .regions = native.regions, .tables = native.tables, .status = if (native.findings.len == 0 and native.kind != .image) .complete else .unresolved };
             }
+            if (self.source.parsed == .audio) {
+                if (binding.input != .audio or binding.provider != .antfly or bbox != null) return error.DocumentCapabilityMismatch;
+                if (self.source.bytes.len > encoded_limit) return error.DocumentSourceLimitExceeded;
+                if (child_definition) |child| {
+                    var nested = self.*;
+                    nested.definition = child;
+                    nested.work_allocator = a;
+                    const previous_limits = run.limits;
+                    defer run.limits = previous_limits;
+                    run.limits = run.nestedLimits(child.budget);
+                    const previous_control = run.control;
+                    defer run.control = previous_control;
+                    const deadline = @import("antfly_platform").time.monotonicNs() +| child.budget.deadline_ms * std.time.ns_per_ms;
+                    nested.control.deadline_ns = if (self.control.deadline_ns) |existing| @min(existing, deadline) else deadline;
+                    const Probe = struct {
+                        fn check(ptr: ?*anyopaque) !void {
+                            try (@as(*Control, @ptrCast(@alignCast(ptr.?)))).check();
+                        }
+                    };
+                    run.control = .{ .ptr = &nested.control, .check_fn = Probe.check };
+                    const page = try executor.readPage(a, child, .{ .ptr = &nested, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, 0, .{ .source_id = self.source.input.id, .number = self.number, .kind = .audio, .coordinate_space = .none }, run);
+                    return .{ .text = page.text, .model = binding.model, .origin = @import("representation.zig").inheritOrigin(page.origin, binding.output_origin), .status = page.status, .silent_audio = page.kind == .audio and @import("representation.zig").hasFinding(page, "audio_silence") };
+                }
+                const pinned = try self.verifyBinding(a, binding);
+                var permit = try run.acquire(ioFor(self.node, self.control), false);
+                defer permit.deinit();
+                run.physicalCall();
+                // Generation releases transient buffers throughout decoding.
+                // Using the page arena would retain every logical free and
+                // exhaust the document ceiling even for a short recording.
+                const work = run.work_allocator orelse self.work_allocator;
+                const result = if (@hasDecl(Node, "documentReadAudio")) try self.node.documentReadAudio(work, pinned.path, self.source.bytes, self.prompt, self.max_tokens, self.control) else return error.DocumentCapabilityMismatch;
+                defer work.free(result.text);
+                _ = try self.verifyBinding(a, binding);
+                try run.tokens(result.prompt_tokens, result.completion_tokens);
+                return .{ .text = try a.dupe(u8, result.text), .model = binding.model, .origin = binding.output_origin, .truncated = result.truncated, .status = if (result.truncated) .truncated else .complete, .silent_audio = if (@hasField(@TypeOf(result), "silent_audio")) result.silent_audio else false };
+            }
+            if (binding.input != .image) return error.DocumentCapabilityMismatch;
             try self.ensureRendered(run);
             const view = self.rendered.?;
             // Crop views retain the original coordinate space. Re-encode only
@@ -1733,7 +1786,7 @@ test "document nested composites share one budget and one rendered view" {
     try std.testing.expectEqualStrings("interpretation", hosted_region.object.get("children").?.array.items[0].object.get("origin").?.string);
     try std.testing.expectEqualStrings("12.50", hosted_page.object.get("tables").?.array.items[0].object.get("cells").?.array.items[0].object.get("text").?.string);
     fake = .{};
-    try testDurableReading(Fake, &fake);
+    try testDurableReading(Fake, &fake, false);
 }
 
 test "document extraction keeps independent sources atomic and reuses retained readings" {
@@ -3064,7 +3117,7 @@ test "document raster checkpoint and reader queue contracts" {
 
 // Exercise the real executor with the same persistence capability used across
 // native and supervised host boundaries; destroy all invocation state on retry.
-fn testDurableReading(comptime Node: type, node: *Node) !void {
+fn testDurableReading(comptime Node: type, node: *Node, comptime audio: bool) !void {
     const a = std.testing.allocator;
     const runs = readers.document_runs;
     var memory = readers.testing.Store{ .a = a };
@@ -3075,7 +3128,9 @@ fn testDurableReading(comptime Node: type, node: *Node) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const work = arena.allocator();
-    const request =
+    const request = if (audio)
+        \\{"model":"parent","documents":[{"id":"receipt","url":"fixture","media_type":"audio/wav"}]}
+    else
         \\{"model":"parent","documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
     ;
     const identity: runs.Identity = .{ .request = durable.hash(request), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
@@ -3344,4 +3399,158 @@ test "document durable raster checkpoints preserve picture-heavy slide costs acr
     try durable.restore(&restored, decoded.header.usage, decoded.header.costs, false);
     try std.testing.expectEqual(run.usage.rendered_pixels, restored.usage.rendered_pixels);
     try std.testing.expectEqual(run.usage.rendered_pixels, (try store.load(work, "slide-costs", "alice")).used.pixels);
+}
+
+const AudioPlanTestNode = struct {
+    silent: bool = false,
+    transient_work: bool = false,
+    reads: usize = 0,
+    extracts: usize = 0,
+    downloads: usize = 0,
+    repair: bool = false,
+    incomplete: bool = false,
+    mismatch: bool = false,
+    budget: u64 = 1_000_000,
+    retained: ?[]const u8 = null,
+    fn readDocumentArtifact(self: *@This(), a: A, _: []const u8) ![]u8 {
+        return a.dupe(u8, self.retained orelse return error.UnexpectedCall);
+    }
+    fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
+        if (std.mem.eql(u8, name, "parent") and operation == .read) return try std.json.Stringify.valueAlloc(a, c.Definition{
+            .models = &.{.{ .name = "child", .model = "audio-plan", .operation = .read, .input = if (self.mismatch) .image else .audio }},
+            .read = .{ .reader = "child" },
+        }, .{});
+        if (std.mem.eql(u8, name, "audio-plan") and operation == .read) return try std.json.Stringify.valueAlloc(a, c.Definition{
+            .models = &.{
+                .{ .name = "fast", .model = "gemma4-fast", .operation = .read, .input = .audio },
+                .{ .name = "accurate", .model = "gemma4-accurate", .operation = .read, .input = .audio },
+                .{ .name = "verifier", .model = "gemma4-verifier", .operation = .read, .input = .audio },
+            },
+            .read = .{ .reader = "fast", .accurate_reader = if (self.repair) "accurate" else null, .verification_reader = if (self.repair) "verifier" else null },
+            .budget = .{ .max_total_tokens = self.budget },
+        }, .{});
+        if (std.mem.eql(u8, name, "audio-extract") and operation == .extract) return try std.json.Stringify.valueAlloc(a, c.Definition{
+            .models = &.{ .{ .name = "speech", .model = "parent", .operation = .read, .input = .audio }, .{ .name = "entities", .model = "extractor", .operation = .extract } },
+            .read = .{ .reader = "speech" },
+            .extract = .{ .model = "entities", .require_source_support = true },
+        }, .{});
+        return null;
+    }
+    fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+        return .{ .binding = binding, .path = binding.model, .identity = durable.hash(binding.model) };
+    }
+    fn documentDownload(self: *@This(), a: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+        self.downloads += 1;
+        return .{ .data = try @import("../pipelines/audio.zig").wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 }) };
+    }
+    pub fn documentReadAudio(self: *@This(), a: A, model: []const u8, bytes: []const u8, _: ?[]const u8, _: ?i64, control: Control) !struct { text: []const u8, prompt_tokens: usize, completion_tokens: usize, truncated: bool, silent_audio: bool } {
+        try control.check();
+        if (self.transient_work) {
+            for (0..16) |_| {
+                const scratch = try a.alloc(u8, 128 * 1024);
+                @memset(scratch, 0xa5);
+                a.free(scratch);
+            }
+        }
+        try std.testing.expectEqualStrings("RIFF", bytes[0..4]);
+        self.reads += 1;
+        const truncated = self.incomplete or (self.repair and std.mem.eql(u8, model, "gemma4-fast"));
+        return .{ .text = try a.dupe(u8, if (self.silent) "" else if (truncated) "Alice" else "Alice spoke."), .prompt_tokens = if (self.silent) 0 else 10, .completion_tokens = if (self.silent) 0 else 3, .truncated = if (self.silent) false else truncated, .silent_audio = self.silent };
+    }
+    fn extractDirectWithControl(self: *@This(), a: A, _: []const u8, request: @import("antfly_extracting").Request, _: Control) !@import("antfly_extracting").Response {
+        self.extracts += 1;
+        const content = try std.json.parseFromSliceLeaky(V, a, request.inputs[0].content_json, .{});
+        try std.testing.expect(std.mem.indexOf(u8, content.string, "Alice spoke.") != null);
+        return .{ .allocator = a, .json = try a.dupe(u8,
+            \\{"object":"extraction","schema_version":2,"data":[{"entities":[{"label":"person","text":"Alice","start":0,"end":5,"score":0.9}]}],"usage":{"input_tokens":4,"output_tokens":0}}
+        ) };
+    }
+    fn readEncodedImagesReportedDirectWithContext(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) anyerror!readers.BatchResult {
+        return error.UnexpectedCall;
+    }
+    fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
+        return error.UnexpectedCall;
+    }
+    fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+        return error.UnexpectedCall;
+    }
+};
+
+test "document audio planner composes transcription refinement verification and extraction" {
+    const a = std.testing.allocator;
+    var node = AudioPlanTestNode{ .repair = true };
+    const bytes = try Service(AudioPlanTestNode).readJson(&node, a, "{\"model\":\"parent\",\"audio\":\"data:audio/wav;base64,fixture\"}", .{});
+    defer a.free(bytes);
+    var result = try std.json.parseFromSlice(V, a, bytes, .{});
+    defer result.deinit();
+    const row = result.value.object.get("data").?.array.items[0];
+    try std.testing.expectEqualStrings("audio", row.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("none", row.object.get("coordinate_space").?.string);
+    try std.testing.expectEqualStrings("complete", row.object.get("status").?.string);
+    try std.testing.expectEqualStrings("Alice spoke.", row.object.get("text").?.string);
+    try std.testing.expectEqual(@as(usize, 3), node.reads);
+    try std.testing.expectEqual(@as(i64, 39), result.value.object.get("usage").?.object.get("total_tokens").?.integer);
+    const extraction =
+        \\{"model":"audio-extract","schema_version":2,"schema":{"entities":["person"]},"documents":[{"id":"recording","url":"fixture","media_type":"audio/wav"}]}
+    ;
+    const output = try Service(AudioPlanTestNode).extractJson(&node, a, extraction, .{});
+    defer a.free(output);
+    try std.testing.expectEqual(@as(usize, 1), node.extracts);
+    node.retained = bytes;
+    const calls_before_reuse = node.reads;
+    const reused = try Service(AudioPlanTestNode).extractJson(&node, a,
+        \\{"model":"audio-extract","schema_version":2,"schema":{"entities":["person"]},"read_artifact":"retained-audio"}
+    , .{});
+    defer a.free(reused);
+    try std.testing.expectEqual(calls_before_reuse, node.reads);
+    try std.testing.expectEqual(@as(usize, 2), node.extracts);
+    node.incomplete = true;
+    try std.testing.expectError(error.DocumentUnresolved, Service(AudioPlanTestNode).extractJson(&node, a, extraction, .{}));
+    try std.testing.expectEqual(@as(usize, 2), node.extracts);
+}
+
+test "document audio planner rejects mismatched capability before downloading and enforces token budget" {
+    const a = std.testing.allocator;
+    const request = "{\"model\":\"parent\",\"audio\":\"AAAA\"}";
+    var node = AudioPlanTestNode{ .mismatch = true };
+    try std.testing.expectError(error.DocumentCapabilityMismatch, Service(AudioPlanTestNode).readJson(&node, a, request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), node.downloads);
+    node.mismatch = false;
+    node.budget = 1;
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, Service(AudioPlanTestNode).readJson(&node, a, request, .{}));
+}
+
+test "document audio planner durable replay does not rerun transcription" {
+    var node = AudioPlanTestNode{};
+    try testDurableReading(AudioPlanTestNode, &node, true);
+}
+
+test "document nested audio silence remains complete without fallback or invented words" {
+    const a = std.testing.allocator;
+    var node = AudioPlanTestNode{ .silent = true, .repair = true };
+    const bytes = try Service(AudioPlanTestNode).readJson(&node, a, "{\"model\":\"parent\",\"audio\":\"data:audio/wav;base64,fixture\"}", .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(V, a, bytes, .{});
+    defer parsed.deinit();
+    const page = parsed.value.object.get("data").?.array.items[0].object;
+    try std.testing.expectEqualStrings("", page.get("text").?.string);
+    try std.testing.expectEqualStrings("complete", page.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 1), node.reads);
+    var proof = false;
+    for (page.get("findings").?.array.items) |item| if (std.mem.eql(u8, item.string, "audio_silence")) {
+        proof = true;
+    };
+    try std.testing.expect(proof);
+}
+
+test "document audio generation reclaims transient memory outside the page arena" {
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = std.testing.allocator, .limit = 512 * 1024 };
+    const a = bounded.allocator();
+    var node = AudioPlanTestNode{ .transient_work = true };
+    const bytes = try Service(AudioPlanTestNode).readJson(&node, a, "{\"model\":\"parent\",\"audio\":\"fixture\"}", .{});
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Alice spoke.") != null);
+    a.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), node.reads);
+    try std.testing.expect(!bounded.denied);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
 }

@@ -656,9 +656,15 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("antfly_platform", configured_platform_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_paged_attention_diff_exe.root_module);
         quant_kernel_cuda_paged_attention_diff_exe.root_module.link_libc = true;
+        // Build the diagnostic tool independently of the pinned SM89 candidate
+        // compiler so other CUDA targets can supply their own explicit cubins.
+        const install_paged_attention_diff = b.addInstallArtifact(quant_kernel_cuda_paged_attention_diff_exe, .{});
+        b.step("quant-kernel-cuda-paged-attention-diff-tool", "Build paged attention differential tool without compiling SM89 candidates").dependOn(&install_paged_attention_diff.step);
         const quant_kernel_cuda_paged_attention_diff_tests = b.addTest(.{
+            .filters = &.{ "paged attention", "CUDA production dense primitive smoke" },
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/quant_kernel_cuda_paged_attention_diff.zig"),
                 .target = target,
@@ -666,9 +672,12 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("antfly_platform", configured_platform_mod);
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("ml", ml_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_paged_attention_diff_tests.root_module);
         quant_kernel_cuda_paged_attention_diff_tests.root_module.link_libc = true;
         const run_quant_kernel_cuda_paged_attention_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_tests);
+        b.step("test-cuda-paged-attention-diff-tool", "Run paged attention differential harness unit tests").dependOn(&run_quant_kernel_cuda_paged_attention_diff_tests.step);
         const run_quant_kernel_cuda_paged_attention_diff = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_exe);
         run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd256");
         run_quant_kernel_cuda_paged_attention_diff.addFileArg2(score_prework_hd256_cubin, .{ .make_absolute = true });

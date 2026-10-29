@@ -76,6 +76,8 @@ pub const DocumentSource = struct {
     include_hidden: bool = false,
 };
 pub const Request = struct {
+    /// Base64 or data URI audio (including audio tracks in video containers).
+    audio: ?[]const u8 = null,
     images: []const []const u8 = &.{},
     documents: []const DocumentSource = &.{},
     prompt: ?[]const u8 = null,
@@ -258,6 +260,7 @@ pub const Reader = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        accepts_audio: bool = false,
         accepts_documents: bool = false,
         read: *const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result,
         read_reported: ?*const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult = null,
@@ -265,11 +268,15 @@ pub const Reader = struct {
     };
 
     pub fn read(self: Reader, alloc: Allocator, req: Request) ![]Result {
+        if (req.audio != null and !self.vtable.accepts_audio) return error.UnsupportedAudioInput;
+        if (req.audio != null and (req.images.len > 0 or req.documents.len > 0)) return error.InvalidDocumentSource;
         if (req.documents.len > 0 and !self.vtable.accepts_documents) return error.UnsupportedDocumentFormat;
         return try self.vtable.read(self.ptr, alloc, req);
     }
 
     pub fn readReported(self: Reader, alloc: Allocator, req: Request) !BatchResult {
+        if (req.audio != null and !self.vtable.accepts_audio) return error.UnsupportedAudioInput;
+        if (req.audio != null and (req.images.len > 0 or req.documents.len > 0)) return error.InvalidDocumentSource;
         if (req.documents.len > 0 and !self.vtable.accepts_documents) return error.UnsupportedDocumentFormat;
         if (self.vtable.read_reported) |reported| return try reported(self.ptr, alloc, req);
         const items = try self.read(alloc, req);
@@ -600,7 +607,7 @@ const AntflyReaderState = struct {
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
         }
-        return .{ .ptr = state, .vtable = &.{ .accepts_documents = true, .read = read, .read_reported = readReported, .deinit = deinit } };
+        return .{ .ptr = state, .vtable = &.{ .accepts_audio = true, .accepts_documents = true, .read = read, .read_reported = readReported, .deinit = deinit } };
     }
 
     pub fn deinit(ptr: *anyopaque) void {
@@ -626,9 +633,15 @@ const AntflyReaderState = struct {
 
     fn readReported(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
-        if (req.documents.len > 0) {
-            if (req.images.len > 0) return error.InvalidDocumentSource;
-            const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = self.model, .documents = req.documents, .prompt = req.prompt, .max_tokens = req.max_tokens }, .{ .emit_null_optional_fields = false });
+        if (req.documents.len > 0 or req.audio != null) {
+            if (req.images.len > 0 or (req.documents.len > 0 and req.audio != null)) return error.InvalidDocumentSource;
+            const body = try std.json.Stringify.valueAlloc(alloc, .{
+                .model = self.model,
+                .documents = if (req.documents.len > 0) @as(?[]const DocumentSource, req.documents) else null,
+                .audio = req.audio,
+                .prompt = req.prompt orelse self.prompt,
+                .max_tokens = req.max_tokens orelse self.max_tokens,
+            }, .{ .emit_null_optional_fields = false });
             defer alloc.free(body);
             const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
             defer alloc.free(url);
@@ -1871,3 +1884,46 @@ pub const document_rpc = @import("document_rpc.zig");
 pub const testing = document_runs.testing;
 
 pub const document_stream = @import("document_stream.zig");
+
+test "antfly audio reader preserves truncated completion and measured usage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Case = struct {
+        fn inspect(request: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("data:video/mp4;base64,AAAA", parsed.value.object.get("audio").?.string);
+            try std.testing.expect(!parsed.value.object.contains("images"));
+            try std.testing.expect(!parsed.value.object.contains("documents"));
+        }
+        fn run(alloc: Allocator, reader: Reader, result: *?BatchResult, failure: *?anyerror) std.Io.Cancelable!void {
+            result.* = reader.readReported(alloc, .{ .audio = "data:video/mp4;base64,AAAA" }) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/read", .assert_request = Case.inspect, .respond = .{
+        .body = "{\"object\":\"list\",\"model\":\"gemma4\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"partial speech\",\"origin\":\"transcription\",\"status\":\"truncated\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}",
+    } }});
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    const reader = try initReader(a, &client, .{ .provider = .antfly, .model = "gemma4", .api_url = server.baseUrl() });
+    defer reader.deinit();
+    var result: ?BatchResult = null;
+    defer if (result) |*value| value.deinit(a);
+    var failure: ?anyerror = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, Case.run, .{ a, reader, &result, &failure });
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), result.?.items.len);
+    try std.testing.expectEqual(Completion.length, result.?.items[0].completion);
+    try std.testing.expectEqual(@as(i64, 15), result.?.usage.?.total_tokens);
+    try std.testing.expectError(error.ReadOutputTruncated, requireComplete(result.?.items));
+}

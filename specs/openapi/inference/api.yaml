@@ -894,9 +894,13 @@ paths:
           $ref: '#/components/responses/TransientCapacity'
   /read:
     post:
-      summary: Read text from images (OCR/document understanding)
+      summary: Read text from images, documents, or audio
       description: |
         Reads text from images and documents with a local reader model. OCR and document-reading tasks can also run on a vision-capable generator or a connected provider.
+
+        Audio input uses an audio-capable generator such as Gemma 4. Supported video
+        containers are transcribed from their audio track. Results report truncation;
+        generated text does not imply word alignment or speaker identification.
 
         ## Models
 
@@ -2962,13 +2966,17 @@ components:
       type: object
       required:
         - model
-      description: Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
-      x-antfly-exactly-one-of: [images, documents]
+      description: Read exactly one of images, documents, or audio. Audio reads use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported video containers.
+      x-antfly-exactly-one-of: [images, documents, audio]
       properties:
         model:
           type: string
-          description: Name of reader model from models_dir/readers/
+          description: Reader model from models_dir/readers/, or an audio-capable generator from models_dir/generators/ for audio inputs.
           example: lightonai/LightOnOCR-3-0.8B
+        audio:
+          type: string
+          minLength: 1
+          description: Base64-encoded audio or a data URI, mutually exclusive with images and documents. Supports audio tracks in MP4/MOV and WebM containers. Uses an audio-capable generator from models_dir/generators/ such as Gemma 4. Returns transcript text without word timestamps or speaker labels; video frames are not captioned. Use a registered document reader with an audio binding for planning, fallback, verification, artifact retention, and durable jobs.
         retain_artifact:
           type: boolean
           default: false
@@ -3083,7 +3091,7 @@ components:
           description: One-based original page or slide number.
         kind:
           type: string
-          enum: [page, slide, image]
+          enum: [page, slide, image, audio]
         inherited_parts:
           type: array
           items:

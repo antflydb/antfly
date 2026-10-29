@@ -642,7 +642,7 @@ export class InferenceClient {
     });
   }
 
-  /** Read images or complete PDF/PPTX documents with a registered reader/composite. */
+  /** Read images, complete PDF/PPTX documents, or audio with a capable model. */
   async read(
     request: components["schemas"]["InferenceReadRequest"]
   ): Promise<components["schemas"]["InferenceReadResponse"]> {

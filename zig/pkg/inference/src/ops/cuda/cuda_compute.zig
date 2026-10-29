@@ -7362,10 +7362,13 @@ const CudaKvDeviceStorage = struct {
         }
     }
 
-    fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    fn hookDeinit(ctx: *anyopaque, _: std.mem.Allocator) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        // The hook belongs to the model's CUDA allocator, while its enclosing
+        // KV runtime can use a distinct admitted request allocator.
+        const owner = self.allocator;
         self.deinit();
-        allocator.destroy(self);
+        owner.destroy(self);
     }
 
     fn cloneExactPrefix(
@@ -12120,14 +12123,23 @@ fn cudaTurboquantSplitAttentionEnabled() bool {
 
 // Eager launches cover this sequence, not every other page in the pool.
 // Graphs with device-updated lengths must still cover their reserved capacity.
-fn cudaSplitAttentionCapacity(logical_tokens: usize, physical_tokens: usize, dynamic_length: bool) usize {
-    return if (dynamic_length) @max(logical_tokens, physical_tokens) else logical_tokens;
+// E4B replay warmup must use that same capacity so its scratch trace is stable.
+fn cudaSplitAttentionCapacity(logical_tokens: usize, physical_tokens: usize, dynamic_length: bool, replay_planned: bool) usize {
+    return if (dynamic_length or replay_planned) @max(logical_tokens, physical_tokens) else logical_tokens;
 }
 
 test "LightOnOCR3 CUDA split attention plans logical context and preserves graph capacity" {
-    try std.testing.expectEqual(@as(usize, 662), cudaSplitAttentionCapacity(662, 65536, false));
-    try std.testing.expectEqual(@as(usize, 65536), cudaSplitAttentionCapacity(662, 65536, true));
-    try std.testing.expectEqual(@as(usize, 1024), cudaSplitAttentionCapacity(1024, 512, true));
+    try std.testing.expectEqual(@as(usize, 662), cudaSplitAttentionCapacity(662, 65536, false, false));
+    try std.testing.expectEqual(@as(usize, 65536), cudaSplitAttentionCapacity(662, 65536, true, false));
+    try std.testing.expectEqual(@as(usize, 1024), cudaSplitAttentionCapacity(1024, 512, true, false));
+    // E4B warmup must allocate exactly the scratch used during capture, even
+    // before device scalars exist and while the prefix fits in one chunk.
+    const warmup = cudaSplitAttentionCapacity(46, 544, false, true);
+    const capture = cudaSplitAttentionCapacity(49, 544, true, true);
+    try std.testing.expectEqual(@as(usize, 544), warmup);
+    try std.testing.expectEqual(warmup, capture);
+    try std.testing.expectEqual(@as(usize, 8), (@min(warmup, 512) + 63) / 64);
+    try std.testing.expectEqual(@as(usize, 5), (capture + 127) / 128);
 }
 
 fn cudaTurboquantSplitAttentionChunkSize() usize {
@@ -25038,6 +25050,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
             attention.kv_sequence_len,
             layer.capacity_tokens,
             decode_scalars.ptr != 0 or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active,
+            warp_f16 and cudaDebugGraphPersistentReplayEnabled(self),
         );
         // The F16 warp kernel partitions the visible window from its first
         // key. Keep this capacity fixed across graph replays as the prefix
@@ -29799,6 +29812,17 @@ test "cuda compute vtable is type checked" {
     _ = graph_prepare_input_fn;
     _ = graph_prepare_greedy_input_fn;
     _ = vtable;
+}
+
+test "CUDA KV hook teardown uses its allocation owner instead of the request allocator" {
+    const Bounded = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
+    var owner = Bounded{ .backing = std.testing.allocator, .limit = 4096 };
+    var request = Bounded{ .backing = std.testing.allocator, .limit = 4096 };
+    const hook = try CudaKvDeviceStorage.create(owner.allocator(), undefined, .f16);
+    try std.testing.expect(owner.live > 0);
+    hook.hook().deinit(request.allocator());
+    try std.testing.expectEqual(@as(usize, 0), owner.live);
+    try std.testing.expectEqual(@as(usize, 0), request.live);
 }
 
 test "cuda shape helpers reject incompatible shapes" {

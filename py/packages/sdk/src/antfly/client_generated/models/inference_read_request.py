@@ -18,29 +18,37 @@ T = TypeVar("T", bound="InferenceReadRequest")
 
 @_attrs_define
 class InferenceReadRequest:
-    """Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
+    """Read exactly one of images, documents, or audio. Audio reads use an audio-capable generator such as Gemma 4 and
+    transcribe the audio track of supported video containers.
 
-    Attributes:
-        model (str): Name of reader model from models_dir/readers/ Example: lightonai/LightOnOCR-3-0.8B.
-        retain_artifact (bool | Unset): Request an opaque, process-local reading handle for extraction reuse. Retention
-            is best effort; inspect document.artifact_id and artifact_ttl_ms. Default: False.
-        documents (list[DocumentSource] | Unset): Complete documents, mutually exclusive with images. Each source is
-            independent; selected pages are read in original source order.
-        images (list[InferenceImageURL] | Unset): Images to read text from. Supports:
-            - Data URIs: `data:image/png;base64,...`
-            - URLs (if content_security allows)
-             Example: [{'url': 'data:image/png;base64,iVBORw0KGgo...'}].
-        prompt (str | Unset): Optional task prompt for document understanding models.
-            - Donut CORD: "<s_cord-v2>" for receipt parsing
-            - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
-            - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
-            - Pix2Struct: "What type of document is this?"
-            - Moondream: "Describe this image."
-             Example: What type of document is this?.
-        max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
+        Attributes:
+            model (str): Reader model from models_dir/readers/, or an audio-capable generator from models_dir/generators/
+                for audio inputs. Example: lightonai/LightOnOCR-3-0.8B.
+            audio (str | Unset): Base64-encoded audio or a data URI, mutually exclusive with images and documents. Supports
+                audio tracks in MP4/MOV and WebM containers. Uses an audio-capable generator from models_dir/generators/ such as
+                Gemma 4. Returns transcript text without word timestamps or speaker labels; video frames are not captioned. Use
+                a registered document reader with an audio binding for planning, fallback, verification, artifact retention, and
+                durable jobs.
+            retain_artifact (bool | Unset): Request an opaque, process-local reading handle for extraction reuse. Retention
+                is best effort; inspect document.artifact_id and artifact_ttl_ms. Default: False.
+            documents (list[DocumentSource] | Unset): Complete documents, mutually exclusive with images. Each source is
+                independent; selected pages are read in original source order.
+            images (list[InferenceImageURL] | Unset): Images to read text from. Supports:
+                - Data URIs: `data:image/png;base64,...`
+                - URLs (if content_security allows)
+                 Example: [{'url': 'data:image/png;base64,iVBORw0KGgo...'}].
+            prompt (str | Unset): Optional task prompt for document understanding models.
+                - Donut CORD: "<s_cord-v2>" for receipt parsing
+                - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
+                - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
+                - Pix2Struct: "What type of document is this?"
+                - Moondream: "Describe this image."
+                 Example: What type of document is this?.
+            max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
     """
 
     model: str
+    audio: str | Unset = UNSET
     retain_artifact: bool | Unset = False
     documents: list[DocumentSource] | Unset = UNSET
     images: list[InferenceImageURL] | Unset = UNSET
@@ -50,6 +58,8 @@ class InferenceReadRequest:
 
     def to_dict(self) -> dict[str, Any]:
         model = self.model
+
+        audio = self.audio
 
         retain_artifact = self.retain_artifact
 
@@ -78,6 +88,8 @@ class InferenceReadRequest:
                 "model": model,
             }
         )
+        if audio is not UNSET:
+            field_dict["audio"] = audio
         if retain_artifact is not UNSET:
             field_dict["retain_artifact"] = retain_artifact
         if documents is not UNSET:
@@ -98,6 +110,8 @@ class InferenceReadRequest:
 
         d = dict(src_dict)
         model = d.pop("model")
+
+        audio = d.pop("audio", UNSET)
 
         retain_artifact = d.pop("retain_artifact", UNSET)
 
@@ -125,6 +139,7 @@ class InferenceReadRequest:
 
         inference_read_request = cls(
             model=model,
+            audio=audio,
             retain_artifact=retain_artifact,
             documents=documents,
             images=images,

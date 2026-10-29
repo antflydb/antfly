@@ -1798,12 +1798,22 @@ components:
           - image/png
           - image/jpeg
           - image/webp
+          - audio/wav
+          - audio/mpeg
+          - audio/aac
+          - audio/mp4
+          - audio/ogg
+          - audio/flac
+          - audio/webm
+          - video/mp4
+          - video/quicktime
+          - video/webm
         pages:
           type: array
           minItems: 1
           maxItems: 1024
           uniqueItems: true
-          description: Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+          description: Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection.
           items:
             type: integer
             minimum: 1

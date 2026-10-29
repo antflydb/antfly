@@ -5136,8 +5136,12 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Read text from images (OCR/document understanding)
+         * Read text from images, documents, or audio
          * @description Reads text from images and documents with a local reader model. OCR and document-reading tasks can also run on a vision-capable generator or a connected provider.
+         *
+         *     Audio input uses an audio-capable generator such as Gemma 4. Supported video
+         *     containers are transcribed from their audio track. Results report truncation;
+         *     generated text does not imply word alignment or speaker identification.
          *
          *     ## Models
          *
@@ -23234,13 +23238,15 @@ export interface components {
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
         };
-        /** @description Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference. */
+        /** @description Read exactly one of images, documents, or audio. Audio reads use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported video containers. */
         InferenceReadRequest: {
             /**
-             * @description Name of reader model from models_dir/readers/
+             * @description Reader model from models_dir/readers/, or an audio-capable generator from models_dir/generators/ for audio inputs.
              * @example lightonai/LightOnOCR-3-0.8B
              */
             model: string;
+            /** @description Base64-encoded audio or a data URI, mutually exclusive with images and documents. Supports audio tracks in MP4/MOV and WebM containers. Uses an audio-capable generator from models_dir/generators/ such as Gemma 4. Returns transcript text without word timestamps or speaker labels; video frames are not captioned. Use a registered document reader with an audio binding for planning, fallback, verification, artifact retention, and durable jobs. */
+            audio?: string;
             /**
              * @description Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
              * @default false
@@ -23321,7 +23327,7 @@ export interface components {
             /** @description One-based original page or slide number. */
             number?: number;
             /** @enum {string} */
-            kind?: "page" | "slide" | "image";
+            kind?: "page" | "slide" | "image" | "audio";
             /** @description Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved. */
             inherited_parts?: {
                 [key: string]: unknown;
@@ -29377,8 +29383,8 @@ export interface components {
             /** @description Inline data URI or location allowed by the deployment content security policy. */
             url: string;
             /** @enum {string} */
-            media_type: "application/pdf" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "image/png" | "image/jpeg" | "image/webp";
-            /** @description Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. */
+            media_type: "application/pdf" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "image/png" | "image/jpeg" | "image/webp" | "audio/wav" | "audio/mpeg" | "audio/aac" | "audio/mp4" | "audio/ogg" | "audio/flac" | "audio/webm" | "video/mp4" | "video/quicktime" | "video/webm";
+            /** @description Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection. */
             pages?: number[];
             /**
              * @description Include slide speaker notes as separate evidence, never silently as visible slide text.

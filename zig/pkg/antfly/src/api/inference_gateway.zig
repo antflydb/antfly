@@ -746,22 +746,35 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return ctx.json(.{ .object = "list", .model = model, .data = data });
         },
         .read => {
-            try only(request, &.{ "model", "images", "prompt", "max_tokens" });
-            const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
-            if (images != .array or images.array.items.len == 0) return error.InvalidInferenceRequest;
-            const urls = try a.alloc([]const u8, images.array.items.len);
-            for (images.array.items, urls) |v, *out| out.* = try string(if (v == .object) v.object.get("url") orelse return error.InvalidInferenceRequest else v);
+            try only(request, &.{ "model", "images", "audio", "prompt", "max_tokens" });
+            const audio = if (request.object.get("audio")) |value| try string(value) else null;
+            const images = request.object.get("images");
+            if ((audio != null) == (images != null)) return error.InvalidInferenceRequest;
+            if (audio) |value| if (value.len == 0) return error.InvalidInferenceRequest;
+            const urls = if (images) |value| blk: {
+                if (value != .array or value.array.items.len == 0) return error.InvalidInferenceRequest;
+                const urls = try a.alloc([]const u8, value.array.items.len);
+                for (value.array.items, urls) |v, *out| out.* = try string(if (v == .object) v.object.get("url") orelse return error.InvalidInferenceRequest else v);
+                break :blk urls;
+            } else &.{};
             var result = try executor.read(a, name, .{
+                .audio = audio,
                 .images = urls,
                 .prompt = if (request.object.get("prompt")) |v| try string(v) else null,
                 .max_tokens = if (request.object.get("max_tokens")) |v| try integer(v) else null,
             });
             defer result.deinit(a);
-            const Item = struct { object: []const u8 = "read", index: usize, text: []const u8, fields: ?Json, regions: ?Json };
+            const Item = struct { object: []const u8 = "read", index: usize, text: []const u8, status: []const u8, origin: ?[]const u8, fields: ?Json, regions: ?Json };
             const data = try a.alloc(Item, result.items.len);
             for (result.items, data, 0..) |item, *out, i| out.* = .{
                 .index = i,
                 .text = item.text,
+                .status = switch (item.completion) {
+                    .complete => "complete",
+                    .length => "truncated",
+                    .unresolved => "unresolved",
+                },
+                .origin = if (audio != null) "transcription" else null,
                 .fields = if (item.fields_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
                 .regions = if (item.regions_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
             };

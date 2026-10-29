@@ -515,7 +515,7 @@ func (c *InferenceClient) decide(ctx context.Context, body oapi.DecisionRequest)
 	return resp.JSON200, nil
 }
 
-// Read reads image batches or complete PDF/PPTX document sources. Document
+// Read reads image batches, complete PDF/PPTX documents, or audio transcripts. Document
 // results retain page/slide identity and may explicitly report unresolved pages.
 func (c *InferenceClient) Read(ctx context.Context, req oapi.InferenceReadRequest) (*oapi.InferenceReadResponse, error) {
 	resp, err := c.client.ReadImagesWithResponse(ctx, req)
