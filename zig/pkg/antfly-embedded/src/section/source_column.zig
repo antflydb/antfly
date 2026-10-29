@@ -289,8 +289,66 @@ pub const Text = struct {
         const size = std.mem.readInt(u32, entry[40..44], .little);
         return try offsets.prepare(a, try View.init(self.view.source, self.view.offset + start, size), self.length, std.mem.readInt(u32, entry[44..48], .little), std.mem.readInt(u32, entry[48..52], .little), selection, control);
     }
+    /// Own only final bounded UTF-8 chunks; decompression buffers are reclaimable.
+    pub fn readChunks(self: Text, a: A, control: Token) ![]const []const u8 {
+        const work = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(work);
+        errdefer for (parts.items) |part| a.free(part);
+        const Append = struct {
+            fn copy(output: A, temporary: A, list: *std.ArrayList([]const u8), bytes: []const u8) !void {
+                if (bytes.len == 0) return;
+                const owned = try output.dupe(u8, bytes);
+                errdefer output.free(owned);
+                try list.append(temporary, owned);
+            }
+        };
+        var carry: [4]u8 = undefined;
+        var held: usize = 0;
+        var at: u32 = 0;
+        while (at < self.length) {
+            try control.check();
+            const index = at / page_size;
+            if (index % 4 == 0) {
+                const through = @min(self.pages.len / 32, @as(usize, index) + 5);
+                for (@as(usize, index) + 1..through) |future| {
+                    const entry = self.pages[future * 32 ..][0..16];
+                    self.view.source.prefetch(self.view.offset + std.mem.readInt(u64, entry[0..8], .little), std.mem.readInt(u32, entry[8..12], .little));
+                }
+            }
+            const end = @min(self.length, at +| page_size);
+            const bytes = try self.read(work, at, end, control);
+            defer work.free(bytes);
+            var begin: usize = 0;
+            if (held != 0) {
+                const width = try std.unicode.utf8ByteSequenceLength(carry[0]);
+                const needed = width - held;
+                if (needed > bytes.len) return error.InvalidData;
+                @memcpy(carry[held..width], bytes[0..needed]);
+                try Append.copy(a, work, &parts, carry[0..width]);
+                begin = needed;
+                held = 0;
+            }
+            var stop = bytes.len;
+            if (stop > begin) {
+                var lead = stop - 1;
+                while (lead > begin and bytes[lead] & 0xc0 == 0x80) lead -= 1;
+                const width = try std.unicode.utf8ByteSequenceLength(bytes[lead]);
+                if (stop - lead < width) {
+                    held = stop - lead;
+                    @memcpy(carry[0..held], bytes[lead..]);
+                    stop = lead;
+                }
+            }
+            try Append.copy(a, work, &parts, bytes[begin..stop]);
+            at = end;
+        }
+        if (held != 0) return error.InvalidData;
+        return a.dupe([]const u8, parts.items);
+    }
     pub fn read(self: Text, a: A, first: u32, end: u32, control: Token) ![]u8 {
         if (first > end or end > self.length) return error.InvalidData;
+        const work = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
         const out = try a.alloc(u8, end - first);
         errdefer a.free(out);
         var begin = first;
@@ -310,11 +368,11 @@ pub const Text = struct {
             const entry = self.pages[index * 32 ..][0..16];
             const offset = std.mem.readInt(u64, entry[0..8], .little);
             const n = std.mem.readInt(u32, entry[8..12], .little);
-            const encoded = try a.alloc(u8, n);
-            defer a.free(encoded);
+            const encoded = try work.alloc(u8, n);
+            defer work.free(encoded);
             try self.view.readInto(offset, encoded);
-            const raw = try a.alloc(u8, std.mem.readInt(u32, entry[12..16], .little));
-            defer a.free(raw);
+            const raw = try work.alloc(u8, std.mem.readInt(u32, entry[12..16], .little));
+            defer work.free(raw);
             try snappy.decodeInto(encoded, raw);
             const at = begin % page_size;
             const stop = @min(end - begin, raw.len - at);
@@ -714,4 +772,37 @@ fn inlineReaderScenario(a: A) !void {
 test "highlight inline source Reader materializes typed JSON and releases allocations on failure" {
     try inlineReaderScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, inlineReaderScenario, .{});
+}
+
+test "highlight chunked source delivery preserves UTF8 across page boundaries without a full string buffer" {
+    const a = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    try text.appendNTimes(a, 'x', page_size - 1);
+    try text.appendSlice(a, "🙂\n\"\\");
+    try text.appendNTimes(a, 'y', page_size + 17);
+    var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = text.items }, &.{});
+    try std.testing.expect(try writer.finish());
+    var cursor = Cursor.init(try Reader.init(a, try View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len)));
+    defer cursor.deinit();
+    const source = (try cursor.text(0)).?;
+    const parts = try source.readChunks(a, .none);
+    defer {
+        for (parts) |part| a.free(part);
+        a.free(parts);
+    }
+    var at: usize = 0;
+    for (parts) |part| {
+        try std.testing.expect(part.len <= page_size);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(part));
+        try std.testing.expectEqualSlices(u8, text.items[at..][0..part.len], part);
+        at += part.len;
+    }
+    try std.testing.expectEqual(text.items.len, at);
+    try std.testing.expect(parts.len >= 3);
 }

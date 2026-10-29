@@ -399,57 +399,125 @@ fn suffixBounds(blocks: anytype) void {
         blocks[at - 1].minimum_gap = @min(blocks[at - 1].minimum_gap, blocks[at].minimum_gap);
     }
 }
-fn prepareInternal(a: A, view: View, source_length: u32, root_raw: u32, count: u32, selection: Selection, control: Control, compact: bool, known_mask: ?[]const u8) anyerror!Plan {
-    const work = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
-    var h: [header_size]u8 = undefined;
-    try control.check();
-    if (view.length < h.len) return error.InvalidData;
-    try view.readInto(0, &h);
-    if (!std.mem.eql(u8, h[0..8], magic) or std.mem.readInt(u32, h[20..24], .little) != root_raw or std.mem.readInt(u32, h[24..28], .little) != count or root_raw > @as(u64, source_length) * 64 + 64) return error.InvalidData;
-    const root_ref: Ref = .{ .offset = std.mem.readInt(u64, h[8..16], .little), .wire = std.mem.readInt(u32, h[16..20], .little), .raw = root_raw, .count = 0 };
-    if (root_ref.offset > view.length or root_ref.wire != view.length - root_ref.offset) return error.InvalidData;
-    const root_bytes = try read(work, view, root_ref, view.length, control);
-    defer work.free(root_bytes);
-    var root: Parser = .{ .bytes = root_bytes };
-    const n = try root.int(u32);
-    if (n > (root_bytes.len - root.at) / 36) return error.InvalidData;
+const Navigation = struct {
     const Page = struct { ceiling: []const u8, ref: Ref };
-    const pages = try work.alloc(Page, n);
-    defer work.free(pages);
-    var previous: ?[]const u8 = null;
-    var term_count: u64 = 0;
-    var prior_end: u64 = header_size;
-    for (pages) |*page| {
+    root_ref: Ref,
+    pages: []const Page,
+    lane_refs: []const Ref,
+    flags: u32,
+    term_count: u32,
+    fn load(a: A, view: View, source_length: u32, root_raw: u32, count: u32, control: Control) !*const Navigation {
+        var h: [header_size]u8 = undefined;
         try control.check();
-        page.* = .{ .ceiling = try root.string(), .ref = try root.ref() };
-        const ref = page.ref;
-        if ((previous != null and std.mem.order(u8, previous.?, page.ceiling) != .lt) or ref.offset < prior_end or ref.offset > root_ref.offset or ref.wire == 0 or ref.wire > root_ref.offset - ref.offset or ref.count == 0 or ref.count > page_terms or ref.raw > @as(u64, source_length) * 64 + 64) return error.InvalidData;
-        previous = page.ceiling;
-        prior_end = ref.offset + ref.wire;
-        term_count += ref.count;
+        if (view.length < h.len) return error.InvalidData;
+        try view.readInto(0, &h);
+        if (!std.mem.eql(u8, h[0..8], magic) or std.mem.readInt(u32, h[20..24], .little) != root_raw or std.mem.readInt(u32, h[24..28], .little) != count or root_raw > @as(u64, source_length) * 64 + 64) return error.InvalidData;
+        const root_ref: Ref = .{ .offset = std.mem.readInt(u64, h[8..16], .little), .wire = std.mem.readInt(u32, h[16..20], .little), .raw = root_raw, .count = 0 };
+        if (root_ref.offset > view.length or root_ref.wire != view.length - root_ref.offset) return error.InvalidData;
+        const root_bytes = try read(a, view, root_ref, view.length, control);
+
+        var root: Parser = .{ .bytes = root_bytes };
+        const n = try root.int(u32);
+        if (n > (root_bytes.len - root.at) / 36) return error.InvalidData;
+
+        const pages = try a.alloc(Page, n);
+
+        var previous: ?[]const u8 = null;
+        var term_count: u64 = 0;
+        var prior_end: u64 = header_size;
+        for (pages) |*page| {
+            try control.check();
+            page.* = .{ .ceiling = try root.string(), .ref = try root.ref() };
+            const ref = page.ref;
+            if ((previous != null and std.mem.order(u8, previous.?, page.ceiling) != .lt) or ref.offset < prior_end or ref.offset > root_ref.offset or ref.wire == 0 or ref.wire > root_ref.offset - ref.offset or ref.count == 0 or ref.count > page_terms or ref.raw > @as(u64, source_length) * 64 + 64) return error.InvalidData;
+            previous = page.ceiling;
+            prior_end = ref.offset + ref.wire;
+            term_count += ref.count;
+        }
+        const lane_count = try root.int(u32);
+        if (lane_count > (root.bytes.len - root.at) / 32) return error.InvalidData;
+        const lane_refs = try a.alloc(Ref, lane_count);
+
+        var lane_total: u64 = 0;
+        var lane_end: u64 = prior_end;
+        var lane_through: u32 = 0;
+        for (lane_refs, 0..) |*ref, i| {
+            try control.check();
+            ref.* = try root.ref();
+            if (ref.offset < lane_end or ref.offset > root_ref.offset or ref.wire == 0 or ref.wire > root_ref.offset - ref.offset or ref.count == 0 or ref.count > block_tokens or ref.raw == 0 or ref.raw > page_bytes or ref.through_end < lane_through or ref.through_end > source_length or (i + 1 < lane_refs.len and ref.count != block_tokens)) return error.InvalidData;
+            if (ref.minimum_start > source_length or ref.minimum_gap > source_length or (std.mem.readInt(u32, h[28..32], .little) & 0x40000000 != 0 and (i != 0 or ref.count > 1) and (ref.minimum_start == 0 or ref.minimum_gap == 0))) return error.InvalidData;
+            lane_end = ref.offset + ref.wire;
+            lane_through = ref.through_end;
+            lane_total += ref.count;
+        }
+        if (lane_count != 0 and (lane_total != count or std.mem.readInt(u32, h[28..32], .little) & 0x80000000 == 0)) return error.InvalidData;
+        if (root.at != root.bytes.len or term_count != (std.mem.readInt(u32, h[28..32], .little) & 0x3fffffff) or term_count > count or (term_count == 0) != (count == 0)) return error.InvalidData;
+        suffixBounds(lane_refs);
+        const result = try a.create(Navigation);
+        result.* = .{ .root_ref = root_ref, .pages = pages, .lane_refs = lane_refs, .flags = std.mem.readInt(u32, h[28..32], .little), .term_count = @intCast(term_count) };
+        return result;
     }
-    const lane_count = try root.int(u32);
-    if (lane_count > (root.bytes.len - root.at) / 32) return error.InvalidData;
-    const lane_refs = try work.alloc(Ref, lane_count);
-    defer work.free(lane_refs);
-    var lane_total: u64 = 0;
-    var lane_end: u64 = prior_end;
-    var lane_through: u32 = 0;
-    for (lane_refs, 0..) |*ref, i| {
-        try control.check();
-        ref.* = try root.ref();
-        if (ref.offset < lane_end or ref.offset > root_ref.offset or ref.wire == 0 or ref.wire > root_ref.offset - ref.offset or ref.count == 0 or ref.count > block_tokens or ref.raw == 0 or ref.raw > page_bytes or ref.through_end < lane_through or ref.through_end > source_length or (i + 1 < lane_refs.len and ref.count != block_tokens)) return error.InvalidData;
-        if (ref.minimum_start > source_length or ref.minimum_gap > source_length or (std.mem.readInt(u32, h[28..32], .little) & 0x40000000 != 0 and (i != 0 or ref.count > 1) and (ref.minimum_start == 0 or ref.minimum_gap == 0))) return error.InvalidData;
-        lane_end = ref.offset + ref.wire;
-        lane_through = ref.through_end;
-        lane_total += ref.count;
+};
+const Dictionary = struct {
+    terms: []const Plan.Term,
+    fn load(a: A, view: View, source_length: u32, page: Navigation.Page, lower: ?[]const u8, bound: u64, flags: u32, control: Control) !*const Dictionary {
+        const bytes = try read(a, view, page.ref, bound, control);
+        var parser: Parser = .{ .bytes = bytes };
+        const terms = try a.alloc(Plan.Term, page.ref.count);
+        var prior = lower;
+        for (terms) |*term| {
+            try control.check();
+            const text_ = try parser.string();
+            if ((prior != null and std.mem.order(u8, prior.?, text_) != .lt) or std.mem.order(u8, text_, page.ceiling) == .gt) return error.InvalidData;
+            prior = text_;
+            const minimum_start = try parser.int(u32);
+            const minimum_gap = try parser.int(u32);
+            const first_start = try parser.int(u32);
+            const regular_length = try parser.int(u32);
+            const count = try parser.int(u32);
+            if (count == 0 or count > (parser.bytes.len - parser.at) / 32) return error.InvalidData;
+            const refs = try a.alloc(Ref, count);
+            var block_end: u64 = header_size;
+            var through: u32 = 0;
+            var occurrences: u32 = 0;
+            const ordered = flags & 0x80000000 != 0;
+            const disjoint = flags & 0x40000000 != 0;
+            if (disjoint and !ordered) return error.InvalidData;
+            for (refs, 0..) |*ref, i| {
+                ref.* = try parser.ref();
+                if (ref.offset < block_end or ref.offset > page.ref.offset or ref.wire == 0 or ref.wire > page.ref.offset - ref.offset or ref.count == 0 or ref.count > block_tokens or ref.raw == 0 or ref.raw > page_bytes) return error.InvalidData;
+                if ((i + 1 < refs.len and ref.count != block_tokens) or ref.through_end > source_length or ref.through_end < through) return error.InvalidData;
+                if (ref.minimum_start > source_length or ref.minimum_gap > source_length or (disjoint and (i != 0 or ref.count > 1) and (ref.minimum_start == 0 or ref.minimum_gap == 0))) return error.InvalidData;
+                through = ref.through_end;
+                block_end = ref.offset + ref.wire;
+                occurrences = std.math.add(u32, occurrences, ref.count) catch return error.InvalidData;
+            }
+            if (first_start > source_length or regular_length > source_length - first_start or (regular_length != 0 and (!disjoint or occurrences < 2 or minimum_start <= regular_length or @as(u64, first_start) + @as(u64, occurrences - 1) * minimum_start + regular_length > source_length))) return error.InvalidData;
+            if (minimum_start > source_length or minimum_gap > source_length or (occurrences == 1 and (minimum_start != 0 or minimum_gap != 0)) or (disjoint and occurrences > 1 and (minimum_start == 0 or minimum_gap == 0))) return error.InvalidData;
+            suffixBounds(refs);
+            term.* = .{ .text = text_, .blocks = refs, .count = occurrences, .minimum_start = minimum_start, .minimum_gap = minimum_gap, .first_start = first_start, .regular_length = regular_length };
+        }
+        if (parser.at != bytes.len or prior == null or !std.mem.eql(u8, prior.?, page.ceiling)) return error.InvalidData;
+        const result = try a.create(Dictionary);
+        result.* = .{ .terms = terms };
+        return result;
     }
-    if (lane_count != 0 and (lane_total != count or std.mem.readInt(u32, h[28..32], .little) & 0x80000000 == 0)) return error.InvalidData;
-    if (root.at != root.bytes.len or term_count != (std.mem.readInt(u32, h[28..32], .little) & 0x3fffffff) or term_count > count or (term_count == 0) != (count == 0)) return error.InvalidData;
-    suffixBounds(lane_refs);
-    const needed = try selectedPages(work, pages, selection);
-    defer if (needed) |bits| work.free(bits);
+};
+fn identity(comptime name: []const u8, values: anytype) [32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(name);
+    inline for (values) |value| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, value, .little);
+        hash.update(&bytes);
+    }
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    return result;
+}
+fn prepareInternal(a: A, view: View, source_length: u32, root_raw: u32, count: u32, selection: Selection, control: Control, compact: bool, known_mask: ?[]const u8) anyerror!Plan {
     try control.check();
+    const work = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
     const owner = try a.create(std.heap.ArenaAllocator);
     owner.* = .init(a);
     errdefer {
@@ -457,6 +525,30 @@ fn prepareInternal(a: A, view: View, source_length: u32, root_raw: u32, count: u
         a.destroy(owner);
     }
     const out = owner.allocator();
+    const Loader = struct {
+        view: View,
+        length: u32,
+        raw: u32,
+        count: u32,
+        control: Control,
+        fn load(raw: *anyopaque, allocator: A) !*const anyopaque {
+            const loader: *@This() = @ptrCast(@alignCast(raw));
+            return try Navigation.load(allocator, loader.view, loader.length, loader.raw, loader.count, loader.control);
+        }
+    };
+    var loader: Loader = .{ .view = view, .length = source_length, .raw = root_raw, .count = count, .control = control };
+    const lease = try view.source.acquireDecoded(.{ .offset = view.offset, .length = view.length, .interpretation = identity("source-offset-navigation-v1", .{ source_length, root_raw, count }), .context = &loader, .decode = Loader.load });
+    defer if (lease) |held| held.release();
+    var navigation_arena = std.heap.ArenaAllocator.init(work);
+    defer navigation_arena.deinit();
+    const navigation: *const Navigation = if (lease) |held| @ptrCast(@alignCast(held.value)) else try Navigation.load(navigation_arena.allocator(), view, source_length, root_raw, count, control);
+    const pages = navigation.pages;
+    const lane_refs = navigation.lane_refs;
+    const root_ref = navigation.root_ref;
+    const term_count = navigation.term_count;
+    const needed = try selectedPages(work, pages, selection);
+    defer if (needed) |bits| work.free(bits);
+    try control.check();
     var tentative = compact and lane_refs.len != 0;
     if (selection.ranges) |ranges| {
         const exact_only = for (ranges) |range| {
@@ -475,7 +567,7 @@ fn prepareInternal(a: A, view: View, source_length: u32, root_raw: u32, count: u
     var singletons: u32 = 0;
     var selected_terms: usize = 0;
     var terms: std.ArrayList(Plan.Term) = .empty;
-    previous = null;
+    var previous: ?[]const u8 = null;
     var total: u64 = 0;
     var ordinal: u32 = 0;
     for (pages, 0..) |page, page_index| {
@@ -494,64 +586,57 @@ fn prepareInternal(a: A, view: View, source_length: u32, root_raw: u32, count: u
                 continue;
             }
         }
-        const dictionary_bytes = try read(work, view, page.ref, root_ref.offset, control);
-        defer work.free(dictionary_bytes);
-        var p: Parser = .{ .bytes = dictionary_bytes };
-        var prior = lower;
-        for (0..page.ref.count) |_| {
+        const DictionaryLoader = struct {
+            view: View,
+            length: u32,
+            page: Navigation.Page,
+            lower: ?[]const u8,
+            bound: u64,
+            flags: u32,
+            control: Control,
+            fn load(raw: *anyopaque, allocator: A) !*const anyopaque {
+                const loader_: *@This() = @ptrCast(@alignCast(raw));
+                return try Dictionary.load(allocator, loader_.view, loader_.length, loader_.page, loader_.lower, loader_.bound, loader_.flags, loader_.control);
+            }
+        };
+        var dictionary_loader: DictionaryLoader = .{ .view = view, .length = source_length, .page = page, .lower = lower, .bound = root_ref.offset, .flags = navigation.flags, .control = control };
+        var fingerprint = std.crypto.hash.Blake3.init(.{});
+        fingerprint.update(&identity("source-offset-dictionary-v1", .{ source_length, page.ref.raw, page.ref.count, root_ref.offset, navigation.flags }));
+        fingerprint.update(lower orelse "");
+        fingerprint.update(&.{0});
+        fingerprint.update(page.ceiling);
+        var interpretation: [32]u8 = undefined;
+        fingerprint.final(&interpretation);
+        const dictionary_lease = try view.source.acquireDecoded(.{ .offset = view.offset + page.ref.offset, .length = page.ref.wire, .interpretation = interpretation, .context = &dictionary_loader, .decode = DictionaryLoader.load });
+        defer if (dictionary_lease) |held| held.release();
+        var dictionary_arena = std.heap.ArenaAllocator.init(work);
+        defer dictionary_arena.deinit();
+        const decoded_dictionary: *const Dictionary = if (dictionary_lease) |held| @ptrCast(@alignCast(held.value)) else try Dictionary.load(dictionary_arena.allocator(), view, source_length, page, lower, root_ref.offset, navigation.flags, control);
+        for (decoded_dictionary.terms) |term| {
             defer ordinal += 1;
             try control.check();
-            const term = try p.string();
-            if ((prior != null and std.mem.order(u8, prior.?, term) != .lt) or std.mem.order(u8, term, page.ceiling) == .gt) return error.InvalidData;
-            prior = term;
-            const minimum_start = try p.int(u32);
-            const minimum_gap = try p.int(u32);
-            const first_start = try p.int(u32);
-            const regular_length = try p.int(u32);
-            const blocks = try p.int(u32);
-            if (blocks == 0 or blocks > (p.bytes.len - p.at) / 32) return error.InvalidData;
-            const matched = if (known_mask) |bits| maskContains(bits, ordinal) else if (selection.matches) |check| try check(selection.ptr.?, term) else true;
-            const retained = if (matched and !tentative) try out.dupe(u8, term) else "";
-            const refs = try out.alloc(Ref, if (matched and !tentative) blocks else 0);
-            var bounds: []Plan.DensityBlock = &.{};
-            var block_end: u64 = header_size;
-            var prior_through: u32 = 0;
-            var occurrences: u32 = 0;
-            const ordered = std.mem.readInt(u32, h[28..32], .little) & 0x80000000 != 0;
-            const disjoint = std.mem.readInt(u32, h[28..32], .little) & 0x40000000 != 0;
-            if (disjoint and !ordered) return error.InvalidData;
-            for (0..blocks) |i| {
-                const ref = try p.ref();
-                if (ref.offset < block_end or ref.offset > page.ref.offset or ref.wire == 0 or ref.wire > page.ref.offset - ref.offset or ref.count == 0 or ref.count > block_tokens or ref.raw == 0 or ref.raw > page_bytes) return error.InvalidData;
-                if ((i + 1 < blocks and ref.count != block_tokens) or ref.through_end > source_length or ref.through_end < prior_through) return error.InvalidData;
-                prior_through = ref.through_end;
-                occurrences = std.math.add(u32, occurrences, ref.count) catch return error.InvalidData;
-                block_end = ref.offset + ref.wire;
-                if (ref.minimum_start > source_length or ref.minimum_gap > source_length or (disjoint and (i != 0 or ref.count > 1) and (ref.minimum_start == 0 or ref.minimum_gap == 0))) return error.InvalidData;
-                if (!matched) continue;
-                if (tentative and i == 0 and (blocks > 1 or ref.count > 1)) bounds = try out.alloc(Plan.DensityBlock, blocks);
-                total += ref.count;
-                if (total > count) return error.InvalidData;
-                if (!tentative) refs[i] = ref else if (bounds.len != 0) bounds[i] = .{ .through_end = ref.through_end, .minimum_start = ref.minimum_start, .minimum_gap = ref.minimum_gap };
-            }
-            if (first_start > source_length or regular_length > source_length - first_start or (regular_length != 0 and (!disjoint or occurrences < 2 or minimum_start <= regular_length or @as(u64, first_start) + @as(u64, occurrences - 1) * minimum_start + regular_length > source_length))) return error.InvalidData;
-            if (minimum_start > source_length or minimum_gap > source_length or (occurrences == 1 and (minimum_start != 0 or minimum_gap != 0)) or (disjoint and occurrences > 1 and (minimum_start == 0 or minimum_gap == 0))) return error.InvalidData;
-            if (matched) {
-                selected_terms += 1;
-                if (tentative) {
-                    mask[ordinal / 8] |= @as(u8, 1) << @as(u3, @intCast(ordinal % 8));
-                    if (occurrences == 1) singletons += 1 else {
-                        suffixBounds(bounds);
-                        try density.append(out, .{ .count = occurrences, .blocks = bounds });
-                    }
-                } else {
-                    suffixBounds(refs);
-                    try terms.append(out, .{ .text = retained, .blocks = refs, .count = occurrences, .minimum_start = minimum_start, .minimum_gap = minimum_gap, .ordinal = ordinal, .first_start = first_start, .regular_length = regular_length });
+            const matched = if (known_mask) |bits| maskContains(bits, ordinal) else if (selection.matches) |check| try check(selection.ptr.?, term.text) else true;
+            if (!matched) continue;
+            total += term.count;
+            if (total > count) return error.InvalidData;
+            selected_terms += 1;
+            if (tentative) {
+                mask[ordinal / 8] |= @as(u8, 1) << @as(u3, @intCast(ordinal % 8));
+                if (term.count == 1) singletons += 1 else {
+                    const bounds = try out.alloc(Plan.DensityBlock, term.blocks.len);
+                    for (bounds, term.blocks) |*entry, ref| entry.* = .{ .through_end = ref.through_end, .minimum_start = ref.minimum_start, .minimum_gap = ref.minimum_gap };
+                    try density.append(out, .{ .count = term.count, .blocks = bounds });
                 }
+            } else {
+                var retained = term;
+                retained.text = try out.dupe(u8, term.text);
+                retained.blocks = try out.dupe(Ref, term.blocks);
+                retained.ordinal = ordinal;
+                try terms.append(out, retained);
             }
         }
-        if (p.at != p.bytes.len or prior == null or !std.mem.eql(u8, prior.?, page.ceiling)) return error.InvalidData;
     }
+
     if (known_mask == null and selection.matches == null and selection.ranges == null and total != count) return error.InvalidData;
     if (tentative and (selected_terms < 64 or total * 8 < count)) {
         const expanded = try prepareInternal(a, view, source_length, root_raw, count, .{}, control, false, mask);
@@ -559,7 +644,7 @@ fn prepareInternal(a: A, view: View, source_length: u32, root_raw: u32, count: u
         a.destroy(owner);
         return expanded;
     }
-    return .{ .a = a, .owner = owner, .view = view, .source_length = source_length, .terms = try terms.toOwnedSlice(out), .count = @intCast(total), .root_raw = root_raw, .source_mask = if (tentative) mask else null, .selected_terms = selected_terms, .density_terms = try density.toOwnedSlice(out), .source_singletons = singletons, .source_count = count, .term_count = @intCast(term_count), .source_blocks = try out.dupe(Ref, lane_refs), .ordered = std.mem.readInt(u32, h[28..32], .little) & 0x80000000 != 0, .disjoint = std.mem.readInt(u32, h[28..32], .little) & 0x40000000 != 0 };
+    return .{ .a = a, .owner = owner, .view = view, .source_length = source_length, .terms = try terms.toOwnedSlice(out), .count = @intCast(total), .root_raw = root_raw, .source_mask = if (tentative) mask else null, .selected_terms = selected_terms, .density_terms = try density.toOwnedSlice(out), .source_singletons = singletons, .source_count = count, .term_count = @intCast(term_count), .source_blocks = try out.dupe(Ref, lane_refs), .ordered = navigation.flags & 0x80000000 != 0, .disjoint = navigation.flags & 0x40000000 != 0 };
 }
 pub fn select(a: A, view: View, source_length: u32, root_raw: u32, count: u32, selection: Selection, control: Control) !Vector {
     const plan = try prepare(a, view, source_length, root_raw, count, selection, control);
@@ -1220,4 +1305,87 @@ test "highlight compact navigation and lazy full tokens unwind every allocation 
     try Scenario.run(a, view, encoded);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Scenario.run, .{ view, encoded });
+}
+
+test "highlight source decoded navigation shares immutable roots and dictionaries without retaining query selections" {
+    const segment_source = @import("../segment_source.zig");
+    const segment = @import("../segment.zig");
+    const Cache = struct {
+        bytes: []const u8,
+        arena: std.heap.ArenaAllocator,
+        values: std.AutoHashMapUnmanaged([32]u8, *const anyopaque) = .empty,
+        reads: usize = 0,
+        decodes: usize = 0,
+        leases: usize = 0,
+        checks: usize = 0,
+        canceled: bool = false,
+        fn close(_: *anyopaque) void {}
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.canceled) return error.DeadlineExceeded;
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn release(raw: *anyopaque, _: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.leases != 0);
+            self.leases -= 1;
+        }
+        fn acquire(raw: *anyopaque, request: segment_source.DecodeRequest) !?segment_source.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update(&request.interpretation);
+            var bytes: [16]u8 = undefined;
+            std.mem.writeInt(u64, bytes[0..8], request.offset, .little);
+            std.mem.writeInt(u64, bytes[8..16], request.length, .little);
+            hash.update(&bytes);
+            var key: [32]u8 = undefined;
+            hash.final(&key);
+            const cached = self.values.get(key) orelse load: {
+                const value = try request.invoke(self.arena.allocator());
+                try self.values.put(self.arena.allocator(), key, value);
+                self.decodes += 1;
+                break :load value;
+            };
+            self.leases += 1;
+            return .{ .value = cached, .owner = self, .item = self, .release_fn = release };
+        }
+    };
+    const a = std.testing.allocator;
+    var inputs = std.heap.ArenaAllocator.init(a);
+    defer inputs.deinit();
+    const tokens = try inputs.allocator().alloc(analysis.Token, 8192);
+    for (tokens, 0..) |*token, i| token.* = .{ .term = if (i % 2 == 0) "needle" else "quark", .start_byte = @intCast(i * 8), .end_byte = @intCast(i * 8 + 6), .position = @intCast(i) };
+    var memory = segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    const encoded = try write(a, &sink, tokens);
+    var cache: Cache = .{ .bytes = memory.out.items, .arena = .init(a) };
+    defer cache.arena.deinit();
+    const view = try View.init(.{ .ranges = .{ .ptr = &cache, .length = memory.out.items.len, .read_into = Cache.read, .close = Cache.close, .check_read_context = Cache.check, .acquire_decoded = Cache.acquire } }, 0, memory.out.items.len);
+    const Select = struct {
+        term: []const u8,
+        fn matches(raw: *anyopaque, term: []const u8) !bool {
+            return std.mem.eql(u8, @as(*@This(), @ptrCast(@alignCast(raw))).term, term);
+        }
+    };
+    for ([_][]const u8{ "needle", "quark", "needle" }, 0..) |term, iteration| {
+        var selected: Select = .{ .term = term };
+        var plan = try prepare(a, view, @intCast(tokens.len * 8), encoded.root_raw, encoded.count, .{ .ptr = &selected, .matches = Select.matches, .ranges = &.{.{ .lower = term }} }, .none);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(u32, 4096), plan.count);
+        try std.testing.expectEqualStrings(term, plan.terms[0].text);
+        try std.testing.expectEqual(@as(usize, 2), cache.decodes);
+        if (iteration != 0) try std.testing.expectEqual(@as(usize, 3), cache.reads);
+        try std.testing.expectEqual(@as(usize, 0), cache.leases);
+    }
+    cache.canceled = true;
+    try std.testing.expectError(error.DeadlineExceeded, prepare(a, view, @intCast(tokens.len * 8), encoded.root_raw, encoded.count, .{}, .none));
+    try std.testing.expectEqual(@as(usize, 0), cache.leases);
+    try std.testing.expect(cache.checks >= 12);
+    std.debug.print("SOURCE_NAVIGATION repeated_queries=3 immutable_decodes={d} raw_reads={d} retained_query_leases=0\n", .{ cache.decodes, cache.reads });
 }

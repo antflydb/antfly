@@ -2207,6 +2207,44 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                         encoded[span["start"] : span["end"]] == b"needle"
                         for span in fragment["spans"]
                     )
+                    # Large projected UTF-8 strings use bounded native chunks.
+                    # Explicit virtual identity composes with those columns and
+                    # must not reopen an unavailable Parquet object.
+                    projected = client.query(
+                        {
+                            "request": {
+                                "full_text_search": {
+                                    "conjuncts": [
+                                        {"match": "unicodecase", "field": "body"},
+                                        {"match": "needle", "field": "body"},
+                                    ]
+                                },
+                                "fields": ["id", "body", "_id"],
+                                "highlight": {"fields": ["body"], "fragment_size": 100},
+                                "limit": 1,
+                            }
+                        }
+                    )["hits"]["hits"]
+                    assert len(projected) == 1
+                    assert projected[0]["_source"] == {
+                        "id": count + 2,
+                        "body": unicode_body,
+                        "_id": projected[0]["_id"],
+                    }
+                    assert projected[0]["_highlights"] == multilingual[0]["_highlights"]
+                    identity = client.query(
+                        {
+                            "request": {
+                                "full_text_search": {
+                                    "match": "unicodecase",
+                                    "field": "body",
+                                },
+                                "fields": ["_id"],
+                                "limit": 1,
+                            }
+                        }
+                    )["hits"]["hits"]
+                    assert identity[0]["_source"] == {"_id": projected[0]["_id"]}
                     # A rare term in a large real vocabulary uses the paged
                     # dictionary and matching occurrence blocks. All patterns
                     # retain exact source spans after native reader restart.

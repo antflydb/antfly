@@ -1396,10 +1396,23 @@ const Execution = struct {
     fn hydrateTypedFromSource(self: *Execution, a: A, hits: []types.SearchHit, keys: []const []const u8, pin: ?*const search.PinnedTextSource) !void {
         return self.hydrateTypedSelection(a, .{ .hits = hits }, keys, pin);
     }
+    fn identityColumns(self: *Execution, a: A, hits: @import("lake_text_delivery.zig").Selection) ![]?types.ColumnSource {
+        const page = try types.ColumnSourcePage.native(a, &.{"_id"}, hits.len());
+        defer page.release();
+        for (0..hits.len()) |i| {
+            try self.context.ensureActive();
+            try page.setNative(i, 0, .{ .string = try publicKey(self, page.arena.allocator(), hits.at(i).id) });
+        }
+        try page.finishNative();
+        const sources = try a.alloc(?types.ColumnSource, hits.len());
+        for (sources, 0..) |*source, i| source.* = page.row(i);
+        return sources;
+    }
     fn hydrateTypedSelection(self: *Execution, a: A, hits: @import("lake_text_delivery.zig").Selection, keys: []const []const u8, pin: ?*const search.PinnedTextSource) !void {
         std.debug.assert(hits.len() == keys.len);
-        if (self.overlay == null and (pin == null or pin.?.stored_projection_fields.len == 0)) {
-            const columns = physical: {
+        const identity_only = if (self.hydration_fields) |paths| paths.len == 1 and std.mem.eql(u8, paths[0], "_id") else false;
+        if (self.overlay == null and (identity_only or pin == null or pin.?.stored_projection_fields.len == 0)) {
+            const columns = if (identity_only) try self.identityColumns(a, hits) else physical: {
                 const started = @import("antfly_platform").time.monotonicNs();
                 defer self.server.lake_query_metrics.record(.hydration_source, started);
                 break :physical try loadSelected(types.ColumnSource, self, a, keys, self.hydration_fields);
@@ -1433,7 +1446,7 @@ const Execution = struct {
             fields = plan.parquet;
             stored_fields = plan.sidecar;
         };
-        if (self.overlay == null and stored_fields.len != 0 and fields.?.len == 0) {
+        if (self.overlay == null and stored_fields.len != 0) {
             const started = @import("antfly_platform").time.monotonicNs();
             defer self.server.lake_query_metrics.record(.hydration_native, started);
             const Rows = struct {
@@ -1453,8 +1466,24 @@ const Execution = struct {
             var rows: Rows = .{ .owner = self, .hits = hits };
             var hydrator = projection.Hydrator.init(a);
             defer hydrator.deinit();
-            const page = try hydrator.columnRows(a, pin.?.snapshot, .{ .ptr = &rows, .len = hits.len(), .document = Rows.doc, .key = Rows.key, .checkpoint = Rows.check }, stored_fields);
-            defer page.release();
+            const native = try hydrator.columnRows(a, pin.?.snapshot, .{ .ptr = &rows, .len = hits.len(), .document = Rows.doc, .key = Rows.key, .checkpoint = Rows.check }, stored_fields);
+            defer native.release();
+            const physical = if (fields.?.len != 0) physical: {
+                const before = @import("antfly_platform").time.monotonicNs();
+                defer self.server.lake_query_metrics.record(.hydration_source, before);
+                const virtual_only = fields.?.len == 1 and std.mem.eql(u8, fields.?[0], "_id");
+                break :physical if (virtual_only) try self.identityColumns(a, hits) else try loadSelected(types.ColumnSource, self, a, keys, fields);
+            } else null;
+            defer if (physical) |values| {
+                for (values) |value| if (value) |row| row.deinit();
+                a.free(values);
+            };
+            const page = if (physical) |values| try types.ColumnSourcePage.join(a, self.hydration_fields orelse all: {
+                const names = try self.arena.alloc([]const u8, self.table.columns.len);
+                for (names, self.table.columns) |*name, column| name.* = column.path;
+                break :all names;
+            }, values, native) else native;
+            defer if (physical != null) page.release();
             for (0..hits.len()) |i| {
                 const hit = hits.at(i);
                 if (hit.stored_data) |bytes| a.free(bytes);
@@ -3836,6 +3865,11 @@ fn requiresEncodedSource(req: types.SearchRequest) bool {
 fn projectedHighlightSource(scratch: *std.heap.ArenaAllocator, hit: *const types.SearchHit, fields: []const []const u8) !?std.json.Value {
     _ = scratch.reset(.retain_capacity);
     const from_columns = hit.source_value == null;
+    if (from_columns) if (hit.column_source) |source| for (fields) |field| {
+        if (std.mem.indexOfScalar(u8, field, '.') == null) if (source.textLength(field)) |length| {
+            if (length >= local.section_source_column.offset_min_bytes) return null;
+        };
+    };
     const value = hit.source_value orelse if (hit.column_source) |source| try source.valueForProjection(scratch, .{ .fields = fields, .include_all_fields = false }) else return null;
     for (fields) |field| {
         const found = local.api_json_helpers.extractJsonPathValue(value, field) orelse return null;

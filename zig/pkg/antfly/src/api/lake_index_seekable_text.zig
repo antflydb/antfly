@@ -1110,6 +1110,60 @@ const Owner = struct {
                 self.lengths[slot] = offset - piece.offset;
             }
         }
+        fn releaseDecoded(owner: *anyopaque, item: *anyopaque) void {
+            const lease: Decoded.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
+            lease.release();
+        }
+        fn acquireDecoded(raw: *anyopaque, request: local.segment_source.DecodeRequest) !?local.segment_source.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checkContext(self);
+            const cached = self.capability.cache orelse return null;
+            const reference = self.owner.directory_ref orelse return null;
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("native-source-interpretation-v1");
+            hash.update(&cached.scope);
+            hash.update(reference.artifact_id);
+            hash.update(reference.checksum);
+            var bounds: [16]u8 = undefined;
+            std.mem.writeInt(u64, bounds[0..8], request.offset, .little);
+            std.mem.writeInt(u64, bounds[8..16], request.length, .little);
+            hash.update(&bounds);
+            hash.update(&request.interpretation);
+            const Loader = struct {
+                request: local.segment_source.DecodeRequest,
+                fn load(context: *anyopaque, item: *Decoded.Item) !void {
+                    const loader: *@This() = @ptrCast(@alignCast(context));
+                    item.payload = .{ .extension = @constCast(loader.request.invoke(item.arena.allocator()) catch |err| {
+                        if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
+                        return err;
+                    }) };
+                }
+            };
+            var loader: Loader = .{ .request = request };
+            const Guard = struct {
+                query: *Query,
+                parent: local.serverless_query_lake_read_context.Context,
+                fn check(raw_: *anyopaque) !void {
+                    const guard: *@This() = @ptrCast(@alignCast(raw_));
+                    try checkContext(guard.query);
+                    try guard.parent.ensureActive();
+                }
+            };
+            var guard: Guard = .{ .query = self, .parent = cached.context };
+            var context = cached.context;
+            context.checkpoint = .{ .ptr = &guard, .check = Guard.check };
+            context.additional_checkpoint = null;
+            var key: [32]u8 = undefined;
+            hash.final(&key);
+            const held = cached.cache.decoded.acquire(key, 1024 * 1024, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
+                try checkContext(self);
+                if (err == error.SqlMemoryLimitExceeded) return null;
+                return err;
+            };
+            errdefer held.release();
+            try checkContext(self);
+            return .{ .value = held.item.payload.extension, .owner = held.cache, .item = held.item, .release_fn = releaseDecoded };
+        }
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return error.Canceled;
@@ -1154,7 +1208,7 @@ const Owner = struct {
         try capability.check();
         const query = try a.create(Query);
         query.* = .{ .a = a, .owner = owner, .capability = capability, .io = capability.context.io };
-        return .{ .ranges = .{ .ptr = query, .length = owner.directory_bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext } };
+        return .{ .ranges = .{ .ptr = query, .length = owner.directory_bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext, .acquire_decoded = Query.acquireDecoded } };
     }
     fn containing(pieces: []const Piece, offset: usize) ?usize {
         var low: usize = 0;

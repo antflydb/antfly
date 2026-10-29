@@ -281,8 +281,14 @@ pub const Hydrator = struct {
             }
             fn text(raw: *anyopaque, _: A, row: usize, name: []const u8, value: local.section_source_column.Text) !bool {
                 const output: *@This() = @ptrCast(@alignCast(raw));
-                const bytes = try value.read(output.page.arena.allocator(), 0, value.length, .{ .ptr = &output.input, .check_fn = Input.checkToken });
-                try output.page.setNative(row, try output.index(name), .{ .string = bytes });
+                const control: @import("antfly_cancellation").CancellationToken = .{ .ptr = &output.input, .check_fn = Input.checkToken };
+                if (value.length > local.section_source_column.page_size) {
+                    const parts = try value.readChunks(output.page.arena.allocator(), control);
+                    try output.page.setNativeChunks(row, try output.index(name), parts);
+                } else {
+                    const bytes = try value.read(output.page.arena.allocator(), 0, value.length, control);
+                    try output.page.setNative(row, try output.index(name), .{ .string = bytes });
+                }
                 return true;
             }
         };
