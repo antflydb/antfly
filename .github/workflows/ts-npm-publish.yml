@@ -105,4 +105,11 @@ jobs:
       - name: Publish Better Auth integration
         if: startsWith(github.ref, 'refs/tags/ts/antfly/better-auth/v')
         working-directory: ts
-        run: pnpm --filter @antfly/better-auth publish --access public --no-git-checks --provenance
+        run: |
+          version=$(node -p "require('./packages/better-auth/package.json').version")
+          test "$GITHUB_REF_NAME" = "ts/antfly/better-auth/v$version"
+          case "$version" in
+            *-*) channel=next ;;
+            *) channel=latest ;;
+          esac
+          pnpm --filter @antfly/better-auth publish --access public --no-git-checks --provenance --tag "$channel"
