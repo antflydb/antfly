@@ -16073,6 +16073,7 @@ fn processDocumentExtractionAsset(
         .prepared_pdf_session = if (prepared_pdf_session) |*session| session else null,
     };
     defer collect_ctx.deinit();
+    var prepared_marking = document_extraction_mod.UnconfiguredGeneratedTextSink{ .alloc = document_extraction_alloc, .config = &extraction_config, .inner = collect_ctx.sink() };
     const extraction_result = if (prepared_pdf_session) |*session|
         document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
             document_extraction_alloc,
@@ -16080,7 +16081,7 @@ fn processDocumentExtractionAsset(
             if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
             extraction_config.ocr_mode,
             extraction_config.ocr_quality,
-            collect_ctx.sink(),
+            prepared_marking.sink(),
             if (page_text_spool) |*spool| spool.cache() else null,
         )
     else

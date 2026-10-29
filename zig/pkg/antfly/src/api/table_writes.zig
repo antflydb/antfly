@@ -34042,15 +34042,12 @@ fn consumerTests() type {
         test "provisioning detects document extraction OCR as model backed" {
             const alloc = std.testing.allocator;
             try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}"}]}]
+                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}"}]}]
             ));
-            // PDF OCR fallback is enabled by default, so an otherwise-empty document
-            // extraction config still needs the model-backed asset producer.
-            try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}]
-            ));
+            // Without an ocr or transcription block, extraction is native text
+            // only and needs no model-backed producer.
             try std.testing.expect(!(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":false}}"}]}]
+                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}]
             )));
         }
 

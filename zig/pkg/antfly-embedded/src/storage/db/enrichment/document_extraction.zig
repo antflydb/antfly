@@ -448,13 +448,10 @@ test "remote fetch classification retries only transient failures" {
     try std.testing.expectEqualStrings("document_extraction", failureStage(error.InvalidDocumentExtractionConfig, "document_extraction"));
 }
 
-pub const default_ocr_model = "antflydb/Florence-2-base";
-pub const default_ocr_config_json =
-    \\{"provider":"antfly","model":"antflydb/Florence-2-base"}
-;
-
+/// The configured OCR reader or generator. There is no implicit model: OCR
+/// runs only when the `ocr` block names one.
 pub fn effectiveOcrConfigJson(config: Config) []const u8 {
-    return if (config.ocr_config_json.len > 0) config.ocr_config_json else default_ocr_config_json;
+    return config.ocr_config_json;
 }
 
 pub const OcrExecutor = enum {
@@ -470,9 +467,70 @@ pub fn ocrProducerType(config: Config) @import("asset_producer.zig").ProducerTyp
 }
 
 pub fn ocrEnabledForRoute(config: Config, route_type: []const u8) bool {
-    return config.ocr_enabled or
-        (config.ocr_pdf_fallback_enabled and std.mem.eql(u8, route_type, "pdf"));
+    _ = route_type;
+    return config.ocr_enabled;
 }
+
+pub const ocr_not_configured_status = "ocr_not_configured";
+pub const transcription_not_configured_status = "transcription_not_configured";
+
+/// Marks a unit that needs OCR or transcription when the configuration has no
+/// reader, generator or transcriber for it. Without this the unit would stay
+/// `pending_*` with no producer ever completing it.
+pub fn markUnconfiguredGeneratedUnit(alloc: Allocator, unit: *Unit, ocr_enabled: bool, transcription_enabled: bool) !void {
+    const status = unit.extraction_status orelse return;
+    const replacement: []const u8 = if (!ocr_enabled and std.mem.eql(u8, status, "pending_ocr"))
+        ocr_not_configured_status
+    else if (!transcription_enabled and std.mem.eql(u8, status, "pending_transcription"))
+        transcription_not_configured_status
+    else
+        return;
+    const owned_status = try alloc.dupe(u8, replacement);
+    errdefer alloc.free(owned_status);
+    // PDF pages keep their native text; record it as such.
+    const owned_method: ?[]u8 = if (std.mem.eql(u8, unit.method, "pdf_ocr_pending")) try alloc.dupe(u8, "pdf_text") else null;
+    if (owned_method) |method| {
+        alloc.free(unit.method);
+        unit.method = method;
+    }
+    alloc.free(status);
+    unit.extraction_status = owned_status;
+}
+
+pub fn markUnconfiguredGeneratedUnits(alloc: Allocator, units: []Unit, config: Config, route_type: []const u8) !void {
+    const ocr_enabled = ocrEnabledForRoute(config, route_type);
+    for (units) |*unit| try markUnconfiguredGeneratedUnit(alloc, unit, ocr_enabled, config.transcription_enabled);
+}
+
+/// Wraps a sink so streamed units needing an unconfigured producer are marked
+/// as they pass through.
+pub const UnconfiguredGeneratedTextSink = struct {
+    alloc: Allocator,
+    config: *const Config,
+    inner: UnitSink,
+    ocr_enabled: bool = false,
+
+    pub fn sink(self: *UnconfiguredGeneratedTextSink) UnitSink {
+        return .{ .ptr = self, .on_begin = onBegin, .on_unit = onUnit, .on_end = onEnd };
+    }
+
+    fn onBegin(ptr: *anyopaque, info: StreamInfo) anyerror!void {
+        const self: *UnconfiguredGeneratedTextSink = @ptrCast(@alignCast(ptr));
+        self.ocr_enabled = ocrEnabledForRoute(self.config.*, info.route_type);
+        try self.inner.on_begin(self.inner.ptr, info);
+    }
+
+    fn onUnit(ptr: *anyopaque, unit: *Unit) anyerror!void {
+        const self: *UnconfiguredGeneratedTextSink = @ptrCast(@alignCast(ptr));
+        try markUnconfiguredGeneratedUnit(self.alloc, unit, self.ocr_enabled, self.config.transcription_enabled);
+        try self.inner.on_unit(self.inner.ptr, unit);
+    }
+
+    fn onEnd(ptr: *anyopaque) anyerror!void {
+        const self: *UnconfiguredGeneratedTextSink = @ptrCast(@alignCast(ptr));
+        try self.inner.on_end(self.inner.ptr);
+    }
+};
 
 pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
     return try pdf.renderPagePngAlloc(alloc, pdf_bytes, page_number, dpi, max_pixels);
@@ -1148,16 +1206,13 @@ pub const Config = struct {
     version_field: []const u8 = "",
     last_modified_field: []const u8 = "",
     html_strip_tags: bool = true,
+    /// True when an `ocr` block names a reader or generator.
     ocr_enabled: bool = false,
-    // Preserve main's default: PDFs use the built-in OCR fallback unless an
-    // explicit document-extraction configuration disables it.
-    ocr_pdf_fallback_enabled: bool = true,
     ocr_mode: OcrMode = .auto,
     ocr_executor: OcrExecutor = .reader,
-    /// Prompt semantics are part of the configured task contract. Keeping the
-    /// resolved policy here prevents execution from guessing behavior from a
-    /// provider or model name.
-    ocr_prompt_policy: OcrPromptPolicy = .florence,
+    /// Resolved from the executor while parsing: readers own their task
+    /// prompt, generators receive the generic transcription instruction.
+    ocr_prompt_policy: OcrPromptPolicy = .plain,
     ocr_config_json: []const u8 = "",
     ocr_render_dpi: u16 = 150,
     ocr_render_resolution: pdf.RenderResolutionPolicy = .requested_dpi,
@@ -1205,11 +1260,11 @@ test "document extraction parses explicit render resolution policy" {
     var default_config = try parseConfig(std.testing.allocator, "{}");
     defer default_config.deinit(std.testing.allocator);
     try std.testing.expectEqual(pdf.RenderResolutionPolicy.requested_dpi, default_config.ocr_render_resolution);
-    var adaptive = try parseConfig(std.testing.allocator, "{\"ocr\":{\"render_resolution\":\"model_input\"}}");
+    var adaptive = try parseConfig(std.testing.allocator, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"r\"},\"render\":{\"resolution\":\"model_input\"}}}");
     defer adaptive.deinit(std.testing.allocator);
     try std.testing.expectEqual(pdf.RenderResolutionPolicy.model_input, adaptive.ocr_render_resolution);
-    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(std.testing.allocator, "{\"ocr\":{\"render_resolution\":\"automatic\"}}"));
-    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(std.testing.allocator, "{\"ocr\":{\"render_resolution\":123}}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(std.testing.allocator, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"r\"},\"render\":{\"resolution\":\"automatic\"}}}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(std.testing.allocator, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"r\"},\"render\":{\"resolution\":123}}}"));
 }
 
 pub const OcrMode = enum {
@@ -1219,7 +1274,6 @@ pub const OcrMode = enum {
 
 pub const OcrPromptPolicy = enum {
     generic,
-    florence,
     plain,
 };
 
@@ -1231,29 +1285,18 @@ pub fn effectiveOcrPrompt(config: Config) []const u8 {
     if (config.ocr_prompt.len > 0) return config.ocr_prompt;
     return switch (config.ocr_prompt_policy) {
         .generic => default_ocr_prompt,
-        .florence => florence_ocr_prompt,
         .plain => "",
     };
 }
 
-fn isFlorenceModel(model: []const u8) bool {
-    return containsAsciiIgnoreCase(model, "florence-2");
-}
-
-fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var offset: usize = 0;
-    while (offset <= haystack.len - needle.len) : (offset += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[offset..][0..needle.len], needle)) return true;
-    }
-    return false;
-}
-
+/// An empty prompt lets the reader run its own OCR task. Florence expands both
+/// an empty prompt and `<OCR>` to its canonical question, which a weak decode
+/// can echo back verbatim.
 pub fn isOcrPromptEcho(text: []const u8, prompt: []const u8) bool {
-    if (prompt.len == 0) return false;
-    if (normalizedPromptTextEqual(text, prompt)) return true;
-    return std.mem.eql(u8, prompt, florence_ocr_prompt) and normalizedPromptTextEqual(text, florence_ocr_canonical_prompt);
+    if (prompt.len == 0 or std.mem.eql(u8, prompt, florence_ocr_prompt))
+        return normalizedPromptTextEqual(text, florence_ocr_prompt) or
+            normalizedPromptTextEqual(text, florence_ocr_canonical_prompt);
+    return normalizedPromptTextEqual(text, prompt);
 }
 
 fn normalizedPromptTextEqual(a_raw: []const u8, b_raw: []const u8) bool {
@@ -1905,7 +1948,7 @@ const Route = struct {
 };
 
 pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
-    if (raw.len == 0) return .{ .ocr_pdf_fallback_enabled = true };
+    if (raw.len == 0) return .{};
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDocumentExtractionConfig;
@@ -1927,51 +1970,80 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.version_field = try dupeSourceStringField(alloc, object, "version_field");
     config.last_modified_field = try dupeSourceStringField(alloc, object, "last_modified_field");
     config.html_strip_tags = (try boolField(object, "html_strip_tags")) orelse true;
-    const configured_ocr_fallback = try boolField(object, "ocr_fallback");
-    const has_explicit_ocr_config = object.get("ocr") != null;
-    config.ocr_enabled = configured_ocr_fallback orelse false;
-    config.ocr_pdf_fallback_enabled = configured_ocr_fallback orelse true;
-    config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
-    if (has_explicit_ocr_config) config.ocr_pdf_fallback_enabled = config.ocr_enabled;
+    // Removed fields fail loudly rather than being silently ignored.
+    inline for (.{ "ocr_fallback", "transcribe_audio" }) |removed| {
+        if (object.get(removed) != null) return error.InvalidDocumentExtractionConfig;
+    }
     try parseOcrOptions(alloc, object, &config);
-    if (config.ocr_executor == .generator and config.ocr_config_json.len == 0)
-        return error.InvalidDocumentExtractionConfig;
-    if (config.ocr_config_json.len > 0) switch (config.ocr_executor) {
+    if (config.ocr_enabled) switch (config.ocr_executor) {
         .reader => try validateReaderConfigJson(alloc, config.ocr_config_json, effectiveOcrPrompt(config)),
         .generator => try validateGeneratorConfigJson(alloc, config.ocr_config_json),
     };
-    config.transcription_enabled = (try boolField(object, "transcribe_audio")) orelse false;
-    config.transcription_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "transcription", &config.transcription_enabled);
+    try parseTranscriptionOptions(alloc, object, &config);
     config.route_preset = try parseRoutePreset(object);
     config.routes = try parseRoutesAlloc(alloc, object);
-    if (configured_ocr_fallback == null and !has_explicit_ocr_config) {
-        for (config.routes) |route| {
-            if (route.extractor_type == .ocr) {
-                config.ocr_enabled = true;
-                break;
-            }
-        }
+    for (config.routes) |route| {
+        // An OCR route needs a configured reader or generator to run.
+        if (route.extractor_type == .ocr and !config.ocr_enabled) return error.DocumentExtractionModelRequired;
     }
     return config;
 }
 
+/// The provider config of a reader, generator or transcriber. Every provider
+/// except Apple's native frameworks must name a model; there is no implicit
+/// default.
+fn producerConfigJsonAlloc(alloc: Allocator, value: std.json.Value, model_out: ?*[]const u8) ![]const u8 {
+    if (value != .object) return error.InvalidDocumentExtractionConfig;
+    const provider = value.object.get("provider") orelse return error.InvalidDocumentExtractionConfig;
+    if (provider != .string or provider.string.len == 0) return error.InvalidDocumentExtractionConfig;
+    const model = value.object.get("model");
+    if (model) |m| if (m != .string) return error.InvalidDocumentExtractionConfig;
+    const model_name = if (model) |m| m.string else "";
+    if (model_name.len == 0 and !std.mem.eql(u8, provider.string, "apple")) return error.DocumentExtractionModelRequired;
+    const raw = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    errdefer alloc.free(raw);
+    if (model_out) |out| if (model_name.len > 0) {
+        out.* = try alloc.dupe(u8, model_name);
+    };
+    return raw;
+}
+
+/// Readers own their OCR task: local readers run their native OCR prompt and
+/// hosted readers send their own read instruction when the prompt is empty.
+/// Generators are general chat models and receive the transcription
+/// instruction.
+fn ocrPromptPolicy(executor: OcrExecutor) OcrPromptPolicy {
+    return switch (executor) {
+        .reader => .plain,
+        .generator => .generic,
+    };
+}
+
+fn parseTranscriptionOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config) !void {
+    const value = object.get("transcription") orelse return;
+    if (value != .object) return error.InvalidDocumentExtractionConfig;
+    try rejectUnknownFields(value.object, &.{"transcriber"});
+    const transcriber = value.object.get("transcriber") orelse return error.DocumentExtractionModelRequired;
+    config.transcription_config_json = try producerConfigJsonAlloc(alloc, transcriber, null);
+    config.transcription_enabled = true;
+}
+
 fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config) !void {
     const value = object.get("ocr") orelse return;
-    if (value != .object) return;
+    if (value != .object) return error.InvalidDocumentExtractionConfig;
     const ocr = value.object;
-    try rejectUnknownFields(ocr, &.{ "enabled", "executor", "config", "mode", "render_dpi", "render_resolution", "max_rendered_pixels", "max_rendered_dimension", "prompt", "prompt_policy", "quality" });
-    if (ocr.get("render_resolution")) |resolution| {
-        if (resolution != .string) return error.InvalidDocumentExtractionConfig;
-        config.ocr_render_resolution = std.meta.stringToEnum(pdf.RenderResolutionPolicy, resolution.string) orelse return error.InvalidDocumentExtractionConfig;
-    }
-    if (ocr.get("executor")) |executor| {
-        if (executor != .string) return error.InvalidDocumentExtractionConfig;
-        config.ocr_executor = if (std.mem.eql(u8, executor.string, "reader"))
-            .reader
-        else if (std.mem.eql(u8, executor.string, "generator"))
-            .generator
-        else
-            return error.InvalidDocumentExtractionConfig;
+    try rejectUnknownFields(ocr, &.{ "reader", "generator", "mode", "render", "prompt", "quality" });
+    const reader = ocr.get("reader");
+    const generator = ocr.get("generator");
+    if (reader != null and generator != null) return error.InvalidDocumentExtractionConfig;
+    const producer = reader orelse generator orelse return error.DocumentExtractionModelRequired;
+    config.ocr_executor = if (reader != null) .reader else .generator;
+    config.ocr_config_json = try producerConfigJsonAlloc(alloc, producer, &config.ocr_model);
+    config.ocr_enabled = true;
+    config.ocr_prompt_policy = ocrPromptPolicy(config.ocr_executor);
+    if (ocr.get("render")) |render_value| {
+        if (render_value != .object) return error.InvalidDocumentExtractionConfig;
+        try parseOcrRenderOptions(render_value.object, config);
     }
     if (ocr.get("mode")) |mode| {
         if (mode != .string) return error.InvalidDocumentExtractionConfig;
@@ -1982,63 +2054,9 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
         else
             return error.InvalidDocumentExtractionConfig;
     }
-    if (try intField(ocr, "render_dpi")) |dpi| {
-        if (dpi < 72 or dpi > 600) return error.InvalidDocumentExtractionConfig;
-        config.ocr_render_dpi = @intCast(dpi);
-    }
-    if (try intField(ocr, "max_rendered_pixels")) |pixels| {
-        if (pixels < 1 or pixels > 100_000_000) return error.InvalidDocumentExtractionConfig;
-        config.ocr_max_rendered_pixels = @intCast(pixels);
-    }
-    if (try intField(ocr, "max_rendered_dimension")) |dimension| {
-        if (dimension < 512 or dimension > 16_384) return error.InvalidDocumentExtractionConfig;
-        config.ocr_max_rendered_dimension = @intCast(dimension);
-    }
-    if (ocr.get("config")) |producer| {
-        if (producer == .object) if (producer.object.get("model")) |model| {
-            if (model != .string) return error.InvalidDocumentExtractionConfig;
-            config.ocr_model = try alloc.dupe(u8, model.string);
-        };
-    }
-    if (ocr.get("prompt_policy")) |policy| {
-        if (policy != .string) return error.InvalidDocumentExtractionConfig;
-        config.ocr_prompt_policy = if (std.mem.eql(u8, policy.string, "generic"))
-            .generic
-        else if (std.mem.eql(u8, policy.string, "florence"))
-            .florence
-        else if (std.mem.eql(u8, policy.string, "plain"))
-            .plain
-        else
-            return error.InvalidDocumentExtractionConfig;
-    } else {
-        // Backward compatibility is resolved once while parsing. Runtime
-        // execution consumes only the explicit policy above.
-        if (config.ocr_executor == .reader and config.ocr_config_json.len > 0 and isFlorenceModel(config.ocr_model)) {
-            std.log.warn("OCR prompt policy inferred as florence for compatibility; configure ocr.prompt_policy explicitly model={s}", .{config.ocr_model});
-        }
-        const apple_reader = if (ocr.get("config")) |producer| blk: {
-            if (producer == .object) if (producer.object.get("provider")) |provider| {
-                break :blk provider == .string and std.mem.eql(u8, provider.string, "apple");
-            };
-            break :blk false;
-        } else false;
-        config.ocr_prompt_policy = if (config.ocr_executor == .reader and apple_reader)
-            .plain
-        else if (config.ocr_executor == .generator)
-            .generic
-        else if (config.ocr_config_json.len == 0 or isFlorenceModel(config.ocr_model))
-            .florence
-        else
-            .generic;
-    }
     if (ocr.get("prompt")) |prompt| {
         if (prompt != .string) return error.InvalidDocumentExtractionConfig;
         config.ocr_prompt = try alloc.dupe(u8, prompt.string);
-    } else if (ocr.get("config")) |producer| {
-        if (producer == .object) if (producer.object.get("prompt")) |prompt| {
-            if (prompt != .string) return error.InvalidDocumentExtractionConfig;
-            config.ocr_prompt = try alloc.dupe(u8, prompt.string);
-        };
     }
     const quality_value = ocr.get("quality") orelse return;
     if (quality_value != .object) return error.InvalidDocumentExtractionConfig;
@@ -2064,6 +2082,26 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     if (try floatField(quality, "max_corrupted_line_ratio")) |v| config.ocr_quality.max_corrupted_line_ratio = try ratio(v);
     if (try floatField(quality, "font_corruption_score_threshold")) |v| config.ocr_quality.font_corruption_score_threshold = try ratio(v);
     if (try floatField(quality, "max_replacement_char_ratio")) |v| config.ocr_quality.max_replacement_char_ratio = try ratio(v);
+}
+
+fn parseOcrRenderOptions(render: std.json.ObjectMap, config: *Config) !void {
+    try rejectUnknownFields(render, &.{ "dpi", "resolution", "max_pixels", "max_dimension" });
+    if (render.get("resolution")) |resolution| {
+        if (resolution != .string) return error.InvalidDocumentExtractionConfig;
+        config.ocr_render_resolution = std.meta.stringToEnum(pdf.RenderResolutionPolicy, resolution.string) orelse return error.InvalidDocumentExtractionConfig;
+    }
+    if (try intField(render, "dpi")) |dpi| {
+        if (dpi < 72 or dpi > 600) return error.InvalidDocumentExtractionConfig;
+        config.ocr_render_dpi = @intCast(dpi);
+    }
+    if (try intField(render, "max_pixels")) |pixels| {
+        if (pixels < 1 or pixels > 100_000_000) return error.InvalidDocumentExtractionConfig;
+        config.ocr_max_rendered_pixels = @intCast(pixels);
+    }
+    if (try intField(render, "max_dimension")) |dimension| {
+        if (dimension < 512 or dimension > 16_384) return error.InvalidDocumentExtractionConfig;
+        config.ocr_max_rendered_dimension = @intCast(dimension);
+    }
 }
 
 fn rejectUnknownFields(object: std.json.ObjectMap, allowed: []const []const u8) !void {
@@ -2126,31 +2164,6 @@ fn boolField(object: std.json.ObjectMap, field: []const u8) !?bool {
     };
 }
 
-fn parseOptionalProducerConfigJsonAlloc(
-    alloc: Allocator,
-    object: std.json.ObjectMap,
-    field: []const u8,
-    enabled: *bool,
-) ![]const u8 {
-    const value = object.get(field) orelse return "";
-    switch (value) {
-        .bool => |flag| {
-            enabled.* = flag;
-            return "";
-        },
-        .object => |producer_object| {
-            enabled.* = (try boolField(producer_object, "enabled")) orelse true;
-            const config_value = producer_object.get("config") orelse .null;
-            if (config_value == .null) return "";
-            if (config_value != .object) return error.InvalidDocumentExtractionConfig;
-            const provider = config_value.object.get("provider") orelse return error.InvalidDocumentExtractionConfig;
-            if (provider != .string or provider.string.len == 0) return error.InvalidDocumentExtractionConfig;
-            return try std.json.Stringify.valueAlloc(alloc, config_value, .{});
-        },
-        else => return error.InvalidDocumentExtractionConfig,
-    }
-}
-
 fn validateReaderConfigJson(alloc: Allocator, raw: []const u8, prompt: []const u8) !void {
     var parsed = std.json.parseFromSlice(reader_config.Config, alloc, raw, .{
         .allocate = .alloc_always,
@@ -2171,16 +2184,13 @@ fn validateReaderConfigJson(alloc: Allocator, raw: []const u8, prompt: []const u
 test "document extraction Apple OCR defaults to a plain prompt" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"config":{"provider":"apple"}}}
+        \\{"ocr":{"reader":{"provider":"apple"}}}
     );
     defer config.deinit(alloc);
     try std.testing.expectEqual(OcrPromptPolicy.plain, config.ocr_prompt_policy);
     try std.testing.expectEqualStrings("", effectiveOcrPrompt(config));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"prompt":"Describe the page","config":{"provider":"apple"}}}
-    ));
-    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"prompt_policy":"generic","config":{"provider":"apple"}}}
+        \\{"ocr":{"prompt":"Describe the page","reader":{"provider":"apple"}}}
     ));
 }
 
@@ -2398,6 +2408,18 @@ pub fn extractDownloadedAlloc(
     source_url: []const u8,
     config: Config,
 ) !Result {
+    var result = try extractDownloadedUnmarkedAlloc(alloc, downloaded, source_url, config);
+    errdefer result.deinit(alloc);
+    try markUnconfiguredGeneratedUnits(alloc, result.units, config, result.route_type);
+    return result;
+}
+
+fn extractDownloadedUnmarkedAlloc(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config: Config,
+) !Result {
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
@@ -2440,6 +2462,17 @@ pub fn extractDownloadedAlloc(
 }
 
 pub fn extractDownloadedStreaming(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config: Config,
+    sink: UnitSink,
+) !void {
+    var marking = UnconfiguredGeneratedTextSink{ .alloc = alloc, .config = &config, .inner = sink };
+    return extractDownloadedStreamingUnmarked(alloc, downloaded, source_url, config, marking.sink());
+}
+
+fn extractDownloadedStreamingUnmarked(
     alloc: Allocator,
     downloaded: anytype,
     source_url: []const u8,
@@ -4822,7 +4855,9 @@ test "document extraction routes image content to pending OCR unit" {
     };
     defer downloaded.deinit(alloc);
 
-    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/image.png", .{});
+    var config = try parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}");
+    defer config.deinit(alloc);
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/image.png", config);
     defer result.deinit(alloc);
     try std.testing.expectEqualStrings("image", result.route_type);
     try std.testing.expectEqual(@as(usize, 1), result.units.len);
@@ -4830,6 +4865,11 @@ test "document extraction routes image content to pending OCR unit" {
     try std.testing.expectEqualStrings("image", result.units[0].unit_type);
     try std.testing.expectEqualStrings("ocr_pending", result.units[0].method);
     try std.testing.expectEqualStrings("pending_ocr", result.units[0].extraction_status.?);
+
+    // Without a reader the unit is marked rather than left pending forever.
+    var unconfigured = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/image.png", .{});
+    defer unconfigured.deinit(alloc);
+    try std.testing.expectEqualStrings(ocr_not_configured_status, unconfigured.units[0].extraction_status.?);
     try std.testing.expectEqual(@as(usize, 0), result.units[0].text.len);
     try std.testing.expectEqual(@as(u64, 19), result.units[0].byte_length.?);
     try std.testing.expectEqual(@as(usize, 64), result.units[0].source_sha256.?.len);
@@ -4840,7 +4880,7 @@ test "document extraction routes image content to pending OCR unit" {
 test "document extraction applies configured audio transcript route" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"routes":[{"match":{"content_type_prefix":"audio/"},"extractor":{"type":"transcript","unit":"transcript_segment"}}]}
+        \\{"transcription":{"transcriber":{"provider":"antfly","model":"openai/whisper-small"}},"routes":[{"match":{"content_type_prefix":"audio/"},"extractor":{"type":"transcript","unit":"transcript_segment"}}]}
     );
     defer config.deinit(alloc);
     var downloaded = TestDownloadedContent{
@@ -4868,52 +4908,109 @@ test "document extraction parses generated OCR and transcription config" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
         \\{
-        \\  "ocr_fallback": true,
-        \\  "ocr": {"config": {"provider": "antfly", "model": "antflydb/Florence-2-base"}},
-        \\  "transcription": {"enabled": true, "config": {"provider": "mock-transcriber"}}
+        \\  "ocr": {"reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}},
+        \\  "transcription": {"transcriber": {"provider": "antfly", "model": "openai/whisper-small"}}
         \\}
     );
     defer config.deinit(alloc);
 
     try std.testing.expect(config.ocr_enabled);
     try std.testing.expect(config.transcription_enabled);
-    try std.testing.expect(std.mem.indexOf(u8, config.ocr_config_json, "antfly") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config.transcription_config_json, "mock-transcriber") != null);
+    try std.testing.expectEqualStrings("lightonai/LightOnOCR-3-0.8B", config.ocr_model);
+    try std.testing.expect(std.mem.indexOf(u8, config.transcription_config_json, "openai/whisper-small") != null);
+
+    var apple = try parseConfig(alloc, "{\"transcription\":{\"transcriber\":{\"provider\":\"apple\"}}}");
+    defer apple.deinit(alloc);
+    try std.testing.expect(apple.transcription_enabled);
 }
 
-test "document extraction defaults OCR to PDF routes and accepts explicit image OCR" {
+test "document extraction runs OCR only when an ocr block names a model" {
     const alloc = std.testing.allocator;
     var defaults = try parseConfig(alloc, "{}");
     defer defaults.deinit(alloc);
     try std.testing.expect(!defaults.ocr_enabled);
-    try std.testing.expect(defaults.ocr_pdf_fallback_enabled);
-    try std.testing.expect(ocrEnabledForRoute(defaults, "pdf"));
+    try std.testing.expect(!defaults.transcription_enabled);
+    try std.testing.expect(!ocrEnabledForRoute(defaults, "pdf"));
     try std.testing.expect(!ocrEnabledForRoute(defaults, "image"));
-    try std.testing.expectEqualStrings(default_ocr_config_json, effectiveOcrConfigJson(defaults));
+    try std.testing.expectEqualStrings("", effectiveOcrConfigJson(defaults));
 
-    var image_enabled = try parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}");
-    defer image_enabled.deinit(alloc);
-    try std.testing.expect(ocrEnabledForRoute(image_enabled, "image"));
+    var reader = try parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}");
+    defer reader.deinit(alloc);
+    try std.testing.expect(ocrEnabledForRoute(reader, "pdf"));
+    try std.testing.expect(ocrEnabledForRoute(reader, "image"));
+    try std.testing.expectEqualStrings("{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}", effectiveOcrConfigJson(reader));
 
-    var routed_image = try parseConfig(alloc, "{\"routes\":[{\"extractor\":{\"type\":\"ocr\"}}]}");
-    defer routed_image.deinit(alloc);
-    try std.testing.expect(ocrEnabledForRoute(routed_image, "image"));
+    var routed = try parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}},\"routes\":[{\"extractor\":{\"type\":\"ocr\"}}]}");
+    defer routed.deinit(alloc);
+    try std.testing.expect(ocrEnabledForRoute(routed, "image"));
 
-    var fallback_disabled = try parseConfig(alloc, "{\"ocr_fallback\":false}");
-    defer fallback_disabled.deinit(alloc);
-    try std.testing.expect(!fallback_disabled.ocr_enabled);
-    try std.testing.expect(!ocrEnabledForRoute(fallback_disabled, "pdf"));
-
-    var nested_disabled = try parseConfig(alloc, "{\"ocr\":{\"enabled\":false}}");
-    defer nested_disabled.deinit(alloc);
-    try std.testing.expect(!nested_disabled.ocr_enabled);
-    try std.testing.expect(!ocrEnabledForRoute(nested_disabled, "pdf"));
+    // A model is required, an OCR route needs an ocr block, and removed
+    // switches are rejected rather than ignored.
+    try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"routes\":[{\"extractor\":{\"type\":\"ocr\"}}]}"));
+    try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"ocr\":{}}"));
+    try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\"}}}"));
+    try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"transcription\":{\"transcriber\":{\"provider\":\"antfly\"}}}"));
+    try std.testing.expectError(error.DocumentExtractionModelRequired, parseConfig(alloc, "{\"transcription\":{}}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc, "{\"ocr_fallback\":false}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc, "{\"transcribe_audio\":true}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc, "{\"ocr\":true}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc, "{\"ocr\":{\"enabled\":true,\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"},\"generator\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc, "{\"transcription\":{\"enabled\":true,\"transcriber\":{\"provider\":\"apple\"}}}"));
 }
 
-test "document extraction OCR parts carry PNG media and Florence prompt" {
+test "unconfigured OCR and transcription units are marked instead of left pending" {
+    const alloc = std.testing.allocator;
+    var page = Unit{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = try alloc.dupe(u8, "pdf_ocr_pending"),
+        .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+    };
+    var audio = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast(""),
+        .method = try alloc.dupe(u8, "transcript_pending"),
+        .extraction_status = try alloc.dupe(u8, "pending_transcription"),
+    };
+    defer {
+        alloc.free(page.method);
+        alloc.free(page.extraction_status.?);
+        alloc.free(audio.method);
+        alloc.free(audio.extraction_status.?);
+    }
+    try markUnconfiguredGeneratedUnit(alloc, &page, false, false);
+    try markUnconfiguredGeneratedUnit(alloc, &audio, false, false);
+    try std.testing.expectEqualStrings(ocr_not_configured_status, page.extraction_status.?);
+    try std.testing.expectEqualStrings("pdf_text", page.method);
+    try std.testing.expectEqualStrings(transcription_not_configured_status, audio.extraction_status.?);
+    try std.testing.expectEqualStrings("transcript_pending", audio.method);
+
+    // A configured producer leaves the unit pending for its run.
+    var pending = Unit{
+        .unit_id = @constCast("image:000001"),
+        .unit_type = @constCast("image"),
+        .text = @constCast(""),
+        .method = try alloc.dupe(u8, "ocr_pending"),
+        .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+    };
+    defer {
+        alloc.free(pending.method);
+        alloc.free(pending.extraction_status.?);
+    }
+    try markUnconfiguredGeneratedUnit(alloc, &pending, true, false);
+    try std.testing.expectEqualStrings("pending_ocr", pending.extraction_status.?);
+}
+
+test "document extraction OCR parts let local readers run their own task" {
     const alloc = std.testing.allocator;
     const png = &.{ 0x89, 'P', 'N', 'G' };
-    const parts = try ocrPagePartsJsonAlloc(alloc, .{ .ocr_model = default_ocr_model }, "pdf", "application/pdf", .{
+    var config = try parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}");
+    defer config.deinit(alloc);
+    const parts = try ocrPagePartsJsonAlloc(alloc, config, "pdf", "application/pdf", .{
         .unit_id = @constCast("page:000001"),
         .unit_type = @constCast("page"),
         .text = @constCast(""),
@@ -4921,7 +5018,8 @@ test "document extraction OCR parts carry PNG media and Florence prompt" {
         .page_number = 1,
     }, png);
     defer alloc.free(parts);
-    try std.testing.expect(std.mem.indexOf(u8, parts, "<OCR>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "{\"type\":\"text\",\"text\":\"\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "Render tables as Markdown") == null);
     try std.testing.expect(std.mem.indexOf(u8, parts, "image/png") != null);
     try std.testing.expect(std.mem.indexOf(u8, parts, "iVBORw==") != null);
 }
@@ -5466,7 +5564,7 @@ test "OCR meaningful content rejects punctuation while retaining text and table 
 test "OCR options parse configurable thresholds resolution model and explicit prompt" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"mode":"always","render_dpi":200,"max_rendered_pixels":123456,"max_rendered_dimension":3072,"quality":{"min_content_chars":75,"max_replacement_char_ratio":0.1},"config":{"provider":"antfly","model":"antflydb/Florence-2-base","prompt":"Preserve tables"}}}
+        \\{"ocr":{"mode":"always","prompt":"Preserve tables","render":{"dpi":200,"max_pixels":123456,"max_dimension":3072},"quality":{"min_content_chars":75,"max_replacement_char_ratio":0.1},"reader":{"provider":"antfly","model":"lightonai/LightOnOCR-3-0.8B"}}}
     );
     defer config.deinit(alloc);
     try std.testing.expect(config.ocr_enabled);
@@ -5475,20 +5573,23 @@ test "OCR options parse configurable thresholds resolution model and explicit pr
     try std.testing.expectEqual(@as(u64, 123456), config.ocr_max_rendered_pixels);
     try std.testing.expectEqual(@as(u32, 3072), config.ocr_max_rendered_dimension);
     try std.testing.expectEqual(@as(usize, 75), config.ocr_quality.min_content_chars);
-    try std.testing.expectEqualStrings("antflydb/Florence-2-base", config.ocr_model);
+    try std.testing.expectEqualStrings("lightonai/LightOnOCR-3-0.8B", config.ocr_model);
     try std.testing.expectEqualStrings("Preserve tables", config.ocr_prompt);
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"max_rendered_pixels":100000001,"config":{"provider":"antfly"}}}
+        \\{"ocr":{"render":{"max_pixels":100000001},"reader":{"provider":"antfly","model":"r"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"max_rendered_dimension":511,"config":{"provider":"antfly"}}}
+        \\{"ocr":{"render":{"max_dimension":511},"reader":{"provider":"antfly","model":"r"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"render_dpi":200,"reader":{"provider":"antfly","model":"r"}}}
     ));
 }
 
 test "document extraction validates generator-backed OCR with generator contract" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"executor":"generator","prompt":"Transcribe exactly","config":{"provider":"antfly","model":"google/gemma-4-mm"}}}
+        \\{"ocr":{"prompt":"Transcribe exactly","generator":{"provider":"antfly","model":"google/gemma-4-mm"}}}
     );
     defer config.deinit(alloc);
     try std.testing.expectEqual(OcrExecutor.generator, config.ocr_executor);
@@ -5501,89 +5602,66 @@ test "document extraction validates generator-backed OCR with generator contract
     );
 
     try std.testing.expectError(
-        error.InvalidDocumentExtractionConfig,
-        parseConfig(alloc, "{\"ocr\":{\"enabled\":true,\"executor\":\"generator\"}}"),
-    );
-    try std.testing.expectError(
-        error.InvalidDocumentExtractionConfig,
-        parseConfig(alloc, "{\"ocr\":{\"enabled\":true,\"executor\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"\"}}}"),
+        error.DocumentExtractionModelRequired,
+        parseConfig(alloc, "{\"ocr\":{\"generator\":{\"provider\":\"antfly\",\"model\":\"\"}}}"),
     );
 }
 
-test "OCR prompt policy is explicit after compatibility parsing" {
+test "OCR prompt policy follows the executor" {
     const alloc = std.testing.allocator;
-    var florence = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"config":{"provider":"antfly","model":"antflydb/Florence-2-base"}}}
-    );
-    defer florence.deinit(alloc);
-    try std.testing.expectEqual(OcrPromptPolicy.florence, florence.ocr_prompt_policy);
-    try std.testing.expectEqualStrings(florence_ocr_prompt, effectiveOcrPrompt(florence));
+    inline for (.{ "antflydb/Florence-2-base", "lightonai/LightOnOCR-3-0.8B", "monkt/paddleocr-onnx" }) |model| {
+        var local = try parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"" ++ model ++ "\"}}}");
+        defer local.deinit(alloc);
+        try std.testing.expectEqual(OcrPromptPolicy.plain, local.ocr_prompt_policy);
+        try std.testing.expectEqualStrings("", effectiveOcrPrompt(local));
+    }
 
-    var generic_reader = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"config":{"provider":"antfly","model":"some-reader"}}}
+    // Hosted readers send their own read instruction for an empty prompt.
+    var remote = try parseConfig(alloc,
+        \\{"ocr":{"reader":{"provider":"openai","model":"gpt-4o"}}}
     );
-    defer generic_reader.deinit(alloc);
-    try std.testing.expectEqual(OcrPromptPolicy.generic, generic_reader.ocr_prompt_policy);
-    try std.testing.expectEqualStrings(default_ocr_prompt, effectiveOcrPrompt(generic_reader));
+    defer remote.deinit(alloc);
+    try std.testing.expectEqualStrings("", effectiveOcrPrompt(remote));
+
+    var generator = try parseConfig(alloc,
+        \\{"ocr":{"generator":{"provider":"antfly","model":"ggml-org/gemma-4-E4B-it-GGUF"}}}
+    );
+    defer generator.deinit(alloc);
+    try std.testing.expectEqualStrings(default_ocr_prompt, effectiveOcrPrompt(generator));
 
     var explicit = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"prompt_policy":"generic","config":{"provider":"antfly","model":"antflydb/Florence-2-base"}}}
+        \\{"ocr":{"prompt":"<OCR_WITH_REGION>","reader":{"provider":"antfly","model":"antflydb/Florence-2-base"}}}
     );
     defer explicit.deinit(alloc);
-    try std.testing.expectEqual(OcrPromptPolicy.generic, explicit.ocr_prompt_policy);
-    try std.testing.expectEqualStrings(default_ocr_prompt, effectiveOcrPrompt(explicit));
+    try std.testing.expectEqualStrings("<OCR_WITH_REGION>", effectiveOcrPrompt(explicit));
 }
 
 test "generated text provider config is validated while parsing extraction config" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"config":{"model":"missing-provider"}}}
+        \\{"ocr":{"reader":{"model":"missing-provider"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"config":{"provider":"antfyl","model":"reader"}}}
+        \\{"ocr":{"reader":{"provider":"antfyl","model":"reader"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"config":{"provider":"antfly","max_tokens":"many"}}}
+        \\{"ocr":{"reader":{"provider":"antfly","model":"r","max_tokens":"many"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"config":"not-an-object"}}
+        \\{"ocr":{"reader":"not-an-object"}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":"false","config":{"provider":"antfly"}}}
+        \\{"ocr":{"reader":{"provider":"antfly","model":"r"},"render":{"dpi":"150"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"render_dpi":"150","config":{"provider":"antfly"}}}
+        \\{"ocr":{"reader":{"provider":"antfly","model":"r"},"quality":{"min_content_chars":"50"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"quality":{"min_content_chars":"50"},"config":{"provider":"antfly"}}}
+        \\{"ocr":{"reader":{"provider":"antfly","model":"r"},"render":{"dp":150}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr_fallback":"false"}
+        \\{"ocr":{"reader":{"provider":"antfly","model":"r"},"quality":{"min_content_char":50}}}
     ));
-    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"render_dp":150,"config":{"provider":"antfly"}}}
-    ));
-    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"quality":{"min_content_char":50},"config":{"provider":"antfly"}}}
-    ));
-}
-
-test "OCR page request uses the Florence task prompt by default" {
-    const alloc = std.testing.allocator;
-    const unit = Unit{
-        .unit_id = @constCast("page:000002"),
-        .unit_type = @constCast("page"),
-        .text = @constCast(""),
-        .method = @constCast("pdf_ocr_pending"),
-        .page_number = 2,
-    };
-    const parts = try ocrPagePartsJsonAlloc(alloc, .{ .ocr_model = "antflydb/Florence-2-base" }, "pdf", "application/pdf", unit, "png");
-    defer alloc.free(parts);
-    try std.testing.expect(std.mem.indexOf(u8, parts, "image/png") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parts, "<OCR>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parts, "Render tables as Markdown") == null);
-    try std.testing.expect(std.mem.indexOf(u8, parts, "page:000002") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parts, "cG5n") != null);
 }
 
 test "OCR page request preserves explicit and generic reader prompts" {
@@ -5600,24 +5678,27 @@ test "OCR page request preserves explicit and generic reader prompts" {
         defer alloc.free(explicit);
         try std.testing.expect(std.mem.indexOf(u8, explicit, "custom instruction") != null);
     }
-
-    // An empty config intentionally selects Antfly's default Florence reader
-    // and its <OCR> task token. Exercise the generic prompt with the same
-    // provider metadata that a parsed non-Florence reader config carries.
     {
         const generic = try ocrPagePartsJsonAlloc(alloc, .{
-            .ocr_config_json = "{\"provider\":\"generic-reader\"}",
-            .ocr_model = "generic/vision-reader",
+            .ocr_config_json = "{\"provider\":\"openai\",\"model\":\"gpt-4o\"}",
+            .ocr_model = "gpt-4o",
             .ocr_prompt_policy = .generic,
         }, "pdf", "application/pdf", unit, "png");
         defer alloc.free(generic);
         try std.testing.expect(std.mem.indexOf(u8, generic, "Render tables as Markdown") != null);
+        try std.testing.expect(std.mem.indexOf(u8, generic, "page:000001") != null);
+        try std.testing.expect(std.mem.indexOf(u8, generic, "cG5n") != null);
     }
 }
 
 test "OCR prompt echo detection covers Florence task and canonical prompts" {
     try std.testing.expect(isOcrPromptEcho(" <OCR>\n", florence_ocr_prompt));
     try std.testing.expect(isOcrPromptEcho("what is the text in the image", florence_ocr_prompt));
+    // Local readers receive an empty prompt; Florence expands it to the same
+    // canonical question.
+    try std.testing.expect(isOcrPromptEcho("What is the text in the image?", ""));
+    try std.testing.expect(isOcrPromptEcho("<OCR>", ""));
+    try std.testing.expect(!isOcrPromptEcho("Invoice total: $123.45", ""));
     try std.testing.expect(isOcrPromptEcho("TRANSCRIBE this page faithfully!", "Transcribe this page faithfully."));
     try std.testing.expect(!isOcrPromptEcho("Invoice total: $123.45", florence_ocr_prompt));
 }
