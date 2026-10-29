@@ -48298,16 +48298,17 @@ test "precompute OCR error policy distinguishes unavailable models from transien
     try std.testing.expect(!isRetryableAssetProducerError(error.ReadRequestFailed));
 }
 
-test "db document extraction OCR default is scoped to PDF routes" {
+test "db document extraction OCR runs only with a configured reader" {
     const alloc = std.testing.allocator;
     var defaults = try document_extraction_mod.parseConfig(alloc, "{}");
     defer defaults.deinit(alloc);
-    try std.testing.expect(document_extraction_mod.ocrEnabledForRoute(defaults, "pdf"));
+    try std.testing.expect(!document_extraction_mod.ocrEnabledForRoute(defaults, "pdf"));
     try std.testing.expect(!document_extraction_mod.ocrEnabledForRoute(defaults, "image"));
 
-    var explicit_image = try document_extraction_mod.parseConfig(alloc, "{\"ocr\":true}");
-    defer explicit_image.deinit(alloc);
-    try std.testing.expect(document_extraction_mod.ocrEnabledForRoute(explicit_image, "image"));
+    var configured = try document_extraction_mod.parseConfig(alloc, "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}");
+    defer configured.deinit(alloc);
+    try std.testing.expect(document_extraction_mod.ocrEnabledForRoute(configured, "pdf"));
+    try std.testing.expect(document_extraction_mod.ocrEnabledForRoute(configured, "image"));
 }
 
 fn applyGeneratedUnitText(
@@ -82973,7 +82974,7 @@ test "db document extraction stores zip archive entry units" {
     try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"source_content_type\":\"application/zip\"") != null);
 }
 
-test "db document extraction stores image pending OCR unit" {
+test "db document extraction marks image OCR not configured without a reader" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -83017,7 +83018,7 @@ test "db document extraction stores image pending OCR unit" {
     defer alloc.free(unit_payload);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_type\":\"image\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_pending\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"pending_ocr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"ocr_not_configured\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"byte_length\":19") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"source_sha256\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":false") != null);
@@ -83049,7 +83050,7 @@ test "db document extraction completes image OCR with reader producer" {
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     });
 
     try db.batch(.{
@@ -83102,7 +83103,7 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"mode\":\"always\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"mode\":\"always\",\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     });
 
     const pdf_bytes = try std.Io.Dir.cwd().readFileAlloc(
@@ -83170,7 +83171,7 @@ test "db async document extraction reuses generated OCR text across streaming pa
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     });
 
     try db.batch(.{
@@ -83220,7 +83221,7 @@ test "db document extraction stores structured OCR confidence and coordinates" {
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     });
 
     try db.batch(.{
@@ -83277,7 +83278,7 @@ test "db document extraction completes audio transcription with transcriber prod
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"mock-transcriber\",\"model\":\"test-transcriber\"}}}}",
     });
 
     try db.batch(.{
@@ -83333,7 +83334,7 @@ test "db document extraction transcript segments time chunk artifacts" {
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"mock-transcriber\",\"model\":\"test-transcriber\"}}}}",
     });
     try db.addEnrichment(.{
         .name = "document_chunks_v1",
@@ -83422,7 +83423,7 @@ test "db document extraction keeps diarized speakers through reopen" {
             .kind = .asset,
             .field = "url",
             .content_type = "application/json",
-            .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\",\"diarization\":true}}}}",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"mock-transcriber\",\"model\":\"test-transcriber\",\"diarization\":true}}}}",
         });
         try db.addEnrichment(.{
             .name = "document_chunks_v1",

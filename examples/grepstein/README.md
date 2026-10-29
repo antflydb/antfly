@@ -173,7 +173,7 @@ inference. The deployed Antfly v0.3.0-rc.6 shared L4 reader pool passed syntheti
 OCR and model-switching qualification for both 4B and 0.8B. Those checks establish
 runtime compatibility; corpus coverage and text quality still require a representative
 PDF pilot before backfill. Its native `/read` contract uses
-an image-only prompt, so the extraction producer keeps `prompt_policy: plain`.
+an image-only prompt; the extraction producer sends no prompt to readers.
 The profile requests at most 512 output tokens per page; truncated OCR returns
 an error instead of publishing incomplete text. Dense pages can need a separate
 larger-budget workflow and a separately qualified serving policy. Do not count
