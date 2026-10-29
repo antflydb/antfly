@@ -2,8 +2,9 @@
 
 This is the native reclamation protocol implemented for issue #1278. The
 collector uses the existing Antfly transactional page engine and immutable log.
-It is opt-in for new prefixes; local fault/allocation tests pass. Real-provider
-and final-artifact qualification are tracked separately below.
+It is opt-in for new prefixes. Local fault/allocation, native scale and real
+standard-GCS qualification pass at the checkpoint below. Qualification after
+integrating newer main commits remains a separate artifact closure.
 
 ## Safety boundary and activation
 
@@ -197,3 +198,33 @@ separately canceled task. Explicit operation checkpoints still serialize lease
 renewals and source-pin checks and preserve their specific error. This shared
 runtime contract avoids turning a stopped HTTP watchdog into request-wide
 cancellation. Qualification preserves the initial provider failures separately.
+
+
+## Qualified checkpoint before main integration
+
+Implementation `d10a545001` and scale fixture `71f79b92ff` add the managed
+collector and its shared cancellation/read-budget contracts. The native suite
+passes 630 tests with eight environment-dependent skips and no failures/leaks;
+the later focused scale run passes 27 with two live-provider skips. The native
+50,000-record fixture retains and verifies every one of 25,000 records, their
+LSNs/timestamps and original batch receipt, while a newer-epoch write remains
+visible. It traces 1,965 pages in 884 steps, deletes 6,224 obsolete objects and
+peaks at 194 backend operations per step. Its clock is deterministic: these
+numbers describe CPU/I/O scale, not real grace or provider latency. Job-end
+object counts include the completed job's private metadata; repeated-cycle
+cleanup qualification must include the later maintenance slots too.
+
+Real GCS tests use two published generations, assert that ordinary pruning
+establishes a retired WAL cut, then wait the actual 60-second collection grace.
+They verify all 512 approximately 1 KiB document bodies and the original receipt
+after reopening with collection disabled. The final unversioned bucket
+`antfly-1278-multi-mvsvdcnq-1f2dda0d` deletes 54 objects; versioned bucket
+`antfly-1278-multi-mvsvdc29-ba368fb1` deletes 59 including eligible HEAD history.
+Both pass transport/runtime contracts and cleanup with bucket absence verified.
+All six disposable GCS buckets created during this phase were removed. Earlier
+failed cancellation and missing-retired-cut reports remain preserved.
+
+Evidence is in `examples/cloudflare-serverless/dist/qualification/native-gc-lab/`.
+AWS authentication remains unavailable. Mock opaque/tuple/null version tests
+are not real S3 qualification, and native GCS success does not add a GCS
+JavaScript transport. The live Cloudflare gate remains separate and unpassed.

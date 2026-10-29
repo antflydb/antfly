@@ -322,3 +322,57 @@ Reports, exact role bundles/bindings and failed/intermediate runs remain local
 under `examples/cloudflare-serverless/dist/qualification/multiprovider-lab/`.
 All 1,592 previously sealed artifacts remain hash-valid. No Cloudflare resources
 were created for this checkpoint; its prepared smoke pair has no gate result.
+
+
+## Native collection checkpoint and integration boundary
+
+At `d10a545001`/`71f79b92ff`, the implemented native collector passes fault,
+allocation, restart, version and fairness contracts, a 50,000-record retained-tail
+fixture, and actual versioned/unversioned GCS collection/reopen tests. See the
+[collection protocol](native-indexed-wal-collection.md) for exact safety bounds
+and qualification limitations. The shared runtime also separates fallible
+checkpoints from transport cancellation probes: stopping a watchdog must not
+renew leases or cache that task's cancellation as failure of a live request.
+
+The rebuilt full/compact/observation modules are 7,329,084 bytes each. Their
+SHA-256 hashes are respectively `7946334d2770219463ecfd29913d1254831264dcdbc4e0b1982fd1bd7688b29a`,
+`8bfbe4e89a9ca1d8db9a62c83b14d6748c9ef74213155f4113e47d96b43247b0`,
+and `ff85bfdf0333eb9be8a991b7c291b52380e1bcf14fad0889dd089ba6417b7865`.
+All 330 Node and 31 actual-workerd tests pass. A recovered platform
+`SQLITE_NOMEM` still appears and remains an unresolved live-memory concern.
+The engine and the new native collector do not use SQLite.
+
+The final 50,000-document mixed text/vector fixture passes all nine stages:
+peak 869 operations, 28,826,922 transferred bytes, 11,788,282 working bytes and
+27,590,656 linear-memory bytes. Its 21,526,325,594-byte owned backing file is
+removed afterward. A separate 50,000-row metadata fixture passes three
+collection cycles, reopen, hot-root and read-only observer checks, with peak
+121 operations and 6,029,312 linear bytes. These are local fixtures rather than
+cloud latency or total-isolate memory measurements.
+
+Both frozen ANN corpora also pass using the 8 MiB reader module and an explicit
+8 MiB request working budget. Synthetic 10,000-document read peaks are
+7,208,960 linear bytes; the 1,000-document real-model corpus peaks at 5,963,776.
+At probes 8/32/all, synthetic recall is .45/.86/1 with mean GETs
+63.2/123.6/140.3; real recall is 1 at every budget with mean GETs
+40.9/40.9/39.4. Mean bytes at each budget are no greater than the frozen control.
+As in the unchanged ANN gate policy, those GET/byte comparisons are per-budget
+means; three individual real-model exact queries transfer more bytes. The
+matched previous-candidate comparisons preserve its recall, GET and byte values.
+
+The 2,057 previously sealed artifacts still match their hashes. New checkpoint
+reports and binaries remain under `dist/qualification/native-gc-lab/`. The PR
+also has two import/ownership-anchor conflicts with 22 newer main commits;
+merge that main and qualify its integrated artifacts separately before calling
+this the final deployment candidate. AWS authentication and explicit
+Cloudflare token/cleanup authorization remain external prerequisites. No live
+gate, cold-epoch or cross-cloud latency parity result is implied.
+
+
+The checkpoint repeats proof overlap in both orders. Delayed read/write p95
+(milliseconds) is 746/1168 without proofs versus 467/1176 with proofs, and in
+reverse order 561/1164 versus 448/1167. Zero-delay runs are 113/95 versus
+101/101, and in reverse order 108/108 versus 121/121. All exact checks pass.
+The write and reverse-zero regressions keep `DETACHED_METADATA_PROOFS` off;
+`NATIVE_READ_AFFINITY` and `WAL_DOCUMENT_INDEX` also remain off for the selected
+Worker profile. These short local ablations do not replace the live gate.
