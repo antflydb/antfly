@@ -15,6 +15,7 @@
 
 """Test measurement accounting without invoking a compiler."""
 
+import errno
 import importlib.util
 import json
 import os
@@ -544,6 +545,38 @@ class ParallelAuditIsolation(unittest.TestCase):
             shutil.rmtree(source.root)
             self.assertEqual((cloned.cwd / "internal").read_text(), "worker edit")
             self.assertEqual((cloned.cwd / "external").read_text(), "external")
+
+    def test_cache_seed_crosses_filesystems_without_aliasing_mutable_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "phase", root / "fixture"
+            entries = (
+                "o/hash/maker",
+                "h/input",
+                "o/hash/input.lock",
+                "p/source.tar.gz",
+            )
+            for relative in entries:
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+                os.utime(path, ns=(1_600_000_000_000_000_000,) * 2)
+            with mock.patch.object(
+                measurement.os,
+                "link",
+                side_effect=OSError(errno.EXDEV, "different device"),
+            ) as link:
+                measurement.clone_audit_cache(source, target)
+            self.assertEqual(link.call_count, 2)
+            for relative in entries:
+                original, cloned = source / relative, target / relative
+                self.assertEqual(cloned.read_bytes(), original.read_bytes())
+                self.assertEqual(cloned.stat().st_mtime_ns, original.stat().st_mtime_ns)
+                self.assertNotEqual(cloned.stat().st_ino, original.stat().st_ino)
+            (target / "h/input").write_text("worker revision")
+            shutil.rmtree(source)
+            self.assertEqual((target / "o/hash/maker").read_text(), "o/hash/maker")
+            self.assertEqual((target / "h/input").read_text(), "worker revision")
 
     def test_cache_clones_share_immutable_objects_and_keep_manifests_private(self):
         with tempfile.TemporaryDirectory() as directory:

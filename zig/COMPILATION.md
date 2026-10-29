@@ -1947,3 +1947,15 @@ IR dumps; the baseline build reported 17 minutes. These runs shared a busy Mac
 and are not a controlled throughput or isolated compiler-time comparison.
 The row-preparation regression passes 12/12 with zero leaks. These measurements
 do not establish that the complete Darwin library meets its 80 MiB gate.
+
+The full tooling job also seeds its fixture from a PVC onto the runner's
+separate temporary filesystem. Immutable object snapshots now copy on `EXDEV`,
+while same-volume snapshots keep hard links and other errors remain fatal.
+Seven isolation regressions pass, including copied-byte/mtime preservation,
+private manifests and locks, and survival after the source cache is removed.
+
+The external Mach-O final linker previously ignored the product's strip flag,
+even when every input archive was stripped. It now drops local symbols with
+`-x` only for stripped products. Real Darwin links verify that private function
+names remain available when unstripped and disappear when stripped; both modes
+retain the public export inventory and executable/shared-library consumers.
