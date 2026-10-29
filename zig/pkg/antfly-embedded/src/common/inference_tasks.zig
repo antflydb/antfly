@@ -506,8 +506,12 @@ pub fn readingBody(a: std.mem.Allocator, cfg: readers.Config, request: Json) ![]
     const decoded = std.json.parseFromValue(@import("inference_api").ReadRequest, a, forwarded, .{}) catch return error.InvalidInferenceRequest;
     defer decoded.deinit();
     const body = decoded.value;
-    if ((body.images != null) == (body.documents != null)) return error.InvalidInferenceRequest;
-    const count = if (body.images) |images| images.len else body.documents.?.len;
+    const forms = @as(usize, @intFromBool(body.images != null)) + @intFromBool(body.documents != null) + @intFromBool(body.audio != null);
+    if (forms != 1) return error.InvalidInferenceRequest;
+    if (body.audio) |audio| {
+        if (audio.len == 0) return error.InvalidInferenceRequest;
+    }
+    const count = if (body.images) |images| images.len else if (body.documents) |documents| documents.len else 1;
     if (count == 0 or count > 64) return error.InvalidInferenceRequest;
     if (body.max_tokens) |tokens| if (tokens < 1 or tokens > 1024) return error.InvalidInferenceRequest;
     return std.json.Stringify.valueAlloc(a, forwarded, .{});
@@ -781,6 +785,24 @@ pub fn embeddingParts(a: std.mem.Allocator, input: Json) ![]@import("antfly_temp
         } else return error.UnsupportedInferenceFeature;
     }
     return parts;
+}
+
+test "provider registry gateway audio reads preserve input and reject mixed sources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = readers.Config{ .provider = .antfly, .model = "gemma4", .max_tokens = 512 };
+    const raw = "{\"audio\":\"data:video/mp4;base64,AAAA\"}";
+    const encoded = try readingBody(a, cfg, try std.json.parseFromSliceLeaky(Json, a, raw, .{}));
+    const result = try std.json.parseFromSliceLeaky(Json, a, encoded, .{});
+    try std.testing.expectEqualStrings("gemma4", result.object.get("model").?.string);
+    try std.testing.expectEqualStrings("data:video/mp4;base64,AAAA", result.object.get("audio").?.string);
+    try std.testing.expectEqual(@as(i64, 512), result.object.get("max_tokens").?.integer);
+    for ([_][]const u8{
+        "{\"audio\":\"x\",\"images\":[]}",
+        "{\"audio\":\"x\",\"documents\":[]}",
+        "{\"audio\":\"\"}",
+    }) |invalid| try std.testing.expectError(error.InvalidInferenceRequest, readingBody(a, cfg, try std.json.parseFromSliceLeaky(Json, a, invalid, .{})));
 }
 
 test "provider registry gateway read aliases preserve documents retention and caller defaults" {

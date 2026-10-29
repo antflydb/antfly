@@ -385,7 +385,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.listPredictors(ctx);
         }
 
-        /// Read text from images (OCR/document understanding)
+        /// Read text from images, documents, or audio
         /// POST /read
         fn readImages(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.readImages(ctx);

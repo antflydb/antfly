@@ -14228,9 +14228,16 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
   /ai/v1/read:
     post:
-      summary: Read text from images (OCR/document understanding)
+      summary: Read text from images, documents, or audio
       description: >
         Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+
+
+        Audio input uses an audio-capable generator such as Gemma 4. Supported video
+
+        containers are transcribed from their audio track. Results report truncation;
+
+        generated text does not imply word alignment or speaker identification.
 
 
         ## Models
@@ -51022,16 +51029,26 @@ components:
       type: object
       required:
         - model
-      description: Read exactly one of images or documents. The server rejects absent or simultaneous
-        input forms before inference.
+      description: Read exactly one of images, documents, or audio. Audio reads use an audio-capable generator
+        such as Gemma 4 and transcribe the audio track of supported video containers.
       x-antfly-exactly-one-of:
         - images
         - documents
+        - audio
       properties:
         model:
           type: string
-          description: Name of reader model from models_dir/readers/
+          description: Reader model from models_dir/readers/, or an audio-capable generator from models_dir/generators/
+            for audio inputs.
           example: microsoft/trocr-base-printed
+        audio:
+          type: string
+          minLength: 1
+          description: Base64-encoded audio or a data URI, mutually exclusive with images and documents.
+            Supports audio tracks in MP4/MOV and WebM containers. Uses an audio-capable generator from
+            models_dir/generators/ such as Gemma 4. Returns transcript text without word timestamps or
+            speaker labels; video frames are not captioned. Use a registered document reader with an audio
+            binding for planning, fallback, verification, artifact retention, and durable jobs.
         retain_artifact:
           type: boolean
           default: false
@@ -51168,6 +51185,7 @@ components:
             - page
             - slide
             - image
+            - audio
         inherited_parts:
           type: array
           items:
@@ -65241,13 +65259,24 @@ components:
             - image/png
             - image/jpeg
             - image/webp
+            - audio/wav
+            - audio/mpeg
+            - audio/aac
+            - audio/mp4
+            - audio/ogg
+            - audio/flac
+            - audio/webm
+            - video/mp4
+            - video/quicktime
+            - video/webm
         pages:
           type: array
           minItems: 1
           maxItems: 1024
           uniqueItems: true
           description: Optional one-based page/slide selection, returned in original source order. Omission
-            selects every visible page/slide.
+            selects every visible page/slide. Audio/video recordings are one source unit and do not accept
+            page selection.
           items:
             type: integer
             minimum: 1

@@ -22,7 +22,7 @@ class DocumentSource:
             image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original
             source coordinates.
         pages (list[int] | Unset): Optional one-based page/slide selection, returned in original source order. Omission
-            selects every visible page/slide.
+            selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection.
         include_notes (bool | Unset): Include slide speaker notes as separate evidence, never silently as visible slide
             text. Default: False.
         include_hidden (bool | Unset): Include hidden slides. Default: False.

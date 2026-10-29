@@ -101,9 +101,13 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     body: InferenceReadRequest,
 ) -> Response[InferenceError | InferenceReadResponse | InferenceTransientCapacityError]:
-    """Read text from images (OCR/document understanding)
+    """Read text from images, documents, or audio
 
      Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+
+    Audio input uses an audio-capable generator such as Gemma 4. Supported video
+    containers are transcribed from their audio track. Results report truncation;
+    generated text does not imply word alignment or speaker identification.
 
     ## Models
 
@@ -149,8 +153,9 @@ def sync_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
-            absent or simultaneous input forms before inference.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio. Audio reads
+            use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported
+            video containers.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -176,9 +181,13 @@ def sync(
     client: AuthenticatedClient | Client,
     body: InferenceReadRequest,
 ) -> InferenceError | InferenceReadResponse | InferenceTransientCapacityError | None:
-    """Read text from images (OCR/document understanding)
+    """Read text from images, documents, or audio
 
      Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+
+    Audio input uses an audio-capable generator such as Gemma 4. Supported video
+    containers are transcribed from their audio track. Results report truncation;
+    generated text does not imply word alignment or speaker identification.
 
     ## Models
 
@@ -224,8 +233,9 @@ def sync(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
-            absent or simultaneous input forms before inference.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio. Audio reads
+            use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported
+            video containers.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -246,9 +256,13 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     body: InferenceReadRequest,
 ) -> Response[InferenceError | InferenceReadResponse | InferenceTransientCapacityError]:
-    """Read text from images (OCR/document understanding)
+    """Read text from images, documents, or audio
 
      Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+
+    Audio input uses an audio-capable generator such as Gemma 4. Supported video
+    containers are transcribed from their audio track. Results report truncation;
+    generated text does not imply word alignment or speaker identification.
 
     ## Models
 
@@ -294,8 +308,9 @@ async def asyncio_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
-            absent or simultaneous input forms before inference.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio. Audio reads
+            use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported
+            video containers.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -319,9 +334,13 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     body: InferenceReadRequest,
 ) -> InferenceError | InferenceReadResponse | InferenceTransientCapacityError | None:
-    """Read text from images (OCR/document understanding)
+    """Read text from images, documents, or audio
 
      Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+
+    Audio input uses an audio-capable generator such as Gemma 4. Supported video
+    containers are transcribed from their audio track. Results report truncation;
+    generated text does not imply word alignment or speaker identification.
 
     ## Models
 
@@ -367,8 +386,9 @@ async def asyncio(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
-            absent or simultaneous input forms before inference.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio. Audio reads
+            use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported
+            video containers.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

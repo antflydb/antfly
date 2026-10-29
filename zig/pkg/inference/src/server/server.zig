@@ -4086,11 +4086,20 @@ pub const Node = struct {
         media_count: usize = 0,
         image_count: usize = 0,
         has_audio: bool = false,
+        /// Internal /read task policy; ordinary audio generation retains its semantics.
+        audio_transcription: bool = false,
         /// Trusted internal constrained generation (for context preparation).
         /// This is not derived from caller-supplied message contents.
         grammar: ?[]const u8 = null,
         enable_thinking: ?bool = null,
         expected_model_revision: ?[32]u8 = null,
+
+        fn kvDType(self: @This(), config: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
+            // Audio transcription keeps its source context at accelerator
+            // precision, consistent with the Gemma 4 generation default.
+            if (self.audio_transcription) return if (backend == .native) .f32 else .f16;
+            return session_factory.recommendedKvDTypeForGptConfig(config, backend);
+        }
     };
 
     /// Owns one direct-generation admission from source preflight through
@@ -5642,6 +5651,7 @@ pub const Node = struct {
         truncated: bool,
         /// Prompt tokens served from the model's prefix KV cache.
         cached_prompt_tokens: usize = 0,
+        silent_audio: bool = false,
     };
 
     const NativePromptTokenCount = struct {
@@ -5854,13 +5864,18 @@ pub const Node = struct {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
+        // Preserve model resolution, capability checks, admission and cancellation
+        // for silence, but do not ask a generative model to invent a transcript.
+        if (preflight.audio_transcription and try audioReadIsDigitalSilence(allocator, messages, execution_control)) {
+            return .{ .text = try allocator.dupe(u8, ""), .prompt_tokens = 0, .completion_tokens = 0, .truncated = false, .silent_audio = true };
+        }
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
             .metal => .metal,
             .cuda => .cuda,
             .pjrt, .wasm => return error.UnsupportedGeneratorProvider,
         };
-        const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+        const kv_dtype = preflight.kvDType(gpt_config, backend_kind);
         const prompt_cache_requested = prompt_cache_key != null and
             self.config.prompt_cache.enabled and
             promptCacheBackendEligible(self.config.prompt_cache.mode, backend_kind);
@@ -7703,7 +7718,7 @@ pub const Node = struct {
             item.page_number = image.page_number;
         }
         const execution = try qwenReadExecution(allocator, results);
-        return .{ .items = out, .execution = execution };
+        return .{ .items = out, .execution = execution, .usage = try readers_api.measuredUsage(out) };
     }
 
     const ConcurrentOcrBenchTask = struct {
@@ -9153,6 +9168,17 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
+        if (request.audio) |audio| {
+            if (request.images.len > 0 or request.documents.len > 0) return error.InvalidDocumentSource;
+            const raw = try std.json.Stringify.valueAlloc(allocator, api.ReadRequest{ .model = model_name, .audio = audio, .prompt = request.prompt, .max_tokens = request.max_tokens }, .{ .emit_null_optional_fields = false });
+            defer allocator.free(raw);
+            const definition = try self.documentDefinition(allocator, model_name, .read);
+            defer if (definition) |bytes| allocator.free(bytes);
+            const result = if (definition != null or control.document_store.configured()) try self.readDocumentsJsonWithControl(allocator, raw, control) else try self.readAudioJsonWithControl(allocator, raw, control);
+            defer allocator.free(result);
+            if (request.max_response_bytes) |limit| if (result.len > limit) return error.ResponseTooLarge;
+            return readers_api.documentResults(allocator, result);
+        }
         const definition = try self.documentDefinition(allocator, model_name, .read);
         defer if (definition) |bytes| allocator.free(bytes);
         if (request.documents.len > 0 or definition != null or std.mem.eql(u8, model_name, "antfly/native-document")) {
@@ -20447,15 +20473,19 @@ pub const Node = struct {
     }
 
     pub fn documentResolveBinding(self: *Node, a: std.mem.Allocator, binding: document_contract.Binding) !document_contract.Snapshot {
-        if (std.mem.eql(u8, binding.model, "antfly/native-document") and binding.operation == .read) return .{ .binding = binding, .path = binding.model, .identity = @splat(0) };
+        if (std.mem.eql(u8, binding.model, "antfly/native-document") and binding.operation == .read and binding.input == .image) return .{ .binding = binding, .path = binding.model, .identity = @splat(0) };
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*owned| owned.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
-        const path = if (binding.operation == .read) try self.resolveReadRequestModelPath(a, io, binding.model) else try self.resolveRequestModelPath(a, io, binding.model, if (binding.operation == .decide) "deciders" else "extractors");
+        const path = if (binding.operation == .read and binding.input == .audio) try self.resolveRequestModelPath(a, io, binding.model, "generators") else if (binding.operation == .read) try self.resolveReadRequestModelPath(a, io, binding.model) else try self.resolveRequestModelPath(a, io, binding.model, if (binding.operation == .decide) "deciders" else "extractors");
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
         switch (binding.operation) {
-            .read => if (!isGenerativeReadModel(&manifest) and !(try readers_mod.probeManifest(a, path, manifest)).isSupported()) return error.DocumentCapabilityMismatch,
+            .read => {
+                if (binding.input == .audio) {
+                    if (manifest.model_type != .generator or !(try resolvedGenerateExecutorContract(self, &manifest)).accepts_audio) return error.DocumentCapabilityMismatch;
+                } else if (!isGenerativeReadModel(&manifest) and !(try readers_mod.probeManifest(a, path, manifest)).isSupported()) return error.DocumentCapabilityMismatch;
+            },
             .decide => if (decideExecutionContract(manifest) == null) return error.DocumentCapabilityMismatch,
             .extract => if (!manifest.hasCapability("extraction") and manifest.model_type != .extractor) return error.DocumentCapabilityMismatch,
         }
@@ -20673,11 +20703,165 @@ pub const Node = struct {
         return ctx.response.build();
     }
 
+    const AudioReadInput = struct {
+        const default_prompt = "Transcribe the speech in this audio. Return only the transcript, without commentary.";
+        clips: [1][]const u8,
+        parts: [2]generation.Message.ContentPart,
+
+        fn init(bytes: []const u8, prompt: ?[]const u8) AudioReadInput {
+            return .{ .clips = .{bytes}, .parts = .{ .{ .audio = 0 }, .{ .text = prompt orelse default_prompt } } };
+        }
+        fn message(self: *const AudioReadInput) generation.Message {
+            return .{ .role = "user", .content = self.parts[1].text, .audio_bytes = &self.clips, .content_parts = &self.parts };
+        }
+    };
+
+    /// Planner leaf: admission belongs only to this physical call, while the
+    /// parent document run owns source snapshots, budgets and checkpoints.
+    pub fn documentReadAudio(self: *Node, a: std.mem.Allocator, model_path: []const u8, bytes: []const u8, prompt: ?[]const u8, max_tokens: ?i64, supplied_control: InferenceExecutionControl) !DirectGenerateOutput {
+        const input = AudioReadInput.init(bytes, prompt);
+        const messages = [_]generation.Message{input.message()};
+        var preflight = try directGeneratePreflightForMessages(&messages);
+        preflight.enable_thinking = false;
+        preflight.audio_transcription = true;
+        const tokens: i32 = @intCast((try validateReadMaxTokens(max_tokens)) orelse max_read_tokens);
+        var admission = try self.beginDirectGenerateAdmission(preflight, tokens);
+        defer admission.deinit();
+        admission.execution_control = self.bindExecutionControl(null, supplied_control);
+        try admission.prepareMessages(&messages);
+        return self.generateMessagesDirectPrepared(a, model_path, &messages, tokens, preflight, admission.reserved_units, null, false, null, false, null, null, null, try admission.boundExecutionControl()) catch |err| {
+            return if (err == error.EmbeddingSequenceTooLong) error.AudioTooLong else err;
+        };
+    }
+
+    /// Audio reads use the ordinary multimodal generator, including its model
+    /// capability checks, projector limits, cancellation and token accounting.
+    /// Video containers are audio inputs here: no frames enter the prompt.
+    pub fn readAudioJsonWithControl(self: *Node, a: std.mem.Allocator, raw: []const u8, supplied_control: InferenceExecutionControl) ![]u8 {
+        return self.readAudioJsonWithAdmission(a, raw, supplied_control, .direct);
+    }
+
+    fn readAudioJsonWithAdmission(self: *Node, a: std.mem.Allocator, raw: []const u8, supplied_control: InferenceExecutionControl, owner: ExtractionAdmissionOwner) ![]u8 {
+        const parsed = try std.json.parseFromSlice(api.ReadRequest, a, raw, .{});
+        defer parsed.deinit();
+        const request = parsed.value;
+        const audio = request.audio orelse return error.InvalidGenerationRequest;
+        if (audio.len == 0 or request.images != null or request.documents != null or
+            (request.retain_artifact orelse false) or supplied_control.document_store.configured() or
+            std.mem.trim(u8, request.model, " \t\r\n").len == 0)
+            return error.InvalidGenerationRequest;
+        const max_tokens: i32 = @intCast((try validateReadMaxTokens(request.max_tokens)) orelse default_read_admission_max_tokens);
+        const prompt = request.prompt orelse AudioReadInput.default_prompt;
+        const control = self.bindExecutionControl(null, supplied_control);
+        try control.check();
+
+        var shape: RequestMediaAdmissionShape = .{};
+        shape.addInline(audio.len, false);
+        const media_admission = requestMediaAdmission(self, shape);
+        const resident = std.math.mul(usize, media_admission.byte_cap, 2) catch return error.RemoteContentTooLarge;
+        const audio_admission = audioDecodeAdmission(self, resident);
+        // The generator's audio projector uses a fixed bounded decode arena.
+        // Reject a smaller envelope rather than reserving less than it can use.
+        if (audio_admission.max_decode_working_bytes < default_max_audio_decode_working_bytes) return error.AudioTooLarge;
+        const reserved = @max(audio_admission.units, estimateGenerateAdmissionUnitsFromShape(prompt.len, 1, max_tokens));
+        switch (owner) {
+            .direct => try self.acquireAdmissionUnits(reserved),
+            .http_route => try self.reserveAdmissionUnits(reserved),
+        }
+        defer switch (owner) {
+            .direct => self.releaseAdmissionUnits(reserved),
+            .http_route => self.releaseSlotUnits(reserved),
+        };
+        self.metrics.incRequest("read");
+        defer self.metrics.decActive();
+        var budget = RequestMediaBudget.init(media_admission.byte_cap);
+        const decoded = try decodeMediaDataWithBudget(a, audio, &budget);
+        defer decoded.deinit(a);
+        // Verify the physical container and MIME before resolving/loading a model.
+        _ = try canonicalAudioMimeForBytes(decoded.mime_type orelse "application/octet-stream", decoded.data);
+        const input = AudioReadInput.init(decoded.data, prompt);
+        const messages = [_]generation.Message{input.message()};
+        var preflight = try directGeneratePreflightForMessages(&messages);
+        preflight.encoded_media_bytes = audio.len;
+        preflight.enable_thinking = false;
+        preflight.audio_transcription = true;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*threaded| threaded.deinit();
+        const io = self.inferenceIo(a, null, &owned_io);
+        const model_path = try self.resolveRequestModelPath(a, io, request.model, "generators");
+        defer a.free(model_path);
+        const output = try self.generateMessagesDirectPrepared(a, model_path, &messages, max_tokens, preflight, reserved, null, false, null, false, null, null, null, control);
+        defer a.free(output.text);
+        const results = [_]api.ReadObject{.{
+            .object = "read",
+            .index = 0,
+            .text = output.text,
+            .origin = "transcription",
+            .status = if (output.truncated) "truncated" else "complete",
+        }};
+        return std.json.Stringify.valueAlloc(a, api.ReadResponse{
+            .object = "list",
+            .data = &results,
+            .model = request.model,
+            .usage = tokenUsage(output.prompt_tokens, output.completion_tokens),
+        }, .{});
+    }
+
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
         if (try ctx.body()) |raw| {
             const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
             if (envelope) |parsed_document| {
                 defer parsed_document.deinit();
+                if (parsed_document.value == .object) {
+                    const object = parsed_document.value.object;
+                    const forms = @as(usize, @intFromBool(object.contains("images"))) + @intFromBool(object.contains("documents")) + @intFromBool(object.contains("audio"));
+                    if (forms > 1) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "read requires exactly one input form" });
+                }
+                if (parsed_document.value == .object and parsed_document.value.object.contains("audio") and
+                    (httpInferenceExecutionControl(self, ctx).document_store.configured() or (self.isDocumentOperation(ctx.allocator, parsed_document.value, .read) catch |err| return requestModelResolutionError(ctx, err))))
+                {
+                    const result = self.readDocumentsJsonWithControl(ctx.allocator, raw, httpInferenceExecutionControl(self, ctx)) catch |err| return documentFailureResponse(ctx, err);
+                    defer ctx.allocator.free(result);
+                    try ctx.setHeader("content-type", "application/json");
+                    _ = ctx.response.body(result);
+                    return ctx.response.build();
+                }
+                if (parsed_document.value == .object and parsed_document.value.object.contains("audio")) {
+                    const result = self.readAudioJsonWithAdmission(ctx.allocator, raw, httpInferenceExecutionControl(self, ctx), .http_route) catch |err| switch (err) {
+                        error.InvalidGenerationRequest,
+                        error.InvalidMaxTokens,
+                        error.InvalidDataUri,
+                        error.InvalidBase64,
+                        error.UnknownField,
+                        error.UnexpectedToken,
+                        error.MissingField,
+                        => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "audio reads require a model, exactly one audio input, and max_tokens from 1 to 1024" }),
+                        error.InvalidInferenceMedia, error.UnsupportedInferenceMimeType => return unsupportedAudioResponse(ctx, "unsupported or corrupt audio container"),
+                        error.AudioTooLarge, error.AudioInputTooLong => return audioTooLargeResponse(ctx),
+                        error.AudioTooLong, error.EmbeddingSequenceTooLong => return audioDurationLimitResponse(ctx),
+                        error.RemoteContentTooLarge => return remoteContentErrorResponse(ctx, err),
+                        error.InvalidModelIdentifier,
+                        error.ModelOutsideModelsDir,
+                        error.ModelNotFound,
+                        error.ModelNotSpecified,
+                        error.FileNotFound,
+                        error.NotDir,
+                        error.AmbiguousModelIdentifier,
+                        => return requestModelResolutionError(ctx, err),
+                        error.UnknownModelCompatibility, error.IncompatibleModel => return modelLoadFailureResponse(ctx, err),
+                        error.UnsupportedAudioFormat,
+                        error.InvalidAudioInput,
+                        error.EmptyAudioInput,
+                        error.NativeAudioGenerationNotImplemented,
+                        error.PromptTooLong,
+                        => return ctx.status(400).json(.{ .@"error" = "INVALID_AUDIO", .message = "audio input or selected model does not support this read request" }),
+                        else => if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err) else return inferenceFailureResponse(ctx, err),
+                    };
+                    defer ctx.allocator.free(result);
+                    try ctx.setHeader("content-type", "application/json");
+                    _ = ctx.response.body(result);
+                    return ctx.response.build();
+                }
                 if (httpInferenceExecutionControl(self, ctx).document_store.configured() or (self.isDocumentOperation(ctx.allocator, parsed_document.value, .read) catch |err| return documentFailureResponse(ctx, err))) {
                     const result = self.readDocumentsJsonWithControl(ctx.allocator, raw, httpInferenceExecutionControl(self, ctx)) catch |err| return documentFailureResponse(ctx, err);
                     defer ctx.allocator.free(result);
@@ -24661,8 +24845,9 @@ pub const Node = struct {
     fn documentCatalogInfo(self: *Node, a: std.mem.Allocator, definition: ?document_contract.Definition, task: []const u8) !std.json.Value {
         const limits = self.documentLimits(if (definition) |def| def.budget else .{});
         const is_read = std.mem.eql(u8, task, "read");
-        const modalities: []const []const u8 = if (is_read) &.{"image"} else &.{"text"};
-        const mime_types: []const []const u8 = if (is_read) &.{ "image/png", "image/jpeg", "image/webp" } else &.{"text/plain"};
+        const audio_read = if (definition) |def| if (def.read) |r| (try def.binding(r.reader, .read)).input == .audio else false else false;
+        const modalities: []const []const u8 = if (is_read) (if (audio_read) &.{"audio"} else &.{"image"}) else &.{"text"};
+        const mime_types: []const []const u8 = if (is_read) (if (audio_read) &.{ "audio/wav", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/flac", "audio/webm", "video/mp4", "video/quicktime", "video/webm" } else &.{ "image/png", "image/jpeg", "image/webp" }) else &.{"text/plain"};
         const encoded = try std.json.Stringify.valueAlloc(a, .{
             .capabilities = .{ "document_sources_v1", "document_evidence_v1" },
             .inputs = modalities,
@@ -24671,7 +24856,7 @@ pub const Node = struct {
                 .task = task,
                 .input_modalities = modalities,
                 .accepted_mime_types = mime_types,
-                .input_granularity = if (is_read) "page" else "item",
+                .input_granularity = if (audio_read or !is_read) "item" else "page",
                 .output = if (is_read) "read_result" else "extraction",
                 .result_cardinality = "one_per_item",
                 .prompt_policy = if (is_read) "model_default" else "structured_schema",
@@ -24690,6 +24875,7 @@ pub const Node = struct {
                 .remote_execution = if (definition) |def| def.allow_remote else false,
                 .max_parallel_calls = @as(u32, if (self.session_manager.io != null) @intCast(limits.max_parallel_calls) else 1),
                 .document_formats = .{
+                    .audio = .{ .transcription = audio_read, .timestamps = false, .diarization = false },
                     .pdf = .{ .native_text = true, .visual_rendering = true, .annotation_rendering = true },
                     .pptx = .{ .native_text = true, .visual_rendering = true, .native_pictures = true, .basic_vector_shapes = true, .solid_backgrounds = true, .group_transforms = true, .chart_rendering = true, .native_chart_types = .{ "bar", "line", "pie" }, .text_rendering = true, .theme_colors = true, .font_policy = "bundled_roboto_sfnt", .complex_script_shaping = false, .speaker_notes = true, .hidden_slide_policy = true },
                     .images = .{ .formats = .{ "image/png", "image/jpeg", "image/webp" }, .perspective_correction = true },
@@ -24697,7 +24883,12 @@ pub const Node = struct {
                 .artifact_reuse = .{ .retention = "process_local", .max_ttl_ms = @as(u32, 300000), .durable_resume = false },
             },
         }, .{});
-        return std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{});
+        var info = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{});
+        if (audio_read) {
+            const formats = info.object.getPtr("inference_capabilities").?.object.getPtr("document_formats").?;
+            inline for (.{ "pdf", "pptx", "images" }) |format| _ = formats.object.swapRemove(format);
+        }
+        return info;
     }
 
     pub fn listPredictors(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -41144,6 +41335,10 @@ fn unsupportedAudioResponse(ctx: *httpx.Context, message: []const u8) !httpx.Res
     });
 }
 
+fn audioDurationLimitResponse(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(413).json(.{ .@"error" = "AUDIO_TOO_LONG", .message = "audio exceeds the model duration limit", .retryable = false });
+}
+
 fn audioTooLargeResponse(ctx: *httpx.Context) !httpx.Response {
     return ctx.status(413).json(.{
         .@"error" = "AUDIO_TOO_LARGE",
@@ -44271,12 +44466,110 @@ test "generated constrained native request parsing preserves single and batch sc
     try std.testing.expectEqualStrings("1e-400", batch.value.requests[0].body.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
 }
 
+// Exact decoded zero is a source fact. Keep arbitrarily quiet nonzero audio
+// available to the recognizer rather than introducing an energy threshold.
+fn digitalAudioSilence(samples: []const f32) !bool {
+    if (samples.len == 0) return false;
+    var silent = true;
+    for (samples) |sample| {
+        if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
+        if (sample != 0) silent = false;
+    }
+    return silent;
+}
+
+fn audioReadIsDigitalSilence(a: std.mem.Allocator, messages: []const generation.Message, control: InferenceExecutionControl) !bool {
+    if (messages.len != 1) return false;
+    const clips = messages[0].audio_bytes orelse return false;
+    if (clips.len != 1) return false;
+    try control.check();
+    var decoded = try audio_mod.decodeBounded(a, clips[0], .{}, default_max_audio_decode_working_bytes);
+    defer decoded.deinit();
+    try control.check();
+    // Longer inputs must reach the encoder's duration validation even if silent.
+    if (decoded.sample_rate == 0 or @as(u128, decoded.samples.len) > @as(u128, decoded.sample_rate) * 30) return false;
+    return digitalAudioSilence(decoded.samples);
+}
+
+test "audio read KV policy agrees with full precision Gemma generation" {
+    const config = gpt_model_mod.Config{ .family = .gemma, .num_kv_shared_layers = 20 };
+    const ordinary = Node.DirectGeneratePreflight{};
+    const transcription = Node.DirectGeneratePreflight{ .has_audio = true, .audio_transcription = true };
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, ordinary.kvDType(config, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, transcription.kvDType(config, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, transcription.kvDType(config, .metal));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, transcription.kvDType(config, .native));
+}
+
+test "audio read digital silence preserves quiet speech and rejects invalid samples" {
+    try std.testing.expect(try digitalAudioSilence(&.{ 0, -0.0, 0 }));
+    try std.testing.expect(!try digitalAudioSilence(&.{}));
+    try std.testing.expect(!try digitalAudioSilence(&.{ 0, 1e-12, 0 }));
+    try std.testing.expectError(error.InvalidAudioSamples, digitalAudioSilence(&.{ 0, std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidAudioSamples, digitalAudioSilence(&.{std.math.inf(f32)}));
+}
+
 fn documentFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.AudioTooLong) return audioDurationLimitResponse(ctx);
     if (remoteContentRequestFailure(err)) |_| return remoteContentErrorResponse(ctx, err);
     if (isTransientInferenceCapacityError(err) or err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded or err == error.Cancelled or err == error.Canceled or err == error.OutOfMemory) return inferenceFailureResponse(ctx, err);
     const name = @errorName(err);
     const status: u16 = if (err == error.DocumentArtifactNotFound or err == error.ModelNotFound) 404 else if (err == error.DocumentArtifactExpired) 410 else if (err == error.DocumentModelRevisionMismatch) 409 else if (err == error.DocumentUnresolved) 422 else if (err == error.DocumentBudgetExhausted or err == error.Timeout) 504 else if (err == error.RemoteDocumentModelDenied) 403 else if (err == error.CloudflareRateLimited) 429 else if (std.mem.indexOf(u8, name, "Limit") != null or err == error.DocumentOutputTooLarge) 413 else if (std.mem.startsWith(u8, name, "Cloudflare") or err == error.InvalidCloudflareResponse) 502 else 400;
     return ctx.status(status).json(.{ .@"error" = name, .message = "Document operation could not satisfy its input, capability, evidence, or execution contract" });
+}
+
+test "audio read rejects mixed inputs and unsupported options before model admission" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    const requests = [_][]const u8{
+        "{\"model\":\"missing\",\"audio\":\"\"}",
+        "{\"model\":\"missing\",\"audio\":\"AAAA\",\"images\":[]}",
+        "{\"model\":\"missing\",\"audio\":\"AAAA\",\"documents\":[]}",
+        "{\"model\":\"missing\",\"audio\":\"AAAA\",\"max_tokens\":0}",
+        "{\"model\":\"missing\",\"audio\":\"AAAA\",\"max_tokens\":1025}",
+        "{\"model\":\" \",\"audio\":\"AAAA\"}",
+    };
+    for (requests) |body| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.readImages(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "INVALID_REQUEST") != null);
+    }
+}
+
+test "audio read rejects non-audio bytes before resolving a model and releases admission" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .max_concurrent_requests = 2, .max_work_units = 256 });
+    defer node.deinit();
+    const body = "{\"model\":\"missing\",\"audio\":\"data:image/png;base64,YWJj\"}";
+    try std.testing.expectError(error.UnsupportedInferenceMimeType, node.readAudioJsonWithControl(a, body, .{}));
+    try std.testing.expectError(error.InvalidInferenceMedia, node.readAudioJsonWithControl(a, "{\"model\":\"missing\",\"audio\":\"YWJj\"}", .{}));
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, node.readAudioJsonWithControl(a, body, .{ .check_fn = Cancel.check }));
+    for (0..8) |_| {
+        try std.testing.expectError(error.UnsupportedInferenceMimeType, node.readAudioJsonWithControl(a, body, .{}));
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.stats().in_flight_requests);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+    // HTTP middleware owns the only request slot; the audio leaf reserves work only.
+    node.inference_admission.max_concurrent_requests = 1;
+    try std.testing.expect(node.tryAcquireRequestSlot());
+    defer node.releaseRequestSlot();
+    for (0..8) |_| {
+        try std.testing.expectError(error.UnsupportedInferenceMimeType, node.readAudioJsonWithAdmission(a, body, .{}, .http_route));
+        try std.testing.expectEqual(@as(usize, 1), node.inference_admission.stats().in_flight_requests);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
 }
 
 test "document direct read accepts whole PDF and ordered PPTX without model admission" {
@@ -47254,4 +47547,38 @@ test "Whisper HTTP pipelines inherit narrowed output policy and preserve typed f
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 413), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "OUTPUT_TOKEN_LIMIT_EXCEEDED") != null);
+}
+
+test "audio read planner catalog advertises only audio source capabilities" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    const definition = document_contract.Definition{
+        .models = &.{.{ .name = "speech", .model = "gemma4", .operation = .read, .input = .audio }},
+        .read = .{ .reader = "speech" },
+    };
+    const info = try node.documentCatalogInfo(arena.allocator(), definition, "read");
+    const capabilities = info.object.get("inference_capabilities").?;
+    try std.testing.expectEqualStrings("audio", capabilities.object.get("input_modalities").?.array.items[0].string);
+    const formats = capabilities.object.get("document_formats").?;
+    try std.testing.expect(formats.object.get("audio").?.object.get("transcription").?.bool);
+    try std.testing.expect(!formats.object.contains("pdf") and !formats.object.contains("images"));
+}
+
+test "audio read prompt renders one audio part through both chat and fallback templates" {
+    const a = std.testing.allocator;
+    const input = Node.AudioReadInput.init("recording", "Transcribe exactly.");
+    const messages = [_]generation.Message{input.message()};
+    const plain = try generation.formatMessages(a, &messages);
+    defer a.free(plain);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plain, "<|audio|>"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plain, "Transcribe exactly."));
+    var template = try generation.ChatTemplate.init(a, "{% for message in messages %}{% for part in message.content %}{% if part.type == 'audio' %}<|audio|>{% elif part.type == 'text' %}{{ part.text }}{% endif %}{% endfor %}{% endfor %}", "", "", "", "");
+    defer template.template.deinit();
+    const rendered = try template.apply(a, &messages, false);
+    defer a.free(rendered);
+    try std.testing.expectEqualStrings("<|audio|>Transcribe exactly.", rendered);
+    try std.testing.expectEqualStrings("recording", messages[0].audio_bytes.?[0]);
 }

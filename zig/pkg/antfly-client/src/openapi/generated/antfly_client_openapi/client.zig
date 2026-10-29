@@ -902,7 +902,7 @@ pub const Client = struct {
         return ApiResponse(types.InferenceModelInstanceUnloadResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Read text from images (OCR/document understanding)
+    /// Read text from images, documents, or audio
     /// POST /ai/v1/read
     pub fn readImages(self: *@This(), body: types.InferenceReadRequest) !ApiResponse(types.InferenceReadResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read", .{self.base_url});

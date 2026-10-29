@@ -8540,12 +8540,14 @@ pub fn getMetalExactJitDispatchStats(session: Session) ?MetalExactJitDispatchSta
 pub fn recommendedKvDTypeForGptConfig(config: gpt_mod.Config, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
     return switch (backend_kind) {
         .native => .f32,
-        .cuda => if (shouldDefaultGemmaCudaKvDTypeToPolar4(config)) .polar4 else if (config.family == .gemma) .f32 else .f16,
+        // Gemma 4's compressed KV default loses speech detail and bypasses
+        // the F16 attention kernels used by the qualified decode profile.
+        .cuda => if (config.family == .gemma and !isGemma4KvArchitecture(config)) .f32 else .f16,
         .metal => if (config.family == .gemma) metalGemmaKvDTypeOverride() orelse .f16 else .f16,
     };
 }
 
-fn shouldDefaultGemmaCudaKvDTypeToPolar4(config: gpt_mod.Config) bool {
+fn isGemma4KvArchitecture(config: gpt_mod.Config) bool {
     if (config.family != .gemma) return false;
     return config.num_kv_shared_layers > 0 or
         config.global_head_dim > 0 or
@@ -8575,8 +8577,23 @@ test "recommendedKvDTypeForGptConfig keeps backend defaults without a session" {
     const llama = gpt_mod.Config{ .family = .llama };
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .native));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .cuda));
-    try std.testing.expectEqual(runtime.kv.pool.KvDType.polar4, recommendedKvDTypeForGptConfig(gemma4, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(gemma4, .cuda));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(llama, .metal));
+}
+
+test "Gemma 4 CUDA KV defaults preserve full precision across architecture variants" {
+    const configs = [_]gpt_mod.Config{
+        .{ .family = .gemma, .num_kv_shared_layers = 20 },
+        .{ .family = .gemma, .global_head_dim = 512 },
+        .{ .family = .gemma, .ple_hidden_size = 256 },
+        .{ .family = .gemma, .gemma4_mtp_assistant = true },
+        .{ .family = .gemma, .attention_k_eq_v = true },
+        .{ .family = .gemma, .rope_dim_override = 128 },
+    };
+    for (configs) |config| {
+        try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(config, .cuda));
+        try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(config, .native));
+    }
 }
 
 pub fn getClipConfig(session: Session) ?clip_mod.Config {

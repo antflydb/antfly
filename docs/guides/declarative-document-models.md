@@ -18,7 +18,7 @@ processing does not introduce another `/agents` resource.
 }
 ```
 
-Supply exactly one input form. `/read` accepts `images` or `documents`;
+Supply exactly one input form. `/read` accepts `images`, `documents`, or `audio`;
 `/extract` accepts `inputs`, `documents`, or `read_artifact`. Existing image
 requests retain their image behavior. Document results carry `source_id` and the
 one-based original page/slide `number`. `max_pages` bounds selected pages across
@@ -47,6 +47,282 @@ is left unknown while its native text remains available.
 OCR model. A composite can retain trustworthy native text and render uncertain
 pages lazily for OCR. `/ai/v1/models` advertises the document executor and format
 capabilities, including unavailable rendering features.
+
+## Audio and video transcription
+
+Read speech with an audio-capable Gemma 4 generator installed under
+`models/generators/`. The `audio` field accepts base64 or a data URI and is
+mutually exclusive with `images` and `documents`:
+
+```json
+{
+  "model": "google/gemma-4-E2B-it",
+  "audio": "data:audio/wav;base64,...",
+  "max_tokens": 1024
+}
+```
+
+MP4/MOV and WebM containers use their audio track; this mode does not caption
+video frames. The ordinary generator capability contract and audio projector
+limits apply. Oversized clips fail rather than silently dropping later speech;
+long-recording windowing is currently provided by Whisper through `/transcribe`.
+
+Each response contains one `data` entry with `origin: "transcription"`, transcript
+`text`, and `status: "complete"` or `"truncated"`. Check status before using the
+text as extraction evidence. Usage reports measured generator tokens. An optional
+`prompt` can request a language or a different transcription style. Word
+timestamps and speaker labels are not inferred from generated text.
+
+Audio also participates in the document planner. Register a reader at
+`models/readers/audio-balanced/document_agent.json`:
+
+```json
+{
+  "version": 1,
+  "models": [
+    {"name": "speech", "model": "google/gemma-4-E2B-it", "operation": "read", "input": "audio"}
+  ],
+  "read": {"reader": "speech"},
+  "budget": {"max_model_calls": 8, "max_total_tokens": 32000}
+}
+```
+
+Call `/ai/v1/read` with `model: "audio-balanced"`, the same `audio` field,
+and optionally `retain_artifact: true`. You can instead supply `documents`:
+
+```json
+{
+  "model": "audio-balanced",
+  "documents": [{
+    "id": "hearing",
+    "url": "data:audio/wav;base64,...",
+    "media_type": "audio/wav"
+  }],
+  "max_tokens": 1024,
+  "retain_artifact": true
+}
+```
+
+A recording is one bounded source unit with `kind: "audio"` and
+`coordinate_space: "none"`. It has no image geometry or inferred timestamps.
+The planner preserves source identity, model revisions, completion status,
+measured usage, events, and the same deadline/call/token/output limits as
+image and document reads. Audio/video sources reject page selection and slide
+options. Each source must match its reader's declared input modality.
+
+For conditional refinement, add another `operation: "read", input: "audio"`
+binding and reference it as `accurate_reader`. The planner uses it when the
+first transcript is incomplete. To accept changed literal text, configure a
+`verification_reader` backed by an independent audio-capable generator to corroborate the
+replacement. Existing router/fallback policies
+and nested read composites also apply. Every read binding in a plan must consume
+the same modality; image crop and table-reading stages cannot consume audio.
+
+To chain transcription into extraction, register this under
+`models/extractors/hearing-entities/document_agent.json`, replacing the extractor
+model with an installed compatible extractor:
+
+```json
+{
+  "version": 1,
+  "models": [
+    {"name": "transcript", "model": "audio-balanced", "operation": "read", "input": "audio"},
+    {"name": "entities", "model": "your-extraction-model", "operation": "extract"}
+  ],
+  "read": {"reader": "transcript"},
+  "extract": {"model": "entities", "require_source_support": true}
+}
+```
+
+Submit the audio source directly to `/ai/v1/extract`:
+
+```json
+{
+  "model": "hearing-entities",
+  "schema_version": 2,
+  "schema": {"entities": ["person", "organization"]},
+  "documents": [{
+    "id": "hearing",
+    "url": "data:audio/wav;base64,...",
+    "media_type": "audio/wav"
+  }]
+}
+```
+
+The read stage runs automatically and extraction receives the completed
+transcript with source provenance. Unresolved or truncated readings prevent
+extraction. Retained readings can also be supplied through `read_artifact`.
+Audio read and extract jobs use the existing durable `/read/jobs` and
+`/extract/jobs` endpoints and checkpoints. Word alignment, diarization, speaker
+chunking, and long-recording window planning are not implemented by this source
+adapter. EmbeddingGemma 2 can still embed the original recording separately.
+
+### Gemma 4 E4B QAT qualification
+
+The [final production-binary qualification record](../../zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-production-20261029.json)
+passes the predeclared gates on 73 clean LibriSpeech clips with the E4B QAT
+decoder, matching projector, F16 KV and the GB10 profile below. The
+[earlier independent-reference comparison](../../zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-reference-20261029.json)
+is retained to explain the original implementation failures:
+
+| Runtime | Word-error rate | Errors / reference words |
+| --- | --- | --- |
+| Native before the audio conversion fixes | 90.43% | 1,040 / 1,150 |
+| Native after audio conversion fixes, earlier Polar4 KV configuration | 11.74% | 135 / 1,150 |
+| Native final production configuration, F16 KV | 8.26% | 95 / 1,150 |
+| Earlier independent llama.cpp reference | 7.83% | 90 / 1,150 |
+
+The fixes avoid applying `softplus` twice to converted GGUF query scales, map
+convolution normalization weights to their correct roles, and enforce the strict
+conformer attention window boundary. Original HF/EmbeddingGemma 2 weight handling
+is preserved. The earlier audio-template placeholder and request-permit cleanup
+fixes are also covered by regressions.
+
+The final configuration passes the 10% aggregate WER gate. The Spanish 8 kHz
+regression has 18.18% WER, within its predeclared 20% gate. English mono, stereo,
+MP4/AAC and WebM/Opus reads are exact. Planned and direct normalized transcripts
+match for all six regression inputs, including digital silence, which returns
+an empty completed reading with zero generated words. Both routes reject a
+31-second clip with HTTP 413 and `AUDIO_TOO_LONG` rather than silently truncating.
+Transcription uses reclaiming document work memory, and CUDA and Metal KV hooks
+release their state through the allocator that created it. The final CUDA run
+completes without the earlier document-memory and heap-corruption failures;
+Metal hardware was not part of this qualification.
+
+The production 128-bin CUDA frontend passes CPU-reference parity. The complete
+audio encoder also matches an independent Hugging Face implementation using
+the same weights (final projected-feature cosine similarity above 0.9999999997).
+The remaining difference from the earlier llama.cpp transcripts includes its
+different mel-log floor convention; transcript accuracy is measured separately
+from numerical parity.
+
+Successful HTTP responses and `status: "complete"` establish execution completion,
+not transcript accuracy. The clean corpus contains only one speaker and 481 seconds
+of audio. The passing result qualifies these fixtures and this configuration;
+it does not establish robustness for noisy recordings, legal hearings,
+overlapping speakers, or long recordings.
+
+The [GB10 performance and kernel validation record](../../zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-decode-20261029.json)
+includes a sequential native/llama.cpp comparison with the same QAT GGUF, F16
+K/V, one warmup and five greedy 256-token completions per prompt. Thinking,
+draft assistants and prompt-cache reuse are disabled. Timestamped per-process
+GPU monitoring found no competing or unknown compute activity during any sample.
+
+| Prompt tokens | Native decode tokens/sec | llama.cpp decode tokens/sec | Native time to first token | llama.cpp time to first token |
+| --- | --- | --- | --- | --- |
+| 46 | 65.63 | 67.20 | 99 ms | 55 ms |
+| 49 | 65.73 | 67.87 | 97 ms | 55 ms |
+| 866 | 64.95 | 67.09 | 233 ms | 209 ms |
+
+These measurements use the opt-in [GB10 E4B profile](../../zig/pkg/inference/scripts/gemma4/gemma4_e4b_qat_gb10.env).
+BF16 prefill weight mirrors and Flash prefill attention reduce the 866-token
+prompt's first-token latency from 11.05 seconds to 0.23 seconds. The mirrors add
+7525 MiB of device residency, so this profile needs separate memory and concurrency
+sizing. Decode remains on the QAT quantized weights. F16 is now the Gemma 4 CUDA
+KV default for both text and audio; older Gemma CUDA models retain their F32
+default. Native decode is within 3.2% of the reference on these prompts. These are
+GB10 measurements, not an L4 rerun.
+
+Longer-prompt checks use five samples after one warmup, 32 completion tokens,
+F16 KV, disabled prompt caching and the same per-process GPU audit:
+
+| Prompt tokens | Native time to first token | llama.cpp time to first token |
+| --- | --- | --- |
+| 1724 | 447 ms | 390 ms |
+| 4298 | 1049 ms | 988 ms |
+
+Time to first token includes request setup, prompt processing and the first
+decoded token. The 4298-token result is within 6.2% of the reference. Across these prompts, native
+first-token latency remains 23–61 ms higher than the reference.
+
+The E4B F16 Flash-style split kernel passes 408 independent CPU-reference cases
+in eager launches and the same 408 cases with persistent CUDA graph replay,
+including changes to device sequence scalars. Worst absolute error is `7.6e-6`
+against a `5e-4` limit. Regenerated normalization kernels match the original CUDA
+bundle bit for bit across 81 shape/operation cases. An explicit trace confirms
+persistent replay with the Flash-style route active. Warmup and capture now use
+the same reserved scratch capacity. Kernel parity and throughput do not establish
+transcription accuracy; the profile remains opt-in. Prefill separately passes
+270 cases using the actual production fatbin against a GPU scalar oracle checked
+with sampled CPU rows. These cover both head sizes, three numerical patterns,
+three page layouts, query lengths through 8192 and KV contexts through 32768.
+Worst absolute error is `1.25e-4` against a `5e-3` gate; output guards, input
+immutability and repeated-launch determinism pass.
+
+To use the measured profile, source it before starting the server or benchmark:
+
+```sh
+source zig/pkg/inference/scripts/gemma4/gemma4_e4b_qat_gb10.env
+python zig/pkg/inference/scripts/gemma4/benchmark_text_decode.py \
+  --binary zig/pkg/inference/zig-out/bin/antfly-inference-http-server \
+  --models-dir models --request-json '{"cache_dtype":"f16"}' \
+  --output .benchmark-results/gemma4-decode --require-quiet-gpu
+```
+
+The profile reserves 2048 total tokens for graph replay. Size bounded requests
+and the graph capacity together when measuring longer contexts. The benchmark
+preserves rejected runs and fails if GPU contention is unknown, completion-token
+budgets differ, or repeated greedy output changes.
+
+To reproduce one paged attention graph check, run from `zig/pkg/inference`:
+
+```sh
+zig build quant-kernel-cuda-paged-attention-diff-tool -Dcuda=true -Doptimize=ReleaseFast
+ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT=1 \
+  zig-out/bin/antfly-quant-kernel-cuda-paged-attention-diff \
+  --production-oracle --warp-f16 --graph-replay --heads 8 --kv-heads 2 \
+  --head-dim 256 --sliding-window 512 --kv-len 1024 \
+  --key-format f16 --value-format f16 --json
+```
+
+Use `--head-dim 512 --sliding-window 0` for global attention. The record lists all
+context lengths and query positions tested; each checks three numerical patterns
+and four physical page layouts. The tool rejects unsupported dispatch rather than
+counting a fallback kernel as a Flash-style pass.
+
+To reproduce, install `av`, `numpy`, and `pyarrow` in a worktree-local environment.
+The evaluated generator is `google/gemma-4-E4B-it-qat-q4_0-gguf`, with matching
+`gemma-4-E4B-it-mmproj.gguf` in the same directory and a manifest declaring
+`"inputs": ["text", "image", "audio"]`. The record pins both artifact hashes and
+the corpus revision. Download its parquet into the shared conformance-fixture
+cache, verify its SHA256, and create a corpus-source JSON with the record's
+`corpus` object plus a `cache_path` pointing to that file.
+
+Build `http-server` with `-Dcuda=true -Doptimize=ReleaseFast -Dstrip=true` from
+`zig/pkg/inference`. Then, from the repository root:
+
+```sh
+python zig/pkg/inference/scripts/gemma4/qualify_transcription.py \
+  --binary zig/pkg/inference/zig-out/bin/antfly-inference-http-server \
+  --models-dir models \
+  --corpus-source corpus-source.json \
+  --output .benchmark-results/gemma4-transcription
+```
+
+The harness starts and stops its own server, explicitly preloads CUDA, verifies
+CUDA residency after each read, and preserves incremental results on failure.
+`--offset` and `--limit` support explicitly recorded corpus shards. Do not discard
+rejected inputs from coverage accounting. Two request permits allow the HTTP
+request and the planner's physical model call; raw HTTP reads with one permit
+are covered separately by the admission regression.
+
+For the independent reference, build the record's pinned upstream llama.cpp
+revision with CUDA and run:
+
+```sh
+python zig/pkg/inference/scripts/gemma4/qualify_transcription_reference.py \
+  --binary path/to/llama.cpp/build/bin/llama-server \
+  --llama-root path/to/llama.cpp \
+  --model-dir models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf \
+  --corpus-source corpus-source.json \
+  --output .benchmark-results/gemma4-reference
+```
+
+Both harnesses count tokens from final SSE usage, not event counts. Decode
+throughput is `(completion_tokens - 1) / (terminal_usage_time -
+first_visible_token_time)`; end-to-end throughput includes prompt processing.
+The [earlier contended run](../../zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-20261029.json)
+is retained as historical evidence.
 
 ## Registration and reading policy
 

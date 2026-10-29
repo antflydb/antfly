@@ -407,8 +407,9 @@ fn generatedGqaScorePreworkTiled64Eligible(
     compute_major: i32,
     compute_minor: i32,
 ) bool {
-    if (compute_major != 8 or compute_minor != 9 or
-        request.num_heads != 8 or request.num_kv_heads != 1 or
+    const sm89_e2b = compute_major == 8 and compute_minor == 9 and request.num_kv_heads == 1;
+    const gb10_e4b = compute_major == 12 and compute_minor == 1 and request.num_kv_heads == 2;
+    if ((!sm89_e2b and !gb10_e4b) or request.num_heads != 8 or
         request.format != 2 or request.value_format != 2)
     {
         return false;
@@ -1354,8 +1355,14 @@ const GqaFlashPrefillRequest = struct {
     total_sequence_len: usize,
 };
 
+fn gqaFlashPrefillTargetSupported(major: i32, minor: i32, kv_heads: usize) bool {
+    // E4B's page-16 F16 kernel is also qualified on GB10. The automatic
+    // selector still excludes E4B, so this requires an explicit Flash profile.
+    return (major == 8 and minor == 9) or (major == 12 and minor == 1 and kv_heads == 2);
+}
+
 fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEligibility {
-    if (request.compute_major != 8 or request.compute_minor != 9) {
+    if (!gqaFlashPrefillTargetSupported(request.compute_major, request.compute_minor, request.base.num_kv_heads)) {
         return .compute_capability_ineligible;
     }
     const kv_heads: usize = if (request.base.num_kv_heads == 2) 2 else 1;
@@ -4094,7 +4101,7 @@ pub const KernelModule = struct {
             .gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode,
             .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
             .gqa_attention_decode_f16_warp_stage1_f32 = gqa_attention_decode_f16_warp_stage1_f32,
-            .e4b_f16_warp_split_enabled = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false),
+            .e4b_f16_warp_split_enabled = e4bF16WarpSplitTargetSupported(ctx.info.compute_major, ctx.info.compute_minor) and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false),
             .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
             .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
             .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
@@ -21070,6 +21077,7 @@ pub fn smokeDenseF32(allocator: std.mem.Allocator) !void {
 
     try smokeLinearF32(allocator, &ctx, &module);
     try smokeRmsNormF32(allocator, &ctx, &module);
+    try smokeRmsNormE4BShape(allocator, &ctx, &module);
     try smokeRmsNormBareF32(allocator, &ctx, &module);
     try smokeElementwiseF32(allocator, &ctx, &module);
     try smokeLayerNormF32(allocator, &ctx, &module);
@@ -22474,6 +22482,69 @@ fn smokeRmsNormF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, 
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected, 0.003);
+}
+
+// Cover the E4B register-retained fast path, including multiple rows and
+// output aliasing. The oracle accumulates in f64 independently of the GPU tree.
+fn smokeRmsNormE4BShape(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const dim = 2560;
+    const rows = 3;
+    const count = rows * dim;
+    const eps: f32 = 1e-5;
+    const x = try allocator.alloc(f32, count);
+    defer allocator.free(x);
+    const w = try allocator.alloc(f32, dim);
+    defer allocator.free(w);
+    const r = try allocator.alloc(f32, count);
+    defer allocator.free(r);
+    const expected = try allocator.alloc(f32, count);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(f32, count);
+    defer allocator.free(actual);
+    for (x, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 211)) - 105)) / 31.0;
+    for (w, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 13.0;
+    for (r, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 53)) - 26)) / 17.0;
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, dim * @sizeOf(f32));
+    defer weight.free(ctx);
+    var residual = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer residual.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer output.free(ctx);
+    var scalar = try buffer_mod.DeviceBuffer.alloc(ctx, @sizeOf(f32));
+    defer scalar.free(ctx);
+    const scale = [_]f32{-0.375};
+    try weight.copyFromHost(ctx, std.mem.sliceAsBytes(w));
+    try residual.copyFromHost(ctx, std.mem.sliceAsBytes(r));
+    try scalar.copyFromHost(ctx, std.mem.sliceAsBytes(&scale));
+    for (0..3) |op| {
+        for (0..rows) |row| {
+            var sum: f64 = 0;
+            for (x[row * dim ..][0..dim]) |value| sum += @as(f64, value) * value;
+            const inv = 1.0 / @sqrt(sum / dim + eps);
+            for (0..dim) |col| {
+                const i = row * dim + col;
+                var value = @as(f64, x[i]) * inv * w[col];
+                if (op != 0) value += r[i];
+                if (op == 2) value *= scale[0];
+                expected[i] = @floatCast(value);
+            }
+        }
+        for ([_]bool{ false, true }) |in_place| {
+            try input.copyFromHost(ctx, std.mem.sliceAsBytes(x));
+            const dst = if (in_place) input else output;
+            switch (op) {
+                0 => try module.launchRmsNormF32(ctx, dst, input, weight, rows, dim, eps),
+                1 => try module.launchRmsNormAddF32(ctx, dst, input, weight, residual, rows, dim, eps),
+                2 => try module.launchRmsNormAddOutputScaleF32(ctx, dst, input, weight, residual, scalar, rows, dim, eps),
+                else => unreachable,
+            }
+            try dst.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+            try ctx.synchronize();
+            try expectApproxSlice(actual, expected, 5e-6);
+        }
+    }
 }
 
 fn smokeRmsNormBareF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -24919,7 +24990,7 @@ test "generated CUDA score prework tiled64 consumer is typed and fail closed" {
     try std.testing.expect(required.tiled64_required);
 
     // Explicit score prework can run on other architectures, but the tiled
-    // candidate remains SM89-only. Required mode carries the unsatisfied
+    // candidate remains architecture/topology scoped. Required mode carries the unsatisfied
     // requirement to launch-time so it errors instead of silently falling
     // back to serial.
     try std.testing.expectEqual(
@@ -24986,6 +25057,49 @@ test "generated CUDA score prework tiled64 consumer is typed and fail closed" {
         return error.MissingScorePreworkSelection;
     try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, global.consumer);
     try std.testing.expectEqual(@as(u16, 4096), global.score_capacity);
+}
+
+test "generated CUDA tiled64 GB10 E4B opt-in preserves topology format and paging bounds" {
+    var request = GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 256,
+        .num_heads = 8,
+        .num_kv_heads = 2,
+        .head_dim = 256,
+        .sliding_window = 512,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 1024,
+        .base_key_row_bytes = 1024,
+        .value_row_bytes = 1024,
+        .block_count = 16,
+        .page_size_tokens = 16,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 256,
+    };
+    const selected = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .required_tiled64, 12, 1) orelse return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, selected.consumer);
+    try std.testing.expect(selected.tiled64_required);
+    // The eligibility extension does not promote automatic score prework.
+    try std.testing.expect(generatedGqaScorePreworkSelectionWithConsumerFor(request, .automatic, .serial, 12, 1) == null);
+    for ([_][2]i32{ .{ 12, 0 }, .{ 8, 0 }, .{ 8, 9 } }) |cc| {
+        const other = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .tiled64, cc[0], cc[1]) orelse return error.MissingScorePreworkSelection;
+        try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.serial, other.consumer);
+    }
+    request.block_count = 15;
+    try std.testing.expectEqual(std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected, std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 12, 1)));
+    request.block_count = 16;
+    request.head_dim = 512;
+    request.sliding_window = 0;
+    request.key_row_bytes = 2048;
+    request.base_key_row_bytes = 2048;
+    request.value_row_bytes = 2048;
+    const global = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .required_tiled64, 12, 1) orelse return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, global.consumer);
+    request.value_format = 0;
+    try std.testing.expectEqual(std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected, std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 12, 1)));
 }
 
 test "generated CUDA score prework consumer telemetry is bounded by event consumer and head dim" {
@@ -25494,6 +25608,12 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
         .base = .{ .batch = 1, .q_seq_len = 2048, .kv_seq_len = 32768, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .mask_len = 0, .bias_mode = 0, .key_row_bytes = 2048, .base_key_row_bytes = 2048, .value_row_bytes = 2048, .block_count = 2048, .page_size_tokens = 16, .format = 2, .value_format = 2, .physical_token_capacity = 32768, .block_table_present = true, .decode_scalars_present = false },
     };
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_major = 12;
+    request.compute_minor = 1;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_minor = 0;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .compute_capability_ineligible);
+    request.compute_minor = 1;
     // The old one-KV-head exact/warp entry points must still reject E4B.
     try std.testing.expect(gqaF16PrefillEligibility(request.base) == .shape_ineligible);
     request.base.value_row_bytes = 1024;
@@ -25513,7 +25633,26 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
 }
 
+test "E4B Flash prefill target gate keeps GB10 qualification narrow" {
+    try std.testing.expect(gqaFlashPrefillTargetSupported(8, 9, 1));
+    try std.testing.expect(gqaFlashPrefillTargetSupported(8, 9, 2));
+    try std.testing.expect(gqaFlashPrefillTargetSupported(12, 1, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(12, 1, 1));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(12, 0, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(8, 0, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(9, 0, 2));
+}
+
+fn e4bF16WarpSplitTargetSupported(major: i32, minor: i32) bool {
+    return (major == 8 and minor == 9) or (major == 12 and minor == 1);
+}
+
 test "E4B Flash warp decode selection preserves compressed and E2B routes" {
+    try std.testing.expect(e4bF16WarpSplitTargetSupported(8, 9));
+    try std.testing.expect(e4bF16WarpSplitTargetSupported(12, 1));
+    try std.testing.expect(!e4bF16WarpSplitTargetSupported(12, 0));
+    try std.testing.expect(!e4bF16WarpSplitTargetSupported(8, 0));
+
     var module: KernelModule = undefined;
     module.e4b_f16_warp_split_enabled = true;
     module.gqa_attention_decode_f16_warp_stage1_f32 = @ptrFromInt(1);

@@ -333,7 +333,7 @@ pub const Client = struct {
         return ApiResponse(types.PredictorsResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Read text from images (OCR/document understanding)
+    /// Read text from images, documents, or audio
     /// POST /read
     pub fn readImages(self: *@This(), body: types.ReadRequest) !ApiResponse(types.ReadResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/read", .{self.base_url});

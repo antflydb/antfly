@@ -12,7 +12,7 @@ pub const DocumentSource = struct {
     /// Inline data URI or location allowed by the deployment content security policy.
     url: []const u8,
     media_type: []const u8,
-    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection.
     pages: ?[]const i64 = null,
     /// Include slide speaker notes as separate evidence, never silently as visible slide text.
     include_notes: ?bool = null,
