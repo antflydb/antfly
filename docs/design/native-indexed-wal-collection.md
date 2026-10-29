@@ -3,8 +3,8 @@
 This is the native reclamation protocol implemented for issue #1278. The
 collector uses the existing Antfly transactional page engine and immutable log.
 It is opt-in for new prefixes. Local fault/allocation, native scale and real
-standard-GCS qualification pass at the checkpoint below. Qualification after
-integrating newer main commits remains a separate artifact closure.
+standard-GCS qualification pass after integrating main `d35a1ef33e`. The final
+source and evidence boundaries are recorded below.
 
 ## Safety boundary and activation
 
@@ -85,8 +85,11 @@ closed. The reader lifetime stays 30 seconds; tests do not shorten either limit.
 ## Bounded tracing and sweep
 
 Seed the frontier with record, receipt and document roots. Read and authenticate
-each page with the same native tree decoder as serving. Persist a node's mark,
-pending children and advancement together in one transactional commit. A node
+each page with the same native tree decoder as serving. Persist up to eight
+nodes' marks, pending children, advancement and the canonical job row together
+in one transactional commit. A bounded pending-mutation overlay resolves reads
+against earlier changes in the same step and coalesces repeated keys, including
+a frontier entry inserted and consumed within that step. A node
 can contain hundreds of child references, so retain an explicit child offset
 and commit chunks of at most 60 children within the existing
 512-command ceiling. Never construct the entire reachable set in memory.
@@ -170,8 +173,11 @@ eight completed trace nodes, one partial branch continuation, or 16 inventory
 entries. Native metadata reads batch candidate marks against one captured root,
 limit each response to 64 KiB encoded JSON and each value to 16 KiB, and fail the
 whole read rather than truncate. The shared transactional API exposes optional
-encoded/value limits for other hosts too. Frontier commits checkpoint every
-eight commits. The job namespace includes namespace hash, retired epoch and ID.
+encoded/value limits for other hosts too. At most eight groups of 60 children,
+two marks and one frontier deletion, plus the job row, require 505 commands;
+the existing 512-command ceiling remains unchanged. Immutable-log checkpoints
+still occur every eight commits. The job namespace includes namespace hash,
+retired epoch and ID.
 
 Version inventories support opaque GCS cursors and S3 key/version marker tuples.
 Reachable immutable keys retain all their versions. Historical HEAD deletion
@@ -228,3 +234,39 @@ Evidence is in `examples/cloudflare-serverless/dist/qualification/native-gc-lab/
 AWS authentication remains unavailable. Mock opaque/tuple/null version tests
 are not real S3 qualification, and native GCS success does not add a GCS
 JavaScript transport. The live Cloudflare gate remains separate and unpassed.
+
+
+## Integrated qualification and batched progress
+
+Main `d35a1ef33e` is integrated through `22c815aabb`. The batched collector in
+`be56c13991` passes the repeated 50,000-record collection fixture: 1,965 marked
+pages, 6,224 obsolete WAL objects deleted, 884 first-cycle and 398 second-cycle
+steps. Every retained record, original LSN/timestamp and receipt is checked,
+along with writes after the epoch barrier. Private metadata cleanup and a
+second collection leave 1,973 and then 1,966 objects, respectively.
+
+Against the integrated per-node-commit baseline, private metadata objects
+requiring cleanup fall from 25,109 to 7,397 (70.5% fewer), and peak storage
+operations per step fall from 194 to 99 (49.0% fewer). Final object counts are
+unchanged. The deterministic clock in this fixture measures work and correctness,
+not cloud latency. A lost acknowledgment of the grouped mark transaction is
+recovered on takeover; both committed marks remain visible and takeover waits
+the complete real grace again.
+
+The final clean-source provider runs at `10eadf1f24` pass for standard GCS with
+and without versioning. They exercise the actual 60-second grace, preserve all
+512 document bodies and the original receipt, and reopen with collection off.
+Unversioned bucket `antfly-1278-multi-mvt0y08h-0c4e699e` collects 54 objects;
+versioned bucket `antfly-1278-multi-mvt0xmzx-04773d2d` collects 59. Both reports
+preserve the executed native binary, verify fresh managed data in the owned
+bucket, and confirm cleanup and bucket absence.
+
+The guarded complete native command passes with 631 primary tests, nine
+environment-dependent skips, and no failures or leaks. The separate focused
+50,000-record command passes 28 tests with two live-provider skips. Failed
+commands caused by a deleted compiler cache remain preserved as failed runs;
+they are not substituted for the successful guarded command.
+
+Evidence is under `examples/cloudflare-serverless/dist/qualification/native-gc-batch-lab/`.
+Real S3 still requires local AWS credentials. These GCS and local results do
+not qualify the live Cloudflare latency or physical cold-start gates.

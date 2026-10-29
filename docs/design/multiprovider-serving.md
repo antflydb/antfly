@@ -361,10 +361,9 @@ means; three individual real-model exact queries transfer more bytes. The
 matched previous-candidate comparisons preserve its recall, GET and byte values.
 
 The 2,057 previously sealed artifacts still match their hashes. New checkpoint
-reports and binaries remain under `dist/qualification/native-gc-lab/`. The PR
-also has two import/ownership-anchor conflicts with 22 newer main commits;
-merge that main and qualify its integrated artifacts separately before calling
-this the final deployment candidate. AWS authentication and explicit
+reports and binaries remain under `dist/qualification/native-gc-lab/`. The subsequent integration merges all 22 newer main commits, including both
+import/ownership-anchor additions; its separately qualified artifacts are
+recorded below. AWS authentication and explicit
 Cloudflare token/cleanup authorization remain external prerequisites. No live
 gate, cold-epoch or cross-cloud latency parity result is implied.
 
@@ -376,3 +375,60 @@ reverse order 561/1164 versus 448/1167. Zero-delay runs are 113/95 versus
 The write and reverse-zero regressions keep `DETACHED_METADATA_PROOFS` off;
 `NATIVE_READ_AFFINITY` and `WAL_DOCUMENT_INDEX` also remain off for the selected
 Worker profile. These short local ablations do not replace the live gate.
+
+
+## Integrated multiprovider qualification
+
+Main `d35a1ef33e` is merged through `22c815aabb`. The integrated native collector
+now commits up to eight nodes of authenticated marking/frontier progress in one
+bounded transaction, with an in-step mutation overlay and a 505-command upper
+bound. It reuses Antfly's transactional engine on every native object provider.
+The repeated 50,000-record fixture reduces private cleanup objects by 70.5%
+and peak storage operations per step by 49.0%, retaining identical final object
+counts and exact record/receipt checks. See
+[native indexed-WAL collection](native-indexed-wal-collection.md).
+
+At source `10eadf1f24`, the guarded native command passes 631 primary tests with
+nine skips and no failures/leaks, and all 334 Node tests pass. Clean-source real
+GCS runs pass both versioned and unversioned transport/runtime/collection
+contracts, verify fresh managed storage, preserve their executed binary, and
+verify bucket absence after cleanup. A fresh AWS profile check still reports
+`NoCredentials`; memory/fault fixtures and GCS success do not constitute real
+S3 qualification.
+
+The final rebuilt WASM modules are byte-identical to the separately sealed
+main-integration scale/ANN/workerd artifacts. Each file is 7,357,736 bytes:
+
+- Full, 32 MiB cap: `872f61127362cd6fdb5a90cd9ea5a892a98a29ce10efef2f7f3b91b0f8b27ed8`.
+- Compact, 16 MiB cap: `3b7b1dbae138f3f2f8b74cbd93fac6263bd88c487d4929b84894a22c3a18a1cb`.
+- Observe, 8 MiB cap: `b8571892485276fb8a9227e423ba6838ace3e2ce8062b40a7831d71560e99300`.
+
+The generated module closure records the exact artifacts. The unchanged
+module/Worker closure
+retains 31 passing actual-workerd cases, the nine-stage 50,000-document mixed
+fixture, repeated 50,000-row metadata collection, and both frozen ANN corpora
+at probes 8/32/all. ANN read peaks remain 7,208,960 and 5,963,776 linear bytes
+under the 8 MiB reader/request budget; recall and mean GET/byte comparisons
+pass. These are local contract/scale results, not total isolate RSS or cloud
+latency. Recovered platform `SQLITE_NOMEM` remains unresolved.
+
+Provider qualification requires clean committed source before creating a
+bucket and verifies the same clean HEAD afterward. Use
+`qualification/provider-contracts.mjs --provider=gcs --region=us-central1
+--versioned=true --wal-gc=true --cache-dir=ABSOLUTE_WORKTREE_CACHE --out=REPORT_DIR`
+(and repeat with versioning false). It records the compiler, executed binaries,
+source revision and fresh native data before cleanup. Do not edit source during
+a run. Compiler caches stay within the worktree; active-run markers protect
+both the selected cache and the standard-library fixture cache until child
+processes settle. Earlier cache-loss failures remain separate failed evidence.
+
+`qualification/native-host-contracts.mjs --binary=PATH --out=REPORT_DIR` exercises
+the release CLI, internal HTTP ingestion/publication/latest query, process
+restart and file-backed managed WAL policy with collection disabled on reopen.
+This smoke does not qualify a new keyed HTTP ingestion protocol or cloud SLO.
+
+Final reports are under `dist/qualification/native-gc-batch-lab/`; previous
+native and main-integration evidence remains sealed separately. Legacy-prefix
+migration, real S3 access, matched cross-cloud performance and the unchanged
+live Cloudflare gate remain separate requirements. The existing two Cloudflare
+stacks remain paused pending the explicit disposable-token/cleanup authorization.
