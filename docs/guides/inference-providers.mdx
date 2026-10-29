@@ -55,7 +55,7 @@ environment variables; see [Secrets management](/docs/secrets).
 | [Jev (TypeSafe)](/docs/guides/providers/jev) (`jev`) |  |  |  |  |  |  |  |  | ✓ |  |
 | [Linkup](/docs/guides/providers/web-search) (`linkup`) |  |  |  |  |  |  |  |  |  | ✓ |
 | [Ollama](/docs/guides/providers/ollama) (`ollama`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
-| [OpenAI](/docs/guides/providers/openai) (`openai`) | ✓ |  |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |
+| [OpenAI](/docs/guides/providers/openai) (`openai`) | ✓ |  |  | ✓ | ✓ | ✓ | ✓ |  | ✓ |  |
 | [OpenRouter](/docs/guides/providers/openrouter) (`openrouter`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
 | [Pioneer](/docs/guides/providers/pioneer) (`pioneer`) |  |  |  |  |  |  |  | ✓ |  |  |
 | [Serper](/docs/guides/providers/web-search) (`serper`) |  |  |  |  |  |  |  |  |  | ✓ |
@@ -131,7 +131,10 @@ to use tools, because text-only callbacks cannot carry tool calls and results.
 
 Pulls entities, relations, and structured records out of text. Configured under
 `extractors` and used by the `extractor` enrichment producer and graph indexes.
-A generator can also act as an extractor through a constrained output schema.
+A generator can also act as an extractor through a constrained output schema
+(`"method": "generated"`): OpenAI, Gemini, Vertex AI, Anthropic, and Bedrock
+Claude models qualify, as described on each provider page. The table lists
+only dedicated extraction providers.
 Direct endpoint: `/ai/v1/extract`.
 
 ### Decider

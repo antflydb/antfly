@@ -41,6 +41,32 @@ instance role. `region` defaults to `AWS_REGION`, then
 }
 ```
 
+## Extraction
+
+Extract entities, relations, and structured records with a generated extractor
+backed by an Anthropic Claude on Bedrock generator. Use it as an `extractor` producer on an
+enrichment, or send the `config` object with `inputs` added to `/ai/v1/extract`:
+
+```json
+{
+  "type": "extractor",
+  "config": {
+    "method": "generated",
+    "generator": {"provider": "bedrock", "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "region": "us-east-1"},
+    "probabilities": "verdict_only",
+    "schema": {
+      "entities": ["person", "company"],
+      "relations": [{"type": "works_for"}]
+    }
+  }
+}
+```
+
+Admitted model families: Anthropic Claude 3 and later model IDs and cross-region inference profiles. Output is returned through a forced Converse tool call. Other models, and task variants such as
+audio, image, search, or embedding models, are rejected when the config is
+saved. `verdict_only` is required unless the model reports token
+log-probabilities.
+
 ## Related
 
 - [Multimodal Embeddings](/docs/guides/multimodal)
