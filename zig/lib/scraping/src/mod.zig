@@ -334,6 +334,30 @@ pub const RemoteContentConfig = struct {
     }
 };
 
+/// JSON payload for the compiled storage owner. The derived facade borrows
+/// policy and connection values from this payload; only its GCS map is owned.
+/// Release that map before destroying the parsed payload.
+pub const RemoteContentSnapshotData = struct {
+    security: ContentSecurityConfig = .{},
+    gcs_connections: []const NamedGcsConnection = &.{},
+
+    pub const NamedGcsConnection = struct {
+        name: []const u8,
+        connection: GcsContentConnection,
+    };
+
+    pub fn configAlloc(self: *const @This(), alloc: Allocator) !RemoteContentConfig {
+        var config = RemoteContentConfig{ .security = self.security };
+        errdefer config.gcs_connections.deinit(alloc);
+        for (self.gcs_connections) |entry| {
+            const result = try config.gcs_connections.getOrPut(alloc, entry.name);
+            if (result.found_existing) return error.InvalidRemoteContentConfig;
+            result.value_ptr.* = entry.connection;
+        }
+        return config;
+    }
+};
+
 pub fn downloadContentAlloc(
     alloc: Allocator,
     uri: []const u8,
@@ -2479,4 +2503,25 @@ test "GCS canceled requests fail before credential discovery" {
     const buckets = [_][]u8{@constCast("bucket")};
     const connection = GcsContentConnection{ .buckets = &buckets, .credentials = .{ .source = .service_account, .credentials_path = @constCast("__missing_google_credentials__.json") } };
     try std.testing.expectError(error.Canceled, downloadGcsContentAlloc(a, .{ .io = std.testing.io, .cancellation = CancellationToken.fromAtomic(&canceled) }, "gs://bucket/doc.pdf", null, &connection));
+}
+
+test "remote content snapshot owns borrowed GCS views and rolls back allocation failures" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const raw =
+                \\{"security":{"max_download_size_bytes":1024},"gcs_connections":[{"name":"archive","connection":{"buckets":["originals"],"prefix":"objects/sha256","credentials":{"source":"bearer_token","bearer_token":"${secret:reader}"}}}]}
+            ;
+            var parsed = try std.json.parseFromSlice(RemoteContentSnapshotData, alloc, raw, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            var config = try parsed.value.configAlloc(alloc);
+            defer config.gcs_connections.deinit(alloc);
+            try std.testing.expectEqual(@as(?u64, 1024), config.security.?.max_download_size_bytes);
+            const connection = config.gcs_connections.get("archive").?;
+            try std.testing.expectEqualStrings("${secret:reader}", connection.credentials.bearer_token.?);
+            var location = try parseGcsLocationAlloc(alloc, "gs://originals/objects/sha256/doc.pdf?generation=123");
+            defer location.deinit(alloc);
+            try std.testing.expect(connection.allows(&location));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

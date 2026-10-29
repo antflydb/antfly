@@ -28,7 +28,7 @@ import (
 )
 
 func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T) {
-	for _, problem := range []string{"", "ocr_failed", "unknown_ocr", "stale_artifact", "stale_source", "missing_page", "unqualified_source"} {
+	for _, problem := range []string{"", "embedded_only", "ocr_failed", "unknown_ocr", "stale_artifact", "stale_source", "missing_page", "unqualified_source", "failed_reprocess", "in_progress", "last_error", "unknown_raw_ocr", "missing_manifest"} {
 		t.Run(problem, func(t *testing.T) {
 			state := t.TempDir()
 			hash := strings.Repeat("a", 64)
@@ -48,8 +48,10 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 				case strings.Contains(r.URL.Path, "/indexes/"):
 					fmt.Fprint(w, `{"status":{"readiness":{"complete":true,"queryable":true}},"shard_status":{"one":{"readiness":{"complete":true,"queryable":true}}}}`)
 				case strings.Contains(r.URL.Path, "/artifacts/"):
-					artifact := map[string]any{"source_url": source, "generation": 1, "unit_count": 2, "ocr_attempted_count": 2, "ocr_failed_count": 0}
+					artifact := map[string]any{"source_url": source, "generation": 1, "unit_count": 2, "ocr_attempted_count": 2, "ocr_failed_count": 0, "route_type": "pdf", "merge_status": "converged"}
 					switch problem {
+					case "embedded_only":
+						artifact["ocr_attempted_count"] = 0
 					case "ocr_failed":
 						artifact["ocr_failed_count"] = 1
 					case "unknown_ocr":
@@ -58,6 +60,30 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 						artifact["source_url"] = source + "4"
 					case "missing_page":
 						artifact["unit_count"] = 1
+					case "failed_reprocess":
+						// Failed refreshes preserve prior pages and serving indexes.
+						artifact["route_type"] = "error"
+						artifact["merge_status"] = "failed"
+						artifact["last_error_code"] = "RemoteDocumentFetchFailed"
+						artifact["ocr_attempted_count"] = 0
+					case "in_progress":
+						artifact["merge_status"] = "in_progress"
+					case "last_error":
+						artifact["last_error_code"] = "InvalidPdf"
+					}
+					manifest := map[string]any{"ocr_attempted_count": artifact["ocr_attempted_count"], "ocr_failed_count": artifact["ocr_failed_count"]}
+					if problem == "unknown_raw_ocr" {
+						// The public summary normalizes absent raw counters to zero.
+						artifact["ocr_attempted_count"] = 0
+						artifact["ocr_failed_count"] = 0
+						manifest = map[string]any{}
+					}
+					encoded, _ := json.Marshal(manifest)
+					if problem != "missing_manifest" {
+						artifact["manifest_json"] = string(encoded)
+					}
+					if r.URL.Query().Get("detail") != "raw" {
+						t.Error("qualification must request raw OCR evidence")
 					}
 					json.NewEncoder(w).Encode(artifact)
 				default:
@@ -73,11 +99,15 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 			if problem == "ocr_failed" && (q.OCRFailed != 1 || q.OCRAttempted != 2) {
 				t.Fatalf("failed OCR counts were hidden: %+v", q)
 			}
-			if problem != "" {
+			expectedAttempts := 2
+			if problem == "embedded_only" {
+				expectedAttempts = 0
+			}
+			if problem != "" && problem != "embedded_only" {
 				if err == nil || q.Complete {
 					t.Fatalf("incomplete extraction accepted: %+v", q)
 				}
-			} else if err != nil || !q.Complete || q.Pages != 2 || q.Records != 1 || q.OCRAttempted != 2 || q.PublicationSHA256 != digest {
+			} else if err != nil || !q.Complete || q.Pages != 2 || q.Records != 1 || q.OCRAttempted != expectedAttempts || q.PublicationSHA256 != digest {
 				t.Fatalf("qualification failed: %+v %v", q, err)
 			}
 		})

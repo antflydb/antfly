@@ -173,8 +173,10 @@ separate; it needs read access to the originals bucket.
 
 `wait` checks index serving milestones. `qualify` separately checks every PDF in
 the sealed publication against its native generation-pinned GCS artifact, exact
-page count and explicit OCR counters. Missing counters, stale source bindings or
-any OCR failure block qualification, even when full-text search is ready. Run it
+page count and explicit OCR counters from the raw extraction manifest. With API
+authentication enabled, `qualify` needs a table-admin key to read that raw evidence.
+Failed or unfinished extraction, missing counters, stale source bindings or any
+OCR failure block qualification, even when full-text search is ready. Run it
 before semantic/graph enrichment; a successful receipt measures extraction
 coverage, not OCR transcription accuracy, source authorization or public readiness.
 

@@ -138,7 +138,7 @@ func qualifyCorpus(client *http.Client, tableURL, state string) (extractionQuali
 		if doc["url"] != source || doc["version"] != version {
 			return q, fmt.Errorf("%s: current source differs from the sealed publication", record.ID)
 		}
-		raw, err = corpusRequest(client, "GET", tableURL+"/documents/"+url.PathEscape(record.ID)+"/artifacts/"+corpusUnits, nil)
+		raw, err = corpusRequest(client, "GET", tableURL+"/documents/"+url.PathEscape(record.ID)+"/artifacts/"+corpusUnits+"?detail=raw", nil)
 		if err != nil {
 			return q, fmt.Errorf("%s: %w", record.ID, err)
 		}
@@ -146,8 +146,10 @@ func qualifyCorpus(client *http.Client, tableURL, state string) (extractionQuali
 			Source     string `json:"source_url"`
 			Generation uint64 `json:"generation"`
 			Units      *int   `json:"unit_count"`
-			Attempted  *int   `json:"ocr_attempted_count"`
-			Failed     *int   `json:"ocr_failed_count"`
+			Route      string `json:"route_type"`
+			Merge      string `json:"merge_status"`
+			LastError  string `json:"last_error_code"`
+			Manifest   string `json:"manifest_json"`
 		}
 		if err = json.Unmarshal(raw, &artifact); err != nil {
 			return q, err
@@ -155,13 +157,25 @@ func qualifyCorpus(client *http.Client, tableURL, state string) (extractionQuali
 		if artifact.Source != source || artifact.Generation == 0 || artifact.Units == nil || *artifact.Units != int(last-first+1) {
 			return q, fmt.Errorf("%s: artifact source/generation/page inventory is incomplete or changed", record.ID)
 		}
-		if artifact.Attempted == nil || artifact.Failed == nil || *artifact.Attempted < 0 || *artifact.Failed < 0 || *artifact.Failed > *artifact.Attempted {
+		// The summary API defaults absent OCR counters to zero. Only the raw
+		// manifest can distinguish known zero coverage from missing evidence.
+		var coverage struct {
+			Attempted *int `json:"ocr_attempted_count"`
+			Failed    *int `json:"ocr_failed_count"`
+		}
+		if err = json.Unmarshal([]byte(artifact.Manifest), &coverage); err != nil {
+			return q, fmt.Errorf("%s: missing or invalid extraction manifest: %w", record.ID, err)
+		}
+		if coverage.Attempted == nil || coverage.Failed == nil || *coverage.Attempted < 0 || *coverage.Failed < 0 || *coverage.Failed > *coverage.Attempted {
 			return q, fmt.Errorf("%s: OCR coverage is unknown or invalid", record.ID)
 		}
-		q.OCRAttempted += *artifact.Attempted
-		q.OCRFailed += *artifact.Failed
-		if *artifact.Failed != 0 {
-			return q, fmt.Errorf("%s: %d OCR pages failed; index readiness does not establish extraction coverage", record.ID, *artifact.Failed)
+		q.OCRAttempted += *coverage.Attempted
+		q.OCRFailed += *coverage.Failed
+		if artifact.Route != "pdf" || artifact.Merge != "converged" || artifact.LastError != "" {
+			return q, fmt.Errorf("%s: extraction is failed, incomplete or unsupported (route=%q, merge=%q, error=%q)", record.ID, artifact.Route, artifact.Merge, artifact.LastError)
+		}
+		if *coverage.Failed != 0 {
+			return q, fmt.Errorf("%s: %d OCR pages failed; index readiness does not establish extraction coverage", record.ID, *coverage.Failed)
 		}
 		q.Records++
 		q.Pages += *artifact.Units

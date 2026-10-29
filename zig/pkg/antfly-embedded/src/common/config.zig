@@ -1812,6 +1812,29 @@ pub fn remoteContentSecurityJsonAlloc(
     return try std.json.Stringify.valueAlloc(alloc, security, .{});
 }
 
+/// Preserve scoped GCS content connections as well as destination policy
+/// across the storage-owner boundary. Secret references stay unresolved until
+/// the destination has passed connection selection and scope validation.
+pub fn remoteContentSnapshotJsonAlloc(
+    alloc: std.mem.Allocator,
+    remote_content: *const scraping.RemoteContentConfig,
+) ![]u8 {
+    var snapshot = try remote_content.acquire();
+    defer snapshot.deinit();
+    const config = snapshot.config;
+    const entries = try alloc.alloc(scraping.RemoteContentSnapshotData.NamedGcsConnection, config.gcs_connections.count());
+    defer alloc.free(entries);
+    var it = config.gcs_connections.iterator();
+    var index: usize = 0;
+    while (it.next()) |entry| : (index += 1) {
+        entries[index] = .{ .name = entry.key_ptr.*, .connection = entry.value_ptr.* };
+    }
+    return try std.json.Stringify.valueAlloc(alloc, scraping.RemoteContentSnapshotData{
+        .security = config.security orelse .{},
+        .gcs_connections = entries,
+    }, .{});
+}
+
 fn parseRemoteContentS3Credential(alloc: std.mem.Allocator, value: std.json.Value) !Config.S3CredentialConfig {
     const scraping_cfg = try std.json.parseFromValue(scraping_openapi.S3CredentialConfig, alloc, value, .{
         .allocate = .alloc_always,
