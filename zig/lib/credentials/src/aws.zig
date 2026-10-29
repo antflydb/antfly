@@ -76,6 +76,7 @@ pub const CredentialSource = union(enum) {
 /// invocation. Computing a residual timeout for every network hop prevents a
 /// credential refresh from restarting the caller's timeout budget.
 pub const RequestContext = struct {
+    execution_wait: ?httpx.socket.WriteControl = null,
     deadline_ns: ?i96 = null,
     cancellation: ?CancellationToken = null,
 
@@ -94,11 +95,21 @@ pub const RequestContext = struct {
         return .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     }
 
+    pub fn withExecutionWait(self: RequestContext, control: ?httpx.socket.WriteControl) RequestContext {
+        var result = self;
+        result.execution_wait = control;
+        return result;
+    }
+
     pub fn isBounded(self: RequestContext) bool {
-        return self.deadline_ns != null or self.cancellation != null;
+        return self.deadline_ns != null or self.cancellation != null or self.execution_wait != null;
     }
 
     pub fn check(self: RequestContext, io: std.Io) !void {
+        if (self.execution_wait) |control| control.check() catch |err| return switch (err) {
+            error.Canceled => error.Cancelled,
+            else => err,
+        };
         if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         if (self.deadline_ns) |deadline| {
             if (std.Io.Timestamp.now(io, .awake).toNanoseconds() >= deadline) return error.Timeout;
@@ -131,8 +142,13 @@ pub const RequestContext = struct {
         try self.check(io);
         const remaining_ms = try self.remainingTimeoutMs(io);
         const poll_ms: u64 = @min(remaining_ms orelse 5, 5);
-        io.sleep(.fromMilliseconds(@intCast(@max(poll_ms, 1))), .awake) catch |err| switch (err) {
-            error.Canceled => return error.Cancelled,
+        const duration = std.Io.Duration.fromMilliseconds(@intCast(@max(poll_ms, 1)));
+        (if (self.execution_wait) |control|
+            control.withWait(std.Io.sleep, .{ io, duration, std.Io.Clock.awake })
+        else
+            io.sleep(duration, .awake)) catch |err| {
+            try self.check(io);
+            return if (err == error.Canceled) error.Cancelled else err;
         };
         try self.check(io);
     }
@@ -218,13 +234,23 @@ pub const CredentialCache = struct {
     fn getWithContext(self: *CredentialCache, result_alloc: std.mem.Allocator, cache_alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, context: RequestContext) !Credentials {
         var lease = try self.getLeaseForSourceWithContext(cache_alloc, http, region, .default, context);
         defer lease.release();
-        return try lease.credentials().clone(result_alloc);
+        var result = try lease.credentials().clone(result_alloc);
+        errdefer result.deinit(result_alloc);
+        try context.check(http.io);
+        return result;
     }
 
     pub fn getForSourceWithContext(self: *CredentialCache, result_alloc: std.mem.Allocator, cache_alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource, context: RequestContext) !Credentials {
-        var lease = try self.getLeaseForSourceWithContext(cache_alloc, http, region, source, context);
+        return self.getForSourceWithContextAndIo(result_alloc, cache_alloc, http, null, region, source, context);
+    }
+
+    pub fn getForSourceWithContextAndIo(self: *CredentialCache, result_alloc: std.mem.Allocator, cache_alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8, source: CredentialSource, context: RequestContext) !Credentials {
+        var lease = try self.getLeaseForSourceWithContextAndIo(cache_alloc, http, filesystem_io, region, source, context);
         defer lease.release();
-        return try lease.credentials().clone(result_alloc);
+        var result = try lease.credentials().clone(result_alloc);
+        errdefer result.deinit(result_alloc);
+        try context.check(http.io);
+        return result;
     }
 
     /// Returns a ref-counted immutable credential snapshot. Storage clients use
@@ -290,7 +316,7 @@ pub const CredentialCache = struct {
                 if (std.mem.eql(u8, &snapshot.source_key, &source_key) and snapshot.credentials.isFresh(now)) {
                     snapshot.retain();
                     self.mutex.unlock(io);
-                    return .{ .snapshot = snapshot };
+                    return checkedLease(snapshot, context, io);
                 }
             }
 
@@ -301,7 +327,7 @@ pub const CredentialCache = struct {
                     if (std.mem.eql(u8, &snapshot.source_key, &source_key) and snapshot.credentials.isUnexpired(now)) {
                         snapshot.retain();
                         self.mutex.unlock(io);
-                        return .{ .snapshot = snapshot };
+                        return checkedLease(snapshot, context, io);
                     }
                 }
                 if (context.isBounded()) {
@@ -317,6 +343,10 @@ pub const CredentialCache = struct {
             self.mutex.unlock(io);
 
             var fresh = resolveCredentialsUncachedWithContextAndIo(alloc, http, filesystem_io, region, source, context) catch |err| {
+                context.check(io) catch |original| {
+                    self.finishFailedRefresh(io);
+                    return original;
+                };
                 const request_aborted = err == error.Timeout or err == error.Cancelled or err == error.Canceled;
                 if (request_aborted) {
                     self.finishFailedRefresh(io);
@@ -338,16 +368,23 @@ pub const CredentialCache = struct {
                 self.refreshed.broadcast(io);
                 self.mutex.unlock(io);
                 if (closing) return error.CredentialCacheClosed;
-                if (fallback) |snapshot| return .{ .snapshot = snapshot };
+                if (fallback) |snapshot| return checkedLease(snapshot, context, io);
                 return err;
             };
-            errdefer fresh.deinit(alloc);
+            var fresh_owned = true;
+            errdefer if (fresh_owned) fresh.deinit(alloc);
+            context.check(io) catch |err| {
+                fresh.deinit(alloc);
+                fresh_owned = false;
+                self.finishFailedRefresh(io);
+                return err;
+            };
             const snapshot = alloc.create(Snapshot) catch |err| {
                 self.finishFailedRefresh(io);
                 return err;
             };
             snapshot.* = .{ .alloc = alloc, .source_key = source_key, .credentials = fresh };
-            fresh = undefined;
+            fresh_owned = false;
 
             self.mutex.lockUncancelable(io);
             if (self.closing) {
@@ -364,8 +401,15 @@ pub const CredentialCache = struct {
             self.refreshed.broadcast(io);
             self.mutex.unlock(io);
             if (old) |previous| previous.release();
-            return .{ .snapshot = snapshot };
+            return checkedLease(snapshot, context, io);
         }
+    }
+
+    fn checkedLease(snapshot: *Snapshot, context: RequestContext, io: std.Io) !Lease {
+        var lease: Lease = .{ .snapshot = snapshot };
+        errdefer lease.release();
+        try context.check(io);
+        return lease;
     }
 
     fn finishFailedRefresh(self: *CredentialCache, io: std.Io) void {
@@ -433,6 +477,7 @@ fn credentialHttpRequest(
     options.timeout_ms = try context.remainingTimeoutMs(http.io);
     options.cookies_enabled = false;
     options.cancellation = context.httpCancellation();
+    options.socket_control = context.execution_wait;
     return http.request(method, url, options) catch |err| switch (err) {
         error.Timeout, error.Cancelled, error.Canceled => err,
         else => error.MissingAwsCredentials,

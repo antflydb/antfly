@@ -4010,11 +4010,48 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const serverless_execution_tests = b.addTest(.{
         .name = "serverless-execution-tests",
         .root_module = serverless_execution_root,
-        .filters = &.{ "managed embedder HTTP waits preserve independent discovery and caller budgets", "remote Antfly execution discovery single flights advertised activation and refreshes its capability lease", "model activation honors caller expiry and cancellation during the load request", "managed embedder propagates requested dimensions and pins across HTTP text and media transports", "managed embedder surfaces rate-limited openai compatible responses as retryable", "serverless sparse enricher", "model aware media serverless chunks use the shared paged provider and retain recipes", "model aware media completed namespace discovers secondary generations through bounded durable scans", "serverless graph metric runtime fanout", "serverless graph metric edge tiles", "serverless bounded graph metric", "serverless vector builder observes cancellation", "serverless execution", "serverless object enrichment writes a stable idempotent WAL identity", "serverless builder publishes and lifecycle-binds configured graph metrics", "serverless lake graph metrics share one bounded HITS execution for a compatible pair", "serverless request deadlines preserve accepted WAL", "fs wal", "fs WAL", "serverless server module compiles", "serverless server starts managed runtime and serves listener requests", "serverless main process memory budget" },
+        .filters = &.{ "google auth", "provider quotas", "credential cache shutdown waits for an in-flight refresh", "AWS credential leases survive source replacement and cache shutdown", "AWS credential files use supplied filesystem authority", "managed embedder HTTP waits preserve independent discovery and caller budgets", "remote Antfly execution discovery single flights advertised activation and refreshes its capability lease", "model activation honors caller expiry and cancellation during the load request", "managed embedder propagates requested dimensions and pins across HTTP text and media transports", "managed embedder surfaces rate-limited openai compatible responses as retryable", "serverless sparse enricher", "model aware media serverless chunks use the shared paged provider and retain recipes", "model aware media completed namespace discovers secondary generations through bounded durable scans", "serverless graph metric runtime fanout", "serverless graph metric edge tiles", "serverless bounded graph metric", "serverless vector builder observes cancellation", "serverless execution", "serverless object enrichment writes a stable idempotent WAL identity", "serverless builder publishes and lifecycle-binds configured graph metrics", "serverless lake graph metrics share one bounded HITS execution for a compatible pair", "serverless request deadlines preserve accepted WAL", "fs wal", "fs WAL", "serverless server module compiles", "serverless server starts managed runtime and serves listener requests", "serverless main process memory budget" },
         .max_rss = 8 * 1024 * 1024 * 1024,
     });
     b.step("antfly-serverless-execution-test", "Verify serverless shared scheduler policy, protected health and owning release")
         .dependOn(&b.addRunArtifact(serverless_execution_tests).step);
+
+    // Credential libraries are separate modules: consumer filters alone do
+    // not discover their allocator, refresh, and shutdown regression tests.
+    const google_refresh_root = b.createModule(.{
+        .root_source_file = b.path("lib/google/src/auth.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    google_refresh_root.addImport("antfly_credentials", antfly_imports.credentials);
+    google_refresh_root.addImport("antfly_platform", antfly_imports.platform);
+    google_refresh_root.addImport("httpx", antfly_imports.httpx);
+    const google_refresh_tests = b.addTest(.{
+        .name = "google-credential-refresh-tests",
+        .root_module = google_refresh_root,
+        .filters = &.{ "google auth", "google credential" },
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-google-credential-refresh-test", "Verify Google credential refresh ownership, cancellation and publication")
+        .dependOn(&b.addRunArtifact(google_refresh_tests).step);
+
+    const aws_refresh_root = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/aws.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    aws_refresh_root.addImport("antfly_cancellation", antfly_imports.cancellation);
+    aws_refresh_root.addImport("antfly_platform", antfly_imports.platform);
+    aws_refresh_root.addImport("httpx", antfly_imports.httpx);
+    const aws_refresh_tests = b.addTest(.{
+        .name = "aws-credential-refresh-tests",
+        .root_module = aws_refresh_root,
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-aws-credential-refresh-test", "Verify AWS credential snapshots, source authority and refresh shutdown")
+        .dependOn(&b.addRunArtifact(aws_refresh_tests).step);
 
     const wal_admission_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/wal_admission_test_root.zig"),

@@ -5934,6 +5934,7 @@ fn embedWithEntryPartsForTaskOnceHttpInvoke(
             .region = entry.region,
             .endpoint = entry.base_url,
             .request_format = entry.bedrock_request_format,
+            .credential_filesystem_io = embeddingIo(entry),
             .socket_control = entry.http_control,
             .attempt_observer = embeddingAttemptObserver(entry),
             .input_type = effectiveInputType(entry, task_type),
@@ -7241,6 +7242,7 @@ fn embedBatchWithVertex(
 ) ![]const []const f32 {
     if (texts.len == 0) return error.EmptyEmbeddingResponse;
     const auth_control = @import("antfly_google").RequestControl{
+        .execution_wait = entry.http_control,
         .deadline_ns = embeddingOperationDeadline(entry),
         .cancellation = embeddingHttpCancellation(entry),
     };
@@ -7440,6 +7442,7 @@ fn embedBatchWithBedrockRequest(
         .region = entry.region,
         .endpoint = entry.base_url,
         .request_format = entry.bedrock_request_format,
+        .credential_filesystem_io = embeddingIo(entry),
         .socket_control = entry.http_control,
         .attempt_observer = embeddingAttemptObserver(entry),
         .input_type = effectiveInputType(entry, task_type),

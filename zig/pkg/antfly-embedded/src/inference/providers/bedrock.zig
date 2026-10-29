@@ -104,6 +104,7 @@ pub const Options = struct {
     /// upstream operation and must not consume this model's quota.
     attempt_observer: ?httpx.AttemptObserver = null,
     socket_control: ?httpx.socket.WriteControl = null,
+    credential_filesystem_io: ?std.Io = null,
     credential_source: CredentialSource = .default,
     region: []const u8,
     endpoint: []const u8,
@@ -162,7 +163,7 @@ pub const Provider = struct {
 
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
-        const control = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation);
+        const control = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control);
         try control.check(self.http.io);
         const body = try converse.requestJsonAlloc(alloc, messages, .{
             .max_tokens = self.max_tokens,
@@ -207,7 +208,7 @@ pub const Provider = struct {
             // Credential refresh and the model call share one absolute
             // deadline; refreshes cannot restart the request timeout.
             const cache = self.credential_cache orelse &self.owned_credential_cache;
-            creds = try cache.getForSourceWithContext(alloc, std.heap.smp_allocator, self.http, self.options.region, self.options.credential_source, control);
+            creds = try cache.getForSourceWithContextAndIo(alloc, std.heap.smp_allocator, self.http, self.options.credential_filesystem_io, self.options.region, self.options.credential_source, control);
             const host = try endpointHostAlloc(alloc, endpoint);
             defer alloc.free(host);
             const parsed_url = try std.Uri.parse(url);
@@ -234,7 +235,7 @@ pub const Provider = struct {
     }
 
     pub fn chatStream(self: *Provider, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage, sink: inference.ChatStream, include_usage: bool) !httpx.Response {
-        const control = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation);
+        const control = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control);
         try control.check(self.http.io);
         const body = try converse.requestJsonAlloc(alloc, messages, .{
             .max_tokens = self.max_tokens,
@@ -288,7 +289,7 @@ pub const Provider = struct {
             alloc,
             model,
             texts,
-            RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation),
+            RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control),
         );
     }
 
@@ -320,7 +321,7 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        const request_context = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation);
+        const request_context = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control);
         const request_format = try resolveRequestFormat(model, self.options.request_format);
         if (request_format == .titan_multimodal) {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -349,10 +350,11 @@ pub const Provider = struct {
         const cache = self.credential_cache orelse &self.owned_credential_cache;
         // Cached snapshots outlive this invocation and may be refreshed by a
         // concurrent request. Never allocate them from the caller's arena.
-        var creds = try cache.getForSourceWithContext(
+        var creds = try cache.getForSourceWithContextAndIo(
             alloc,
             std.heap.smp_allocator,
             self.http,
+            self.options.credential_filesystem_io,
             self.options.region,
             self.options.credential_source,
             request_context,

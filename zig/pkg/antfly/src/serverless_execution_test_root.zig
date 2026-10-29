@@ -1406,3 +1406,250 @@ test "serverless execution remote model discovery waiter lends its own retained 
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }
+
+test "serverless execution model quota wait lends capacity and never releases an unowned permit" {
+    const sources = @import("antfly_local_sources");
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const App = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, _: sources.common_http_http_common.HttpRequest) !sources.common_http_http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .release);
+            return .{ .status = 200, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, "{\"data\":[{\"embedding\":[0.25,0.75]}]}") };
+        }
+        fn never(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    for ([_]bool{ false, true }) |reject| {
+        var app = App{};
+        var listener = sources.common_http_std_http_listener.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+        defer listener.deinit();
+        try listener.start();
+        const url = try listener.baseUri(alloc);
+        defer alloc.free(url);
+        const raw = try std.fmt.allocPrint(alloc, "{{\"model\":{{\"type\":\"embeddings\",\"field\":\"text\",\"dimension\":2,\"embedder\":{{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"{s}\",\"rate_limit\":{{\"max_concurrency\":1}}}}}}}}", .{url});
+        defer alloc.free(raw);
+        var managed = try sources.inference_managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, raw, .{ .io = io });
+        defer managed.deinit();
+        app.calls.store(0, .release);
+        const limiter = managed.entries[0].quota.?.limiter();
+        const observer = limiter.observer(0);
+        try observer.before(observer.ptr, .{ .io = io, .deadline_ms = null, .cancellation_ptr = &app, .is_cancelled = App.never, .body_bytes = 0, .output_tokens = 0 });
+        var held = true;
+        defer if (held) observer.after(observer.ptr, null);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = io, .retained_bytes = @import("serverless/catalog/service.zig").CatalogService.Scope.retained_bytes }, .background, 2);
+        var read: @import("api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = alloc };
+        var job: ModelHttpTest.Job = .{ .dense = managed.denseInterface(), .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .runnable = (try read.team()).borrow } };
+        var future = try io.concurrent(ModelHttpTest.Job.run, .{&job});
+        defer future.cancel(io);
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+        while (scheduler.stats().runnable_slots != 0) {
+            if (job.done.load(.acquire)) return job.failure orelse error.QuotaWaitDidNotBlock;
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.QuotaWaitKeptCpu;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        var control: Runnable.Execution = .{};
+        defer control.finish();
+        try control.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        control.finish();
+        try std.testing.expectEqual(@as(usize, 0), app.calls.load(.acquire));
+        if (reject) {
+            job.revoked.store(true, .release);
+            while (!job.done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.QuotaScopeDidNotReject;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        } else {
+            observer.after(observer.ptr, null);
+            held = false;
+            query.finish();
+        }
+        future.await(io);
+        if (reject) {
+            try std.testing.expectEqual(error.ModelTransportRevoked, job.failure.?);
+            try std.testing.expectEqual(@as(u32, 1), limiter.in_flight);
+            try std.testing.expectEqual(@as(usize, 0), app.calls.load(.acquire));
+            observer.after(observer.ptr, null);
+            held = false;
+        } else {
+            if (job.failure) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), app.calls.load(.acquire));
+        }
+        try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+        query.finish();
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "serverless execution credential refresh owners and waiters lend capacity without retaining cache locks" {
+    const google = @import("antfly_google");
+    const aws = @import("antfly_credentials").aws;
+    const sources = @import("antfly_local_sources");
+    const httpx = @import("httpx");
+    const Context = @import("antfly_inference_execution_context").RequestContext;
+    const Family = enum { google, aws };
+    const App = struct {
+        family: Family,
+        received: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, _: sources.common_http_http_common.HttpRequest) !sources.common_http_http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .release);
+            self.received.store(true, .release);
+            try self.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            const body = if (self.family == .google) "{\"access_token\":\"new-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}" else "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>AKID</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>session</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>";
+            return .{ .status = 200, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, body) };
+        }
+    };
+    const Job = struct {
+        family: Family,
+        google_source: *google.CachedTokenSource,
+        aws_cache: *aws.CredentialCache,
+        client: *httpx.Client,
+        aws_source: aws.CredentialSource,
+        context: Context,
+        revoked: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.revoked.load(.acquire)) return error.CredentialScopeRevoked;
+        }
+        fn cancelled(raw: *const anyopaque) bool {
+            check(raw) catch return true;
+            return false;
+        }
+        fn perform(self: *@This(), wait: *@import("antfly_inference_execution_context").HttpWait) !void {
+            const a = std.testing.allocator;
+            switch (self.family) {
+                .google => {
+                    const token = try self.google_source.accessTokenAllocWithControl(a, .{ .deadline_ns = self.context.deadline_ns, .execution_wait = wait.control() });
+                    defer a.free(token);
+                    try wait.ready();
+                    try std.testing.expectEqualStrings("new-token", token);
+                },
+                .aws => {
+                    var credentials = try self.aws_cache.getForSourceWithContextAndIo(a, std.heap.smp_allocator, self.client, self.context.io, "us-east-1", self.aws_source, aws.RequestContext.init(self.context.io, 5000, null).withExecutionWait(wait.control()));
+                    defer credentials.deinit(a);
+                    try wait.ready();
+                    try std.testing.expectEqualStrings("AKID", credentials.access_key_id);
+                },
+            }
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.context.cancellation = .{ .ptr = self, .check_fn = check, .is_cancelled_fn = cancelled };
+            var wait: @import("antfly_inference_execution_context").HttpWait = .{ .context = self.context };
+            self.perform(&wait) catch |err| {
+                wait.ready() catch |original| {
+                    self.failure = original;
+                    return;
+                };
+                self.failure = err;
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(Family)) |family| for ([_]bool{ false, true }) |reject| {
+        var app: App = .{ .family = family };
+        var listener = sources.common_http_std_http_listener.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+        defer listener.deinit();
+        try listener.start();
+        const url = try listener.baseUri(alloc);
+        defer alloc.free(url);
+        const cfg: google.Config = .{ .credentials = .{ .authorized_user = .{ .client_id = try alloc.dupe(u8, "client"), .client_secret = try alloc.dupe(u8, "secret"), .refresh_token = try alloc.dupe(u8, "refresh"), .token_uri = try alloc.dupe(u8, url) } }, .scope = try alloc.dupe(u8, google.default_scope) };
+        var google_source = try google.CachedTokenSource.initWithIo(alloc, cfg, io);
+        defer google_source.deinit();
+        var aws_cache = aws.CredentialCache{};
+        defer aws_cache.deinit(std.heap.smp_allocator);
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "test-web-identity" });
+        const token_path = try tmp.dir.realPathFileAlloc(io, "token", alloc);
+        defer alloc.free(token_path);
+        const aws_source: aws.CredentialSource = .{ .web_identity = .{ .role_arn = "test-role", .token_file = token_path, .sts_endpoint = url } };
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var executions: [2]Runnable.Execution = @splat(.{});
+        defer for (&executions) |*execution| execution.finish();
+        var reads: [2]@import("api/runnable_local_read.zig").Read = undefined;
+        var jobs: [2]Job = undefined;
+        var futures: [2]std.Io.Future(void) = undefined;
+        var active: usize = 0;
+        defer for (futures[0..active]) |*future| future.cancel(io);
+        defer app.release.set(io);
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+        const count: usize = if (reject) 1 else 2;
+        for (0..count) |index| {
+            try executions[index].startWithSlots(&scheduler, .{ .io = io, .retained_bytes = @import("serverless/catalog/service.zig").CatalogService.Scope.retained_bytes }, .background, if (reject) 2 else 1);
+            reads[index] = .{ .execution = &executions[index], .allocator = alloc };
+            jobs[index] = .{ .family = family, .google_source = &google_source, .aws_cache = &aws_cache, .client = &client, .aws_source = aws_source, .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .runnable = (try reads[index].team()).borrow } };
+            futures[index] = try io.concurrent(Job.run, .{&jobs[index]});
+            active += 1;
+            while (scheduler.stats().resource_blocked != index + 1 or !app.received.load(.acquire)) {
+                if (jobs[index].done.load(.acquire)) return jobs[index].failure orelse error.CredentialRefreshDidNotWait;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CredentialWaiterKeptCpu;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+        if (family == .google) {
+            try std.testing.expect(google_source.mutex.tryLock());
+            google_source.mutex.unlock();
+        } else {
+            try std.testing.expect(aws_cache.mutex.tryLock());
+            aws_cache.mutex.unlock(io);
+        }
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        var control: Runnable.Execution = .{};
+        defer control.finish();
+        try control.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        control.finish();
+        app.release.set(io);
+        if (reject) {
+            while (scheduler.stats().queued == 0) {
+                if (jobs[0].done.load(.acquire)) return jobs[0].failure orelse error.CredentialReturnDidNotQueue;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CredentialReturnDidNotQueue;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            jobs[0].revoked.store(true, .release);
+            while (!jobs[0].done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CredentialReturnDidNotReject;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        } else query.finish();
+        for (0..count) |index| {
+            futures[index].await(io);
+            if (reject) try std.testing.expectEqual(error.CredentialScopeRevoked, jobs[index].failure.?) else if (jobs[index].failure) |err| return err;
+        }
+        active = 0;
+        try std.testing.expectEqual(@as(usize, 1), app.calls.load(.acquire));
+        if (family == .google) {
+            try std.testing.expect(!google_source.refreshing);
+            if (reject) try std.testing.expect(google_source.cached_token == null);
+        } else {
+            try std.testing.expect(!aws_cache.refreshing);
+            if (reject) try std.testing.expect(aws_cache.cached == null);
+        }
+        query.finish();
+        for (&executions) |*execution| execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}

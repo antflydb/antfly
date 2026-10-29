@@ -113,7 +113,7 @@ pub const GeminiProvider = struct {
     }
 
     pub fn embedText(self: *GeminiProvider, alloc: Allocator, model: []const u8, texts: []const []const u8, options: EmbedOptions) !inference.EmbedResult {
-        const control = RequestControl.fromTimeout(options.timeout_ms, options.cancellation);
+        const control = RequestControl.fromTimeout(options.timeout_ms, options.cancellation).withExecutionWait(self.socket_control);
         try control.check();
         if (texts.len == 0) return error.EmptyResponse;
         if (options.request_format == .predict) return error.InvalidEmbedderConfig;
@@ -366,7 +366,7 @@ pub const Provider = struct {
         documents: []const []const u8,
         options: RerankOptions,
     ) ![]f32 {
-        const control = google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation);
+        const control = google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation).withExecutionWait(self.socket_control);
         try control.check();
         const Record = struct {
             id: []const u8,
@@ -438,7 +438,7 @@ pub const Provider = struct {
         texts: []const []const u8,
         options: EmbedOptions,
     ) !inference.EmbedResult {
-        const control = google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation);
+        const control = google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation).withExecutionWait(self.socket_control);
         try control.check();
         if (texts.len == 0) return error.EmptyResponse;
 
@@ -485,7 +485,7 @@ pub const Provider = struct {
         texts: []const []const u8,
         options: EmbedOptions,
     ) !inference.EmbedResult {
-        return self.embedTextRequestWithControl(alloc, model, texts, options, google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation));
+        return self.embedTextRequestWithControl(alloc, model, texts, options, google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation).withExecutionWait(self.socket_control));
     }
 
     fn embedTextRequestWithControl(
@@ -589,7 +589,7 @@ pub const Provider = struct {
     }
 
     pub fn setRequestControl(self: *Provider, timeout_ms: ?u64, cancellation: ?httpx.CancellationToken) void {
-        self.request_control = google_auth.RequestControl.fromTimeout(timeout_ms, cancellation);
+        self.request_control = google_auth.RequestControl.fromTimeout(timeout_ms, cancellation).withExecutionWait(self.socket_control);
     }
 
     pub fn setAbsoluteRequestControl(self: *Provider, control: google_auth.RequestControl) void {

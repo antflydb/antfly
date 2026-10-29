@@ -2060,6 +2060,7 @@ pub const Client = struct {
             .deadline_ms = deadline_ms,
             .cancellation_ptr = interrupt,
             .is_cancelled = attemptCancelled,
+            .execution_wait = req.socket_control,
             .body_bytes = req.bodyLen(),
             .output_tokens = hook.output_tokens,
         });
@@ -2240,6 +2241,7 @@ pub const Client = struct {
             .deadline_ms = deadline_ms,
             .cancellation_ptr = interrupt,
             .is_cancelled = attemptCancelled,
+            .execution_wait = req.socket_control,
             .body_bytes = req.bodyLen(),
             .output_tokens = hook.output_tokens,
         });

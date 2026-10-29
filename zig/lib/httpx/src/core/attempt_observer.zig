@@ -30,6 +30,7 @@ pub const AttemptObserver = struct {
 
     pub const Context = struct {
         io: std.Io,
+        execution_wait: ?@import("../net/socket.zig").WriteControl = null,
         deadline_ms: ?i64,
         cancellation_ptr: *const anyopaque,
         is_cancelled: *const fn (*const anyopaque) bool,

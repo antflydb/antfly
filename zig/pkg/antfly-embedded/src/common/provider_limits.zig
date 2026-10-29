@@ -255,7 +255,11 @@ pub const Limiter = struct {
             self.mutex.unlock();
             if (wait_ns == 0) return;
             // Keep both caller cancellation and the transport watchdog live.
-            try context.io.sleep(.fromNanoseconds(@intCast(@min(wait_ns, 5 * std.time.ns_per_ms))), .awake);
+            const duration = std.Io.Duration.fromNanoseconds(@intCast(@min(wait_ns, 5 * std.time.ns_per_ms)));
+            if (context.execution_wait) |control|
+                try control.withWait(std.Io.sleep, .{ context.io, duration, std.Io.Clock.awake })
+            else
+                try context.io.sleep(duration, .awake);
         }
     }
 

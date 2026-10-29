@@ -53,6 +53,7 @@ pub const TransportResponse = struct {
 /// One immutable budget for credential queueing, all exchanges, and the
 /// authenticated request. Never store borrowed cancellation in the cache.
 pub const RequestControl = struct {
+    execution_wait: ?httpx.socket.WriteControl = null,
     deadline_ns: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
 
@@ -63,9 +64,37 @@ pub const RequestControl = struct {
         };
     }
 
+    pub fn withExecutionWait(self: RequestControl, wait: ?httpx.socket.WriteControl) RequestControl {
+        var result = self;
+        result.execution_wait = wait;
+        return result;
+    }
+
     pub fn check(self: RequestControl) !void {
+        if (self.execution_wait) |wait| wait.check() catch |err| return switch (err) {
+            error.Canceled => error.Cancelled,
+            else => err,
+        };
         if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         if (self.deadline_ns) |deadline| if (platform.time.monotonicNs() >= deadline) return error.Timeout;
+    }
+
+    fn yieldOnce() !void {
+        platform.time.yieldNow();
+    }
+
+    fn waitForRefresh(self: RequestControl, io: ?std.Io) !void {
+        try self.check();
+        if (io) |executor| {
+            const duration = std.Io.Duration.fromMilliseconds(1);
+            if (self.execution_wait) |wait|
+                try wait.withWait(std.Io.sleep, .{ executor, duration, std.Io.Clock.awake })
+            else
+                try executor.sleep(duration, .awake);
+        } else if (self.execution_wait) |wait| {
+            try wait.withWait(yieldOnce, .{});
+        } else platform.time.yieldNow();
+        try self.check();
     }
 
     pub fn remainingTimeoutMs(self: RequestControl) !?u64 {
@@ -131,6 +160,7 @@ const HttpxTransport = struct {
             .body = body,
             .timeout_ms = try control.remainingTimeoutMs(),
             .cancellation = control.cancellation,
+            .socket_control = control.execution_wait,
         });
         defer response.deinit();
         try control.check();
@@ -298,6 +328,7 @@ pub const CachedTokenSource = struct {
     /// Filesystem authority for ADC and external-account subject-token files.
     filesystem_io: ?std.Io,
     mutex: std.atomic.Mutex = .unlocked,
+    refreshing: bool = false,
     cached_token: ?AccessToken = null,
 
     pub fn init(alloc: Allocator, cfg: Config) !CachedTokenSource {
@@ -381,46 +412,81 @@ pub const CachedTokenSource = struct {
         return self.accessTokenAllocWithControl(alloc, .{});
     }
 
-    pub fn accessTokenAllocWithControl(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
-        try control.check();
-        while (!self.mutex.tryLock()) {
-            try control.check();
-            if (self.io) |io| {
-                try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
-            } else {
-                @import("antfly_platform").time.yieldNow();
-            }
-        }
-        defer self.mutex.unlock();
-        try control.check();
-        return self.accessTokenAllocLocked(alloc, control);
+    fn lockForRequest(self: *CachedTokenSource, control: RequestControl) !void {
+        while (!self.mutex.tryLock()) try control.waitForRefresh(self.io);
     }
 
-    fn accessTokenAllocLocked(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
-        const now = nowSeconds();
-        if (self.cached_token) |token| {
-            if (token.expires_at_s > now + 30) return try alloc.dupe(u8, token.value);
-        }
+    fn lockForCleanup(self: *CachedTokenSource) void {
+        while (!self.mutex.tryLock()) platform.time.yieldNow();
+    }
 
-        var minted = self.mintTokenAlloc(self.alloc, now, control) catch |err| {
+    fn finishRefresh(self: *CachedTokenSource) void {
+        self.lockForCleanup();
+        self.refreshing = false;
+        self.mutex.unlock();
+    }
+
+    pub fn accessTokenAllocWithControl(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
+        while (true) {
             try control.check();
-            if (err == error.Cancelled) return err;
-            // A proactive refresh failure must not turn a still-valid token
-            // into an outage. Once expired, fail closed and surface the auth
-            // provider error.
+            try self.lockForRequest(control);
+            const now = nowSeconds();
             if (self.cached_token) |token| {
-                if (token.expires_at_s > nowSeconds()) return try alloc.dupe(u8, token.value);
+                if (token.expires_at_s > now + 30 or (self.refreshing and token.expires_at_s > now)) {
+                    const result = alloc.dupe(u8, token.value) catch |err| {
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    self.mutex.unlock();
+                    errdefer alloc.free(result);
+                    try control.check();
+                    return result;
+                }
+            }
+            if (self.refreshing) {
+                self.mutex.unlock();
+                try control.waitForRefresh(self.io);
+                continue;
+            }
+            self.refreshing = true;
+            self.mutex.unlock();
+            break;
+        }
+        // Refresh/signing/network work runs without the cache mutex. In
+        // particular, no CPU-return queue may retain that shared mutex.
+        defer self.finishRefresh();
+        var minted = self.mintTokenAlloc(self.alloc, nowSeconds(), control) catch |err| {
+            try control.check();
+            if (err == error.Cancelled or err == error.Canceled) return err;
+            self.lockForCleanup();
+            const fallback: ?[]u8 = if (self.cached_token) |token| blk: {
+                if (token.expires_at_s <= nowSeconds()) break :blk null;
+                break :blk alloc.dupe(u8, token.value) catch |allocation_error| {
+                    self.mutex.unlock();
+                    return allocation_error;
+                };
+            } else null;
+            self.mutex.unlock();
+            if (fallback) |result| {
+                errdefer alloc.free(result);
+                try control.check();
+                return result;
             }
             return err;
         };
-        errdefer minted.deinit(self.alloc);
+        var minted_owned = true;
+        errdefer if (minted_owned) minted.deinit(self.alloc);
         try control.check();
-
-        // Finish fallible caller allocation before transferring ownership to
-        // the cache; minted's errdefer must never free a published token.
+        // Allocate and validate the caller's copy before publishing the cache.
         const result = try alloc.dupe(u8, minted.value);
+        errdefer alloc.free(result);
+        try control.check();
+        self.lockForCleanup();
         if (self.cached_token) |*existing| existing.deinit(self.alloc);
         self.cached_token = minted;
+        minted_owned = false;
+        self.mutex.unlock();
+        try control.check();
         return result;
     }
 
@@ -1588,4 +1654,21 @@ test "google auth remaining budget includes previous exchanges" {
     const after = (try control.remainingTimeoutMs()).?;
     try std.testing.expect(after < before);
     try std.testing.expectError(error.Timeout, projectIdFromDefaultCredentialsAllocWithControl(std.testing.allocator, .{ .deadline_ns = 0 }));
+}
+
+test "google auth preserves valid proactive fallback after upstream timeout" {
+    const a = std.testing.allocator;
+    const cfg = try configFromJsonAlloc(a, "{\"type\":\"authorized_user\",\"client_id\":\"client\",\"client_secret\":\"secret\",\"refresh_token\":\"refresh\"}", default_scope);
+    const Timeout = struct {
+        fn request(_: ?*anyopaque, _: Allocator, _: HttpMethod, _: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: RequestControl) !TransportResponse {
+            return error.Timeout;
+        }
+    };
+    var source = CachedTokenSource.initWithRequestFn(a, cfg, null, Timeout.request);
+    defer source.deinit();
+    source.cached_token = .{ .value = try a.dupe(u8, "still-valid"), .expires_at_s = nowSeconds() + 10 };
+    const result = try source.accessTokenAllocWithControl(a, .{});
+    defer a.free(result);
+    try std.testing.expectEqualStrings("still-valid", result);
+    try std.testing.expect(!source.refreshing);
 }

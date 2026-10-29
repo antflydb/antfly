@@ -653,3 +653,42 @@ remaining mutation/retention/immutable-artifact provider boundaries, and serial
 graph preparation checkpoints. Original cross-engine resource gates, including
 the file-engine descriptor bound, remain open. Full GNU/full qualification is
 still waived.
+
+### Maintenance credential refresh and quota waits
+
+HTTP attempt observers now receive the request's execution-wait control.
+Provider quota admission returns CPU during capacity, pacing and cooldown waits,
+after releasing the limiter mutex. Only successful admission owns a permit;
+cancellation during a wait never releases another caller's concurrency slot.
+The controls reach normal managed model requests through their existing shared
+clients, without storing invocation callbacks in the limiter registry.
+
+Google and AWS credential HTTP exchanges and refresh waiters carry the same
+caller control and deadline. Google token refresh now runs outside the token
+cache mutex, with one refresh owner and bounded polling by waiters. Fresh tokens
+and valid fallback snapshots retain their existing cache behavior; caller
+allocation and authority checks precede publication/transfer. Rejected return
+from a credential exchange cannot publish a replacement token or silently use a
+cached fallback. AWS snapshot/caller-copy cleanup also preserves ownership when
+refresh or shutdown rejects transfer. Managed Bedrock calls pass their existing
+executor explicitly for credential files rather than creating a request-local
+filesystem executor.
+
+Evidence: `serverless-credential-quota-v5-debug.json`, the prior fresh integration
+run `serverless-credential-quota-v3-debug.json`, and their logs in the cumulative
+receipts. The real model HTTP quota fixture proves query/control progress while
+admission waits and verifies that rejection neither sends a request nor releases
+an unowned permit. Real loopback OAuth and STS fixtures cover refresh owners,
+shared waiters, mutex availability during network waits, one exchange for two
+callers, rejected CPU return, unpublished rejected credentials and root retirement.
+Dedicated Google/AWS test targets run the libraries' actual allocation,
+cancellation, source-authority and shutdown regression tests; consumer filters
+alone did not discover those separate-module tests. Fixture tokens and responses
+are deterministic; live cloud identities and services are not qualified here.
+
+The maintenance milestone remains open for credential-file physical wait
+boundaries, provider/model construction and asset loading, lease renewal and
+remaining mutation/retention/immutable-artifact provider boundaries, and serial
+graph preparation checkpoints. The original cross-engine resource gates remain
+open, including the file-engine descriptor bound. Full GNU/full qualification
+remains waived; the installed CLI was not rebuilt for this increment.
