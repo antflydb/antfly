@@ -935,6 +935,17 @@ pub fn create(b: *std.Build) ?void {
             shutil.rmtree(baseline.parent)
             output = build_at(clone)
             self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
+            # Canonical authored identities must still track a worker taking
+            # private ownership of a provider and changing its actual bytes.
+            native = measurement.own(clone.parent, "zig/native.c")
+            native.write_text(
+                native.read_text().replace("FIXTURE_VALUE;", "FIXTURE_VALUE + 1;")
+            )
+            (clone / "native.h").write_text("#define FIXTURE_VALUE 9\n")
+            output = build_at(clone)
+            self.assertRegex(output, r"compile lib fixture-native .* success")
+            output = build_at(clone)
+            self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
 
     def test_extra_owner_fixture_does_not_expand_audit(self):
         result = self.build()
