@@ -20,7 +20,7 @@ test('workerd Logpush collector ingests gzip and exercises a private Worker with
  const persist=await mkdtemp(resolve('dist','logpush-workerd-')),mf=new Miniflare(convertV4MiniflareOptions({workers,resourcePersistencePath:persist}));
  const call=(path,body,headers={})=>mf.dispatchFetch('https://local.invalid'+path,{method:'POST',headers:{Authorization:'Bearer '+token,...headers},body});
  try{
-  const compressed=await new Response(new Blob(['{"content": "tests"}']).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();assert.equal((await call('/ingest',compressed)).status,200);
+  const compressed=await new Response(new Blob(['{"content": "test"}']).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();assert.equal((await call('/ingest',compressed)).status,200);
   const exercised=await(await call('/exercise','{"count":2}')).json();assert.equal(exercised.expected.length,2);assert.ok(exercised.expected.every(v=>v.id!==v.rpc));
   const row={ScriptName:source,EventTimestampMs:Date.now(),EventType:'worker_rpc',Entrypoint:'Probe',Outcome:'ok',Logs:[{message:[JSON.stringify({event:'antfly.qualification_probe',id:exercised.expected[0].rpc,kind:'rpc',phase:'complete'})]}]};assert.equal((await call('/ingest',JSON.stringify(row))).status,200);
   const report=await(await call('/report','{}')).json();assert.equal(report.objects.length,2);assert.equal(report.qualification,false);assert.ok(!JSON.stringify(report).includes(token));

@@ -25,6 +25,7 @@ test('Logpush ingestion sanitizes and deduplicates durable batches without persi
 });
 test('Logpush gzip validation and source boundaries cannot create unscoped durable data',async()=>{
  const e=env(),compressed=await new Response(new Blob(['{\n  "content": "tests"\n}']).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();assert.equal((await collector.fetch(request('/ingest',compressed,{'Content-Encoding':'gzip'}),e)).status,200);assert.equal(e.LOGS.objects.size,0);
+ assert.equal((await collector.fetch(request('/ingest','{"content":"test"}'),e)).status,200);assert.equal(e.LOGS.objects.size,0);
  const wrong={...row(),ScriptName:'production'};assert.equal((await collector.fetch(request('/ingest',JSON.stringify(wrong)),e)).status,400);assert.equal(e.LOGS.objects.size,1);assert.equal(JSON.parse(new TextDecoder().decode([...e.LOGS.objects.values()][0].body)).rejection,'TelemetrySourceMismatch');assert.ok(!new TextDecoder().decode([...e.LOGS.objects.values()][0].body).includes('production'));
  assert.equal((await collector.fetch(new Request('https://collector.invalid/ingest',{method:'POST',body:JSON.stringify(row())}),e)).status,401);assert.equal(e.LOGS.objects.size,1);
  assert.equal((await collector.fetch(request('/ingest','{invalid'),e)).status,400);assert.equal((await collector.fetch(request('/ingest','x'.repeat(6*1024*1024+1)),e)).status,413);assert.equal(e.LOGS.objects.size,3);assert.ok([...e.LOGS.objects.keys()].every(key=>key.startsWith('probe-v1/'+capture+'/rejections/')));

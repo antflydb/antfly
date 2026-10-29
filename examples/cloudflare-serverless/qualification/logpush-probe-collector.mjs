@@ -63,7 +63,7 @@ export default {async fetch(request,env){
  try{
   if(path==='/ingest'&&request.method==='POST'){
    const bytes=await readBody(request),text=new TextDecoder('utf-8',{fatal:true}).decode(bytes),lines=text.trim().split('\n');
-   if(bytes.length<=4096){let challenge;try{challenge=JSON.parse(text);}catch{}if(challenge?.content==='tests'&&Object.keys(challenge).length===1)return Response.json({validation:true,qualification:false});}
+   if(bytes.length<=4096){let challenge;try{challenge=JSON.parse(text);}catch{}if(['test','tests'].includes(challenge?.content)&&Object.keys(challenge).length===1)return Response.json({validation:true,qualification:false});}
    if(lines.length>1000)fail('TelemetryRecordBudgetExceeded');
    const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=JSON.parse(line);}catch{fail('TelemetryJsonInvalid');}rejectionShape={json_type:row===null?'null':Array.isArray(row)?'array':typeof row,content:row?.content==='tests'?'tests':row?.content==='test'?'test':row&&Object.hasOwn(row,'content')?'other':'absent',has_script_name:typeof row?.ScriptName==='string',keys:row&&typeof row==='object'?Object.keys(row).filter(key=>['content','test','filename','ScriptName','Event','Logs'].includes(key)):[],key_count:row&&typeof row==='object'?Object.keys(row).length:0};rows.push(await sanitizeLogpushProbe(row,env.SOURCE_WORKER));}
    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');
