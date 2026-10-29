@@ -1955,14 +1955,15 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                 client.ready(bench.readiness_indexes({"definition": definition}))
                 original.rename(unavailable)
                 try:
-                    for fields, descending in (
-                        (fields, descending)
+                    for fields, order_field, descending in (
+                        (fields, order_field, descending)
                         for fields in (
                             ["id", "bucket"],
                             ["*", "-wide", "-body"],
                             ["-wide", "-body"],
                             ["id", "bucket", "_id", "_type"],
                         )
+                        for order_field in ("id", "_id")
                         for descending in (False, True)
                     ):
                         response = client.query(
@@ -1973,7 +1974,9 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                                         "field": "body",
                                     },
                                     "fields": fields,
-                                    "order_by": [{"field": "id", "desc": descending}],
+                                    "order_by": [
+                                        {"field": order_field, "desc": descending}
+                                    ],
                                     "limit": 32,
                                 }
                             }

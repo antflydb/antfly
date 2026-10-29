@@ -1518,7 +1518,12 @@ const Execution = struct {
         const projected = (try projectionColumns(self.arena, self.table, req)) orelse return null;
         var fields: std.ArrayList([]const u8) = .empty;
         try fields.appendSlice(self.arena, projected);
-        for (req.order_by) |order| try appendHydrationPath(self.arena, self.table, &fields, order.field);
+        for (req.order_by) |order| {
+            // Hit identity already supplies this sort key; loading a virtual
+            // source column would make wildcard payloads depend on ordering.
+            if (std.mem.eql(u8, order.field, "_id")) continue;
+            try appendHydrationPath(self.arena, self.table, &fields, order.field);
+        }
         const options = req.highlight orelse return fields.items;
         if (req.full_text == null and req.full_text_queries.len == 0) return fields.items;
         try self.planHighlights(req);
@@ -5921,4 +5926,15 @@ test "external lake covering and overlay source metadata preserve physical types
     };
     try Scenario.run(a, table, parsed.value);
     try std.testing.checkAllAllocationFailures(a, Scenario.run, .{ table, parsed.value });
+}
+
+test "external lake hydration projection keeps virtual identity sorting outside wildcard source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var owner: Execution = .{ .server = undefined, .source = undefined, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = "", .arena = arena.allocator(), .table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "id", .path = "id", .type = .integer },
+        .{ .name = "body", .path = "body", .type = .string },
+    } } };
+    const fields = (try owner.planHydration(.{ .fields = &.{ "*", "-body" }, .order_by = &.{.{ .field = "_id" }} })).?;
+    try std.testing.expectEqualSlices([]const u8, &.{"id"}, fields);
 }
