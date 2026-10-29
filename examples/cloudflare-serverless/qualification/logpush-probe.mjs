@@ -1,0 +1,92 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Owned diagnostic lifecycle. No raw provider logs or credentials reach disk.
+import{readFile,writeFile,mkdir,readdir,appendFile,unlink}from'node:fs/promises';import{resolve,dirname,basename}from'node:path';import{fileURLToPath}from'node:url';import{spawn,execFileSync}from'node:child_process';import{createHash,randomBytes}from'node:crypto';
+const cwd=fileURLToPath(new URL('../',import.meta.url)),cli=resolve(cwd,'node_modules/wrangler/bin/wrangler.js'),base='antfly-1278-telemetry-';
+const json=async path=>JSON.parse(await readFile(path)),save=(path,value)=>writeFile(path,JSON.stringify(value,null,2),{mode:0o600});
+async function prepare(gatePath){
+ const gate=await json(gatePath);if(!/^[a-f0-9]{32}$/.test(gate.account??''))throw Error('TelemetryAccountInvalid');
+ if(execFileSync('git',['status','--porcelain'],{cwd,encoding:'utf8'}).trim())throw Error('TelemetryCleanSourceRequired');
+ const sourceRevision=execFileSync('git',['rev-parse','HEAD'],{cwd,encoding:'utf8'}).trim();
+ const tag=Date.now().toString(36)+randomBytes(2).toString('hex'),id=base+tag,dir=resolve(cwd,'dist/qualification/logpush-probe-'+tag);await mkdir(dir,{recursive:true});
+ const run={schema:1,qualification:false,source_revision:sourceRevision,id,account:gate.account,dir,source:id+'-source',collector:id+'-collector',bucket:id,capture_id:crypto.randomUUID(),token_file:resolve(dir,'api-token'),observability_token_file:resolve(cwd,'dist/qualification/gate-mvslyh876561/observability-token'),created_at:Date.now(),deployed:false,token_installed:false,deleted:false};
+ await writeFile(run.token_file,randomBytes(32).toString('hex'),{mode:0o600});
+ const common={account_id:run.account,compatibility_date:'2026-10-23'};
+ await save(resolve(dir,'source.json'),{...common,name:run.source,main:resolve(cwd,'qualification/logpush-probe-source.mjs'),workers_dev:false,logpush:true,observability:{enabled:true,head_sampling_rate:1},durable_objects:{bindings:[{name:'PROBES',class_name:'Probe'}]},migrations:[{tag:'v1',new_sqlite_classes:['Probe']}]});
+ await save(resolve(dir,'collector.json'),{...common,name:run.collector,main:resolve(cwd,'qualification/logpush-probe-collector.mjs'),workers_dev:true,logpush:false,observability:{enabled:false},r2_buckets:[{binding:'LOGS',bucket_name:run.bucket}],services:[{binding:'FIXTURE',service:run.source}],vars:{SOURCE_WORKER:run.source,CAPTURE_ID:run.capture_id}});
+ const proposal={name:id,dataset:'workers_trace_events',enabled:false,filter:JSON.stringify({where:{key:'ScriptName',operator:'eq',value:run.source}}),output_options:{field_names:['Event','EventTimestampMs','EventType','Exceptions','Logs','Outcome','ScriptName','ScriptVersion','Entrypoint','CPUTimeMs','WallTimeMs'],sample_rate:1,timestamp_format:'rfc3339'},max_upload_bytes:5000000,max_upload_records:1000};
+ await save(resolve(dir,'job-proposal.json'),proposal);await save(resolve(dir,'run.json'),run);console.log(JSON.stringify({manifest:resolve(dir,'run.json'),source:run.source,collector:run.collector,bucket:run.bucket,qualification:false}));
+}
+async function openRun(path){
+ const run=await json(path),tag=run.id?.slice(base.length);
+ if(run.origin){let origin;try{origin=new URL(run.origin);}catch{throw Error('TelemetryOriginMismatch');}if(origin.protocol!=='https:'||!origin.hostname.startsWith(run.collector+'.')||!origin.hostname.endsWith('.workers.dev')||origin.username||origin.password||origin.port||origin.pathname!=='/'||origin.search||origin.hash)throw Error('TelemetryOriginMismatch');}
+
+ if(run.job_id!=null&&(!Number.isSafeInteger(run.job_id)||run.job_id<1))throw Error('TelemetryJobIdentityInvalid');
+ if(run.schema!==1||!/^[a-z0-9]+$/.test(tag??'')||run.id!==base+tag||run.source!==run.id+'-source'||run.collector!==run.id+'-collector'||run.bucket!==run.id||!/^[a-f0-9]{32}$/.test(run.account??'')||resolve(path)!==resolve(run.dir,'run.json')||basename(run.dir)!=='logpush-probe-'+tag||resolve(run.token_file)!==resolve(run.dir,'api-token')||!run.dir.startsWith(resolve(cwd,'dist/qualification')+'/'))throw Error('TelemetryScopeMismatch');
+ for(const role of ['source','collector']){const c=await json(resolve(run.dir,role+'.json'));if(c.name!==run[role]||c.account_id!==run.account)throw Error('TelemetryConfigScopeMismatch');if(role==='collector'&&(c.r2_buckets?.length!==1||c.r2_buckets[0].bucket_name!==run.bucket||(c.vars?.RETIRE_MODE==='true'?c.services?.length!==0:c.services?.length!==1||c.services[0].service!==run.source)||c.logpush!==false))throw Error('TelemetryConfigScopeMismatch');}
+ return run;
+}
+async function command(run,args,input,{allowExists=false,allowMissing=false}={}){
+ let token='';try{token=(await readFile(run.token_file,'utf8')).trim();}catch{}
+ const result=await new Promise((ok,bad)=>{const child=spawn(process.execPath,[cli,...args],{cwd,env:{...process.env,WRANGLER_SEND_METRICS:'false',WRANGLER_LOG:'info'},stdio:['pipe','pipe','pipe']});let output='';child.stdout.on('data',p=>output+=p);child.stderr.on('data',p=>output+=p);child.on('error',bad);child.on('close',code=>ok({code,output}));child.stdin.end(input);});
+ let safe=result.output;if(token)safe=safe.replaceAll(token,'[REDACTED]');safe=safe.replace(/Bearer [A-Za-z0-9._-]+/g,'Bearer [REDACTED]');await appendFile(resolve(run.dir,'lifecycle.log'),safe);
+ if(result.code!==0&&!(allowExists&&/already exists/i.test(safe))&&!(allowMissing&&/does not exist|not found|could not find/i.test(safe)))throw Error('TelemetryLifecycleCommandFailed');return safe;
+}
+async function api(run,path,method='GET',body){
+ const token=(await readFile(run.observability_token_file,'utf8')).trim();if(!/^[A-Za-z0-9_-]{20,256}$/.test(token))throw Error('TelemetryAccountCredentialInvalid');
+ const response=await fetch('https://api.cloudflare.com/client/v4/accounts/'+run.account+'/'+path,{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(30000)});
+ const value=await response.json();if(!response.ok||value.success!==true){await save(resolve(run.dir,'api-failure-'+Date.now()+'.json'),{path,method,status:response.status,error_codes:(value.errors??[]).map(e=>e.code).filter(Number.isSafeInteger)});throw Object.assign(Error('TelemetryApiStatus'+response.status),{status:response.status});}return value.result;
+}
+async function verify(run){
+ if(!run.bundle_hashes)throw Error('TelemetrySealRequired');
+ for(const role of ['source','collector']){const config=await json(resolve(run.dir,role+'.json')),dir=resolve(run.dir,'bundle-'+role);if(dirname(config.main)!==dir||!run.bundle_hashes[role]?.[basename(config.main)])throw Error('TelemetryBundleSelectionChanged');for(const [name,sha]of Object.entries(run.bundle_hashes[role]))if(basename(name)!==name||createHash('sha256').update(await readFile(resolve(dir,name))).digest('hex')!==sha)throw Error('TelemetryBundleChanged');}
+}
+async function collector(run,path,body={}){
+ const token=(await readFile(run.token_file,'utf8')).trim(),response=await fetch(new URL(path,run.origin),{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(60000)});const value=await response.json();if(!response.ok)throw Error('TelemetryCollectorStatus'+response.status);return value;
+}
+async function main(){
+ const[action,path]=process.argv.slice(2);if(action==='prepare')return prepare(path);if(!['seal','deploy','install-token','create-job','exercise','read','cleanup'].includes(action))throw Error('TelemetryActionInvalid');
+ const run=await openRun(path);if(run.deleted){if(action==='cleanup')return;throw Error('TelemetryAlreadyDeleted');}const config=role=>resolve(run.dir,role+'.json');
+ if(action==='seal'){
+  run.bundle_hashes={};for(const role of ['source','collector']){const out=resolve(run.dir,'bundle-'+role);await mkdir(out);await command(run,['deploy','--dry-run','--config',config(role),'--outdir',out]);const hashes={};for(const name of await readdir(out))if(name.endsWith('.js'))hashes[name]=createHash('sha256').update(await readFile(resolve(out,name))).digest('hex');if(Object.keys(hashes).length!==1)throw Error('TelemetryBundleAmbiguous');run.bundle_hashes[role]=hashes;const c=await json(config(role));c.main=resolve(out,Object.keys(hashes)[0]);await save(config(role),c);}await save(path,run);return;
+ }
+ await verify(run);
+ if(action==='deploy'){
+  await command(run,['r2','bucket','create',run.bucket,'--config',config('collector')],undefined,{allowExists:true});run.versions={};for(const role of ['source','collector']){const output=await command(run,['deploy','--no-bundle','--config',config(role)]);const version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('TelemetryVersionMissing');run.versions[role]=version;if(role==='collector'){run.origin=/https:\/\/[^\s]+\.workers\.dev/.exec(output)?.[0];if(!run.origin||!new URL(run.origin).hostname.startsWith(run.collector+'.'))throw Error('TelemetryOriginMismatch');}await save(path,run);}run.deployed=true;await save(path,run);return;
+ }
+ if(action==='install-token'){
+  if(!run.deployed)throw Error('TelemetryDeployRequired');const token=(await readFile(run.token_file,'utf8')).trim();if(!/^[a-f0-9]{64}$/.test(token))throw Error('TelemetryDisposableTokenInvalid');await command(run,['secret','put','API_TOKEN','--config',config('collector')],token);let ready=false;for(let n=0;n<120;n++){try{const response=await fetch(new URL('/report',run.origin),{method:'POST',headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(10000)});if(response.ok&&(await response.json()).capture_id===run.capture_id){ready=true;break;}}catch{}await new Promise(r=>setTimeout(r,500));}if(!ready)throw Error('TelemetryTokenDidNotConverge');run.token_installed=true;await save(path,run);return;
+ }
+ if(action==='create-job'){
+  if(!run.token_installed||run.job_id)throw Error('TelemetryJobPrecondition');const proposal=await json(resolve(run.dir,'job-proposal.json'));
+  if(proposal.dataset!=='workers_trace_events'||proposal.output_options?.sample_rate!==1||proposal.filter!==JSON.stringify({where:{key:'ScriptName',operator:'eq',value:run.source}}))throw Error('TelemetryJobScopeMismatch');
+  const url=new URL('/ingest',run.origin);url.search='header_Authorization='+encodeURIComponent('Bearer '+(await readFile(run.token_file,'utf8')).trim());const result=await api(run,'logpush/jobs','POST',{...proposal,enabled:true,destination_conf:url.toString()});if(!Number.isSafeInteger(result.id))throw Error('TelemetryJobIdentityMissing');run.job_id=result.id;run.job_enabled=true;await save(path,run);console.log(JSON.stringify({job_id:run.job_id,qualification:false}));return;
+ }
+ if(action==='exercise'){const value=await collector(run,'/exercise',{count:8});await save(resolve(run.dir,'exercise-'+Date.now()+'.json'),value);console.log(JSON.stringify({calls:value.expected.length,qualification:false}));return;}
+ if(action==='read'){const value=await collector(run,'/report');await save(resolve(run.dir,'capture-'+Date.now()+'.json'),value);const rows=value.objects.flatMap(o=>o.value.rows??[]);console.log(JSON.stringify({objects:value.objects.length,records:rows.length,event_types:rows.reduce((o,r)=>(o[r.event_type]=(o[r.event_type]??0)+1,o),{}),qualification:false}));return;}
+ if(action==='cleanup'){
+  run.cleanup_steps??={};const step=async(name,fn)=>{if(run.cleanup_steps[name])return;await fn();run.cleanup_steps[name]=true;await save(path,run);};
+  if(run.job_id)await step('delete-job',async()=>{let job;try{job=await api(run,'logpush/jobs/'+run.job_id);}catch(error){if(error.status===404)return;throw error;}let filter;try{filter=typeof job.filter==='string'?JSON.parse(job.filter):job.filter;}catch{}if(job.name!==run.id||job.dataset!=='workers_trace_events'||filter?.where?.key!=='ScriptName'||filter.where.operator!=='eq'||filter.where.value!==run.source||Object.keys(filter).length!==1||Object.keys(filter.where).length!==3)throw Error('TelemetryCleanupJobScopeMismatch');try{await api(run,'logpush/jobs/'+run.job_id,'DELETE');}catch(error){if(error.status!==404)throw error;}});
+  await step('delete-source',()=>command(run,['delete','--force','--config',config('source')],undefined,{allowMissing:true}));
+  await step('retire-collector',async()=>{const c=await json(config('collector'));c.vars.RETIRE_MODE='true';c.services=[];await save(config('collector'),c);await command(run,['deploy','--no-bundle','--config',config('collector')]);});
+  await step('quiescence',()=>new Promise(r=>setTimeout(r,31000)));
+  await step('drain',async()=>{for(let n=0;n<1000;n++)if((await collector(run,'/drain')).done)return;throw Error('TelemetryDrainBudgetExceeded');});
+  await step('delete-bucket',()=>command(run,['r2','bucket','delete',run.bucket,'--config',config('collector')],undefined,{allowMissing:true}));
+  await step('delete-collector',()=>command(run,['delete','--force','--config',config('collector')],undefined,{allowMissing:true}));
+  await unlink(run.token_file).catch(error=>{if(error.code!=='ENOENT')throw error;});run.deleted=true;await save(path,run);return;
+ }
+}
+await main();

@@ -95,7 +95,7 @@ populations: control sample interval 1.025974025974026, candidate
 explicit unsampled-zero proof; the builder Worker populations are unsampled.
 Waiting longer does not turn those app populations into complete evidence.
 
-The current credential receives HTTP 403/code 10000 listing Logpush jobs.
+At the previous checkpoint, the credential received HTTP 403/code 10000 listing Logpush jobs.
 The attempted dataset-discovery URL returns 404, which is not an entitlement
 finding. Inspecting/configuring an export needs an account credential with the
 appropriate Logs permissions or details of an existing unsampled export.
@@ -191,3 +191,35 @@ Current evidence is under
 `examples/cloudflare-serverless/dist/qualification/runtime-recovery-1793292255/`.
 All earlier sealed reports remain unchanged. The hour-long and cold cloud
 populations have not been run on this runtime; the PR remains draft.
+
+
+## Permission update and isolated Logpush delivery probe
+
+The user updated the existing observability token. Rechecking the same private
+file now returns HTTP 200 for both the documented Workers Trace Events fields
+and Logpush jobs. All eight required fields are available and the account has
+no existing export jobs. The previous permission blocker is resolved; previous
+403 evidence remains unchanged. Delivery, identities and completeness are not
+yet qualified.
+
+The new diagnostic uses a private source Worker with a real Durable Object
+RPC and a separate authenticated collector Worker with an owned R2 bucket.
+Only the source is included in the exact Logpush filter; the collector disables
+its own export to prevent recursion. The source emits unique fixture identities
+and a late `waitUntil` marker. The collector handles gzip destination validation,
+bounds compressed/decompressed bytes and record counts, discards arbitrary
+headers, URLs and error text, and persists sanitized immutable batches with
+conditional creation. Unknown platform event types remain unknown and cannot
+silently qualify. This is a diagnostic fixture, not application evidence.
+
+A newly generated disposable collector token protects ingestion and local
+inspection. It is distinct from the existing Cloudflare account credential;
+that account token is used only for the Cloudflare API. The lifecycle seals
+bundles from clean committed source, verifies exact Worker/bucket/job scope,
+and retires ingestion before draining and deleting its test resources. Local
+Node tests cover redaction, duplicates, gzip, scope, byte limits, resource
+signals and retirement. Actual workerd exercises private service binding, DO
+RPC and gzip ingestion. The next live step is to validate the platform's actual
+terminal record/identity schema and delivery settlement, then decide whether
+it satisfies the original completeness requirements. No sampled estimate or
+application marker alone is a replacement for independent platform evidence.
