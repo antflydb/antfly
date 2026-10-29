@@ -1503,6 +1503,8 @@ pub const IndexManager = struct {
     retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
+    graph_read_owners_mutex: std.atomic.Mutex = .unlocked,
+    retired_graph_read_owners: ?*GraphReadOwner = null,
     /// The DB-owned lazy metric runtime is notified only after a graph metric
     /// configuration is installed. The callback must not take catalog_mutex.
     graph_metric_notify: ?GraphMetricNotify = null,
@@ -3040,7 +3042,72 @@ pub const IndexManager = struct {
 
     pub const SparseCompactionResult = sparse_mod.SparseIndex.SegmentCompactionResult;
 
+    /// Retained statement roots keep their physical stores alive across catalog
+    /// relocation/removal. Retirement never waits for readers under apply locks.
+    pub const GraphReadOwner = struct {
+        manager: *IndexManager,
+        name: []u8,
+        path: []u8,
+        next: ?*GraphReadOwner = null,
+        references: std.atomic.Value(usize) = .init(1),
+        retired: ?GraphIndex = null,
+        abandon: bool = false,
+
+        pub fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) != 1) return;
+            const manager = self.manager;
+            if (self.retired) |*entry| manager.deinitGraphIndexEntry(entry, self.abandon);
+            // Keep the namespace fenced through physical close, including its
+            // deferred flushes. Cleanup/recreation can proceed only afterward.
+            manager.lockAtomicWithBackoff(&manager.graph_read_owners_mutex);
+            var link = &manager.retired_graph_read_owners;
+            while (link.*) |owner| {
+                if (owner == self) {
+                    link.* = owner.next;
+                    break;
+                }
+                link = &owner.next;
+            }
+            manager.graph_read_owners_mutex.unlock();
+            manager.alloc.free(self.path);
+            manager.alloc.free(self.name);
+            manager.alloc.destroy(self);
+        }
+    };
+
+    pub fn retainGraphReadOwner(self: *IndexManager, name: []const u8) !*GraphReadOwner {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        for (self.graph_indexes.items) |*entry| if (std.mem.eql(u8, entry.config.name, name)) {
+            if (entry.read_owner == null) {
+                const owner = try self.alloc.create(GraphReadOwner);
+                errdefer self.alloc.destroy(owner);
+                const owned_name = try self.alloc.dupe(u8, name);
+                errdefer self.alloc.free(owned_name);
+                owner.* = .{ .manager = self, .name = owned_name, .path = try self.alloc.dupe(u8, entry.rebuild_root_path) };
+                entry.read_owner = owner;
+            }
+            const owner = entry.read_owner.?;
+            _ = owner.references.fetchAdd(1, .monotonic);
+            return owner;
+        };
+        return error.IndexNotFound;
+    }
+
+    fn graphRootRetained(self: *const IndexManager, path: []const u8) bool {
+        const manager = @constCast(self);
+        manager.lockAtomicWithBackoff(&manager.graph_read_owners_mutex);
+        defer manager.graph_read_owners_mutex.unlock();
+        var owner = manager.retired_graph_read_owners;
+        while (owner) |retained| : (owner = retained.next) {
+            if (std.mem.eql(u8, retained.path, path) or
+                (retained.path.len > path.len and std.mem.startsWith(u8, retained.path, path) and retained.path[path.len] == '/')) return true;
+        }
+        return false;
+    }
+
     pub const GraphIndex = struct {
+        read_owner: ?*GraphReadOwner = null,
         /// Volatile source refresh frontier for enrichment adjacency. Protected
         /// by apply_mutex; never certifies consumer completion or replay retention.
         /// A recreated/reopened generation starts from its durable checkpoint.
@@ -7070,6 +7137,17 @@ pub const IndexManager = struct {
     }
 
     fn deinitGraphIndexEntry(self: *IndexManager, entry: *GraphIndex, abandon_after_crash: bool) void {
+        if (entry.read_owner) |owner| {
+            entry.read_owner = null;
+            self.lockAtomicWithBackoff(&self.graph_read_owners_mutex);
+            owner.retired = entry.*;
+            owner.abandon = abandon_after_crash;
+            owner.next = self.retired_graph_read_owners;
+            self.retired_graph_read_owners = owner;
+            self.graph_read_owners_mutex.unlock();
+            owner.release();
+            return;
+        }
         entry.clearNeighborRefresh();
         if (abandon_after_crash) {
             entry.index.abandonAfterCrash();
@@ -14482,6 +14560,16 @@ pub const IndexManager = struct {
             self.catalog_mutex.unlockExclusive();
             return error.IndexGenerationStillActive;
         }
+        self.lockAtomicWithBackoff(&self.graph_read_owners_mutex);
+        var owner = self.retired_graph_read_owners;
+        while (owner) |retained| : (owner = retained.next) {
+            if (std.mem.eql(u8, retained.name, name)) {
+                self.graph_read_owners_mutex.unlock();
+                self.catalog_mutex.unlockExclusive();
+                return error.IndexGenerationStillActive;
+            }
+        }
+        self.graph_read_owners_mutex.unlock();
         if (active_path) |path| self.invalidateIndexPathCaches(path);
         self.invalidateIndexPathCaches(canonical_path);
         self.catalog_mutex.unlockExclusive();
@@ -15120,7 +15208,7 @@ pub const IndexManager = struct {
             if (active_roots.contains(name)) continue;
             const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, name });
             defer self.alloc.free(path);
-            if (self.repairShadowInProgress(path)) continue;
+            if (self.graphRootRetained(path) or self.repairShadowInProgress(path)) continue;
             // The inventory above is only a scan optimization. A cooperating
             // manager may publish this root and durably clear its construction
             // marker after that scan. Re-read canonical publication authority
@@ -21862,6 +21950,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteIndexDirUsingIoIfPresentFallible(self: *const IndexManager, path: []const u8) !void {
+        if (self.graphRootRetained(path)) return error.IndexGenerationStillActive;
         if (self.generation_storage) |storage| return storage.deleteTree(path);
         if (is_hostless) return;
         if (self.io) |io| {
@@ -21931,6 +22020,7 @@ pub const IndexManager = struct {
     }
 
     fn pruneGenerationCanonicalRoot(self: *const IndexManager, path: []const u8) !void {
+        if (self.graphRootRetained(path)) return;
         const storage = self.generation_storage orelse return pruneCanonicalIndexRootAfterPointerInstall(path);
         const files = try storage.listFileNamesAlloc(self.alloc, path);
         defer lsm_backend_mod.Storage.freeFileNames(self.alloc, files);

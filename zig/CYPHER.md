@@ -4299,3 +4299,101 @@ case measures 35.5 ms. Computed 400-key equality now succeeds with 400 anchors a
 15,606 states, rather than exceeding the default state ceiling. These timings
 are local diagnostic measurements; the scan/work ceilings are regression-tested
 independently of wall-clock latency.
+
+### Computed property domains and statement-local storage roots
+
+Property equality, pattern-map equality and finite property membership now use
+bounded, deterministic scalar access hints over existing input bindings. They
+share the document-key hint evaluator and preserve the full Cypher predicate as
+an authoritative residual. Allocation-free constant folding remains separate.
+Candidate-dependent expressions, entity reads, volatile calls and failed scalar
+evaluation fall back to ordinary execution. Query work, memory, depth and
+cancellation limits still apply to hint construction.
+
+Finite key/property domains also recognize graph-free list comprehensions,
+`coalesce`, and `reverse`. Collection eligibility is depth/work/cardinality
+bounded before materialization; comprehensions prove their predicate and
+projection with the iteration variable shadowing any outer binding. Computed
+key domains enter the existing deduplicated, paged `get_many` access path.
+Membership and null/error semantics remain those of the ordinary evaluator.
+
+Selected, non-resumable graph reads retain immutable primary, scalar-index and
+outgoing/reverse graph roots under the distributed statement capture cohort.
+They release the cohort before row execution and fork the captured roots for
+independent page readers. These reads do not sync, seal, publish or reopen a
+physical query generation. Search/procedures, mutations, serializable SQL range
+tracking and explicitly durable consumers retain the physical generation path.
+Both implementations share graph catalog guards, deadlines, population bounds,
+authorization and typed RPC dispatch.
+
+Pinned relational readers bind captured scalar-index definitions and row-policy
+phase/generation/epoch to authenticated typed sessions. Document scans reuse the
+native projection/filtering path over the retained transaction, and document
+point reads project stored byte spans before constructing requested properties.
+TTL uses the statement cohort's wall time. SQL child cursors retain their parent
+owner independently, so closing the graph handle cannot invalidate SQL rows.
+
+Graph store ownership has a separate reference-counted lifetime. Catalog removal
+moves physical cleanup to the last reader instead of waiting under apply/catalog
+locks. Captured roots survive catalog-array relocation; live identity guards
+reject drop/recreation before further reads. This prevents a DDL/read lock cycle
+while preserving immutable adjacency and writer progress.
+
+Indexed typed-session range bounds resolve against the same captured scalar
+catalog as their row reader. A live drop/replacement cannot substitute a later
+column type or make an already captured index disappear during deferred cursor
+construction.
+
+Retired graph namespaces remain fenced through the backend's final close,
+including deferred flushes. Index cleanup yields while a retained reader still
+owns that namespace; same-name admission stays behind the existing durable
+cleanup tombstone. Canonical pruning and orphan shadow-root collection also
+respect retained graph roots. This prevents an old backend from flushing into
+a deleted or recreated namespace, while index removal itself does not wait for
+query readers under apply/catalog locks.
+
+Authenticated adjacency pages validate the principal lease before and after
+reading the captured graph roots. Producer and endpoint visibility still pass
+through the ordinary per-entity policy projection. SQL transaction overlays can
+normalize supplied postimages and derive their field edges using guarded schema
+metadata without reading live documents or adjacency. Failed durable-cut setup
+closes the reader before reclaiming its physical generation.
+
+Qualification for computed domains and statement-local roots: all 496 optimized
+core Cypher tests pass. Four native fixtures pass with no leaks across all 58
+build steps, exercising durable and pinned cuts, staged postimage projection,
+captured visibility, child SQL cursor lifetime, scalar catalog replacement and
+graph namespace retirement/recreation. The storage compilation ownership audit
+passes all 30 tests. The Go SDK suite, 547 TypeScript SDK tests (one skip), 304
+Antfarm tests and 15 CI contract tests pass after merging origin/main; the
+Antfarm production bundle was rebuilt from the merged source.
+
+The optimized production CLI passes all 71 build steps. The public campaign
+passes 18 cases on its first run; the broad property/SQL-overlay case passes
+after making index readiness an explicit fixture precondition before the
+64,000-row ordered-read workload. Fast statement capture does not drain index
+construction jobs. Readiness probes alone tolerate bounded coherent-read
+admission contention; ordinary query assertions still fail immediately.
+
+The remaining owner-loss case passed its isolated rerun and four additional
+fault injections. Its first campaign run timed out with a durable
+`committed_repair_required` receipt instead of reaching `committed`. That
+intermittent result remains unexplained; neither the recovery assertion nor its
+deadline was relaxed, and the successful reruns do not establish that the
+intermittent failure is fixed. All 20 distinct public cases have passed against
+the final binary across these runs, including authenticated replicated queries,
+graph mutations/recovery, SQL overlays, managed search and operator ceilings.
+
+Local API-key measurements use a standalone server, a relational table with
+2,000 rows and an `id` scalar index, three warmups and seven timed requests per
+case. Responses are checked against exact sums and explicit anchor/work ceilings.
+Before this change a document-key point query measured 15.041 ms median; with
+statement-local roots the final binary measured 0.984 ms with the same one anchor
+and 30 states. Computed two-key property equality measured 1.123 ms, two anchors
+and 102 states; computed two-key document membership measured 1.096 ms, two
+anchors and 150 states. Computed 400-key property equality, pattern maps and document membership
+used exactly 400 anchors and respectively 19,206, 17,606 and 26,816 states, within
+the 50,000-state regression ceiling. Their medians were respectively 18.579,
+18.435 and 10.769 ms. Timings are local diagnostic observations,
+not latency guarantees; the public regression tests enforce deterministic
+results, work/anchor ceilings and bounded memory independently.

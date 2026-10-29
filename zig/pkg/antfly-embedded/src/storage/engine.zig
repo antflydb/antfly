@@ -81,6 +81,8 @@ pub const VTable = struct {
     acquireCypherReadAuthority: *const fn (self: *DB, alloc: Allocator, proof: []const u8, database: []const u8) Outcome(DB.CypherReadLease),
     permitsCypherDocument: *const fn (self: *DB, alloc: Allocator, document: std.json.Value, json_null_fields: []const []const u8, proof: []const u8, database: []const u8) Outcome(bool),
     cypherFieldDerivedEdgeType: *const fn (self: *const DB, index_name: []const u8, edge_type: []const u8) Outcome(bool),
+    getCypherPinnedDocument: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, types.LookupOptions) Outcome(?types.LookupResult),
+    captureCypherSelectedSnapshot: *const fn (*DB, Allocator, *const DB.StatementReadFence, []const []const u8, u64, types.CancellationToken) Outcome(DB.CypherPinnedSnapshot),
     captureCypherPinnedSnapshot: *const fn (*DB, Allocator, *const DB.StatementReadFence, @import("cypher").catalog.Graph, []const u8) Outcome(DB.CypherPinnedSnapshot),
     scanCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(types.ScanResult),
     graphEdgesForCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, []const []const u8, graph_mod.EdgeDirection, ?graph_mod.CypherEdgeScanCursor, graph_mod.EdgePageLimits) Outcome(graph_mod.CypherEdgePage),

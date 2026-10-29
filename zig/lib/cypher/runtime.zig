@@ -11039,7 +11039,7 @@ const Engine = struct {
             if (node.alias) |alias| {
                 var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
                 if (operation.predicate) |predicate| try self.predicateFilters(predicate, alias, input.row, &filters);
-                for (node.properties) |property| if (self.constant(property.value, input.row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+                for (node.properties) |property| if (try self.seekValue(property.value, input.row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
                 for (filters.items) |filter| if (filter.op == .eq) {
                     const lookup_plan = &self.lookups[index];
                     const table = self.graph.label(node.labels[0]).?.table;
@@ -11129,6 +11129,68 @@ const Engine = struct {
             else => return err,
         };
     }
+    /// Finite access domains share the scalar evaluator's residual/error
+    /// contract. Prove a small graph-free producer before allocating its cells.
+    fn seekCollection(self: *Engine, expression: *const ast.Expr, row: Row) anyerror!?v.Value {
+        if (self.constant(expression, row)) |value| return value;
+        if (!self.read_only) return null;
+        var remaining: usize = 4096;
+        const eligible = try self.collectionHint(expression, row, &remaining, 0);
+        try Engine.chargeWork(self, (4096 - remaining) / 64);
+        if (!eligible) return null;
+        return self.eval(expression, row, null) catch |err| switch (err) {
+            error.CypherTypeMismatch, error.CypherNumericOverflow, error.CypherDivisionByZero, error.CypherInvalidSubstring, error.CypherInvalidRange => null,
+            else => return err,
+        };
+    }
+    fn collectionHint(self: *Engine, expression: *const ast.Expr, row: Row, remaining: *usize, depth: usize) anyerror!bool {
+        if (remaining.* == 0 or depth >= @min(64, self.limits.recursion_depth) or expression.execution_range_binding) return false;
+        remaining.* -= 1;
+        if (expression.execution_list_source) |id| {
+            const source = self.producer_sources.items[id];
+            return self.collectionHint(source.expression, source.row, remaining, depth + 1);
+        }
+        return switch (expression.value) {
+            .literal => |item| item == .null,
+            .variable, .parameter => blk: {
+                const value = (if (expression.value == .variable) lookup(row, expression.value.variable) else self.parameterValue(expression.value.parameter)) orelse break :blk false;
+                if (value == .null) break :blk true;
+                if (value != .list or value.list.len > 4096) break :blk false;
+                break :blk self.seekData(value, remaining, depth + 1);
+            },
+            .list => |items| blk: {
+                if (items.len > 4096) break :blk false;
+                for (items) |item| if (!self.seekExpression(item, row, remaining, depth + 1)) break :blk false;
+                break :blk true;
+            },
+            .comprehension => |item| blk: {
+                if (!try self.collectionHint(item.input, row, remaining, depth + 1)) break :blk false;
+                // Shadow outer bindings while proving row-local projections.
+                // The source proof excludes entities, including in nested data.
+                const scoped = try self.a.alloc(v.Entry, row.len + 1);
+                scoped[0] = .{ .name = item.alias, .value = .null };
+                @memcpy(scoped[1..], row);
+                if (item.predicate) |predicate| if (!self.seekExpression(predicate, scoped, remaining, depth + 1)) break :blk false;
+                if (item.projection) |projection| if (!self.seekExpression(projection, scoped, remaining, depth + 1)) break :blk false;
+                break :blk true;
+            },
+            .call => |item| blk: {
+                const signature = @import("functions.zig").lookup(item.name) orelse break :blk false;
+                if (!signature.repeatable or item.star or item.distinct or item.execution_list or item.args.len < signature.minimum or item.args.len > signature.maximum) break :blk false;
+                if (std.ascii.eqlIgnoreCase(item.name, "range")) {
+                    const start = self.constant(item.args[0], row) orelse break :blk false;
+                    const end = self.constant(item.args[1], row) orelse break :blk false;
+                    const step = if (item.args.len == 3) self.constant(item.args[2], row) orelse break :blk false else v.Value{ .integer = 1 };
+                    const range = @import("range.zig").Range.init(start, end, step) catch break :blk false;
+                    break :blk if (range) |value| value.length <= 4096 else true;
+                }
+                if (!std.ascii.eqlIgnoreCase(item.name, "coalesce") and !std.ascii.eqlIgnoreCase(item.name, "reverse")) break :blk false;
+                for (item.args) |arg| if (!try self.collectionHint(arg, row, remaining, depth + 1)) break :blk false;
+                break :blk true;
+            },
+            else => false,
+        };
+    }
     fn seekExpression(self: *Engine, expression: *const ast.Expr, row: Row, remaining: *usize, depth: usize) bool {
         if (expression.execution_range_binding or expression.execution_list_source != null or remaining.* == 0 or depth >= @min(64, self.limits.recursion_depth)) return false;
         remaining.* -= 1;
@@ -11147,7 +11209,7 @@ const Engine = struct {
             } else false,
             .unary => |item| self.seekExpression(item.operand, row, remaining, depth + 1),
             .binary => |item| switch (item.op) {
-                .add, .subtract, .multiply, .divide, .modulo, .power, .@"and", .@"or", .xor => self.seekExpression(item.left, row, remaining, depth + 1) and self.seekExpression(item.right, row, remaining, depth + 1),
+                .add, .subtract, .multiply, .divide, .modulo, .power, .@"and", .@"or", .xor, .eq, .neq, .lt, .lte, .gt, .gte, .starts_with, .ends_with, .contains => self.seekExpression(item.left, row, remaining, depth + 1) and self.seekExpression(item.right, row, remaining, depth + 1),
                 else => false,
             },
             .call => |item| call: {
@@ -11325,12 +11387,7 @@ const Engine = struct {
             if (op == .in and index != 0) continue;
             const property = operands[index];
             if (property.value != .property or property.value.property.base.value != .variable or !std.mem.eql(u8, property.value.property.base.value.variable, alias)) continue;
-            var value = self.constant(operands[1 - index], row);
-            if (op == .in and operands[1 - index].value == .list) {
-                var items: std.ArrayList(v.Value) = .empty;
-                for (operands[1 - index].value.list) |item| try items.append(self.a, self.constant(item, row) orelse return);
-                value = .{ .list = items.items };
-            }
+            const value = if (op == .in) try self.seekCollection(operands[1 - index], row) else try self.seekValue(operands[1 - index], row);
             if (value) |operand| try filters.append(self.a, .{
                 .property = property.value.property.name,
                 .value = if (op == .in) try self.filterMembership(operands[1 - index], operand) else operand,
@@ -11595,7 +11652,7 @@ const Engine = struct {
     fn nodeFilters(self: *Engine, first: ast.Node, predicate: ?*const ast.Expr, row: Row) ![]const backend_mod.PropertyFilter {
         var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
         try self.labelFilters(first, &filters);
-        for (first.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+        for (first.properties) |property| if (try self.seekValue(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
         if (predicate) |expression| if (first.alias) |alias| try self.predicateFilters(expression, alias, row, &filters);
         return filters.items;
     }
@@ -11780,7 +11837,7 @@ const Engine = struct {
                 return scan_where(self.backend.ptr, self.a, table, order.filters, cursor, bounded_demand);
             var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
             try self.labelFilters(first, &filters);
-            for (first.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+            for (first.properties) |property| if (try self.seekValue(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
             if (predicate) |expression| if (first.alias) |alias| try self.predicateFilters(expression, alias, row, &filters);
             if (filters.items.len != 0) {
                 const page = try scan_where(self.backend.ptr, self.a, table, filters.items, cursor, bounded_demand);
@@ -11876,7 +11933,7 @@ const Engine = struct {
             finite = true;
             return true;
         }
-        const source = self.constant(pair.right, row) orelse return false;
+        const source = try self.seekCollection(pair.right, row) orelse return false;
         switch (source) {
             .list => {
                 try Engine.chargeWork(self, source.list.len);
@@ -11893,7 +11950,7 @@ const Engine = struct {
         if (try self.anchorKeys(predicate, node.alias, row) != null) return 100_000;
         var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
         try self.labelFilters(node, &filters);
-        for (node.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+        for (node.properties) |property| if (try self.seekValue(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
         if (predicate) |expression| if (node.alias) |alias| try self.predicateFilters(expression, alias, row, &filters);
         return (if (self.backend.vtable.scan_where != null) @as(usize, 100) * @min(filters.items.len, 999) else 0) + @intFromBool(node.labels.len > 0);
     }
@@ -13702,7 +13759,7 @@ const Engine = struct {
         if (try self.anchorKeys(predicate, node.alias, row) != null) return 100_000;
         var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
         try self.labelFilters(node, &filters);
-        for (node.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+        for (node.properties) |property| if (try self.seekValue(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
         if (predicate) |expression| if (node.alias) |alias| try self.predicateFilters(expression, alias, row, &filters);
         var seeks: usize = 0;
         for (filters.items) |filter| if (filter.op == .eq or filter.op == .in) {
@@ -14180,7 +14237,7 @@ const Engine = struct {
             if (self.backend.vtable.expand_between) |between| if (target.alias) |alias| if (lookup(row, alias)) |bound| {
                 if (bound != .node) return .{ .items = &.{} };
                 var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
-                for (edge.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+                for (edge.properties) |property| if (try self.seekValue(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
                 const page = try between(self.backend.ptr, self.a, mapping, identity, bound.node.identity, edge.direction, filters.items, cursor, demand, self.limits.explored_edges -| self.stats.explored_edges);
                 try self.accountEdges(page);
                 return page;

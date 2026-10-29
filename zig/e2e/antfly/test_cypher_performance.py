@@ -45,7 +45,9 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
     def with_graph_work_budget(*args, **kwargs):
         path = write_config(*args, **kwargs)
         config = json.loads(path.read_text())
-        config["graph_execution"] = {"max_intermediate_states": 1000000}
+        config.setdefault("resources", {}).setdefault("query", {}).setdefault(
+            "request_limits", {}
+        )["graph"] = {"max_intermediate_states": 1000000}
         path.write_text(json.dumps(config))
         return path
 
@@ -70,13 +72,18 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 )
                 if not (
                     wait_for_index
-                    and response.status_code == 429
-                    and response.json().get("code") == "CypherAnchorBudgetExceeded"
+                    and (
+                        response.status_code == 429
+                        and response.json().get("code") == "CypherAnchorBudgetExceeded"
+                        or response.status_code == 503
+                        and response.json().get("code") == "Backpressured"
+                    )
                     and time.monotonic() < deadline
                 ):
                     break
-                # SQL index publication precedes asynchronous owner backfill.
-                # Retry only this read until its strict budget proves READY use.
+                # Publication precedes asynchronous backfill, whose metadata
+                # commit can also hold coherent-read admission briefly. Retry
+                # only readiness probes until their strict budget proves READY.
                 time.sleep(0.1)
             assert response.status_code in (200, 201, 202), (
                 response.status_code,
@@ -114,11 +121,38 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             "antfly.documentKey(n)='n'+toString(i)",
             "antfly.documentKey(n) IN ['n'+toString(i)]",
             "antfly.documentKey(n)='n'+toString(coalesce(i,0))",
+            "n.id='n'+toString(i)",
+            "n.id IN [k IN [i] | 'n'+toString(k)]",
         ):
             computed = call(
                 f"/graphs/{graph}/query",
                 {
                     "query": f"UNWIND range(0,399) AS i MATCH(n:D) WHERE {key_predicate} RETURN sum(n.score)",
+                    "limits": {"scanned_anchors": 400, "intermediate_states": 50000},
+                },
+            )
+            assert computed["rows"] == [[{"type": "integer", "value": "79800"}]], (
+                computed
+            )
+            assert computed["stats"]["scanned_anchors"] <= 400, computed
+        computed = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "UNWIND range(0,399) AS i MATCH(n:D {id:'n'+toString(i)}) RETURN sum(n.score)",
+                "limits": {"scanned_anchors": 400, "intermediate_states": 50000},
+            },
+        )
+        assert computed["rows"] == [[{"type": "integer", "value": "79800"}]], computed
+        assert computed["stats"]["scanned_anchors"] <= 400, computed
+        for collection in (
+            "[i IN range(0,399) | 'n'+toString(i)]",
+            "coalesce([i IN range(0,399) | 'n'+toString(i)], [])",
+            "reverse([i IN range(0,399) | 'n'+toString(i)])",
+        ):
+            computed = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": f"MATCH(n:D) WHERE antfly.documentKey(n) IN {collection} RETURN sum(n.score)",
                     "limits": {"scanned_anchors": 400, "intermediate_states": 50000},
                 },
             )
@@ -822,6 +856,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         for query in (
             "MATCH (n:P) RETURN count(*)",
+            "MATCH (n:P) WHERE antfly.documentKey(n) IN [i IN range(0,199) | 'n'+toString(i)] RETURN count(n.body)",
             f"CALL antfly.search('{payload_table}',{{query:'body:needle',mode:'text',limit:200}}) YIELD score RETURN count(*)",
         ):
             pruned = call(
@@ -944,6 +979,23 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 "statement": f"CREATE INDEX {ordered_table}_partition ON {ordered_table}(score,id)"
             },
         )
+        # This fixture tests ordered pulls, not large asynchronous backfills.
+        # Establish READY on the empty table before bulk writes maintain both
+        # indexes; fast statement cuts deliberately do not drain build jobs.
+        ready_until = time.monotonic() + 60
+        while True:
+            response = session.get(
+                server.api_url.rstrip("/") + f"/tables/{ordered_table}/indexes",
+                timeout=45,
+            )
+            assert response.status_code == 200, response.text
+            indexes = response.json()
+            states = [index["status"]["relational_index"]["state"] for index in indexes]
+            assert "failed" not in states, indexes
+            if len(states) == 2 and all(state == "ready" for state in states):
+                break
+            assert time.monotonic() < ready_until, indexes
+            time.sleep(0.1)
         for start in range(0, 64000, 4000):
             call(
                 f"/tables/{ordered_table}/batch",

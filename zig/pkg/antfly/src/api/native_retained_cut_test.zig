@@ -354,239 +354,328 @@ test "external lake single-range remote text continuation executes its already b
 }
 
 test "external lake Cypher execution reads immutable native document and graph cuts" {
-    const a = std.testing.allocator;
-    const cypher = @import("cypher");
-    const DB = local.storage_db_db.DB;
-    var directory = try local.common_test_directory.TestDirectory.init("cypher-native-cut");
-    defer directory.cleanup();
-    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{directory.path()});
-    defer a.free(pins);
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
-    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
-    defer db.close();
-    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 41 });
-    try db.batch(.{
-        .writes = &.{ .{ .key = "a", .value = "{\"id\":\"a\",\"title\":\"Alpha\"}" }, .{ .key = "b", .value = "{\"id\":\"b\",\"title\":\"Beta\"}" } },
-        .graph_writes = &.{ .{ .index_name = "links", .source = "a", .target = "b", .edge_type = "cites", .edge_id = "first", .weight = 1 }, .{ .index_name = "links", .source = "a", .target = "b", .edge_type = "cites", .edge_id = "second", .weight = 2 } },
-        .sync_level = .full_index,
-    });
-    const id: [64]u8 = @splat('c');
-    const Cut = @typeInfo(@FieldType(local.storage_db_types.SearchRequest, "native_query_cut")).optional.child;
-    const cut: Cut = .{ .id = &id, .table_id = 7, .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .create = true };
-    var snapshot = try db.openQueryCut(cut, .none);
-    defer snapshot.close();
-    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"id\":\"b\",\"title\":\"Changed\"}" }}, .sync_level = .full_index });
-    const Authority = struct {
-        pub fn bind(_: *anyopaque, _: cypher.catalog.Graph) !void {}
-        pub fn checkpoint(_: *anyopaque) !void {}
-        pub fn projectRelationship(_: *anyopaque, _: std.mem.Allocator, relationship: *const cypher.value.Relationship) !?*const cypher.value.Relationship {
-            return relationship;
-        }
-        pub fn project(_: *anyopaque, _: std.mem.Allocator, node: *const cypher.value.Node) !?*const cypher.value.Node {
-            return node;
-        }
-    };
-    var owner: u8 = 0;
-    const authority: DB.CypherBackend.Authority = .{ .ptr = &owner, .bind = Authority.bind, .checkpoint = Authority.checkpoint, .project = Authority.project, .project_relationship = Authority.projectRelationship };
-    const catalog_identity = (try @import("../system_catalog/graph_bindings.zig").indexIdentity(a, "{\"links\":{\"type\":\"graph\",\"_index_incarnation\":41}}", "links")).?;
-    const native_identity = (try snapshot.cypherGraphIndexIdentity(a, "links")).?;
-    try std.testing.expectEqual(catalog_identity.incarnation, native_identity.incarnation);
-    try std.testing.expectEqual(catalog_identity.config_hash, native_identity.config_hash);
-    const graph: cypher.catalog.Graph = .{ .name = "knowledge", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Document", .table = "docs", .table_id = 7 }}, .relationships = &.{.{ .name = "CITES", .index = "links", .source_label = "Document", .target_label = "Document", .stored_type = "cites", .identity = catalog_identity }} };
-    var request = try cypher.request.Request.parse(a, "{\"query\":\"MATCH (a:Document {id:'a'})-[r:CITES]->(b) RETURN b.title, r.weight ORDER BY r.weight\"}", .{});
-    defer request.deinit();
-    var diagnostic: cypher.compiler.Diagnostic = .{};
-    try std.testing.expectError(error.CypherSnapshotRequired, DB.queryCypher(a, &.{.{ .name = "docs", .db = &db }}, authority, 1, graph, request, &diagnostic));
-    var result = try DB.queryCypher(a, &.{.{ .name = "docs", .db = &snapshot }}, authority, @import("antfly_platform").time.realtimeNs(), graph, request, &diagnostic);
-    defer result.deinit();
-    const json = try std.json.Stringify.valueAlloc(a, result.rows, .{});
-    defer a.free(json);
-    try std.testing.expectEqualStrings("[[\"Beta\",1],[\"Beta\",2]]", json);
+    inline for (.{ true, false }) |durable| {
+        const a = std.testing.allocator;
+        const cypher = @import("cypher");
+        const DB = local.storage_db_db.DB;
+        var directory = try local.common_test_directory.TestDirectory.init("cypher-native-cut");
+        defer directory.cleanup();
+        const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{directory.path()});
+        defer a.free(pins);
+        defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+        var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
+        defer db.close();
+        try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 41 });
+        try db.batch(.{
+            .writes = &.{ .{ .key = "a", .value = "{\"id\":\"a\",\"title\":\"Alpha\"}" }, .{ .key = "b", .value = "{\"id\":\"b\",\"title\":\"Beta\"}" } },
+            .graph_writes = &.{ .{ .index_name = "links", .source = "a", .target = "b", .edge_type = "cites", .edge_id = "first", .weight = 1 }, .{ .index_name = "links", .source = "a", .target = "b", .edge_type = "cites", .edge_id = "second", .weight = 2 } },
+            .sync_level = .full_index,
+        });
+        const id: [64]u8 = @splat('c');
+        const Cut = @typeInfo(@FieldType(local.storage_db_types.SearchRequest, "native_query_cut")).optional.child;
+        const cut: Cut = .{ .id = &id, .table_id = 7, .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .create = true };
+        var snapshot = try db.openQueryCut(cut, .none);
+        defer snapshot.close();
+        try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"id\":\"b\",\"title\":\"Changed\"}" }}, .sync_level = .full_index });
+        const Authority = struct {
+            pub fn bind(_: *anyopaque, _: cypher.catalog.Graph) !void {}
+            pub fn checkpoint(_: *anyopaque) !void {}
+            pub fn projectRelationship(_: *anyopaque, _: std.mem.Allocator, relationship: *const cypher.value.Relationship) !?*const cypher.value.Relationship {
+                return relationship;
+            }
+            pub fn project(_: *anyopaque, _: std.mem.Allocator, node: *const cypher.value.Node) !?*const cypher.value.Node {
+                return node;
+            }
+        };
+        var owner: u8 = 0;
+        const authority: DB.CypherBackend.Authority = .{ .ptr = &owner, .bind = Authority.bind, .checkpoint = Authority.checkpoint, .project = Authority.project, .project_relationship = Authority.projectRelationship };
+        const catalog_identity = (try @import("../system_catalog/graph_bindings.zig").indexIdentity(a, "{\"links\":{\"type\":\"graph\",\"_index_incarnation\":41}}", "links")).?;
+        const native_identity = (try snapshot.cypherGraphIndexIdentity(a, "links")).?;
+        try std.testing.expectEqual(catalog_identity.incarnation, native_identity.incarnation);
+        try std.testing.expectEqual(catalog_identity.config_hash, native_identity.config_hash);
+        const graph: cypher.catalog.Graph = .{ .name = "knowledge", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Document", .table = "docs", .table_id = 7 }}, .relationships = &.{.{ .name = "CITES", .index = "links", .source_label = "Document", .target_label = "Document", .stored_type = "cites", .identity = catalog_identity }} };
+        var request = try cypher.request.Request.parse(a, "{\"query\":\"MATCH (a:Document {id:'a'})-[r:CITES]->(b) RETURN b.title, r.weight ORDER BY r.weight\"}", .{});
+        defer request.deinit();
+        var diagnostic: cypher.compiler.Diagnostic = .{};
+        try std.testing.expectError(error.CypherSnapshotRequired, DB.queryCypher(a, &.{.{ .name = "docs", .db = &db }}, authority, 1, graph, request, &diagnostic));
+        var result = try DB.queryCypher(a, &.{.{ .name = "docs", .db = &snapshot }}, authority, @import("antfly_platform").time.realtimeNs(), graph, request, &diagnostic);
+        defer result.deinit();
+        const json = try std.json.Stringify.valueAlloc(a, result.rows, .{});
+        defer a.free(json);
+        try std.testing.expectEqualStrings("[[\"Beta\",1],[\"Beta\",2]]", json);
 
-    // Exercise the production compiled-boundary read port while the caller
-    // already holds both statement fences. A second capture lock would hang.
-    try db.runMaintenanceUntil(db.core.nextDerivedSequence(), .{});
-    const domain = local.system_catalog_domain;
-    const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "knowledge", .source_json = "{\"labels\":[{\"name\":\"Document\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"CITES\",\"index\":\"links\",\"source_label\":\"Document\",\"target_label\":\"Document\",\"stored_type\":\"cites\"}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }}, .graph_indexes = &.{.{ .mapping_index = 0, .identity = catalog_identity }} };
-    const catalog_json = try std.json.Stringify.valueAlloc(a, record, .{});
-    defer a.free(catalog_json);
-    var statement_fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
-    defer statement_fence.release();
-    var capture: DB.CypherBackend = .{ .tables = &.{.{ .name = "docs", .db = &db, .capture_fence = &statement_fence }}, .authority = authority, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
-    const materialized = try cypher.snapshot.Materialized.create(a, capture.backend(), graph, .{});
-    defer materialized.deinit();
-    // An unrelated owner capability must never authorize mutable capture.
-    var wrong_owner: DB.StatementReadFence = .{ .source = &snapshot, .primary = undefined, .replay = undefined };
-    var invalid_capture: DB.CypherBackend = .{ .tables = &.{.{ .name = "docs", .db = &db, .capture_fence = &wrong_owner }}, .authority = authority, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
-    try std.testing.expectError(error.CypherSnapshotRequired, cypher.snapshot.Materialized.create(a, invalid_capture.backend(), graph, .{}));
-    var read = try DB.CypherStatementSnapshot.create(a, &db, &statement_fence, .{ .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('d'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
-    var read_open = true;
-    defer if (read_open) read.deinit();
-    statement_fence.release();
-    try std.testing.expectError(error.CypherSnapshotRequired, cypher.snapshot.Materialized.create(a, capture.backend(), graph, .{}));
-    try db.batch(.{ .writes = &.{ .{ .key = "b", .value = "{\"id\":\"b\",\"title\":\"After graph capture\"}" }, .{ .key = "later", .value = "{\"id\":\"later\"}" } }, .sync_level = .full_index });
-    const Channel = struct {
-        fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-            const port: *local.storage_statement_read_fence.GraphRead = @ptrCast(@alignCast(ptr));
-            return port.invoke(alloc, body);
+        // Exercise the production compiled-boundary read port while the caller
+        // already holds both statement fences. A second capture lock would hang.
+        try db.runMaintenanceUntil(db.core.nextDerivedSequence(), .{});
+        const domain = local.system_catalog_domain;
+        const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "knowledge", .source_json = "{\"labels\":[{\"name\":\"Document\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"CITES\",\"index\":\"links\",\"source_label\":\"Document\",\"target_label\":\"Document\",\"stored_type\":\"cites\"}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }}, .graph_indexes = &.{.{ .mapping_index = 0, .identity = catalog_identity }} };
+        const catalog_json = try std.json.Stringify.valueAlloc(a, record, .{});
+        defer a.free(catalog_json);
+        var statement_fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
+        defer statement_fence.release();
+        var capture: DB.CypherBackend = .{ .tables = &.{.{ .name = "docs", .db = &db, .capture_fence = &statement_fence }}, .authority = authority, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
+        const materialized = try cypher.snapshot.Materialized.create(a, capture.backend(), graph, .{});
+        defer materialized.deinit();
+        // An unrelated owner capability must never authorize mutable capture.
+        var wrong_owner: DB.StatementReadFence = .{ .source = &snapshot, .primary = undefined, .replay = undefined };
+        var invalid_capture: DB.CypherBackend = .{ .tables = &.{.{ .name = "docs", .db = &db, .capture_fence = &wrong_owner }}, .authority = authority, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
+        try std.testing.expectError(error.CypherSnapshotRequired, cypher.snapshot.Materialized.create(a, invalid_capture.backend(), graph, .{}));
+        var read = try DB.CypherStatementSnapshot.create(a, &db, &statement_fence, .{ .durable = durable, .indexes = if (durable) null else &.{"links"}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('d'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
+        var read_open = true;
+        defer if (read_open) read.deinit();
+        statement_fence.release();
+        try std.testing.expectError(error.CypherSnapshotRequired, cypher.snapshot.Materialized.create(a, capture.backend(), graph, .{}));
+        try db.batch(.{ .writes = &.{ .{ .key = "b", .value = "{\"id\":\"b\",\"title\":\"After graph capture\"}" }, .{ .key = "later", .value = "{\"id\":\"later\"}" } }, .sync_level = .full_index });
+        {
+            const native: *if (durable) DB.CypherStatementSnapshot.Durable else DB.CypherStatementSnapshot.Pinned = @ptrCast(@alignCast(read.ptr));
+            var filtered = try native.db.scan(a, "b", "b", .{ .inclusive_from = true, .limit = 1, .include_documents = false, .filter_query_json = "{\"term\":{\"id\":\"b\"}}" });
+            defer filtered.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), filtered.hashes.len);
+            try std.testing.expectEqualStrings("b", filtered.hashes[0].id);
+            try std.testing.expectEqual(@as(usize, 0), filtered.documents.len);
         }
-    };
-    var client: cypher.rpc.Client = .{ .channel = .{ .ptr = &read, .call = Channel.invoke }, .incarnation = 1, .revision = 1 };
-    var wire_arena = std.heap.ArenaAllocator.init(a);
-    defer wire_arena.deinit();
-    // The real owner uses DB.CypherBackend, not the embedded pinned adapter.
-    // Population metadata must survive that adapter and remain on this cut
-    // after a new live document is committed.
-    try std.testing.expectEqual(@as(?u64, 2), try client.backend().vtable.population_upper_bound.?(&client, wire_arena.allocator(), "docs"));
-    try std.testing.expectEqual(@as(?usize, 2), try client.backend().vtable.estimate_where.?(&client, wire_arena.allocator(), "docs", &.{}, 15000));
-    try std.testing.expectError(error.Forbidden, client.backend().vtable.population_upper_bound.?(&client, wire_arena.allocator(), "other"));
-    const node = (try client.backend().vtable.get(&client, wire_arena.allocator(), .{ .table = "docs", .key = "b" })).?;
-    try std.testing.expectEqualStrings("Changed", node.properties[1].value.string);
-    try std.testing.expectError(error.Forbidden, client.backend().vtable.get(&client, wire_arena.allocator(), .{ .table = "other", .key = "b" }));
-    // SQL and graph reads must consume the same document generation. The SQL
-    // child independently retains the cut after its graph parent is released.
-    // Exercise the actual native typed callback, with no wire fallback available.
-    try std.testing.expect(read.vtable.invoke_typed != null);
-    const TypedOnly = struct {
-        fn forbiddenWire(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
-            return error.TestUnexpectedWireCall;
+        const Channel = struct {
+            fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+                const port: *local.storage_statement_read_fence.GraphRead = @ptrCast(@alignCast(ptr));
+                return port.invoke(alloc, body);
+            }
+        };
+        var client: cypher.rpc.Client = .{ .channel = .{ .ptr = &read, .call = Channel.invoke }, .incarnation = 1, .revision = 1 };
+        var wire_arena = std.heap.ArenaAllocator.init(a);
+        defer wire_arena.deinit();
+        // The real owner uses DB.CypherBackend, not the embedded pinned adapter.
+        // Population metadata must survive that adapter and remain on this cut
+        // after a new live document is committed.
+        try std.testing.expectEqual(@as(?u64, 2), try client.backend().vtable.population_upper_bound.?(&client, wire_arena.allocator(), "docs"));
+        try std.testing.expectEqual(@as(?usize, 2), try client.backend().vtable.estimate_where.?(&client, wire_arena.allocator(), "docs", &.{}, 15000));
+        try std.testing.expectError(error.Forbidden, client.backend().vtable.population_upper_bound.?(&client, wire_arena.allocator(), "other"));
+        const node = (try client.backend().vtable.get(&client, wire_arena.allocator(), .{ .table = "docs", .key = "b" })).?;
+        try std.testing.expectEqualStrings("Changed", node.properties[1].value.string);
+        try std.testing.expectError(error.Forbidden, client.backend().vtable.get(&client, wire_arena.allocator(), .{ .table = "other", .key = "b" }));
+        // SQL and graph reads must consume the same document generation. The SQL
+        // child independently retains the cut after its graph parent is released.
+        // Exercise the actual native typed callback, with no wire fallback available.
+        try std.testing.expect(read.vtable.invoke_typed != null);
+        const TypedOnly = struct {
+            fn forbiddenWire(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
+                return error.TestUnexpectedWireCall;
+            }
+            fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, input: cypher.rpc.Request) !cypher.rpc.Reply {
+                const native: *local.storage_statement_read_fence.GraphRead = @ptrCast(@alignCast(ptr));
+                return native.invokeTyped(alloc, input);
+            }
+        };
+        var typed_client: cypher.rpc.Client = .{ .channel = .{ .ptr = &read, .call = TypedOnly.forbiddenWire, .typed = TypedOnly.invoke }, .incarnation = 1, .revision = 1 };
+        const typed_node = (try typed_client.backend().vtable.get(&typed_client, wire_arena.allocator(), .{ .table = "docs", .key = "b" })).?;
+        try std.testing.expectEqualStrings("Changed", typed_node.properties[1].value.string);
+        try std.testing.expectEqual(@as(?u64, 2), try typed_client.backend().vtable.population_upper_bound.?(&typed_client, wire_arena.allocator(), "docs"));
+        const many = try typed_client.backend().vtable.get_many.?(&typed_client, wire_arena.allocator(), &.{ .{ .table = "docs", .key = "a" }, .{ .table = "docs", .key = "b" } });
+        try std.testing.expectEqual(@as(usize, 2), many.len);
+        try std.testing.expectEqualStrings("Changed", many[1].?.properties[1].value.string);
+        const edges = try typed_client.backend().vtable.expand(&typed_client, wire_arena.allocator(), graph.relationships[0], .{ .table = "docs", .key = "a" }, .out, null, 128);
+        try std.testing.expectEqual(@as(usize, 2), edges.items.len);
+        const bounded = try read.invokeTyped(wire_arena.allocator(), .{ .operation = .get_many, .graph_incarnation = 1, .graph_revision = 1, .identities = &.{.{ .table = "docs", .key = "b" }}, .max_work = 0 });
+        try std.testing.expectEqual(cypher.rpc.BudgetFailure.work, bounded.read_failure.?);
+        try std.testing.expectEqual(@as(usize, 0), bounded.values.len);
+        {
+            const staged_document = try std.json.parseFromSliceLeaky(std.json.Value, wire_arena.allocator(), "{\"id\":\"b\",\"title\":\"Projected\"}", .{});
+            const normalized = try read.invokeTyped(wire_arena.allocator(), .{ .operation = .normalize, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .identity = .{ .table = "docs", .key = "b" }, .document = staged_document });
+            const projected = try read.invokeTyped(wire_arena.allocator(), .{ .operation = .project, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .identity = .{ .table = "docs", .key = "b" }, .document = staged_document, .include_relationships = true });
+            try std.testing.expectEqual(@as(usize, 1), normalized.values.len);
+            try std.testing.expectEqual(@as(usize, 1), projected.values.len);
+            try std.testing.expectEqualStrings("Projected", projected.values[0].value.node.properties[1].value.string);
         }
-        fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, input: cypher.rpc.Request) !cypher.rpc.Reply {
-            const native: *local.storage_statement_read_fence.GraphRead = @ptrCast(@alignCast(ptr));
-            return native.invokeTyped(alloc, input);
-        }
-    };
-    var typed_client: cypher.rpc.Client = .{ .channel = .{ .ptr = &read, .call = TypedOnly.forbiddenWire, .typed = TypedOnly.invoke }, .incarnation = 1, .revision = 1 };
-    const typed_node = (try typed_client.backend().vtable.get(&typed_client, wire_arena.allocator(), .{ .table = "docs", .key = "b" })).?;
-    try std.testing.expectEqualStrings("Changed", typed_node.properties[1].value.string);
-    try std.testing.expectEqual(@as(?u64, 2), try typed_client.backend().vtable.population_upper_bound.?(&typed_client, wire_arena.allocator(), "docs"));
-    const many = try typed_client.backend().vtable.get_many.?(&typed_client, wire_arena.allocator(), &.{ .{ .table = "docs", .key = "a" }, .{ .table = "docs", .key = "b" } });
-    try std.testing.expectEqual(@as(usize, 2), many.len);
-    try std.testing.expectEqualStrings("Changed", many[1].?.properties[1].value.string);
-    const edges = try typed_client.backend().vtable.expand(&typed_client, wire_arena.allocator(), graph.relationships[0], .{ .table = "docs", .key = "a" }, .out, null, 128);
-    try std.testing.expectEqual(@as(usize, 2), edges.items.len);
-    const bounded = try read.invokeTyped(wire_arena.allocator(), .{ .operation = .get_many, .graph_incarnation = 1, .graph_revision = 1, .identities = &.{.{ .table = "docs", .key = "b" }}, .max_work = 0 });
-    try std.testing.expectEqual(cypher.rpc.BudgetFailure.work, bounded.read_failure.?);
-    try std.testing.expectEqual(@as(usize, 0), bounded.values.len);
-    const staged_document = try std.json.parseFromSliceLeaky(std.json.Value, wire_arena.allocator(), "{\"id\":\"b\",\"title\":\"Projected\"}", .{});
-    const normalized = try read.invokeTyped(wire_arena.allocator(), .{ .operation = .normalize, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .identity = .{ .table = "docs", .key = "b" }, .document = staged_document });
-    const projected = try read.invokeTyped(wire_arena.allocator(), .{ .operation = .project, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .identity = .{ .table = "docs", .key = "b" }, .document = staged_document, .include_relationships = true });
-    try std.testing.expectEqual(@as(usize, 1), normalized.values.len);
-    try std.testing.expectEqual(@as(usize, 1), projected.values.len);
-    try std.testing.expectEqualStrings("Projected", projected.values[0].value.node.properties[1].value.string);
-
-    try std.testing.expectError(error.Forbidden, typed_client.backend().vtable.get(&typed_client, wire_arena.allocator(), .{ .table = "other", .key = "b" }));
-    var sql_view = try read.openSql(a, "docs", "b", "b", .{ .inclusive_from = true, .sql_document_preimage = true, .relational_query_json = "{\"fields\":[\"_id\"]}" });
-    defer sql_view.deinit();
-    read.deinit();
-    read_open = false;
-    var sql_page = try sql_view.next(a, 1);
-    defer sql_page.deinit();
-    try std.testing.expectEqual(@as(usize, 1), sql_page.rows.len);
-    const document = sql_page.rows[0].document orelse return error.TestExpectedDocument;
-    try std.testing.expectEqualStrings("Changed", document.object.get("title").?.string);
+        try std.testing.expectError(error.Forbidden, typed_client.backend().vtable.get(&typed_client, wire_arena.allocator(), .{ .table = "other", .key = "b" }));
+        var sql_view = try read.openSql(a, "docs", "b", "b", .{ .inclusive_from = true, .sql_document_preimage = true, .relational_query_json = "{\"fields\":[\"_id\"]}" });
+        defer sql_view.deinit();
+        read.deinit();
+        read_open = false;
+        var sql_page = try sql_view.next(a, 1);
+        defer sql_page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), sql_page.rows.len);
+        const document = sql_page.rows[0].document orelse return error.TestExpectedDocument;
+        try std.testing.expectEqualStrings("Changed", document.object.get("title").?.string);
+    }
 }
 
 test "external lake Cypher execution reads immutable native document and graph cuts with selective projections" {
-    const a = std.testing.allocator;
-    const DB = local.storage_db_db.DB;
-    var directory = try local.common_test_directory.TestDirectory.init("cypher-selective-cut");
-    defer directory.cleanup();
-    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{directory.path()});
-    defer a.free(pins);
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
-    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_index_workers = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } });
-    defer db.close();
-    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 41 });
-    try db.addIndex(.{ .name = "unused", .kind = .graph, .config_json = "{}", .coverage_generation = 42 });
-    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"title\":\"Alpha\"}" }}, .sync_level = .full_index });
-    try db.runMaintenanceUntil(db.core.nextDerivedSequence(), .{});
-    const identity = (try db.cypherGraphIndexIdentity(a, "links")).?;
-    const domain = local.system_catalog_domain;
-    const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "g", .source_json = "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"R\",\"index\":\"links\",\"source_label\":\"D\",\"target_label\":\"D\",\"stored_type\":\"r\"}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }}, .graph_indexes = &.{.{ .mapping_index = 0, .identity = identity }} };
-    const catalog_json = try std.json.Stringify.valueAlloc(a, record, .{});
-    defer a.free(catalog_json);
-    // An unrelated unfinished projection cannot delay a primary/adjacency read.
-    var checkpoint = try db.core.loadProjectionCheckpoint(a, "unused");
-    checkpoint.applied_sequence = 0;
-    try db.core.saveProjectionCheckpoint("unused", checkpoint);
-    // Revoking a completion prefix is itself a primary commit. Advance the
-    // healthy projection to that commit without repairing the unrelated one.
-    var healthy = try db.core.loadProjectionCheckpoint(a, "links");
-    healthy.applied_sequence = db.core.nextDerivedSequence();
-    try db.core.saveProjectionCheckpoint("links", healthy);
-    var fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
-    defer fence.release();
-    for ([_][]const []const u8{ &.{}, &.{"links"} }, 0..) |names, i| {
-        var read = try DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .indexes = names, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat(@as(u8, 'e') + @as(u8, @intCast(i))), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
-        defer read.deinit();
-        const native: *DB.CypherStatementSnapshot = @ptrCast(@alignCast(read.ptr));
-        try std.testing.expectEqual(names.len, native.db.core.index_manager.graph_indexes.items.len);
-        try std.testing.expect(native.db.core.graphIndex("unused") == null);
-        try std.testing.expect((try native.db.cypherGraphIndexIdentity(a, "links")) != null);
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const reply = try read.invokeTyped(arena.allocator(), .{ .operation = .get, .graph_incarnation = 1, .graph_revision = 1, .identity = .{ .table = "docs", .key = "a" } });
-        try std.testing.expectEqual(@as(usize, 1), reply.values.len);
-        const typed_json = try std.json.Stringify.valueAlloc(arena.allocator(), reply, .{});
-        const wire_json = try read.invoke(arena.allocator(), "{\"operation\":\"get\",\"graph_incarnation\":1,\"graph_revision\":1,\"identity\":{\"table\":\"docs\",\"key\":\"a\"}}");
-        try std.testing.expectEqualStrings(wire_json, typed_json);
-        const Cut = @typeInfo(@FieldType(local.storage_db_types.SearchRequest, "native_query_cut")).optional.child;
-        try std.testing.expectError(error.CatalogGenerationChanged, db.openQueryCut(@as(Cut, .{ .id = &native.input.cut_id, .table_id = 7, .expires_ms = native.input.expires_ms }), .none));
+    inline for (.{ true, false }) |durable| {
+        const a = std.testing.allocator;
+        const DB = local.storage_db_db.DB;
+        var directory = try local.common_test_directory.TestDirectory.init("cypher-selective-cut");
+        defer directory.cleanup();
+        const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{directory.path()});
+        defer a.free(pins);
+        defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+        var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_index_workers = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 41 });
+        try db.addIndex(.{ .name = "unused", .kind = .graph, .config_json = "{}", .coverage_generation = 42 });
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"title\":\"Alpha\"}" }}, .sync_level = .full_index });
+        try db.runMaintenanceUntil(db.core.nextDerivedSequence(), .{});
+        const identity = (try db.cypherGraphIndexIdentity(a, "links")).?;
+        const domain = local.system_catalog_domain;
+        const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "g", .source_json = "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"R\",\"index\":\"links\",\"source_label\":\"D\",\"target_label\":\"D\",\"stored_type\":\"r\"}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }}, .graph_indexes = &.{.{ .mapping_index = 0, .identity = identity }} };
+        const catalog_json = try std.json.Stringify.valueAlloc(a, record, .{});
+        defer a.free(catalog_json);
+        // An unrelated unfinished projection cannot delay a primary/adjacency read.
+        var checkpoint = try db.core.loadProjectionCheckpoint(a, "unused");
+        checkpoint.applied_sequence = 0;
+        try db.core.saveProjectionCheckpoint("unused", checkpoint);
+        // Revoking a completion prefix is itself a primary commit. Advance the
+        // healthy projection to that commit without repairing the unrelated one.
+        var healthy = try db.core.loadProjectionCheckpoint(a, "links");
+        healthy.applied_sequence = db.core.nextDerivedSequence();
+        try db.core.saveProjectionCheckpoint("links", healthy);
+        var fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
+        defer fence.release();
+        for ([_][]const []const u8{ &.{}, &.{"links"} }, 0..) |names, i| {
+            var read = try DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .durable = durable, .indexes = names, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat(@as(u8, 'e') + @as(u8, @intCast(i))), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
+            defer read.deinit();
+            if (durable) {
+                const native: *DB.CypherStatementSnapshot.Durable = @ptrCast(@alignCast(read.ptr));
+                try std.testing.expectEqual(names.len, native.db.core.index_manager.graph_indexes.items.len);
+                try std.testing.expect(native.db.core.graphIndex("unused") == null);
+                try std.testing.expect((try native.db.cypherGraphIndexIdentity(a, "links")) != null);
+            } else {
+                const native: *DB.CypherStatementSnapshot.Pinned = @ptrCast(@alignCast(read.ptr));
+                try std.testing.expectEqual(names.len, native.db.cut.graphs.len);
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, pins, .{}));
+            }
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const reply = try read.invokeTyped(arena.allocator(), .{ .operation = .get, .graph_incarnation = 1, .graph_revision = 1, .identity = .{ .table = "docs", .key = "a" } });
+            try std.testing.expectEqual(@as(usize, 1), reply.values.len);
+            const typed_json = try std.json.Stringify.valueAlloc(arena.allocator(), reply, .{});
+            const wire_json = try read.invoke(arena.allocator(), "{\"operation\":\"get\",\"graph_incarnation\":1,\"graph_revision\":1,\"identity\":{\"table\":\"docs\",\"key\":\"a\"}}");
+            try std.testing.expectEqualStrings(wire_json, typed_json);
+            if (durable) {
+                const native: *DB.CypherStatementSnapshot.Durable = @ptrCast(@alignCast(read.ptr));
+                const Cut = @typeInfo(@FieldType(local.storage_db_types.SearchRequest, "native_query_cut")).optional.child;
+                try std.testing.expectError(error.CatalogGenerationChanged, db.openQueryCut(@as(Cut, .{ .id = &native.input.cut_id, .table_id = 7, .expires_ms = native.input.expires_ms }), .none));
+            }
 
-        try std.testing.expectError(error.CatalogGenerationChanged, read.invokeTyped(arena.allocator(), .{ .operation = .get, .graph_incarnation = 2, .graph_revision = 1, .identity = .{ .table = "docs", .key = "a" } }));
+            try std.testing.expectError(error.CatalogGenerationChanged, read.invokeTyped(arena.allocator(), .{ .operation = .get, .graph_incarnation = 2, .graph_revision = 1, .identity = .{ .table = "docs", .key = "a" } }));
+        }
+        try std.testing.expectError(error.CypherSnapshotNotReady, DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .indexes = &.{"unused"}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('a'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none));
+        try std.testing.expectError(error.CypherSnapshotNotReady, DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('a'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none));
     }
-    try std.testing.expectError(error.CypherSnapshotNotReady, DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('a'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none));
 }
 
 test "external lake Cypher catalog cache invalidates on live index drop and recreation" {
+    inline for (.{ true, false }) |durable| {
+        const a = std.testing.allocator;
+        const DB = local.storage_db_db.DB;
+        var directory = try local.common_test_directory.TestDirectory.init("cypher-catalog-epochs");
+        defer directory.cleanup();
+        const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{directory.path()});
+        defer a.free(pins);
+        defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+        var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_index_workers = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 41 });
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"title\":\"Alpha\"}" }}, .sync_level = .full_index });
+        try db.runMaintenanceUntil(db.core.nextDerivedSequence(), .{});
+        // This no-edge fixture explicitly publishes the projection frontier;
+        // no asynchronous worker runs to cover metadata-only replay commits.
+        var ready = try db.core.loadProjectionCheckpoint(a, "links");
+        ready.applied_sequence = db.core.nextDerivedSequence();
+        try db.core.saveProjectionCheckpoint("links", ready);
+        const identity = (try db.cypherGraphIndexIdentity(a, "links")).?;
+        const domain = local.system_catalog_domain;
+        const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "g", .source_json = "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"R\",\"index\":\"links\",\"source_label\":\"D\",\"target_label\":\"D\",\"stored_type\":\"r\"}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }}, .graph_indexes = &.{.{ .mapping_index = 0, .identity = identity }} };
+        const catalog_json = try std.json.Stringify.valueAlloc(a, record, .{});
+        defer a.free(catalog_json);
+        var fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
+        defer fence.release();
+        var read = try DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .durable = durable, .indexes = if (durable) &.{} else &.{"links"}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('c'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
+        var read_open = true;
+        defer if (read_open) read.deinit();
+        fence.release();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const request: @import("cypher").rpc.Request = .{ .operation = .get, .graph_incarnation = 1, .graph_revision = 1, .identity = .{ .table = "docs", .key = "a" } };
+        const native: *if (durable) DB.CypherStatementSnapshot.Durable else DB.CypherStatementSnapshot.Pinned = @ptrCast(@alignCast(read.ptr));
+        const before = native.catalog_guards[0].validated.?.generation;
+        try std.testing.expectEqual(@as(usize, 1), (try read.invokeTyped(arena.allocator(), request)).values.len);
+        // A catalog commit unrelated to this graph refreshes the proof once.
+        try db.addIndex(.{ .name = "unused", .kind = .graph, .config_json = "{}", .coverage_generation = 43 });
+        try std.testing.expectEqual(@as(usize, 1), (try read.invokeTyped(arena.allocator(), request)).values.len);
+        try std.testing.expect(native.catalog_guards[0].validated.?.generation > before);
+        try std.testing.expectEqual(db.core.index_manager.writePlanGeneration(), native.catalog_guards[0].validated.?.generation);
+        try std.testing.expect(try db.deleteIndex("links"));
+        try std.testing.expectError(error.CatalogGenerationChanged, read.invokeTyped(arena.allocator(), request));
+        // Same-name admission waits for production generation-retirement cleanup.
+        if (!durable) {
+            // A retired backend may still flush during close. Its namespace
+            // cannot be deleted/reused until the final captured reader retires.
+            try std.testing.expectError(error.IndexGenerationStillActive, db.core.index_manager.finalizeRetiredIndexStorage(db.core.store, "links"));
+            read.deinit();
+            read_open = false;
+        }
+        db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+        var cleaned = false;
+        for (0..1000) |_| switch (try db.advanceGeneratedArtifactCleanupPage("links")) {
+            .idle => {
+                cleaned = true;
+                break;
+            },
+            .progressed => {},
+            .busy => std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {},
+        };
+        try std.testing.expect(cleaned);
+        try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 42 });
+        if (durable) {
+            try std.testing.expectError(error.CatalogGenerationChanged, read.invokeTyped(arena.allocator(), request));
+        } else {
+            var replacement_fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
+            defer replacement_fence.release();
+            try std.testing.expectError(error.CatalogGenerationChanged, DB.CypherStatementSnapshot.create(a, &db, &replacement_fence, .{ .indexes = &.{}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('d'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none));
+        }
+    }
+}
+
+test "external lake Cypher indexed bounds use the captured scalar catalog" {
     const a = std.testing.allocator;
     const DB = local.storage_db_db.DB;
-    var directory = try local.common_test_directory.TestDirectory.init("cypher-catalog-epochs");
+    var directory = try local.common_test_directory.TestDirectory.init("cypher-scalar-catalog");
     defer directory.cleanup();
-    const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{directory.path()});
-    defer a.free(pins);
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
-    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_index_workers = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_index_workers = false, .start_optional_runtime_workers = false });
     defer db.close();
-    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 41 });
-    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"title\":\"Alpha\"}" }}, .sync_level = .full_index });
-    try db.runMaintenanceUntil(db.core.nextDerivedSequence(), .{});
-    const identity = (try db.cypherGraphIndexIdentity(a, "links")).?;
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"by_id","keys":[{"column":"id"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2}" } } });
+    for (0..128) |_| {
+        if ((try db.relationalIndexBuildStatus("by_id")).state == .ready) break;
+        try db.buildRelationalIndexStep("by_id", .{});
+    } else return error.TestIndexNotReady;
     const domain = local.system_catalog_domain;
-    const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "g", .source_json = "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"R\",\"index\":\"links\",\"source_label\":\"D\",\"target_label\":\"D\",\"stored_type\":\"r\"}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }}, .graph_indexes = &.{.{ .mapping_index = 0, .identity = identity }} };
-    const catalog_json = try std.json.Stringify.valueAlloc(a, record, .{});
-    defer a.free(catalog_json);
+    const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "g", .source_json = "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }} };
+    const json = try std.json.Stringify.valueAlloc(a, record, .{});
+    defer a.free(json);
     var fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
     defer fence.release();
-    var read = try DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .indexes = &.{}, .catalog_json = catalog_json, .table = "docs", .table_id = 7, .cut_id = @splat('c'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
+    var read = try DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .indexes = &.{}, .schema_version = 1, .catalog_json = json, .table = "docs", .table_id = 7, .cut_id = @splat('b'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
     defer read.deinit();
     fence.release();
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const request: @import("cypher").rpc.Request = .{ .operation = .get, .graph_incarnation = 1, .graph_revision = 1, .identity = .{ .table = "docs", .key = "a" } };
-    const native: *DB.CypherStatementSnapshot = @ptrCast(@alignCast(read.ptr));
-    const before = native.catalog_guards[0].validated.?.generation;
-    try std.testing.expectEqual(@as(usize, 1), (try read.invokeTyped(arena.allocator(), request)).values.len);
-    // A catalog commit unrelated to this graph refreshes the proof once.
-    try db.addIndex(.{ .name = "unused", .kind = .graph, .config_json = "{}", .coverage_generation = 43 });
-    try std.testing.expectEqual(@as(usize, 1), (try read.invokeTyped(arena.allocator(), request)).values.len);
-    try std.testing.expect(native.catalog_guards[0].validated.?.generation > before);
-    try std.testing.expectEqual(db.core.index_manager.writePlanGeneration(), native.catalog_guards[0].validated.?.generation);
-    try std.testing.expect(try db.deleteIndex("links"));
-    try std.testing.expectError(error.CatalogGenerationChanged, read.invokeTyped(arena.allocator(), request));
-    // Same-name admission waits for production generation-retirement cleanup.
-    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
-    var cleaned = false;
-    for (0..1000) |_| switch (try db.advanceGeneratedArtifactCleanupPage("links")) {
-        .idle => {
-            cleaned = true;
-            break;
-        },
-        .progressed => {},
-        .busy => std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {},
-    };
-    try std.testing.expect(cleaned);
-    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 42 });
-    try std.testing.expectError(error.CatalogGenerationChanged, read.invokeTyped(arena.allocator(), request));
+    // Publish removal without changing the schema epoch. Index bounds and row
+    // reads must both keep the statement's earlier immutable definitions.
+    var schema = db.core.acquireSchemaView().?;
+    defer schema.release();
+    var removal = try db.core.relational_indexes.prepare(schema, &.{});
+    defer removal.deinit();
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try std.testing.expect(try db.core.relational_indexes.commit(&removal, &.{}));
+    }
+    const native: *DB.CypherStatementSnapshot.Pinned = @ptrCast(@alignCast(read.ptr));
+    const session = try native.db.openRelationalReadSession(a, "", "", .{ .limit = 1, .relational_query_json = "{\"index\":\"by_id\",\"schema_version\":1,\"fields\":[\"id\"],\"lower\":{\"values\":[2]},\"upper\":{\"values\":[2]}}" });
+    defer session.deinit();
+    var page = try session.reader.nextPage(a, db.backend_runtime.io(), .{ .rows = 1, .output_bytes = 4096 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualStrings("b", page.rows[0].key);
+    try std.testing.expectEqualStrings("{\"id\":2}", page.rows[0].json);
 }

@@ -111,6 +111,12 @@ fn cypherFieldDerivedEdgeType(self: *const DB, index_name: []const u8, edge_type
     return .{ .value = self.cypherFieldDerivedEdgeType(index_name, edge_type) };
 }
 
+fn getCypherPinnedDocument(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, key: []const u8, opts: types.LookupOptions) engine.Outcome(?types.LookupResult) {
+    return .{ .value = self.getCypherPinnedDocument(alloc, cut, key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn captureCypherSelectedSnapshot(self: *DB, alloc: Allocator, fence: *const DB.StatementReadFence, names: []const []const u8, now: u64, cancellation: types.CancellationToken) engine.Outcome(DB.CypherPinnedSnapshot) {
+    return .{ .value = self.captureCypherSelectedSnapshot(alloc, fence, names, now, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, fence: *const DB.StatementReadFence, graph: @import("cypher").catalog.Graph, table: []const u8) engine.Outcome(DB.CypherPinnedSnapshot) {
     return .{ .value = self.captureCypherPinnedSnapshot(alloc, fence, graph, table) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

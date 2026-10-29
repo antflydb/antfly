@@ -19,20 +19,35 @@ const port = @import("../cypher_read.zig");
 const domain = @import("../../system_catalog/domain.zig");
 pub fn Snapshot(comptime DB: type) type {
     return struct {
+        pub const Durable = Implementation(DB, DB);
+        pub const Pinned = Implementation(DB, DB.CypherPinnedDatabase);
+        pub fn create(a: std.mem.Allocator, db: *DB, fence: *const DB.StatementReadFence, input: port.Input, cancellation: @import("types.zig").CancellationToken) !port.Read {
+            // Writes/procedures use full managed generations. Pure graph and
+            // GRAPH_TABLE reads have a complete, table-local index selection.
+            if (!input.durable and input.indexes != null) return Pinned.create(a, db, fence, input, cancellation);
+            return Durable.create(a, db, fence, input, cancellation);
+        }
+    };
+}
+fn Implementation(comptime DB: type, comptime ReadDB: type) type {
+    const Adapter = cypher.native.Adapter(ReadDB, @import("../../graph/graph.zig").GraphIndex, DB.CypherEdgeScanCursor);
+    const durable = ReadDB == DB;
+
+    return struct {
         const Self = @This();
         references: std.atomic.Value(usize) = .init(1),
         a: std.mem.Allocator,
         arena: std.heap.ArenaAllocator,
         source: *DB,
-        db: DB,
+        db: ReadDB,
         population_upper_bound: ?u64,
         input: port.Input,
         graph: cypher.catalog.Graph,
         graphs: []const cypher.catalog.Graph,
         catalog_guards: []cypher.catalog_guard.Guard,
         graph_index: usize = 0,
-        tables: [1]DB.CypherBackend.Table,
-        adapter: DB.CypherBackend,
+        tables: [1]Adapter.Table,
+        adapter: Adapter,
         policy: @import("row_policy_gate.zig").Gate.Lease,
         pub fn create(a: std.mem.Allocator, db: *DB, fence: *const DB.StatementReadFence, input: port.Input, cancellation: @import("types.zig").CancellationToken) !port.Read {
             var stage: []const u8 = "catalog";
@@ -69,22 +84,23 @@ pub fn Snapshot(comptime DB: type) type {
                 var lease = authority;
                 lease.release();
             }
-            var cut: @import("native_query_cut.zig").Request = .{ .id = &copied.cut_id, .table_id = copied.table_id, .expires_ms = copied.expires_ms, .create = true, .indexes = copied.indexes };
             stage = "capture";
-            // Install cleanup before capture so a failed publication/open/bind
-            // cannot leave a statement generation consuming admission capacity.
-            errdefer db.releaseStatementQueryCut(cut);
-            try db.captureQueryCutAtStatementFence(cut, fence, cancellation);
-            cut.create = false;
-            stage = "open";
-            var readonly = try db.openQueryCut(cut, cancellation);
+            var readonly: ReadDB = if (comptime durable) physical: {
+                var cut: @import("native_query_cut.zig").Request = .{ .id = &copied.cut_id, .table_id = copied.table_id, .expires_ms = copied.expires_ms, .create = true, .indexes = copied.indexes };
+                errdefer db.releaseStatementQueryCut(cut);
+                try db.captureQueryCutAtStatementFence(cut, fence, cancellation);
+                cut.create = false;
+                stage = "open";
+                break :physical try db.openQueryCut(cut, cancellation);
+            } else .{ .source = db, .core = db.core, .cut = try db.captureCypherSelectedSnapshot(a, fence, copied.indexes.?, copied.ttl_now_ns, cancellation) };
+            errdefer if (durable) db.releaseStatementQueryCut(.{ .id = &copied.cut_id, .table_id = copied.table_id, .expires_ms = copied.expires_ms });
             errdefer readonly.close();
-            const population: ?u64 = population: {
+            const population: ?u64 = if (comptime durable) population: {
                 var primary_read = try readonly.core.store.beginReadTxn();
                 defer primary_read.abort();
                 const summary = (try @import("doc_identity.zig").readVisibilitySummaryTxn(&primary_read)) orelse break :population null;
                 break :population summary.live_ordinals;
-            };
+            } else readonly.cut.population_upper_bound;
             const guards = try owned.alloc(cypher.catalog_guard.Guard, graphs.len);
             for (graphs, guards) |entry, *guard| guard.* = try cypher.catalog_guard.Guard.init(owned, entry, copied.table);
             self.* = .{ .catalog_guards = guards, .a = a, .arena = arena, .source = db, .db = readonly, .population_upper_bound = population, .input = copied, .graph = graph, .graphs = graphs, .policy = authority, .tables = undefined, .adapter = undefined };
@@ -149,7 +165,7 @@ pub fn Snapshot(comptime DB: type) type {
             try checkpoint(ptr);
             return self.population_upper_bound;
         }
-        fn readAuthorization(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8) !DB.CypherBackend.ReadAuthorization {
+        fn readAuthorization(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8) !Adapter.ReadAuthorization {
             const self = cast(ptr);
             if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
             const remaining_ms = self.input.expires_ms -| @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
@@ -392,7 +408,7 @@ pub fn Snapshot(comptime DB: type) type {
             if (self.input.filter_query_json.len != 0) {
                 if (opts.filter_query_json.len == 0) opts.filter_query_json = self.input.filter_query_json else opts.filter_query_json = try std.fmt.allocPrint(scratch.allocator(), "{{\"conjuncts\":[{s},{s}]}}", .{ opts.filter_query_json, self.input.filter_query_json });
             }
-            const view = try @import("cypher_sql_view.zig").open(Self, DB, a, self, &self.db, from, to, opts);
+            const view = try @import("cypher_sql_view.zig").open(Self, ReadDB, a, self, &self.db, from, to, opts);
             _ = self.references.fetchAdd(1, .monotonic);
             return view;
         }
@@ -406,7 +422,7 @@ pub fn Snapshot(comptime DB: type) type {
             const self = cast(ptr);
             if (self.references.fetchSub(1, .acq_rel) != 1) return;
             self.db.close();
-            self.source.releaseStatementQueryCut(.{ .id = &self.input.cut_id, .table_id = self.input.table_id, .expires_ms = self.input.expires_ms });
+            if (comptime durable) self.source.releaseStatementQueryCut(.{ .id = &self.input.cut_id, .table_id = self.input.table_id, .expires_ms = self.input.expires_ms });
             self.policy.release();
             self.arena.deinit();
             self.a.destroy(self);

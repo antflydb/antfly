@@ -9571,7 +9571,10 @@ pub const DB = struct {
                 std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
-        try finalizeRetiredIndexCleanupContext(ctx, index_name, cleanup_key);
+        finalizeRetiredIndexCleanupContext(ctx, index_name, cleanup_key) catch |err| switch (err) {
+            error.IndexGenerationStillActive => return .busy,
+            else => return err,
+        };
         return .progressed;
     }
 
@@ -28147,6 +28150,32 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("captureCypherPinnedSnapshot", .{ self, alloc, fence, graph, table });
         return @import("cypher_pinned_read.zig").capture(self, alloc, fence, graph, table);
     }
+    /// Retain local immutable roots for a non-resumable graph statement.
+    pub fn captureCypherSelectedSnapshot(self: *DB, alloc: Allocator, fence: *const StatementReadFence, names: []const []const u8, now: u64, cancellation: types.CancellationToken) !CypherPinnedSnapshot {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherSelectedSnapshot", .{ self, alloc, fence, names, now, cancellation });
+        if (fence.source != self or !fence.primary.active or !fence.replay.active or fence.primary.admission != self.core.snapshot_admission or fence.replay.admission != self.core.snapshot_replay_admission) return error.CypherSnapshotRequired;
+        try cancellation.check();
+        try self.enforcePortableRuntimeGate();
+        if (names.len != 0) if (self.enrichment_runtime) |runtime| try runtime.requireHealthyForQueryCapture();
+        const target = self.currentMaintenanceTargetSequence();
+        for (names) |name| if (try self.core.loadAppliedSequence(alloc, name) < target) return error.CypherSnapshotNotReady;
+        if (self.loadIndexRepairState(alloc)) |value| {
+            var repairs = value;
+            defer repairs.deinit(alloc);
+            for (repairs.entries.items) |entry| if (@import("cypher").dependencies.contains(names, entry.intent.index_name)) return error.NativeBackupRepairStateNotQuiescent;
+        } else |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => {},
+            else => return err,
+        }
+        var cut = try @import("cypher_pinned_read.zig").captureSelected(self, alloc, fence, names, now);
+        errdefer cut.deinit();
+        try cancellation.check();
+        return cut;
+    }
+    pub fn getCypherPinnedDocument(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("getCypherPinnedDocument", .{ self, alloc, cut, key, opts });
+        return @import("cypher_pinned_read.zig").get(self, alloc, cut, key, opts);
+    }
     pub fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !types.ScanResult {
         if (comptime storage_engine.enabled) return storage_engine.call("scanCypherPinnedSnapshot", .{ self, alloc, cut, from, to, opts });
         return @import("cypher_pinned_read.zig").scan(self, alloc, cut, from, to, opts);
@@ -41220,7 +41249,7 @@ pub const DB = struct {
         var lower: ?RelationalRows.Bound = null;
         var upper: ?RelationalRows.Bound = null;
         if (parsed.value.index) |name| {
-            var indexes = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
+            var indexes = (if (statement) |cut| if (cut.indexes) |pinned| relational_index_catalog.WriteSnapshot{ .head = pinned.head, .plan = pinned.plan.clone() } else null else self.core.relational_indexes.acquire()) orelse return error.IndexNotFound;
             defer indexes.deinit();
             if (indexes.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
             const index = for (indexes.plan.boundIndexes()) |candidate| {
@@ -41388,9 +41417,15 @@ pub const DB = struct {
         visitor: types.ScanVisitor,
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("scanVisit", .{ self, alloc, from_key, to_key, opts, visitor });
+        return self.scanVisitAtCypherSnapshot(alloc, from_key, to_key, opts, visitor, null);
+    }
+
+    /// Shared native scan over either a new read transaction or a retained
+    /// graph statement root. Projection/filtering use the same stored bytes.
+    pub fn scanVisitAtCypherSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor, cut: ?*CypherPinnedSnapshot) !void {
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-        if (opts.isRelational()) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
-        var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
+        if (cut == null and opts.isRelational()) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
+        var row_policy_lease = if (cut != null) try self.acquireCypherReadAuthority(alloc, opts.row_policy_principal_proof, opts.row_policy_database) else try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         const projection_plan = db_query_projection.buildLookupFieldSelectionPlan(.{
             .fields = opts.fields,
@@ -41405,10 +41440,14 @@ pub const DB = struct {
         errdefer if (apply_shared_held) self.core.unlockApplyShared();
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
+        if (cut) |pinned| {
+            if ((if (schema_view) |view| view.version() else 0) != pinned.schema_version) return error.SchemaVersionChanged;
+            if (schema_view) |view| if (view.storageMode() != .document) return error.RelationalTableRequired;
+        }
         const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
-        const scan_now_ns = if (ttl_duration_ns == 0) 0 else currentTimeNs();
+        const scan_now_ns = if (cut) |pinned| pinned.now else if (ttl_duration_ns == 0) 0 else currentTimeNs();
 
-        const borrowed_range = self.core.byteRange();
+        const borrowed_range = if (cut) |pinned| pinned.byte_range else self.core.byteRange();
         const range_start = try alloc.dupe(u8, borrowed_range.start);
         errdefer alloc.free(range_start);
         const range_end = try alloc.dupe(u8, borrowed_range.end);
@@ -41443,7 +41482,7 @@ pub const DB = struct {
             ordinalProjectionFields(opts.fields, opts.include_all_fields)
         else
             null;
-        var read_txn = try self.core.store.beginReadTxn();
+        var read_txn = if (cut) |pinned| try pinned.primary.forkRead() else try self.core.store.beginReadTxn();
         defer read_txn.abort();
         var projection_context = TransactionProjectionContext{
             .source = .{ .core = self.core },
@@ -41808,6 +41847,7 @@ pub const DB = struct {
             &state,
             ScanState.scanEntry,
         );
+        try row_policy_lease.checkAt(@intCast(platform_time.realtimeNs() / std.time.ns_per_s));
     }
 
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {

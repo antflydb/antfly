@@ -44,7 +44,9 @@ def test_graph_operator_ceilings_cover_sql_and_staged_graphs(monkeypatch, ceilin
     def config(root, *, pgwire_port=None):
         path = original_config(root, pgwire_port=pgwire_port)
         values = json.loads(path.read_text())
-        values["graph_execution"] = ceiling
+        values.setdefault("resources", {}).setdefault("query", {}).setdefault(
+            "request_limits", {}
+        )["graph"] = ceiling
         path.write_text(json.dumps(values))
         return path
 

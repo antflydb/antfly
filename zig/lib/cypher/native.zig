@@ -131,6 +131,14 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
         }
+        fn acquireSchema(db: *DB) @TypeOf(db.core.acquireSchemaView()) {
+            if (comptime @hasDecl(DB, "acquireCypherSchemaView")) return db.acquireCypherSchemaView();
+            return db.core.acquireSchemaView();
+        }
+        fn acquireIndexes(db: *DB) @TypeOf(db.core.relational_indexes.acquire()) {
+            if (comptime @hasDecl(DB, "acquireCypherIndexCatalog")) return db.acquireCypherIndexCatalog();
+            return db.core.relational_indexes.acquire();
+        }
         const ScanOptions = if (@hasDecl(DB, "cypherDocumentScanOptions")) @typeInfo(@typeInfo(@TypeOf(DB.cypherDocumentScanOptions)).@"fn".return_type.?).error_union.payload else void;
         fn scanOptions(self: *Self, a: A, db: *DB, input: ScanOptions) !ScanOptions {
             var opts = try db.cypherDocumentScanOptions(a, input);
@@ -357,7 +365,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             defer scratch.deinit();
             const temporary = scratch.allocator();
             const db = try self.selected(table);
-            var schema = db.core.acquireSchemaView() orelse return null;
+            var schema = acquireSchema(db) orelse return null;
             defer schema.release();
             const column_type = for (schema.tableSchema().relational_columns) |column| {
                 if (std.mem.eql(u8, column.name, filters[chosen].property)) break column.column_type;
@@ -441,9 +449,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const temporary = scratch.allocator();
             try checkpoint(ptr);
             const db = try self.selected(table);
-            var schema = db.core.acquireSchemaView() orelse return null;
+            var schema = acquireSchema(db) orelse return null;
             defer schema.release();
-            var indexes = db.core.relational_indexes.acquire() orelse return null;
+            var indexes = acquireIndexes(db) orelse return null;
             defer indexes.deinit();
             if (indexes.plan.schemaView().epoch != schema.epoch) return error.CatalogGenerationChanged;
             const cursor = if (encoded) |bytes| try std.json.parseFromSliceLeaky(OrderedCursor, temporary, bytes, .{}) else null;
@@ -628,7 +636,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const authorization = try self.readAuthorization(temporary, table);
             var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(limit) });
             if (opts.relational_query == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
-            var schema = db.core.acquireSchemaView() orelse return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
+            var schema = acquireSchema(db) orelse return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             defer schema.release();
             const Query = @TypeOf(opts.relational_query.?);
             var conditions: std.ArrayList(Query.Condition) = .empty;

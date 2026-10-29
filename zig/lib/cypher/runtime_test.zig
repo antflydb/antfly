@@ -8914,3 +8914,73 @@ test "computed row-bound document keys seek without changing residual semantics"
     defer compiled.deinit();
     try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
 }
+
+test "computed property access hints retain indexed equality and membership domains" {
+    const Indexed = struct {
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            return error.TestUnexpectedFullScan;
+        }
+        fn filtered(_: *anyopaque, a: std.mem.Allocator, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            var out: std.ArrayList(*const v.Node) = .empty;
+            for (&Fixture.nodes) |*node| {
+                if (!std.mem.eql(u8, table, node.identity.table)) continue;
+                if (after) |cursor| if (std.mem.order(u8, node.identity.key, cursor) != .gt) continue;
+                var matches = true;
+                for (filters) |filter| {
+                    if (!std.mem.eql(u8, filter.property, "id")) return error.TestUnexpectedFilter;
+                    const value = (v.Value{ .node = node }).property("id");
+                    matches = matches and switch (filter.op) {
+                        .eq => value.eql(filter.value),
+                        .in => list: {
+                            for (filter.value.list) |item| if (value.eql(item)) break :list true;
+                            break :list false;
+                        },
+                        else => return error.TestUnexpectedFilter,
+                    };
+                }
+                if (!matches) continue;
+                if (out.items.len == limit) break;
+                try out.append(a, node);
+            }
+            return .{ .items = out.items, .examined = out.items.len, .next = if (out.items.len == limit) out.items[out.items.len - 1].identity.key else null };
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND ['A','B'] AS k MATCH(n:Document) WHERE n.id=toLower(k) RETURN sum(n.rank)",
+        "UNWIND ['A','B'] AS k MATCH(n:Document {id:toLower(k)}) RETURN sum(n.rank)",
+        "MATCH(n:Document) WHERE n.id IN [i IN ['A','B'] | toLower(i)] RETURN sum(n.rank)",
+    }) |query| {
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        callbacks.scan = Indexed.scan;
+        callbacks.scan_where = Indexed.filtered;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{ .scanned_anchors = 2 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 3), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(usize, 2), result.stats.scanned_anchors);
+    }
+}
+
+test "computed finite key collections seek once and preserve domains and scope" {
+    for ([_]struct { query: []const u8, total: i64, reads: usize }{
+        .{ .query = "MATCH(n:Document) WHERE antfly.documentKey(n) IN [k IN ['A','B'] | toLower(k)] RETURN sum(n.rank)", .total = 3, .reads = 2 },
+        .{ .query = "WITH ['a','b'] AS keys MATCH(n:Document) WHERE antfly.documentKey(n) IN coalesce(keys,[]) RETURN sum(n.rank)", .total = 3, .reads = 2 },
+        .{ .query = "WITH 'outer' AS k MATCH(n:Document) WHERE antfly.documentKey(n) IN [k IN ['A','A','B'] | toLower(k)] RETURN sum(n.rank)", .total = 3, .reads = 2 },
+        .{ .query = "MATCH(n:Document) WHERE antfly.documentKey(n) IN [k IN ['A','B'] WHERE k<>'B' | toLower(k)] RETURN sum(n.rank)", .total = 1, .reads = 1 },
+        .{ .query = "MATCH(n:Document) WHERE antfly.documentKey(n) IN [i IN range(0,399) | 'n'+toString(i)] RETURN count(n)", .total = 0, .reads = 400 },
+        .{ .query = "MATCH(n:Document) WHERE antfly.documentKey(n) IN reverse(['a','b']) RETURN sum(n.rank)", .total = 3, .reads = 2 },
+        .{ .query = "MATCH(n:Document) WHERE antfly.documentKey(n) IN [k IN [n.id] | k] RETURN sum(n.rank)", .total = 6, .reads = 3 },
+    }) |case| {
+        var fixture: Fixture = .{};
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = case.reads, .intermediate_states = 100000 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.total, result.rows[0][0].integer);
+        try std.testing.expectEqual(case.reads, result.stats.scanned_anchors);
+    }
+}
