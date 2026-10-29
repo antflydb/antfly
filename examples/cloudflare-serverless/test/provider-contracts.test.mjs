@@ -18,7 +18,8 @@ import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {mkdtemp,writeFile,readFile,rm,mkdir,chmod} from 'node:fs/promises';
-import {resolve,join} from 'node:path';
+import {resolve,join,relative} from 'node:path';
+import {assertCommittedSource,assertSameSource,executedNativeBinaries} from '../qualification/native-provenance.mjs';
 const exec=promisify(execFile),runner=resolve('qualification/provider-contracts.mjs');
 
 for(const [name,patch,expected] of [
@@ -81,4 +82,24 @@ fs.writeFileSync(path,JSON.stringify(s));process.stdout.write(JSON.stringify(out
   if(failDelete){assert.equal(saved.cleanup_error,'VersionCleanupDeleteFailed');assert.equal(after.calls.includes('s3 rb'),false);}
   else {assert.equal(saved.cleanup_absence_verified,true);assert.equal(saved.retained_before_cleanup.versions,3);assert.equal(saved.retained_before_cleanup.bytes,300);assert.equal(after.deleted,true);assert.equal(after.entries.length+after.markers.length,0);}
  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('provider qualification requires a committed source before using credentials',()=>{
+ assert.doesNotThrow(()=>assertCommittedSource({revision:'a'.repeat(40),status:''}));
+ for(const status of [' M zig/source.zig\n','?? qualification/new-source.mjs\n'])assert.throws(()=>assertCommittedSource({revision:'a'.repeat(40),status}),/QualificationSourceNotCommitted/);
+});
+test('provider qualification rejects moving commits and source edits during the run',()=>{
+ const initial={revision:'a'.repeat(40),status:''};assert.doesNotThrow(()=>assertSameSource(initial,{...initial}));
+ for(const changed of [{revision:'b'.repeat(40),status:''},{...initial,status:' M zig/source.zig\n'},{...initial,status:'?? qualification/new-source.mjs\n'}])assert.throws(()=>assertSameSource(initial,changed),/QualificationSourceChanged/);
+});
+test('native executable evidence accepts absolute relative and quoted cache paths',()=>{
+ const cwd=resolve('../..','zig'),cache=resolve('../..','.zig-cache/cache [native]'),first=join(cache,'o','abc123','test'),second=join(cache,'o','def456','test-local');
+ const log=['failed command: '+first+' --suite-filter multiprovider','failed command: "'+relative(cwd,first)+'" --suite-filter multiprovider','failed command: '+second+' --suite-filter multiprovider'].join('\n');
+ assert.deepEqual(executedNativeBinaries(log,cache,cwd).map(value=>value.path).sort(),[first,second].sort());
+});
+test('native executable evidence cannot copy paths outside the selected cache',()=>{
+ const cwd=resolve('../..','zig'),cache=resolve('../..','.zig-cache/cache [native]');
+ const log=['failed command: /outside/o/abc123/test --suite-filter x','failed command: '+cache.replace('[native]','n')+'/o/abc123/test --suite-filter x','failed command: /tools/zig test @args'].join('\n');
+ assert.deepEqual(executedNativeBinaries(log,cache,cwd),[]);
 });
