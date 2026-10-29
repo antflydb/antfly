@@ -141,10 +141,13 @@ with b.managed_server(
                     elapsed = time.perf_counter_ns() - start
                     ids = [hit["_source"]["id"] for hit in response["hits"]["hits"]]
                     assert ids == expected, (name, ids, expected)
-                    assert all(
-                        set(hit["_source"]) == {"id", "bucket"}
-                        for hit in response["hits"]["hits"]
-                    )
+                    source_keys = {"id", "bucket"}
+                    if name != "explicit_narrow_control":
+                        source_keys.add("_type")
+                    for hit in response["hits"]["hits"]:
+                        assert set(hit["_source"]) == source_keys
+                        if "_type" in source_keys:
+                            assert hit["_source"]["_type"] == "row"
                     samples.append(
                         {
                             "case": name,

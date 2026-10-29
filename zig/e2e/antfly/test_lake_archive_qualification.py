@@ -17,6 +17,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1982,10 +1983,13 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                         assert [
                             hit["_source"]["id"] for hit in response["hits"]["hits"]
                         ] == expected
-                        assert all(
-                            set(hit["_source"]) == {"id", "bucket"}
-                            for hit in response["hits"]["hits"]
-                        )
+                        source_keys = {"id", "bucket"}
+                        if fields[0] != "id":
+                            source_keys.add("_type")
+                        for hit in response["hits"]["hits"]:
+                            assert set(hit["_source"]) == source_keys, hit["_source"]
+                            if "_type" in source_keys:
+                                assert hit["_source"]["_type"] == "row"
                     sql = client.call(
                         "POST",
                         "/sql",
@@ -2284,8 +2288,6 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                                 ]
                                 == fragment["text"]
                             )
-                            import re
-
                             begin = fragment["offset"]
                             end = begin + len(fragment["text"])
                             expected_spans = []
