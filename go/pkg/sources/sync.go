@@ -111,18 +111,22 @@ func NewSyncWriter(client SyncClient, table, sourceID string, providerIDs []stri
 // Only changed rows are submitted to scoped LinearMerge.
 // documents is updated with the exact projection verified by the shared barrier.
 // Skipped includes fresh query proofs; read-only no-ops have no merge cursor/range.
+// Invalid input closes the writer so earlier proofs cannot authorize cleanup.
 func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) (MergeResult, error) {
 	if w.finished || w.failed || len(documents) == 0 || len(documents) > 1000 {
+		w.failed = true
 		return MergeResult{}, fmt.Errorf("invalid source merge page")
 	}
 	ids := make([]string, 0, len(documents))
 	for id, doc := range documents {
 		key, err := RecordKey(w.sourceID, configString(doc.Metadata, "identity"))
 		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID || doc.Version != 1 || configString(doc.Metadata, "sha256") == "" {
+			w.failed = true
 			return MergeResult{}, fmt.Errorf("record outside pinned source inventory")
 		}
 		digest := sha256.Sum256([]byte(doc.Content))
 		if !utf8.ValidString(doc.Content) || strings.ContainsRune(doc.Content, 0) || configString(doc.Metadata, "sha256") != hex.EncodeToString(digest[:]) {
+			w.failed = true
 			return MergeResult{}, fmt.Errorf("source content digest does not match normalized text")
 		}
 		ids = append(ids, id)

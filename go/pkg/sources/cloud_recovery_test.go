@@ -463,3 +463,63 @@ func TestNewUpsertInvalidatesAnEarlierVerificationBeforeQueryFailure(t *testing.
 	_, err = writer.Finish(t.Context())
 	require.ErrorContains(t, err, "not completely verified")
 }
+
+func TestInvalidUpsertCannotReuseEarlierVerificationForCleanup(t *testing.T) {
+	for _, scenario := range []string{"digest", "invalid_utf8", "nul", "identity", "empty_page", "oversized_page"} {
+		t.Run(scenario, func(t *testing.T) {
+			runner, connector, backend := runnerFixture(t)
+			item := connector.inventory.Objects[0]
+			key, err := RecordKey(testSourceID, item.ID)
+			require.NoError(t, err)
+			doc, err := Normalize(testSourceID, item, connector.data[item.ID], *runner.Profile.Sources[0].Permissions, time.Now())
+			require.NoError(t, err)
+			writer, err := NewSyncWriter(runner.Publisher, "sources", testSourceID, []string{item.ID}, true)
+			require.NoError(t, err)
+			_, err = writer.Upsert(t.Context(), map[string]Document{key: doc})
+			require.NoError(t, err)
+
+			obsolete, err := RecordKey(testSourceID, item.ID+"-obsolete")
+			require.NoError(t, err)
+			backend.mu.Lock()
+			backend.records[obsolete] = map[string]any{"source_id": testSourceID}
+			before := backend.contentMerges
+			backend.mu.Unlock()
+
+			invalid := doc
+			invalid.Metadata = cloneSourceMetadata(doc.Metadata)
+			page := map[string]Document{key: invalid}
+			switch scenario {
+			case "digest":
+				invalid.Content = "changed text with the old digest"
+				page[key] = invalid
+			case "invalid_utf8", "nul":
+				invalid.Content = string([]byte{0xff})
+				if scenario == "nul" {
+					invalid.Content = "text\x00"
+				}
+				invalid.Metadata["sha256"] = fmt.Sprintf("%x", sha256.Sum256([]byte(invalid.Content)))
+				page[key] = invalid
+			case "identity":
+				invalid.Metadata["source_id"] = "another-source"
+			case "empty_page":
+				page = nil
+			case "oversized_page":
+				for i := 0; i < 1000; i++ {
+					page[fmt.Sprintf("extra-%d", i)] = invalid
+				}
+			}
+			_, err = writer.Upsert(t.Context(), page)
+			require.Error(t, err)
+			_, err = writer.Finish(t.Context())
+			require.Error(t, err, "an invalid update must not authorize cleanup using an earlier verification")
+			_, err = writer.Upsert(t.Context(), map[string]Document{key: doc})
+			require.Error(t, err, "validation failure requires a new writer")
+			backend.mu.Lock()
+			defer backend.mu.Unlock()
+			require.Equal(t, before, backend.contentMerges)
+			require.Zero(t, backend.cleanupMerges)
+			require.Zero(t, backend.deletes)
+			require.Contains(t, backend.records, obsolete)
+		})
+	}
+}
