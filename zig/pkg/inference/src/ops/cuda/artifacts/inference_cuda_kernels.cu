@@ -1470,6 +1470,7 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(
     }
 }
 
+// tile-codegen:begin rms_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rms_norm_f32(
     float* dst,
     const float* input,
@@ -1738,6 +1739,7 @@ extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(
         third[idx] = normalized * third_weight[i];
     }
 }
+// tile-codegen:end rms_norm family
 
 // Fused Gemma 4 A4B parallel-FFN epilogue:
 //   rms(shared) + rms(routed) -> rms(combined) + attention residual.

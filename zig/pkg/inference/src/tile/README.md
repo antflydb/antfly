@@ -59,6 +59,24 @@ default baseline x86-64 target (no AVX/FMA) is about 15x slower.
 failure). The model kernels are generated for Metal and CUDA but no runtime
 launches them yet; the OpenCL harness is the host-side reference for doing so.
 
+## Production RMSNorm family (`rms_norm.zig`)
+
+The 17 Metal RMSNorm kernels in `metal_kernels.m` and the 8 in
+`inference_cuda_kernels.cu` are generated from descriptions into
+marker-delimited regions (`tile-codegen:begin/end rms_norm family`) with
+unchanged names, buffer slots and params structs, so host dispatch is
+untouched.
+
+- Metal is generated freely. `scripts/tile/check_metal_rms_norm.py <old.m>
+  <new.m>` compiles both versions' MSL as C++ against a small shim, runs every
+  kernel with one OS thread per GPU thread (real barriers and `simd_sum`)
+  over a grid of shapes and threadgroup sizes, requires bitwise-equal
+  outputs, and checks two kernels against an f64 reference.
+- CUDA renders byte-identical to the previous hand-written text, so the
+  checked-in PTX/fatbin/cubin stay valid without a CUDA toolkit. Merging the
+  CUDA table into the Metal one (one description per kernel) needs an
+  artifact regeneration with the pinned CUDA 13.2 toolchain.
+
 ## Commands
 
 ```sh

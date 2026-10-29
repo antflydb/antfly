@@ -24,6 +24,7 @@ const std = @import("std");
 const gpu = @import("gpu.zig");
 const whisper = @import("whisper_logits.zig");
 const gpu_model = @import("gpu_model.zig");
+const rms_norm = @import("rms_norm.zig");
 const whisper_model = @import("whisper_model.zig");
 
 const File = struct { path: []const u8, data: []const u8 };
@@ -34,6 +35,25 @@ const files = [_]File{
     .{ .path = "src/ops/cuda/generated/tile_whisper_logits.cu", .data = gpu.renderCuda(whisper.kernel) },
     .{ .path = "src/ops/metal/generated/tile_whisper_model.metal", .data = gpu_model.renderModule(whisper_model.kernels, .metal, "src/tile/whisper_model.zig") },
     .{ .path = "src/ops/cuda/generated/tile_whisper_model.cu", .data = gpu_model.renderModule(whisper_model.kernels, .cuda, "src/tile/whisper_model.zig") },
+};
+
+/// Generated regions inside hand-maintained files: the text between the
+/// begin and end marker lines is owned by the generator.
+const Region = struct { path: []const u8, begin: []const u8, end: []const u8, data: []const u8 };
+
+const regions = [_]Region{
+    .{
+        .path = "src/backends/metal_kernels.m",
+        .begin = "           // tile-codegen:begin rms_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)\n",
+        .end = "           // tile-codegen:end rms_norm family\n",
+        .data = rms_norm.metalRegion(),
+    },
+    .{
+        .path = "src/ops/cuda/artifacts/inference_cuda_kernels.cu",
+        .begin = "// tile-codegen:begin rms_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)\n",
+        .end = "// tile-codegen:end rms_norm family\n",
+        .data = rms_norm.cudaRegion(),
+    },
 };
 
 const opencl_source = gpu_model.renderModule(whisper_model.kernels, .opencl, "src/tile/whisper_model.zig");
@@ -73,6 +93,33 @@ pub fn main(init: std.process.Init) !void {
         };
         if (!std.mem.eql(u8, actual, f.data)) {
             std.debug.print("{s}: stale\n", .{f.path});
+            stale += 1;
+        }
+    }
+    for (regions) |r| {
+        const contents = cwd.readFileAlloc(io, r.path, allocator, .limited(64 * 1024 * 1024)) catch |err| {
+            std.debug.print("{s}: {s}\n", .{ r.path, @errorName(err) });
+            stale += 1;
+            continue;
+        };
+        const begin = std.mem.indexOf(u8, contents, r.begin) orelse {
+            std.debug.print("{s}: missing marker {s}", .{ r.path, r.begin });
+            stale += 1;
+            continue;
+        };
+        const body_start = begin + r.begin.len;
+        const body_end = std.mem.indexOfPos(u8, contents, body_start, r.end) orelse {
+            std.debug.print("{s}: missing marker {s}", .{ r.path, r.end });
+            stale += 1;
+            continue;
+        };
+        if (std.mem.eql(u8, contents[body_start..body_end], r.data)) continue;
+        if (write) {
+            const updated = try std.mem.concat(allocator, u8, &.{ contents[0..body_start], r.data, contents[body_end..] });
+            try cwd.writeFile(io, .{ .sub_path = r.path, .data = updated });
+            std.debug.print("wrote region in {s}\n", .{r.path});
+        } else {
+            std.debug.print("{s}: generated region stale\n", .{r.path});
             stale += 1;
         }
     }
