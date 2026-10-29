@@ -30,3 +30,20 @@ pub fn testArtifactPhysicalOwnership(alloc: @import("std").mem.Allocator, io: @i
     for (validated.artifacts) |*artifact| try receipt.verifyValidatedArtifactSha256(io, artifact, artifact.sha256.?);
     return validated.artifacts[0].size;
 }
+
+pub fn testDirectoryPhysicalOwnership(alloc: @import("std").mem.Allocator, io: @import("std").Io, path: []const u8, context: *anyopaque, check: *const fn (*anyopaque) anyerror!void, park: *const fn (*anyopaque) anyerror!void, enter: *const fn (*anyopaque) anyerror!void) !u64 {
+    if (!@import("builtin").is_test) @compileError("test only");
+    const execution = @import("execution_control.zig");
+    var scope = execution.CheckpointScope.init(.{ .context = context, .check_fn = check, .wait_begin_fn = park, .wait_end_fn = enter });
+    defer scope.deinit();
+    var walker = try @import("util/admitted_walker.zig").Walker.init(alloc, io, path);
+    defer walker.deinit();
+    var count: u64 = 0;
+    while (try walker.next()) |entry| {
+        if (entry.basename[0] == '.') continue;
+        if (entry.kind == .directory) try walker.enter(entry) else if (@import("std").mem.endsWith(u8, entry.basename, ".gguf")) {
+            count += 1;
+        }
+    }
+    return count;
+}

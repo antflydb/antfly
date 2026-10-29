@@ -1727,3 +1727,27 @@ open: serial graph checkpoint preparation, framework/vendor and registry
 preparation, mapped-page-fault scope and wider cross-engine/deployment evidence
 still require their complete production milestones. Full GNU qualification
 remains waived.
+
+
+### Graph and model directory preparation frontier
+
+Graph preparation is integrated in `2eed95bd00`: topology/CSR construction,
+projection, sorting and metric encoding checkpoint their existing owner. The
+focused graph root passes 80 serverless cases and 32 embedded cases, including
+a queued query progressing through a 32,768-node / 131,072-edge public build,
+serial-identical output and refused preparation cleanup.
+
+Model manifest GGUF directory discovery now lends the same worker's CPU grant
+through physical directory operations, while owning all opened directories
+through cancellation, refused reentry and allocation failure. The normal listing
+path preserves nested decoder/projector identity and retries successfully.
+Real API-owner integration checks query/control progress, retained-byte and team
+ownership, and descriptor recovery at every physical refusal. The focused native
+manifest suite selects and passes 11 cases with no skips; production worker
+semantic checks pass. See `model-discovery-final.json` and the resource ownership
+ledger for the exact deterministic integration scope.
+
+The file-engine descriptor recovery gate remains closed for its unchanged macOS
+profile. The full goal remains open for framework/vendor construction, registry
+pull/download admission and preparation, mapped-page-fault scope, and wider
+cross-engine/deployment evidence. Full GNU qualification remains waived.

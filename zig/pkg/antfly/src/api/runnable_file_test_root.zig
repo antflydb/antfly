@@ -106,6 +106,14 @@ test "native model files lend actual owner capacity and preserve rejected return
 }
 
 test "native model artifact receipts lend actual owner capacity and preserve rejected return ownership" {
+    try testPhysicalArtifactOwnership(false);
+}
+
+test "native model directory discovery lends actual owner capacity and closes every refused traversal" {
+    try testPhysicalArtifactOwnership(true);
+}
+
+fn testPhysicalArtifactOwnership(comptime directory: bool) !void {
     const Clock = struct {
         fn now() u64 {
             return 0;
@@ -169,6 +177,12 @@ test "native model artifact receipts lend actual owner capacity and preserve rej
     try tmp.dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data = receipt });
     const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(path);
+    if (directory) {
+        try tmp.dir.createDirPath(io, "a/b/c");
+        try tmp.dir.writeFile(io, .{ .sub_path = "a/b/c/other.gguf", .data = "other" });
+        try tmp.dir.createDirPath(io, ".hidden/cache");
+        try tmp.dir.writeFile(io, .{ .sub_path = ".hidden/cache/stale.gguf", .data = "stale" });
+    }
     const Fds = struct {
         fn count() !usize {
             var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, if (@import("builtin").os.tag == .linux) "/proc/self/fd" else "/dev/fd", .{ .iterate = true });
@@ -193,9 +207,9 @@ test "native model artifact receipts lend actual owner capacity and preserve rej
         defer if (parent) |handle| owner.finish(handle);
         probe.parent = parent.?;
         probe.retained_bytes = state.owner.scheduler.stats().retained_bytes;
-        const result = files.testArtifactPhysicalOwnership(alloc, io, path, &probe, Probe.check, Probe.park, Probe.enter);
+        const result = if (directory) files.testDirectoryPhysicalOwnership(alloc, io, path, &probe, Probe.check, Probe.park, Probe.enter) else files.testArtifactPhysicalOwnership(alloc, io, path, &probe, Probe.check, Probe.park, Probe.enter);
         if (reject_at == 0) {
-            try std.testing.expectEqual(@as(u64, body.len), try result);
+            try std.testing.expectEqual(if (directory) @as(u64, 2) else @as(u64, body.len), try result);
             try std.testing.expectEqual(@as(usize, 2), state.owner.scheduler.stats().runnable_slots);
             total_waits = probe.waits;
             try std.testing.expect(total_waits > 10);

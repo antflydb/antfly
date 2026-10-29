@@ -29,6 +29,8 @@ const gliner_boundary = @import("gliner_boundary.zig");
 const gliner_qualification = @import("gliner_boundary_qualification.zig");
 const boundary_bundle = @import("gliner_boundary_bundle.zig");
 const compat = @import("../io/compat.zig");
+const execution = @import("../execution_control.zig");
+const artifact_walker = @import("../util/admitted_walker.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
@@ -2530,7 +2532,7 @@ fn posixBasename(path: []const u8) []const u8 {
 
 fn resolvedWalkerEntryKind(io: std.Io, entry: Dir.Walker.Entry) !?std.Io.File.Kind {
     if (entry.kind != .unknown) return entry.kind;
-    const stat = entry.dir.statFile(io, entry.basename, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    const stat = execution.physicalWait(Dir.statFile, .{ entry.dir, io, entry.basename, Dir.StatFileOptions{ .follow_symlinks = false } }) catch |err| switch (err) {
         // Directory iteration is only a snapshot. A concurrent cleanup may
         // remove an entry before filesystems that report DT_UNKNOWN can stat it.
         error.FileNotFound => return null,
@@ -2548,6 +2550,7 @@ fn discoverGgufPathsWithCatalog(allocator: std.mem.Allocator, catalog: *const Ar
 
     if (catalog.receipt) |*validated| {
         for (validated.artifacts) |artifact| {
+            try (execution.InferenceExecutionControl{}).check();
             try selection.consider(
                 allocator,
                 posixBasename(artifact.path),
@@ -2560,23 +2563,20 @@ fn discoverGgufPathsWithCatalog(allocator: std.mem.Allocator, catalog: *const Ar
         return selection.paths;
     }
 
-    var dir = Dir.cwd().openDir(io, base_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var walker = artifact_walker.Walker.init(allocator, io, base_dir) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return .{},
         else => return err,
     };
-    defer dir.close(io);
-
-    var walker = try dir.walkSelectively(allocator);
     defer walker.deinit();
 
-    while (try walker.next(io)) |entry| {
+    while (try walker.next()) |entry| {
         const name = entry.basename;
         if (name.len == 0 or name[0] == '.') continue;
         const kind = (try resolvedWalkerEntryKind(io, entry)) orelse continue;
         if (kind == .directory) {
             var directory_entry = entry;
             directory_entry.kind = .directory;
-            try walker.enter(io, directory_entry);
+            try walker.enter(directory_entry);
             continue;
         }
         if (kind != .file and kind != .sym_link) continue;
@@ -8454,4 +8454,82 @@ test "dense embedding output geometry requires resolved metadata" {
     const qwen = manifest.denseEmbeddingOutput().?;
     try std.testing.expectEqual(@as(u32, 1024), qwen.native_dimensions);
     try std.testing.expectEqual(@as(u32, 32), qwen.minimum_dimensions);
+}
+
+test "model artifact discovery preserves listing identity and refuses every original CPU return" {
+    const Probe = struct {
+        running: bool = true,
+        returns: usize = 0,
+        refuse_at: usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+        }
+        fn park(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+            self.running = false;
+        }
+        fn enter(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.running);
+            self.returns += 1;
+            if (self.returns == self.refuse_at) return error.ModelDiscoveryReturnDenied;
+            self.running = true;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "weights/nested");
+    try tmp.dir.createDirPath(io, ".hidden/stale");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\",\"tasks\":[\"generate\"]}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights/nested/model.gguf", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights/mmproj-model.gguf", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".hidden/stale/model.gguf", .data = "" });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(path);
+    var total: usize = 1;
+    var refuse_at: usize = 0;
+    while (refuse_at <= total) : (refuse_at += 1) {
+        var probe: Probe = .{ .refuse_at = refuse_at };
+        var scope = execution.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.park, .wait_end_fn = Probe.enter });
+        defer scope.deinit();
+        if (refuse_at == 0) {
+            var manifest = (try loadListingCandidateFromDir(alloc, path)).?;
+            defer manifest.deinit();
+            try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "weights/nested/model.gguf"));
+            try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_projector_path.?, "weights/mmproj-model.gguf"));
+            try std.testing.expect(manifest.hasTask("generate"));
+            total = probe.returns;
+            try std.testing.expect(total > 10);
+        } else {
+            try std.testing.expectError(error.ModelDiscoveryReturnDenied, loadListingCandidateFromDir(alloc, path));
+            try std.testing.expectEqual(refuse_at, probe.returns);
+            try std.testing.expect(!probe.running);
+        }
+    }
+    var retry = (try loadListingCandidateFromDir(alloc, path)).?;
+    defer retry.deinit();
+    try std.testing.expect(retry.gguf_path != null);
+    const Exercise = struct {
+        fn descriptors() !usize {
+            const name = if (@import("builtin").os.tag == .linux) "/proc/self/fd" else "/dev/fd";
+            var directory = try Dir.openDirAbsolute(std.testing.io, name, .{ .iterate = true });
+            defer directory.close(std.testing.io);
+            var iterator = directory.iterate();
+            var count: usize = 0;
+            while (try iterator.next(std.testing.io)) |_| count += 1;
+            return count;
+        }
+        fn run(a: std.mem.Allocator, root: []const u8) !void {
+            const before = try descriptors();
+            defer std.debug.assert((descriptors() catch @panic("descriptor count failed")) == before);
+            var manifest = (try loadListingCandidateFromDir(a, root)).?;
+            defer manifest.deinit();
+        }
+    };
+    if (@import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos)
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Exercise.run, .{path});
 }

@@ -5666,3 +5666,35 @@ functions. It does not establish deployed HTTP latency, cloud-provider throughpu
 or mapped-page-fault qualification. Model/framework/download preparation and the
 remaining cross-engine qualification remain part of the broader objective. The
 existing full GNU qualification waiver remains in effect.
+
+
+### Model artifact directory discovery retains its original execution
+
+Model manifest loading and listing now traverse GGUF artifact directories through
+an owned walker. Each physical directory open, iterator read and unknown-kind
+stat lends the synchronous worker's existing CPU grant. Path/frame allocation,
+artifact selection and receipt iteration run with that grant. No request token
+is stored in the resulting manifest. Hidden trees, decoder/projector selection
+and managed-receipt authority retain their existing behavior.
+
+The traversal owns every opened directory until exhaustion or explicit cleanup.
+Rejected CPU return, early stop, and allocation failure close the whole remaining
+stack without requesting new execution capacity. This fixes child-directory
+retention when preparation exits before the standard selective walker exhausts.
+
+`antfly-inference-file-owner-test` exercises the shared production walker through
+actual API-owned grants: query and control operations progress at every wait;
+the original team/retained bytes survive successful return; every rejected return
+recovers the process descriptor baseline. Focused inference tests call the normal
+manifest listing/candidate path, preserve nested decoder/projector identity,
+propagate every injected original return failure, retry successfully, and sweep
+all allocation failures with a descriptor-count assertion. The production
+`antfly-inference-worker-provider-check` also passes. Receipts are recorded as
+`model-discovery-v1.json`, `model-discovery-v2.json`, and `model-discovery-final.json`
+in the cumulative integration directory.
+
+This closes directory discovery within admitted model preparation. It does not
+admit embedded model pulls, which currently have no shared execution grant, or
+qualify vendor/framework construction, downloads, mapped-page faults, or deployed
+cross-engine performance. Those remain in the full goal; full GNU qualification
+remains waived.
