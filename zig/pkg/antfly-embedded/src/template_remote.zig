@@ -247,13 +247,7 @@ pub fn renderJsonToPartsWithConfig(
     return try template_mod.textToParts(alloc, rendered);
 }
 
-pub fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
-    const directives = try template_mod.parseErrorDirectives(alloc, rendered);
-    defer template_mod.freeErrorDirectives(alloc, directives);
-    if (directives.len == 0) return;
-    if (directives[0].isPermanent()) return RenderError.PermanentPromptFailure;
-    return RenderError.TransientPromptFailure;
-}
+pub const validateRenderedTemplate = @import("template_inspection.zig").validateRenderedTemplate;
 
 fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     try beginRemoteHelper(ctx);
