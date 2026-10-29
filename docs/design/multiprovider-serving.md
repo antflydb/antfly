@@ -467,8 +467,32 @@ selects a reserved relative physical prefix only through an explicit immutable
 marker on a pristine logical root. Existing cloud version-one keys and receipts
 retain their exact layout; old filesystem markers fail closed instead of being
 rewritten. The new focused tests pass 31 with three environment skips and no
-failures/leaks. The failed process report remains preserved while the corrected
-release is rebuilt. The smoke uses API-only mode with manual publication enabled,
+failures/leaks. The failed process report remains preserved. The corrected stripped release
+now passes the API-only process lifecycle, including exact publication/reopen
+reads, a subsequent write, persisted reader policy and clean shutdown/storage
+cleanup. The inspector verifies the filesystem object envelope and SHA-256
+before decoding its payload; earlier inspector failures remain preserved. The smoke uses API-only mode with manual publication enabled,
 requires live/ready/validated health, isolates fixture configuration from inherited
 Antfly environment variables, and waits for process output to close before
 recording cleanup. It does not qualify a background maintenance loop.
+
+
+At corrected implementation `489e28c436`, final qualification passes 635 native
+tests (nine environment skips, no failures/leaks), all 334 Node cases and fresh
+real GCS contracts in both versioning modes with cleanup/absence verified.
+The three rebuilt WASMs remain byte-identical to the sealed main-integration
+family, retaining its 31 workerd cases, 50,000-document/metadata scale and frozen
+ANN results by exact closure. The native collector and scale-test body also
+match the batched checkpoint exactly. Final native binary SHA-256 is
+`761cefcb16412ecaf0fd25c1d2dfd97dafbe5ac09b6a085f3edcab607f9786ca`.
+
+The current local Cloudflare proposal is under
+`native-gc-batch-lab/cloudflare-root-layout/gate-mvslyh876561/`, built from
+`489e28c436`. Its control bundles remain exactly `c44896ac8c`; all configuration
+is unchanged except local entry paths. Verification passes without copying
+tokens or changing cloud resources/deployments. The earlier local proposal and
+the actual paused deployment at `131a703fed` remain preserved. Copy the final
+proposal into an unsealed runtime directory before any authorized lifecycle
+changes. AWS's fresh default-profile check still returns `NoCredentials`.
+Recovered platform `SQLITE_NOMEM`, the live Cloudflare gate and matched
+colocated provider performance remain open.

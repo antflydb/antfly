@@ -69,7 +69,29 @@ async function start(collection){
  }
  if(!ready)throw Error('NativeReadinessTimedOut');report.lifecycles.push({runtime_role:'api',collection_enabled:collection,ready:true,environment_isolated:true,arguments:args});return call;
 }
-async function inspect(path,latest){let marker=false,managedHeads=0;for(const entry of await readdir(path,{withFileTypes:true})){const p=join(path,entry.name);if(entry.isDirectory()){const nested=await inspect(p,latest);marker ||= nested.marker;managedHeads+=nested.managedHeads;}else if(entry.isFile()&&(await stat(p)).size<=4096){const value=await readFile(p,'utf8');if(value==='antfly-wal:indexed-managed:2')marker=true;try{const head=JSON.parse(value);if(head.root_lifetime_ms===30000&&head.latest_lsn===latest)managedHeads++;}catch{}}}return{marker,managedHeads};}
+async function inspect(path,latest){
+ let marker=false,managedHeads=0,validatedObjects=0;
+ for(const entry of await readdir(path,{withFileTypes:true})){
+  const p=join(path,entry.name);
+  if(entry.isDirectory()){const nested=await inspect(p,latest);marker ||= nested.marker;managedHeads+=nested.managedHeads;validatedObjects+=nested.validatedObjects;continue;}
+  if(!entry.isFile()||(await stat(p)).size>84+16384+4096)continue;
+  const bytes=await readFile(p);
+  if(bytes.subarray(0,8).toString('ascii')!=='AFOBJ001')continue;
+  assert.ok(bytes.length>=84,'TruncatedFilesystemObjectHeader');
+  const length=bytes.readBigUInt64LE(8),typeLength=bytes.readUInt32LE(16);
+  assert.ok(typeLength<=16384,'InvalidFilesystemContentType');
+  assert.equal(84n+BigInt(typeLength)+length,BigInt(bytes.length),'InvalidFilesystemObjectLength');
+  if(length>4096n)continue;
+  const body=bytes.subarray(84+typeLength);
+  assert.equal(createHash('sha256').update(body).digest('hex'),bytes.subarray(20,84).toString('ascii'),'FilesystemObjectChecksumMismatch');
+  validatedObjects++;
+  const value=body.toString('utf8');
+  if(value==='antfly-wal:indexed-managed:2')marker=true;
+  try{const head=JSON.parse(value);if(head.root_lifetime_ms===30000&&head.latest_lsn===latest)managedHeads++;}catch{}
+ }
+ return{marker,managedHeads,validatedObjects,object_format:'AFOBJ001'};
+}
+
 try{
  let call=await start(true);
  await call('PUT','/internal/v1/namespaces/docs',{created_at_ns:123,policy:{default_query_view:'published',keep_latest_versions:4,max_pending_records:4,compaction_trigger_version_count:2,vector_distance_metric:'inner_product'}},201);

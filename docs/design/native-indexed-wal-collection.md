@@ -301,5 +301,22 @@ and no failures/leaks. It covers fresh filesystem HTTP namespace admission,
 selection acknowledgment loss, receipt replay, collection/private cleanup under
 the relative root, version-one cloud compatibility, filesystem refusal to
 reinterpret old markers, and historical activation guards. The initial release
-smoke failure remains preserved; the corrected release and full qualification
-are being rebuilt separately before claiming that smoke passes.
+smoke failure remains preserved. At `489e28c436`, the corrected full native
+command passes 635 tests with nine environment skips and no failures/leaks;
+all 334 Node tests and both fresh standard-GCS modes pass. Final buckets
+`antfly-1278-multi-mvt5xcxr-75cf3288` (unversioned, 54 collected objects) and
+`antfly-1278-multi-mvt5xbpo-2b7ef8bf` (versioned, 59) are removed with absence
+verified. The collector implementation and 50,000-record scale body remain
+source-identical to the batched checkpoint.
+
+
+The corrected stripped release also passes the actual API-only process smoke:
+HTTP ingest, explicit publication and exact latest-body reads; clean shutdown;
+reopen with collection disabled; another write and exact three-document reads.
+After each shutdown, the inspector validates the filesystem backend's
+`AFOBJ001` envelope, content length and SHA-256 before decoding the managed
+marker and HEAD. It verifies layout two, latest LSNs 2 then 3, and the persisted
+30-second reader lifetime. Both processes exit with code zero and owned storage
+is removed. The earlier plain-text-inspector failures remain separate failed
+reports. This is a Darwin file-backend lifecycle smoke, not a cloud latency,
+background maintenance-loop or keyed HTTP ingestion qualification.
