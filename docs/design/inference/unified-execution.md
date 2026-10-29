@@ -3388,3 +3388,9 @@ for four host-backed K-block FFN routes, preserving their distinct normalization
 and projection schedules, public ABIs and error precedence. Its qualification
 compares original outputs and real Metal command traces and injects allocation
 and encoder failures.
+
+### AT ternary Metal host FFN execution
+
+[The AT register](unified-execution-at-outcomes.md) records a shared specialized
+TL1/TL2 host owner, its original-versus-candidate command and output checks,
+and two corrected C/Zig FFN ABI mismatches with real-device regression tests.

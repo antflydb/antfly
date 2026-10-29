@@ -3,6 +3,12 @@
 Audited head: `25c557cc70`. This is an audit and proposed implementation scope,
 not another completed consolidation campaign. No production source changed.
 
+This is a historical inventory. Subsequent implementation and measured results
+are recorded in [AR](unified-execution-ar-outcomes.md),
+[AS](unified-execution-as-outcomes.md), and
+[AT](unified-execution-at-outcomes.md). The estimates below are not remaining
+work budgets or measured reductions at the current head.
+
 ## Recommendation
 
 Prioritize whole lifecycle and execution-family owners. The next changes should
