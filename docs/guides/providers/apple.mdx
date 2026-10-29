@@ -1,0 +1,38 @@
+---
+title: Apple
+description: macOS Vision OCR, SpeechAnalyzer transcription, and Foundation Models generation on device
+---
+
+The `apple` provider uses Apple's on-device frameworks on macOS. macOS server
+release archives include Vision OCR; source builds enable it with
+`-Dapple-ocr=true`, or all three components with `-Dapple-providers=true`.
+
+## What It Provides
+
+| Component | Inputs | Framework |
+|---|---|---|
+| Reader | Images | Vision text recognition, with `recognition_languages` and `recognition_level` |
+| Transcriber | Audio files | SpeechAnalyzer |
+| Generator | Text | Foundation Models (Apple Intelligence) |
+
+Apple components take no `model`: the operating system provides it. Each has
+its own availability; working OCR does not imply that the Apple Intelligence
+generation model is ready. Generation and transcription need macOS 26 or later.
+
+## Credentials
+
+None. Everything runs on the device.
+
+## Example
+
+```json
+{
+  "readers": {
+    "vision": { "provider": "apple", "recognition_languages": ["en-US"] }
+  }
+}
+```
+
+## Related
+
+- [Native Apple providers](/docs/guides/apple-native-ocr): building, OCR in Antfarm, indexing scanned PDFs, and limits
