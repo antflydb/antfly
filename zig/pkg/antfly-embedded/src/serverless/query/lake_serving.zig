@@ -1230,7 +1230,7 @@ pub const ServingSource = struct {
     pub fn protectContext(self: *ServingSource, parent: @import("lake_read_context.zig").Context) @import("lake_read_context.zig").Context {
         if (self.snapshot_pin) |pin| {
             var context = parent;
-            context.additional_checkpoint = .{ .ptr = pin.ptr, .check = pin.check };
+            context.read_lease = .{ .ptr = pin.ptr, .check = pin.check };
             // The pin owner also retains the original context (including any
             // publication lease), so adding protection never drops authority.
             return context;
@@ -1672,4 +1672,40 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try private.ensureInventory(.{});
     try private.ownInventory();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &constrained, metadata });
+}
+
+test "external lake snapshot context preserves owner checkpoints and passive lease checks" {
+    const Context = @import("lake_read_context.zig").Context;
+    const State = struct {
+        owner_checks: usize = 0,
+        lease_checks: usize = 0,
+        denied: bool = false,
+        expired: bool = false,
+        fn owner(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.owner_checks += 1;
+            if (self.denied) return error.Forbidden;
+        }
+        fn lease(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lease_checks += 1;
+            if (self.expired) return error.LakeSnapshotReadLeaseExpired;
+        }
+        fn destroy(_: *anyopaque) void {}
+    };
+    var state: State = .{};
+    var source: ServingSource = undefined;
+    source.snapshot_pin = .{ .ptr = &state, .check = State.lease, .deinit = State.destroy };
+    const original: Context = .{ .additional_checkpoint = .{ .ptr = &state, .check = State.owner } };
+    const protected = source.protectContext(original);
+    try protected.checkLifetime();
+    try std.testing.expectEqual(@as(usize, 0), state.owner_checks);
+    try std.testing.expectEqual(@as(usize, 1), state.lease_checks);
+    try protected.ensureActive();
+    try std.testing.expectEqual(@as(usize, 1), state.owner_checks);
+    state.denied = true;
+    try std.testing.expectError(error.Forbidden, protected.ensureActive());
+    state.expired = true;
+    try std.testing.expectError(error.LakeSnapshotReadLeaseExpired, protected.checkLifetime());
+    try std.testing.expectEqual(@as(usize, 2), state.owner_checks);
 }

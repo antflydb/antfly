@@ -75,7 +75,7 @@ pub const BindingObjectStoreOpenOptions = struct {
         const self: *const @This() = @ptrCast(@alignCast(raw));
         if (source.catalog == null or self.node_config == null or self.node_config.?.storage.artifacts.connection == null or snapshot.len == 0) return null;
         const pins = @import("lake_snapshot_pins.zig");
-        var opened = try openNativeArtifactObjectStoreAlloc(pin_alloc, self.node_config.?, self.secret_store, false);
+        var opened = try openNativeArtifactObjectStoreFor(pin_alloc, self.node_config.?, self.secret_store, false, context);
         errdefer opened.deinit();
         const prefix = try pins.namespace(pin_alloc, opened.prefix, source, uuid);
         errdefer pin_alloc.free(prefix);
@@ -920,4 +920,38 @@ test "credentialed binding lake capabilities keep read and write workflow author
             }
         }
     }
+}
+
+test "external lake snapshot resolver rejects original authority before opening artifact credentials" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Context = local.serverless_query_lake_read_context.Context;
+    var cfg = try common_config.Config.parseFromSlice(a,
+        \\{"storage":{"engine":"local","local":{},"artifacts":{"connection":"native","bucket":"pins","prefix":"native"}},"connections":{"native":{"kind":"external_io","capabilities":["storage.primary"],"external_io":{"protocol":"s3","buckets":["pins"],"prefix":"native"}}}}
+    );
+    defer cfg.deinit();
+    const options: BindingObjectStoreOpenOptions = .{ .node_config = &cfg };
+    const resolver = options.lakeOptions().snapshot_pin_resolver.?;
+    const source: catalog_binding.Binding = .{ .table_id = "events", .format = .parquet, .source_uri = "s3://pins/events", .schema_fingerprint = "v1", .catalog = .{ .type = .managed } };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 3 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.startWithSlots(&scheduler, .{ .io = std.testing.io }, .query, 2);
+    var context = (Context{ .io = std.testing.io, .deadline_ns = 0 }).withExecution(&execution);
+    try std.testing.expectError(error.DeadlineExceeded, resolver.acquire(resolver.ptr, a, source, "42", "uuid", context));
+    const Authority = struct {
+        fn check(_: *anyopaque) !void {
+            return error.CatalogGenerationChanged;
+        }
+    };
+    var marker: u8 = 0;
+    context.deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    context.authority = .{ .ptr = &marker, .check = Authority.check };
+    try std.testing.expectError(error.CatalogGenerationChanged, resolver.acquire(resolver.ptr, a, source, "42", "uuid", context));
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

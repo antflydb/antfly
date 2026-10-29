@@ -28,6 +28,9 @@ pub const Context = struct {
     /// Original read authority is independent of CPU ownership and may be
     /// polled while parked. Its callback must not acquire a runnable grant.
     authority: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    /// Passive snapshot protection is independent of the current owner's
+    /// checkpoint. Rebinding a source must preserve both checks.
+    read_lease: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     execution: ?*@import("../../common/runnable_scheduler.zig").Execution = null,
     wait: ?@import("../../sql/execution_wait.zig").Boundary = null,
     /// A synchronous physical object-provider operation. Encoding, decoding and
@@ -73,6 +76,7 @@ pub const Context = struct {
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         if (self.execution) |execution| try execution.checkLifetime();
         if (self.authority) |hook| try hook.check(hook.ptr);
+        if (self.read_lease) |hook| try hook.check(hook.ptr);
     }
     pub fn ensureActive(self: Context) !void {
         try self.checkLifetime();

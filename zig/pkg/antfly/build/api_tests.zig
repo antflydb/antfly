@@ -1541,7 +1541,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_lake_admission_tests = b.addTest(.{
         .name = "sql-lake-admission-tests",
         .root_module = options.api_http_runtime_test_mod,
-        .filters = &.{ "SQL lake request admission", "lake SQL accepted capability", "external lake snapshot retirement", "external lake segmented WAL", "external lake WAL collection" },
+        .filters = &.{ "SQL lake request admission", "lake SQL accepted capability", "external lake snapshot retirement", "external lake snapshot heartbeat", "external lake snapshot resolver", "external lake snapshot context", "external lake segmented WAL", "external lake WAL collection" },
         .max_rss = 6 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

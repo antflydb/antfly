@@ -1209,3 +1209,52 @@ production source hashes match the broad run; only this regression case
 was added afterward. `read-pin-renewal-final.json` binds
 these source bytes to the committed snapshots. Licensing and Apache boundary
 checks pass. No full qualification or live-cloud claim is made.
+
+
+### Lake snapshot heartbeat authority and provider boundaries (2026-10-29, in progress)
+
+Snapshot-pin acquisition, renewal and retirement now use the existing physical
+provider adapters. Allocation, numeric parsing and CAS formatting stay outside
+physical object waits. The configured snapshot resolver forwards the original
+read context into artifact-store opening, so an expired or refused source fails
+before credential/provider initialization.
+
+Owner checks are passive: they inspect the original request/root lifetime,
+sticky provider refusal, and cached Unix/suspend-inclusive source deadlines.
+Background renewal does not invoke foreground checkpoint or wait hooks. Each
+provider attempt is bounded by the minimum of its ten-second ceiling and the
+original read deadline. Renewal checks old source rights through every physical
+wait and before publishing its new local bounds, so a delayed response cannot
+revive an expired reader. Precise cancellation, deadline and retirement errors
+survive the heartbeat instead of becoming a generic lease-expired flag. Other
+provider failures retain the existing unavailable-reader contract.
+
+This exposed an existing coupling in ServingSource.protectContext: snapshot
+protection replaced the caller's additional checkpoint. A separate passive
+read-lease hook now preserves both lease protection and the current owner's
+policy checkpoint across execution rebinding. Lifetime polling runs the lease
+hook; runnable owner checkpoints continue to validate policy.
+
+The real periodic worker is tested against a filesystem object provider with
+an injected uncancelable sync barrier. Coverage includes initial acquisition
+lending its original query CPU, passive checks during renewal, cancellation,
+original expiry, source-authority expiry, retirement and destruction physically
+joining the blocked callback. The configured S3 resolver's refusal tests stop
+before credential/provider opening; they do not claim a live S3 operation. SQL
+retained-cut, catalog/WAL/pin admission and maintenance source-pin tests exercise
+the normal surrounding callers.
+
+The lake heartbeat milestone is NOT complete. Periodic heartbeat tasks still
+need shared, admitted execution. The next production path is a bounded renewal
+service shared across snapshot readers, with per-reader original lifetime checks,
+physical callback detachment/join and server shutdown. Its operation/byte limits
+must preserve health progress; a control child per snapshot would exhaust the
+small protected reserve for ordinary multi-table reads. The current tests prove
+source correctness and initial-provider waiting, not admitted periodic CPU or
+live-cloud throughput. The remaining full-design and cross-engine recovery gates
+listed above remain open; full qualification remains waived.
+
+Evidence: lake-heartbeat-v7-final.json records the focused lake admission,
+maintenance source-pin renewal, provider-opening, real text-retirement, SQL scan
+startup and physical read-resource targets. lake-heartbeat-final.json binds their
+tested source hashes to the committed bytes.
