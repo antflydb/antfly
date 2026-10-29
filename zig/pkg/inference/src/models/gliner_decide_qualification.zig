@@ -68,10 +68,12 @@ pub const Identity = struct {
     sidecars: Sidecars,
 };
 
-pub const QualifiedVariant = enum { decide_deberta, decide_1b };
+pub const QualifiedVariant = enum { decide_deberta, decide_deberta_q8, decide_1b };
 pub const Backend = enum { native, metal, cuda, other };
 
 const legacy_weight = FilePin{ .path = "model.safetensors", .size_bytes = 1_945_828_140, .sha256 = "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997" };
+const legacy_q8_encoder = FilePin{ .path = "gliner2-encoder.Q8_0.gguf", .size_bytes = 465_145_600, .sha256 = "8d9bea7df21ab4a8a17333f51f246faab5280159e5751ebbadd81a85ec96c871" };
+const legacy_q8_head = FilePin{ .path = "gliner2-head.Q8_0.gguf", .size_bytes = 62_064_576, .sha256 = "52cb6197d3dcfe5ad6276ceb037a3333d2921bbcf3dfb8289aeff82fbd5693dc" };
 const legacy_config = FilePin{ .path = "config.json", .size_bytes = 594, .sha256 = "e748e5b80575471c91b3f0dd00f513ba58242544fcb7e1236e0021e61abd7673" };
 const legacy_encoder_config = FilePin{ .path = "encoder_config/config.json", .size_bytes = 920, .sha256 = "bd32f1484ba5a199f7a63df44df3814b839fffcf6e64478323c4689868ef6015" };
 const legacy_special_tokens = FilePin{ .path = "special_tokens_map.json", .size_bytes = 2414, .sha256 = "84ea70143f533d7e99b393d87f20010887a9ac2cba955828ef313886e4e83f4f" };
@@ -154,9 +156,23 @@ fn isDecide1B(identity: Identity) bool {
         sidecarsMatch(identity.sidecars, decide_1b_config, decide_1b_encoder_config, decide_1b_tokenizer, decide_1b_tokenizer_config, null);
 }
 
+fn isLegacyDecideQ8(identity: Identity) bool {
+    if (identity.inventory.all_f32 or identity.weight_companion == null or
+        !digestMatches(identity.weight, legacy_q8_encoder) or
+        !digestMatches(identity.weight_companion.?, legacy_q8_head)) return false;
+    // Geometry, markers, complete tensor count and every sidecar must retain
+    // the reviewed legacy contract; only the two exact weight files differ.
+    var fp32_shape = identity;
+    fp32_shape.inventory.all_f32 = true;
+    fp32_shape.weight = digestFromPin(legacy_weight);
+    fp32_shape.weight_companion = null;
+    return isLegacyDecide(fp32_shape);
+}
+
 /// The only shared authority used by pull-time publication and live serving.
 pub fn qualifiedVariant(identity: Identity) ?QualifiedVariant {
     if (isLegacyDecide(identity)) return .decide_deberta;
+    if (isLegacyDecideQ8(identity)) return .decide_deberta_q8;
     if (decide_1b_production_qualified and isDecide1B(identity)) return .decide_1b;
     return null;
 }
@@ -170,11 +186,14 @@ pub const RequestLimits = struct {
     prepared_sequences: usize = 1,
     sequence_tokens: usize = 198,
 };
+pub const cuda_batch_items: usize = 8;
+const legacy_cuda_limits = RequestLimits{ .request_items = cuda_batch_items, .prepared_sequences = cuda_batch_items, .sequence_tokens = 512 };
 
 /// The two immutable precision variants share the measured request geometry.
 /// Their numerical and serving evidence remain independently captured.
 pub fn requestLimits(identity: Identity) !?RequestLimits {
     const variant = try require(identity);
+    if (variant == .decide_deberta_q8) return legacy_cuda_limits;
     if (variant != .decide_1b) return null;
     return .{ .prepared_sequences = 64, .sequence_tokens = 1024 };
 }
@@ -185,10 +204,14 @@ pub fn supportsSpanExtraction(identity: Identity) bool {
 
 pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize, sequences: usize, tokens: usize) !void {
     const variant = try require(identity);
-    if (variant != .decide_1b) return;
-    if (backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
-    const limits = (try requestLimits(identity)).?;
-    if (items == 0 or items > limits.request_items or sequences == 0 or sequences > limits.prepared_sequences or tokens == 0 or tokens > limits.sequence_tokens)
+    // Retain the established native/Metal legacy envelope. Newly qualified
+    // CUDA serving has <=8 items, each with one <=512-token sequence.
+    if (variant == .decide_deberta and backend != .cuda) return;
+    if (variant == .decide_deberta_q8) {
+        if (backend != .cuda) return error.UnsupportedGlinerDecisionBackend;
+    } else if (variant == .decide_1b and backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
+    const limits = if (variant == .decide_deberta) legacy_cuda_limits else (try requestLimits(identity)).?;
+    if ((backend == .cuda and variant != .decide_1b and sequences != items) or items == 0 or items > limits.request_items or sequences == 0 or sequences > limits.prepared_sequences or tokens == 0 or tokens > limits.sequence_tokens)
         return error.UnsupportedGlinerDecisionGeometry;
 }
 
@@ -296,4 +319,44 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
     identity.weight = digestFromPin(decide_1b_weight);
     identity.inventory.all_f32 = true;
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+}
+
+test "GLiNER Decide Q8 CUDA qualification binds both exact files and bounded requests" {
+    var identity = legacyIdentity();
+    identity.inventory.all_f32 = false;
+    identity.weight = digestFromPin(legacy_q8_encoder);
+    identity.weight_companion = digestFromPin(legacy_q8_head);
+    try std.testing.expectEqual(QualifiedVariant.decide_deberta_q8, try require(identity));
+    for ([_]usize{ 1, 2, 4, 8 }) |n| try requireRequestIdentity(identity, .cuda, n, n, 512);
+    for ([_]Backend{ .native, .metal, .other }) |backend|
+        try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequestIdentity(identity, backend, 1, 1, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 9, 9, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 2, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 1, 513));
+    try std.testing.expect(!supportsSpanExtraction(identity));
+    const original = identity;
+    identity.weight.sha256[0] ^= 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = original;
+    identity.weight_companion.?.sha256[0] ^= 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = original;
+    identity.inventory.count -= 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = original;
+    identity.sidecars.tokenizer.sha256[0] ^= 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = original;
+    identity.markers.l += 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+}
+
+test "GLiNER Decide CUDA legacy geometry stays bounded without changing native policy" {
+    const identity = legacyIdentity();
+    for ([_]usize{ 1, 2, 4, 8 }) |n| try requireRequestIdentity(identity, .cuda, n, n, 512);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 9, 9, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 2, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 1, 513));
+    try requireRequestIdentity(identity, .native, 2, 2, 512);
+    try requireRequestIdentity(identity, .metal, 2, 2, 512);
 }

@@ -1,5 +1,6 @@
 """Contains all the data models used in inputs/outputs"""
 
+from .a4b_residency_mode import A4BResidencyMode
 from .administer_sql_settings_response_200 import AdministerSqlSettingsResponse200
 from .advance_table_storage_migration_body import AdvanceTableStorageMigrationBody
 from .advance_table_storage_migration_body_action import AdvanceTableStorageMigrationBodyAction
@@ -121,6 +122,7 @@ from .chunk_coordinates import ChunkCoordinates
 from .chunk_coordinates_kind import ChunkCoordinatesKind
 from .chunk_coordinates_picture_basis import ChunkCoordinatesPictureBasis
 from .chunk_descriptor import ChunkDescriptor
+from .chunk_diarization_config import ChunkDiarizationConfig
 from .chunk_embedding_context import ChunkEmbeddingContext
 from .chunk_embedding_error import ChunkEmbeddingError
 from .chunk_embedding_event import ChunkEmbeddingEvent
@@ -141,6 +143,7 @@ from .chunk_output_coverage import ChunkOutputCoverage
 from .chunk_output_label import ChunkOutputLabel
 from .chunk_output_result import ChunkOutputResult
 from .chunk_output_result_kind import ChunkOutputResultKind
+from .chunk_output_result_speaker_scope import ChunkOutputResultSpeakerScope
 from .chunk_output_result_status import ChunkOutputResultStatus
 from .chunk_output_target import ChunkOutputTarget
 from .chunk_output_target_kind import ChunkOutputTargetKind
@@ -149,6 +152,7 @@ from .chunk_outputs import ChunkOutputs
 from .chunk_source_reference import ChunkSourceReference
 from .chunk_source_reference_type import ChunkSourceReferenceType
 from .chunk_source_reference_version_kind import ChunkSourceReferenceVersionKind
+from .chunk_speaker_span import ChunkSpeakerSpan
 from .chunk_transcript_span import ChunkTranscriptSpan
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
@@ -193,6 +197,7 @@ from .composed_query_source import ComposedQuerySource
 from .composed_source_overlay import ComposedSourceOverlay
 from .composed_table_source import ComposedTableSource
 from .confidence_step_config import ConfidenceStepConfig
+from .config import Config
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
 from .connected_model import ConnectedModel
@@ -210,6 +215,7 @@ from .constrained_generator_producer_config_output_schema import ConstrainedGene
 from .constrained_output import ConstrainedOutput
 from .constrained_probabilities import ConstrainedProbabilities
 from .contains_query import ContainsQuery
+from .content_security_config import ContentSecurityConfig
 from .create_algebraic_index_request import CreateAlgebraicIndexRequest
 from .create_algebraic_index_request_type import CreateAlgebraicIndexRequestType
 from .create_api_key_request import CreateApiKeyRequest
@@ -290,12 +296,18 @@ from .decision_evidence_image_type import DecisionEvidenceImageType
 from .decision_evidence_message import DecisionEvidenceMessage
 from .decision_evidence_message_role import DecisionEvidenceMessageRole
 from .decision_evidence_message_type import DecisionEvidenceMessageType
+from .decision_evidence_table_image import DecisionEvidenceTableImage
+from .decision_evidence_table_image_detail import DecisionEvidenceTableImageDetail
+from .decision_evidence_table_image_type import DecisionEvidenceTableImageType
 from .decision_evidence_text import DecisionEvidenceText
 from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
 from .decision_similarity import DecisionSimilarity
+from .decision_table_source import DecisionTableSource
+from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
+from .decision_table_source_mime_type import DecisionTableSourceMimeType
 from .decision_usage import DecisionUsage
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .dense_native_storage_phase import DenseNativeStoragePhase
@@ -400,10 +412,6 @@ from .entity_consumer_progress_page_results_item import EntityConsumerProgressPa
 from .entity_curation_result import EntityCurationResult
 from .entity_curation_result_atomicity import EntityCurationResultAtomicity
 from .entity_curation_result_results_item import EntityCurationResultResultsItem
-from .entity_curation_result_results_item_absorbed_item import EntityCurationResultResultsItemAbsorbedItem
-from .entity_curation_result_results_item_absorbed_item_disposition import (
-    EntityCurationResultResultsItemAbsorbedItemDisposition,
-)
 from .entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
 from .entity_distinct_request import EntityDistinctRequest
 from .entity_merge_request import EntityMergeRequest
@@ -733,6 +741,7 @@ from .graph_document_term_range_filter import GraphDocumentTermRangeFilter
 from .graph_document_wildcard_filter import GraphDocumentWildcardFilter
 from .graph_edge_weight_range import GraphEdgeWeightRange
 from .graph_exact_result_stats import GraphExactResultStats
+from .graph_execution_config import GraphExecutionConfig
 from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
 from .graph_index_config_metrics import GraphIndexConfigMetrics
@@ -919,7 +928,6 @@ from .index_source_readiness_status_state import IndexSourceReadinessStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
-from .inference_a4b_residency_mode import InferenceA4BResidencyMode
 from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
 from .inference_audio_context import InferenceAudioContext
@@ -943,7 +951,6 @@ from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
-from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_context_checkpoint import InferenceContextCheckpoint
 from .inference_context_checkpoint_version import InferenceContextCheckpointVersion
 from .inference_context_diagnostics import InferenceContextDiagnostics
@@ -960,7 +967,6 @@ from .inference_context_tool_evidence import InferenceContextToolEvidence
 from .inference_context_tool_result_outcome import InferenceContextToolResultOutcome
 from .inference_context_tool_result_outcome_disposition import InferenceContextToolResultOutcomeDisposition
 from .inference_context_unresolved_tool_call import InferenceContextUnresolvedToolCall
-from .inference_credentials import InferenceCredentials
 from .inference_decide_long_document import InferenceDecideLongDocument
 from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_request import InferenceDecideRequest
@@ -1040,11 +1046,10 @@ from .inference_image_url_content_part_type import InferenceImageURLContentPartT
 from .inference_kv_cache_policy import InferenceKvCachePolicy
 from .inference_kv_cache_policy_mode import InferenceKvCachePolicyMode
 from .inference_kv_cache_policy_version import InferenceKvCachePolicyVersion
-from .inference_level import InferenceLevel
 from .inference_media_content_part import InferenceMediaContentPart
 from .inference_media_content_part_type import InferenceMediaContentPartType
+from .inference_memory_config import InferenceMemoryConfig
 from .inference_model_backend import InferenceModelBackend
-from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
 from .inference_model_info_dense_output import InferenceModelInfoDenseOutput
@@ -1060,9 +1065,6 @@ from .inference_model_instance_unload_blocked_reason import InferenceModelInstan
 from .inference_model_instance_unload_response import InferenceModelInstanceUnloadResponse
 from .inference_model_instance_unload_response_outcome import InferenceModelInstanceUnloadResponseOutcome
 from .inference_model_kind import InferenceModelKind
-from .inference_model_quantization import InferenceModelQuantization
-from .inference_model_ref import InferenceModelRef
-from .inference_model_ref_cuda_precision import InferenceModelRefCudaPrecision
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
@@ -1082,8 +1084,6 @@ from .inference_predictor_task import InferencePredictorTask
 from .inference_predictors_response import InferencePredictorsResponse
 from .inference_predictors_response_object import InferencePredictorsResponseObject
 from .inference_predictors_response_predictors import InferencePredictorsResponsePredictors
-from .inference_prompt_cache_config import InferencePromptCacheConfig
-from .inference_prompt_cache_config_mode import InferencePromptCacheConfigMode
 from .inference_provider_type import InferenceProviderType
 from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
@@ -1101,7 +1101,7 @@ from .inference_read_result_raster_to_source_type_0 import InferenceReadResultRa
 from .inference_read_result_status import InferenceReadResultStatus
 from .inference_read_result_tables_item import InferenceReadResultTablesItem
 from .inference_read_result_transform import InferenceReadResultTransform
-from .inference_request_admission_config import InferenceRequestAdmissionConfig
+from .inference_request_limits_config import InferenceRequestLimitsConfig
 from .inference_rerank_object import InferenceRerankObject
 from .inference_rerank_object_object import InferenceRerankObjectObject
 from .inference_rerank_request import InferenceRerankRequest
@@ -1113,13 +1113,8 @@ from .inference_rewrite_request import InferenceRewriteRequest
 from .inference_rewrite_response import InferenceRewriteResponse
 from .inference_rewrite_response_object import InferenceRewriteResponseObject
 from .inference_role import InferenceRole
-from .inference_runtime_config import InferenceRuntimeConfig
-from .inference_runtime_config_model_strategies import InferenceRuntimeConfigModelStrategies
-from .inference_runtime_config_model_strategies_additional_property import (
-    InferenceRuntimeConfigModelStrategiesAdditionalProperty,
-)
+from .inference_server_config import InferenceServerConfig
 from .inference_sparse_vector import InferenceSparseVector
-from .inference_style import InferenceStyle
 from .inference_synthesis_request import InferenceSynthesisRequest
 from .inference_synthesis_request_format import InferenceSynthesisRequestFormat
 from .inference_text_content import InferenceTextContent
@@ -1161,7 +1156,6 @@ from .inference_transcription_stream_message_type import InferenceTranscriptionS
 from .inference_transient_capacity_error import InferenceTransientCapacityError
 from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
 from .inference_vad_config import InferenceVadConfig
-from .inferenceschemas_config import InferenceschemasConfig
 from .ingest_lake_changes_body import IngestLakeChangesBody
 from .ingest_lake_changes_body_changes_item import IngestLakeChangesBodyChangesItem
 from .ingest_lake_changes_body_changes_item_op import IngestLakeChangesBodyChangesItemOp
@@ -1181,6 +1175,8 @@ from .join_operator import JoinOperator
 from .join_profile import JoinProfile
 from .join_strategy import JoinStrategy
 from .join_type import JoinType
+from .kernel_jit_config import KernelJitConfig
+from .kernel_jit_mode import KernelJitMode
 from .key_range import KeyRange
 from .lake_catalog_commit_request import LakeCatalogCommitRequest
 from .lake_catalog_commit_request_requirements_item import LakeCatalogCommitRequestRequirementsItem
@@ -1205,6 +1201,7 @@ from .legacy_graph_result_node_evidence import LegacyGraphResultNodeEvidence
 from .legacy_graph_search_result import LegacyGraphSearchResult
 from .legacy_graph_search_result_kind import LegacyGraphSearchResultKind
 from .legacy_graph_search_result_metric_status import LegacyGraphSearchResultMetricStatus
+from .level import Level
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
@@ -1889,6 +1886,11 @@ from .metadata_capability_unavailable_error_required_capability import (
 from .metadata_leader_unavailable_error import MetadataLeaderUnavailableError
 from .metadata_leader_unavailable_error_code import MetadataLeaderUnavailableErrorCode
 from .metadata_leader_unavailable_error_error import MetadataLeaderUnavailableErrorError
+from .model_backend import ModelBackend
+from .model_format import ModelFormat
+from .model_kind import ModelKind
+from .model_quantization import ModelQuantization
+from .model_ref import ModelRef
 from .multi_batch_request import MultiBatchRequest
 from .multi_batch_request_tables import MultiBatchRequestTables
 from .multi_batch_response import MultiBatchResponse
@@ -1945,6 +1947,12 @@ from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
 from .prepare_native_kv_checkpoint_x_antfly_kv_encoding import PrepareNativeKvCheckpointXAntflyKVEncoding
 from .prior_artifact_context import PriorArtifactContext
+from .projection_expression import ProjectionExpression
+from .projection_expression_case_item import ProjectionExpressionCaseItem
+from .projection_expression_cast import ProjectionExpressionCast
+from .projection_expression_cast_type import ProjectionExpressionCastType
+from .prompt_cache_config import PromptCacheConfig
+from .prompt_cache_config_mode import PromptCacheConfigMode
 from .provenance_decision import ProvenanceDecision
 from .provenance_decision_configuration import ProvenanceDecisionConfiguration
 from .provenance_decision_configuration_kind import ProvenanceDecisionConfigurationKind
@@ -1991,6 +1999,7 @@ from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from .query_admission_config import QueryAdmissionConfig
 from .query_builder_request import QueryBuilderRequest
 from .query_builder_request_constraints import QueryBuilderRequestConstraints
 from .query_builder_request_example_documents_item import QueryBuilderRequestExampleDocumentsItem
@@ -2041,7 +2050,9 @@ from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
 from .query_request_foreign_sources import QueryRequestForeignSources
+from .query_request_params import QueryRequestParams
 from .query_request_query import QueryRequestQuery
+from .query_request_select import QueryRequestSelect
 from .query_responses import QueryResponses
 from .query_result import QueryResult
 from .query_result_base import QueryResultBase
@@ -2195,6 +2206,12 @@ from .resource_reference_kind import ResourceReferenceKind
 from .resource_selector import ResourceSelector
 from .resource_selector_kind import ResourceSelectorKind
 from .resource_type import ResourceType
+from .resources_config import ResourcesConfig
+from .resources_config_inference import ResourcesConfigInference
+from .resources_config_memory import ResourcesConfigMemory
+from .resources_config_query import ResourcesConfigQuery
+from .resources_config_query_request_limits import ResourcesConfigQueryRequestLimits
+from .resources_config_write import ResourcesConfigWrite
 from .restore_job import RestoreJob
 from .restore_job_list import RestoreJobList
 from .restore_job_phase import RestoreJobPhase
@@ -2221,6 +2238,11 @@ from .role_assignment import RoleAssignment
 from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
+from .runtime_config import RuntimeConfig
+from .runtime_config_generation_batching import RuntimeConfigGenerationBatching
+from .runtime_config_generation_batching_mode import RuntimeConfigGenerationBatchingMode
+from .runtime_config_model_strategies import RuntimeConfigModelStrategies
+from .runtime_config_model_strategies_additional_property import RuntimeConfigModelStrategiesAdditionalProperty
 from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
@@ -2312,6 +2334,7 @@ from .store_root_enrollment_identity import StoreRootEnrollmentIdentity
 from .store_root_enrollment_request import StoreRootEnrollmentRequest
 from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
 from .stt_provider import STTProvider
+from .style import Style
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
 from .table import Table
@@ -2476,10 +2499,12 @@ from .web_search_config import WebSearchConfig
 from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
 from .wildcard_query import WildcardQuery
+from .write_admission_config import WriteAdmissionConfig
 from .you_search_config import YouSearchConfig
 from .you_search_config_provider import YouSearchConfigProvider
 
 __all__ = (
+    "A4BResidencyMode",
     "AdministerSqlSettingsResponse200",
     "AdvanceTableStorageMigrationBody",
     "AdvanceTableStorageMigrationBodyAction",
@@ -2601,6 +2626,7 @@ __all__ = (
     "ChunkCoordinatesKind",
     "ChunkCoordinatesPictureBasis",
     "ChunkDescriptor",
+    "ChunkDiarizationConfig",
     "ChunkEmbeddingContext",
     "ChunkEmbeddingError",
     "ChunkEmbeddingEvent",
@@ -2624,6 +2650,7 @@ __all__ = (
     "ChunkOutputLabel",
     "ChunkOutputResult",
     "ChunkOutputResultKind",
+    "ChunkOutputResultSpeakerScope",
     "ChunkOutputResultStatus",
     "ChunkOutputs",
     "ChunkOutputTarget",
@@ -2632,6 +2659,7 @@ __all__ = (
     "ChunkSourceReference",
     "ChunkSourceReferenceType",
     "ChunkSourceReferenceVersionKind",
+    "ChunkSpeakerSpan",
     "ChunkTranscriptSpan",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
@@ -2673,6 +2701,7 @@ __all__ = (
     "ComposedSourceOverlay",
     "ComposedTableSource",
     "ConfidenceStepConfig",
+    "Config",
     "ConfigureExtensionRequest",
     "ConjunctionQuery",
     "ConnectedModel",
@@ -2690,6 +2719,7 @@ __all__ = (
     "ConstrainedOutput",
     "ConstrainedProbabilities",
     "ContainsQuery",
+    "ContentSecurityConfig",
     "CreateAlgebraicIndexRequest",
     "CreateAlgebraicIndexRequestType",
     "CreateApiKeyRequest",
@@ -2770,12 +2800,18 @@ __all__ = (
     "DecisionEvidenceMessage",
     "DecisionEvidenceMessageRole",
     "DecisionEvidenceMessageType",
+    "DecisionEvidenceTableImage",
+    "DecisionEvidenceTableImageDetail",
+    "DecisionEvidenceTableImageType",
     "DecisionEvidenceText",
     "DecisionEvidenceTextType",
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
     "DecisionSimilarity",
+    "DecisionTableSource",
+    "DecisionTableSourceFilterQuery",
+    "DecisionTableSourceMimeType",
     "DecisionUsage",
     "DeleteArtifactEnrichmentResponse201",
     "DenseNativeStoragePhase",
@@ -2878,8 +2914,6 @@ __all__ = (
     "EntityCurationResult",
     "EntityCurationResultAtomicity",
     "EntityCurationResultResultsItem",
-    "EntityCurationResultResultsItemAbsorbedItem",
-    "EntityCurationResultResultsItemAbsorbedItemDisposition",
     "EntityCurationResultResultsItemCuration",
     "EntityDistinctRequest",
     "EntityMergeRequest",
@@ -3203,6 +3237,7 @@ __all__ = (
     "GraphDocumentWildcardFilter",
     "GraphEdgeWeightRange",
     "GraphExactResultStats",
+    "GraphExecutionConfig",
     "GraphIdentityNodeSelector",
     "GraphIndexConfig",
     "GraphIndexConfigMetrics",
@@ -3389,7 +3424,6 @@ __all__ = (
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
-    "InferenceA4BResidencyMode",
     "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
     "InferenceAudioContext",
@@ -3413,7 +3447,6 @@ __all__ = (
     "InferenceConfig",
     "InferenceConnection",
     "InferenceConnectionModels",
-    "InferenceContentSecurityConfig",
     "InferenceContextCheckpoint",
     "InferenceContextCheckpointVersion",
     "InferenceContextDiagnostics",
@@ -3430,7 +3463,6 @@ __all__ = (
     "InferenceContextToolResultOutcome",
     "InferenceContextToolResultOutcomeDisposition",
     "InferenceContextUnresolvedToolCall",
-    "InferenceCredentials",
     "InferenceDecideLongDocument",
     "InferenceDecideLongDocumentMode",
     "InferenceDecideRequest",
@@ -3510,11 +3542,10 @@ __all__ = (
     "InferenceKvCachePolicy",
     "InferenceKvCachePolicyMode",
     "InferenceKvCachePolicyVersion",
-    "InferenceLevel",
     "InferenceMediaContentPart",
     "InferenceMediaContentPartType",
+    "InferenceMemoryConfig",
     "InferenceModelBackend",
-    "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelInfoChunkingLimits",
     "InferenceModelInfoDenseOutput",
@@ -3530,9 +3561,6 @@ __all__ = (
     "InferenceModelInstanceUnloadResponse",
     "InferenceModelInstanceUnloadResponseOutcome",
     "InferenceModelKind",
-    "InferenceModelQuantization",
-    "InferenceModelRef",
-    "InferenceModelRefCudaPrecision",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",
@@ -3552,8 +3580,6 @@ __all__ = (
     "InferencePredictorTask",
     "InferencePredictRequest",
     "InferencePredictResponse",
-    "InferencePromptCacheConfig",
-    "InferencePromptCacheConfigMode",
     "InferenceProviderType",
     "InferenceReadObject",
     "InferenceReadObjectObject",
@@ -3571,7 +3597,7 @@ __all__ = (
     "InferenceReadResultStatus",
     "InferenceReadResultTablesItem",
     "InferenceReadResultTransform",
-    "InferenceRequestAdmissionConfig",
+    "InferenceRequestLimitsConfig",
     "InferenceRerankObject",
     "InferenceRerankObjectObject",
     "InferenceRerankRequest",
@@ -3583,12 +3609,8 @@ __all__ = (
     "InferenceRewriteResponse",
     "InferenceRewriteResponseObject",
     "InferenceRole",
-    "InferenceRuntimeConfig",
-    "InferenceRuntimeConfigModelStrategies",
-    "InferenceRuntimeConfigModelStrategiesAdditionalProperty",
-    "InferenceschemasConfig",
+    "InferenceServerConfig",
     "InferenceSparseVector",
-    "InferenceStyle",
     "InferenceSynthesisRequest",
     "InferenceSynthesisRequestFormat",
     "InferenceTextContent",
@@ -3649,6 +3671,8 @@ __all__ = (
     "JoinProfile",
     "JoinStrategy",
     "JoinType",
+    "KernelJitConfig",
+    "KernelJitMode",
     "KeyRange",
     "LakeCatalogCommitRequest",
     "LakeCatalogCommitRequestRequirementsItem",
@@ -3673,6 +3697,7 @@ __all__ = (
     "LegacyGraphSearchResult",
     "LegacyGraphSearchResultKind",
     "LegacyGraphSearchResultMetricStatus",
+    "Level",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
@@ -4145,6 +4170,11 @@ __all__ = (
     "MetadataLeaderUnavailableError",
     "MetadataLeaderUnavailableErrorCode",
     "MetadataLeaderUnavailableErrorError",
+    "ModelBackend",
+    "ModelFormat",
+    "ModelKind",
+    "ModelQuantization",
+    "ModelRef",
     "MultiBatchRequest",
     "MultiBatchRequestTables",
     "MultiBatchResponse",
@@ -4199,6 +4229,12 @@ __all__ = (
     "PrefixQuery",
     "PrepareNativeKvCheckpointXAntflyKVEncoding",
     "PriorArtifactContext",
+    "ProjectionExpression",
+    "ProjectionExpressionCaseItem",
+    "ProjectionExpressionCast",
+    "ProjectionExpressionCastType",
+    "PromptCacheConfig",
+    "PromptCacheConfigMode",
     "ProvenanceDecision",
     "ProvenanceDecisionConfiguration",
     "ProvenanceDecisionConfigurationKind",
@@ -4243,6 +4279,7 @@ __all__ = (
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
+    "QueryAdmissionConfig",
     "QueryBuilderRequest",
     "QueryBuilderRequestConstraints",
     "QueryBuilderRequestExampleDocumentsItem",
@@ -4293,7 +4330,9 @@ __all__ = (
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
     "QueryRequestForeignSources",
+    "QueryRequestParams",
     "QueryRequestQuery",
+    "QueryRequestSelect",
     "QueryResponses",
     "QueryResult",
     "QueryResultBase",
@@ -4444,6 +4483,12 @@ __all__ = (
     "ResolverWait",
     "ResourceReference",
     "ResourceReferenceKind",
+    "ResourcesConfig",
+    "ResourcesConfigInference",
+    "ResourcesConfigMemory",
+    "ResourcesConfigQuery",
+    "ResourcesConfigQueryRequestLimits",
+    "ResourcesConfigWrite",
     "ResourceSelector",
     "ResourceSelectorKind",
     "ResourceType",
@@ -4473,6 +4518,11 @@ __all__ = (
     "RouteType",
     "RowFilterEntry",
     "RowFilterEntryFilter",
+    "RuntimeConfig",
+    "RuntimeConfigGenerationBatching",
+    "RuntimeConfigGenerationBatchingMode",
+    "RuntimeConfigModelStrategies",
+    "RuntimeConfigModelStrategiesAdditionalProperty",
     "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
@@ -4564,6 +4614,7 @@ __all__ = (
     "StoreRootEnrollmentRequest",
     "StreamTranscriptionAudioFormat",
     "STTProvider",
+    "Style",
     "SuccessMessage",
     "SyncLevel",
     "Table",
@@ -4728,6 +4779,7 @@ __all__ = (
     "WebSearchConnection",
     "WebSearchProvider",
     "WildcardQuery",
+    "WriteAdmissionConfig",
     "YouSearchConfig",
     "YouSearchConfigProvider",
 )

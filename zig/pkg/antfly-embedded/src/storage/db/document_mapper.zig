@@ -899,6 +899,7 @@ pub const BuildTextSegmentResult = struct {
 pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
+    contribution_cache: ?*introducer_mod.AnalyzedContributionCache = null,
     /// Encoded results belong to the caller's allocator. Transient builders
     /// may have a shorter, reclaiming lifetime even when results use a region.
     scratch_allocator: ?Allocator = null,
@@ -1424,6 +1425,7 @@ fn buildTextSegmentFromProjectionBatchWithProfile(
 
 fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introducer_mod.BuildTextOptions {
     var build_options = introducer_mod.BuildTextOptions{
+        .contribution_cache = options.contribution_cache,
         .profile = options.profile,
         .resource_manager = options.resource_manager,
         .postings_run_io = options.postings_run_io,

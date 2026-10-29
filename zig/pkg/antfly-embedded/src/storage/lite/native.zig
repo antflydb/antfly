@@ -479,6 +479,46 @@ test "lite allocator v4 detached proof follows local append-only commits and ena
     try std.testing.expect((try file.check()).valid);
 }
 
+test "lite allocator v4 detached proof follows an unchecked reopened writer" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "proof-reopened-lineage.aflite");
+    defer a.free(path);
+    const value: [32768]u8 = @splat('v');
+    {
+        var seed = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        for (0..16) |_| try seed.putDocument("pool", &value);
+        _ = try seed.reclaimPages(4096);
+    }
+    var owner = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer owner.close();
+    owner.defer_allocator_verification = true;
+    const reader = try owner.captureAllocatorVerificationSnapshot(null);
+    var reader_open = true;
+    defer {
+        if (reader_open) reader.close();
+        a.destroy(reader);
+    }
+    try owner.putDocument("local", "before reopen");
+    var replacement = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer replacement.close();
+    replacement.defer_allocator_verification = true;
+    try replacement.inheritAllocatorVerification(&owner);
+    try replacement.putDocument("local", "after reopen");
+    try std.testing.expect(!replacement.free_pages_verified);
+    try std.testing.expectEqual(@as(u64, 0), (try replacement.allocatorStats()).?.reused_pages);
+    try reader.completeAllocatorVerification();
+    try replacement.inheritAllocatorVerification(reader);
+    try std.testing.expect(replacement.free_pages_verified);
+    reader.close();
+    reader_open = false;
+    for (0..8) |_| try replacement.putDocument("local", &value);
+    try std.testing.expect((try replacement.allocatorStats()).?.reused_pages > 0);
+    try std.testing.expect((try replacement.check()).valid);
+}
+
 test "lite allocator v4 detached append lineage rejects external publication and cancellation" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -497,10 +537,16 @@ test "lite allocator v4 detached append lineage rejects external publication and
         a.destroy(reader);
     }
     try file.putDocument("local", "append");
+    var replacement = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer replacement.close();
+    replacement.defer_allocator_verification = true;
+    try replacement.inheritAllocatorVerification(&file);
     cancel.request();
     try std.testing.expectError(error.MaintenanceCanceled, reader.completeAllocatorVerification());
     try file.inheritAllocatorVerification(reader);
     try std.testing.expect(!file.free_pages_verified);
+    try replacement.inheritAllocatorVerification(reader);
+    try std.testing.expect(!replacement.free_pages_verified);
     // The independently protected original proof can finish, but an adopted
     // foreign checkpoint severs its relationship to this writer's free pool.
     reader.allocator_cancel_token = null;
@@ -509,10 +555,12 @@ test "lite allocator v4 detached append lineage rejects external publication and
     defer foreign.close();
     foreign.defer_allocator_verification = true;
     try foreign.putDocument("foreign", "append");
-    try file.adoptIndexPublicationHeader(foreign.header);
-    try file.inheritAllocatorVerification(reader);
-    try std.testing.expect(!file.free_pages_verified);
-    try std.testing.expect(file.allocator_verification_base == null);
+    for ([_]*NativeFile{ &file, &replacement }) |target| {
+        try target.adoptIndexPublicationHeader(foreign.header);
+        try target.inheritAllocatorVerification(reader);
+        try std.testing.expect(!target.free_pages_verified);
+        try std.testing.expect(target.allocator_verification_base == null);
+    }
 }
 
 test "lite allocator v4 fallback reuses completed immutable leaf payload proofs" {
@@ -3968,6 +4016,94 @@ pub const VacuumImage = struct {
 
 pub const ReaderCoordinator = @import("reader_coordinator.zig").Coordinator;
 
+var test_header_fingerprint_hashes: std.atomic.Value(u64) = .init(0);
+
+test "lite header fingerprints cache unchanged state and fence every header field" {
+    var file: NativeFile = .{ .allocator = std.testing.allocator, .io_impl = undefined, .path = undefined, .file = undefined, .header = .{} };
+    const original = file.header;
+    const expected = NativeFile.fingerprintHeader(original);
+    const before = test_header_fingerprint_hashes.load(.monotonic);
+    for (0..64) |_| try std.testing.expectEqual(expected, file.headerFingerprint());
+    try std.testing.expectEqual(before + 1, test_header_fingerprint_hashes.load(.monotonic));
+    inline for (@typeInfo(Header).@"struct".field_names, @typeInfo(Header).@"struct".field_types) |field, Field| {
+        if (comptime std.mem.eql(u8, field, "checkpoints")) {
+            inline for (0..checkpoint_slot_count) |slot| {
+                inline for (@typeInfo(CheckpointSlot).@"struct".field_names) |checkpoint_field| {
+                    file.header = original;
+                    @field(file.header.checkpoints[slot], checkpoint_field) += 1;
+                    try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
+                    try std.testing.expect(!std.mem.eql(u8, &expected, &file.headerFingerprint()));
+                }
+            }
+        } else {
+            file.header = original;
+            if (comptime Field == bool) @field(file.header, field) = !@field(original, field) else @field(file.header, field) += 1;
+            try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
+            try std.testing.expect(!std.mem.eql(u8, &expected, &file.headerFingerprint()));
+        }
+    }
+    file.header = original;
+    file.transaction_header = original;
+    file.transaction_header.?.checkpoints[1].commit_sequence = 99;
+    try std.testing.expectEqual(NativeFile.fingerprintHeader(file.transaction_header.?), file.headerFingerprint());
+    // Abort restores the committed key; no stale transaction digest may survive.
+    file.transaction_header = null;
+    try std.testing.expectEqual(expected, file.headerFingerprint());
+}
+
+test "lite header fingerprint cache publishes coherent keys and digests to concurrent readers" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const Shared = struct {
+        cache: HeaderFingerprintCache = .{},
+        failed: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This(), worker: usize) void {
+            for (0..64) |i| {
+                var header: Header = .{};
+                header.checkpoints[worker % checkpoint_slot_count].commit_sequence = @intCast(i % 3);
+                const expected = NativeFile.fingerprintHeader(header);
+                const digest = self.cache.lookup(header) orelse blk: {
+                    self.cache.remember(header, expected);
+                    break :blk expected;
+                };
+                if (!std.mem.eql(u8, &expected, &digest)) self.failed.store(true, .monotonic);
+            }
+        }
+    };
+    var shared: Shared = .{};
+    var tasks: [4]std.Io.Future(void) = undefined;
+    var started: usize = 0;
+    defer for (tasks[0..started]) |*task| task.await(std.testing.io);
+    for (&tasks, 0..) |*task, worker| {
+        task.* = try std.testing.io.concurrent(Shared.run, .{ &shared, worker });
+        started += 1;
+    }
+    for (&tasks) |*task| task.await(std.testing.io);
+    started = 0;
+    try std.testing.expect(!shared.failed.load(.monotonic));
+}
+
+// NativeFile generations can serve concurrent readers. Cache only a complete
+// structural header match, including the inactive recovery slot and transaction
+// header. A publication, rollback or reload therefore invalidates naturally;
+// persisted certificate bytes and the canonical digest remain unchanged.
+const HeaderFingerprintCache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    cached: ?struct { header: Header, digest: [32]u8 } = null,
+
+    fn lookup(self: *HeaderFingerprintCache, header: Header) ?[32]u8 {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.cached) |entry| if (std.meta.eql(entry.header, header)) return entry.digest;
+        return null;
+    }
+
+    fn remember(self: *HeaderFingerprintCache, header: Header, digest: [32]u8) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.cached = .{ .header = header, .digest = digest };
+    }
+};
+
 pub const NativeFile = struct {
     allocator: Allocator,
     /// The default constructors own this Threaded runtime. Borrowed-I/O
@@ -3987,6 +4123,7 @@ pub const NativeFile = struct {
     reader_window_lock: ?std.Io.File = null,
     reader_window_previous_frontier: ?u64 = null,
     header: Header,
+    header_fingerprint_cache: HeaderFingerprintCache = .{},
     transaction_header: ?Header = null,
     // Lease-only metadata transactions may append without proving free-page
     // reuse. General mutations still validate before any physical reuse.
@@ -4333,17 +4470,27 @@ pub const NativeFile = struct {
         self.header = header;
     }
 
-    /// Reuse a completed proof for identical checkpoints or this writer's
-    /// append-only descendants of its captured base. The caller serializes
-    /// publications; foreign headers, inode changes and uncertainty reject it.
+    /// Carry pending lineage across identical runtime generations, or inherit
+    /// a completed proof for append-only descendants of its captured base.
+    /// The caller serializes publications; foreign headers, inode changes
+    /// and uncertainty reject inheritance.
     pub fn inheritAllocatorVerification(self: *NativeFile, owner: *NativeFile) !void {
-        if (!std.mem.eql(u8, self.path, owner.path) or !owner.free_pages_verified or owner.transaction_header != null or owner.durable_header != null or
+        if (!owner.free_pages_verified and (self.free_pages_verified or owner.allocator_verification_base == null)) return;
+        if (!std.mem.eql(u8, self.path, owner.path) or owner.transaction_header != null or owner.durable_header != null or
             owner.checkpoint_publication_uncertain or self.transaction_header != null or self.durable_header != null or
             self.checkpoint_publication_uncertain) return;
         const identical = std.meta.eql(self.header, owner.header);
         const descendant = if (self.allocator_verification_base) |base| std.meta.eql(base, owner.header) else false;
         if (!identical and !descendant) return;
         if ((try self.file.stat(self.runtime())).inode != (try owner.file.stat(owner.runtime())).inode) return;
+        if (!owner.free_pages_verified) {
+            // Reopening the identical generation must retain the pending
+            // append-only lineage too. This grants no reuse: only completion
+            // of the independently fenced original proof can verify it.
+            if (identical and !self.free_pages_verified and owner.allocator_verification_base != null)
+                self.allocator_verification_base = owner.allocator_verification_base;
+            return;
+        }
         self.free_pages_verified = true;
         self.allocator_verification_base = null;
     }
@@ -4412,6 +4559,7 @@ pub const NativeFile = struct {
     const allocator_certificate_size = 72;
 
     fn fingerprintHeader(header: Header) [32]u8 {
+        if (builtin.is_test) _ = test_header_fingerprint_hashes.fetchAdd(1, .monotonic);
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, header);
         var digest: [32]u8 = undefined;
@@ -4420,7 +4568,13 @@ pub const NativeFile = struct {
     }
 
     fn headerFingerprint(self: *NativeFile) [32]u8 {
-        return fingerprintHeader(self.transaction_header orelse self.header);
+        const header = self.transaction_header orelse self.header;
+        if (self.header_fingerprint_cache.lookup(header)) |digest| return digest;
+        // Hash outside the cache lock. Concurrent first readers may duplicate
+        // this bounded work; hits never hash or wait behind a hash operation.
+        const digest = fingerprintHeader(header);
+        self.header_fingerprint_cache.remember(header, digest);
+        return digest;
     }
 
     /// Hash the complete canonical allocator state, not the physical encoding

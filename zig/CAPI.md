@@ -309,6 +309,38 @@ conversion, reclamation, and historical index backfill to that owner. Lease-scop
 fences new read pins until page reuse and checkpoint publication finish; temporary
 lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
 
+After a native writer publishes to a revision-4 Lite file, its last clean close
+lets an in-flight allocator proof finish and publishes a checked certificate
+when the inode and checkpoints still match. It does not cancel and restart that
+walk. If no proof started, close may bootstrap a file of at most 4 MiB; larger
+files and legacy revision-3 files do not start a shutdown proof. A failed or
+canceled walk is never restarted at close. Large unverified files still depend
+on worker progress; close can wait for that existing proof, but never launches
+a second large scan. The walk and reader teardown run outside both publication
+locks. Subsequent processes inherit a valid certificate before opening index
+sources. Owners that make no publications require no new proof at close.
+Queued replay and storage maintenance recheck shutdown after acquiring the
+owner gate. A historical proof attempt does not keep queued maintenance alive.
+
+Pending append-only proof lineage survives reopening an identical unchecked
+generation on the same inode. This does not enable reuse early: the original
+fenced proof must complete before foreground writes can reuse pages. Foreign
+publication and inode replacement still invalidate inheritance.
+
+Directory marker sweep progress belongs to the connection owner and survives
+foreground runtime replacement, including turns when allocator verification is
+busy. Each turn still examines at most 64 directory entries and preserves locked
+live markers. The focused regression set is:
+
+```sh
+cd zig
+zig build capi-test -Dembedded-only=true \
+  -Dtest-filter='capi native short lived writers' \
+  -Dtest-filter='capi native marker sweep' \
+  -Dtest-filter='capi native allocator proof survives close' \
+  -Dtest-filter='capi native close bounds proof work'
+```
+
 Entity curation commits policy to the destination namespace before returning.
 `antfly_db_resolver_curation_json` and `antfly_db_render_resolver_key_json`
 read that committed policy immediately, even while source projections and graph
@@ -319,6 +351,26 @@ identify the observed policy incarnation and revision. `config_generation`
 retains its existing resolver-generation meaning. A curation `wait` releases
 writer admission while observing the captured sources and destination; `applied`
 requires their policy projection and resolution/promotion replay to complete.
+
+Entity mutation and proposal-decision responses report cascaded keys and their
+`release` or `suppress` dispositions in `namespaces[].absorbed`, once per
+namespace. Match a consumer summary in `results` to its outcome using
+`key_template`. Consumer summaries contain replay progress; they do not repeat
+absorbed keys. Direct edit retries report empty absorbed lists when there is no
+new cascade; already-decided proposal retries return their receipt and progress.
+
+For example, collect the unique keys affected across matching namespaces:
+
+```python
+response = db.curate_entity(
+    "default", "concept/note", {"action": "suppress", "absorbed": "suppress"}
+)
+absorbed_keys = sorted({
+    item["key"]
+    for namespace in response.get("namespaces", [])
+    for item in namespace["absorbed"]
+})
+```
 
 This follows SQLite's separation of connection lifetime from writer ownership;
 it does not claim SQLite WAL concurrency or change Antfly SQL's existing

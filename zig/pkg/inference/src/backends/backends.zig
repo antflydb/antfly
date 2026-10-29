@@ -128,6 +128,47 @@ pub const BackendType = enum {
     }
 };
 
+const memory_policy = @import("../runtime/tier/memory.zig");
+var cuda_memory_bytes = std.atomic.Value(usize).init(0);
+var cuda_unified_memory = std.atomic.Value(bool).init(false);
+
+pub fn cudaDeviceMemoryBytes(backend: BackendType) usize {
+    if (!build_options.enable_cuda) return 0;
+    if (backend != .cuda) return 0;
+    const cached = cuda_memory_bytes.load(.acquire);
+    if (cached != 0) return cached;
+    var driver = @import("../ops/cuda/driver.zig").CudaDriver.open() catch return 0;
+    defer driver.deinit();
+    const capacity = driver.defaultDeviceMemory() catch return 0;
+    const bytes = capacity.total_bytes;
+    cuda_unified_memory.store(capacity.unified, .release);
+    cuda_memory_bytes.store(bytes, .release);
+    std.log.info("CUDA admission device capacity_bytes={d} unified={}", .{ bytes, capacity.unified });
+    return bytes;
+}
+
+pub fn cudaUsesUnifiedMemory() bool {
+    return cuda_memory_bytes.load(.acquire) != 0 and cuda_unified_memory.load(.acquire);
+}
+
+pub fn defaultMemoryLimits(backend: BackendType, process_limit: usize) memory_policy.Limits {
+    const class: memory_policy.BackendClass = if (backend.usesGpuHostedSession()) .gpu else .cpu;
+    const defaults = memory_policy.defaultLimitsForBackendWithProcessLimit(class, process_limit);
+    const bytes = cudaDeviceMemoryBytes(backend);
+    var limits = memory_policy.limitsForDiscreteDevice(defaults, bytes, process_limit);
+    if (bytes != 0 and cuda_unified_memory.load(.acquire))
+        limits = memory_policy.clampUnifiedDeviceLimits(limits, limits.host_limit_bytes);
+    return limits;
+}
+
+pub fn clampPhysicalMemoryLimits(backend: BackendType, limits: memory_policy.Limits, process_limit: usize) memory_policy.Limits {
+    const bytes = cudaDeviceMemoryBytes(backend);
+    var out = memory_policy.clampDiscreteDeviceLimits(limits, bytes, process_limit);
+    if (bytes != 0 and cuda_unified_memory.load(.acquire))
+        out = memory_policy.clampUnifiedDeviceLimits(out, memory_policy.defaultSharedAdmissionLimitsWithProcessLimit(process_limit).host_limit_bytes);
+    return out;
+}
+
 /// The backend that determines a session's resource domain and interruption
 /// policy.
 pub const BackendRuntime = struct {

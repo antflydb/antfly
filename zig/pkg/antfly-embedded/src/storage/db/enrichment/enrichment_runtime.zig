@@ -5435,6 +5435,7 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
                     .embedding => delta.embedding = values,
                     .transcribe => delta.transcribe = values,
                     .classify => delta.classify = values,
+                    .diarize => delta.diarize = values,
                 }
             }
         }
@@ -14549,6 +14550,7 @@ fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bo
     return provider == .string and std.mem.eql(u8, provider.string, "antfly");
 }
 fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     const Task = struct {
         runtime: *EnrichmentRuntime,
         producer: asset_producer_mod.Producer,
@@ -14701,10 +14703,10 @@ fn mediaRepairDecision(a: Allocator, desired: @import("inference_chunker").outpu
     var changed = false;
     for (original) |value| if (std.mem.eql(u8, value.name, desired.name)) {
         seen = true;
-        const identity = try desired.recipeIdentity(a, if (current_identity) |current| current.model_identity else value.model_identity, if (current_identity) |current| current.model_revision else value.model_revision);
+        const identity = try desired.receiptRecipeIdentity(a, current_identity orelse value);
         changed = changed or !std.mem.eql(u8, &identity, value.recipe_id);
         if (desired.model_identity) |pin| changed = changed or !std.mem.eql(u8, pin, value.model_identity);
-        failed = failed or (value.status != .complete and !value.terminal) or (value.status == .complete and value.embedding == null and value.spans == null and value.labels == null);
+        failed = failed or (value.status != .complete and !value.terminal) or (value.status == .complete and value.embedding == null and value.spans == null and value.labels == null and value.speaker_spans == null);
     };
     return .{ .needed = !seen or failed or changed };
 }
@@ -14807,24 +14809,27 @@ fn repairMediaOutputPrepared(runtime: *EnrichmentRuntime, request: enrichment_ty
         if (current_identity) |identity| {
             replacement.model_identity = identity.model_identity;
             replacement.model_revision = identity.model_revision;
+            replacement.speaker_model_revision = identity.speaker_model_revision;
         }
         replacement.kind = desired.kind;
         replacement.required = desired.required;
-        const failure_identity = try desired.recipeIdentity(scratch, replacement.model_identity, replacement.model_revision);
+        const failure_identity = try desired.receiptRecipeIdentity(scratch, replacement);
         replacement.recipe_id = try scratch.dupe(u8, &failure_identity);
         replacement.status = .failed;
         replacement.code = @errorName(failure.?);
         replacement.embedding = null;
         replacement.spans = null;
         replacement.labels = null;
+        replacement.speaker_spans = null;
         try replacements.append(scratch, replacement);
     };
     if (replacements.items.len == 0 and failure != null) {
         const model_identity = if (current_identity) |value| value.model_identity else "";
         const model_revision = if (current_identity) |value| value.model_revision else "";
-        const identity = try desired.recipeIdentity(scratch, model_identity, model_revision);
+        const speaker_revision = if (current_identity) |value| value.speaker_model_revision else null;
+        const identity = if (desired.hasDiarization()) try desired.speakerRecipeIdentity(scratch, model_identity, model_revision, speaker_revision orelse "") else try desired.recipeIdentity(scratch, model_identity, model_revision);
         const owned_identity = try scratch.dupe(u8, &identity);
-        try replacements.append(scratch, .{ .name = desired.name, .kind = desired.kind, .required = desired.required, .model = desired.model, .model_identity = model_identity, .model_revision = model_revision, .recipe_id = owned_identity, .start_ns = metadata.descriptor.coordinates.start_ns, .end_ns = metadata.descriptor.coordinates.end_ns, .status = .failed, .code = @errorName(failure.?) });
+        try replacements.append(scratch, .{ .name = desired.name, .kind = desired.kind, .required = desired.required, .model = desired.model, .model_identity = model_identity, .model_revision = model_revision, .speaker_model_revision = speaker_revision, .recipe_id = owned_identity, .start_ns = metadata.descriptor.coordinates.start_ns, .end_ns = metadata.descriptor.coordinates.end_ns, .status = .failed, .code = @errorName(failure.?) });
     }
     if (replacements.items.len == 0) return error.InvalidChunkOutput;
     // Old embedded receipts predate explicit attempt counters: an existing
@@ -14967,7 +14972,7 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
             const values = try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, decision_arena.allocator(), parent.outputs_json orelse "[]", .{});
             for (values) |value| {
                 if (!std.mem.eql(u8, value.name, name) or !value.reusable()) continue;
-                const recipe = try target.recipeIdentity(decision_arena.allocator(), if (current_output) |current| current.model_identity else value.model_identity, if (current_output) |current| current.model_revision else value.model_revision);
+                const recipe = try target.receiptRecipeIdentity(decision_arena.allocator(), current_output orelse value);
                 if (skips.items.len < 4096 and std.mem.eql(u8, &recipe, value.recipe_id)) try skips.append(decision_arena.allocator(), .{ .ordinal = parent.descriptor.ordinal, .sub_index = value.sub_index });
             }
         }
@@ -15412,6 +15417,7 @@ const IndexDocumentCheckpoint = struct {
     }
 };
 fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, authority: ?*const @import("../artifact_producer_context.zig").Token) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     var arena = std.heap.ArenaAllocator.init(runtime.alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -25954,7 +25960,7 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     config.embedding.?.task_type = try a.dupe(u8, metadata.task_type);
     config.embedding.?.model_identity = try a.dupe(u8, metadata.model_identity);
     var policy = @import("../../../chunking/types.zig").MediaPolicy{};
-    inline for (@typeInfo(@TypeOf(metadata.policy)).@"struct".field_names) |name| @field(policy, name) = @intCast(@field(metadata.policy, name));
+    inline for (@typeInfo(@TypeOf(metadata.policy)).@"struct".field_names) |name| @field(policy, name) = if (@TypeOf(@field(metadata.policy, name)) == bool) @field(metadata.policy, name) else @intCast(@field(metadata.policy, name));
     config.policy = policy;
     // Route through the consumer's canonical endpoint, never a recipe-supplied
     // URL or credential. Existing execution context supplies authenticated I/O.
@@ -26052,7 +26058,7 @@ fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.Gener
         }
     }
     if (value.status == .complete and value.embedding != null) try value.validate(target);
-    const recipe = try target.recipeIdentity(a, value.model_identity, value.model_revision);
+    const recipe = try target.receiptRecipeIdentity(a, value);
     if (!std.mem.eql(u8, &recipe, value.recipe_id)) return error.IncompatibleChunkEmbeddingTarget;
     inline for (.{ "model", "model_identity", "model_revision" }) |field| {
         a.free(@field(result, field));
@@ -41154,4 +41160,34 @@ test "enrichment maintenance document failures share durable retry policy" {
     }
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.CloudflareRateLimited));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
+}
+
+test "model aware media diarized repair receipts reuse source identities and detect companion deployments" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const O = @import("inference_chunker").outputs;
+    const target = O.Target{ .name = "speech", .kind = .transcribe, .model = "whisper", .diarize = true };
+    const primary: [64]u8 = @splat('a');
+    const speaker: [64]u8 = @splat('b');
+    var receipt = O.Result{ .name = "speech", .kind = .transcribe, .model = "whisper", .required = true, .model_identity = &primary, .model_revision = &primary, .speaker_model_revision = &speaker, .recipe_id = "", .status = .complete, .speaker_scope = .source, .start_ns = 0, .end_ns = 1, .spans = &.{.{ .text = "hello", .start_ns = 0, .end_ns = 1, .speaker_index = 0 }} };
+    const recipe = try target.receiptRecipeIdentity(alloc, receipt);
+    receipt.recipe_id = &recipe;
+    var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 1 } }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "whisper", .model_identity = &primary, .task_type = "TRANSCRIBE", .dimensions = 0, .policy = .{}, .outputs_json = try std.json.Stringify.valueAlloc(alloc, &[_]O.Result{receipt}, .{ .emit_null_optional_fields = false }) };
+    try std.testing.expect(!(try mediaRepairDecision(alloc, target, &metadata, receipt)).needed);
+    const next_speaker: [64]u8 = @splat('c');
+    var deployed = receipt;
+    deployed.speaker_model_revision = &next_speaker;
+    try std.testing.expect((try mediaRepairDecision(alloc, target, &metadata, deployed)).needed);
+    var configured = target;
+    configured.diarization = .{ .similarity_threshold = 0.7 };
+    try std.testing.expect((try mediaRepairDecision(alloc, configured, &metadata, receipt)).needed);
+    // Legacy local labels cannot satisfy a request for the new source scope.
+    var legacy = receipt;
+    legacy.speaker_model_revision = null;
+    const legacy_recipe = try target.recipeIdentity(alloc, legacy.model_identity, legacy.model_revision);
+    legacy.recipe_id = &legacy_recipe;
+    metadata.outputs_json = try std.json.Stringify.valueAlloc(alloc, &[_]O.Result{legacy}, .{ .emit_null_optional_fields = false });
+    try std.testing.expect((try mediaRepairDecision(alloc, target, &metadata, receipt)).needed);
 }

@@ -40,6 +40,12 @@ const public_limits = @import("antfly_public_limits");
 const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const field_projection = @import("field_projection.zig");
+pub const ProjectionReceipt = field_projection.Receipt;
+test {
+    _ = field_projection;
+    _ = @import("../storage/db/field_projection_source.zig");
+}
 const query_openapi = @import("antfly_query_openapi");
 const reranking_mod = @import("antfly_reranking");
 const vector_codec = @import("antfly_vector").codec;
@@ -51,7 +57,148 @@ const public_query_max_tree_depth: usize = 64;
 const public_query_max_tree_nodes: usize = 16 * 1024;
 pub const QueryResponse = @import("query_response.zig").QueryResponse;
 
+pub fn fieldProjectionStorageEligible(req: db_mod.types.SearchRequest) bool {
+    return field_projection.storageEligible(req);
+}
+
+/// Local producer receipts cannot cross the worker wire. Re-establish them
+/// only for this hydration request's validated execution outputs. They never
+/// replace the revision-bound document authorization checked by the caller.
+pub fn finalizeHydratedProjectionSources(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hits: []db_mod.types.SearchHit) !void {
+    if (!field_projection.hydrationEligible(req)) return;
+    if (req.field_projection_plan) |shared| if (shared.get(req.field_projection_json)) |plan| {
+        return finalizeCompletedProjectionSources(a, req, hits, plan);
+    };
+    var plan = try field_projection.decode(a, req.field_projection_json);
+    defer plan.deinit();
+    try finalizeCompletedProjectionSources(a, req, hits, &plan);
+}
+
+fn finalizeCompletedProjectionSources(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hits: []db_mod.types.SearchHit, plan: *const field_projection.Plan) !void {
+    if (!field_projection.storageEligible(req) and !field_projection.hydrationEligible(req)) return;
+    for (hits) |*hit| {
+        if (hasFinalizedPublicSource(hit.*)) continue;
+        if (hit.source_value != null or hit.column_source != null) continue;
+        const stored = hit.stored_data orelse continue;
+        var completed = false;
+        if (hit.computed_json) |bytes| if ((if (hit.computed_receipt) |receipt| receipt.matches(bytes, plan.fingerprint) else false) or try plan.wireOutput(a, bytes, true) != null) {
+            completed = true;
+            hit.finalized_source = .{ .bytes = stored };
+            if (hit.computed_receipt == null or !hit.computed_receipt.?.matches(bytes, plan.fingerprint)) {
+                const owned = try plan.ownValidatedReceipt(a, bytes);
+                if (hit.computed_receipt) |previous| a.destroy(previous);
+                hit.computed_receipt = owned;
+            }
+        };
+        if (!completed and plan.bindings.len == 0) return error.UnsupportedQueryRequest;
+    }
+}
+
 pub const testing = if (builtin.is_test) struct {
+    pub fn expectNativeScalarArraySource() !void {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
+        defer a.free(path);
+        var db = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const padding = try a.alloc(u8, 32768);
+        defer a.free(padding);
+        @memset(padding, 'x');
+        const json = try std.fmt.allocPrint(a, "{{\"arr\":[{{\"n\":1}},{{\"n\":2}}],\"padding\":\"{s}\"}}", .{padding});
+        defer a.free(json);
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = json }}, .sync_level = .full_index });
+        const req: db_mod.types.SearchRequest = .{ .query = .{ .match_all = {} }, .fields = &.{"arr.1.n"}, .include_all_fields = false, .defer_stored_projection = true, .field_projection_json = "{\"fields\":[\"arr.1.n\",{\"name\":\"constant\",\"expression\":{\"literal\":1}}]}" };
+        var result = try db.search(a, req);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("{\"arr\":[{\"n\":2}]}", result.hits[0].stored_data.?);
+        try std.testing.expect(result.hits[0].finalized_source.?.matches(result.hits[0].stored_data.?));
+        // A decoded local/remote wire result has no pointer receipt.
+        result.hits[0].finalized_source = null;
+        var response = try encodeQueryResponses(a, "docs", req, .{}, result);
+        defer response.deinit(a);
+        var decoded = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+        defer decoded.deinit();
+        const source = decoded.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object.get("_source").?;
+        try std.testing.expectEqual(@as(i64, 2), source.object.get("arr").?.array.items[0].object.get("n").?.integer);
+    }
+    pub fn expectConditionalSourceProjection() !void {
+        const a = std.testing.allocator;
+        var owned = try parseQueryRequest(a, null, "docs",
+            \\{"fields":[],"params":{"cached":"no-match"},"select":{"id":{"field":"_id"},"value":{"case":[{"when":{"literal":false},"then":{"field":"image"}}],"else":{"literal":null}}}}
+        );
+        defer owned.deinit(a);
+        try std.testing.expect(owned.req.field_projection_json.len != 0);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const cold = try toOpenApiHit(arena.allocator(), owned.req, .{ .id = @constCast("a"), .stored_data = @constCast("{}") });
+        try std.testing.expect(cold._computed != null);
+        const computed = try ant_json.parseFromSliceLeaky(std.json.Value, arena.allocator(), cold._computed.?.bytes, .{});
+        try std.testing.expectEqualStrings("a", computed.object.get("id").?.string);
+        try std.testing.expect(computed.object.get("value").? == .null);
+        try std.testing.expect(!computed.object.contains(field_projection.marker));
+    }
+    pub fn expectConditionalSourceWireSpans() !void {
+        const a = std.testing.allocator;
+        var request = try parseQueryRequest(a, null, "docs", "{\"fields\":[\"body\"]}");
+        defer request.deinit(a);
+        const body = "{\"body\":{\"image\":\"quoted\\\" image\",\"number\":1e0},\"_artifact_unit_fingerprint\":\"private\",\"_hierarchy_unit_revision_token\":\"private\",\"_resolution_work\":1}";
+        var hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc"), .stored_data = @constCast(body), .artifact_ref = .{ .document_id = @constCast("doc"), .name = @constCast("fixture"), .kind = .embedding } }};
+        var response = try encodeQueryResponses(a, "docs", request.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 });
+        defer response.deinit(a);
+        // Reference conversion remains the ordinary DOM path for callers that
+        // explicitly need typed results; wire output must be equivalent.
+        var reference_arena = std.heap.ArenaAllocator.init(a);
+        defer reference_arena.deinit();
+        const reference = try toOpenApiHit(reference_arena.allocator(), request.req, hits[0]);
+        const expected = try std.json.Stringify.valueAlloc(a, reference, .{ .emit_null_optional_fields = false });
+        defer a.free(expected);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+        defer parsed.deinit();
+        const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+        const actual = try std.json.Stringify.valueAlloc(a, hit, .{});
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+        // A receipt is admitted only for the producer's exact public output.
+        const projected = try @import("../storage/db/document_query.zig").lookupJsonWithOutput(a, a, body, .{ .fields = &.{"body"}, .include_all_fields = false });
+        defer a.free(projected.json);
+        const normalized = projected.json;
+        hits[0].stored_data = @constCast(normalized);
+        hits[0].finalized_source = .{ .bytes = normalized };
+        var finalized = try encodeQueryResponses(a, "docs", request.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 });
+        defer finalized.deinit(a);
+        try std.testing.expectEqualStrings(response.json, finalized.json);
+        // Borrowing must not allocate another payload-sized response fragment.
+        const large = try a.alloc(u8, 1024 * 1024);
+        defer a.free(large);
+        @memset(large, 'x');
+        const Sink = struct {
+            fn start(_: *anyopaque, _: usize) !void {}
+            fn write(_: *anyopaque, _: []const u8) !void {}
+        };
+        var marker: u8 = 0;
+        var plan: ColumnWirePlan = undefined;
+        plan.init(a, .{ .ptr = &marker, .start_fn = Sink.start, .write_fn = Sink.write, .max_bytes = 2 * 1024 * 1024, .preparation_bytes = 2 * 1024 * 1024 }, request.req);
+        defer plan.deinit();
+        try plan.finalized(large);
+        try std.testing.expectEqual(@as(usize, 1), plan.segments.items.len);
+        try std.testing.expect(plan.segments.items[0].finalized.ptr == large.ptr);
+        try std.testing.expect(plan.arena.queryCapacity() < 4096);
+        // Cloning rebinds the receipt; clearing retires it.
+        var cloned = try hits[0].clone(a);
+        defer cloned.deinit(a);
+        try std.testing.expect(cloned.finalized_source.?.matches(cloned.stored_data.?));
+        try std.testing.expect(!cloned.finalized_source.?.matches(normalized));
+        cloned.clearSource(a);
+        try std.testing.expect(cloned.finalized_source == null);
+        // Replacement invalidates the receipt and uses strict projection.
+        hits[0].artifact_ref = null;
+        hits[0].stored_data = @constCast("{\"body\":{\"image\":1,\"image\":2}}");
+        try std.testing.expectError(error.DuplicateField, encodeQueryResponses(a, "docs", request.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 }));
+    }
+
     pub fn bodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {
         return queryBodyHasInternalShardFields(alloc, body);
     }
@@ -2216,11 +2363,22 @@ fn freeOwnedMutableStrings(alloc: std.mem.Allocator, values: [][]u8) void {
 }
 
 pub const OwnedQueryRequest = struct {
+    projection_plan: ?*field_projection.Plan = null,
     fields: [][]const u8 = &.{},
     req: db_mod.types.SearchRequest = .{},
     native_cut: ?std.json.Parsed(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child) = null,
 
+    /// Physical preparation for a consumer borrowing encoded native sources.
+    /// Ordinary wire queries retain their established source projection path.
+    pub fn prepareEncodedDelivery(self: *OwnedQueryRequest, alloc: std.mem.Allocator) !void {
+        try prepareSourceOnlyProjection(alloc, &self.req, &self.projection_plan, false);
+    }
+
     pub fn deinit(self: *OwnedQueryRequest, alloc: std.mem.Allocator) void {
+        if (self.projection_plan) |plan| {
+            plan.deinit();
+            alloc.destroy(plan);
+        }
         if (self.fields.len > 0) {
             for (self.fields) |field| alloc.free(field);
             alloc.free(self.fields);
@@ -2317,6 +2475,7 @@ fn applyCommonSearchRequestOptions(
     alloc: std.mem.Allocator,
     request: anytype,
     req: *db_mod.types.SearchRequest,
+    projection_owner: *?*field_projection.Plan,
 ) !void {
     if (request.limit) |limit| req.limit = @intCast(limit);
     if (comptime @hasField(@TypeOf(request), "evaluate")) {
@@ -2344,6 +2503,21 @@ fn applyCommonSearchRequestOptions(
             .through = if (requirements.after_write) |receipt| .{ .table_id = receipt.table_id, .object_generation = receipt.object_generation, .wal_lsn = receipt.wal_lsn } else null,
         };
     };
+    if (comptime @hasField(@TypeOf(request), "select")) {
+        if (request.select) |selection| {
+            const prepared = field_projection.encodePrepared(alloc, request.fields orelse &.{}, selection, request.params orelse .{ .object = .empty }) catch |err| return if (err == error.InvalidSqlParameters) error.InvalidQueryRequest else err;
+            projection_owner.* = prepared.plan;
+            req.field_projection_json = prepared.json;
+            req.field_projection_plan = .{ .plan = prepared.plan, .encoded = prepared.json };
+            if (req.evaluation_json.len != 0) {
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                const raw = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), req.evaluation_json, .{});
+                const compute = if (raw.object.get("compute")) |value| if (value == .object) value.object else return error.InvalidQueryRequest else std.json.ObjectMap.empty;
+                for (prepared.plan.bindings) |binding| if (compute.contains(binding.name)) return error.InvalidQueryRequest;
+            }
+        } else if (request.params != null) return error.InvalidQueryRequest;
+    }
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
@@ -2419,6 +2593,24 @@ fn applyCommonSearchRequestOptions(
     try validatePublicSortCursorTuple(req.*);
     if (request.embedding_template != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
     if (request.embedding_template != null and request.embeddings != null) return error.UnsupportedQueryRequest;
+}
+
+fn prepareSourceOnlyProjection(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest, projection_owner: *?*field_projection.Plan, worker_projection: bool) !void {
+    var execution = req.*;
+    if (worker_projection and execution.document_authority_mode == .hydrate) {
+        execution.document_authority_mode = .none;
+        execution.include_stored = true;
+    }
+    // Source masks and named scalars share one internal projection program.
+    // Keep retained/cursor and oversized shapes on their existing source path.
+    const source_shape = worker_projection or (req.offset == 0 and req.order_by.len == 0 and req.search_after.len == 0 and req.search_before.len == 0 and req.remote_snapshot == null and req.native_query_cut == null);
+    if (source_shape and req.field_projection_json.len == 0 and req.fields.len <= 4096 and !req.count_only and req.limit != 0 and field_projection.sourceStorageEligible(execution)) {
+        const prepared = try field_projection.encodeSourcePrepared(alloc, if (req.include_all_fields) &.{"*"} else req.fields);
+        projection_owner.* = prepared.plan;
+        req.field_projection_json = prepared.json;
+        req.field_projection_plan = .{ .plan = prepared.plan, .encoded = prepared.json };
+    }
+    req.defer_stored_projection = req.defer_stored_projection or req.field_projection_json.len != 0;
 }
 
 fn validatePublicSortCursorTuple(req: db_mod.types.SearchRequest) !void {
@@ -2511,10 +2703,12 @@ fn applySearchRequestFields(
         try cloneFields(alloc, items)
     else
         &.{};
+    errdefer freeClonedFields(alloc, fields);
     req.fields = fields;
     req.include_all_fields = include_all_fields;
-    req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null or req.hasHitEvaluation();
-    req.defer_stored_projection = req.hasHitEvaluation() or canDeferStoredProjection(fields) or
+
+    req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null or req.hasHitEvaluation() or req.field_projection_json.len != 0;
+    req.defer_stored_projection = req.field_projection_json.len != 0 or req.hasHitEvaluation() or canDeferStoredProjection(fields) or
         !req.hierarchy_match_include_all_fields or
         !req.hierarchy_source_include_all_fields or
         !req.hierarchy_unit_include_all_fields;
@@ -2881,10 +3075,13 @@ fn parseQueryRequestWithDeadlineCore(
         alloc,
         body_for_contract,
         .{ .parse_numbers = false },
-    ) catch return classifyPublicFilterContractErrorAlloc(alloc, effective_body);
+    ) catch |err| return if (err == error.OutOfMemory) err else classifyPublicFilterContractErrorAlloc(alloc, effective_body);
     defer parsed.deinit();
     try ensureQueryDeadline(execution_deadline_ns);
-    const request = parsed.value;
+    var request = parsed.value;
+    var worker_projection_fields = try parseProjectionSourceFields(alloc, effective_body);
+    defer if (worker_projection_fields) |*mask| mask.deinit();
+    if (worker_projection_fields) |mask| request.fields = if (mask.value.include_all) null else mask.value.fields;
 
     if (request.analyses != null) return error.UnsupportedQueryRequest;
     if (request.document_renderer != null) return error.UnsupportedQueryRequest;
@@ -2894,7 +3091,13 @@ fn parseQueryRequestWithDeadlineCore(
     var req: db_mod.types.SearchRequest = .{};
     errdefer freeSearchRequest(alloc, &req);
 
-    try applyCommonSearchRequestOptions(alloc, request, &req);
+    var projection_owner: ?*field_projection.Plan = null;
+    errdefer if (projection_owner) |plan| {
+        plan.deinit();
+        alloc.destroy(plan);
+    };
+    try applyCommonSearchRequestOptions(alloc, request, &req, &projection_owner);
+    req.field_projection_transport = worker_projection_fields != null;
     if (request.execution) |execution| if (execution.value_verification) |policy| {
         req.value_search_execution = .{
             .allow_scan = policy.allow_scan orelse false,
@@ -2993,7 +3196,9 @@ fn parseQueryRequestWithDeadlineCore(
     }
     try validateScoreSortHasScoreBearingSource(req);
 
+    if (worker_projection_fields != null) try prepareSourceOnlyProjection(alloc, &req, &projection_owner, true);
     return .{
+        .projection_plan = projection_owner,
         .fields = fields,
         .req = req,
     };
@@ -3099,6 +3304,7 @@ pub fn isPublicQueryValidationError(err: anyerror) bool {
         error.RerankerCandidateLimitExceeded,
         error.InvalidDecisionSpecification,
         error.InvalidFunctionExpression,
+        error.InvalidSqlParameters,
         error.UnknownQueryFunction,
         error.UnknownFunctionBinding,
         error.CyclicFunctionBinding,
@@ -3310,8 +3516,8 @@ fn classifyPublicFilterContractErrorAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) anyerror {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
-        return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err|
+        return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
     defer parsed.deinit();
     const request = switch (parsed.value) {
         .object => |object| object,
@@ -3402,7 +3608,12 @@ fn buildPreflightSearchRequestAlloc(
     var req: db_mod.types.SearchRequest = .{};
     errdefer freeSearchRequest(alloc, &req);
 
-    try applyCommonSearchRequestOptions(alloc, request, &req);
+    var projection_owner: ?*field_projection.Plan = null;
+    errdefer if (projection_owner) |plan| {
+        plan.deinit();
+        alloc.destroy(plan);
+    };
+    try applyCommonSearchRequestOptions(alloc, request, &req, &projection_owner);
 
     if (request.search_after != null and request.search_before != null) return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
 
@@ -3460,6 +3671,7 @@ fn buildPreflightSearchRequestAlloc(
     try validateScoreSortHasScoreBearingSource(req);
 
     return .{
+        .projection_plan = projection_owner,
         .fields = fields,
         .req = req,
     };
@@ -3649,6 +3861,9 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"_primary_text_index_name\"",
         "\"_embedding_limits\"",
         "\"execution\"",
+        "\"source_projection\"",
+        "\"select\"",
+        "\"params\"",
         "\"value_search_execution\"",
         "\"lake_read\"",
         "\"lake_visibility\"",
@@ -3791,13 +4006,52 @@ fn hasColumnSources(hits: []const db_mod.types.SearchHit) bool {
     return false;
 }
 
+// Storage-finalized conditional sources are already publicly projected. Keep
+// them as spans through the wire boundary, stripping private transport fields
+// with the same strict selector engine instead of materializing another DOM.
+fn canStreamFinalizedSource(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, _: ?*const field_projection.Plan) bool {
+    if (!req.include_stored or req.document_authority_mode != .none) return false;
+    return hasFinalizedPublicSource(hit);
+}
+fn hasFinalizedPublicSource(hit: db_mod.types.SearchHit) bool {
+    return hit.finalized_source != null and hit.finalized_source.?.matches(hit.stored_data orelse return false) and hit.source_value == null and hit.column_source == null;
+}
+fn preparedComputedOutput(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !?ant_json.RawObject {
+    const plan = projection orelse return null;
+    const bytes = hit.computed_json orelse return null;
+    if (hit.computed_receipt) |receipt| if (receipt.matches(bytes, plan.fingerprint)) return receipt.output(req.field_projection_transport);
+    return plan.wireOutput(a, bytes, req.field_projection_transport);
+}
+fn hasNamedProjection(projection: ?*const field_projection.Plan) bool {
+    return if (projection) |plan| plan.bindings.len != 0 else false;
+}
+fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: *db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !metadata_openapi.QueryHit {
+    const ready = try preparedComputedOutput(a, req, hit.*, projection);
+    if (ready != null and (field_projection.storageEligible(req) or field_projection.hydrationEligible(req)) and hit.source_value == null and hit.column_source == null) {
+        if (hit.stored_data) |bytes| hit.finalized_source = .{ .bytes = bytes };
+    }
+    // Rebind normalized response receipts before choosing raw source delivery.
+    // Reuse the validated output, rather than scanning large payloads twice.
+    return toOpenApiHitPreparedSource(a, req, hit.*, projection, canStreamFinalizedSource(req, hit.*, projection) or (hit.column_source != null and !hasNamedProjection(projection) and req.document_authority_mode == .none), ready);
+}
+fn hasFinalizedWireSources(req: db_mod.types.SearchRequest, hits: []const db_mod.types.SearchHit, projection: ?*const field_projection.Plan) bool {
+    for (hits) |hit| if (canStreamFinalizedSource(req, hit, projection)) return true;
+    return false;
+}
+fn writeConditionalWireSource(a: std.mem.Allocator, writer: *std.Io.Writer, raw: []const u8) !void {
+    const query = @import("../storage/db/document_query.zig");
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{ "*", "-" ++ hierarchy_navigation.unit_fingerprint_field, "-" ++ hierarchy_navigation.grouped_unit_revision_envelope_field, "-_resolution_work" }, .include_all_fields = false })).?;
+    defer plan.deinit();
+    try query.writeLookupObject(a, writer, raw, &plan);
+}
+
 // Metadata is encoded once into small owned spans. Source segments retain
 // projected typed descriptors, borrowing scalar bytes from the hit's page.
 // The complete exact length is known before transport starts, without replaying
 // the envelope encoder or retaining a full encoded response buffer.
 const ColumnWirePlan = struct {
     const Prepared = @import("../storage/db/column_source.zig").Prepared;
-    const Segment = union(enum) { metadata: []const u8, source: Prepared };
+    const Segment = union(enum) { metadata: []const u8, source: Prepared, finalized: []const u8 };
     const Spill = @import("../sql/spill.zig");
     a: std.mem.Allocator,
     backing: std.mem.Allocator,
@@ -3865,6 +4119,7 @@ const ColumnWirePlan = struct {
         for (self.segments.items) |segment| switch (segment) {
             .metadata => |bytes| try self.spool.writeAll(bytes),
             .source => |prepared| try std.json.Stringify.value(prepared, .{}, &self.spool),
+            .finalized => |bytes| try self.spool.writeAll(bytes),
         };
         try self.spool.flush();
         self.segments.deinit(self.backing);
@@ -3920,6 +4175,18 @@ const ColumnWirePlan = struct {
         }
         try self.segments.append(self.backing, .{ .source = try prepared.clone(self.a) });
     }
+    /// The hit owns these immutable bytes through transport. If admission
+    /// requires spilling, startSpill consumes every borrow before hits retire.
+    fn finalized(self: *@This(), bytes: []const u8) !void {
+        try self.writer.flush();
+        try self.account(bytes.len);
+        try self.reserve(bytes.len +| @sizeOf(Segment) * 2);
+        if (self.spill != null) {
+            try self.spool.writeAll(bytes);
+            return self.spool.flush();
+        }
+        try self.segments.append(self.backing, .{ .finalized = bytes });
+    }
     fn emit(self: *@This(), writer: *std.Io.Writer, req: db_mod.types.SearchRequest) !void {
         if (self.spill) |*file| {
             var bytes: [16 * 1024]u8 = undefined;
@@ -3938,6 +4205,7 @@ const ColumnWirePlan = struct {
             switch (segment) {
                 .metadata => |bytes| try writer.writeAll(bytes),
                 .source => |prepared| try std.json.Stringify.value(prepared, .{}, writer),
+                .finalized => |bytes| try writer.writeAll(bytes),
             }
         }
     }
@@ -3950,6 +4218,7 @@ fn ColumnWireResult(comptime T: type) type {
         base: T,
         hits: []db_mod.types.SearchHit,
         req: db_mod.types.SearchRequest,
+        projection: ?*const field_projection.Plan,
         scratch: *std.heap.ArenaAllocator,
         alloc: std.mem.Allocator,
         failure: *?anyerror,
@@ -3966,7 +4235,7 @@ fn ColumnWireResult(comptime T: type) type {
                     try w.objectField("hits");
                     try w.beginArray();
                     var released: usize = 0;
-                    var hit_arena = std.heap.ArenaAllocator.init(self.alloc);
+                    var hit_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(self.alloc));
                     defer hit_arena.deinit();
                     for (self.base.hits.?.hits.?, self.hits, 0..) |base_hit, _, hit_index| {
                         const hydrator = if (self.plan) |plan| plan.sink.hydrator else null;
@@ -3976,9 +4245,9 @@ fn ColumnWireResult(comptime T: type) type {
                                 return error.WriteFailed;
                             };
                         };
-                        const hit = self.hits[hit_index];
+                        var hit = self.hits[hit_index];
                         _ = hit_arena.reset(.retain_capacity);
-                        const api_hit = if (hydrator != null) toOpenApiHit(hit_arena.allocator(), self.req, hit) catch |err| {
+                        const api_hit = if (hydrator != null) toOpenApiHitForWire(hit_arena.allocator(), self.req, &hit, self.projection) catch |err| {
                             self.failure.* = err;
                             return error.WriteFailed;
                         } else base_hit;
@@ -3989,7 +4258,26 @@ fn ColumnWireResult(comptime T: type) type {
                         try w.beginObject();
                         inline for (@typeInfo(@TypeOf(api_hit)).@"struct".field_names) |field| {
                             if (comptime std.mem.eql(u8, field, "_source")) {
-                                if (hit.column_source) |source| {
+                                if (canStreamFinalizedSource(self.req, hit, self.projection)) {
+                                    try w.objectField(field);
+                                    try w.beginWriteRaw();
+                                    const bytes = hit.stored_data.?;
+                                    const finalized = if (hit.finalized_source) |receipt| receipt.matches(bytes) else false;
+                                    if (finalized) {
+                                        if (self.plan) |plan| {
+                                            plan.finalized(bytes) catch |err| {
+                                                self.failure.* = plan.failure orelse err;
+                                                return error.WriteFailed;
+                                            };
+                                        } else try w.writer.writeAll(bytes);
+                                    } else writeConditionalWireSource(hit_arena.allocator(), w.writer, bytes) catch |err| {
+                                        self.failure.* = err;
+                                        return error.WriteFailed;
+                                    };
+                                    w.endWriteRaw();
+                                } else if (hasNamedProjection(self.projection)) {
+                                    try writeWireField(w, field, api_hit._source);
+                                } else if (hit.column_source) |source| {
                                     if (self.req.include_stored) {
                                         try w.objectField(field);
                                         const options: db_mod.types.LookupOptions = .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields };
@@ -4040,7 +4328,7 @@ fn writeWireField(w: *std.json.Stringify, comptime name: []const u8, value: anyt
     try w.objectField(name);
     try w.write(value);
 }
-fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize) ![]u8 {
+fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize, projection: ?*const field_projection.Plan) ![]u8 {
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -4068,7 +4356,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
                 }
             };
         }
-        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
         std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
         plan.writer.flush() catch |err| return plan.failure orelse err;
         // Every prepared fragment now belongs to residency or the spool.
@@ -4096,7 +4384,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
         delivered.* = plan.length;
         return empty;
     }
-    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure };
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure };
     return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
 }
 
@@ -4125,9 +4413,24 @@ pub fn encodeQueryResponsesWithDelivery(
     const arena = arena_impl.allocator();
 
     const emitted_hits = if (req.count_only) result.hits[0..0] else result.hits;
+    const lease = try prepareFieldProjection(arena, req);
+    defer if (lease) |value| value.deinit(arena);
+    const projection = if (lease) |value| value.plan else null;
+    const typed_delivery = req.graph_queries.len == 0 and (if (delivery) |sink| sink.typed_result != null else false);
+    const encoded_sources: []?ant_json.RawObject = if (typed_delivery) try arena.alloc(?ant_json.RawObject, emitted_hits.len) else &.{};
+    @memset(encoded_sources, null);
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
-    for (emitted_hits, 0..) |hit, i| {
-        hits[i] = try toOpenApiHit(arena, req, hit);
+    for (emitted_hits, 0..) |*hit, i| {
+        // Preserve the existing validated raw-wire representation instead of
+        // parsing/cloning large source values just to enter an in-process port.
+        // Column/typed sources must still apply their public source masks.
+        if (typed_delivery and hit.column_source == null and hit.source_value == null) {
+            hits[i] = try toOpenApiHitForWire(arena, req, hit, projection);
+            if (canStreamFinalizedSource(req, hit.*, projection)) encoded_sources[i] = ant_json.RawObject.fromImmutableValidated(hit.stored_data.?, null);
+        } else hits[i] = if (typed_delivery)
+            try toOpenApiHitPrepared(arena, req, hit.*, projection)
+        else
+            try toOpenApiHitForWire(arena, req, hit, projection);
     }
 
     const graph_dialect = if (req.graph_queries.len > 0)
@@ -4167,7 +4470,14 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
+            if (graph_results == null and typed_delivery) if (delivery) |sink| if (sink.typed_result) |target| {
+                if (sink.hydrator != null) return error.InvalidArgument;
+                if (req.cancellation) |token| try token.check();
+                target.consume(target.ptr, .{ .result = query_results[0], .encoded_sources = encoded_sources }) catch return error.QueryDeliveryFailed;
+                delivered = 0;
+                break :blk try alloc.alloc(u8, 0);
+            };
+            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered, projection) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.QueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -4199,7 +4509,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.StatefulQueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -4218,18 +4528,51 @@ pub fn encodeQueryResponsesWithDelivery(
     };
 }
 
+pub const ProjectionLease = struct {
+    plan: *const field_projection.Plan,
+    owned: ?*field_projection.Plan = null,
+    pub fn deinit(self: ProjectionLease, a: std.mem.Allocator) void {
+        if (self.owned) |plan| {
+            plan.deinit();
+            a.destroy(plan);
+        }
+    }
+};
+pub fn prepareFieldProjection(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !?ProjectionLease {
+    if (req.field_projection_json.len == 0 or req.document_authority_mode != .none) return null;
+    if (req.field_projection_plan) |shared| if (shared.get(req.field_projection_json)) |plan| return .{ .plan = plan };
+    const plan = try alloc.create(field_projection.Plan);
+    errdefer alloc.destroy(plan);
+    plan.* = try field_projection.decode(alloc, req.field_projection_json);
+    return .{ .plan = plan, .owned = plan };
+}
 fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !metadata_openapi.QueryHit {
+    const lease = try prepareFieldProjection(alloc, req);
+    defer if (lease) |value| value.deinit(alloc);
+    return toOpenApiHitPrepared(alloc, req, hit, if (lease) |value| value.plan else null);
+}
+fn toOpenApiHitPrepared(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !metadata_openapi.QueryHit {
+    return toOpenApiHitPreparedSource(alloc, req, hit, projection, false, try preparedComputedOutput(alloc, req, hit, projection));
+}
+fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?*const field_projection.Plan, skip_source: bool, ready_computed: ?ant_json.RawObject) !metadata_openapi.QueryHit {
     try validateOpenApiHitSortTuple(req, hit);
 
-    return .{
-        ._computed = if (hit.computed_json) |data| try takeOpenApiObjectMap(alloc, try ant_json.parseFromSliceLeaky(std.json.Value, alloc, data, .{})) else null,
+    // A normalized worker/local query response may have crossed an ownership
+    // boundary that deliberately retires pointer receipts. Validate completed
+    // outputs before touching source: eligible producers already applied the
+    // source mask, so applying numeric array selections again loses positions.
+    const projected_source = hasFinalizedPublicSource(hit) or
+        (ready_computed != null and field_projection.storageEligible(req) and hit.stored_data != null and hit.source_value == null and hit.column_source == null);
+
+    var api_hit: metadata_openapi.QueryHit = .{
+        ._computed = if (projection == null) (if (hit.computed_json) |data| try ant_json.RawObject.init(data) else null) else null,
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
         ._score_details = toOpenApiScoreDetails(hit.score_details),
         ._distance = if (hit.distance) |distance| finiteScoreOrZero(distance) else null,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
-        ._source = if (req.document_authority_mode != .none and hit.document_authority != null) private: {
+        ._source = if (skip_source) null else if (req.document_authority_mode != .none and hit.document_authority != null) private: {
             const envelope = try db_mod.types.document_authority.encode(alloc, hit.document_authority.?.*, hit.stored_data);
             defer alloc.free(envelope);
             break :private try takeOpenApiObjectMap(alloc, try parseStoredSourceValue(alloc, envelope));
@@ -4246,19 +4589,57 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
                 // coordinator revision envelope. Projecting it by public unit
                 // fields would turn it into `{}` and defeat revision binding.
                 try parseInternalGroupedUnitRevisionEnvelopeValue(alloc, stored_data)
-            else if (req.defer_stored_projection)
+            else if (req.defer_stored_projection and !projected_source)
                 try projectPublicStoredSourceValue(alloc, stored_data, .{
                     .fields = req.fields,
                     .include_all_fields = req.include_all_fields,
                 })
             else
                 try parseStoredSourceValue(alloc, stored_data))
+        else if (hit.column_source) |columns|
+            (if (req.include_stored) try takeOpenApiObjectMap(alloc, try projectPublicSourceView(alloc, try columns.valueForProjectionAlloc(alloc, .{ .fields = req.fields, .include_all_fields = req.include_all_fields }), .{ .fields = req.fields, .include_all_fields = req.include_all_fields })) else null)
         else
             null,
         .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
         ._highlights = try highlightsJsonValue(alloc, hit.highlights),
     };
+    if (projection) |plan| {
+        // An empty scalar program attests source completion across native
+        // ownership boundaries, but adds no `_computed` to public responses.
+        if (plan.bindings.len == 0 and !req.field_projection_transport) return api_hit;
+        if (ready_computed) |ready| {
+            api_hit._computed = ready;
+            return api_hit;
+        }
+        const previous = if (hit.computed_json) |bytes| try ant_json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{}) else null;
+        var row_arena = std.heap.ArenaAllocator.init(alloc);
+        defer row_arena.deinit();
+        var source: ProjectionWireSource = .{ .hit = hit, .arena = &row_arena };
+        var value = try plan.evaluate(alloc, .{ .context = &source, .read = ProjectionWireSource.read }, previous, field_projection.requestLimits(&req));
+        if (!req.field_projection_transport) _ = value.object.orderedRemove(field_projection.marker);
+        // Encode chosen values once while their temporary source view is alive.
+        api_hit._computed = .{ .bytes = try std.json.Stringify.valueAlloc(alloc, value, .{}) };
+    }
+    return api_hit;
 }
+const ProjectionWireSource = struct {
+    hit: db_mod.types.SearchHit,
+    arena: *std.heap.ArenaAllocator,
+    root: ?std.json.Value = null,
+    fn read(raw: *anyopaque, a: std.mem.Allocator, path: []const u8, kind: @import("../sql/scalar.zig").ColumnRead) !@import("../sql/scalar.zig").Datum {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const temp = self.arena.allocator();
+        const root = if (self.hit.column_source) |columns|
+            try columns.valueForProjection(self.arena, .{ .fields = @as([]const []const u8, &.{path}), .include_all_fields = false })
+        else value: {
+            if (self.root == null) self.root = if (self.hit.source_value) |source| source else if (self.hit.stored_data) |bytes| try projectPublicStoredSourceValue(temp, bytes, .{ .fields = &.{}, .include_all_fields = true }) else .{ .object = .empty };
+            break :value self.root.?;
+        };
+        var source: field_projection.JsonSource = .{ .id = self.hit.id, .root = root };
+        const port = source.source();
+        return port.read(port.context, a, path, kind);
+    }
+};
 
 /// Move an owned dynamic JSON object into the generated OpenAPI object-map
 /// representation without cloning its keys or values. Stored documents are
@@ -11158,6 +11539,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.index_name) |index_name| alloc.free(index_name);
     if (req.primary_text_index_name) |index_name| alloc.free(index_name);
     if (req.remote_snapshot) |snapshot| alloc.free(snapshot);
+    if (req.field_projection_json.len > 0) alloc.free(req.field_projection_json);
     if (req.evaluation_json.len > 0) alloc.free(req.evaluation_json);
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);
@@ -12177,6 +12559,7 @@ fn queryBodyForGeneratedContractAlloc(
 
 fn isInternalShardFieldName(name: []const u8) bool {
     const internal_fields = [_][]const u8{
+        "_projection_source_fields",
         "_distributed_text_stats",
         "native_doc_id_constraints",
         "_filter_query_json",
@@ -12209,9 +12592,18 @@ fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
 }
 
 fn objectHasForbiddenPublicQueryField(object: std.json.ObjectMap) bool {
-    return object.get("identity_read_generation") != null or
+    return object.get("source_projection") != null or
+        object.get("identity_read_generation") != null or
         object.get("allow_doc_identity_reassignment") != null or
         objectHasInternalShardField(object);
+}
+
+const ProjectionSourceMask = struct { fields: []const []const u8, include_all: bool };
+fn parseProjectionSourceFields(a: std.mem.Allocator, body: []const u8) !?std.json.Parsed(ProjectionSourceMask) {
+    var raw = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer raw.deinit();
+    const value = raw.value.object.get("_projection_source_fields") orelse return null;
+    return try std.json.parseFromValue(ProjectionSourceMask, a, value, .{ .allocate = .alloc_always });
 }
 
 fn objectHasNonNullField(object: std.json.ObjectMap, name: []const u8) bool {
@@ -12521,6 +12913,7 @@ fn validateCanonicalHierarchyExecutionBudget(req: db_mod.types.SearchRequest) !v
 
 fn removeInternalShardFields(object: *std.json.ObjectMap) void {
     const internal_fields = [_][]const u8{
+        "_projection_source_fields",
         "_distributed_text_stats",
         "native_doc_id_constraints",
         "_filter_query_json",
@@ -13241,10 +13634,7 @@ fn freeTextQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) void {
 }
 
 fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
-    return try alloc.dupe(u8, out.written());
+    return std.json.Stringify.valueAlloc(alloc, value, .{});
 }
 
 pub const consumer_tests = consumerTests();
@@ -16495,6 +16885,7 @@ fn consumerTests() type {
             try std.testing.expect(parsed.req.include_all_fields);
             try std.testing.expect(parsed.req.include_stored);
             try std.testing.expect(!parsed.req.defer_stored_projection);
+            try std.testing.expect(parsed.projection_plan == null);
             try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
         }
 
@@ -19274,7 +19665,7 @@ fn typedLakeSourceScenario(a: std.mem.Allocator) !void {
     }
 }
 
-test "external lake typed source preserves ownership highlights exact values and public projection" {
+test "api query contract external lake typed source preserves ownership highlights exact values and public projection" {
     try typedLakeSourceScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, typedLakeSourceScenario, .{});
 }
@@ -19339,12 +19730,12 @@ fn columnLakeSourceScenario(a: std.mem.Allocator) !void {
     defer spilled.deinit(a);
     try std.testing.expectEqual(spilled.delivered_bytes.?, counter.bytes);
 }
-test "external lake column sources share pages and encode with typed source parity under allocation failures" {
+test "api query contract external lake column sources share pages and encode with typed source parity under allocation failures" {
     try columnLakeSourceScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, columnLakeSourceScenario, .{});
 }
 
-test "external lake column response delivery preserves cancellation and malformed source errors" {
+test "api query contract external lake column response delivery preserves cancellation and malformed source errors" {
     const a = std.testing.allocator;
     const rows = @import("../storage/rowsource/types.zig");
     const refs = [_]rows.RowRef{.{ .relational_key = "doc" }};
@@ -19824,4 +20215,372 @@ test "logical query public canonical threshold survives lowering and worker tran
     try std.testing.expect(!filtered_query.req.full_text.?.bool_query.pure_should_optional);
     const invalid = "{\"query\":{\"bool\":{\"should\":[{\"contains\":\"needle\",\"field\":\"content\"}],\"minimum_should_match\":2}}}";
     try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(a, null, "docs", invalid));
+}
+
+test "api query contract select worker roundtrip preserves masks params and receipts" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "\"fields\":[],", "\"fields\":[\"revision\"],", "" }) |mask| {
+        const body = try std.fmt.allocPrint(a, "{{{s}\"params\":{{\"cached\":\"known\"}},\"select\":{{\"identity\":{{\"call\":\"value_identity\",\"args\":[{{\"field\":\"image\"}}]}},\"expected\":{{\"param\":\"cached\"}}}}}}", .{mask});
+        defer a.free(body);
+        var original = try parsePublicQueryRequest(a, null, "docs", body);
+        defer original.deinit(a);
+        const wire = try @import("query_execution_contract.zig").encodeQueryRequest(a, original.req);
+        defer a.free(wire);
+        try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(a, null, "docs", wire));
+        var worker = try parseQueryRequest(a, null, "docs", wire);
+        defer worker.deinit(a);
+        try std.testing.expect(worker.req.field_projection_transport);
+        try std.testing.expectEqual(original.req.include_all_fields, worker.req.include_all_fields);
+        try std.testing.expectEqual(original.req.fields.len, worker.req.fields.len);
+        var first = try field_projection.decode(a, original.req.field_projection_json);
+        defer first.deinit();
+        var second = try field_projection.decode(a, worker.req.field_projection_json);
+        defer second.deinit();
+        try std.testing.expectEqualStrings(&first.fingerprint, &second.fingerprint);
+    }
+}
+
+test "api query contract worker projection receipt preserves compacted array source" {
+    const a = std.testing.allocator;
+    var request = try parseQueryRequest(a, null, "docs", "{\"fields\":[\"arr.1.n\"],\"select\":{\"constant\":{\"literal\":1}}}");
+    defer request.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var plan = try field_projection.decode(a, request.req.field_projection_json);
+    defer plan.deinit();
+    var source: field_projection.JsonSource = .{ .id = "a", .root = .null };
+    const computed = try plan.evaluate(temp, source.source(), null, .{});
+    var hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a"), .stored_data = @constCast("{\"arr\":[{\"n\":2}]}"), .computed_json = try std.json.Stringify.valueAlloc(temp, computed, .{}) }};
+    request.req.document_authority_mode = .hydrate;
+    try finalizeHydratedProjectionSources(temp, request.req, &hits);
+    try std.testing.expect(hits[0].finalized_source.?.matches(hits[0].stored_data.?));
+    request.req.document_authority_mode = .none;
+    request.req.defer_stored_projection = true;
+    // Encoded query responses deliberately retire the local pointer receipt.
+    hits[0].finalized_source = null;
+    const wire = try toOpenApiHit(temp, request.req, hits[0]);
+    try std.testing.expectEqual(@as(i64, 2), wire._source.?.map.get("arr").?.array.items[0].object.get("n").?.integer);
+}
+
+test "api query contract projection preparation is request owned and cloned params are isolated" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var owned = try parseQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[],\"select\":{\"c\":{\"param\":\"n\"}},\"params\":{\"n\":1}}");
+            defer owned.deinit(a);
+            const shared = (try prepareFieldProjection(a, owned.req)).?;
+            defer shared.deinit(a);
+            try std.testing.expect(shared.owned == null);
+            try std.testing.expect(shared.plan == owned.projection_plan.?);
+            const clone = try a.dupe(u8, owned.req.field_projection_json);
+            defer a.free(clone);
+            const at = std.mem.lastIndexOf(u8, clone, "\"n\":1").?;
+            clone[at + 4] = '2';
+            var req = owned.req;
+            req.field_projection_json = clone;
+            try std.testing.expect(req.field_projection_plan.?.get(clone) == null);
+            const separate = (try prepareFieldProjection(a, req)).?;
+            defer separate.deinit(a);
+            try std.testing.expect(separate.owned != null);
+            try std.testing.expectEqual(@as(i64, 1), shared.plan.params.object.get("n").?.integer);
+            try std.testing.expectEqual(@as(i64, 2), separate.plan.params.object.get("n").?.integer);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try Fixture.run(probe.allocator());
+    // Parser and arena warm paths may use fewer allocations on subsequent
+    // calls. Check every observed failure point without requiring equal counts.
+    var induced: usize = 0;
+    for (0..probe.alloc_index + 16) |index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        if (Fixture.run(failing.allocator())) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            induced += 1;
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    try std.testing.expect(induced > 0);
+}
+
+test "api query contract typed delivery consumes admitted projections without JSON serialization" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, temp, "{\"value\":{\"field\":\"items.1\"}}", .{});
+    const encoded = try field_projection.encodePrepared(temp, &.{}, input, .{ .object = .empty });
+    defer {
+        encoded.plan.deinit();
+        temp.destroy(encoded.plan);
+    }
+    var source: field_projection.JsonSource = .{ .id = "a", .root = try std.json.parseFromSliceLeaky(std.json.Value, temp, "{\"items\":[\"first\",\"second\"]}", .{}) };
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "a"), .stored_data = try a.dupe(u8, "{}") };
+    defer hit.deinit(a);
+    hit.computed_json = try encoded.plan.evaluateEncoded(temp, a, source.source(), null, .{});
+    hit.computed_receipt = try encoded.plan.ownValidatedReceipt(a, hit.computed_json.?);
+    const req: db_mod.types.SearchRequest = .{ .include_stored = true, .include_all_fields = false, .field_projection_json = encoded.json, .field_projection_plan = .{ .encoded = encoded.json, .plan = encoded.plan } };
+    const Sink = struct {
+        a: std.mem.Allocator,
+        count: usize = 0,
+        reject: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, view: @import("query_response.zig").ResultView) !void {
+            const result = view.result;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.ConsumerRejected;
+            self.count += 1;
+            const hits = result.hits.?.hits.?;
+            try std.testing.expectEqual(@as(usize, 1), hits.len);
+            const object = try std.json.parseFromSliceLeaky(std.json.Value, self.a, hits[0]._computed.?.bytes, .{});
+            try std.testing.expectEqualStrings("second", object.object.get("value").?.string);
+        }
+    };
+    var sink: Sink = .{ .a = temp };
+    var hits = [_]db_mod.types.SearchHit{hit};
+    var response = try encodeQueryResponsesWithDelivery(a, "docs", req, .{ .took_ms = 0 }, .{ .alloc = a, .hits = &hits, .total_hits = 1 }, .{
+        .ptr = &sink,
+        .start_fn = Sink.start,
+        .write_fn = Sink.write,
+        .typed_result = .{ .ptr = &sink, .consume = Sink.consume },
+    });
+    defer response.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    try std.testing.expectEqual(@as(?usize, 0), response.delivered_bytes);
+    try std.testing.expectEqual(@as(usize, 0), response.json.len);
+    sink.reject = true;
+    try std.testing.expectError(error.QueryDeliveryFailed, encodeQueryResponsesWithDelivery(a, "docs", req, .{ .took_ms = 0 }, .{ .alloc = a, .hits = &hits, .total_hits = 1 }, .{
+        .ptr = &sink,
+        .start_fn = Sink.start,
+        .write_fn = Sink.write,
+        .typed_result = .{ .ptr = &sink, .consume = Sink.consume },
+    }));
+}
+
+test "api query contract column scalar outputs retain independent source masks in wire and typed consumers" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "a" }};
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "items", .values = .{ .json = &.{"[{\"value\":\"first\"},{\"value\":\"second\"}]"} } },
+        .{ .name = "hidden", .values = .{ .bytes = &.{"requested only by select"} } },
+    };
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "a"), .column_source = page.row(0) };
+    defer hit.deinit(a);
+    const select = try std.json.parseFromSliceLeaky(std.json.Value, temp, "{\"chosen\":{\"field\":\"items.1.value\"},\"hidden\":{\"field\":\"hidden\"}}", .{});
+    const encoded = try field_projection.encodePrepared(temp, &.{"items.1.value"}, select, .{ .object = .empty });
+    defer {
+        encoded.plan.deinit();
+        temp.destroy(encoded.plan);
+    }
+    const req: db_mod.types.SearchRequest = .{ .include_stored = true, .include_all_fields = false, .fields = &.{"items.1.value"}, .field_projection_json = encoded.json, .field_projection_plan = .{ .encoded = encoded.json, .plan = encoded.plan } };
+    var hits = [_]db_mod.types.SearchHit{hit};
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1 };
+    var response = try encodeQueryResponses(a, "docs", req, .{}, result);
+    defer response.deinit(a);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, temp, response.json, .{});
+    const public_hit = parsed.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+    try std.testing.expectEqualStrings("{\"items\":[{\"value\":\"second\"}]}", try std.json.Stringify.valueAlloc(temp, public_hit.object.get("_source").?, .{}));
+    try std.testing.expectEqualStrings("second", public_hit.object.get("_computed").?.object.get("chosen").?.string);
+    const Sink = struct {
+        a: std.mem.Allocator,
+        called: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, view: @import("query_response.zig").ResultView) !void {
+            const value = view.result;
+            try std.testing.expect(view.encoded_sources[0] == null);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+            const selected = value.hits.?.hits.?[0];
+            const source = selected._source.?.map;
+            try std.testing.expect(source.get("hidden") == null);
+            try std.testing.expectEqual(@as(usize, 1), source.get("items").?.array.items.len);
+            try std.testing.expectEqualStrings("second", source.get("items").?.array.items[0].object.get("value").?.string);
+            const computed = try std.json.parseFromSliceLeaky(std.json.Value, self.a, selected._computed.?.bytes, .{});
+            try std.testing.expectEqualStrings("second", computed.object.get("chosen").?.string);
+            try std.testing.expectEqualStrings("requested only by select", computed.object.get("hidden").?.string);
+        }
+    };
+    var sink: Sink = .{ .a = temp };
+    var delivered = try encodeQueryResponsesWithDelivery(a, "docs", req, .{}, result, .{ .ptr = &sink, .start_fn = Sink.start, .write_fn = Sink.write, .typed_result = .{ .ptr = &sink, .consume = Sink.consume } });
+    defer delivered.deinit(a);
+    try std.testing.expect(sink.called);
+}
+
+test "api query contract typed delivery borrows finalized source within a small preparation budget" {
+    const a = std.testing.allocator;
+    const prefix = "{\"image\":\"";
+    const suffix = "\"}";
+    const body = try a.alloc(u8, prefix.len + 1024 * 1024 + suffix.len);
+    defer a.free(body);
+    @memcpy(body[0..prefix.len], prefix);
+    @memset(body[prefix.len .. body.len - suffix.len], 'a');
+    @memcpy(body[body.len - suffix.len ..], suffix);
+    // Preparing a parsed/cloned source would exceed this entire arena. The
+    // native public-source witness must allow a borrow, not an inferred receipt.
+    var buffer: [128 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const constrained = fixed.allocator();
+    var hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a"), .stored_data = body, .finalized_source = .{ .bytes = body } }};
+    const Sink = struct {
+        expected: []const u8,
+        called: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, view: @import("query_response.zig").ResultView) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+            try std.testing.expectEqual(@as(usize, 1), view.encoded_sources.len);
+            const value = view.encoded_sources[0].?;
+            try std.testing.expectEqual(@intFromPtr(self.expected.ptr), @intFromPtr(value.bytes.ptr));
+            try std.testing.expectEqualStrings(self.expected, value.bytes);
+            const selected = view.result.hits.?.hits.?[0];
+            try std.testing.expectEqualStrings("a", selected._id);
+            try std.testing.expect(selected._source == null);
+        }
+    };
+    var sink: Sink = .{ .expected = body };
+    var response = try encodeQueryResponsesWithDelivery(constrained, "docs", .{ .include_stored = true, .include_all_fields = false, .fields = &.{"image"} }, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 }, .{
+        .ptr = &sink,
+        .start_fn = Sink.start,
+        .write_fn = Sink.write,
+        .typed_result = .{ .ptr = &sink, .consume = Sink.consume },
+    });
+    defer response.deinit(constrained);
+    try std.testing.expect(sink.called);
+    try std.testing.expectEqual(@as(?usize, 0), response.delivered_bytes);
+}
+
+test "api query contract source only projection preserves public shape and worker proof" {
+    const a = std.testing.allocator;
+    var original = try parsePublicQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[\"arr.1.n\"]}");
+    defer original.deinit(a);
+    try std.testing.expect(original.projection_plan == null);
+    try original.prepareEncodedDelivery(a);
+    const plan = original.projection_plan.?;
+    try std.testing.expectEqual(@as(usize, 0), plan.bindings.len);
+    try std.testing.expect(field_projection.storageEligible(original.req));
+    var hydrate_only: db_mod.types.SearchRequest = .{ .fields = original.req.fields, .include_all_fields = false, .include_stored = false, .document_authority_mode = .hydrate };
+    var hydrate_owner: ?*field_projection.Plan = null;
+    try prepareSourceOnlyProjection(a, &hydrate_only, &hydrate_owner, true);
+    defer {
+        a.free(hydrate_only.field_projection_json);
+        hydrate_owner.?.deinit();
+        a.destroy(hydrate_owner.?);
+    }
+    try std.testing.expect(field_projection.hydrationEligible(hydrate_only));
+    try std.testing.expectEqualStrings(&plan.fingerprint, &hydrate_owner.?.fingerprint);
+    const wire = try @import("query_execution_contract.zig").encodeQueryRequest(a, original.req);
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "\"select\"") == null);
+    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(a, null, "docs", wire));
+    var worker = try parseQueryRequest(a, null, "docs", wire);
+    defer worker.deinit(a);
+    try std.testing.expect(worker.req.field_projection_transport);
+    try std.testing.expectEqualStrings(&plan.fingerprint, &worker.projection_plan.?.fingerprint);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var source: field_projection.JsonSource = .{ .id = "a", .root = .null };
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "a"), .stored_data = try a.dupe(u8, "{\"arr\":[{\"n\":2}]}") };
+    defer hit.deinit(a);
+    hit.computed_json = try plan.evaluateEncoded(arena.allocator(), a, source.source(), null, .{});
+    hit.computed_receipt = try plan.ownValidatedReceipt(a, hit.computed_json.?);
+    hit.finalized_source = .{ .bytes = hit.stored_data.? };
+    var hits = [_]db_mod.types.SearchHit{hit};
+    var public = try encodeQueryResponses(a, "docs", original.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 });
+    defer public.deinit(a);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), public.json, .{});
+    const selected = parsed.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+    try std.testing.expect(!selected.object.contains("_computed"));
+    try std.testing.expectEqual(@as(i64, 2), selected.object.get("_source").?.object.get("arr").?.array.items[0].object.get("n").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, public.json, field_projection.marker) == null);
+    var internal = try encodeQueryResponses(a, "docs", worker.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 });
+    defer internal.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, internal.json, field_projection.marker) != null);
+    // An older worker can return already-compacted source without the new
+    // completion proof. Refuse to guess that original indexes still exist.
+    var old_hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a"), .stored_data = @constCast("{\"arr\":[{\"n\":2}]}") }};
+    var hydration = original.req;
+    hydration.document_authority_mode = .hydrate;
+    try std.testing.expectError(error.UnsupportedQueryRequest, finalizeHydratedProjectionSources(arena.allocator(), hydration, &old_hits));
+    var empty = try parsePublicQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[]}");
+    defer empty.deinit(a);
+    try std.testing.expect(empty.projection_plan == null);
+    var ordered = try parsePublicQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[\"image\"],\"order_by\":[{\"field\":\"_id\"}]}");
+    defer ordered.deinit(a);
+    try ordered.prepareEncodedDelivery(a);
+    try std.testing.expect(ordered.projection_plan == null);
+    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(a, null, "docs", "{\"select\":{}}"));
+}
+
+test "api query contract source only column delivery keeps payload outside metadata preparation" {
+    const a = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(a, null, "docs", "{\"fields\":[\"body\"]}");
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.projection_plan == null);
+    try parsed.prepareEncodedDelivery(a);
+    try std.testing.expectEqual(@as(usize, 0), parsed.projection_plan.?.bindings.len);
+    const body = try a.alloc(u8, 1024 * 1024);
+    defer a.free(body);
+    @memset(body, 'a');
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "a" }};
+    const columns = [_]rows.ColumnVector{.{ .name = "body", .values = .{ .bytes = &.{body} } }};
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hits = [_]db_mod.types.SearchHit{.{ .id = try a.dupe(u8, "a"), .column_source = page.row(0) }};
+    defer hits[0].deinit(a);
+    var buffer: [128 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const Counter = struct {
+        bytes: usize = 0,
+        starts: usize = 0,
+        length: usize = 0,
+        fn start(raw: *anyopaque, length: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.starts += 1;
+            self.length = length;
+        }
+        fn write(raw: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bytes += bytes.len;
+        }
+    };
+    var counter: Counter = .{};
+    var response = try encodeQueryResponsesWithDelivery(fixed.allocator(), "docs", parsed.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 }, .{
+        .ptr = &counter,
+        .start_fn = Counter.start,
+        .write_fn = Counter.write,
+        .spill_io = std.testing.io,
+        .consume_columns = true,
+        .preparation_bytes = 16 * 1024,
+        .max_bytes = 2 * 1024 * 1024,
+    });
+    defer response.deinit(fixed.allocator());
+    try std.testing.expectEqual(@as(usize, 1), counter.starts);
+    try std.testing.expectEqual(counter.length, counter.bytes);
+    try std.testing.expect(counter.bytes > body.len);
+    try std.testing.expectEqual(@as(?usize, counter.bytes), response.delivered_bytes);
+    try std.testing.expect(hits[0].column_source == null);
 }

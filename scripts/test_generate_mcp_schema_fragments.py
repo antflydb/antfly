@@ -187,6 +187,8 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "table",
             "table_target",
             "fields",
+            "select",
+            "params",
             "hierarchy",
             "limit",
             "timeout_ms",
@@ -217,6 +219,8 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "search_after": ["hn1/revision/artifact/1/0/fingerprint", "artifact:unit"],
         }
         self.assertEqual([], list(validator.iter_errors(valid)))
+        conditional = {**valid, "select": {"text": {"field": "text"}}, "params": {}}
+        self.assertEqual([], list(validator.iter_errors(conditional)))
         resumed = {**valid, "remote_snapshot": "a" * 64}
         self.assertEqual([], list(validator.iter_errors(resumed)))
         with_read_requirement = copy.deepcopy(valid)

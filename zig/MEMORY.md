@@ -2666,6 +2666,99 @@ Pin membership maintenance consumes bounded native edit journals. Pin edits repa
 only changed boundaries; routing edits repair affected root membership and path
 shortcuts. New edits coalesce into persistent repair queues. Unaffected roots can
 retain indexed serving under a bounded current-head proof while affected roots
-use exact fallback. A single new pair with 6,000 unrelated pins requires nine
+use exact fallback. A single new pair with 6,000 unrelated pins requires 13
 owner writes, rather than clearing and rebuilding the entire profile. The shared
 metadata/Lite contracts retain source, head, visibility and final grant fences.
+
+Resolver dependency projection follow-up: static consumers use shared projection
+format 5. Reverse-parent dependencies scope a leaf correction to its affected
+paths. The bounded journal maintains deduplicated key invalidations; compact
+full-SHA digests are deduplicated once and sorted before unaffected-root proofs.
+Adaptive summaries store small roots inline and larger roots in bounded sorted
+fingerprint leaves, with full-SHA verification after every positive. Reference
+counts preserve collisions during deletion. Durable ingestion and next-work
+queues preserve active repair/walk progress under unrelated edits, with one
+scratch decode per event. Configured parent guards cover masked-edge unmerge.
+Owner-built coverage includes all configured nodes and only their reachable
+native paths. A shared latest-version native-tail index fences newly incoming
+paths without copying an entire native namespace into every profile. Unreferenced
+native paths are pruned even if native declarations survive. Native memory
+identities without static consumers create neither this projection nor its
+journal. Membership backfill merge-seeks configured nodes and native pin counts,
+with resumable cursors for either sparse direction. Event and per-item lookup
+scratch have separate lifetimes, so large canonical keys do not accumulate
+throughout an event. Exact native-tail terminals reuse the shared bounded routing
+cache under profile, journal-origin and source keys. Edited routing sources are
+intersected with published and in-flight profile coverage before walking; all
+routing edits remain journaled so later connections through previously flat
+edges cannot evade the fence. Cached results retain full-SHA path dependencies
+and survive unrelated routing edits after bounded ancestry and changed-key
+validation. Actual dependency changes invalidate reuse immediately. Small-root
+summaries search the sorted change set instead of probing every changed digest
+per root, and every fingerprint hit still requires full-SHA verification.
+Fallback canonicalization decodes each hop in resettable scratch and keeps only
+bounded digest history, so valid long-key paths work with cached membership or
+streaming fallback. Source and final grant fences remain independent. These
+changes preserve projection format 5; the new journal contract advances Lite to
+reader 29, topology to 68, metadata bootstrap to v21 and Lite enrollment to v9.
+See `RESOLUTION.md` for bounded maintenance, measurements and fallback rules.
+
+Recent routing-source discovery intersects a frozen sorted digest set from the
+bounded recent journal with profile coverage. It never walks old retained source
+versions merely because a small new burst exceeds a point-lookup threshold.
+Canonical cache hits can provide validated suffix dependencies to a bounded local
+memo; membership probes binary-search the borrowed sorted dependencies without
+materializing whole cached paths, including repeated multi-entry pages.
+Accepted canonical proofs advance synchronized, compare-checked sequence/graph/
+routing checkpoints, so unrelated heads validate the new history suffix without
+replaying the entry's lifetime. The immutable paths and dependencies retain their
+existing cache ownership and accounting. No root-set, source or grant decision
+enters the shared certificate. Failed dependency/ancestry checks and barriers
+still force fallback, and older snapshots cannot overwrite newer checkpoints.
+The operation-count regressions and concurrency contracts are in `RESOLUTION.md`.
+
+Legacy native namespaces must qualify their complete base content before sharing
+native graph data. A bounded owner migration hashes stable record pages, fences
+publication on the exact head, and publishes a qualified lineage without changing
+the logical curation revision. Ordinary edits preserve an unqualified state;
+read-only queries remain exact and perform no migration writes. This also covers
+older nonzero fingerprints derived from unknown zero-fingerprint bases. The
+qualification marker and resumable work use Lite reader 29, topology 68, metadata
+bootstrap v21 and Lite enrollment v9; projection format remains 5.
+
+Immutable invalidation preparation is shared across candidate pages at the same
+qualified baseline/current head pair. It uses the existing decoded cache budget
+and lease accounting, and keeps root decisions, native masks and grants outside
+the cache. Denied admission retains exact streaming behavior. Together with
+borrowed sorted suffix dependencies, this removes repeated journal preparation
+and path-length memo fills while preserving final source and authorization fences.
+
+
+Shared resolver routing proofs also reuse immutable sorted full-SHA routing-change
+plans, including each source's latest mutation sequence, under the existing
+48-MiB decoded-profile budget. Plans are qualified by namespace ancestry and the
+exact sequence window. Recent-source discovery borrows them directly; extension
+for older terminal checkpoints uses private scratch. Root verdicts, source
+coverage, native masks and authorization remain fresh. Cache denial preserves
+bounded streaming fallback; no additional cache budget or durable format is added.
+
+
+Fresh resolver coverage uses adaptive, byte-bounded request-local pages. Dense
+intersections reuse up to 128 rows within 1 MiB of existing scratch; sparse gaps
+retain galloping seeks. Allocation exhaustion shrinks the page width rather than
+truncating matches. Pages are independent of frozen history and event I/O and do
+not survive the request. Both native point reads and scan calls are measured:
+the 128-event/20-query fixture retains 380 point reads while scans drop from
+6,480 to 280, with coverage seeks dropping from 6,340 to 140.
+
+
+Legacy qualification now preserves progress during continuous edits. A version-2
+control row tracks processed records through a bounded Antfly SHA-256 transcript;
+mutations behind the cursor fold in full old/new values and exact byte deltas,
+while later records are read at their current values. The cursor and fence update
+atomically with each native edit, without a foreground namespace scan or an
+unbounded catch-up queue. Final publication still fences the exact current head.
+Untracked cuts restart safely; historical v1 work is retired rather than trusted.
+The 256-record upgrade fixture qualifies in three owner turns under ongoing edits,
+instead of repeatedly hashing the same prefix. The durable gates are reader 29,
+topology 68, metadata bootstrap v21 and Lite enrollment v9.

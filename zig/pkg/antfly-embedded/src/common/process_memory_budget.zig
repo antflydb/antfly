@@ -20,6 +20,7 @@ pub const canonical_env = "ANTFLY_PROCESS_MEMORY_BUDGET_MB";
 pub const inference_compat_env = "ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB";
 
 pub const Source = enum {
+    config,
     cli,
     canonical_environment,
     compatibility_environment,
@@ -133,6 +134,14 @@ pub fn resolveSystemDetailed(
         try resolveDetailed(cli_mib, canonical_env_value, compatibility_env_value),
         process_memory.systemEnvelope(),
     );
+}
+
+pub fn resolveSystemWithConfig(cli_mib: ?usize, canonical: ?[]const u8, compatibility: ?[]const u8, config_bytes: usize) !EffectiveResolution {
+    const configured: Resolution = if (cli_mib == null and canonical == null and compatibility == null)
+        .{ .limit_bytes = config_bytes, .source = if (config_bytes == 0) .automatic else .config }
+    else
+        try resolveDetailed(cli_mib, canonical, compatibility);
+    return resolveEffectiveDetailed(configured, process_memory.systemEnvelope());
 }
 
 test "process memory budget resolution preserves precedence and explicit zero" {
