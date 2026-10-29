@@ -119,7 +119,6 @@ pub const AddEmbeddedResult = struct {
     run_lite_rs_tests: *std.Build.Step.Run,
     run_lite_ts_tests: *std.Build.Step.Run,
     run_lite_go_example: *std.Build.Step.Run,
-    run_lite_go_retrieval_template: *std.Build.Step.Run,
     run_cabi_packaging_tests: *std.Build.Step.Run,
     run_capi_tests: *std.Build.Step.Run,
 };
@@ -498,37 +497,19 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "go",
         "run",
         ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-go-example.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-go-example.afb",
+        "smoke",
+        "-reset",
+        "-db",
+        "../../zig/.zig-cache/antfly-docs-knowledge-base-smoke.aflite",
+        "-backup",
+        "../../zig/.zig-cache/antfly-docs-knowledge-base-smoke.afb",
     });
     run_lite_go_example.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
-    run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
+    run_lite_go_example.setCwd(b.path("../examples/antfly-docs-knowledge-base"));
     run_lite_go_example.step.dependOn(install_libantfly);
     run_lite_go_example.step.dependOn(&install_capi_header.step);
-    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
+    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go knowledge-base example's model-free smoke check");
     lite_go_example_step.dependOn(&run_lite_go_example.step);
-
-    const run_lite_go_retrieval_template = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "run",
-        ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.afb",
-    });
-    run_lite_go_retrieval_template.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
-    run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
-    run_lite_go_retrieval_template.step.dependOn(install_libantfly);
-    run_lite_go_retrieval_template.step.dependOn(&install_capi_header.step);
-    const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
-    lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
 
     const run_cabi_packaging_tests = b.addSystemCommand(&.{
         "env",
@@ -725,7 +706,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .run_lite_rs_tests = run_lite_rs_tests,
         .run_lite_ts_tests = run_lite_ts_tests,
         .run_lite_go_example = run_lite_go_example,
-        .run_lite_go_retrieval_template = run_lite_go_retrieval_template,
         .run_cabi_packaging_tests = run_cabi_packaging_tests,
         .run_capi_tests = run_capi_tests,
     };

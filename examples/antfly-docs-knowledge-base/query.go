@@ -27,13 +27,13 @@ import (
 
 // searchHitHierarchy is the ancestry envelope QueryHit carries for a chunk or
 // embedding artifact hit (specs/openapi/antfly/metadata.yaml QueryHit /
-// QueryHitHierarchy). ParentDocKey lets dogfood project a semantic hit over
+// QueryHitHierarchy). ParentDocKey lets the example project a semantic hit over
 // the chunk_vectors artifact back to the source document.
 type searchHitHierarchy struct {
-	Level           string `json:"level"`
-	ParentDocKey    string `json:"parent_doc_key"`
-	Artifact        string `json:"artifact"`
-	MatchedArtifact string `json:"matched_artifact"`
+	Level           string          `json:"level"`
+	ParentDocKey    string          `json:"parent_doc_key"`
+	Artifact        string          `json:"artifact"`
+	MatchedArtifact json.RawMessage `json:"matched_artifact"`
 }
 
 type searchHit struct {
@@ -93,22 +93,11 @@ const (
 	edgeDirectionBoth uint8 = 2
 )
 
-// runQuery executes dogfood's hybrid retrieval: full-text search over the
-// default full-text index merged (RRF) with semantic search over
-// chunk_vectors, then a depth-2 both-direction traversal of the knowledge
-// graph starting from the resolved source documents of the top hits. If the
-// hybrid request fails (for example, chunk_vectors has no indexed vectors yet
-// because ingest has not finished draining, or the local libantfly build's
-// enrichment worker never started for a remote-provider handle -- see the
-// dogfood README's "Known limitations" section), runQuery falls back to
-// full-text-only search rather than failing outright.
-func runQuery(db *embedded.DB, text string, limit int) error {
-	// Antfly embeds the semantic_search text itself through the index's
-	// configured embedder (the handle's in-process runtime, or the index's
-	// api_url provider), exactly like the server does. The match form scores
-	// every query term (BM25 OR semantics), which a natural-language question
-	// needs; the "query" string form requires every term to match.
-	request := map[string]any{
+// hybridSearchRequest is the search body both Lite and the server accept:
+// full-text match search merged by RRF with semantic search over the chunk
+// embeddings, which Antfly embeds with the index's configured embedder.
+func hybridSearchRequest(text string, limit int) map[string]any {
+	return map[string]any{
 		"full_text_search": map[string]any{"match": map[string]any{"field": "body", "text": text}},
 		"full_text_index":  fullTextIndexName,
 		"semantic_search":  text,
@@ -117,6 +106,50 @@ func runQuery(db *embedded.DB, text string, limit int) error {
 		"limit":            limit,
 		"fields":           []string{"title", "body", "source", "kind"},
 	}
+}
+
+// printHits prints search hits, projecting chunk hits back to their section,
+// and returns the distinct section keys in rank order.
+func printHits(hits []searchHit) []string {
+	resolvedKeys := make([]string, 0, len(hits))
+	seen := make(map[string]bool)
+	for i, hit := range hits {
+		docKey := hit.ID
+		note := ""
+		if hit.Hierarchy != nil && hit.Hierarchy.ParentDocKey != "" {
+			docKey = hit.Hierarchy.ParentDocKey
+			if hit.Hierarchy.Artifact != "" {
+				note = fmt.Sprintf(" (via chunk artifact %s)", hit.Hierarchy.Artifact)
+			}
+		}
+		title, _ := hit.Source["title"].(string)
+		source, _ := hit.Source["source"].(string)
+		fmt.Printf("%2d. [%.4f] %s -- %s%s\n", i+1, hit.Score, docKey, firstNonEmpty(title, source), note)
+
+		if !seen[docKey] {
+			seen[docKey] = true
+			resolvedKeys = append(resolvedKeys, docKey)
+		}
+	}
+	return resolvedKeys
+}
+
+// runQuery executes this example's hybrid retrieval: full-text search over the
+// default full-text index merged (RRF) with semantic search over
+// chunk_vectors, then a depth-2 both-direction traversal of the knowledge
+// graph starting from the resolved source documents of the top hits. If the
+// hybrid request fails (for example, chunk_vectors has no indexed vectors yet
+// because ingest has not finished draining, or the local libantfly build's
+// enrichment worker never started for a remote-provider handle -- see the
+// the example README's "Known limitations" section), runQuery falls back to
+// full-text-only search rather than failing outright.
+func runQuery(db *embedded.DB, text string, limit int) error {
+	// Antfly embeds the semantic_search text itself through the index's
+	// configured embedder (the handle's in-process runtime, or the index's
+	// api_url provider), exactly like the server does. The match form scores
+	// every query term (BM25 OR semantics), which a natural-language question
+	// needs; the "query" string form requires every term to match.
+	request := hybridSearchRequest(text, limit)
 	body, err := json.Marshal(request)
 	if err != nil {
 		return fmt.Errorf("marshal search request: %w", err)
@@ -150,24 +183,7 @@ func runQuery(db *embedded.DB, text string, limit int) error {
 
 	fmt.Printf("Query: %q (%d hits)\n\n", text, len(results.Hits))
 
-	resolvedKeys := make([]string, 0, len(results.Hits))
-	seen := make(map[string]bool)
-	for i, hit := range results.Hits {
-		docKey := hit.ID
-		note := ""
-		if hit.Hierarchy != nil && hit.Hierarchy.ParentDocKey != "" {
-			docKey = hit.Hierarchy.ParentDocKey
-			note = fmt.Sprintf(" (via chunk artifact %s)", hit.Hierarchy.Artifact)
-		}
-		title, _ := hit.Source["title"].(string)
-		source, _ := hit.Source["source"].(string)
-		fmt.Printf("%2d. [%.4f] %s -- %s%s\n", i+1, hit.Score, docKey, firstNonEmpty(title, source), note)
-
-		if !seen[docKey] {
-			seen[docKey] = true
-			resolvedKeys = append(resolvedKeys, docKey)
-		}
-	}
+	resolvedKeys := printHits(results.Hits)
 
 	const maxTraversalSeeds = 5
 	seeds := resolvedKeys

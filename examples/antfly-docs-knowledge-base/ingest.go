@@ -27,16 +27,20 @@ import (
 	"github.com/antflydb/antfly/go/pkg/embedded"
 )
 
-// corpusIncludes selects Antfly's own design docs, plans, and history, relative to
-// the repository root (the -repo flag).
+// corpusIncludes selects Antfly's own documentation relative to the repository
+// root (the -repo flag): user guides and reference, subsystem design docs,
+// plans, and dated history.
 var corpusIncludes = []string{
+	"docs/*.md",
+	"docs/*.mdx",
+	"docs/guides/**",
+	"docs/reference/**",
+	"docs/operations/**",
+	"docs/design/**",
+	"docs/plans/**/*.md",
 	"zig/*.md",
 	"zig/pkg/**/*.md",
 	"zig/lib/**/*.md",
-	"docs/design/**",
-	"docs/operations/**/history/**/*.md",
-	"docs/reference/**/history/**/*.md",
-	"docs/plans/**/*.md",
 }
 
 // corpusExcludes trims generated, vendored, and non-prose files out of the
@@ -49,10 +53,10 @@ var corpusExcludes = []string{
 	"**/LICENSE*",
 }
 
-// docSection is dogfood's document shape: one row per markdown section,
-// classified as design, plan, or history by path. This is
-// deliberately narrower than docsaf.DocumentSection.ToDocument(): dogfood
-// wants a stable, dogfood-specific field set (title/heading_path/body/
+// docSection is this example's document shape: one row per markdown section,
+// classified by path (see docKind). This is
+// deliberately narrower than docsaf.DocumentSection.ToDocument(): the example
+// wants a stable, example-specific field set (title/heading_path/body/
 // source/kind) rather than docsaf's generic content-source document shape.
 type docSection struct {
 	Key         string
@@ -63,17 +67,23 @@ type docSection struct {
 	Kind        string
 }
 
-// docKind classifies a corpus-relative path as design, plan, or history.
-// Historical records retain the "work-log" kind for existing queries; proposed
-// work is "plan" and living subsystem documentation is "design".
+// docKind classifies a corpus-relative path. Dated records under history/
+// are "work-log", proposed work is "plan", user-facing guides and reference
+// pages are "guide" and "reference", and living subsystem docs are "design".
 func docKind(relPath string) string {
-	if strings.HasPrefix(relPath, "docs/plans/") {
+	switch {
+	case strings.HasPrefix(relPath, "docs/plans/"):
 		return "plan"
-	}
-	if strings.HasPrefix(relPath, "docs/") && strings.Contains(relPath, "/history/") {
+	case strings.HasPrefix(relPath, "docs/") && strings.Contains(relPath, "/history/"):
 		return "work-log"
+	case strings.HasPrefix(relPath, "docs/guides/"),
+		strings.HasPrefix(relPath, "docs/") && strings.Count(relPath, "/") == 1:
+		return "guide"
+	case strings.HasPrefix(relPath, "docs/reference/"), strings.HasPrefix(relPath, "docs/operations/"):
+		return "reference"
+	default:
+		return "design"
 	}
-	return "design"
 }
 
 // collectDocSections walks the corpus under repoRoot and splits every
@@ -120,7 +130,7 @@ func collectDocSections(ctx context.Context, repoRoot string) ([]docSection, err
 	return sections, nil
 }
 
-// toDocument converts a docSection to the JSON document body dogfood writes.
+// toDocument converts a docSection to the JSON document body the example writes.
 func (s docSection) toDocument() map[string]any {
 	doc := map[string]any{
 		"title":  s.Title,
@@ -134,7 +144,7 @@ func (s docSection) toDocument() map[string]any {
 	return doc
 }
 
-// ingestBatchSize bounds how many documents dogfood writes per Batch call.
+// ingestBatchSize bounds how many documents the example writes per Batch call.
 const ingestBatchSize = 200
 
 // ingestSections writes docSections to db in bounded batches, returning the

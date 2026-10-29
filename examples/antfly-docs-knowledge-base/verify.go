@@ -85,7 +85,7 @@ func verifyKnowledgeGraphConfig(storedConfigJSON string, cfg indexBuildConfig) e
 
 // catalogEnrichment is the subset of the enrichment-catalog row shape
 // (db_mod.types.EnrichmentConfig serialized by antfly_db_list_enrichments_json)
-// dogfood verifies.
+// the example verifies.
 type catalogEnrichment struct {
 	Name               string `json:"name"`
 	Kind               string `json:"kind"`

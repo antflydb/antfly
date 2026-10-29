@@ -13,15 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command dogfood ingests Antfly's own design docs and work log into an
-// embedded Antfly Lite database and builds a small knowledge graph over them:
-// Qwen3 embeddings over fixed-size chunks for semantic search, and GLiNER2.5
-// entity/relation extraction feeding a graph index (the "autograph" pattern).
-//
-// It dogfoods the docs cleanup itself: design docs (zig/*.md, zig/pkg/**/*.md,
-// zig/lib/**/*.md, docs/design/**) and topic history (docs/**/history/**/*.md) are
-// ingested as distinct document kinds, so `dogfood query` and `dogfood entity`
-// can be used to sanity-check that the split reads sensibly end to end.
+// Command antfly-docs-knowledge-base builds a searchable knowledge base over
+// Antfly's own documentation. It walks the docs with docsaf, splits markdown
+// into sections, and writes them to embedded Antfly Lite (the default) or to a
+// running Antfly server (-url or ANTFLY_URL). Antfly chunks and embeds each
+// section with Qwen3 for semantic search and extracts entities and relations
+// with GLiNER2.5 into a knowledge graph. Commands query the result with hybrid
+// search and graph traversal, export a portable backup, and run a model-free
+// smoke check of the embedded API.
 package main
 
 import (
@@ -34,6 +33,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -49,9 +49,10 @@ const (
 	// windowed long documents (zig/pkg/inference/models/gliner2/GLINER25.md).
 	defaultExtractModel  = "fastino/gliner2.5-base-v1"
 	defaultTargetTokens  = 400
+	defaultDBPath        = "kb.aflite"
 	defaultOverlapTokens = 40
 
-	// healthProbeTimeout bounds how long dogfood waits for the inference
+	// healthProbeTimeout bounds how long the example waits for the inference
 	// server's health check before treating it as unreachable.
 	healthProbeTimeout = 3 * time.Second
 )
@@ -72,6 +73,10 @@ func main() {
 		err = runEntityCmd(os.Args[2:])
 	case "status":
 		err = runStatusCmd(os.Args[2:])
+	case "backup":
+		err = runBackupCmd(os.Args[2:])
+	case "smoke":
+		err = runSmokeCmd(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -85,18 +90,23 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `dogfood: embedded Antfly Lite knowledge graph over Antfly's own docs
+	fmt.Fprintln(os.Stderr, `antfly-docs-knowledge-base: a knowledge base over Antfly's own docs
 
 Usage:
-  dogfood ingest [-db dogfood.aflite] [-repo ../..] [-reset] [flags...]
-  dogfood query "<text>" [-db dogfood.aflite]
-  dogfood entity "<name>" [-db dogfood.aflite]
-  dogfood status [-db dogfood.aflite]`)
+  antfly-docs-knowledge-base ingest [-db kb.aflite | -url URL] [-repo ../..] [-reset] [flags...]
+  antfly-docs-knowledge-base query "<text>" [-db kb.aflite | -url URL]
+  antfly-docs-knowledge-base entity "<name>" [-db kb.aflite]
+  antfly-docs-knowledge-base status [-db kb.aflite]
+  antfly-docs-knowledge-base backup [-db kb.aflite] [-out kb.afb]
+  antfly-docs-knowledge-base smoke [-db smoke.aflite] [-backup smoke.afb] [-reset]
+
+-url defaults to $ANTFLY_URL. When it is set, ingest and query use that server
+instead of an embedded Lite file.`)
 }
 
 func runIngestCmd(args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
-	dbPath := fs.String("db", "dogfood.aflite", "Antfly Lite database path")
+	dbPath := fs.String("db", defaultDBPath, "Antfly Lite database path")
 	repoRoot := fs.String("repo", "../..", "repository root to ingest design docs, plans, and history from")
 	reset := fs.Bool("reset", false, "remove the existing Lite database before ingesting")
 	inferenceURL := fs.String("inference-url", defaultInferenceURL, "optional remote antfly inference server (e.g. http://127.0.0.1:8090); empty runs inference in-process")
@@ -105,8 +115,22 @@ func runIngestCmd(args []string) error {
 	targetTokens := fs.Int("target-tokens", defaultTargetTokens, "fixed chunker target tokens per chunk")
 	overlapTokens := fs.Int("overlap-tokens", defaultOverlapTokens, "fixed chunker overlap tokens between chunks")
 	metrics := fs.Bool("metrics", true, "publish a pagerank metric on the knowledge graph index")
+	serverURL := fs.String("url", defaultServerURL(), "Antfly server API URL, e.g. http://localhost:8080/db/v1 (default $ANTFLY_URL); empty writes to the Lite file")
+	table := fs.String("table", defaultTableName, "server table name (server mode only)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	cfg := indexBuildConfig{
+		InferenceURL:  *inferenceURL,
+		EmbedModel:    *embedModel,
+		ExtractModel:  *extractModel,
+		TargetTokens:  *targetTokens,
+		OverlapTokens: *overlapTokens,
+		Metrics:       *metrics,
+	}
+	if *serverURL != "" {
+		return runServerIngest(*serverURL, *table, *repoRoot, cfg, *reset)
 	}
 
 	if *reset {
@@ -125,14 +149,6 @@ func runIngestCmd(args []string) error {
 		return err
 	}
 
-	cfg := indexBuildConfig{
-		InferenceURL:  *inferenceURL,
-		EmbedModel:    *embedModel,
-		ExtractModel:  *extractModel,
-		TargetTokens:  *targetTokens,
-		OverlapTokens: *overlapTokens,
-		Metrics:       *metrics,
-	}
 	if err := ensureSchemaAndIndexes(db, cfg); err != nil {
 		return err
 	}
@@ -171,18 +187,23 @@ func runIngestCmd(args []string) error {
 }
 
 func runQueryCmd(args []string) error {
-	flagArgs, positional := reorderFlags(args, map[string]bool{"db": true, "limit": true, "inference-url": true})
+	flagArgs, positional := reorderFlags(args, map[string]bool{"db": true, "limit": true, "inference-url": true, "url": true, "table": true})
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
-	dbPath := fs.String("db", "dogfood.aflite", "Antfly Lite database path")
+	dbPath := fs.String("db", defaultDBPath, "Antfly Lite database path")
 	limit := fs.Int("limit", 8, "number of hybrid search hits to return")
+	serverURL := fs.String("url", defaultServerURL(), "Antfly server API URL (default $ANTFLY_URL); empty queries the Lite file")
+	table := fs.String("table", defaultTableName, "server table name (server mode only)")
 	inferenceURL := fs.String("inference-url", defaultInferenceURL, "remote antfly inference server (must match ingest; empty: in-process)")
 	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
 	if len(positional) < 1 {
-		return fmt.Errorf("usage: dogfood query \"<text>\" [-db dogfood.aflite]")
+		return fmt.Errorf("usage: antfly-docs-knowledge-base query \"<text>\" [-db kb.aflite | -url URL]")
 	}
 	text := positional[0]
+	if *serverURL != "" {
+		return runServerQuery(newServerClient(*serverURL), *table, text, *limit)
+	}
 
 	db, err := openExistingLite(*dbPath, *inferenceURL)
 	if err != nil {
@@ -196,12 +217,12 @@ func runQueryCmd(args []string) error {
 func runEntityCmd(args []string) error {
 	flagArgs, positional := reorderFlags(args, map[string]bool{"db": true, "inference-url": true})
 	fs := flag.NewFlagSet("entity", flag.ExitOnError)
-	dbPath := fs.String("db", "dogfood.aflite", "Antfly Lite database path")
+	dbPath := fs.String("db", defaultDBPath, "Antfly Lite database path")
 	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
 	if len(positional) < 1 {
-		return fmt.Errorf("usage: dogfood entity \"<name>\" [-db dogfood.aflite]")
+		return fmt.Errorf("usage: antfly-docs-knowledge-base entity \"<name>\" [-db kb.aflite]")
 	}
 	name := positional[0]
 
@@ -219,7 +240,7 @@ func runEntityCmd(args []string) error {
 // preserving their relative order, and returns the remaining tokens as
 // positional arguments. The standard flag package stops recognizing flags at
 // the first positional token, which would otherwise make
-// `dogfood query "<text>" -db custom.aflite` silently ignore -db.
+// `query "<text>" -db custom.aflite` silently ignore -db.
 func reorderFlags(args []string, valueFlags map[string]bool) (flagArgs, positional []string) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -243,7 +264,7 @@ func reorderFlags(args []string, valueFlags map[string]bool) (flagArgs, position
 
 func runStatusCmd(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	dbPath := fs.String("db", "dogfood.aflite", "Antfly Lite database path")
+	dbPath := fs.String("db", defaultDBPath, "Antfly Lite database path")
 	inferenceURL := fs.String("inference-url", defaultInferenceURL, "remote antfly inference server to probe (empty: in-process runtime)")
 	extractModel := fs.String("extract-model", defaultExtractModel, "Antfly inference extraction model to probe")
 	if err := fs.Parse(args); err != nil {
@@ -314,7 +335,7 @@ func runStatusCmd(args []string) error {
 // "Remote Inference Provider"). libantfly does not embed the inference
 // runtime -- the capi link anchor resolves it from an executable consumer,
 // and the local-inference-runtime build flag only advertises the capability
-// -- so dogfood cannot use LocalRuntimeConfigured from Go. Instead it points
+// -- so this example cannot use LocalRuntimeConfigured from Go. Instead it points
 // every embedder/chunker/extractor producer config at a separately running
 // `antfly inference run` server and sets RemoteProviderConfigured so
 // Status().Inference.Mode reports "remote_provider" rather than the default
@@ -379,14 +400,14 @@ func requireInferenceProvider(db *embedded.DB, inferenceURL, extractModel string
 				"  antfly inference run\n"+
 				"  antfly inference pull %s\n"+
 				"  antfly inference pull %s\n"+
-				"See examples/dogfood/README.md for prerequisites.",
+				"See examples/antfly-docs-knowledge-base/README.md for prerequisites.",
 			inferenceURL, err, defaultEmbedModel, defaultExtractModel)
 	}
 	if err := probeExtractor(inferenceURL, extractModel); err != nil {
 		return fmt.Errorf(
 			"antfly inference server at %s cannot serve extraction model %q: %w\n"+
 				"Use a servable extractor, e.g. -extract-model %s.\n"+
-				"See examples/dogfood/README.md for prerequisites.",
+				"See examples/antfly-docs-knowledge-base/README.md for prerequisites.",
 			inferenceURL, extractModel, err, defaultExtractModel)
 	}
 	return nil
@@ -419,7 +440,7 @@ func probeInferenceHealth(inferenceURL string) error {
 const extractSmokeInput = "Raft handles leader election and log replication between nodes."
 
 // probeExtractor issues a minimal POST to the inference server's
-// /ai/v1/extract route (specs/openapi/inference/api.yaml) using the dogfood
+// /ai/v1/extract route (specs/openapi/inference/api.yaml) using the knowledge-base
 // entity schema and returns an error with the server's message on failure.
 func probeExtractor(inferenceURL, model string) error {
 	url := strings.TrimRight(inferenceURL, "/") + "/ai/v1/extract"
@@ -482,6 +503,9 @@ type existingIndex struct {
 func ensureSchemaAndIndexes(db *embedded.DB, cfg indexBuildConfig) error {
 	if err := db.SetSchemaJSON(schemaJSON()); err != nil {
 		return fmt.Errorf("set schema: %w", err)
+	}
+	if err := ensureEntitiesTable(db); err != nil {
+		return err
 	}
 
 	existingRaw, err := db.IndexesJSON()
@@ -558,4 +582,103 @@ func ensureSchemaAndIndexes(db *embedded.DB, cfg indexBuildConfig) error {
 		fmt.Printf("added index %q (extractor=%s)\n", knowledgeGraphIndex, cfg.ExtractModel)
 	}
 	return nil
+}
+
+// runServerIngest writes the same sections and index configs to a running
+// Antfly server. The server chunks, embeds, and extracts in the background.
+func runServerIngest(serverURL, table, repoRoot string, cfg indexBuildConfig, reset bool) error {
+	client := newServerClient(serverURL)
+	if err := ensureServerTables(client, table, cfg, reset); err != nil {
+		return err
+	}
+	fmt.Printf("Walking corpus under %s...\n", repoRoot)
+	sections, err := collectDocSections(context.Background(), repoRoot)
+	if err != nil {
+		return fmt.Errorf("collect doc sections: %w", err)
+	}
+	fmt.Printf("Found %d document sections\n", len(sections))
+	written, err := ingestSectionsServer(client, table, sections)
+	if err != nil {
+		return fmt.Errorf("ingest sections (%d written before failure): %w", written, err)
+	}
+	fmt.Printf("Done. Wrote %d documents to table %q; the server builds embeddings and the knowledge graph in the background.\n", written, table)
+	return nil
+}
+
+// runBackupCmd exports a portable .afb backup of the Lite knowledge base and
+// checks the .aflite file without opening another handle.
+func runBackupCmd(args []string) error {
+	fs := flag.NewFlagSet("backup", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath, "Antfly Lite database path")
+	out := fs.String("out", "kb.afb", "portable Antfly backup output path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := openExistingLite(*dbPath, "")
+	if err != nil {
+		return fmt.Errorf("open %s: %w", *dbPath, err)
+	}
+	if err := db.BackupToFile(*out); err != nil {
+		db.Close()
+		return fmt.Errorf("write portable backup: %w", err)
+	}
+	db.Close()
+	fmt.Printf("wrote portable backup: %s\n", *out)
+	check, err := embedded.CheckFile(*dbPath)
+	if err != nil {
+		return fmt.Errorf("check %s: %w", *dbPath, err)
+	}
+	fmt.Printf("check: valid=%t size=%d compact_size=%d\n", check.Valid, check.FileSize, check.CompactSize)
+	return nil
+}
+
+// ensureEntitiesTable creates the table the entity resolver promotes
+// canonical entities into. Lite requires resolver destination tables to exist
+// before ingestion drains.
+func ensureEntitiesTable(db *embedded.DB) error {
+	raw, err := db.ListTablesJSON()
+	if err != nil {
+		return fmt.Errorf("list tables: %w", err)
+	}
+	if tableListed(raw, entitiesTable) {
+		return nil
+	}
+	if err := db.CreateTableJSON(entitiesTable, []byte(`{}`)); err != nil {
+		return fmt.Errorf("create %s table: %w", entitiesTable, err)
+	}
+	fmt.Printf("created table %q for promoted entities\n", entitiesTable)
+	return nil
+}
+
+// tableListed reports whether a ListTablesJSON response names table. It
+// accepts either a list of names or a list of objects with a name field.
+func tableListed(raw []byte, table string) bool {
+	var names []string
+	if json.Unmarshal(raw, &names) == nil {
+		return slices.Contains(names, table)
+	}
+	var entries []struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(raw, &entries) == nil {
+		for _, entry := range entries {
+			if entry.Name == table {
+				return true
+			}
+		}
+		return false
+	}
+	var wrapped struct {
+		Tables []struct {
+			Name string `json:"name"`
+		} `json:"tables"`
+	}
+	if json.Unmarshal(raw, &wrapped) == nil {
+		for _, entry := range wrapped.Tables {
+			if entry.Name == table {
+				return true
+			}
+		}
+	}
+	return false
 }
