@@ -14,16 +14,17 @@
 // limitations under the License.
 
 import {createHash} from 'node:crypto';
+import{versionIdentity,attemptParameter,requestAttemptUuid}from'./attempt-token.mjs';
+export{versionIdentity,attemptParameter}from'./attempt-token.mjs';
 import{reconcileCounterPopulations}from'./independent-counters.mjs';
 const hash=value=>createHash('sha256').update(value).digest('hex');
 export function rayIdentity(value){return typeof value==='string'&&/^[a-f0-9]{16,32}(?:-[A-Z]{3})?$/i.test(value)?hash(value.split('-')[0].toLowerCase()):null;}
-export function versionIdentity(value){return typeof value==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(value)?value.toLowerCase():null;}
+
 export const invocationTypes=new Set(['fetch','scheduled','alarm','cron','queue','email','tail','rpc','jsrpc','websocket','workflow','unknown']);
 export function attemptIdentity(value){return versionIdentity(value)?hash(value.toLowerCase()):null;}
 // Lowercase base36 with a non-hex prefix avoids the provider's documented
 // UUID/hex and mixed-case base64 redaction heuristics. The entropy is unchanged.
-export function attemptParameter(value){const id=versionIdentity(value);return id?'q'+BigInt('0x'+id.replaceAll('-','')).toString(36).padStart(25,'0'):null;}
-export function requestAttemptIdentity(value){try{const parameter=new URL(value).searchParams.get('__antfly_qualification_attempt');if(versionIdentity(parameter))return attemptIdentity(parameter);if(!/^q[0-9a-z]{25}$/.test(parameter??''))return null;let number=0n;for(const digit of parameter.slice(1))number=number*36n+BigInt(parseInt(digit,36));if(number>=1n<<128n)return null;const hex=number.toString(16).padStart(32,'0'),id=[hex.slice(0,8),hex.slice(8,12),hex.slice(12,16),hex.slice(16,20),hex.slice(20)].join('-');return attemptParameter(id)===parameter?attemptIdentity(id):null;}catch{return null;}}
+export function requestAttemptIdentity(value){const id=requestAttemptUuid(value);return id?attemptIdentity(id):null;}
 // One entry per physical attempt, including HTTP admission retries. Never
 // retain bodies, URLs, raw headers or credentials.
 export class InvocationLedger{

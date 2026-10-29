@@ -76,6 +76,7 @@ export default {async fetch(request,env){
    await env.LOGS.put(prefix+'batches/'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});
    return Response.json({stored:true,records:rows.length,qualification:false});
   }
+  if(path==='/counter-witness'&&request.method==='POST'){const input=JSON.parse(new TextDecoder().decode(await readBody(request)));if(!uuid(input.id)||!env.COUNTER)fail('TelemetryWitnessInvalid');return Response.json(await env.COUNTER.witness(input.id));}
   if(path==='/exercise'&&request.method==='POST'){
    const input=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await readBody(request))),count=input.count??8;if(!Number.isInteger(count)||count<1||count>32)fail('TelemetryProbeBudgetInvalid');
    const expected=[];for(let i=0;i<count;i++){const id=crypto.randomUUID(),response=await env.FIXTURE.fetch('https://probe.invalid/?nonce='+id,{method:'POST',headers:{Authorization:'Bearer '+env.API_TOKEN}});if(!response.ok)fail('TelemetryProbeFailed');const value=await response.json();if(value.id!==id||!uuid(value.rpc))fail('TelemetryProbeIdentityInvalid');expected.push(value);}
