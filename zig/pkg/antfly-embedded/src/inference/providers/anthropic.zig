@@ -30,6 +30,7 @@ pub const Provider = struct {
     cfg: lib.GeneratorConfig,
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
+    socket_control: ?httpx.socket.WriteControl = null,
     attempt_observer: ?httpx.AttemptObserver = null,
     max_response_bytes: ?usize = null,
 
@@ -58,6 +59,7 @@ pub const Provider = struct {
             .json = body,
             .timeout_ms = self.timeout_ms,
             .cancellation = self.cancellation,
+            .socket_control = self.socket_control,
             .attempt_observer = self.attempt_observer,
             .max_response_size = self.max_response_bytes,
             .max_retries = 0,

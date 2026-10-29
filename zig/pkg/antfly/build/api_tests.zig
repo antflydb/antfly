@@ -4047,6 +4047,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-serverless-execution-test", "Verify serverless shared scheduler policy, protected health and owning release")
         .dependOn(&b.addRunArtifact(serverless_execution_tests).step);
 
+    const asset_provider_wait_tests = b.addTest(.{
+        .name = "asset-provider-wait-tests",
+        .root_module = serverless_execution_root,
+        .filters = &.{"serverless execution asset providers own HTTP waits"},
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-asset-provider-wait-test", "Verify asset HTTP/capability waits and independently owned compatibility workers")
+        .dependOn(&b.addRunArtifact(asset_provider_wait_tests).step);
+
     // Credential libraries are separate modules: consumer filters alone do
     // not discover their allocator, refresh, and shutdown regression tests.
     const google_refresh_root = b.createModule(.{

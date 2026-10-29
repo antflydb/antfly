@@ -49,6 +49,21 @@ pub const CancellationToken = struct {
         };
     }
 
+    /// The transport loan is independent of whether a caller has a cancel
+    /// predicate. Its callbacks remain borrowed until the operation joins.
+    pub fn withExecutionWait(token: ?CancellationToken, control: ?@import("httpx").socket.WriteControl) ?CancellationToken {
+        if (token == null and control == null) return null;
+        const Inert = struct {
+            const value: u8 = 0;
+            fn never(_: *const anyopaque) bool {
+                return false;
+            }
+        };
+        var result = token orelse CancellationToken{ .ptr = &Inert.value, .is_cancelled_fn = Inert.never };
+        result.execution_wait = control orelse result.execution_wait;
+        return result;
+    }
+
     pub fn isCancelled(self: CancellationToken) bool {
         return self.is_cancelled_fn(self.ptr);
     }

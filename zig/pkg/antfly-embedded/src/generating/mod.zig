@@ -565,6 +565,34 @@ const BackendState = struct {
 
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
+        var wait: execution_context.HttpWait = .{ .context = self.request_context orelse self.execution.requestContext(self.http.io) };
+        const control = wait.control();
+        switch (self.provider) {
+            inline .openai, .remote_antfly, .vertex, .gemini, .anthropic => |*provider| provider.socket_control = control,
+            .bedrock => |*provider| provider.options.socket_control = control,
+            .embedded_antfly, .apple => {},
+        }
+        defer switch (self.provider) {
+            inline .openai, .remote_antfly, .gemini, .anthropic => |*provider| provider.socket_control = null,
+            .vertex => |*provider| {
+                provider.socket_control = null;
+                provider.request_control.execution_wait = null;
+            },
+            .bedrock => |*provider| provider.options.socket_control = null,
+            .embedded_antfly, .apple => {},
+        };
+        try wait.ready();
+        var result = generateInvoke(ptr, alloc, model, messages) catch |err| {
+            try wait.ready();
+            return err;
+        };
+        errdefer result.deinit();
+        try wait.ready();
+        return result;
+    }
+
+    fn generateInvoke(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
+        const self: *BackendState = @ptrCast(@alignCast(ptr));
         if (self.request_context) |context| {
             try context.updateDetail(.executing, 0, 1, model, @tagName(std.meta.activeTag(self.provider)));
             const timeout_ms = try context.remainingTimeoutMs();
@@ -578,10 +606,10 @@ const BackendState = struct {
                     provider.setRequestTimeoutMs(timeout_ms);
                     provider.setRequestCancellation(context.cancellation);
                 },
-                .vertex => |*provider| provider.setAbsoluteRequestControl(.{
+                .vertex => |*provider| provider.setAbsoluteRequestControl(@as(@import("antfly_google").auth.RequestControl, .{
                     .deadline_ns = context.deadline_ns,
                     .cancellation = cancellation,
-                }),
+                }).withExecutionWait(provider.socket_control)),
                 .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
                 .bedrock => |*provider| provider.setRequestControl(timeout_ms, context.cancellation),
                 .embedded_antfly, .apple => {},
@@ -1336,7 +1364,8 @@ pub fn generateAntflyTextBatchResponse(
     options: BackendFactory.Options,
     texts: []const []const u8,
 ) !httpx.Response {
-    if (options.request_context) |context| try context.check();
+    var wait: execution_context.HttpWait = .{ .context = options.request_context orelse options.execution.requestContext(http.io) };
+    try wait.ready();
     try cfg.validate();
     if (cfg.provider != .antfly or cfg.url.len == 0 or texts.len == 0)
         return error.InvalidGeneratorConfig;
@@ -1354,7 +1383,8 @@ pub fn generateAntflyTextBatchResponse(
     defer if (authorization) |value| alloc.free(value);
     var headers: [1][2][]const u8 = undefined;
     if (authorization) |value| headers[0] = .{ "Authorization", value };
-    return http.post(url, .{
+    var response = http.post(url, .{
+        .socket_control = wait.control(),
         .json = body,
         .headers = if (authorization != null) &headers else null,
         .timeout_ms = if (options.request_context) |context| try context.remainingTimeoutMs() else 300_000,
@@ -1367,7 +1397,13 @@ pub fn generateAntflyTextBatchResponse(
         else
             null,
         .attempt_observer = state.observeSubmission(state.quota.?.limiter().observer(output_tokens)),
-    });
+    }) catch |err| {
+        try wait.ready();
+        return err;
+    };
+    errdefer response.deinit();
+    try wait.ready();
+    return response;
 }
 
 /// Acquire the task-scoped provider quota used by custom Antfly generation

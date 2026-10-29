@@ -216,22 +216,26 @@ pub const HttpWait = struct {
     context: RequestContext,
     saved_class: ?runtime.runnable_abi.Class = null,
     failure: ?anyerror = null,
+    refusal: @import("antfly_cancellation").Rejection = .{},
 
     pub fn ready(self: *HttpWait) !void {
         try self.context.check();
         if (self.failure) |failure| return failure;
+        try self.refusal.check();
     }
     fn from(raw: ?*anyopaque) *HttpWait {
         return @ptrCast(@alignCast(raw.?));
     }
     fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
         // Watchdogs inspect lifetime only, without touching owner state.
+        from(raw).refusal.check() catch return error.Canceled;
         from(raw).context.check() catch |err| return switch (err) {
             error.Timeout, error.DeadlineExceeded => error.Timeout,
             else => error.Canceled,
         };
     }
     fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
+        try check(raw);
         return from(raw).context.remainingTimeoutMs() catch |err| return switch (err) {
             error.Timeout, error.DeadlineExceeded => error.Timeout,
             else => error.Canceled,
@@ -246,6 +250,9 @@ pub const HttpWait = struct {
         return .ok;
     }
     fn begin(raw: ?*anyopaque) !void {
+        beginOwned(raw) catch |err| return from(raw).refusal.remember(err);
+    }
+    fn beginOwned(raw: ?*anyopaque) !void {
         const self = from(raw);
         try self.ready();
         if (self.saved_class != null) return error.InvalidRunnableTransition;
@@ -257,6 +264,9 @@ pub const HttpWait = struct {
         self.saved_class = class;
     }
     fn end(raw: ?*anyopaque) !void {
+        endOwned(raw) catch |err| return from(raw).refusal.remember(err);
+    }
+    fn endOwned(raw: ?*anyopaque) !void {
         const self = from(raw);
         const class = self.saved_class orelse return error.InvalidRunnableTransition;
         self.saved_class = null;

@@ -51,6 +51,7 @@ pub const Runtime = struct {
     cache: *remote.Cache,
     limits: constrained.Limits = .{},
     capability_snapshot: ?constrained.Capabilities = null,
+    http_control: ?httpx.socket.WriteControl = null,
     require_execution_lease: bool = false,
     semantic_validation: ?struct {
         ptr: *anyopaque,
@@ -98,6 +99,7 @@ pub const Runtime = struct {
     }
     fn waitContext(self: *Runtime) remote.WaitContext {
         var context = self.options.execution.waitContext();
+        context.execution_wait = self.http_control;
         if (self.options.request_context) |request| if (request.deadline_ns) |deadline| {
             context.deadline_ns = if (context.deadline_ns) |existing| @min(existing, deadline) else deadline;
         };
@@ -105,6 +107,22 @@ pub const Runtime = struct {
         return context;
     }
     fn resolveCapabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !constrained.Capabilities {
+        const execution = @import("antfly_inference_execution_context");
+        var context = self.options.request_context orelse self.options.execution.requestContext(self.http.io);
+        context.cancellation = .{ .ptr = self, .check_fn = checkCancellation, .is_cancelled_fn = cancellationRequested };
+        var wait: execution.HttpWait = .{ .context = context };
+        const previous = self.http_control;
+        self.http_control = wait.control();
+        defer self.http_control = previous;
+        const result = resolveCapabilitiesInvoke(self, a, cfg) catch |err| {
+            try wait.ready();
+            return err;
+        };
+        try wait.ready();
+        return result;
+    }
+
+    fn resolveCapabilitiesInvoke(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !constrained.Capabilities {
         try cfg.validate();
         if (cfg.provider != .antfly) return hostedCapabilities(cfg.*);
         var native: ?work.InferenceCapabilities = null;

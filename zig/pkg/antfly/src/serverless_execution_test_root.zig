@@ -1917,3 +1917,155 @@ test "serverless execution query template downloads lend capacity before provide
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
 }
+
+test "serverless execution asset providers own HTTP waits capability discovery and compatibility children" {
+    const sources = @import("antfly_local_sources");
+    const Runtime = sources.asset_producer_runtime.Runtime;
+    const Producer = @typeInfo(@TypeOf(Runtime.producer)).@"fn".return_type.?;
+    const Request = @typeInfo(@TypeOf(Producer.produceWithContext)).@"fn".param_types[2].?;
+    const Context = @import("antfly_inference_execution_context").RequestContext;
+    const Mode = enum { reader, transcriber, generator, extractor, capabilities, parallel };
+    const App = struct {
+        mode: Mode,
+        received: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, _: sources.common_http_http_common.HttpRequest) !sources.common_http_http_common.HttpResponse {
+            const app: *@This() = @ptrCast(@alignCast(raw));
+            _ = app.received.fetchAdd(1, .acq_rel);
+            try app.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            const body = switch (app.mode) {
+                .reader, .generator => "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"asset text\"}}]}",
+                .transcriber, .parallel => "{\"text\":\"asset text\"}",
+                .extractor => "{\"object\":\"extraction\",\"model\":\"g\",\"data\":[{\"entities\":[{\"label\":\"x\",\"text\":\"asset text\"}]}]}",
+                .capabilities => "{\"readers\":{\"g\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"read\",\"batch\":{\"mode\":\"native\",\"preferred_items\":8,\"max_items\":12,\"max_encoded_bytes\":33554432,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}",
+            };
+            return .{ .status = 200, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, body) };
+        }
+    };
+    const Job = struct {
+        producer: Producer,
+        request: Request,
+        context: Context,
+        mode: Mode,
+        revoked: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const job: *const @This() = @ptrCast(@alignCast(raw));
+            if (job.revoked.load(.acquire)) return error.AssetInvocationRevoked;
+        }
+        fn invoke(job: *@This()) !void {
+            job.context.cancellation = .{ .ptr = job, .check_fn = check };
+            if (job.mode == .capabilities) {
+                const scoped = job.producer.withInvocationContext(.{ .io = job.context.io, .deadline_ns = job.context.deadline_ns, .cancellation = job.context.cancellation.?, .runnable = job.context.runnable });
+                const caps = try scoped.capabilitiesForRequests(std.testing.allocator, &.{job.request});
+                try std.testing.expect(caps != null);
+                return;
+            }
+            if (job.mode == .parallel) {
+                const outputs = try job.producer.produceBatchWithContext(std.testing.allocator, &.{ job.request, job.request }, job.context);
+                defer {
+                    for (outputs) |output| std.testing.allocator.free(output);
+                    std.testing.allocator.free(outputs);
+                }
+                try std.testing.expectEqual(@as(usize, 2), outputs.len);
+                for (outputs) |output| try std.testing.expect(std.mem.indexOf(u8, output, "asset text") != null);
+                return;
+            }
+            const output = try job.producer.produceWithContext(std.testing.allocator, job.request, job.context);
+            defer std.testing.allocator.free(output);
+            try std.testing.expect(std.mem.indexOf(u8, output, "asset text") != null);
+        }
+        fn run(job: *@This()) void {
+            defer job.done.store(true, .release);
+            job.invoke() catch |err| {
+                job.failure = err;
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| for ([_]bool{ false, true }) |reject| {
+        var app: App = .{ .mode = mode };
+        var listener = sources.common_http_std_http_listener.StdHttpListener.init(a, .{ .serve_in_connection_threads = true, .max_connection_threads = 8 }, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+        defer listener.deinit();
+        try listener.start();
+        const url = try listener.baseUri(a);
+        defer a.free(url);
+        var client = @import("httpx").Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var runtime = Runtime.init(a, &client);
+        defer runtime.deinit();
+        const config = try std.fmt.allocPrint(a, "{{\"provider\":\"{s}\",\"model\":\"g\",\"{s}\":\"{s}\"{s}}}", .{ if (mode == .capabilities) "antfly" else "openai", switch (mode) {
+            .reader, .transcriber, .parallel => "base_url",
+            else => "url",
+        }, url, if (mode == .extractor) ",\"schema\":{\"entities\":[\"x\"]}" else "" });
+        defer a.free(config);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = io, .retained_bytes = 4096 }, .background, 2);
+        var read: @import("api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = a };
+        var job: Job = .{ .producer = runtime.producer(), .mode = mode, .request = .{
+            .producer_type = switch (mode) {
+                .reader, .capabilities => .reader,
+                .transcriber, .parallel => .transcriber,
+                .generator => .generator,
+                .extractor => .extractor,
+            },
+            .config_json = config,
+            .source_text = switch (mode) {
+                .reader, .capabilities => "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
+                .transcriber, .parallel => "data:audio/wav;base64,UklGRg==",
+                else => "asset text",
+            },
+            .content_type = "text/plain",
+        }, .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .runnable = (try read.team()).borrow } };
+        var future = try io.concurrent(Job.run, .{&job});
+        defer future.cancel(io);
+        defer app.release.set(io);
+        const until = @import("antfly_platform").time.monotonicNs() + 3 * std.time.ns_per_s;
+        while (app.received.load(.acquire) < @as(usize, if (mode == .parallel) 2 else 1) or scheduler.stats().runnable_slots != 0) {
+            if (job.done.load(.acquire)) {
+                std.debug.print("asset mode {s}: {?}\n", .{ @tagName(mode), job.failure });
+                return job.failure orelse error.AssetDidNotWait;
+            }
+            if (@import("antfly_platform").time.monotonicNs() >= until) {
+                std.debug.print("asset wait mode={s} reject={} received={d} slots={d} queued={d} operations={d} children={d}\n", .{ @tagName(mode), reject, app.received.load(.acquire), scheduler.stats().runnable_slots, scheduler.stats().queued, scheduler.stats().operations, execution.entry.?.children });
+                return error.AssetKeptCapacity;
+            }
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.startWithSlots(&scheduler, .{ .io = io, .allow_wait = false }, .query, 2);
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        app.release.set(io);
+        if (reject) {
+            while (scheduler.stats().queued == 0) {
+                if (job.done.load(.acquire)) return job.failure orelse error.AssetDidNotQueue;
+                if (@import("antfly_platform").time.monotonicNs() >= until) return error.AssetDidNotQueue;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            job.revoked.store(true, .release);
+            while (!job.done.load(.acquire)) {
+                if (@import("antfly_platform").time.monotonicNs() >= until) return error.AssetDidNotReject;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        } else query.finish();
+        future.await(io);
+        if (reject) try std.testing.expectEqual(error.AssetInvocationRevoked, job.failure.?) else if (job.failure) |err| {
+            std.debug.print("asset mode {s}: {s}\n", .{ @tagName(mode), @errorName(err) });
+            return err;
+        }
+        try std.testing.expect(runtime.http_wait == null and runtime.request_runnable == null);
+        query.finish();
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}

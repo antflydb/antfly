@@ -341,7 +341,7 @@ pub fn read(alloc: Allocator, http: *httpx.Client, cfg: readers.Config, request:
         owned[i] = try scraping.downloadContentAllocWithContext(alloc, .{
             .io = http.io,
             .timeout_ms = remaining_ms,
-            .cancellation = if (opts.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+            .cancellation = scraping.CancellationToken.withExecutionWait(if (opts.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null, opts.socket_control),
         }, url, &security, null);
         filled += 1;
         total = std.math.add(usize, total, owned[i].data.len) catch return error.InferenceEncodedBytesExceeded;

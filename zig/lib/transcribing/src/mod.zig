@@ -458,6 +458,7 @@ pub const RemoteOptions = struct {
     source_table: []const u8 = "",
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
+    socket_control: ?httpx.socket.WriteControl = null,
 };
 
 fn initTranscriber(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
@@ -521,7 +522,7 @@ const AppleTranscriberState = struct {
             downloaded = scraping.downloadContentAllocWithContext(alloc, .{
                 .io = state.http.io,
                 .timeout_ms = state.options.timeout_ms,
-                .cancellation = if (state.options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+                .cancellation = scraping.CancellationToken.withExecutionWait(if (state.options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null, state.options.socket_control),
             }, request.url, &security, if (credentials) |*value| value else null) catch |err| {
                 if (err == error.Canceled) return error.Cancelled;
                 return err;
@@ -667,6 +668,7 @@ const AntflyTranscriberState = struct {
     max_download_bytes: ?usize = null,
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
+    socket_control: ?httpx.socket.WriteControl = null,
     framed_attachments: bool = false,
     /// Provider-level default for speaker labels; a request may override it.
     diarization: ?bool = null,
@@ -708,6 +710,7 @@ const AntflyTranscriberState = struct {
             .max_download_bytes = cfg.max_download_bytes,
             .timeout_ms = options.timeout_ms,
             .cancellation = options.cancellation,
+            .socket_control = options.socket_control,
             .framed_attachments = cfg.framed_attachments,
             .diarization = cfg.diarization,
             .timestamps = cfg.timestamps,
@@ -810,6 +813,7 @@ const AntflyTranscriberState = struct {
             .timeout_ms = self.timeout_ms,
             .max_response_size = self.max_response_bytes,
             .cancellation = self.cancellation,
+            .socket_control = self.socket_control,
         });
         defer resp.deinit();
         if (!resp.ok()) {
@@ -922,7 +926,7 @@ const CloudflareTranscriberState = struct {
     fn transcribe(raw: *anyopaque, a: Allocator, req: Request) anyerror!Response {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (req.diarization orelse false) return error.UnsupportedTranscriptionOptions;
-        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const work = arena.allocator();
@@ -945,6 +949,7 @@ const CloudflareTranscriberState = struct {
             .max_response_bytes = self.cfg.max_response_bytes orelse httpx.types.default_max_body_size,
             .timeout_ms = try control.remainingTimeoutMs(),
             .cancellation = self.options.cancellation,
+            .socket_control = self.options.socket_control,
         });
         return cloudflareTranscript(a, value, req.timestamps orelse self.cfg.timestamps orelse true);
     }
@@ -1067,7 +1072,7 @@ const OpenAiTranscriberState = struct {
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *OpenAiTranscriberState = @ptrCast(@alignCast(ptr));
         if (req.diarization orelse false) return error.UnsupportedTranscriptionOptions;
-        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control);
         const content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
         defer alloc.free(content.content_type);
         const audio_bytes = content.data;
@@ -1092,6 +1097,7 @@ const OpenAiTranscriberState = struct {
             .max_response_size = self.max_response_bytes,
             .timeout_ms = try control.remainingTimeoutMs(),
             .cancellation = self.options.cancellation,
+            .socket_control = self.options.socket_control,
             .max_retries = 0,
             .follow_redirects = false,
             .cookies_enabled = false,
@@ -1256,7 +1262,7 @@ const VertexTranscriberState = struct {
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *VertexTranscriberState = @ptrCast(@alignCast(ptr));
-        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control);
         const content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
         defer alloc.free(content.content_type);
         const audio_bytes = content.data;
@@ -1328,6 +1334,7 @@ const VertexTranscriberState = struct {
             .max_response_size = self.max_response_bytes,
             .timeout_ms = try control.remainingTimeoutMs(),
             .cancellation = self.options.cancellation,
+            .socket_control = self.options.socket_control,
             .max_retries = 0,
             .follow_redirects = false,
             .cookies_enabled = false,
@@ -1806,7 +1813,7 @@ fn resolveAudioContentWithContext(a: Allocator, io: std.Io, url: []const u8, max
     }
     if (scraping.data_uri.hasScheme(url)) return resolveAudioContentAlloc(a, url, max_bytes);
     const security = remoteFetchSecurity(max_bytes);
-    return scraping.downloadContentAllocWithContext(a, .{ .io = io, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = if (options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null }, url, &security, null);
+    return scraping.downloadContentAllocWithContext(a, .{ .io = io, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = scraping.CancellationToken.withExecutionWait(if (options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null, options.socket_control) }, url, &security, null);
 }
 
 fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8, max_download_bytes: ?usize) ![]u8 {

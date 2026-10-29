@@ -923,3 +923,61 @@ mutation/retention/immutable-artifact boundaries and serial graph preparation)
 and original cross-engine gates remain open, including file-engine descriptor
 recovery. Full GNU/full qualification remains waived. These checks do not rebuild
 the installed CLI or establish completion of the full design.
+
+
+### Asset-provider transport waits and compatibility workers
+
+Asset-producer invocation boundaries now own their HTTP wait state through
+capability/memory discovery, scalar and reported batch execution, and raster
+availability checks. Direct Antfly requests and reader, transcription and
+extraction adapters forward invocation controls to transport waits. Google
+credential refresh and remote-audio downloads receive the same control; download
+controls remain present when no cancellation predicate was supplied. Cloudflare
+attempts also forward the control. Request overlays bind the synchronized
+capability-cache owner without copying its mutable mutex/cache state.
+
+Generation owns a separate synchronous wait scope around each actual backend
+call and Antfly text batch. Its OpenAI/Antfly, Vertex/Gemini, Bedrock and Anthropic
+transports use that scope; temporary transport pointers are cleared after every
+physical request joins. Constrained-generation discovery scopes its singleflight
+wait and HTTP control similarly. Parsing, formatting, allocation and result
+transfer keep CPU. Expected source/return refusal cannot become successful
+capability fallback. HttpWait publishes transition refusal through an atomic
+latch for transport monitors; mutable owner-only failure state remains private
+to the owner, and final readiness checks preserve the original error.
+
+Compatibility fanout reserves every owned child capsule before publishing a
+wave. Each physical worker activates its own child under the original source
+restriction, builds an invocation-local provider scope, and retires that child
+after its provider consumers return. The coordinator lends its grant until all
+workers physically join, then reacquires its original class and width before
+copying results. Failed publication cancels/joins published work before retiring
+unpublished reservations. A serial QueueFull retry uses the restored parent
+scope; no parallel worker borrows the parent's single-worker capability.
+Legacy unscheduled calls retain bounded compatibility width without acquiring
+fresh request authority.
+
+`asset-provider-waits-v9-focused.json` records a focused integration fixture
+through the production Producer APIs, real scheduler capsules and a concurrent
+loopback HTTP listener. Twelve success/revocation cases cover readers,
+transcription, generation, extraction, capability discovery, and two concurrent
+compatibility transcriptions. All lend capacity for unrelated query/control
+work; rejected reentry preserves the original source error and retires roots,
+children and retained bytes. The shared Runtime retains no invocation wait or
+runnable pointer. This is synchronous producer integration, not a deployed
+end-to-end table enrichment campaign or a live cloud/TLS qualification.
+
+`asset-provider-waits-v11-final.json` adds affected standalone library suites,
+serverless regression coverage and the production worker semantic compile
+check. The named `antfly-asset-provider-wait-test` target isolates the production
+fixture for efficient feedback; its equivalent case remains part of the
+serverless execution regression suite. Full GNU/full qualification remains
+waived and the installed CLI is not rebuilt by these targets.
+
+This integrates the audited remote HTTP provider/capability paths within the
+remote-asset milestone. Vendor-specific subprocess/native asset-preparation
+paths still require audit and integration; no subprocess/native-throughput claim
+follows from these HTTP fixtures. Credential subprocesses, lease renewal,
+remaining maintenance mutation/retention/immutable-artifact boundaries, serial
+graph preparation and original cross-engine gates remain open, including the
+file-engine descriptor recovery bound. The full design remains incomplete.
