@@ -291,7 +291,7 @@ antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671b
 LightOnOCR-3 takes no instruction prompt, so set `prompt_policy` to `plain`.
 Without an `ocr` model, extraction uses the smaller `antflydb/Florence-2-base`
 reader. Any reader provider works here, including
-[Apple Vision](/docs/guides/apple-native-ocr) on macOS.
+[Apple Vision](/docs/guides/providers/apple) on macOS.
 
 If the model is absent, the page records a failed OCR outcome instead of
 silently disappearing. Install the model and explicitly reprocess the artifact
