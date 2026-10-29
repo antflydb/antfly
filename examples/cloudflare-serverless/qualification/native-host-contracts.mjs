@@ -30,7 +30,7 @@ const hash=createHash('sha256');for await(const bytes of createReadStream(binary
 const binaryHash=hash.digest('hex');
 const directory=await mkdtemp(join(out,'native-host-'));
 const storage=join(directory,'storage');await mkdir(storage,{mode:0o700});
-const report={qualification:false,kind:'native release process CLI/HTTP/file-storage lifecycle; not cloud latency or idempotent HTTP wire qualification',binary,sha256:binaryHash,passed:false,cleanup_complete:false,started_at:new Date().toISOString(),lifecycles:[],exits:[]};
+const report={qualification:false,kind:'native release API-only process CLI/HTTP/file-storage lifecycle with explicit publication; not cloud latency, maintenance-loop or idempotent HTTP wire qualification',binary,sha256:binaryHash,passed:false,cleanup_complete:false,started_at:new Date().toISOString(),lifecycles:[],exits:[]};
 let child,exited,spawnFailed=false,logs='';
 async function port(){const server=createServer();await new Promise((done,fail)=>{server.once('error',fail);server.listen(0,'127.0.0.1',done);});const value=server.address().port;await new Promise((done,fail)=>server.close(error=>error?fail(error):done()));return value;}
 const sleep=ms=>new Promise(done=>setTimeout(done,ms));
@@ -46,18 +46,20 @@ async function stop(){
  finally{clearTimeout(timer);if(process.exitCode!==null||process.signalCode!==null||spawnFailed)child=null;}
 }
 async function start(collection){
- const bind=await port();let health;do{health=await port();}while(health===bind);const args=['serverless','combined'];
+ const bind=await port();let health;do{health=await port();}while(health===bind);const args=['serverless','api'];
  for(const kind of ['artifacts','manifests','wal','progress','catalog']){const path=join(storage,kind);await mkdir(path,{recursive:true});args.push('--'+kind+'-uri',pathToFileURL(path).href);}
  args.push('--indexed-wal','true','--wal-gc',String(collection),'--native-read-state','true','--wal-document-index','true','--query-cache-dir',join(storage,'cache'),'--query-cache-max-bytes','67108864','--host','127.0.0.1','--port',String(bind),'--health-port',String(health));
- for(const name of ['publish','compaction','prune','enrichment'])args.push('--'+name+'-enabled','false');
- const process=spawn(binary,args,{stdio:['ignore','pipe','pipe']});child=process;spawnFailed=false;
- exited=new Promise(done=>{process.once('error',error=>{spawnFailed=true;done({error:error.code});});process.once('exit',(code,signal)=>done({code,signal}));});
+ args.push('--publish-enabled','true');
+ for(const name of ['compaction','prune','enrichment'])args.push('--'+name+'-enabled','false');
+ const env=Object.fromEntries(Object.entries(globalThis.process.env).filter(([key])=>!key.startsWith('ANTFLY_')));
+ const process=spawn(binary,args,{env,stdio:['ignore','pipe','pipe']});child=process;spawnFailed=false;
+ exited=new Promise(done=>{process.once('error',error=>{spawnFailed=true;done({error:error.code});});process.once('close',(code,signal)=>done({code,signal}));});
  const append=bytes=>{if(logs.length+bytes.length<=8*1024*1024)logs+=bytes;else{report.log_overflow=true;process.kill('SIGTERM');}};
  process.stdout.on('data',append);process.stderr.on('data',append);
  const origin='http://127.0.0.1:'+bind;
  const call=async(method,path,body,expected=200,timeout=10000)=>{
   const response=await fetch(origin+path,{method,headers:body===undefined?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
-  const value=await response.json();assert.equal(response.status,expected,JSON.stringify(value));return value;
+  const raw=await response.text();report.last_request={method,path,status:response.status};assert.equal(response.status,expected,raw.slice(0,2048));return JSON.parse(raw);
  };
  let ready=false;
  const deadline=performance.now()+30000;
@@ -65,9 +67,9 @@ async function start(collection){
   if(spawnFailed||process.exitCode!==null||process.signalCode!==null)throw Error('NativeProcessExitedBeforeReadiness');
   try{const status=await call('GET','/health',undefined,200,1000);if(status.live===true&&status.ready===true&&status.validated===true){ready=true;break;}}catch{}await sleep(100);
  }
- if(!ready)throw Error('NativeReadinessTimedOut');report.lifecycles.push({collection_enabled:collection,ready:true});return call;
+ if(!ready)throw Error('NativeReadinessTimedOut');report.lifecycles.push({runtime_role:'api',collection_enabled:collection,ready:true,environment_isolated:true,arguments:args});return call;
 }
-async function inspect(path,latest){let marker=false,managedHeads=0;for(const entry of await readdir(path,{withFileTypes:true})){const p=join(path,entry.name);if(entry.isDirectory()){const nested=await inspect(p,latest);marker ||= nested.marker;managedHeads+=nested.managedHeads;}else if(entry.isFile()&&(await stat(p)).size<=4096){const value=await readFile(p,'utf8');if(value==='antfly-wal:indexed-managed:1')marker=true;try{const head=JSON.parse(value);if(head.root_lifetime_ms===30000&&head.latest_lsn===latest)managedHeads++;}catch{}}}return{marker,managedHeads};}
+async function inspect(path,latest){let marker=false,managedHeads=0;for(const entry of await readdir(path,{withFileTypes:true})){const p=join(path,entry.name);if(entry.isDirectory()){const nested=await inspect(p,latest);marker ||= nested.marker;managedHeads+=nested.managedHeads;}else if(entry.isFile()&&(await stat(p)).size<=4096){const value=await readFile(p,'utf8');if(value==='antfly-wal:indexed-managed:2')marker=true;try{const head=JSON.parse(value);if(head.root_lifetime_ms===30000&&head.latest_lsn===latest)managedHeads++;}catch{}}}return{marker,managedHeads};}
 try{
  let call=await start(true);
  await call('PUT','/internal/v1/namespaces/docs',{created_at_ns:123,policy:{default_query_view:'published',keep_latest_versions:4,max_pending_records:4,compaction_trigger_version_count:2,vector_distance_metric:'inner_product'}},201);

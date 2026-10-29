@@ -33,7 +33,20 @@ pub const ObjectStore = struct {
     bucket: []u8,
     prefix: []u8,
     mutex: std.atomic.Mutex = .unlocked,
-    const Layout = enum(u8) { legacy = 1, indexed = 2, managed_indexed = 3 };
+    const Layout = enum(u8) {
+        legacy = 1,
+        indexed = 2,
+        managed_indexed = 3,
+        indexed_relative = 4,
+        managed_indexed_relative = 5,
+
+        fn managed(self: Layout) bool {
+            return self == .managed_indexed or self == .managed_indexed_relative;
+        }
+        fn relative(self: Layout) bool {
+            return self == .indexed_relative or self == .managed_indexed_relative;
+        }
+    };
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -149,6 +162,8 @@ pub const ObjectStore = struct {
         if (std.mem.eql(u8, result.body, "antfly-wal:legacy:1")) return .legacy;
         if (std.mem.eql(u8, result.body, "antfly-wal:indexed:1")) return .indexed;
         if (std.mem.eql(u8, result.body, "antfly-wal:indexed-managed:1")) return .managed_indexed;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed:2")) return .indexed_relative;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed-managed:2")) return .managed_indexed_relative;
         return error.UnsupportedWalLayout;
     }
     fn ensureLayout(self: *ObjectStore, wanted: Layout, create: bool) !void {
@@ -169,6 +184,8 @@ pub const ObjectStore = struct {
             .legacy => "antfly-wal:legacy:1",
             .indexed => "antfly-wal:indexed:1",
             .managed_indexed => "antfly-wal:indexed-managed:1",
+            .indexed_relative => "antfly-wal:indexed:2",
+            .managed_indexed_relative => "antfly-wal:indexed-managed:2",
         };
         var published = self.client.compareAndPut(self.bucket, key, value, null, .{}) catch |err| {
             // The immutable selection may have committed before an ACK was
@@ -193,9 +210,17 @@ pub const ObjectStore = struct {
         if (self.indexed != null) return error.WalAlreadyConfigured;
         const selected = try self.readLayout();
         if (selected == .legacy) return error.LegacyWalMigrationRequired;
-        if (options.managed_collection and selected == .indexed) return error.ManagedWalMigrationRequired;
-        const wanted: Layout = if (options.managed_collection or selected == .managed_indexed) .managed_indexed else .indexed;
-        if (wanted == .managed_indexed and !@import("indexed_object_store.zig").IndexedObjectStore.managedClockAvailable()) return error.ManagedWalClockUnavailable;
+        if (options.managed_collection and (selected == .indexed or selected == .indexed_relative)) return error.ManagedWalMigrationRequired;
+        // Version one at an empty prefix deliberately retains its historical
+        // leading-slash keys on S3/GCS. It cannot be reinterpreted as relative
+        // paths, nor can the filesystem validator safely alias those names.
+        if (self.fs_client != null and self.prefix.len == 0 and (selected == .indexed or selected == .managed_indexed)) return error.LegacyIndexedRootMigrationRequired;
+        const managed = options.managed_collection or (selected != null and selected.?.managed());
+        const wanted: Layout = selected orelse if (self.prefix.len == 0)
+            (if (managed) .managed_indexed_relative else .indexed_relative)
+        else
+            (if (managed) .managed_indexed else .indexed);
+        if (wanted.managed() and !@import("indexed_object_store.zig").IndexedObjectStore.managedClockAvailable()) return error.ManagedWalClockUnavailable;
         if (selected) |layout| self.layout.store(@backingInt(layout), .release);
         if (selected == null) {
             var cursor: ?[]u8 = null;
@@ -204,17 +229,19 @@ pub const ObjectStore = struct {
             defer self.alloc.free(listing_prefix);
             // A deleted current name does not prove a pristine versioned
             // prefix. Older unbounded readers may still hold historical roots.
-            if (wanted == .managed_indexed and try self.client.supportsObjectVersions(self.bucket, null)) {
+            const pristine = wanted.managed() or wanted.relative();
+            const migration_error = if (wanted.managed()) error.ManagedWalMigrationRequired else error.IndexedWalMigrationRequired;
+            if (pristine and try self.client.supportsObjectVersions(self.bucket, null)) {
                 var versions = try self.client.listObjectVersions(self.bucket, .{ .prefix = listing_prefix, .max_keys = 1 });
                 defer versions.deinit(self.alloc);
-                if (versions.entries.len != 0 or versions.is_truncated) return error.ManagedWalMigrationRequired;
+                if (versions.entries.len != 0 or versions.is_truncated) return migration_error;
             }
             while (true) {
                 var page = try self.client.listObjects(self.bucket, .{ .prefix = listing_prefix, .continuation_token = cursor, .max_keys = 1000 });
                 defer page.deinit(self.alloc);
                 for (page.entries) |item| {
                     if (std.mem.endsWith(u8, item.key, "/wal.log")) return error.LegacyWalMigrationRequired;
-                    if (wanted == .managed_indexed) return error.ManagedWalMigrationRequired;
+                    if (pristine) return migration_error;
                 }
                 if (page.next_continuation_token == null) break;
                 const next = try self.alloc.dupe(u8, page.next_continuation_token orelse return error.InvalidObjectListing);
@@ -225,11 +252,20 @@ pub const ObjectStore = struct {
         try self.ensureLayout(wanted, true);
         const indexed = try self.alloc.create(@import("indexed_object_store.zig").IndexedObjectStore);
         errdefer self.alloc.destroy(indexed);
-        indexed.* = try @import("indexed_object_store.zig").IndexedObjectStore.init(self.alloc, self.client, self.bucket, self.prefix);
+        // Relative layout two reserves a nonempty physical prefix even when
+        // the selected logical prefix is the bucket root. Both page tracing
+        // and private GC metadata inherit the same prefix without changing
+        // their domain or naming rules. The immutable marker selects it.
+        const indexed_prefix = if (wanted.relative())
+            (if (self.prefix.len == 0) try self.alloc.dupe(u8, ".antfly/indexed-v2") else try std.fmt.allocPrint(self.alloc, "{s}/.antfly/indexed-v2", .{self.prefix}))
+        else
+            try self.alloc.dupe(u8, self.prefix);
+        defer self.alloc.free(indexed_prefix);
+        indexed.* = try @import("indexed_object_store.zig").IndexedObjectStore.init(self.alloc, self.client, self.bucket, indexed_prefix);
         indexed.read_state_enabled = options.read_state;
         indexed.document_index_enabled = options.document_index;
         indexed.inline_tail_enabled = options.inline_tail;
-        indexed.managed_reads = wanted == .managed_indexed;
+        indexed.managed_reads = wanted.managed();
         self.indexed = indexed;
     }
     pub fn deinit(self: *ObjectStore) void {
@@ -799,6 +835,142 @@ test "serverless multiprovider managed WAL activates only on a new prefix and pe
     var legacy = try ObjectStore.initWithClient(a, backing, "db", "managed");
     defer legacy.deinit();
     try std.testing.expectError(error.WalLayoutMismatch, legacy.selectLegacy());
+}
+
+test "serverless multiprovider indexed root selection uses relative version two and preserves receipts" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |managed| {
+        var memory = objectstore.MemoryClient.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("db");
+        var foreign = try client.putObject("db", "foreign", "existing", .{});
+        foreign.deinit(a);
+        var occupied = try ObjectStore.initWithClient(a, client, "db", "");
+        defer occupied.deinit();
+        try std.testing.expectError(if (managed) error.ManagedWalMigrationRequired else error.IndexedWalMigrationRequired, occupied.enableIndexed(.{ .managed_collection = managed }));
+        try std.testing.expectError(error.FileNotFound, client.getObject("db", ".antfly/WAL_FORMAT", .{}));
+        try client.deleteObject("db", "foreign", .{});
+
+        var faults = objectstore.ScriptedFaultClient.init(a, client);
+        defer faults.deinit();
+        faults.commitNextPutThenFail(error.InjectedRootSelectionAckLoss);
+        var selected = try ObjectStore.initWithClient(a, faults.client(), "db", "");
+        defer selected.deinit();
+        try selected.enableIndexed(.{ .managed_collection = managed });
+        try std.testing.expectEqualStrings(".antfly/indexed-v2", selected.indexed.?.prefix);
+        try std.testing.expectEqual(@as(u64, 1), try selected.appendIdempotent("docs", 11, "alpha", "original"));
+        try std.testing.expectEqual(@as(u64, 2), try selected.append("docs", 12, "beta"));
+        var marker = try client.getObject("db", ".antfly/WAL_FORMAT", .{});
+        defer marker.deinit(a);
+        try std.testing.expectEqualStrings(if (managed) "antfly-wal:indexed-managed:2" else "antfly-wal:indexed:2", marker.body);
+
+        var reopened = try ObjectStore.initWithClient(a, client, "db", "");
+        defer reopened.deinit();
+        try reopened.enableIndexed(.{});
+        try std.testing.expectEqual(managed, reopened.indexed.?.managed_reads);
+        try std.testing.expectEqualStrings(".antfly/indexed-v2", reopened.indexed.?.prefix);
+        try std.testing.expectEqual(@as(u64, 1), try reopened.appendIdempotent("docs", 11, "alpha", "original"));
+        const records = try reopened.indexed.?.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 2 });
+        defer wal_types.freeRecords(a, records);
+        try std.testing.expectEqual(@as(usize, 2), records.len);
+        try std.testing.expectEqualStrings("alpha", records[0].payload);
+        try std.testing.expectEqual(@as(u64, 11), records[0].timestamp_ns);
+        try std.testing.expectEqualStrings("beta", records[1].payload);
+        try std.testing.expectError(error.WalLayoutMismatch, reopened.selectLegacy());
+        if (managed) {
+            const Collector = @import("collector.zig").Collector;
+            var now: u64 = std.time.ns_per_s;
+            const Clock = struct {
+                fn read(raw: ?*const anyopaque) u64 {
+                    return @as(*const u64, @ptrCast(@alignCast(raw.?))).*;
+                }
+            };
+            selected.indexed.?.read_clock = .{ .ptr = &now, .now_fn = Clock.read };
+            _ = try selected.indexed.?.truncatePrefix("docs", 2);
+            const collector = try a.create(Collector);
+            defer a.destroy(collector);
+            collector.* = Collector.init(a, selected.indexed.?, std.testing.io);
+            collector.step_interval_ns = 0;
+            var finished = false;
+            for (0..1024) |_| {
+                const result = try collector.step("docs", null);
+                if (result.phase == .waiting) now += Collector.grace_ns;
+                if (result.phase == .finished) {
+                    finished = true;
+                    break;
+                }
+            }
+            try std.testing.expect(finished);
+            var idle = false;
+            for (0..1024) |_| if ((try collector.step("docs", null)).phase == .idle) {
+                idle = true;
+                break;
+            };
+            try std.testing.expect(idle);
+            var jobs = try client.listObjects("db", .{ .prefix = ".antfly/indexed-v2/gc-jobs/", .recursive = true });
+            defer jobs.deinit(a);
+            try std.testing.expectEqual(@as(usize, 0), jobs.entries.len);
+            try std.testing.expectEqual(@as(u64, 1), try reopened.appendIdempotent("docs", 11, "alpha", "original"));
+            const retained = try reopened.indexed.?.readRangeAlloc(a, "docs", .{ .start_lsn = 2, .end_lsn = 2 });
+            defer wal_types.freeRecords(a, retained);
+            try std.testing.expectEqual(@as(usize, 1), retained.len);
+            try std.testing.expectEqualStrings("beta", retained[0].payload);
+        }
+    }
+}
+
+test "serverless multiprovider existing empty prefix version one retains its original cloud keys" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |managed| {
+        var memory = objectstore.MemoryClient.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("db");
+        const marker_body = if (managed) "antfly-wal:indexed-managed:1" else "antfly-wal:indexed:1";
+        var marker = try client.putObject("db", ".antfly/WAL_FORMAT", marker_body, .{});
+        marker.deinit(a);
+        // Reproduce the old layout exactly, including the leading slash and
+        // its authenticated tree domain. Existing data must never be renamed.
+        var old = try @import("indexed_object_store.zig").IndexedObjectStore.init(a, client, "db", "");
+        defer old.deinit();
+        old.managed_reads = managed;
+        try std.testing.expectEqual(@as(u64, 1), try old.appendIdempotent("docs", 11, "alpha", "original"));
+        var reopened = try ObjectStore.initWithClient(a, client, "db", "");
+        defer reopened.deinit();
+        try reopened.enableIndexed(.{});
+        try std.testing.expectEqualStrings("", reopened.indexed.?.prefix);
+        try std.testing.expectEqual(managed, reopened.indexed.?.managed_reads);
+        try std.testing.expectEqual(@as(u64, 1), try reopened.appendIdempotent("docs", 11, "alpha", "original"));
+        try std.testing.expectEqual(@as(u64, 2), try reopened.append("docs", 12, "beta"));
+        const records = try reopened.indexed.?.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 2 });
+        defer wal_types.freeRecords(a, records);
+        try std.testing.expectEqual(@as(usize, 2), records.len);
+        try std.testing.expectEqualStrings("alpha", records[0].payload);
+        var unchanged = try client.getObject("db", ".antfly/WAL_FORMAT", .{});
+        defer unchanged.deinit(a);
+        try std.testing.expectEqualStrings(marker_body, unchanged.body);
+    }
+}
+
+test "serverless multiprovider filesystem root never rewrites a version one selection" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |managed| {
+        var path_buf: [256]u8 = undefined;
+        const path = tmpPath(&path_buf, "old-indexed-root");
+        defer cleanupTmp(path);
+        const uri = try std.fmt.allocPrint(a, "file://{s}", .{std.mem.span(path)});
+        defer a.free(uri);
+        var store = try ObjectStore.initFileUri(a, uri);
+        defer store.deinit();
+        const marker_body = if (managed) "antfly-wal:indexed-managed:1" else "antfly-wal:indexed:1";
+        var marker = try store.client.putObject(store.bucket, ".antfly/WAL_FORMAT", marker_body, .{});
+        marker.deinit(a);
+        try std.testing.expectError(error.LegacyIndexedRootMigrationRequired, store.enableIndexed(.{ .managed_collection = managed }));
+        var unchanged = try store.client.getObject(store.bucket, ".antfly/WAL_FORMAT", .{});
+        defer unchanged.deinit(a);
+        try std.testing.expectEqualStrings(marker_body, unchanged.body);
+    }
 }
 
 test "serverless multiprovider concurrent layout selection cannot create a shadow legacy WAL" {

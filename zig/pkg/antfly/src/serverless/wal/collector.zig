@@ -996,20 +996,25 @@ test "serverless multiprovider native collection preserves current HEADs with op
 test "serverless multiprovider managed activation rejects historical versions behind deleted current names" {
     const a = std.testing.allocator;
     const Provider = @import("../artifacts/cloud_generations_test_provider.zig").Provider;
-    var provider = Provider.init(a);
-    defer provider.deinit();
-    provider.until_ms = 0;
-    var client = provider.client();
-    try client.makeBucket("db");
-    var old = try client.putObject("db", "old/wal-v1/HEAD", "unmanaged-old", .{});
-    defer old.deinit(a);
-    var current = try client.putObject("db", "old/wal-v1/HEAD", "unmanaged-current", .{});
-    defer current.deinit(a);
-    try client.deleteObject("db", "old/wal-v1/HEAD", .{ .version_id = current.version_id });
-    var wrapper = try @import("object_store.zig").ObjectStore.initWithClient(a, client, "db", "old");
-    defer wrapper.deinit();
-    try std.testing.expectError(error.ManagedWalMigrationRequired, wrapper.enableIndexed(.{ .managed_collection = true }));
-    try std.testing.expectError(error.FileNotFound, client.getObject("db", "old/.antfly/WAL_FORMAT", .{}));
+    for ([_]u8{ 0, 1, 2 }) |mode| {
+        const prefix = if (mode == 0) "old" else "";
+        const old_key = if (mode == 0) "old/wal-v1/HEAD" else "/wal-v1/HEAD";
+        const managed = mode != 2;
+        var provider = Provider.init(a);
+        defer provider.deinit();
+        provider.until_ms = 0;
+        var client = provider.client();
+        try client.makeBucket("db");
+        var old = try client.putObject("db", old_key, "unmanaged-old", .{});
+        defer old.deinit(a);
+        var current = try client.putObject("db", old_key, "unmanaged-current", .{});
+        defer current.deinit(a);
+        try client.deleteObject("db", old_key, .{ .version_id = current.version_id });
+        var wrapper = try @import("object_store.zig").ObjectStore.initWithClient(a, client, "db", prefix);
+        defer wrapper.deinit();
+        try std.testing.expectError(if (managed) error.ManagedWalMigrationRequired else error.IndexedWalMigrationRequired, wrapper.enableIndexed(.{ .managed_collection = managed }));
+        try std.testing.expectError(error.FileNotFound, client.getObject("db", if (mode == 0) "old/.antfly/WAL_FORMAT" else ".antfly/WAL_FORMAT", .{}));
+    }
 }
 
 test "serverless multiprovider native collection retains document roots and newer epoch writes" {

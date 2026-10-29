@@ -270,3 +270,36 @@ they are not substituted for the successful guarded command.
 Evidence is under `examples/cloudflare-serverless/dist/qualification/native-gc-batch-lab/`.
 Real S3 still requires local AWS credentials. These GCS and local results do
 not qualify the live Cloudflare latency or physical cold-start gates.
+
+
+## Empty logical prefixes and explicit layout version two
+
+The native release HTTP smoke exposed `InvalidObjectKey` before the first
+ingest: the version-one indexed implementation concatenates an empty prefix
+with `/wal-v1/...`. S3/GCS permit those leading-slash object names, while the
+filesystem adapter correctly rejects absolute-looking keys. Trimming the slash
+would change authenticated tree domains and hide existing cloud data.
+
+New empty logical prefixes therefore select `antfly-wal:indexed:2` or
+`antfly-wal:indexed-managed:2`. Their physical indexed prefix is
+`.antfly/indexed-v2`, beneath which existing WAL page and GC-job naming applies.
+The immutable selection marker remains `.antfly/WAL_FORMAT`. Both managed and
+unmanaged version-two activation require a pristine logical prefix, including
+historical versions, before writing the marker. Relative layout two never
+adopts an unmarked tree or unrelated data. Nonempty new prefixes continue to
+select version one; existing version-one cloud roots retain their original
+keys, domains and receipts. An older reader rejects the new marker.
+
+A previously selected version-one filesystem root fails startup with
+`LegacyIndexedRootMigrationRequired`; its marker is never rewritten. Use a new
+owned prefix or a coordinated migration. Disabling collection on a managed
+version-two prefix retains its 30-second reader contract and the same 60-second
+grace. No resource limit or grace threshold changes.
+
+The focused regression command passes 31 tests with three environment skips
+and no failures/leaks. It covers fresh filesystem HTTP namespace admission,
+selection acknowledgment loss, receipt replay, collection/private cleanup under
+the relative root, version-one cloud compatibility, filesystem refusal to
+reinterpret old markers, and historical activation guards. The initial release
+smoke failure remains preserved; the corrected release and full qualification
+are being rebuilt separately before claiming that smoke passes.

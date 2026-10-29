@@ -423,7 +423,7 @@ both the selected cache and the standard-library fixture cache until child
 processes settle. Earlier cache-loss failures remain separate failed evidence.
 
 `qualification/native-host-contracts.mjs --binary=PATH --out=REPORT_DIR` exercises
-the release CLI, internal HTTP ingestion/publication/latest query, process
+the release API-only CLI, explicit HTTP ingestion/publication/latest query, process
 restart and file-backed managed WAL policy with collection disabled on reopen.
 This smoke does not qualify a new keyed HTTP ingestion protocol or cloud SLO.
 
@@ -458,3 +458,17 @@ The actual candidate deployment therefore remains the earlier `131a703fed`.
 After explicit authorization, copy the immutable proposal to an unsealed runtime
 directory before installing the approved disposable tokens or changing lifecycle
 state; keep the sealed proposal and prior deployments' evidence intact.
+
+
+The first native release process smoke found a root-prefix compatibility gap:
+empty-prefix indexed WAL keys began with `/`, which the filesystem adapter
+rejects. [Layout version two](native-indexed-wal-collection.md#empty-logical-prefixes-and-explicit-layout-version-two)
+selects a reserved relative physical prefix only through an explicit immutable
+marker on a pristine logical root. Existing cloud version-one keys and receipts
+retain their exact layout; old filesystem markers fail closed instead of being
+rewritten. The new focused tests pass 31 with three environment skips and no
+failures/leaks. The failed process report remains preserved while the corrected
+release is rebuilt. The smoke uses API-only mode with manual publication enabled,
+requires live/ready/validated health, isolates fixture configuration from inherited
+Antfly environment variables, and waits for process output to close before
+recording cleanup. It does not qualify a background maintenance loop.

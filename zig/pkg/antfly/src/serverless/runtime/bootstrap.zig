@@ -1532,6 +1532,64 @@ fn cleanupTmp(path: [*:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
+test "serverless multiprovider managed empty HTTP namespace remains writable" {
+    const a = std.testing.allocator;
+    var path_buf: [512]u8 = undefined;
+    const path = tmpPath(&path_buf, "managed-empty-http");
+    defer cleanupTmp(path);
+    const artifacts = try std.fmt.allocPrint(a, "file://{s}/artifacts", .{std.mem.span(path)});
+    defer a.free(artifacts);
+    const manifests = try std.fmt.allocPrint(a, "file://{s}/manifests", .{std.mem.span(path)});
+    defer a.free(manifests);
+    const wal = try std.fmt.allocPrint(a, "file://{s}/wal", .{std.mem.span(path)});
+    defer a.free(wal);
+    const progress = try std.fmt.allocPrint(a, "file://{s}/progress", .{std.mem.span(path)});
+    defer a.free(progress);
+    const catalog = try std.fmt.allocPrint(a, "file://{s}/catalog", .{std.mem.span(path)});
+    defer a.free(catalog);
+    const cache = try std.fmt.allocPrint(a, "{s}/cache", .{std.mem.span(path)});
+    defer a.free(cache);
+    var stack: OwnedStack = undefined;
+    try stack.init(a, .{
+        .artifacts_uri = artifacts,
+        .manifests_uri = manifests,
+        .wal_uri = wal,
+        .progress_uri = progress,
+        .catalog_uri = catalog,
+        .indexed_wal = true,
+        .wal_gc = true,
+        .native_read_state = true,
+        .wal_document_index = true,
+        .query_cache_dir = cache,
+        .query_cache_max_bytes = 64 * 1024 * 1024,
+        .role = .api_only,
+        .publish_enabled = true,
+        .compaction_enabled = false,
+        .prune_enabled = false,
+        .enrichment_enabled = false,
+    }, std.testing.io);
+    defer stack.deinit();
+    var ensured = try stack.handler.handle(.{
+        .method = .put,
+        .path = "/internal/v1/namespaces/docs",
+        .body = "{\"created_at_ns\":123,\"policy\":{\"default_query_view\":\"published\",\"keep_latest_versions\":4,\"max_pending_records\":4,\"compaction_trigger_version_count\":2,\"vector_distance_metric\":\"inner_product\"}}",
+    });
+    defer ensured.deinit(a);
+    try std.testing.expectEqual(@as(u16, 201), ensured.status);
+    // Surface the underlying status error rather than the HTTP adapter's 500.
+    var status = try stack.catalog.buildStatus("docs");
+    defer status.deinit(a);
+    try std.testing.expectEqual(@as(u64, 0), status.latest_wal_lsn);
+    var ingested = try stack.handler.handle(.{
+        .method = .put,
+        .path = "/internal/v1/namespaces/docs/ingest-batch",
+        .body = "{\"timestamp_ns\":456,\"mutations\":[{\"kind\":\"upsert\",\"doc_id\":\"doc-a\",\"body\":\"alpha\"},{\"kind\":\"upsert\",\"doc_id\":\"doc-b\",\"body\":\"beta\"}]}",
+    });
+    defer ingested.deinit(a);
+    try std.testing.expectEqual(@as(u16, 202), ingested.status);
+    try std.testing.expectEqual(@as(u64, 2), try stack.wal.latestLsn("docs"));
+}
+
 test "serverless multiprovider bootstrap owns indexed WAL and bounded live read state through publication" {
     const a = std.testing.allocator;
     var memory = objectstore.MemoryClient.init(a);
