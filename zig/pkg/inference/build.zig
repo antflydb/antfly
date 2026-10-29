@@ -360,12 +360,31 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = workflow_ctx.path("src/tile/codegen_main.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const tile_kernel_codegen_run = workflow_ctx.addRunArtifact(tile_kernel_codegen_exe);
     tile_kernel_codegen_run.addPassthruArgs();
     b.step("tile-kernel-codegen", "Verify (or --write) sources rendered from tile kernels").dependOn(&tile_kernel_codegen_run.step);
+    // The CPU lowering is @Vector code: without -Dcpu it targets the build
+    // host's CPU rather than the baseline (no AVX/FMA) the default implies.
+    const tile_whisper_target = if (target.query.cpu_model == .determined_by_arch_os and
+        target.result.cpu.arch == b.graph.host.result.cpu.arch and target.result.os.tag == b.graph.host.result.os.tag)
+        b.graph.host
+    else
+        target;
+    const tile_whisper_exe = b.addExecutable(.{
+        .name = "antfly-tile-whisper",
+        .root_module = b.createModule(.{
+            .root_source_file = workflow_ctx.path("src/tile/whisper_main.zig"),
+            .target = tile_whisper_target,
+            .optimize = if (optimize == .debug) .fast else optimize,
+        }),
+    });
+    tile_whisper_exe.root_module.addImport("inference_audio", runtime_graph.inference_audio_mod);
+    const tile_whisper_run = b.addRunArtifact(tile_whisper_exe);
+    tile_whisper_run.addPassthruArgs();
+    b.step("tile-whisper", "Transcribe with Whisper on tile kernels: -- <hf-model-dir> <audio.wav|mel.f32> [--reference <dir>]").dependOn(&tile_whisper_run.step);
 
     const metal_unavailable_message = "Metal quant kernel evidence targets require a macOS target with xcrun/Metal; no Metal runtime evidence was run.";
     const quant_kernel_metal_check_step = b.step("quant-kernel-metal-check", "Compile generated and promoted Metal quant kernels");

@@ -186,3 +186,153 @@ test "tile cpu vexp matches @exp" {
     try std.testing.expectEqual(@as(f32, 0), cpu.vexp(8, @splat(tile.neg_inf))[0]);
     try std.testing.expectEqual(@as(f32, 1), cpu.vexp(8, @splat(0))[0]);
 }
+
+// ---- Model primitives (GEMM, LayerNorm, attention, data movement) ----
+
+const fexpr = @import("fexpr.zig");
+const vmath = @import("vmath.zig");
+const gemm = @import("gemm.zig");
+const norm = @import("norm.zig");
+const attention = @import("attention.zig");
+const layout = @import("layout.zig");
+
+fn fill(rng: std.Random, xs: []f32, scale: f32) void {
+    for (xs) |*x| x.* = (rng.float(f32) - 0.5) * 2 * scale;
+}
+
+fn expectClose(expected: []const f32, actual: []const f32, rel: f32, abs: f32) !void {
+    for (expected, actual, 0..) |e, a, i| {
+        if (@abs(e - a) > abs + rel * @abs(e)) {
+            std.debug.print("index {d}: expected {d}, got {d}\n", .{ i, e, a });
+            return error.TestExpectedApproxEq;
+        }
+    }
+}
+
+test "tile vmath erf and gelu track the f64 references" {
+    var x: f32 = -6;
+    while (x < 6) : (x += 0.00731) {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(vmath.erfF64(x))), vmath.verf(4, @splat(x))[0], 6e-7);
+        const g: f32 = @floatCast(vmath.geluF64(x));
+        try std.testing.expectApproxEqAbs(g, vmath.vgelu(4, @splat(x))[0], 1e-6 + 1e-6 * @abs(g));
+    }
+}
+
+test "tile gemm matches the f64 reference across shapes and epilogues" {
+    const kernels = comptime .{
+        gemm.Gemm{ .name = "plain" },
+        gemm.Gemm{ .name = "bias_gelu", .epilogue = fexpr.acc.plus(.bias).geluOf() },
+        gemm.Gemm{ .name = "bias_res", .epilogue = fexpr.acc.plus(.bias).plus(.residual) },
+        gemm.Gemm{ .name = "scaled", .epilogue = fexpr.acc.plus(.bias).times(fexpr.lit(0.125)) },
+    };
+    var prng = std.Random.DefaultPrng.init(0x6e33);
+    const rng = prng.random();
+    const shapes = [_][3]usize{ .{ 1, 1, 1 }, .{ 1, 37, 16 }, .{ 5, 7, 33 }, .{ 33, 18, 64 }, .{ 70, 65, 240 }, .{ 1, 300, 384 } };
+    inline for (kernels) |g| for (shapes) |s| {
+        const m, const n, const kd = s;
+        const alloc = std.testing.allocator;
+        const x = try alloc.alloc(f32, m * kd);
+        defer alloc.free(x);
+        const w = try alloc.alloc(f32, n * kd);
+        defer alloc.free(w);
+        const bias = try alloc.alloc(f32, n);
+        defer alloc.free(bias);
+        const res = try alloc.alloc(f32, m * n);
+        defer alloc.free(res);
+        const want = try alloc.alloc(f32, m * n);
+        defer alloc.free(want);
+        const got = try alloc.alloc(f32, m * n);
+        defer alloc.free(got);
+        fill(rng, x, 1);
+        fill(rng, w, 1);
+        fill(rng, bias, 1);
+        fill(rng, res, 1);
+        gemm.reference(g, .{ .x = x, .w = w, .bias = bias, .residual = res.ptr, .out = want.ptr, .m = m, .n = n, .k = kd });
+        // In place: the residual is the output buffer.
+        @memcpy(got, res);
+        gemm.run(g, .{ .x = x, .w = w, .bias = bias, .residual = got.ptr, .out = got.ptr, .m = m, .n = n, .k = kd });
+        try expectClose(want, got, 1e-5, 1e-5 * @as(f32, @floatFromInt(kd)));
+    };
+}
+
+test "tile layernorm matches the f64 reference" {
+    var prng = std.Random.DefaultPrng.init(0x1a7e);
+    const rng = prng.random();
+    const ln = norm.LayerNorm{ .name = "ln" };
+    for ([_][2]usize{ .{ 1, 384 }, .{ 9, 384 }, .{ 3, 17 }, .{ 40, 64 } }) |s| {
+        const rows, const dim = s;
+        const alloc = std.testing.allocator;
+        const x = try alloc.alloc(f32, rows * dim);
+        defer alloc.free(x);
+        const gamma = try alloc.alloc(f32, dim);
+        defer alloc.free(gamma);
+        const beta = try alloc.alloc(f32, dim);
+        defer alloc.free(beta);
+        const want = try alloc.alloc(f32, rows * dim);
+        defer alloc.free(want);
+        const got = try alloc.alloc(f32, rows * dim);
+        defer alloc.free(got);
+        fill(rng, x, 4);
+        for (x, 0..) |*v, i| v.* += @floatFromInt(i % 3); // nonzero mean
+        fill(rng, gamma, 1);
+        fill(rng, beta, 1);
+        norm.reference(ln, .{ .x = x, .gamma = gamma, .beta = beta, .out = want, .rows = rows, .dim = dim });
+        norm.run(ln, .{ .x = x, .gamma = gamma, .beta = beta, .out = got, .rows = rows, .dim = dim });
+        try expectClose(want, got, 1e-5, 1e-5);
+    }
+}
+
+test "tile attention matches the f64 reference (self, causal, cross)" {
+    var prng = std.Random.DefaultPrng.init(0xa77e);
+    const rng = prng.random();
+    const att = attention.Attention{ .name = "att", .head_dim = 64 };
+    const AttCase = struct { tq: usize, tk: usize, heads: usize, causal: bool, q_offset: usize };
+    const cases = [_]AttCase{
+        .{ .tq = 7, .tk = 7, .heads = 2, .causal = false, .q_offset = 0 },
+        .{ .tq = 5, .tk = 5, .heads = 3, .causal = true, .q_offset = 0 },
+        .{ .tq = 1, .tk = 9, .heads = 6, .causal = true, .q_offset = 8 },
+        .{ .tq = 3, .tk = 37, .heads = 2, .causal = true, .q_offset = 34 },
+        .{ .tq = 4, .tk = 150, .heads = 6, .causal = false, .q_offset = 0 },
+    };
+    for (cases) |c| {
+        const ld = c.heads * 64;
+        const alloc = std.testing.allocator;
+        const q = try alloc.alloc(f32, c.tq * ld);
+        defer alloc.free(q);
+        const kk = try alloc.alloc(f32, c.tk * ld);
+        defer alloc.free(kk);
+        const v = try alloc.alloc(f32, c.tk * ld);
+        defer alloc.free(v);
+        const want = try alloc.alloc(f32, c.tq * ld);
+        defer alloc.free(want);
+        const got = try alloc.alloc(f32, c.tq * ld);
+        defer alloc.free(got);
+        fill(rng, q, 1);
+        fill(rng, kk, 1);
+        fill(rng, v, 1);
+        const args: attention.Args = .{ .q = q, .k = kk, .v = v, .out = want, .tq = c.tq, .tk = c.tk, .heads = c.heads, .ld_q = ld, .ld_k = ld, .ld_v = ld, .ld_o = ld, .scale = 0.125, .causal = c.causal, .q_offset = c.q_offset };
+        try attention.reference(att, args);
+        var a2 = args;
+        a2.out = got;
+        attention.run(att, a2);
+        try expectClose(want, got, 1e-5, 2e-6);
+    }
+}
+
+test "tile im2col and embed lay data out as conv and lookup expect" {
+    // channel-major, stride 1, pad 1: out[t, c*3 + j] = x[c, t + j - 1]
+    const x = [_]f32{ 1, 2, 3, 10, 20, 30 }; // C=2, T=3
+    var out: [3 * 6]f32 = undefined;
+    layout.im2col(.{ .name = "a", .kernel = 3, .stride = 1, .pad = 1, .layout = .channel_major }, .{ .x = &x, .out = &out, .channels = 2, .t_in = 3 });
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0, 10, 20, 1, 2, 3, 10, 20, 30, 2, 3, 0, 20, 30, 0 }, &out);
+    // time-major, stride 2: x[t, c]; T=4 -> 2 outputs
+    const y = [_]f32{ 1, 10, 2, 20, 3, 30, 4, 40 };
+    var out2: [2 * 6]f32 = undefined;
+    layout.im2col(.{ .name = "b", .kernel = 3, .stride = 2, .pad = 1, .layout = .time_major }, .{ .x = &y, .out = &out2, .channels = 2, .t_in = 4 });
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0, 10, 20, 2, 3, 4, 20, 30, 40 }, &out2);
+    const table = [_]f32{ 0, 0, 1, 1, 2, 2 };
+    const pos = [_]f32{ 0.5, 0.5, 0.25, 0.25, 0.125, 0.125 };
+    var e: [4]f32 = undefined;
+    layout.embed(.{ .name = "e" }, .{ .ids = &.{ 2, 1 }, .table = &table, .pos = &pos, .out = &e, .dim = 2, .pos_offset = 1 });
+    try std.testing.expectEqualSlices(f32, &.{ 2.25, 2.25, 1.125, 1.125 }, &e);
+}

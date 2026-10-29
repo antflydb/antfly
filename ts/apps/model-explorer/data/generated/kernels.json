@@ -738,6 +738,94 @@
    }
   },
   {
+   "name": "antfly_tile_attention_hd64",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_gemm",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_gemm_bias",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_gemm_bias_gelu",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_gemm_bias_gelu_residual",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_gemm_bias_residual",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_gemm_bias_scale",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_layer_norm",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_whisper_embed",
+   "family": "data_movement",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_whisper_im2col_hidden",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
+   "name": "antfly_tile_whisper_im2col_mel",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/tile_whisper_model.metal"
+   }
+  },
+  {
    "name": "antfly_tile_whisper_logits_partials",
    "family": "other",
    "generated": true,

@@ -16,10 +16,15 @@
 //! `zig build tile-kernel-codegen [-- --write]`: check (default) or rewrite
 //! the checked-in sources rendered from tile kernels. Paths are relative to
 //! the inference package root.
+//!
+//! `-- --emit-opencl <path>` writes the OpenCL test dialect of the Whisper
+//! model kernels (not checked in) for scripts/tile/run_whisper_opencl.py.
 
 const std = @import("std");
 const gpu = @import("gpu.zig");
 const whisper = @import("whisper_logits.zig");
+const gpu_model = @import("gpu_model.zig");
+const whisper_model = @import("whisper_model.zig");
 
 const File = struct { path: []const u8, data: []const u8 };
 
@@ -27,22 +32,33 @@ const files = [_]File{
     .{ .path = "src/ops/metal/generated/tile_whisper_logits_partials.metal", .data = gpu.renderMetal(whisper.kernel) },
     .{ .path = "src/ops/metal/generated/tile_whisper_logits_partials.msl.h", .data = gpu.renderMetalHeader(whisper.kernel, "antfly_tile_whisper_logits_partials_msl") },
     .{ .path = "src/ops/cuda/generated/tile_whisper_logits.cu", .data = gpu.renderCuda(whisper.kernel) },
+    .{ .path = "src/ops/metal/generated/tile_whisper_model.metal", .data = gpu_model.renderModule(whisper_model.kernels, .metal, "src/tile/whisper_model.zig") },
+    .{ .path = "src/ops/cuda/generated/tile_whisper_model.cu", .data = gpu_model.renderModule(whisper_model.kernels, .cuda, "src/tile/whisper_model.zig") },
 };
+
+const opencl_source = gpu_model.renderModule(whisper_model.kernels, .opencl, "src/tile/whisper_model.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     var write = false;
-    for (args[1..]) |arg| {
+    const cwd = std.Io.Dir.cwd();
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--write")) {
             write = true;
+        } else if (std.mem.eql(u8, arg, "--emit-opencl") and i + 1 < args.len) {
+            i += 1;
+            try cwd.writeFile(io, .{ .sub_path = args[i], .data = opencl_source });
+            std.debug.print("wrote {s}\n", .{args[i]});
+            return;
         } else if (!std.mem.eql(u8, arg, "--check")) {
-            std.debug.print("usage: tile-kernel-codegen [--check|--write]\n", .{});
+            std.debug.print("usage: tile-kernel-codegen [--check|--write|--emit-opencl <path>]\n", .{});
             return error.InvalidArguments;
         }
     }
-    const cwd = std.Io.Dir.cwd();
     var stale: usize = 0;
     for (files) |f| {
         if (write) {

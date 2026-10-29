@@ -20,32 +20,14 @@
 
 const std = @import("std");
 const tile = @import("tile.zig");
+const vmath = @import("vmath.zig");
 
 const State = tile.State;
 const no_index = tile.no_index;
 const neg_inf = tile.neg_inf;
 
-/// Vector exp. `@exp` on a `@Vector` lowers to one libm call per lane, which
-/// made the vector kernel slower than scalar code; this is a Cephes-style
-/// polynomial (about 1 ulp) that stays in vector registers. Inputs below
-/// -87.3 (including -inf) return 0.
-pub fn vexp(comptime width: comptime_int, x: @Vector(width, f32)) @Vector(width, f32) {
-    const V = @Vector(width, f32);
-    const I = @Vector(width, i32);
-    const xc = @min(@max(x, @as(V, @splat(-87.3))), @as(V, @splat(88.37)));
-    const n = @round(xc * @as(V, @splat(1.44269504088896341)));
-    const r = xc - n * @as(V, @splat(0.693359375)) - n * @as(V, @splat(-2.12194440e-4));
-    var p: V = @splat(1.9875691500e-4);
-    p = p * r + @as(V, @splat(1.3981999507e-3));
-    p = p * r + @as(V, @splat(8.3334519073e-3));
-    p = p * r + @as(V, @splat(4.1665795894e-2));
-    p = p * r + @as(V, @splat(1.6666665459e-1));
-    p = p * r + @as(V, @splat(5.0000001201e-1));
-    const y = p * r * r + r + @as(V, @splat(1));
-    const ni: I = @intFromFloat(n);
-    const scale: V = @bitCast((ni + @as(I, @splat(127))) << @splat(23));
-    return @select(f32, x < @as(V, @splat(-87.3)), @as(V, @splat(0)), y * scale);
-}
+/// Polynomial vector exp (`@exp` on vectors lowers to per-lane libm calls).
+pub const vexp = vmath.vexp;
 
 pub fn RowReduce(comptime k: tile.RowReduce, comptime width: comptime_int) type {
     comptime k.validate();
