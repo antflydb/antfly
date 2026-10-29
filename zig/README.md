@@ -238,9 +238,10 @@ Run each graph-pattern mode in a fresh process. The JSON output reports p50,
 p95, and p99 latency and query-allocation high-water marks. Process RSS is an
 OS high-water mark; use `--warmup 0 --samples 1` for a cold-query RSS comparison.
 
-The `search-benchmark-game/engines/antfly-zig` directory is an adapter for the
-external `search-benchmark-game` harness. It delegates to the root
-`search-bench` step.
+The [`bench/full_text/search-benchmark-game/engines`](bench/full_text/search-benchmark-game/engines)
+directory holds adapters for the external `search-benchmark-game` harness:
+`antfly-zig` delegates to the root `search-bench` step, and `tantivy-kernel` is
+the Tantivy comparison engine. See [the full-text benchmark](bench/full_text/BENCHMARK.md).
 
 ### PDF-only iteration
 

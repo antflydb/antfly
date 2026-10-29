@@ -1,6 +1,6 @@
 "use client";
 
-import * as SliderPrimitive from "@radix-ui/react-slider";
+import { Slider as SliderPrimitive } from "radix-ui";
 import * as React from "react";
 
 import { cn } from "@/lib/utils";
@@ -35,7 +35,7 @@ function Slider({
         data-slot="slider-track"
         className={cn(
           // square rail — bg track with amber range fill
-          "bg-secondary relative grow overflow-hidden rounded-none",
+          "bg-secondary relative grow overflow-hidden rounded-full",
           "data-[orientation=horizontal]:h-[6px] data-[orientation=horizontal]:w-full",
           "data-[orientation=vertical]:h-full data-[orientation=vertical]:w-[6px]"
         )}
@@ -54,7 +54,7 @@ function Slider({
           className={cn(
             // square ink-bordered handle — sits on top of the amber range,
             // bg-background gives high contrast in both light and dark modes
-            "block size-[14px] shrink-0 rounded-none",
+            "block size-[14px] shrink-0 rounded-full",
             "bg-background border-(length:--border-width) border-amber-500",
             "transition-[box-shadow,border-color] outline-none",
             "hover:border-ring focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",

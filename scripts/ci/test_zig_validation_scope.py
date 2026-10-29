@@ -129,9 +129,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                 "needs.changes.outputs.trace_validate": "true",
                 "needs.changes.outputs.e2e": "true",
                 "needs.e2e-base-build.result": "success" if pr else "skipped",
-                "needs.e2e-base-plan.result": "success"
-                if pr and not full
-                else "skipped",
+                "needs.e2e-base-plan.result": "success",
                 "needs.e2e-full-build.result": "skipped" if pr else "success",
             }
             values.update(overrides)
@@ -234,10 +232,22 @@ class ZigValidationScopeTests(unittest.TestCase):
             "zig-base-wasm",
             "zig-base-lite-models",
             "zig-base",
-            "e2e-base-plan",
             "e2e-base-tests",
             "e2e-base",
         ]
+        self.assertTrue(selected("e2e-base-plan"))
+        self.assertTrue(selected("e2e-base-plan", full=True))
+        self.assertTrue(selected("e2e-base-plan", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "e2e-base-plan", full=True, **{"needs.admission.result": "failure"}
+            )
+        )
+        self.assertFalse(
+            selected(
+                "e2e-full-tests", full=True, **{"needs.e2e-base-plan.result": "failure"}
+            )
+        )
         for job in full_jobs:
             with self.subTest(job=job):
                 self.assertTrue(selected(job, full=True))
@@ -282,11 +292,13 @@ class ZigValidationScopeTests(unittest.TestCase):
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
         self.assertIn(
-            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
+            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]",
             aggregate,
         )
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
-        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1]).split(
+            "\n- uses:", 1
+        )[0]
         for build, tests, low_fd, required, native, success in (
             ("success", "success", "success", "true", "success", True),
             ("success", "success", "failure", "true", "success", False),
@@ -306,16 +318,30 @@ class ZigValidationScopeTests(unittest.TestCase):
                         **os.environ,
                         "BUILD_RESULT": build,
                         "TEST_RESULT": tests,
+                        "PLAN_RESULT": "success",
                         "LOW_FD_RESULT": low_fd,
                         "REQUIRE_LOW_FD": required,
                         "NATIVE_SDK_RESULT": native,
                         "PGWIRE_DRIVER_RESULT": "success",
+                        "BETTER_AUTH_RESULT": "success",
                     },
                     check=False,
                     capture_output=True,
                 )
                 self.assertEqual(result.returncode == 0, success, result.stderr)
 
+        self.assertTrue(selected("better-auth"))
+        self.assertTrue(selected("better-auth", full=True))
+        self.assertTrue(selected("better-auth", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "better-auth",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
         self.assertTrue(selected("embedded-sdk-native"))
         self.assertTrue(selected("embedded-sdk-native", full=True))
         self.assertTrue(selected("embedded-sdk-native", pr="", event="push"))
@@ -345,9 +371,14 @@ class ZigValidationScopeTests(unittest.TestCase):
         # cannot be hidden by otherwise successful E2E and native SDK results.
         for job in ("e2e-base", "e2e-full"):
             command = textwrap.dedent(blocks[job].split("run: |\n", 1)[1])
-            if job == "e2e-base":
-                command = command.split("\n- uses:", 1)[0]
-            for driver in ("success", "failure", "skipped"):
+            command = command.split("\n- uses:", 1)[0]
+            for driver, auth in (
+                ("success", "success"),
+                ("failure", "success"),
+                ("skipped", "success"),
+                ("success", "failure"),
+                ("success", "skipped"),
+            ):
                 with self.subTest(job=job, driver=driver):
                     result = subprocess.run(
                         ["bash", "-c", command],
@@ -360,12 +391,15 @@ class ZigValidationScopeTests(unittest.TestCase):
                             "REQUIRE_LOW_FD": "true",
                             "NATIVE_SDK_RESULT": "success",
                             "PGWIRE_DRIVER_RESULT": driver,
+                            "BETTER_AUTH_RESULT": auth,
                         },
                         check=False,
                         capture_output=True,
                     )
                     self.assertEqual(
-                        result.returncode == 0, driver == "success", result.stderr
+                        result.returncode == 0,
+                        driver == auth == "success",
+                        result.stderr,
                     )
 
     def test_base_native_wasm_and_model_qualification_have_independent_owners(self):
@@ -424,7 +458,9 @@ class ZigValidationScopeTests(unittest.TestCase):
             0
         ]
         self.assertIn("zig-base-wasm, zig-base-lite-models", aggregate)
-        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1]).split(
+            "\n- uses:", 1
+        )[0]
         healthy = {
             "CHANGES_RESULT": "success",
             "X86_64_RESULT": "success",
@@ -521,7 +557,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "\n  e2e-full:\n", 1
         )[0]
         self.assertIn("name: Download ingestion native library", full)
-        self.assertIn("if: matrix.suite == 'antfly'", full)
+        self.assertIn("if: startsWith(matrix.suite, 'antfly-')", full)
         self.assertIn(
             "libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}",
             full,

@@ -1,0 +1,51 @@
+---
+title: Cohere
+description: Cohere embeddings and reranking in Antfly
+---
+
+The `cohere` provider calls the Cohere API.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Embedder | Text | For example `embed-v4.0`; query and document input types are applied automatically |
+| Reranker | Text | Default `rerank-english-v3.0`; for example `rerank-v4.0-pro` |
+
+## Credentials
+
+`api_key`, defaulting to `COHERE_API_KEY`. The endpoint defaults to
+`https://api.cohere.com`.
+
+## Example
+
+```json
+{
+  "rerankers": {
+    "cohere": {
+      "provider": "cohere",
+      "model": "rerank-v4.0-pro",
+      "api_key": "${secret:cohere.api_key}"
+    }
+  }
+}
+```
+
+Override the query and document input types under the embedder's `retrieval`
+object when a model needs different values:
+
+```json
+{
+  "provider": "cohere",
+  "model": "embed-v4.0",
+  "retrieval": {
+    "query_input_type": "search_query",
+    "document_input_type": "search_document"
+  }
+}
+```
+
+## Related
+
+- [Tune Hybrid Search](/docs/guides/hybrid-search)
+- [Provider rate limits](/docs/guides/provider-rate-limits)

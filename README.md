@@ -79,7 +79,7 @@ See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 - **Reranking** — cross-encoder and [late-interaction](https://arxiv.org/abs/2004.12832) ([ColBERT](zig/pkg/inference/RERANKING.md), ColQwen2) reranking with score-based pruning to cut the noise
 - **Aggregations** — stats, terms facets, histogram, date histogram, range, and geo-distance [aggregations](zig/pkg/antfly-embedded/src/search/aggregation.zig) for analytics
 - **Transactions** — ACID transactions at the shard level with distributed coordination
-- **Document TTL** — automatic [document expiration](docs/guides/ttl-example.md) so you don't have to clean up yourself
+- **Document TTL** — automatic [document expiration](docs/reference/ttl.md) so you don't have to clean up yourself
 - **PostgreSQL CDC** — [mirror a Postgres table](docs/guides/cdc-replication.mdx) into Antfly over logical replication, every insert, update, and delete included
 - **CLI** — one `antfly` binary for the server, tables, queries, backups, auth, and the [model registry](docs/guides/inference.mdx) (`antfly inference pull owner/model`)
 - **Secrets** — reference credentials as [`${secret:...}` keystore entries or env vars](docs/reference/secrets.md) instead of putting them in config

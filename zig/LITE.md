@@ -512,6 +512,37 @@ the storage identity available as a typed value on the lower-level DB wrapper.
 It should also expose a path-level Lite integrity check so Zig users can inspect
 invalid `.aflite` files without first opening a handle.
 
+Knowledge-graph pipelines use the same embedded API:
+
+- A writable Lite database promotes resolved entity documents into named tables
+  through an atomic cross-table commit. Create destination tables before adding
+  resolvers; exact-key, prefix and ANN candidate blocking read those same
+  tables. A read-only connection never attaches a promotion sink.
+- `run_until_idle_json` drains all tables until recursive work converges. Its
+  `tables` object identifies per-table pending work; enrichment counters include
+  `last_error_code`. The output buffer can contain diagnostics even when the
+  call returns an error. Failed asynchronous extraction does not roll back the
+  source write, so inspect enrichment errors when waiting for graph
+  materialization.
+- `OpenOptions.models_dir` points database enrichments at application-managed
+  inference models. The database owns a copy of this path. The C struct keeps
+  its size by consuming reserved slots, so older callers remain compatible.
+- `add_index_json` accepts public `{ "name": "kg", "type": "graph", ... }`
+  configuration and the `{ "name", "kind", "config_json" }` envelope.
+  `config_json` may be an object or an escaped JSON string. A graph may combine
+  artifact-derived relations and field-derived edges such as `supersedes`.
+- `antfly_last_error_detail()` returns the calling thread's last error detail.
+  Rust exports `last_error_detail()`, Go exports `LastErrorDetail()`, and Python
+  appends the detail to raised errors after checking `antfly_last_error_code()`.
+  Native entry points clear retained diagnostics, including on successful calls
+  and missing document lookups, so read the detail immediately after a failed
+  call. Go callers using the separate accessor must lock their goroutine to the
+  OS thread across the failed operation and the accessor.
+- New model pulls publish `qualified_limits` through `list_models`, with
+  backend, feature and geometry profiles. Refresh an older model's pull metadata
+  to discover those limits. The receipt is informational; serving still
+  verifies the loaded artifact and the complete prepared request.
+
 ### File Format
 
 Antfly Lite uses `.aflite` as the live database format. Users should

@@ -118,7 +118,7 @@ detail.
 ### Embedded inference without a database
 
 For typed decision requests and answer semantics, see the
-[decision guide](../../../docs/guides/decisions.md).
+[decision guide](../../../docs/reference/decisions.md).
 
 Database failures copy the native diagnostic into the returned `Error`, so it
 survives subsequent calls. `Error` is `Clone` rather than `Copy`; use

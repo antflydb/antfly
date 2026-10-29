@@ -29,15 +29,16 @@ The matching Colony implementation and runbook are in
 application release: it adds a pinned first-boot native runtime, immutable remote
 artifact placement, instance-bound default-identity GCS connections and trusted
 principal forwarding for native composed queries. A runtime catalog edit alone
-cannot install it. RC.5 must be published and resolved to its immutable image;
+cannot install it. RC.6 is published and pinned in `runtime.json`;
 its build success or a local library test does not qualify a managed instance.
 
+The plan defaults to the exact published RC.6 OCI index in `runtime.json`. An
+optional `--image` accepts a registry mirror only when its digest matches that pin.
 Generate reviewable requests in a new directory, without contacting Cloud:
 
 ```sh
 uv run --project examples/hackernews python examples/hackernews/cloud_plan.py \
-  --output /private/tmp/hn-management management \
-  --image ghcr.io/antflydb/antfly@sha256:VERIFIED_RC5_INDEX_DIGEST
+  --output /private/tmp/hn-management management
 ```
 
 The plan contains a single-mode pinned instance (1 CPU/4 GiB/20 GiB initial sample,
@@ -68,8 +69,14 @@ with their returned IDs:
 ```sh
 uv run --project examples/hackernews python examples/hackernews/cloud_plan.py \
   --output /private/tmp/hn-native native \
-  --archive-auth ARCHIVE_AUTH_UUID --current-auth CURRENT_AUTH_UUID
+  --archive-auth ARCHIVE_AUTH_UUID --current-auth CURRENT_AUTH_UUID \
+  --archive-prefix archive/qualification-20261029
 ```
+
+Use a dedicated sample prefix for private qualification. Keep a later full export
+in a separate frozen prefix; do not mix duplicate sample/full-export rows beneath
+the active Parquet source. Moving that source requires an explicit reviewed
+publication/migration, not silently adding files.
 
 Submit those definitions to `/tables/hn_archive`, `/tables/hn_current` and
 `/sources/hackernews` at the authenticated native tenant API. Both tables explicitly
@@ -84,6 +91,16 @@ Use either `ANTFLY_AUTHORIZATION` (the complete header value) or `ANTFLY_API_KEY
 and native producer retain the tenant prefix and reject redirects, so credentials
 and exact write retries cannot silently move to another host. Browser requests
 cannot select backend URLs, table names or pass their own upstream credential.
+
+Prepare the producer's matching RC.6 library from the repository root. This checks
+published source/version metadata, archive size and SHA-256 against `runtime.json`;
+it refuses to overwrite an existing extracted library. The receipt is included in
+the producer image. Select the same architecture for preparation and Docker build.
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/prepare_runtime.py \
+  --architecture amd64
+```
 
 Build the two roles separately from the repository root:
 

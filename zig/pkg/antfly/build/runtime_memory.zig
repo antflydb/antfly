@@ -122,6 +122,18 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         };
         return gib * 1024 * 1024 * 1024;
     }
+    if (unit == .api_kernel and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and profile.host.abi == .gnu and
+        target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
+        target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
+        profile.optimize == .fast and profile.strip and profile.cpu_inference and !profile.sanitize_thread)
+    {
+        // Better Auth run 40820082669: Nix/glibc LLVM API peaked at
+        // 6,698,409,984 bytes against the old 5 GiB claim, forcing a retry.
+        // 8 GiB retains >=25% headroom and overlaps storage within 20 GiB.
+        return 8 * 1024 * 1024 * 1024;
+    }
     if (profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
@@ -752,4 +764,23 @@ test "native Linux CAPI test reservation covers the measured compiler without co
     try std.testing.expect(claim >= peak + peak / 10);
     try std.testing.expect(claim + 2 * 1024 * 1024 * 1024 <= 20 * 1024 * 1024 * 1024);
     try std.testing.expectEqual(@as(usize, 7 * 1024 * 1024 * 1024), testCompileMaxRss(test_owner_names.capi_contract, linux, linux, .fast, 7 * 1024 * 1024 * 1024));
+}
+
+test "native Linux LLVM fast API covers measured peak and preserves overlap" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
+    const gib = 1024 * 1024 * 1024;
+    var profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
+    const peak: usize = 6_698_409_984;
+    const claim = runtimeCompileMaxRss(.api_kernel, profile);
+    try std.testing.expectEqual(8 * gib, claim);
+    try std.testing.expect(claim >= peak + peak / 4);
+    try std.testing.expect(claim + runtimeCompileMaxRss(.storage_kernel, profile) + 2 * gib <= 20 * gib);
+    profile.optimize = .safe;
+    try std.testing.expectEqual(7 * gib, runtimeCompileMaxRss(.api_kernel, profile));
+    profile.optimize = .fast;
+    profile.strip = false;
+    try std.testing.expect(runtimeCompileMaxRss(.api_kernel, profile) > claim);
+    profile.strip = true;
+    profile.sanitize_thread = true;
+    try std.testing.expect(runtimeCompileMaxRss(.api_kernel, profile) > claim);
 }

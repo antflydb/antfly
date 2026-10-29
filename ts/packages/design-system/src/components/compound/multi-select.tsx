@@ -1,7 +1,7 @@
 "use client";
 
+import { Check, ChevronDown } from "lucide-react";
 import * as React from "react";
-import { ChevronDown } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -158,14 +158,18 @@ function MultiSelectItem({
       data-slot="multi-select-item"
       value={value}
       onSelect={() => toggle(value)}
-      className={cn("flex items-center gap-2.5", className)}
+      className={cn("flex items-center gap-2", className)}
       {...props}
     >
-      <span
-        aria-hidden
-        className={cn("size-1.5 shrink-0", isSelected ? "bg-primary" : "bg-transparent")}
-      />
       <span className="flex-1 truncate">{children}</span>
+      <Check
+        aria-hidden
+        className={cn(
+          "size-3.5 shrink-0 text-foreground",
+          isSelected ? "opacity-100" : "opacity-0"
+        )}
+        strokeWidth={2.5}
+      />
     </CommandItem>
   );
 }

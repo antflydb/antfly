@@ -889,7 +889,7 @@ test "capi lite AddIndexJSON registers a graph config's nested resolvers" {
     // JSON (metadata_table_provisioner.ensureResolvers); a native Lite
     // handle admits one index at a time, so registerLiteIndexResolvers
     // harvests the graph config's own "resolvers" array — the shape
-    // examples/dogfood's knowledgeGraphIndexJSON declares. Re-adding the
+    // examples/antfly-docs-knowledge-base's knowledgeGraphIndexJSON declares. Re-adding the
     // same index must be idempotent (upsertResolver observes an unchanged
     // config), matching the enrichment path's contract.
     var test_tmp = try TestDirectory.init("capi");

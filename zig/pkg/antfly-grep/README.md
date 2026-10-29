@@ -219,7 +219,7 @@ antfly-grep ask 'Where are permissions checked?' --threshold 0.7 --json .
 antfly-grep cache clear
 ```
 
-The default HTTP backend uses the public [decision contract](../../../docs/guides/decisions.md).
+The default HTTP backend uses the public [decision contract](../../../docs/reference/decisions.md).
 `--endpoint` accepts the full decision URL; `--base-url` appends `/decisions`.
 `ANTFLY_GREP_TOKEN` supplies the bearer token. `--timeout-ms` bounds requests.
 Redirects and cookies are disabled. Malformed, duplicate, missing, out-of-range,

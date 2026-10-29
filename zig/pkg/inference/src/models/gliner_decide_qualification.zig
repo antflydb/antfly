@@ -188,6 +188,7 @@ pub const RequestLimits = struct {
 };
 pub const cuda_batch_items: usize = 8;
 const legacy_cuda_limits = RequestLimits{ .request_items = cuda_batch_items, .prepared_sequences = cuda_batch_items, .sequence_tokens = 512 };
+pub const metal_batch_items: usize = 8;
 
 /// The two immutable precision variants share the measured request geometry.
 /// Their numerical and serving evidence remain independently captured.
@@ -204,8 +205,9 @@ pub fn supportsSpanExtraction(identity: Identity) bool {
 
 pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize, sequences: usize, tokens: usize) !void {
     const variant = try require(identity);
-    // Retain the established native/Metal legacy envelope. Newly qualified
-    // CUDA serving has <=8 items, each with one <=512-token sequence.
+    // Native and Metal retain the existing request envelope. Metal's physical
+    // batches are bounded independently; larger requests use multiple forwards.
+    // The processor still enforces per-sequence and per-item split limits.
     if (variant == .decide_deberta and backend != .cuda) return;
     if (variant == .decide_deberta_q8) {
         if (backend != .cuda) return error.UnsupportedGlinerDecisionBackend;
@@ -359,4 +361,17 @@ test "GLiNER Decide CUDA legacy geometry stays bounded without changing native p
     try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 1, 513));
     try requireRequestIdentity(identity, .native, 2, 2, 512);
     try requireRequestIdentity(identity, .metal, 2, 2, 512);
+}
+
+test "GLiNER Decide Metal FP32 batching preserves split tasks and rejects Q8" {
+    const identity = legacyIdentity();
+    // Eight is a physical forward limit, not a replacement for the established
+    // public request cardinality and serial split-task envelope.
+    for ([_]usize{ 1, 2, 4, 8, 9, 17, 128 }) |n| try requireRequestIdentity(identity, .metal, n, n, 512);
+    try requireRequestIdentity(identity, .metal, 8, 64, 512);
+    var q8 = identity;
+    q8.weight = digestFromPin(legacy_q8_encoder);
+    q8.weight_companion = digestFromPin(legacy_q8_head);
+    q8.inventory.all_f32 = false;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequestIdentity(q8, .metal, 2, 2, 64));
 }

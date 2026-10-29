@@ -832,6 +832,23 @@ python3 tools/run_bounded_zig_build.py build capi-test -Dembedded-only=true \
 
 ## Query keys, aliases, and migration (Lite native)
 
+| Need | Supported path |
+| --- | --- |
+| Render canonical query seeds | `render_resolver_key_json`, using the durable template and aliases |
+| Extract and resolve ad-hoc text | `resolve_query_json`, including the configured extractor, ANN candidates and scorer |
+| Preserve Unicode marks | `uslug` retains attached combining marks; use the render API for exact canonical bytes |
+| Configure embedding merging | [Embedding merge recipe](#embedding-merge-recipe-and-ordering), tested through `add_index_json` |
+| Alias keys without entity promotion | Inline resolver `aliases` with `promote: false` |
+| Merge keys after ingestion | `merge_resolver_keys_json`, followed by a root drain to replace resolver-owned edges |
+| Establish ANN visibility | Successful root `run_until_idle`; submit later ingestion after the drain returns |
+| Compare descriptions/configs | [Extraction comparison](#comparing-extraction-configs), with per-label counts and labelled exact-span metrics |
+| fp16-encoder descriptions | Windowed descriptions are unsupported and not planned; use the qualified FP32 base or multi-Decide bundle |
+
+A root drain does not guarantee that later mentions in the same ingestion batch
+see newly promoted embeddings. Drain between incremental ingestion units, or
+merge duplicate minted keys explicitly afterward.
+
+
 Use `antfly_db_render_resolver_key_json(db, resolver_name, mention_json, &out)`
 with `{"text":"Qwen3","label":"concept"}`. It reads the durable resolver,
 executes its exact key template (including Unicode 16 NFKC/case folding and

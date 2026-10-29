@@ -29,8 +29,9 @@ import {
   DialogHeader,
   DialogTitle,
   DialogTrigger,
+  Field,
+  FieldLabel,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -294,8 +295,8 @@ export function UsersPage() {
                       <p className="text-sm">{passwordChangeError}</p>
                     </Alert>
                   )}
-                  <div className="space-y-2">
-                    <Label htmlFor="new-password-value">New Password</Label>
+                  <Field className="gap-2">
+                    <FieldLabel htmlFor="new-password-value">New Password</FieldLabel>
                     <Input
                       id="new-password-value"
                       type="password"
@@ -303,7 +304,7 @@ export function UsersPage() {
                       onChange={(e) => setNewPasswordValue(e.target.value)}
                       placeholder="Enter new password"
                     />
-                  </div>
+                  </Field>
                 </div>
                 <DialogFooter>
                   <Button
@@ -351,7 +352,7 @@ export function UsersPage() {
     <DashboardPage>
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">User Management</DashboardPageTitle>
+          <DashboardPageTitle>User Management</DashboardPageTitle>
           <DashboardPageDescription>Manage users and their permissions.</DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -375,17 +376,17 @@ export function UsersPage() {
                     <p className="text-sm">{createError}</p>
                   </Alert>
                 )}
-                <div className="space-y-2">
-                  <Label htmlFor="new-username">Username</Label>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="new-username">Username</FieldLabel>
                   <Input
                     id="new-username"
                     value={newUsername}
                     onChange={(e) => setNewUsername(e.target.value)}
                     placeholder="Enter username"
                   />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="new-password">Password</Label>
+                </Field>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="new-password">Password</FieldLabel>
                   <Input
                     id="new-password"
                     type="password"
@@ -393,7 +394,7 @@ export function UsersPage() {
                     onChange={(e) => setNewPassword(e.target.value)}
                     placeholder="Enter password"
                   />
-                </div>
+                </Field>
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setCreateDialogOpen(false)}>
@@ -470,17 +471,17 @@ export function UsersPage() {
                       </DialogDescription>
                     </DialogHeader>
                     <div className="space-y-4">
-                      <div className="space-y-2">
-                        <Label htmlFor="perm-resource">Resource</Label>
+                      <Field className="gap-2">
+                        <FieldLabel htmlFor="perm-resource">Resource</FieldLabel>
                         <Input
                           id="perm-resource"
                           value={newPermResource}
                           onChange={(e) => setNewPermResource(e.target.value)}
                           placeholder='e.g., "table_name" or "*" for all'
                         />
-                      </div>
-                      <div className="space-y-2">
-                        <Label htmlFor="perm-resource-type">Resource Type</Label>
+                      </Field>
+                      <Field className="gap-2">
+                        <FieldLabel htmlFor="perm-resource-type">Resource Type</FieldLabel>
                         <Select
                           value={newPermResourceType}
                           onValueChange={(value) =>
@@ -497,9 +498,9 @@ export function UsersPage() {
                             <SelectItem value="*">All (*)</SelectItem>
                           </SelectContent>
                         </Select>
-                      </div>
-                      <div className="space-y-2">
-                        <Label htmlFor="perm-type">Permission Type</Label>
+                      </Field>
+                      <Field className="gap-2">
+                        <FieldLabel htmlFor="perm-type">Permission Type</FieldLabel>
                         <Select
                           value={newPermType}
                           onValueChange={(value) =>
@@ -516,7 +517,7 @@ export function UsersPage() {
                             <SelectItem value="admin">Admin</SelectItem>
                           </SelectContent>
                         </Select>
-                      </div>
+                      </Field>
                     </div>
                     <DialogFooter>
                       <Button variant="outline" onClick={() => setAddPermDialogOpen(false)}>
@@ -534,7 +535,7 @@ export function UsersPage() {
                     {permissions.map((perm) => (
                       <div
                         key={`${perm.type}-${perm.resource_type}-${perm.resource}`}
-                        className="flex items-center justify-between rounded-none border p-3"
+                        className="flex items-center justify-between rounded-lg border p-3"
                       >
                         <div className="space-y-1">
                           <div className="flex items-center gap-2">

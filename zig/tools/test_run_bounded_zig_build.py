@@ -36,6 +36,36 @@ SPEC.loader.exec_module(launcher)
 
 
 class BoundedZigBuildTest(unittest.TestCase):
+    def test_measured_build_persists_progress_and_failure_accounting(self):
+        import json
+        import check_storage_compilation as measurement
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "reports/build.json"
+
+            def measured(command, cwd, *, timeout_seconds, progress):
+                self.assertEqual(command, ["zig", "build"])
+                self.assertEqual(timeout_seconds, 7200)
+                progress(
+                    {
+                        "active_processes": [{"artifact": "antfly-runtime-api_kernel"}],
+                        "wall_seconds": 30,
+                    }
+                )
+                self.assertEqual(json.loads(report.read_text())[0]["status"], "running")
+                return 3, "compiler failed\n", {"wall_seconds": 31, "cpu_seconds": 29}
+
+            with (
+                mock.patch.object(measurement, "measured_build", side_effect=measured),
+                mock.patch("sys.stdout", new=io.StringIO()) as output,
+            ):
+                self.assertEqual(launcher.execute_build(["zig", "build"], report), 3)
+                self.assertIn("compiler failed", output.getvalue())
+            final = json.loads(report.read_text())[0]
+            self.assertEqual(final["status"], "failed")
+            self.assertEqual(final["returncode"], 3)
+            self.assertEqual(final["cpu_seconds"], 29)
+
     def test_unit_inventory_failure_never_launches_the_unit_build(self):
         monitor = SCRIPT.parents[2] / "scripts/ci/run-zig-unit-tests.sh"
         with tempfile.TemporaryDirectory() as temporary:

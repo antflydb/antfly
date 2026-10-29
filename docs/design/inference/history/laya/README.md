@@ -1,5 +1,6 @@
 # Laya implementation history
 
+- [Validation, resident Metal, and training measurements (2026-10-12)](2026-10-12-validation-and-measurements.md)
 - [Tree packing](2026-09-24-tree-packing.md)
 - [Packed accuracy qualification (step 0)](2026-09-24-packed-accuracy-qualification.md)
 - [Multi-row segment attention](2026-09-25-multi-row-segment-attention.md)

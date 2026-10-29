@@ -2,4 +2,3 @@
 # Package roots are declared in scripts/source_license_roots.json; server sources have no exceptions.
 zig/build_memory_profile_test.zig
 zig/embedded.build.zig
-zig/pdf_standard_fonts.zig

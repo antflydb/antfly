@@ -24,34 +24,33 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class SdkCiContractTests(unittest.TestCase):
-    def test_auth_native_build_has_complete_bounded_bootstrap(self) -> None:
+    def test_auth_consumes_shared_e2e_artifacts_without_a_native_build(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/better-auth-compatibility.yml"
         ).read_text()
-        native = workflow.split("  native:\n", 1)[1].split("  compatibility:\n", 1)[0]
-        self.assertIn("submodules: true", native)
-        self.assertIn("id-token: write", native)
-        tools = native.index("- name: Install native build tools")
-        compiler = native.index("- name: Install glibc-linked Zig")
-        sources = native.index("- name: Prepare verified Zig source dependencies")
-        build = native.index("- name: Build native test artifacts")
-        self.assertLess(tools, native.index("- name: Install Nix"))
-        self.assertLess(tools, compiler)
-        self.assertLess(compiler, sources)
-        self.assertLess(sources, build)
-        self.assertIn("xz-utils", native[tools:compiler])
-        self.assertIn("Install uv", native[:build])
-        self.assertIn("steps.toolchain.outputs.zig_nixpkgs_revision", native)
-        self.assertIn("grep -q 'dynamically linked'", native)
-        self.assertIn("tools/run_bounded_zig_build.py", native)
-        self.assertIn("-Dstrip=true -Dcpu=baseline", native)
-        self.assertIn("-j2", native)
-        self.assertNotIn("--maxrss", native)
-        self.assertIn("/mnt/cache/antfly/zig/", native)
-        self.assertIn('run: rm -rf -- "$ZIG_LOCAL_CACHE_DIR"', native)
+        self.assertNotIn("  native:", workflow)
+        self.assertNotIn("nix-build", workflow)
+        self.assertNotIn("run_bounded_zig_build", workflow)
+        self.assertNotIn("  schedule:", workflow)
+        self.assertIn(
+            "libantfly-e2e-${{ inputs.artifact_suite }}-${{ github.run_id }}", workflow
+        )
+        self.assertIn(
+            "antfly-e2e-${{ inputs.artifact_suite }}-${{ github.run_id }}", workflow
+        )
+        self.assertIn("ref: ${{ inputs.head_sha || github.sha }}", workflow)
+        self.assertIn("test:integration", workflow)
+        self.assertIn("test:remote", workflow)
+        self.assertIn("package-consumer.mjs", workflow)
+        self.assertIn("Test persistent container recipe", workflow)
+        zig = (REPO_ROOT / ".github/workflows/zig-tests.yml").read_text()
+        self.assertIn("uses: ./.github/workflows/better-auth-compatibility.yml", zig)
+        self.assertEqual(zig.count('test "$BETTER_AUTH_RESULT" = "success"'), 2)
         caller = (REPO_ROOT / ".github/workflows/ts-npm-publish.yml").read_text()
         auth = caller.split("  auth-checks:\n", 1)[1].split("  publish:\n", 1)[0]
-        self.assertIn("id-token: write", auth)
+        self.assertIn("verify_auth_e2e.py", auth)
+        self.assertIn("actions: read", auth)
+        self.assertNotIn("id-token: write", auth)
 
     def test_zig_consumers_have_one_matching_compiler_for_every_scope(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/sdks-ci.yml").read_text()

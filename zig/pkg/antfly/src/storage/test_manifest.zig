@@ -22,10 +22,10 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_db_field_projection_source;
+    _ = @import("antfly_local_sources").storage_source_value_identity;
     _ = @import("antfly_local_sources").storage_engine;
     _ = @import("antfly_local_sources").storage_logical_source;
-    _ = @import("antfly_local_sources").storage_conditional_source;
-    _ = @import("antfly_local_sources").storage_source_proof_registry;
     _ = @import("antfly_local_sources").storage_document_projection;
     _ = @import("antfly_local_sources").storage_db_artifact_graph_completion;
     _ = @import("antfly_local_sources").storage_db_artifact_input_test;

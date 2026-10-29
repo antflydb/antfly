@@ -7,6 +7,9 @@ WORKDIR /app
 COPY examples/hackernews/requirements-producer.txt /app/requirements.txt
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 COPY py/packages/embedded/src/antfly_embedded /app/antfly_embedded
+COPY examples/hackernews/runtime.json /app/runtime.json
+COPY qualification-linux/${TARGETARCH}/hn-runtime.json /app/hn-runtime.json
+RUN python3 -c 'import json,sys; pin=json.load(open("runtime.json")); receipt=json.load(open("hn-runtime.json")); assert receipt["version"] == pin["version"] and receipt["source_commit"] == pin["source_commit"] and receipt["architecture"] == sys.argv[1] and receipt["asset"] == pin["libraries"][sys.argv[1]], "Producer library receipt does not match the pinned runtime"' "${TARGETARCH}"
 COPY qualification-linux/${TARGETARCH}/lib /app/lib
 COPY qualification-linux/${TARGETARCH}/LICENSE qualification-linux/${TARGETARCH}/LICENSING.md qualification-linux/${TARGETARCH}/THIRD_PARTY_NOTICES.md /app/
 COPY qualification-linux/${TARGETARCH}/LICENSES /app/LICENSES

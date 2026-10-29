@@ -52,7 +52,7 @@ ENTRYPOINTS = (
 PACKAGE_ENTRYPOINTS = (
     "zig/pkg/antfly-embedded/src/root.zig",
     "zig/pkg/antfly-embedded/src/engine/root.zig",
-    "zig/examples/antfly_wasm.zig",
+    "zig/pkg/antfly-embedded/src/wasm_root.zig",
     "zig/pkg/inference/src/main.zig",
     "zig/pkg/inference/src/wasm_entry_wasm32.zig",
     "zig/pkg/inference/src/wasm_entry_wasm64.zig",
@@ -338,7 +338,7 @@ SOURCE_MODULES = {
     "openai_api": (
         "zig/pkg/antfly-embedded/src/openapi/generated/openai_api/root.zig",
     ),
-    "pdf_standard_fonts": ("zig/pdf_standard_fonts.zig",),
+    "pdf_standard_fonts": ("zig/lib/pdf/src/agl_lookup.zig",),
     "pjrt": ("zig/lib/pjrt/src/root.zig",),
     "prometheus": ("zig/lib/prometheus/src/root.zig",),
     "protobuf": ("zig/lib/protobuf/src/root.zig",),

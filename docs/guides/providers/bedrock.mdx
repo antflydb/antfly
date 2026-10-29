@@ -1,0 +1,47 @@
+---
+title: AWS Bedrock
+description: Bedrock embeddings and Converse generation in Antfly
+---
+
+The `bedrock` provider calls Amazon Bedrock in your AWS account.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Embedder | Text, images | Images need an image-capable request format: `titan_multimodal` or `cohere_v4` |
+| Generator | Text, images | Converse API, with streaming and structured output |
+
+Embedding `request_format` is one of `titan_text`, `titan_multimodal`,
+`cohere_v3`, or `cohere_v4`; `auto` selects it from the model ID. Cohere formats
+accept retrieval input types. Generation images can be PNG, JPEG, GIF, or WebP,
+in user messages only. `model` may be a model ID or an inference profile ARN.
+
+## Credentials
+
+The standard AWS credential chain: `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), a profile in
+`~/.aws/credentials` selected by `AWS_PROFILE`, web identity, or the container or
+instance role. `region` defaults to `AWS_REGION`, then
+`AWS_DEFAULT_REGION`, then `us-east-1`.
+
+## Example
+
+```json
+{
+  "embedders": {
+    "titan-images": {
+      "provider": "bedrock",
+      "model": "amazon.titan-embed-image-v1",
+      "request_format": "titan_multimodal",
+      "region": "us-east-1",
+      "inputs": ["text", "image"]
+    }
+  }
+}
+```
+
+## Related
+
+- [Multimodal Embeddings](/docs/guides/multimodal)
+- [Provider rate limits](/docs/guides/provider-rate-limits)
