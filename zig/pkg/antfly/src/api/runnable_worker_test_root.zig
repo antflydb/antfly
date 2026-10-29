@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Real scheduler capsules, production phase helpers, and actual worker pipes.
 const std = @import("std");
@@ -443,4 +455,191 @@ test "inference worker physical handoff carries API ownership through checked st
             try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
         }
     }
+}
+
+test "inference worker physical handoff independently funds shared model loader waits" {
+    const loads = @import("inference_worker_load_execution");
+    const wire = @import("inference_worker_wire");
+    const broker = @import("inference_runnable_execution").microbatch;
+    const Child = loads.ChildFor(controls, broker, @import("inference_linalg").pool);
+    const Clock = struct {
+        fn now() u64 {
+            return 0;
+        }
+    };
+    const Parent = struct {
+        ledger: loads.Parent = .{},
+        owner: runtime.runnable_abi.Owner,
+        closed: std.atomic.Value(bool) = .init(false),
+        fn request(raw: *anyopaque, bytes: []const u8) !rpc.ResourceReply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var scratch: [8 * rpc.max_resource_bytes]u8 = undefined;
+            var arena = std.heap.FixedBufferAllocator.init(&scratch);
+            const incoming = try std.json.parseFromSliceLeaky(wire.ResourceRequest, arena.allocator(), bytes, .{});
+            const value = try std.json.parseFromSliceLeaky(wire.LoadExecution, arena.allocator(), incoming.data, .{});
+            const result = self.ledger.operate(std.testing.allocator, std.testing.io, self.owner, &self.closed, incoming.operation, value) catch |err| {
+                const status = runtime.error_abi.statusFromError(err);
+                return .{ .code = status.code, .detail = status.detail };
+            };
+            return .{ .value = result };
+        }
+    };
+    const Job = struct {
+        child: *Child,
+        complete: std.Io.Event = .unset,
+        canceled: std.atomic.Value(bool) = .init(false),
+        acquired: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled.load(.acquire)) return error.Canceled;
+        }
+        fn perform(self: *@This()) !void {
+            var value: usize = 1;
+            var result: broker.ResultSlot = .{ .output = &value };
+            const items = [_]broker.ExecuteItem{.{ .allocator = std.testing.allocator, .identity = .{}, .payload = &value, .slot = &result, .control = .{ .cancellation = broker.Cancellation.fromAtomic(&self.canceled) } }};
+            const admission = self.child.admission();
+            const handle = try admission.begin(admission.context, std.testing.io, .{ .model = "load", .task = .read, .resource_class = .cpu }, 256, .{ .items = &items });
+            defer admission.finish(admission.context, handle);
+            self.acquired.store(true, .release);
+            try (controls.InferenceExecutionControl{ .ptr = self, .check_fn = check }).waitForLoad(std.testing.io, &self.complete, true);
+            try admission.checkpoint.?(admission.context, handle);
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.perform() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    const io = std.testing.io;
+    const Mode = enum { success, cancel_wait, cancel_return };
+    for (std.enums.values(Mode)) |mode| {
+        const cancel = mode != .success;
+        var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Clock.now };
+        defer state.owner.tryDeinit() catch @panic("loader owner leaked");
+        const owner = state.port();
+        const borrow = runtime.native_abi.IoBorrow.init(&io);
+        var parents: [2]?*anyopaque = @splat(null);
+        defer for (parents) |parent| if (parent) |handle| owner.finish(handle);
+        for (&parents) |*parent| {
+            const status = owner.start(owner.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .out_handle = parent });
+            try std.testing.expect(status.isOk());
+            try std.testing.expect(owner.park(parent.*.?, @backingInt(runtime.runnable_abi.Wait.resource)).isOk());
+        }
+        var parent: Parent = .{ .owner = owner };
+        defer parent.ledger.retireAfterJoin(io, std.testing.allocator);
+        var pair: rpc.TestPair = undefined;
+        try pair.initUnstarted();
+        defer pair.deinit();
+        pair.parent.context = &parent;
+        pair.parent.resource_handler = Parent.request;
+        try pair.parent.start();
+        try pair.child.start();
+        var child: Child = .{ .endpoint = &pair.child };
+        var job: Job = .{ .child = &child };
+        var future = try io.concurrent(Job.run, .{&job});
+        defer future.cancel(io);
+        defer job.complete.set(io);
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+        while (!job.acquired.load(.acquire) or state.owner.scheduler.stats().resource_blocked != 3) {
+            if (job.done.load(.acquire)) return job.failure orelse error.LoaderDidNotPark;
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.LoaderDidNotPark;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 3), state.owner.scheduler.stats().operations);
+        var query: ?*anyopaque = null;
+        try std.testing.expect(owner.start(owner.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .slots = if (mode == .cancel_return) 2 else 1, .out_handle = &query }).isOk());
+        defer owner.finish(query.?);
+        var control: ?*anyopaque = null;
+        try std.testing.expect(owner.start(owner.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.control), .out_handle = &control }).isOk());
+        owner.finish(control.?);
+        // One departing caller cannot own the shared loader's lifetime.
+        owner.finish(parents[0].?);
+        parents[0] = null;
+        try std.testing.expect(!job.done.load(.acquire));
+        if (mode == .cancel_return) {
+            job.complete.set(io);
+            while (state.owner.scheduler.stats().queued == 0) {
+                if (job.done.load(.acquire)) return job.failure orelse error.LoaderReturnDidNotQueue;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.LoaderReturnDidNotQueue;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(parent.ledger.mutex.tryLock());
+            parent.ledger.mutex.unlock(io);
+        }
+        if (cancel) job.canceled.store(true, .release) else job.complete.set(io);
+        while (!job.done.load(.acquire)) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.LoaderDidNotRetire;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        future.await(io);
+        if (cancel) try std.testing.expectEqual(error.Canceled, job.failure.?) else if (job.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 2), state.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), parent.ledger.handles.count());
+    }
+}
+
+test "inference worker physical handoff retains queued loader callback through joined retirement" {
+    const loads = @import("inference_worker_load_execution");
+    const wire = @import("inference_worker_wire");
+    const Clock = struct {
+        fn now() u64 {
+            return 0;
+        }
+    };
+    const Job = struct {
+        ledger: *loads.Parent,
+        owner: runtime.runnable_abi.Owner,
+        closed: *std.atomic.Value(bool),
+        key: u64,
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            _ = self.ledger.operate(std.testing.allocator, std.testing.io, self.owner, self.closed, .execution_enter, .{ .key = self.key }) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    _ = wire;
+    const io = std.testing.io;
+    var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_wait_ms = 5000 }), .native_now_ns = Clock.now };
+    defer state.owner.tryDeinit() catch @panic("joined loader owner leaked");
+    const owner = state.port();
+    var ledger: loads.Parent = .{};
+    defer ledger.retireAfterJoin(io, std.testing.allocator);
+    var closed: std.atomic.Value(bool) = .init(false);
+    const key = try ledger.operate(std.testing.allocator, io, owner, &closed, .execution_start, .{ .retained_bytes = 256 });
+    _ = try ledger.operate(std.testing.allocator, io, owner, &closed, .execution_park, .{ .key = key });
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var query: ?*anyopaque = null;
+    try std.testing.expect(owner.start(owner.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .slots = 2, .out_handle = &query }).isOk());
+    defer owner.finish(query.?);
+    var job: Job = .{ .ledger = &ledger, .owner = owner, .closed = &closed, .key = key };
+    var future = try io.concurrent(Job.run, .{&job});
+    defer future.cancel(io);
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (state.owner.scheduler.stats().queued == 0) {
+        if (job.done.load(.acquire)) return job.failure orelse error.LoaderReturnDidNotQueue;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.LoaderReturnDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(ledger.mutex.tryLock());
+    ledger.mutex.unlock(io);
+    // The closed/reaped generation drops registry ownership while its queued
+    // callback still owns a pin. Its grant cannot be freed under that callback.
+    closed.store(true, .release);
+    ledger.retireAfterJoin(io, std.testing.allocator);
+    while (!job.done.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.JoinedLoaderCallbackDidNotRetire;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    future.await(io);
+    try std.testing.expectEqual(error.Canceled, job.failure.?);
+    try std.testing.expectEqual(@as(usize, 0), ledger.handles.count());
+    try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 2), state.owner.scheduler.stats().runnable_slots);
 }

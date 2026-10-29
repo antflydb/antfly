@@ -922,6 +922,14 @@ pub const Endpoint = struct {
     }
 
     pub fn callResource(self: *Endpoint, payload: []const u8) !ResourceReply {
+        return (try self.callResourceWithControl(payload, .{}, .{})).reply;
+    }
+
+    pub const ControlledResourceReply = struct { reply: ResourceReply, refusal: ?anyerror = null };
+
+    /// Refusal cannot abandon an uncertain resource mutation. Notify its owner
+    /// once, then retain pending storage until the original reply is joined.
+    pub fn callResourceWithControl(self: *Endpoint, payload: []const u8, control: EventControl, on_refusal: EventControl) !ControlledResourceReply {
         // Every failure here is a transport failure, not a budget denial.
         errdefer self.fail();
         if (payload.len == 0 or payload.len > max_resource_bytes) return error.InvalidResourceFrame;
@@ -946,10 +954,17 @@ pub const Endpoint = struct {
             self.mutex.unlock(self.io);
         }
         try self.sendFrame(.resource_request, pending.id, payload);
-        try pending.ready.wait(self.io);
+        var refusal: ?anyerror = null;
+        while (!pending.ready.isSet()) {
+            if (refusal == null) control.check() catch |err| {
+                refusal = err;
+                try on_refusal.check();
+            };
+            try self.waitTick(&pending.ready);
+        }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return pending.reply orelse error.InferenceWorkerUnavailable;
+        return .{ .reply = pending.reply orelse return error.InferenceWorkerUnavailable, .refusal = refusal };
     }
 
     fn handleResource(self: *Endpoint, task: *ResourceTask, slot: usize) std.Io.Cancelable!void {

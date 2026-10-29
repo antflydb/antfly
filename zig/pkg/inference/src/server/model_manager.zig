@@ -22,6 +22,7 @@ const std = @import("std");
 const lightonocr3_reader = @import("../readers/lightonocr3.zig");
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const load_execution = @import("executor_microbatch.zig");
 const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -3845,6 +3846,7 @@ const LoadFlight = struct {
     runtime_id: RuntimeId = 0,
     model_dir: ?[]u8 = null,
     completed: std.Io.Event = .unset,
+    execution_admission_configured: bool = false,
     io: std.Io,
     hard_cancellation: ?execution_control_mod.HardCancellationBoundary = null,
     native_call_policy: execution_control_mod.NativeCallPolicy = .require_supervision,
@@ -3913,6 +3915,11 @@ const LoadFlightControl = struct {
             return error.Cancelled;
     }
 
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        return self.flight.waiters.load(.acquire) == LoadFlight.abandoned;
+    }
+
     fn control(self: *@This()) InferenceExecutionControl {
         return .{
             .io = self.flight.io,
@@ -3921,6 +3928,34 @@ const LoadFlightControl = struct {
             .hard_cancellation = self.flight.hard_cancellation,
             .native_call_policy = self.flight.native_call_policy,
         };
+    }
+};
+
+/// Stable on the loader's worker stack through physical completion. It owns
+/// an independent shared-node CPU grant; no request-owned borrow is captured.
+const LoadExecution = struct {
+    admission: ?load_execution.ExecutionAdmission = null,
+    handle: ?*anyopaque = null,
+    control: LoadFlightControl = undefined,
+    output: u8 = 0,
+    result: load_execution.ResultSlot = undefined,
+    items: [1]load_execution.ExecuteItem = undefined,
+
+    fn start(self: *@This(), manager: *ModelManager, flight: *LoadFlight, bytes: usize) !void {
+        const admission = manager.load_execution_admission orelse return;
+        self.control = .{ .flight = flight };
+        self.result = .{ .output = &self.output };
+        self.items[0] = .{ .allocator = manager.allocator, .identity = .{}, .payload = self, .slot = &self.result, .control = .{ .cancellation = .{ .ptr = &self.control, .is_cancelled_fn = LoadFlightControl.canceled } } };
+        self.handle = try admission.begin(admission.context, flight.io, .{ .model = "model-load", .task = .read, .resource_class = .cpu }, bytes, .{ .items = &self.items });
+        self.admission = admission;
+    }
+    fn check(self: *@This()) !void {
+        if (self.admission) |admission| if (admission.checkpoint) |checkpoint| try checkpoint(admission.context, self.handle.?);
+    }
+    fn finish(self: *@This()) void {
+        if (self.admission) |admission| admission.finish(admission.context, self.handle.?);
+        self.admission = null;
+        self.handle = null;
     }
 };
 
@@ -4078,6 +4113,7 @@ const CompositeAssetsLoadFlight = struct {
     kind: CompositeKind = .whisper_metadata,
     model_type: manifest_mod.ModelType = .transcriber,
     completed: std.Io.Event = .unset,
+    execution_admission_configured: bool = false,
     io: std.Io,
     assets: ?*CompositeAssets = null,
     err: ?anyerror = null,
@@ -4976,6 +5012,8 @@ pub const ModelManager = struct {
         assets: *CompositeAssets,
     };
 
+    /// Installed before serving; the host retains it until all load tasks join.
+    load_execution_admission: ?load_execution.ExecutionAdmission = null,
     allocator: std.mem.Allocator,
     /// Stable admitted allocator owned by the host/child through model teardown.
     /// Cache pool buffers retain its physical credit across eviction and reuse.
@@ -7476,15 +7514,7 @@ pub const ModelManager = struct {
     ) !CompositeAssetsHandle {
         defer self.releaseCompositeAssetsLoadFlight(flight_key, flight);
         defer flight.load_state.releaseWaiter(!flight.completed.isSet());
-        while (!flight.completed.isSet()) {
-            if (control) |active| try active.update(.loading_model, 0, 1);
-            flight.completed.waitTimeout(flight.io, .{
-                .duration = .{ .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms), .clock = .awake },
-            }) catch |err| switch (err) {
-                error.Timeout => continue,
-                else => return err,
-            };
-        }
+        try (control orelse InferenceExecutionControl{}).waitForLoad(flight.io, &flight.completed, flight.execution_admission_configured);
         if (control) |active| try active.check();
         const assets = flight.assets;
         const maybe_err = flight.err;
@@ -7505,8 +7535,20 @@ pub const ModelManager = struct {
         defer task.deinit();
         const manager = task.manager;
         defer manager.releaseCompositeAssetsLoadFlight(task.key, task.flight);
+        var execution: LoadExecution = .{};
+        execution.start(manager, &task.flight.load_state, @sizeOf(CompositeLoadTask)) catch |err| {
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
+            return;
+        };
+        defer execution.finish();
         var active = LoadFlightControl{ .flight = &task.flight.load_state };
         const assets = manager.loadCompositeAssetsUncached(task.model_dir, task.paths, task.preferred_backends, task.key, task.flight.runtime_id, task.flight.model_type, task.kind, active.control()) catch |err| {
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
+            return;
+        };
+        execution.check() catch |err| {
+            assets.deinit();
+            manager.allocator.destroy(assets);
             manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
             return;
         };
@@ -7978,6 +8020,7 @@ pub const ModelManager = struct {
             .kind = kind,
             .model_type = model_type,
             .io = coordination_io,
+            .execution_admission_configured = self.load_execution_admission != null,
             .refs = 2,
             .load_state = .{
                 .io = coordination_io,
@@ -7997,7 +8040,7 @@ pub const ModelManager = struct {
             return err;
         };
         self.unlockLoadedModels();
-        if (control != null) {
+        if (control != null or self.load_execution_admission != null) {
             self.load_group.concurrent(coordination_io, runCompositeLoadTask, .{task}) catch |err| {
                 self.finishCompositeAssetsLoadFlight(flight, null, err);
                 task.deinit();
@@ -8318,6 +8361,12 @@ pub const ModelManager = struct {
         const manager = task.manager;
         defer manager.releaseLoadFlight(task.flight_key, task.flight);
 
+        var execution: LoadExecution = .{};
+        execution.start(manager, task.flight, @sizeOf(LoadTask)) catch |err| {
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        defer execution.finish();
         var load_control = LoadFlightControl{ .flight = task.flight };
         var handle = manager.loadFromDirUncached(
             task.model_dir,
@@ -8327,6 +8376,11 @@ pub const ModelManager = struct {
             task.flight.runtime_id,
             load_control.control(),
         ) catch |err| {
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        execution.check() catch |err| {
+            handle.retire();
             manager.finishLoadFlight(task.flight, null, err);
             return;
         };
@@ -8382,18 +8436,7 @@ pub const ModelManager = struct {
             var result = self.consumeLoadFlightWaiter(flight_key, flight, .abandon);
             result.handle.release();
         };
-        while (!flight.completed.isSet()) {
-            if (control) |active| try active.update(.loading_model, 0, 1);
-            flight.completed.waitTimeout(flight.io, .{
-                .duration = .{
-                    .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms),
-                    .clock = .awake,
-                },
-            }) catch |err| switch (err) {
-                error.Timeout => continue,
-                else => return err,
-            };
-        }
+        try (control orelse InferenceExecutionControl{}).waitForLoad(flight.io, &flight.completed, flight.execution_admission_configured);
         var result = self.consumeLoadFlightWaiter(flight_key, flight, .adopt);
         waiter_consumed = true;
         errdefer result.handle.release();
@@ -8562,6 +8605,7 @@ pub const ModelManager = struct {
             .runtime_id = self.nextRuntimeIdLocked(),
             .model_dir = flight_model_dir,
             .io = coordination_io,
+            .execution_admission_configured = self.load_execution_admission != null,
             .hard_cancellation = hard_cancellation,
             .native_call_policy = self.session_manager.native_call_policy,
         };
@@ -8629,7 +8673,7 @@ pub const ModelManager = struct {
             return err;
         };
         self.unlockLoadedModels();
-        if (control != null) {
+        if (control != null or self.load_execution_admission != null) {
             self.load_group.concurrent(coordination_io, runLoadTask, .{task}) catch |err| {
                 // `Group.async` is allowed to execute eagerly when its async pool is
                 // saturated. A request-scoped cold load must never run on the request
@@ -8642,8 +8686,8 @@ pub const ModelManager = struct {
                 self.releaseLoadFlight(flight_key, flight);
             };
         } else {
-            // Startup preloads and direct/offline callers have no request lifetime
-            // to protect. Retain the permissive path for executors such as
+            // Unscheduled startup/direct callers have no request lifetime or
+            // independent CPU admission. Retain the permissive path for executors such as
             // std.testing.io that intentionally do not offer concurrency.
             self.load_group.async(coordination_io, runLoadTask, .{task});
         }
@@ -11682,7 +11726,7 @@ test "load flight waiter exits release retirement reservations and admission" {
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
     defer allocator.free(root);
 
-    const Exit = enum { cancel_during_wait, cancel_after_completion, adopt };
+    const Exit = enum { cancel_during_wait, cancel_after_completion, adopt, park_adopt, reject_resume };
     const Cancellation = struct {
         manager: *ModelManager,
         flight: *LoadFlight,
@@ -11701,8 +11745,37 @@ test "load flight waiter exits release retirement reservations and admission" {
         }
     };
 
+    const Return = struct {
+        manager: *ModelManager,
+        flight: *LoadFlight,
+        model: *LoadedModel,
+        reject: bool,
+        parked: bool = false,
+        entries: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.parked);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.parked);
+            try std.testing.expect(self.manager.load_lock.tryLock());
+            self.manager.load_lock.unlock();
+            self.parked = true;
+            self.manager.finishLoadFlight(self.flight, self.model, null);
+            self.manager.retireLoadedModel(self.model);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.entries += 1;
+            if (self.reject) return error.CpuReturnDenied;
+        }
+    };
+
     for ([_]bool{ false, true }) |task_ref_pending| {
-        for ([_]Exit{ .cancel_during_wait, .cancel_after_completion, .adopt }) |exit| {
+        for ([_]Exit{ .cancel_during_wait, .cancel_after_completion, .adopt, .park_adopt, .reject_resume }) |exit| {
             var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
             defer manager.deinit();
             manager.configureServingPolicy(.{ .allow_unknown = true });
@@ -11716,6 +11789,7 @@ test "load flight waiter exits release retirement reservations and admission" {
             const flight = try allocator.create(LoadFlight);
             flight.* = .{
                 .io = std.testing.io,
+                .execution_admission_configured = true,
                 .refs = 1 + @as(usize, @intFromBool(task_ref_pending)),
                 .task_ref_pending = task_ref_pending,
             };
@@ -11729,20 +11803,30 @@ test "load flight waiter exits release retirement reservations and admission" {
                 .model = model,
                 .publish_before_cancel = exit == .cancel_during_wait,
             };
-            if (exit != .cancel_during_wait) {
+            if (exit == .cancel_after_completion or exit == .adopt) {
                 manager.finishLoadFlight(flight, model, null);
                 manager.retireLoadedModel(model);
             }
-            const result = manager.waitForLoadFlight("flight", flight, if (exit == .adopt) null else .{
+            var returned: Return = .{ .manager = &manager, .flight = flight, .model = model, .reject = exit == .reject_resume };
+            var scope: ?execution_control_mod.CheckpointScope = if (exit == .park_adopt or exit == .reject_resume)
+                execution_control_mod.CheckpointScope.init(.{ .context = &returned, .check_fn = Return.check, .wait_begin_fn = Return.begin, .wait_end_fn = Return.end })
+            else
+                null;
+            defer if (scope) |*active| active.deinit();
+            const result = manager.waitForLoadFlight("flight", flight, if (exit == .adopt or exit == .park_adopt or exit == .reject_resume) null else .{
                 .ptr = &cancellation,
                 .check_fn = Cancellation.check,
             });
-            if (exit == .adopt) {
+            if (exit == .adopt or exit == .park_adopt) {
                 var adopted = try result;
                 try std.testing.expectEqual(@as(usize, 2), model.active_handles);
                 adopted.release();
             } else {
-                try std.testing.expectError(error.Cancelled, result);
+                try std.testing.expectError(if (exit == .reject_resume) error.CpuReturnDenied else error.Cancelled, result);
+            }
+            if (scope != null) {
+                try std.testing.expect(!returned.parked);
+                try std.testing.expectEqual(@as(usize, 1), returned.entries);
             }
             try std.testing.expectEqual(@as(usize, 0), manager.in_flight_loads.count());
             try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
@@ -15872,4 +15956,97 @@ test "model aware media host index cache pressure releases idle leases before pr
     try std.testing.expectEqual(@as(usize, 3), cache.calls);
     try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+}
+
+test "coordinated model and composite loaders own independent execution admission" {
+    const Family = enum { model, composite };
+    const Mode = enum { success, success_without_control, reject_start, reject_completion };
+    const Probe = struct {
+        mode: Mode,
+        caller: std.Thread.Id,
+        begins: std.atomic.Value(usize) = .init(0),
+        finishes: std.atomic.Value(usize) = .init(0),
+        checks: std.atomic.Value(usize) = .init(0),
+        active: std.atomic.Value(bool) = .init(false),
+        thread: std.Thread.Id = undefined,
+        fn begin(raw: *anyopaque, _: std.Io, _: load_execution.Key, bytes: usize, control: load_execution.ExecutionControl) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.caller != std.Thread.getCurrentId());
+            var original = control;
+            try load_execution.ExecutionControl.check(&original);
+            try std.testing.expectEqual(@as(usize, 1), control.items.len);
+            try std.testing.expect(bytes > 0);
+            _ = self.begins.fetchAdd(1, .release);
+            if (self.mode == .reject_start) return error.ResourceTemporarilyUnavailable;
+            try std.testing.expect(!self.active.swap(true, .acq_rel));
+            self.thread = std.Thread.getCurrentId();
+            return self;
+        }
+        fn checkpoint(_: *anyopaque, raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.active.load(.acquire));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            _ = self.checks.fetchAdd(1, .release);
+            if (self.mode == .reject_completion) return error.CpuReturnDenied;
+        }
+        fn finish(_: *anyopaque, raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.thread == std.Thread.getCurrentId());
+            std.debug.assert(self.active.swap(false, .acq_rel));
+            _ = self.finishes.fetchAdd(1, .release);
+        }
+    };
+    const alloc = std.testing.allocator;
+    for (std.enums.values(Family)) |family| for (std.enums.values(Mode)) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        if (family == .model) {
+            try writeCancellationTestModel(tmp.dir, alloc);
+        } else {
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data =
+                \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"},{"id":10,"content":"<|en|>"},{"id":12,"content":"<|transcribe|>"},{"id":13,"content":"<|notimestamps|>"}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":10,"<|transcribe|>":12,"<|notimestamps|>":13},"merges":[]}}
+            });
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"decoder_start_token_id\":7,\"eos_token_id\":8,\"max_length\":99}" });
+        }
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        defer alloc.free(root);
+        var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+        defer io_impl.deinit();
+        var probe: Probe = .{ .mode = mode, .caller = std.Thread.getCurrentId() };
+        var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.native}, .io = io_impl.io() });
+        defer manager.deinit();
+        manager.configureServingPolicy(.{ .allow_unknown = true });
+        manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+        manager.configureModelCache(2, 2);
+        manager.load_execution_admission = .{ .context = &probe, .begin = Probe.begin, .finish = Probe.finish, .checkpoint = Probe.checkpoint };
+        const control: ?InferenceExecutionControl = if (mode == .success_without_control) null else .{};
+        if (family == .model) {
+            const result = manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, control);
+            if (mode == .success or mode == .success_without_control) {
+                var handle = try result;
+                handle.retire();
+            } else try std.testing.expectError(if (mode == .reject_start) error.ResourceTemporarilyUnavailable else error.CpuReturnDenied, result);
+            try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+        } else {
+            const result = manager.acquireCompositeRuntime(root, &.{}, .whisper_metadata, control);
+            if (mode == .success or mode == .success_without_control) {
+                var handle = try result;
+                try std.testing.expectEqual(@as(usize, 99), handle.get().decoder_config.max_length);
+                handle.release();
+            } else {
+                try std.testing.expectError(if (mode == .reject_start) error.ResourceTemporarilyUnavailable else error.CpuReturnDenied, result);
+                try std.testing.expectEqual(@as(usize, 0), manager.composite_assets.count());
+            }
+        }
+        try manager.load_group.await(manager.load_io.?);
+        try std.testing.expect(!probe.active.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), probe.begins.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (mode == .reject_start) 0 else 1), probe.finishes.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (mode == .reject_start) 0 else 1), probe.checks.load(.acquire));
+        if (mode == .reject_start) {
+            try std.testing.expect(manager.resource_domain == null);
+        } else if (mode == .reject_completion) {
+            try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        }
+    };
 }

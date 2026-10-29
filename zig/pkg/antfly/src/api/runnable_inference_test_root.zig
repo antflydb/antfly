@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Focused integration gate: real API owner capsules and inference CPU scopes.
 const std = @import("std");
@@ -543,6 +555,101 @@ test "inference Io mutex wait preserves real owner bytes and control progress" {
         try std.testing.expectEqual(@as(usize, 1), probe.waits);
         try std.testing.expect(probe.gate.tryLock());
         probe.gate.unlock(std.testing.io);
+        scope.deinit();
+        port.finish(parent.?);
+        finished = true;
+        const drained = state.owner.scheduler.stats();
+        try std.testing.expectEqual(@as(usize, 0), drained.operations);
+        try std.testing.expectEqual(@as(usize, 0), drained.runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
+    }
+}
+
+test "inference model load completion preserves real owner bytes and control progress" {
+    const control_module = @import("inference_execution_control");
+    try control_module.testNestedSynchronousResourceWait();
+    const Mode = enum { success, canceled, deadline };
+    const Clock = struct {
+        var current: u64 = 0;
+        fn now() u64 {
+            return current;
+        }
+    };
+    const Probe = struct {
+        owner: *owner_module.State,
+        port: runtime.runnable_abi.Owner,
+        parent: *anyopaque,
+        io: *const runtime.native_abi.IoBorrow,
+        completed: std.Io.Event = .unset,
+        mode: Mode,
+        canceled: std.atomic.Value(bool) = .init(false),
+        retained_bytes: u64,
+        waits: usize = 0,
+        fn checked(status: runtime.error_abi.Status) !void {
+            if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+        }
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(self.canceled.load(.acquire));
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.checkpoint(self.parent));
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.park(self.parent, @backingInt(runtime.runnable_abi.Wait.resource)));
+            self.waits += 1;
+            const parked = self.owner.owner.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 0), parked.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), parked.resource_blocked);
+            try std.testing.expectEqual(self.retained_bytes, parked.retained_bytes);
+            var peer: ?*anyopaque = null;
+            try checked(self.port.start(self.port.context, &.{ .io = self.io, .class = @backingInt(runtime.runnable_abi.Class.query), .out_handle = &peer }));
+            defer self.port.finish(peer.?);
+            var control: ?*anyopaque = null;
+            try checked(self.port.start(self.port.context, &.{ .io = self.io, .class = @backingInt(runtime.runnable_abi.Class.control), .out_handle = &control }));
+            defer self.port.finish(control.?);
+            try std.testing.expectEqual(@as(usize, 2), self.owner.owner.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.owner.owner.scheduler.stats().control_slots);
+            self.canceled.store(self.mode == .canceled, .release);
+            if (self.mode == .deadline) Clock.current = 6;
+            self.completed.set(std.testing.io);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.enter(self.parent, @backingInt(runtime.runnable_abi.Class.inference)));
+        }
+    };
+    for ([_]Mode{ .success, .canceled, .deadline }) |mode| {
+        Clock.current = 0;
+        var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Clock.now };
+        defer state.owner.tryDeinit() catch @panic("owner leaked");
+        const port = state.port();
+        var lease = try runtime.runnable_abi.Lease.init(port);
+        defer lease.deinit();
+        const io = std.testing.io;
+        const borrow = runtime.native_abi.IoBorrow.init(&io);
+        var probe = Probe{ .owner = &state, .port = port, .parent = undefined, .io = &borrow, .mode = mode, .retained_bytes = 0 };
+        var parent: ?*anyopaque = null;
+        try Probe.checked(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .slots = 2, .retained_bytes = 123, .has_deadline = 1, .native_deadline = 1, .deadline_ns = 5, .cancellation = .{ .context = &probe, .is_cancelled = Probe.requested }, .out_handle = &parent }));
+        var finished = false;
+        defer if (!finished) port.finish(parent.?);
+        probe.parent = parent.?;
+        probe.retained_bytes = state.owner.scheduler.stats().retained_bytes;
+        var scope = control_module.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+        defer if (scope.active) scope.deinit();
+        const control = control_module.InferenceExecutionControl{};
+        if (mode == .canceled) {
+            try std.testing.expectError(error.Canceled, control.waitForLoad(io, &probe.completed, true));
+        } else if (mode == .deadline) {
+            try std.testing.expectError(error.DeadlineExceeded, control.waitForLoad(io, &probe.completed, true));
+        } else {
+            try control.waitForLoad(io, &probe.completed, true);
+            try std.testing.expectEqual(@as(usize, 2), state.owner.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(probe.retained_bytes, state.owner.scheduler.stats().retained_bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.waits);
         scope.deinit();
         port.finish(parent.?);
         finished = true;

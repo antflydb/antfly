@@ -284,6 +284,27 @@ pub const InferenceExecutionControl = struct {
         });
     }
 
+    /// Wait for a shared model/assets load without retaining the synchronous
+    /// caller's CPU grant. Loader ownership is independent; only this waiter
+    /// parks, and checked CPU return precedes handle adoption by the caller.
+    pub fn waitForLoad(self: InferenceExecutionControl, io: std.Io, completed: *std.Io.Event, independently_admitted: bool) !void {
+        if (completed.isSet()) return self.check();
+        try self.update(.loading_model, 0, 1);
+        var wait = if (independently_admitted) try ResourceWait.init() else ResourceWait{};
+        defer wait.finish() catch {};
+        while (!completed.isSet()) {
+            try self.update(.loading_model, 0, 1);
+            completed.waitTimeout(io, .{
+                .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+        }
+        try wait.finish();
+        try self.check();
+    }
+
     /// Acquire a process-local execution gate without turning queueing behind
     /// another inference request into an uncancellable wait.
     pub fn lock(self: InferenceExecutionControl, mutex: *std.atomic.Mutex) !void {

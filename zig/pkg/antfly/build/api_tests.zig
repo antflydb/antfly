@@ -1013,6 +1013,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = 8 * 1024 * 1024 * 1024,
     });
     generation_step.dependOn(&provider_check.step);
+    b.step("antfly-inference-worker-provider-check", "Compile the production supervised-worker provider entry and loader admission wiring")
+        .dependOn(&provider_check.step);
     const generation_worker_tests = b.addTest(.{
         .name = "inference-worker-generation-tests",
         .root_module = generation_worker_root,
@@ -1118,12 +1120,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     worker_progress_run.addArg("--require-no-skips");
     b.step("antfly-inference-worker-progress-test", "Verify fixed worker telemetry scratch and non-waiting per-request gates")
         .dependOn(&worker_progress_run.step);
-    const worker_owner_rpc = b.createModule(.{
-        .root_source_file = b.path("pkg/inference/src/host/worker_rpc.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    worker_owner_rpc.addImport("httpx", antfly_imports.httpx);
+    const worker_owner_rpc = antfly_imports.inference_worker_rpc;
     const worker_rpc_control_tests = b.addTest(.{
         .name = "inference-worker-rpc-control-tests",
         .root_module = worker_owner_rpc,
@@ -1161,6 +1158,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
+    const worker_load_execution = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_load_execution.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    worker_load_execution.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    worker_load_execution.addImport("antfly_platform", antfly_imports.platform);
+    worker_load_execution.addImport("antfly_inference_worker_rpc", worker_owner_rpc);
+    worker_load_execution.addImport("antfly_inference_worker_wire", antfly_imports.inference_worker_wire);
+    worker_load_execution.addImport("antfly_inference_bridge", antfly_imports.inference_bridge);
     const worker_owner_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_worker_test_root.zig"),
         .target = target,
@@ -1173,6 +1180,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     worker_owner_root.addImport("inference_execution_control", inference_owner_control);
     worker_owner_root.addImport("inference_worker_rpc", worker_owner_rpc);
     worker_owner_root.addImport("inference_worker_phases", worker_owner_phases);
+    worker_owner_root.addImport("inference_worker_load_execution", worker_load_execution);
+    worker_owner_root.addImport("inference_worker_wire", antfly_imports.inference_worker_wire);
+    worker_owner_root.addImport("inference_runnable_execution", inference_owner_admission);
+    worker_owner_root.addImport("inference_linalg", antfly_imports.inference_server.import_table.get("inference_linalg").?);
     const worker_owner_tests = b.addTest(.{
         .name = "inference-worker-owner-handoff-tests",
         .root_module = worker_owner_root,

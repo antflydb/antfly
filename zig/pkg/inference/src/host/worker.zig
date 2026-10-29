@@ -28,7 +28,8 @@ const worker_heap = @import("worker_heap.zig");
 pub const BootstrapOwner = worker_heap.Bootstrap;
 pub const heap_module = worker_heap;
 const httpx = @import("httpx");
-const execution_control = @import("inference_server").execution_control;
+const inference = @import("inference_server");
+const execution_control = inference.execution_control;
 const Output = @import("worker_output_error.zig").Output;
 const HttpControl = @import("worker_http_control.zig");
 const Progress = rpc.Progress;
@@ -387,6 +388,7 @@ fn invokeHttpOwned(client: *Client, route: []const u8, context: *const bridge.Ht
 
 pub const Client = struct {
     alloc: std.mem.Allocator,
+    load_execution_owner: ?bridge.runnable_abi.Lease = null,
     io: std.Io,
     create_json: []u8,
     environment: std.process.Environ.Map,
@@ -456,8 +458,16 @@ pub const Client = struct {
     }
 
     pub fn configure(self: *Client, budget: bridge.ResourceBudget) !void {
+        return self.configureWithRunnableOwner(budget, null);
+    }
+
+    pub fn configureWithRunnableOwner(self: *Client, budget: bridge.ResourceBudget, owner: ?bridge.runnable_abi.Owner) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (owner) |value| {
+            if (self.load_execution_owner != null) return error.ExternalResourceBudgetsAlreadyConfigured;
+            self.load_execution_owner = try bridge.runnable_abi.Lease.init(value);
+        }
         try self.configureMemory(budget);
         _ = try self.ensureWorker(.{});
     }
@@ -520,6 +530,7 @@ pub const Client = struct {
         if (self.payload_budget) |budget| budget.releaseOwner();
         const budget = self.budget;
         const object_allocator = self.bootstrap_allocator orelse self.alloc;
+        if (self.load_execution_owner) |*lease| lease.deinit();
         object_allocator.destroy(self);
         if (budget) |owner| owner.release_context(owner.context);
     }
@@ -602,7 +613,10 @@ pub const Client = struct {
         errdefer worker.endpoint.deinit();
         const initialized = try call(&worker.endpoint, .initialize, self.create_json, control);
         self.alloc.free(initialized);
-        const configured = try call(&worker.endpoint, .configure, "", control);
+        var configuration_buffer: [64]u8 = undefined;
+        var configuration = std.Io.Writer.fixed(&configuration_buffer);
+        try std.json.Stringify.value(wire.Configuration{ .load_execution = self.load_execution_owner != null }, .{}, &configuration);
+        const configured = try call(&worker.endpoint, .configure, configuration.buffered(), control);
         self.alloc.free(configured);
         self.generation += 1;
         self.worker = worker;
@@ -805,7 +819,7 @@ const Worker = struct {
     leases: std.AutoHashMapUnmanaged(usize, void) = .empty,
     observations: std.ArrayListUnmanaged(*Observation) = .empty,
     child_transient: u64 = 0,
-    resource_scratch: [8 * rpc.max_resource_bytes]u8 = undefined,
+    load_executions: @import("worker_load_execution.zig").Parent = .{},
     metadata_budget: ?*rpc.PayloadBudget = null,
     transport_budget: ?*rpc.PayloadBudget = null,
     const metadata_limit = 1024 * 1024;
@@ -852,6 +866,7 @@ const Worker = struct {
         worker_heap.retireParentAfterJoin(&self.child_transient, &budget);
         if (self.metadata_budget) |metadata| {
             const alloc = metadata.retainedAllocator();
+            self.load_executions.retireAfterJoin(self.owner.io, alloc);
             var leases = self.leases.keyIterator();
             while (leases.next()) |lease| budget.release_admission(budget.context, lease.*);
             self.leases.deinit(alloc);
@@ -885,14 +900,21 @@ const Worker = struct {
 
     fn resourceRequest(raw: *anyopaque, bytes: []const u8) !rpc.ResourceReply {
         const self: *Worker = @ptrCast(@alignCast(raw));
-        self.resources.lockUncancelable(self.owner.io);
-        defer self.resources.unlock(self.owner.io);
-        var arena = std.heap.FixedBufferAllocator.init(&self.resource_scratch);
+        var scratch: [8 * rpc.max_resource_bytes]u8 = undefined;
+        var arena = std.heap.FixedBufferAllocator.init(&scratch);
         const incoming = try std.json.parseFromSliceLeaky(wire.ResourceRequest, arena.allocator(), bytes, .{});
+        const independent = switch (incoming.operation) {
+            .execution_start, .execution_park, .execution_enter, .execution_check, .execution_finish, .execution_cancel => true,
+            else => false,
+        };
+        if (!independent) self.resources.lockUncancelable(self.owner.io);
+        defer if (!independent) self.resources.unlock(self.owner.io);
         const result = self.resourceOperation(arena.allocator(), .{ .operation = incoming.operation, .data = incoming.data }) catch |err| {
             // Only an explicit budget denial is recoverable. Other errors can
             // mean ownership diverged; the RPC lifecycle will reap the worker.
-            if (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+            if (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable and
+                err != error.QueryQueueFull and err != error.SchedulerFull and err != error.RunnableWaitTimeout and err != error.Canceled and err != error.Cancelled and
+                err != error.DeadlineExceeded and err != error.SchedulerClosed) return err;
             const status = bridge.statusFromError(err);
             return .{ .code = status.code, .detail = status.detail };
         };
@@ -903,6 +925,11 @@ const Worker = struct {
         if (self.endpoint.closed.load(.acquire)) return error.ResourceOwnerShuttingDown;
         const budget = self.owner.budget.?;
         switch (envelope.operation) {
+            .execution_start, .execution_park, .execution_enter, .execution_check, .execution_finish, .execution_cancel => {
+                const owner = self.owner.load_execution_owner orelse return error.ResourceOwnerNotConfigured;
+                const value = try std.json.parseFromSliceLeaky(wire.LoadExecution, arena, envelope.data, .{});
+                return self.load_executions.operate(try self.metadataAllocator(), self.owner.io, owner.owner, &self.endpoint.closed, envelope.operation, value);
+            },
             .transient_host => {
                 const value = try std.json.parseFromSliceLeaky(wire.Observation, arena, envelope.data, .{});
                 try worker_heap.adjustParent(&self.child_transient, &budget, value);
@@ -1037,6 +1064,7 @@ const Child = struct {
     create_arena: std.heap.ArenaAllocator,
     heap: worker_heap.Heap = undefined,
     configured: bool = false,
+    load_execution: @import("worker_load_execution.zig").ChildFor(execution_control, inference.executor_microbatch, inference.linalg.pool) = undefined,
     startup_mutex: std.Io.Mutex = .init,
 
     const ProviderDiagnostic = struct {
@@ -1084,6 +1112,11 @@ const Child = struct {
         if (envelope.operation == .configure) {
             defer self.startup_mutex.unlock(self.io);
             if (self.configured) return error.AlreadyExists;
+            const configuration = if (envelope.data.len == 0) wire.Configuration{} else try std.json.parseFromSliceLeaky(wire.Configuration, arena, envelope.data, .{});
+            if (configuration.load_execution) {
+                self.load_execution = .{ .endpoint = &self.endpoint };
+                state.node.model_manager.load_execution_admission = self.load_execution.admission();
+            }
             const budget = self.resourceBudget();
             try host.linkedInferenceConfigure(&.{ .abi_version = bridge.abi_version, .handle = state, .resource_budget = &budget });
             var entries: ?[*]const bridge.RouteManifestEntry = null;

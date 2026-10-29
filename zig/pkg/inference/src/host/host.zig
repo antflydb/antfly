@@ -1008,7 +1008,7 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
         return err;
     };
     if (state.worker) |worker| {
-        try worker.configure(context.resource_budget.*);
+        try worker.configureWithRunnableOwner(context.resource_budget.*, if (runnable_lease) |lease| lease.owner else null);
         state.node.startup_preloads_materialized = true;
         state.runnable_owner = runnable_lease;
         return;

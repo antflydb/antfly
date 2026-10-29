@@ -728,3 +728,53 @@ retention/immutable-artifact provider boundaries, and serial graph preparation.
 Cross-engine resource qualification, including the original file-engine descriptor
 gate, remains open. Full GNU/full qualification remains waived; the installed CLI
 was not rebuilt for this increment.
+
+
+### Independent CPU admission for native model loading
+
+Shared model and composite-asset loads now acquire one independent execution
+grant on their existing loader task. The grant borrows the flight's collective
+lifetime, remains owned through synchronous construction and final checks, and
+finishes before the task releases its flight ownership. Final-fence rejection
+retires an already published primary model or destroys an unpublished composite
+candidate. Callers park while awaiting independently admitted loads and resume
+before adopting handles; warm completed lookups avoid a new wait transition.
+Configured admission always requires a guaranteed concurrent loader, including
+callers without request controls; an exhausted async pool cannot execute it
+inline under the waiting caller's grant.
+
+In-process nodes install their existing execution-admission provider on the
+model manager. Supervised workers use private wire version 17 and carry loader
+CPU start, park, checkpoint, reentry, cancellation and finish over dedicated
+resource RPC. The parent records grants in a separate pinned ledger; scheduler
+waiting holds neither the shared resource mutex nor that ledger's registry
+mutex. Transport close cancels queued callbacks, and physical reap drops the
+generation's registry ownership while active callbacks retain their pins.
+
+Controlled resource RPC retains pending reply storage after cancellation,
+sends the owner an explicit cancellation, and joins the original reply before
+returning. A lost or uncertain mutation reply fences the child. CPU admission
+and the one-worker native CPU scope stay on the actual loader worker; no request
+callback or borrowed caller grant is retained by an asynchronous model load.
+Without a configured execution owner, existing offline/disabled paths retain
+their prior behavior rather than parking around an uncharged loader.
+
+Focused evidence is recorded in `serverless-model-load-waits-v5-debug.json`,
+`serverless-model-load-waits-v6-debug.json`, and
+`native-model-load-waits-v7-debug.json` in the cumulative integration directory. Real scheduler/pipe fixtures cover
+shared loader ownership, query/control progress, one departing caller, final
+cancellation during loading and queued CPU reentry, and pinned callback retirement.
+Constructor fixtures use a tiny local native model and local Whisper metadata;
+the constructor cases disable the async pool and cover controlled and legacy
+callers, admission denial before memory-domain creation, and final-fence rollback.
+These are deterministic native integration cases, not downloaded model or live
+cloud qualification. The production worker entry receives a separate semantic
+compile check. Full GNU/full qualification remains waived.
+
+This completes independent loader admission and shared-flight waiting within the
+maintenance milestone. Physical model-file/download waits inside construction,
+provider/model asset preparation, vendor-process credential waits, lease renewal,
+remaining mutation/retention/immutable-artifact boundaries, and serial graph
+preparation remain open. Cross-engine resource gates, including the original
+file-engine descriptor bound, remain open. The installed CLI is not rebuilt by
+these focused tests.

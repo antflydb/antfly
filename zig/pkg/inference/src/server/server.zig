@@ -4371,6 +4371,7 @@ pub const Node = struct {
         if (self.executor_microbatch_broker) |*broker| broker.deinit();
         self.executor_microbatch_broker = null;
         self.executor_admission = admission;
+        self.model_manager.load_execution_admission = admission;
     }
 
     pub fn testExecutorAdmission(self: *Node) !void {
