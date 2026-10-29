@@ -15,6 +15,7 @@
 @property BOOL forceCopiedOutput;
 @property NSUInteger failAllocation;
 @property NSUInteger allocations;
+@property BOOL recordInitializedBytes;
 @property id<MTLCommandBuffer> command;
 @end
 @implementation HostFfnTrace
@@ -65,6 +66,7 @@
 }
 - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
     ++_trace.allocations; [_trace.events addObject:[NSString stringWithFormat:@"copy %lu",(unsigned long)length]];
+    if (_trace.recordInitializedBytes && length <= 64) [_trace.events addObject:[NSString stringWithFormat:@"initialized %@",[NSData dataWithBytes:bytes length:length]]];
     return _trace.failAllocation == _trace.allocations ? nil : [(id<MTLDevice>)_target newBufferWithBytes:bytes length:length options:options];
 }
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {

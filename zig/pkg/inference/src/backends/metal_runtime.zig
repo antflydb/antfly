@@ -34277,7 +34277,54 @@ test "metal native decoderRuntimeApplyLinear iq2_xs matches trivial reference" {
     try std.testing.expectApproxEqAbs(@as(f32, 32.0), actual[0], 1e-4);
 }
 
-test "metal native decoderRuntimeApplyLinear tl1 matches trivial reference" {
+test "metal native host FFN i2_s slots ABI matches reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const h = 128;
+    const d = 256;
+    const gate_raw: [h * d / 4]u8 = @splat(0xaa); // Every ternary code is +1.
+    const down_raw: [d * h / 4]u8 = @splat(0xaa);
+    for (0..3) |slot| {
+        const raw = if (slot == 2) &down_raw else &gate_raw;
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_quantized_linear_slot(
+            runtime,
+            @backingInt(MetalQuantFormat.i2_s),
+            slot,
+            raw,
+            raw.len,
+            if (slot == 2) d else h,
+            if (slot == 2) h else d,
+        ));
+    }
+    for ([_]usize{ 1, 3 }) |rows| {
+        var input: [3 * h]f32 = @splat(1.0 / 128.0);
+        var residual: [3 * h]f32 = @splat(0.25);
+        var output: [3 * h]f32 = @splat(-12345.0);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
+            runtime,
+            &input,
+            &residual,
+            rows,
+            h,
+            d,
+            2,
+            0,
+            1,
+            std.math.maxInt(usize),
+            2,
+            &output,
+        ));
+        const expected: f32 = (1.0 / (1.0 + @exp(@as(f32, -1.0)))) * d + 0.25;
+        for (output[0 .. rows * h]) |value| try std.testing.expectApproxEqAbs(expected, value, 0.01);
+        for (output[rows * h ..]) |value| try std.testing.expectEqual(@as(f32, -12345.0), value);
+    }
+}
+
+test "metal native decoderRuntimeApplyLinear tl1 and host FFN match trivial reference" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -34336,6 +34383,44 @@ test "metal native decoderRuntimeApplyLinear tl1 matches trivial reference" {
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(in_dim)), actual[0], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(in_dim)), actual[out_dim - 1], 1e-3);
+
+    // Exercise the Zig/C ABI, including every argument after the dimensions.
+    // The former unused C-only attention_input_size argument shifted this call.
+    std.mem.writeInt(u32, weight_raw[packed_len..][0..4], @bitCast(@as(f32, 1.0 / 128.0)), .little);
+    const view = try quant_codec.bitnetTL1View(&shape, weight_raw);
+    var ffn_output: [in_dim]f32 = undefined;
+    const rc = termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
+        runtime,
+        &input_data,
+        &input_data,
+        in_dim,
+        out_dim,
+        2,
+        weight_raw.ptr,
+        weight_raw.len,
+        @intCast(packed_len),
+        @intCast(view.config.bm),
+        @intCast(view.config.by),
+        @intCast(view.config.bmm),
+        weight_raw.ptr,
+        weight_raw.len,
+        @intCast(packed_len),
+        @intCast(view.config.bm),
+        @intCast(view.config.by),
+        @intCast(view.config.bmm),
+        std.math.maxInt(usize),
+        weight_raw.ptr,
+        weight_raw.len,
+        @intCast(packed_len),
+        @intCast(view.config.bm),
+        @intCast(view.config.by),
+        @intCast(view.config.bmm),
+        &ffn_output,
+    );
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    const gate: f32 = @as(f32, @floatFromInt(in_dim)) / 128.0;
+    const expected = (gate / (1.0 + @exp(-gate))) * gate * (@as(f32, @floatFromInt(out_dim)) / 128.0) + 1.0;
+    for (ffn_output) |value| try std.testing.expectApproxEqAbs(expected, value, 0.05);
 }
 
 test "metal native decoderRuntimeApplyLinear tl2 matches trivial reference" {

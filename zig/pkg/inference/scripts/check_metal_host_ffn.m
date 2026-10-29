@@ -5,6 +5,7 @@
 //   -framework MetalPerformanceShaders -framework Accelerate check_metal_host_ffn.m -o check-host-ffn
 #include "../src/backends/metal_kernels.m"
 #include "metal_host_ffn_trace.h"
+#include "metal_host_ternary_ffn_check.h"
 
 typedef int (*HostFfn)(termite_metal_decode_runtime *, const float *, const float *, size_t,
     size_t, size_t, uint32_t, size_t, size_t, size_t, size_t, size_t, float *);
@@ -209,6 +210,11 @@ int main(int argc, const char **argv) { @autoreleasepool {
 #endif
     termite_metal_decode_runtime *runtime = termite_metal_decode_runtime_create();
     if (runtime == NULL) return 1;
+    if (argc == 2 && strcmp(argv[1], "--benchmark-ternary-gpu") == 0) {
+        const int rc = check_host_ternary_ffn(runtime, true);
+        termite_metal_decode_runtime_destroy(runtime);
+        return rc;
+    }
     size_t checked = 0, failures_checked = 0, alias_outputs = 0, copied_outputs = 0;
     for (size_t family = 0; family < 4; ++family) {
         const size_t h = 256, d = 512, capacity = 16 * h;
@@ -299,6 +305,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
             !host_weight_unchanged(runtime,host_down_formats[family],2,d,h,dr,db)) return 10;
         free(gw);free(uw);free(dw);free(gr);free(ur);free(dr);free(input);free(residual);free(output_base);free(reference);free(before);free(gn);free(dn);
     }
+    if (!benchmark) { const int rc = check_host_ternary_ffn(runtime, false); if (rc) return rc; }
     termite_metal_decode_runtime_destroy(runtime);
     if (alias_outputs == 0 || copied_outputs == 0) { fprintf(stderr,"HOST_COPY_COVERAGE alias=%zu copied=%zu checked=%zu failures=%zu\n",alias_outputs,copied_outputs,checked,failures_checked); return 11; }
     fprintf(stderr,"Host FFN oracle/trace/copy/canary/read-only checks passed: %zu cases; %zu failures; %zu aliased / %zu copied outputs\n",checked,failures_checked,alias_outputs,copied_outputs);
