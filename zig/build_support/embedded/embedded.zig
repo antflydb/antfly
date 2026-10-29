@@ -676,6 +676,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // regressions to avoid compiling unrelated resolver replay fixtures.
     b.step("capi-contract-test", "Run hermetic C API contracts without resolver replay suites")
         .dependOn(&run_capi_tests.step);
+    // Physical C API regressions can build their existing implementation owner
+    // directly. The ordinary gate still audits and runs both partitions.
+    @import("../antfly/test_partitions.zig").installLocalArtifact(b, capi_tests.object, "capi-contract-owner-test-build", "Build physical C API contract tests without consumer discovery", "capi-contract-owner-tests");
 
     // Resolver and scorer are owned by embedded storage. Run their pure tests
     // in embedded CI as well as the compatibility lib-* test targets.

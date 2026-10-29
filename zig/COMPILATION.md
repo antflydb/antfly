@@ -2001,3 +2001,10 @@ for collector allocation-failure and bounded embedding regressions, or
 They reuse the normal test bodies and dependencies; the full storage and C API
 entrypoints retain their existing coverage. These targets avoid compiling HTTP
 discovery anchors and unrelated resolver replay suites for a focused regression.
+
+For a regression owned by the physical C API implementation, use
+`zig build capi-contract-owner-test-build -Dtest-filter="..."` and run
+`zig-out/bin/capi-contract-owner-tests`. It installs the same implementation
+partition used by the ordinary C API gate, avoiding an expensive consumer
+compilation solely to discover that the selected tests belong to the owner.
+The ordinary gate continues to audit the complete consumer/owner union.
