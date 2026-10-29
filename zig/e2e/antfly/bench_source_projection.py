@@ -304,11 +304,22 @@ def main():
                             hits = result["hits"]["hits"]
                             assert {h["_id"] for h in hits} == set(documents), result
                             evidence = sorted(
-                                (h["_id"], h["_source"], h.get("_computed"))
+                                (
+                                    h["_id"],
+                                    h["_source"],
+                                    h.get("_computed"),
+                                    h.get("_score"),
+                                )
                                 for h in hits
                             )
                             digest = hashlib.sha256(
-                                json.dumps(evidence, sort_keys=True).encode()
+                                json.dumps(
+                                    {
+                                        "hits": evidence,
+                                        "total": result["hits"].get("total"),
+                                    },
+                                    sort_keys=True,
+                                ).encode()
                             ).hexdigest()
                             assert (
                                 output_hashes.setdefault(

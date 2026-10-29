@@ -10912,7 +10912,49 @@ fn requestRoutedSpanSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.Ca
     };
     if (request == .search and from.len == 0 and to.len == 0 and isDocumentLookupBatch(request.search))
         return table_catalog.routedDocumentKeysSnapshotUntil(alloc, catalog, table_name, request.search.filter_doc_ids, deadline);
-    return table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, from, to, deadline);
+    var whole = try table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, from, to, deadline);
+    errdefer whole.deinit(alloc);
+    // This is a physical choice under the captured catalog, not another
+    // predicate. Single-owner and non-point-shaped queries pay no JSON parse.
+    if (whole.group_ids.len <= 1 or request != .search or from.len != 0 or to.len != 0) return whole;
+    const req = request.search;
+    if (!publicDocumentRoutingShape(req) or std.mem.indexOf(u8, req.filter_query_json, "\"doc_id\"") == null) return whole;
+    try checkQueryDeadline(req);
+    try catalog.budget(deadline).checkpoint();
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, req.filter_query_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return whole,
+    };
+    const validation = @import("antfly_local_sources").storage_db_control_root;
+    validation.validateStructuredFilterValueAlloc(a, value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return whole,
+    };
+    const values = validation.mandatoryFilterDocIds(value, 256) orelse return whole;
+    const ids = try a.alloc([]const u8, values.len);
+    for (values, ids) |item, *id| {
+        if (item.string.len == 0 or item.string.len > 4096 or std.mem.indexOfScalar(u8, item.string, 0) != null) return whole;
+        id.* = item.string;
+    }
+    try checkQueryDeadline(req);
+    try catalog.budget(deadline).checkpoint();
+    var pointed = try table_catalog.routedDocumentKeysSnapshotUntil(alloc, catalog, table_name, ids, deadline);
+    errdefer pointed.deinit(alloc);
+    if (whole.metadata_group_id != pointed.metadata_group_id or !std.meta.eql(whole.metadata_incarnation, pointed.metadata_incarnation) or whole.catalog_revision != pointed.catalog_revision or whole.table_id != pointed.table_id or whole.topology_epoch != pointed.topology_epoch) return error.TopologyChanged;
+    if (pointed.group_ids.len >= whole.group_ids.len) {
+        pointed.deinit(alloc);
+        return whole;
+    }
+    whole.deinit(alloc);
+    return pointed;
+}
+
+fn publicDocumentRoutingShape(req: db_mod.types.SearchRequest) bool {
+    return req.return_mode == .parent and req.query == .match_all and (req.full_text == null or req.full_text.? == .match_all) and
+        req.full_text_queries.len == 0 and req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0 and req.graph_metric_queries.len == 0 and req.graph_metric_rerank == null and req.hierarchy_children == null and !req.hierarchy_grouped_matches and req.filter_text == null and req.exclusion_text == null and req.aggregations_json.len == 0;
 }
 
 fn selectLookupKeysForGroup(alloc: std.mem.Allocator, request: *db_mod.types.SearchRequest, group_id: u64) !?[][]const u8 {
@@ -17853,6 +17895,25 @@ fn consumerTests() type {
             defer routing.deinit();
             var hosted = HostedProvisionedTableReadSource.init("unused", routing.catalog(), raft_mod.read_gate.alreadyReadSafeBarrier(), FakeRouter.iface(), .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
             _ = hosted.withIo(&io_impl);
+            var public = try query_contract.parsePublicQueryRequest(alloc, null, "docs", "{\"query\":{\"bool\":{\"filter\":{\"ids\":[\"doc:a\"]}}},\"filter_query\":{\"match_all\":{}},\"fields\":[],\"limit\":1}");
+            defer public.deinit(alloc);
+            try std.testing.expect(!public.req.filter_doc_ids_positive);
+            const original_filter = try alloc.dupe(u8, public.req.filter_query_json);
+            defer alloc.free(original_filter);
+            const original_text = std.meta.activeTag(public.req.full_text.?);
+            var public_cut = try requestRoutedSpanSnapshot(alloc, routing.catalog(), "docs", "", "", .{ .search = public.req }, null);
+            defer public_cut.deinit(alloc);
+            try std.testing.expectEqualSlices(u64, &.{7}, public_cut.group_ids);
+            try std.testing.expectEqualStrings(original_filter, public.req.filter_query_json);
+            try std.testing.expectEqual(original_text, std.meta.activeTag(public.req.full_text.?));
+            try std.testing.expect(!public.req.filter_doc_ids_positive);
+            for ([_][]const u8{ "{\"bool\":{\"must_not\":[{\"doc_id\":[\"doc:a\"]}]}}", "{\"disjuncts\":[{\"doc_id\":[\"doc:a\"]},{\"match_all\":{}}]}" }) |filter| {
+                var unbounded = public.req;
+                unbounded.filter_query_json = filter;
+                var cover = try requestRoutedSpanSnapshot(alloc, routing.catalog(), "docs", "", "", .{ .search = unbounded }, null);
+                defer cover.deinit(alloc);
+                try std.testing.expectEqualSlices(u64, &.{ 7, 8 }, cover.group_ids);
+            }
             var single: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{"doc:a"}, .filter_query_json = "{\"term\":{\"tenant\":\"a\"}}", .exclusion_query_json = "{\"ids\":[\"blocked\"]}" };
             single.authorization_filter_query_json = single.filter_query_json;
             var cut = try requestRoutedSpanSnapshot(alloc, routing.catalog(), "docs", "", "", .{ .search = single }, null);
