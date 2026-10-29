@@ -253,3 +253,13 @@ It requires explicit unsampled metadata for each population, including quiet
 roles; confidence sample sizes cannot substitute for it. Native publication
 checkpoint/receipt digests identify durable outcomes without claiming transport
 completeness. See [shared object-backed publication](shared-object-publication.md).
+
+## Native coverage readiness
+
+The October 29 [native telemetry probe](cloudflare-native-telemetry.md) now
+passes the small-probe readiness checks using canonical OTLP identities plus a
+separately persisted native Tail terminal population. It includes private RPCs,
+late logs, two settled observations and a positively witnessed zero-traffic
+window. Adaptive sampling remains rejected. Whole-execution, eight-role gate
+adoption and the unchanged full trials remain required; readiness does not add
+a shortcut to qualification.
