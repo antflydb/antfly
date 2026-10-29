@@ -1770,3 +1770,92 @@ benefit is avoiding advisory scheduling of the next required foreground read.
 The local Debug/shared-host qualifications above continue to apply. Across both
 comparisons, all **48 structured HTTP 504 outcomes** carry `query_timeout`; other
 sampled deadline outcomes return the expected results.
+
+### Layout-aware highlights and shared covering batches
+
+The [layout and covering observation](native-layout-highlights-and-cover-batches-v1-observation.json)
+qualifies stored-source recipe **v9**, native reader protocol **95** and runtime
+ABI **71**. Both binaries share main
+`207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563`: the control is merge commit
+`326f9064da`, and the measured runtime is `bf97d8a2cb`. The frozen helpers are
+committed at `df10848c3c`. Executable SHA-256 values are
+`9e0e7f6a525b042d425eaa976eda5b421bea942e6d604e3b07676a52638a2a84` and
+`92fe670927cdb91777736faeddcdf5697bb87af8bacded50639fe9f2ae359c04`.
+
+This refinement keeps exact snippet semantics while addressing four remaining
+costs: regular-span density bounds account for candidate alignment; broad,
+diverse matches use source-order occurrence blocks instead of one decoded head
+per term; economical small fields retain offsets inside shared compressed
+source blocks; covering hydration builds one typed result page per decoded
+physical group. Small-field admission estimates dictionary cost before encoding
+and caps total encoded variants/descriptors at twice the source byte length.
+Rejected captures do not append to a private spill run. SQL NULL remains distinct
+from a non-null JSON `null` in shared covering pages.
+
+The comparison retains **144 measured HTTP requests**, in old/new then new/old
+blocks. Complete successful hit digests, Parquet inputs and helper hashes agree.
+The small-field and covering reports also retain equal totals; the layout runner
+does not retain outer total metadata. The covering runner independently checks
+all 64 integer fields across 256 rows, including values above `2^53`.
+
+Warm local Debug medians, milliseconds:
+
+| Shape | Old → new, primary | Old → new, reverse |
+| --- | ---: | ---: |
+| Regular stride-eight 2-MiB source | 90.55 → 10.36 | 88.50 → 9.74 |
+| Prefix matching 20,000 distinct terms | 797.57 → 104.06 | 766.16 → 101.89 |
+| Sparse 32-KiB control | 9.60 → 9.27 | 9.00 → 8.62 |
+| Hidden eight-field highlights, 256 hits | 289.18 → 163.31 | 321.03 → 185.29 |
+| Projected eight-field highlights, 256 hits | 255.39 → 202.92 | 286.38 → 221.50 |
+| Hidden one-field control, 256 hits | 107.10 → 95.08 | 115.25 → 109.25 |
+| Covering 64 integer columns, 256 hits | 445.30 → 388.81 | 460.15 → 386.26 |
+| Same covering query after process restart | 459.11 → 398.08 | 469.77 → 395.23 |
+
+Both orders support the intended improvements: **88.6–89.0%** for regular dense
+text, **86.7–87.0%** for the diverse prefix, **42.3–43.5%** for hidden wide
+highlighting, **20.5–22.7%** for projected wide highlighting, and **12.7–16.1%**
+for warm covering delivery. The measured controls improve too; this does not
+establish a universal latency improvement. Seven samples per layout point and
+three per other point/cache mode, on a shared host. Process restart retains OS
+and persistent caches and readiness warming; it is not an empty-cache test.
+
+The small-field fixture retains **5.2–5.3%** more total native artifact bytes
+and readiness rises from **1.67–1.74 s** to **2.02–2.08 s**. These are single
+observations per run, include superseded objects and do not isolate live text
+bytes or indexing CPU. The layout fixture's total artifact bytes vary between
+orders; no storage reduction is claimed. Its readiness rises by **0.18–0.30 s**.
+No Release, provider-latency, archive-scale or full-query-memory qualification
+follows from these observations.
+
+Independent exactness/work probes show **512 of 32,768 occurrences visited**
+and **four decoded blocks** for stride-eight text, where the prior bound visits
+all occurrences. The 8,192-distinct-term probe decodes **11 blocks**, keeps the
+fragment kernel under **112,537 bytes** inside a 256-KiB budget, and agrees with
+the full selector. Term navigation is outside that kernel allocation count and
+remains proportional to selected vocabulary. A separate oracle checks **288
+configurations of 4,096 disjoint or crossing spans** against the full selector.
+Fault, cancellation, small-offset admission, inline compaction, crossing-span
+seeks and shared-page ownership cases pass.
+
+Before the final storage-admission policy, the merged branch passes **526 API
+integration cases and 115 frontier cases**, with **250 and 35 shared cases**
+respectively, zero skips/failures/leaks. The final runtime then passes **65
+shared highlight cases and 13 API checks**, and all **48 real Parquet/Iceberg
+cases are verified** on its frozen executable. The 48-case invocation passes 46
+and exposes two overly strict new test assertions requiring whole words at
+fragment edges. After replacing them with exact clipped source intersections,
+both affected cases pass in **9.60 s**, including hidden/projected fields,
+restart, unavailable original objects and structured deadlines. Runtime code
+and executable bytes do not change between those E2E runs. An earlier invocation
+used a basename that selected the harness's legacy API root; it was canceled
+and the identical bytes rerun under the expected `antfly` name. The retained
+validation record distinguishes these attempts.
+
+Use `highlight_layouts.py`, `hidden_highlights.py` and `covering_batches.py`, each
+with `LABEL IMMUTABLE_BINARY RUNTIME_SOURCE_COMMIT`, from the worktree root.
+Run all three with the old binary, all with the new binary, then repeat in the
+opposite binary order. Freeze binaries in separate directories with basename
+`antfly` so the E2E harness selects `/db/v1`. Retain every sample, digest and
+input/helper/executable hash; stop task-owned builds, E2Es and cache cleanup
+before measuring. The covering report replaces redundant ID arrays with their
+counts and hashes while retaining complete hit hashes and every sort profile.
