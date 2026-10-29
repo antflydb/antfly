@@ -108,3 +108,10 @@ test('physical I/O coverage requires matched settlement and retains late resourc
  const missing=create();missing.observe('candidate','app',event({event:'antfly.operation',io_draining:true}));assert.equal(missing.report().passed,false);missing.observe('candidate','app',end);assert.equal(missing.report().passed,false);
  const overflow=create();for(let i=0;i<4097;i++)overflow.observe('candidate','app',event({event:'antfly.io_settled',io_lifecycle_id:crypto.randomUUID()}));assert.equal(overflow.report().streams.find(s=>s.role==='app'&&s.run==='candidate').gap_reasons.io_lifecycle_capacity,1);
 });
+
+
+test('lease and writer phase diagnostics retain only fixed labels',()=>{
+ const value={event:'antfly.operation',op:'lookup',physical:{read_view_lease_hit:1,read_admission_fallback_reason:'ReadSnapshotNeedsPin'}},trace={event:'antfly.trace',scope:'wal',spans:['write_admission','writer_authority','write_refresh','native_wal_plan','native_wal_finalize'].map(name=>({name,duration_ms:2}))};
+ const safe=sanitizeTailEvent({logs:[{message:[JSON.stringify(value),JSON.stringify(trace)]}]});assert.equal(JSON.parse(safe.logs[0].message[0]).physical.read_admission_fallback_reason,'ReadSnapshotNeedsPin');assert.equal(JSON.parse(safe.logs[1].message[0]).spans.length,5);assert.ok(JSON.parse(safe.logs[1].message[0]).spans.every(s=>s.name));
+ value.physical.read_admission_fallback_reason='private arbitrary payload';assert.ok(!JSON.stringify(sanitizeTailEvent({logs:[{message:[JSON.stringify(value)]}]})).includes('private arbitrary payload'));
+});

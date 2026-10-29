@@ -102,13 +102,13 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
               if(prepared?.__read_prepared)prepared.ticket=ticket;
             }
             const admission=await fresh;
-            return await launch({...admission,deadlineMs,nativeResume:{ticket:prepared?.ticket??Array.from(crypto.getRandomValues(new Uint8Array(16))),spentBytes:Math.max(prepared?.__read_spent_bytes??0,usage?.transferred_bytes??0),hostIdentity,usage,physical:preparationPhysical}});
+            return await launch({...admission,deadlineMs:Math.min(deadlineMs,admission.deadlineMs??Infinity),nativeResume:{ticket:prepared?.ticket??Array.from(crypto.getRandomValues(new Uint8Array(16))),spentBytes:Math.max(prepared?.__read_spent_bytes??0,usage?.transferred_bytes??0),hostIdentity,usage,physical:preparationPhysical}});
           }finally{await Promise.allSettled([fresh]);}
         }
-        if(!hint){const admission=await prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs});return launch({nativePlan:{hint:null,fresh:Promise.resolve(admission),deadlineMs}});}
+        if(!hint){const admission=await prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs});return launch({nativePlan:{hint:null,fresh:Promise.resolve(admission),deadlineMs:Math.min(deadlineMs,admission.deadlineMs??Infinity)}});}
         const reservation=pointReadLanes&&env.DIRECT_READS==="true"&&JSON.stringify(input).length<=4096?8*1024*1024:kernel.reservationBytes;
         return await withNativeReadPlanPermit(kernel,reservation,async(speculative,releasePermit)=>{
-          if(!speculative){const admission=await prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs});return launch({...admission,deadlineMs});}
+          if(!speculative){const admission=await prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs});return launch({...admission,deadlineMs:Math.min(deadlineMs,admission.deadlineMs??Infinity)});}
           let admitted;const begun=new Promise(resolve=>admitted=resolve);
           const fresh=prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs,onAdmitted:admitted});
           fresh.then(()=>{admitted();releasePermit();},()=>{admitted();releasePermit();});await begun;
@@ -242,8 +242,10 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       else await rpc("finalizePublication",batch,input.op==="publish"?{posting_quantum:result.posting_quantum,records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes}:undefined,hints);publicationFinalized=true;}
     if(readAdmission?.nativePlan||readAdmission?.nativeResume){nativeReadPlans.remember(env,result.__read_plan);const{__read_plan:ignoredPlan,...publicResult}=result;result=publicResult;}
     if(input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"&&result.job_id&&env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.publication_progress",trace_id:trace.id,job_id:result.job_id,checkpoint_sha256:result.checkpoint_sha256,receipt_sha256:result.receipt_sha256,posting_quantum:result.posting_quantum,phase:result.phase,offset:result.offset??0,published:result.published,wal_end_lsn:result.wal_end_lsn}));
+    const accepted=readAdmission?.nativePlan?await readAdmission.nativePlan.fresh:readAdmission;accepted?.confirm?.(result.visibility);
     operationSucceeded=true;return result;
   } catch (error) {
+    if(readAdmission?.nativePlan){try{(await readAdmission.nativePlan.fresh)?.invalidate?.();}catch{}}else readAdmission?.invalidate?.();
     if (/IntegrityMismatch/.test(String(error))) cache.clear();
     throw preparedPublication?publicationExecutionFailure(error,nativeMetrics):error;
   } finally {

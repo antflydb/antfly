@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{issueReadLease,readLeaseRemaining}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs";
 import {normalizeReadHints,decodeReadHints} from "./publication-read-hints.mjs";
 import {unsupportedRpc} from "./performance.mjs";
 import {ObjectStoreError} from "../../zig/lib/objectstore/wasm/r2.mjs";
@@ -31,7 +32,7 @@ export async function openReadView(store,namespace,{version,trace_id,immutable}=
  const keys=await metadataKeys(namespace);
  return store.transaction(tx=>captureReadView(tx,keys,{version,immutable},now),{traceId:trace_id});
 }
-export async function captureReadView(tx,keys,{version,immutable=true}={},now=Date.now){
+export async function captureReadView(tx,keys,{version,immutable=true,read_lease_policy,lease_observed_at_ms}={},now=Date.now){
   const values=await tx.getMany([keys.head,keys.wal,keys.floor,...(immutable&&keys.hints?[keys.hints]:[])]);
   const head=values[0]?text.decode(values[0].body).trim():"0";
   const selected=version??head;
@@ -47,23 +48,26 @@ export async function captureReadView(tx,keys,{version,immutable=true}={},now=Da
    entries.push([key,pin]);
   }
   const hints=immutable?decodeReadHints(keys.namespace,selected,values[3]):null;
-  return {format:1,version:selected,entries,...(hints?{immutable:hints.records}:{})};
+  const view={format:1,version:selected,entries,...(hints?{immutable:hints.records}:{})};
+  return immutable?issueReadLease(view,{scope:keys.wal.match(/wal-v1\/([a-f0-9]{64})\/HEAD$/)?.[1],walKey:keys.wal,pinPrefix:keys.progress+"READ_PINS/",policy:read_lease_policy,observedAt:lease_observed_at_ms,now:now()}):view;
 
 }
-// One operation owns this view. Its native deadline bounds use of captured WAL
-// roots inside the collector's grace period. Never share it across requests.
+// Ordinary views belong to one operation. Explicit leases permit bounded fenced
+// reuse; every transport remains guarded by the original collector deadline.
 export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},initial,admittedAt=performance.now()}={}){
  const mapView=view=>{if(view.format!==1)throw new Error("InvalidReadView");return {records:new Map(view.entries),immutable:new Map(normalizeReadHints(namespace,view.version,{version:view.version,records:view.immutable})?.records??[])};};
  let pending=initial?Promise.resolve(mapView(initial)):null,hint;const started=admittedAt;
  const progress=`antfly/progress/${namespace}/`,manifest=`antfly/manifests/${namespace}/manifests/`;
+ const lease=initial?.lease;const checkLease=()=>{if(lease&&readLeaseRemaining(initial)<=0)throw new ObjectStoreError(8,"read lease expired");};
  return async(request,body)=>{
+  checkLease();
   if(request.op==="get"&&request.key?.startsWith(manifest)){
    const name=request.key.slice(manifest.length);if(/^[0-9]+\.bin$/.test(name))hint=name.slice(0,-4);
   }
   if((request.op==="get"||request.op==="head")&&(request.key?.startsWith(progress)||/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key??""))){
    if(performance.now()-started>=30000)throw new ObjectStoreError(8,"read view deadline exceeded");
    pending??=coordinator.openReadView(hint==null?{}:{version:hint}).then(mapView).catch(error=>{if(unsupportedRpc(error,"openReadView"))return null;throw error;});
-   const records=(await pending)?.records;
+   const records=(await pending)?.records;checkLease();
    if(records?.has(request.key)){
     const record=records.get(request.key);onMetrics({snapshot_reads:1});
     if(!record)throw new ObjectStoreError(1,"snapshot object not found");
@@ -73,7 +77,7 @@ export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},i
    }
   }
   if((request.op==="get"||request.op==="head")&&pending&&(request.bucket==null||request.bucket==="database")){
-   const record=(await pending)?.immutable.get(request.key);
+   const record=(await pending)?.immutable.get(request.key);checkLease();
    if(record){
     if(performance.now()-started>=30000)throw new ObjectStoreError(8,"read view deadline exceeded");
     if(request.if_match_etag!=null&&request.if_match_etag!==record.etag)throw new ObjectStoreError(2,"immutable hint condition failed");
@@ -83,6 +87,6 @@ export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},i
     onMetrics({snapshot_immutable_reads:1});return{json:{bucket:request.bucket,key:request.key,etag:record.etag,content_length:record.body.byteLength,content_type:record.contentType},body:request.op==="get"?bytes.slice():undefined};
    }
   }
-  return transport(request,body);
+  const result=await transport(request,body);checkLease();return result;
  };
 }

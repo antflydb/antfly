@@ -158,7 +158,8 @@ pub const Log = struct {
             if (recorded.kind != .commit or !same(recorded.state, state)) return error.InvalidImmutableLog;
         }
     }
-    /// Metadata allocations belong to the caller's bounded request arena.
+    /// Only the final cursor belongs to the caller. Recovery reuses a bounded
+    /// scratch arena rather than retaining every decoded frame in that arena.
     pub fn recover(self: Log, a: A, cursor: ?State, takeover: bool) !Recovery {
         return self.recoverMode(a, cursor, takeover, false, false);
     }
@@ -173,7 +174,11 @@ pub const Log = struct {
     pub fn observeCommitted(self: Log, a: A, cursor: ?State) !Recovery {
         return self.recoverMode(a, cursor, false, true, true);
     }
-    fn recoverMode(self: Log, a: A, cursor: ?State, takeover: bool, read_only: bool, follow_owners: bool) !Recovery {
+    fn recoverMode(self: Log, result_alloc: A, cursor: ?State, takeover: bool, read_only: bool, follow_owners: bool) !Recovery {
+        var scratch = std.heap.ArenaAllocator.init(result_alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var root_buffer: [max_root_bytes]u8 = undefined;
         var state = cursor orelse State{};
         try validate(state);
         const checkpoint_value = try self.checkpoint(a);
@@ -182,6 +187,11 @@ pub const Log = struct {
         };
         try self.authenticate(a, state, checkpoint_value);
         for (0..max_steps) |_| {
+            // The root is the only variable-sized field crossing a recovery
+            // step. Copy it before resetting JSON bodies, parse arenas and keys.
+            std.mem.copyForwards(u8, root_buffer[0..state.root.len], state.root);
+            state.root = root_buffer[0..state.root.len];
+            _ = scratch.reset(.retain_capacity);
             if (!follow_owners and !takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
             if (self.cancellation) |token| try token.check();
             const sealed_key = try self.key(a, state.epoch, null);
@@ -215,9 +225,11 @@ pub const Log = struct {
                 _ = self.writeCheckpoint(a, state, true) catch false;
             }
             if (!read_only and state.next == epoch_commits) state = try self.seal(a, state, self.owner);
+            state.root = try result_alloc.dupe(u8, state.root);
             return .{ .state = state };
         }
         if (!follow_owners and !takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
+        state.root = try result_alloc.dupe(u8, state.root);
         return .{ .state = state, .has_more = true };
     }
     fn seal(self: Log, a: A, source: State, owner: [16]u8) !State {
@@ -517,4 +529,30 @@ test "immutable log partial epoch announcement batches recover from the accepted
     try std.testing.expectEqual(observed.state.revision, repaired.revision);
     _ = try log.append(m, repaired, "recovered");
     try std.testing.expectEqualStrings("recovered", (try log.observeCommitted(m, null)).state.root);
+}
+
+test "immutable log recovery bounds scratch memory across a full tail of large roots" {
+    const a = std.testing.allocator;
+    var writer_arena = std.heap.ArenaAllocator.init(a);
+    defer writer_arena.deinit();
+    const m = writer_arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    const log = Log{ .client = client, .bucket = "db", .prefix = "bounded", .owner = @splat(1), .io = std.testing.io };
+    var state = (try log.recover(m, null, true)).state;
+    // Keep the initial checkpoint while simulating a long-lived writer.
+    var root: [max_root_bytes]u8 = @splat('r');
+    root[0] = '"';
+    for (0..63) |_| state = try log.append(m, state, &root);
+    var buffer: [256 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    const observed = try log.observeCommitted(bounded.allocator(), null);
+    try std.testing.expect(!observed.has_more);
+    try std.testing.expectEqual(state.revision, observed.state.revision);
+    try std.testing.expectEqualStrings(state.root, observed.state.root);
+    // Output owns its root after scratch teardown, including escaped JSON.
+    try std.testing.expectEqual(@as(u8, '"'), observed.state.root[0]);
+    try std.testing.expect(bounded.end_index < buffer.len);
 }

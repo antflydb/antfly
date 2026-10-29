@@ -14,23 +14,26 @@
 // limitations under the License.
 
 import{unsupportedRpc}from"./performance.mjs";
+import{bindReadLease,readLeaseRemaining}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs";
 
-// This view belongs to one admitted request. Preparation may overlap queued
-// native work, but neither its admission time nor its deadline is reset.
+// Latest reads always authenticate fresh metadata. An explicit minimum fence
+// may use a certified snapshot without resetting its original GC deadline.
 export async function prepareReadAdmission(env,input,trace,readViews,{background,onPrepared,onAdmitted,deadlineMs}={}){
  if(env.COORDINATOR_BACKEND!=="r2"||input.cursor||!["lookup","list","count","search","status","latest"].includes(input.op))return;
- const physical={rpc_calls:0},started=performance.now();let admission;
- const options={trace_id:trace.id,...(deadlineMs!==undefined?{deadlineMs}:{}),...(input.exact_state?{version:input.exact_state.generation}:{})};
+ const physical={rpc_calls:0},started=performance.now(),wallStarted=Date.now();let admission;
+ const options={trace_id:trace.id,required_visibility:input.required_visibility,allow_cached:env.FENCED_READ_LEASES!=="false"&&input.fresh!==true&&!input.exact_state&&['lookup','list','count','search'].includes(input.op)&&typeof input.required_visibility==='string',...(deadlineMs!==undefined?{deadlineMs}:{}),...(input.exact_state?{version:input.exact_state.generation}:{})};
+ const onLease=sample=>Object.assign(physical,sample);
+ const admitted=view=>{const result={view,started,physical,invalidate:()=>readViews?.invalidate?.()};if(bindReadLease(view,{started})){const remaining=readLeaseRemaining(view);result.deadlineMs=Math.min(deadlineMs??Infinity,wallStarted+30000,Date.now()+remaining);result.confirm=token=>{if(readLeaseRemaining(view)<=0)throw Error('ManifestReadLeaseExpired');readViews?.confirm?.(view,token);};}return result;};
+ const rpc=async()=>{onAdmitted?.();physical.rpc_calls++;return trace.span('rpc:openReadView',()=>env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView(options));};
  try{
   let view;
   if(readViews&&env.READ_ONLY_SNAPSHOTS!=="false"){
-   try{view=await trace.span("native:openReadView",()=>readViews.open({...options,background,onAdmitted,onPrepared:view=>{physical.read_admission_ready_ms=performance.now()-started;onPrepared?.({view,started,physical});}}));physical.native_metadata_views=1;}
-   catch(error){if(!/^(ReadSnapshotNeeds(?:Admission|Pin)|CoordinatorAuthorityMissing|CoordinatorRecovering)$/.test(error?.message))throw error;}
-  }
-  if(!view){onAdmitted?.();physical.rpc_calls++;view=await trace.span("rpc:openReadView",()=>env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView(options));}
-  physical.read_admission_immutable_hints=view.immutable?.length??0;
-  admission={view,started,physical};
- }catch(error){if(!unsupportedRpc(error,"openReadView"))throw error;admission={legacy:true,started,physical};}
+   try{view=await trace.span('native:openReadView',()=>readViews.open({...options,background,onAdmitted,onLease,onPrepared:view=>{physical.read_admission_ready_ms=performance.now()-started;onPrepared?.(admitted(view));}}));physical.native_metadata_views=1;}
+   catch(error){if(!/^(ReadSnapshotNeeds(?:Admission|Pin)|CoordinatorAuthorityMissing|CoordinatorRecovering)$/.test(error?.message))throw error;physical.read_admission_fallback_reason=error.message;}
+  }else physical.read_admission_fallback_reason=env.READ_ONLY_SNAPSHOTS==='false'?'ReadSnapshotsDisabled':'LocalReadObserverUnavailable';
+  if(!view)view=readViews?.admit?await readViews.admit({...options,onLease},rpc):await rpc();
+  physical.read_admission_immutable_hints=view.immutable?.length??0;admission=admitted(view);
+ }catch(error){if(!unsupportedRpc(error,'openReadView'))throw error;physical.read_admission_fallback_reason='LegacyReadViewUnsupported';admission={legacy:true,started,physical};}
  physical.read_admission_ms=performance.now()-started;
  if(physical.rpc_calls)physical.rpc_wait_ms=physical.read_admission_ms;
  return admission;

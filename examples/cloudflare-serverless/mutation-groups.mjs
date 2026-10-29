@@ -18,7 +18,7 @@ import {reserveInput} from "./request-pool.mjs";
 // A bounded admission queue. The timer lets concurrently arriving RPCs share
 // one native update; callers are resolved only after its durable commit.
 export class MutationGroups {
-  constructor(commit,{clock=Date.now}={}) { this.clock=clock;this.commit=commit;this.queue=[];this.bytes=0;this.pending=0;this.running=false; }
+  constructor(commit,{clock=Date.now,monotonic=()=>performance.now()}={}) { this.clock=clock;this.monotonic=monotonic;this.commit=commit;this.queue=[];this.bytes=0;this.pending=0;this.running=false; }
   submit(input) {
     const bytes=new TextEncoder().encode(JSON.stringify(input)).byteLength;
     if(bytes>1024*1024)throw new Error("RequestTooLarge");
@@ -28,7 +28,7 @@ export class MutationGroups {
     return new Promise((resolve,reject)=>{
       let admit;const ready=new Promise(start=>admit=start);
       ready.then(async owner=>{if(!owner)return;await new Promise(start=>setTimeout(start,2));await this.drain();});
-      this.queue.push({input,bytes,resolve:value=>{admit(false);resolve(value);},reject:error=>{admit(false);reject(error);},startGroup:()=>admit(true),release,deadline:this.clock()+30000});this.schedule();
+      this.queue.push({input,bytes,submitted:this.monotonic(),resolve:value=>{admit(false);resolve(value);},reject:error=>{admit(false);reject(error);},startGroup:()=>admit(true),release,deadline:this.clock()+30000});this.schedule();
     });
   }
   schedule(){if(!this.running&&this.queue.length){this.running=true;this.queue[0].startGroup();}}
@@ -38,7 +38,7 @@ export class MutationGroups {
     const expire=()=>{for(const item of expired){this.pending--;this.bytes-=item.bytes;item.release();item.reject(new Error("DeadlineExceeded"));}};
     if(!group.length){this.running=false;this.schedule();expire();return;}
     const settle=async items=>{
-      try{const results=await this.commit(items.map(item=>item.input),Math.min(...items.map(item=>item.deadline)));if(results.length!==items.length)throw new Error("InvalidMutationGroupResults");return results.map(value=>({value}));}
+      try{const results=await this.commit(items.map(item=>item.input),Math.min(...items.map(item=>item.deadline)),{queue_wait_ms:Math.max(...items.map(item=>Math.max(0,this.monotonic()-item.submitted)))});if(results.length!==items.length)throw new Error("InvalidMutationGroupResults");return results.map(value=>({value}));}
       catch(error){if(items.length>1&&/WalIdempotencyConflict|InvalidDocumentMutation|InvalidWalOperationId|InvalidWalBatch|WalRecordTooLarge|GraphPageRecordTooLarge|SyntaxError|UnexpectedToken|UnexpectedEndOfInput|InvalidCharacter|InvalidNumber|MissingField|UnknownField|Overflow/.test(String(error))){const results=[];for(const item of items)results.push(...await settle([item]));return results;}return items.map(()=>({error}));}
     };
     const results=await settle(group);
