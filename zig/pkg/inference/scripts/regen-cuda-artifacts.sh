@@ -440,9 +440,6 @@ required_symbols=(
   termite_linear_q4_0_bias_add_f32_tc_hmma
   termite_linear_q4_0_f32_tc_hmma_bf16
   antfly_linear_q4_0_bf16_staged
-  termite_linear_q4_0_bias_f32_tc_hmma_bf16
-  termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16
-  termite_linear_q4_0_bias_add_f32_tc_hmma_bf16
   termite_activation_multiply_fused_gate_up_f32
   termite_rms_norm_add_weighted_embedding_i32_q6_k_f32
   termite_rms_norm_f32_bf16
@@ -515,11 +512,25 @@ required_symbols=(
   antfly_q4_0_down_q8_1_mmv_v1
 )
 
+# These BF16 epilogues had no host launch slots. Keep them out of every
+# canonical image; the reachable no-bias BF16 and FP16 epilogues remain.
+retired_symbols=(
+  termite_linear_q4_0_bias_f32_tc_hmma_bf16
+  termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16
+  termite_linear_q4_0_bias_add_f32_tc_hmma_bf16
+)
+
 check_required_symbols() {
   local file="$1"
   for symbol in "${required_symbols[@]}"; do
     if ! grep -a -q "$symbol" "$file"; then
       printf 'error: generated CUDA artifact is missing symbol %s\n' "$symbol" >&2
+      exit 1
+    fi
+  done
+  for symbol in "${retired_symbols[@]}"; do
+    if grep -a -q "$symbol" "$file"; then
+      printf 'error: generated CUDA artifact retains retired symbol %s\n' "$symbol" >&2
       exit 1
     fi
   done

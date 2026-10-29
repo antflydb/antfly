@@ -2201,6 +2201,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return compute;
     }
 
+    fn pipelineFormatBit(tensor_type: gguf_tensor_types.TensorType) ?u16 {
+        const known = switch (tensor_type) {
+            .known => |kind| kind,
+            .bitnet_tl2 => return 0, // Non-generated families are always prepared.
+            .unknown => return null,
+        };
+        inline for (std.meta.tags(graph_quant_matmul.GeneratedQuantFormatIndex)) |format| {
+            if (std.ascii.eqlIgnoreCase(@tagName(known), @tagName(format))) {
+                return @as(u16, 1) << @intCast(@backingInt(format));
+            }
+        }
+        return 0;
+    }
+
+    /// Use complete store metadata, never the narrower JIT linear-operation
+    /// scope. Dense weights may stage to Q8_0 after construction.
+    fn modelPipelineFormats(data: *WeightStore, options: metal_runtime.MetalJitOptions) ?u16 {
+        if (options.config.mode.compiles() or options.config.profile_capture_only or options.config.qualified_profile_path != null) return null;
+        const store = data.tensor_store orelse return null;
+        var formats = pipelineFormatBit(.{ .known = .Q8_0 }).?;
+        if (store.kind() == .gguf) {
+            const file = store.ggufFile() orelse return null;
+            for (file.tensors) |tensor| formats |= pipelineFormatBit(tensor.tensor_type) orelse return null;
+        }
+        var entries = data.lazy_weights.valueIterator();
+        while (entries.next()) |entry| {
+            if (entry.quantized_storage) |storage| {
+                formats |= pipelineFormatBit(storage.tensor_type) orelse return null;
+            } else if (store.kind() != .gguf and entry.tensor_ref.quantized) return null;
+        }
+        return formats;
+    }
+
     /// Initialize directly in the caller's allocation. Embedded callers may
     /// have small foreign-language stacks, so do not pass the large context
     /// through several value-returning initialization frames.
@@ -2217,7 +2250,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (io == null and !builtin.is_test and comptime false) {
             const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(provider_impl);
-            provider_impl.* = try MetalNativeProvider.createWithKernelJitOptions(kernel_jit_options);
+            provider_impl.* = try MetalNativeProvider.createWithKernelJitOptionsAndPipelineFormats(kernel_jit_options, modelPipelineFormats(data, kernel_jit_options));
             self.* = .{
                 .allocator = allocator,
                 .data = data,
@@ -2235,7 +2268,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const provider_impl = data.shared_metal_native_provider orelse blk: {
             const created = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(created);
-            created.* = try MetalNativeProvider.createWithKernelJitOptions(kernel_jit_options);
+            created.* = try MetalNativeProvider.createWithKernelJitOptionsAndPipelineFormats(kernel_jit_options, modelPipelineFormats(data, kernel_jit_options));
             data.shared_metal_native_provider = created;
             break :blk created;
         };
@@ -25632,6 +25665,120 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return false;
     }
 
+    // These are existing execution contracts, specialized at compile time.
+    // Gathered F32 never attempts BF16 or opens a planned compute scope.
+    const GatedFfnPhaseMode = enum { gathered_f32, planned_mixed, staged_mixed };
+    const GatedFfnPhaseRequest = struct {
+        gate_slot: usize,
+        up_slot: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        activation: ops.DecoderRuntimeActivationKind,
+    };
+    const GatedFfnProducts = struct {
+        gate: MetalTensor = .empty,
+        up: MetalTensor = .empty,
+        activated: MetalTensor = .empty,
+        gated: MetalTensor = .empty,
+
+        fn releaseInputs(self: *@This()) void {
+            self.activated.deinit();
+            self.activated = .empty;
+            self.up.deinit();
+            self.up = .empty;
+            self.gate.deinit();
+            self.gate = .empty;
+        }
+        fn deinit(self: *@This()) void {
+            self.gated.deinit();
+            self.gated = .empty;
+            self.releaseInputs();
+        }
+    };
+
+    fn missingGatedFfnPhase(comptime mode: GatedFfnPhaseMode, layer: usize, request: GatedFfnPhaseRequest, comptime reason: []const u8) ?GatedFfnProducts {
+        if (mode == .planned_mixed and traceQuantBlockRequested()) std.debug.print(
+            "metal-prefill-staged-null layer={d} reason=" ++ reason ++ " slot_a={d} slot_b={d} hidden={d} intermediate={d}\n",
+            .{ layer, request.gate_slot, request.up_slot, request.hidden_size, request.intermediate_size },
+        );
+        return null;
+    }
+
+    fn runGatedFfnPhaseMt(
+        self: *MetalCompute,
+        comptime mode: GatedFfnPhaseMode,
+        request: GatedFfnPhaseRequest,
+        input: MetalTensor,
+        layer: usize,
+        block_scope: bool,
+    ) !?GatedFfnProducts {
+        if (mode != .gathered_f32) {
+            if (try metal_runtime.decoderRuntimeTryApplyBf16GateUp(self.provider_impl, .{
+                .gate_slot = request.gate_slot,
+                .up_slot = request.up_slot,
+                .input = input,
+                .in_dim = request.hidden_size,
+                .out_dim = request.intermediate_size,
+                .activation = request.activation,
+            })) |gated| return .{ .gated = gated };
+        }
+        var products = GatedFfnProducts{};
+        var transferred = false;
+        defer if (!transferred) products.deinit();
+        const rows: usize = @intCast(input.dim(0));
+        {
+            const scope = if (mode != .planned_mixed or block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .ffn);
+            defer self.endActivePlannedComputeScope(scope);
+            const pair = if (mode == .staged_mixed or rows == 1)
+                try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
+                    .slot_a = request.gate_slot,
+                    .slot_b = request.up_slot,
+                    .input = input,
+                    .in_dim = request.hidden_size,
+                    .out_dim = request.intermediate_size,
+                })
+            else
+                null;
+            if (pair) |value| {
+                products.gate = value.first;
+                products.up = value.second;
+            } else if (mode != .staged_mixed and rows == 1) {
+                return missingGatedFfnPhase(mode, layer, request, "ffn-pair");
+            } else {
+                products.gate = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = request.gate_slot,
+                    .input = input,
+                    .in_dim = request.hidden_size,
+                    .out_dim = request.intermediate_size,
+                })) orelse return missingGatedFfnPhase(mode, layer, request, "ffn-gate-linear");
+                products.up = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = request.up_slot,
+                    .input = input,
+                    .in_dim = request.hidden_size,
+                    .out_dim = request.intermediate_size,
+                })) orelse return missingGatedFfnPhase(mode, layer, request, "ffn-up-linear");
+            }
+        }
+        {
+            const scope = if (mode != .planned_mixed or block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.ffn, .ffn);
+            defer self.endActivePlannedComputeScope(scope);
+            products.activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+                .input = products.gate,
+                .kind = request.activation,
+                .dim = request.intermediate_size,
+            }, &self.timing_stats)) orelse return missingGatedFfnPhase(mode, layer, request, "ffn-activation");
+            if (mode == .planned_mixed) self.activePlannedComputeBarrier(scope or block_scope);
+            products.gated = (try metal_runtime.decoderRuntimeApplyMultiply(
+                self.provider_impl,
+                products.activated,
+                products.up,
+                request.intermediate_size,
+            )) orelse return missingGatedFfnPhase(mode, layer, request, "ffn-multiply");
+        }
+        transferred = true;
+        return products;
+    }
+
     fn finishGatedDecoderBlockFromAttentionOutputMt(
         self: *MetalCompute,
         request: *const ops.RunGatedDecoderBlockRequest,
@@ -25808,104 +25955,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return tensor;
         }
 
-        var gated = (try metal_runtime.decoderRuntimeTryApplyBf16GateUp(self.provider_impl, .{
+        var products = (try self.runGatedFfnPhaseMt(.planned_mixed, .{
             .gate_slot = request.gate_ffn_linear_slot,
             .up_slot = request.up_ffn_linear_slot,
-            .input = ffn_normed,
-            .in_dim = request.hidden_size,
-            .out_dim = request.intermediate_size,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
             .activation = request.activation,
-        })) orelse fallback: {
-            const ffn_rows = @as(usize, @intCast(ffn_normed.dim(0)));
-            var gate_proj: MetalTensor = undefined;
-            var up_proj: MetalTensor = undefined;
-            {
-                const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .ffn);
-                defer self.endActivePlannedComputeScope(ffn_scope);
-                if (ffn_rows == 1) {
-                    const gate_up = (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
-                        .slot_a = request.gate_ffn_linear_slot,
-                        .slot_b = request.up_ffn_linear_slot,
-                        .input = ffn_normed,
-                        .in_dim = request.hidden_size,
-                        .out_dim = request.intermediate_size,
-                    })) orelse {
-                        if (trace_quant) std.debug.print(
-                            "metal-prefill-staged-null layer={d} reason=ffn-pair slot_a={d} slot_b={d} hidden={d} intermediate={d}\n",
-                            .{ attention_layer_index, request.gate_ffn_linear_slot, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size },
-                        );
-                        return null;
-                    };
-                    gate_proj = gate_up.first;
-                    up_proj = gate_up.second;
-                } else {
-                    gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                        .slot = request.gate_ffn_linear_slot,
-                        .input = ffn_normed,
-                        .in_dim = request.hidden_size,
-                        .out_dim = request.intermediate_size,
-                    })) orelse {
-                        if (trace_quant) std.debug.print(
-                            "metal-prefill-staged-null layer={d} reason=ffn-gate-linear slot={d} hidden={d} intermediate={d} rows={d}\n",
-                            .{ attention_layer_index, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size, ffn_rows },
-                        );
-                        return null;
-                    };
-                    errdefer gate_proj.deinit();
-                    up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                        .slot = request.up_ffn_linear_slot,
-                        .input = ffn_normed,
-                        .in_dim = request.hidden_size,
-                        .out_dim = request.intermediate_size,
-                    })) orelse {
-                        if (trace_quant) std.debug.print(
-                            "metal-prefill-staged-null layer={d} reason=ffn-up-linear slot={d} hidden={d} intermediate={d} rows={d}\n",
-                            .{ attention_layer_index, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size, ffn_rows },
-                        );
-                        gate_proj.deinit();
-                        return null;
-                    };
-                }
-            }
-            defer gate_proj.deinit();
-            defer up_proj.deinit();
-
-            var activated: MetalTensor = undefined;
-            var gated_fallback: MetalTensor = undefined;
-            {
-                const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.ffn, .ffn);
-                defer self.endActivePlannedComputeScope(ffn_scope);
-                activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
-                    .input = gate_proj,
-                    .kind = request.activation,
-                    .dim = request.intermediate_size,
-                }, &self.timing_stats)) orelse {
-                    if (trace_quant) std.debug.print(
-                        "metal-prefill-staged-null layer={d} reason=ffn-activation intermediate={d}\n",
-                        .{ attention_layer_index, request.intermediate_size },
-                    );
-                    return null;
-                };
-                errdefer activated.deinit();
-                self.activePlannedComputeBarrier(ffn_scope or block_scope);
-                gated_fallback = (try metal_runtime.decoderRuntimeApplyMultiply(
-                    self.provider_impl,
-                    activated,
-                    up_proj,
-                    request.intermediate_size,
-                )) orelse {
-                    if (trace_quant) std.debug.print(
-                        "metal-prefill-staged-null layer={d} reason=ffn-multiply intermediate={d}\n",
-                        .{ attention_layer_index, request.intermediate_size },
-                    );
-                    activated.deinit();
-                    return null;
-                };
-            }
-            defer activated.deinit();
-            break :fallback gated_fallback;
-        };
-        defer gated.deinit();
+        }, ffn_normed, attention_layer_index, block_scope)) orelse return null;
+        defer products.deinit();
+        products.releaseInputs();
+        const gated = products.gated;
 
         var down: MetalTensor = undefined;
         {
@@ -26798,51 +26857,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             };
         }
 
-        const ffn_rows = @as(usize, @intCast(ffn_normed.dim(0)));
-        var gate_proj: MetalTensor = undefined;
-        var up_proj: MetalTensor = undefined;
-        if (ffn_rows == 1) {
-            const gate_up = (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
-                .slot_a = request.gate_ffn_linear_slot,
-                .slot_b = request.up_ffn_linear_slot,
-                .input = ffn_normed,
-                .in_dim = request.hidden_size,
-                .out_dim = request.intermediate_size,
-            })) orelse return null;
-            gate_proj = gate_up.first;
-            up_proj = gate_up.second;
-        } else {
-            gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                .slot = request.gate_ffn_linear_slot,
-                .input = ffn_normed,
-                .in_dim = request.hidden_size,
-                .out_dim = request.intermediate_size,
-            })) orelse return null;
-            errdefer gate_proj.deinit();
-            up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                .slot = request.up_ffn_linear_slot,
-                .input = ffn_normed,
-                .in_dim = request.hidden_size,
-                .out_dim = request.intermediate_size,
-            })) orelse return null;
-        }
-        defer gate_proj.deinit();
-        defer up_proj.deinit();
-
-        var activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
-            .input = gate_proj,
-            .kind = request.activation,
-            .dim = request.intermediate_size,
-        }, &self.timing_stats)) orelse return null;
-        defer activated.deinit();
-
-        var gated = (try metal_runtime.decoderRuntimeApplyMultiply(
-            self.provider_impl,
-            activated,
-            up_proj,
-            request.intermediate_size,
-        )) orelse return null;
-        defer gated.deinit();
+        var products = (try self.runGatedFfnPhaseMt(.gathered_f32, .{
+            .gate_slot = request.gate_ffn_linear_slot,
+            .up_slot = request.up_ffn_linear_slot,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
+            .activation = request.activation,
+        }, ffn_normed, attention.layer_index, false)) orelse return null;
+        defer products.deinit();
+        const gated = products.gated;
 
         var down = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
             .slot = request.down_ffn_linear_slot,
@@ -27629,62 +27652,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (rows == 0 or @as(usize, @intCast(input.dim(1))) != request.hidden_size) return null;
         if (@as(usize, @intCast(residual.dim(0))) != rows or @as(usize, @intCast(residual.dim(1))) != request.hidden_size) return null;
 
-        var gated = (try metal_runtime.decoderRuntimeTryApplyBf16GateUp(self.provider_impl, .{
+        var products = (try self.runGatedFfnPhaseMt(.staged_mixed, .{
             .gate_slot = request.gate_linear_slot,
             .up_slot = request.up_linear_slot,
-            .input = input,
-            .in_dim = request.hidden_size,
-            .out_dim = request.intermediate_size,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
             .activation = request.activation,
-        })) orelse fallback: {
-            var gate_proj: MetalTensor = undefined;
-            var up_proj: MetalTensor = undefined;
-            if (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
-                .slot_a = request.gate_linear_slot,
-                .slot_b = request.up_linear_slot,
-                .input = input,
-                .in_dim = request.hidden_size,
-                .out_dim = request.intermediate_size,
-            })) |pair| {
-                gate_proj = pair.first;
-                up_proj = pair.second;
-            } else {
-                gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                    .slot = request.gate_linear_slot,
-                    .input = input,
-                    .in_dim = request.hidden_size,
-                    .out_dim = request.intermediate_size,
-                })) orelse return null;
-                errdefer gate_proj.deinit();
-                up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                    .slot = request.up_linear_slot,
-                    .input = input,
-                    .in_dim = request.hidden_size,
-                    .out_dim = request.intermediate_size,
-                })) orelse {
-                    gate_proj.deinit();
-                    return null;
-                };
-            }
-            defer gate_proj.deinit();
-            defer up_proj.deinit();
-
-            var activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
-                .input = gate_proj,
-                .kind = request.activation,
-                .dim = request.intermediate_size,
-            }, &self.timing_stats)) orelse return null;
-            defer activated.deinit();
-
-            const gated_fallback = (try metal_runtime.decoderRuntimeApplyMultiply(
-                self.provider_impl,
-                activated,
-                up_proj,
-                request.intermediate_size,
-            )) orelse return null;
-            break :fallback gated_fallback;
-        };
-        defer gated.deinit();
+        }, input, 0, false)) orelse return null;
+        defer products.deinit();
+        products.releaseInputs();
+        const gated = products.gated;
 
         var projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
             .slot = request.down_linear_slot,
@@ -50428,4 +50405,136 @@ fn recordLightOnStreamTopology(stats: *[3]u64, frames: *[2]u64, expected: u64, s
 fn lightOnReportedRowBit(rows: usize) u64 {
     if (rows == 0 or rows > 64) return 0;
     return @as(u64, 1) << @as(u6, @intCast(rows - 1));
+}
+
+test "Metal FFN phase policies preserve F32 output and intermediate lifetimes" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const hidden = 32;
+    const intermediate = 64;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var gate_weights: [hidden * intermediate]f32 = undefined;
+    var up_weights: [hidden * intermediate]f32 = undefined;
+    for (&gate_weights, &up_weights, 0..) |*gate, *up, i| {
+        gate.* = @sin(@as(f32, @floatFromInt(i)) * 0.37) * 0.02;
+        up.* = @cos(@as(f32, @floatFromInt(i)) * 0.23) * 0.02;
+    }
+    const gate = try cb.fromFloat32Shape(&gate_weights, &.{ intermediate, hidden });
+    defer cb.free(gate);
+    const up = try cb.fromFloat32Shape(&up_weights, &.{ intermediate, hidden });
+    defer cb.free(up);
+    const zero_bias = try cb.fromFloat32Shape(&@as([intermediate]f32, @splat(0)), &.{intermediate});
+    defer cb.free(zero_bias);
+    try std.testing.expect(try cb.decoderRuntimePrepareLinear(&.{ .slot = 0, .weight = gate, .bias = zero_bias, .in_dim = hidden, .out_dim = intermediate, .retain_dense_fallback = false }));
+    try std.testing.expect(try cb.decoderRuntimePrepareLinear(&.{ .slot = 1, .weight = up, .bias = zero_bias, .in_dim = hidden, .out_dim = intermediate, .retain_dense_fallback = false }));
+    // Default slot preparation may stage dense weights to Q8. This oracle
+    // requests original F32 storage explicitly instead of comparing Q8 weights
+    // against the unquantized source values.
+    try std.testing.expectEqual(.dense, compute.provider_impl.raw_linear_slot_kinds[0]);
+    try std.testing.expectEqual(.dense, compute.provider_impl.raw_linear_slot_kinds[1]);
+    const request = MetalCompute.GatedFfnPhaseRequest{ .gate_slot = 0, .up_slot = 1, .hidden_size = hidden, .intermediate_size = intermediate, .activation = .silu };
+    for ([_]usize{ 1, 3, 8 }) |rows| {
+        var values: [8 * hidden]f32 = undefined;
+        for (values[0 .. rows * hidden], 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.31);
+        const input_ct = try cb.fromFloat32Shape(values[0 .. rows * hidden], &.{ @intCast(rows), hidden });
+        defer cb.free(input_ct);
+        var input = try compute.ownedDeviceMetalTensorFromCt(input_ct);
+        defer input.deinit();
+        inline for (.{ MetalCompute.GatedFfnPhaseMode.gathered_f32, .planned_mixed, .staged_mixed }) |mode| {
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            defer cb.decoderRuntimeCancelFrame() catch {};
+            var products = (try compute.runGatedFfnPhaseMt(mode, request, input, 0, false)) orelse {
+                std.debug.print("FFN phase declined: mode={s} rows={d}\n", .{ @tagName(mode), rows });
+                return error.TestUnexpectedResult;
+            };
+            defer products.deinit();
+            try std.testing.expect(products.gated.isDevice());
+            try std.testing.expectEqual(rows * intermediate, products.gate.elemCount());
+            if (mode != .gathered_f32) {
+                products.releaseInputs();
+                try std.testing.expectEqual(@as(usize, 0), products.gate.elemCount());
+                try std.testing.expectEqual(@as(usize, 0), products.up.len);
+                try std.testing.expectEqual(@as(usize, 0), products.activated.len);
+            }
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            const actual = try products.gated.toHostSlice();
+            for (0..rows) |row| for (0..intermediate) |col| {
+                var expected_gate: f64 = 0;
+                var expected_up: f64 = 0;
+                for (0..hidden) |k| {
+                    expected_gate += @as(f64, values[row * hidden + k]) * gate_weights[col * hidden + k];
+                    expected_up += @as(f64, values[row * hidden + k]) * up_weights[col * hidden + k];
+                }
+                const expected = expected_gate / (1 + @exp(-expected_gate)) * expected_up;
+                std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual[row * intermediate + col], 1e-5) catch |err| {
+                    std.debug.print("FFN phase mismatch: mode={s} rows={d} row={d} column={d}\n", .{ @tagName(mode), rows, row, col });
+                    return err;
+                };
+            };
+        }
+        var missing_up = request;
+        missing_up.up_slot = 7;
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer cb.decoderRuntimeCancelFrame() catch {};
+        try std.testing.expectEqual(@as(?MetalCompute.GatedFfnProducts, null), try compute.runGatedFfnPhaseMt(.gathered_f32, missing_up, input, 0, false));
+        try cb.decoderRuntimeCancelFrame();
+    }
+}
+
+test "Metal pipeline census covers complete model metadata and preserves open-store preparation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const T = struct {
+        const store_mod = @import("../models/tensor_store.zig");
+        const format = @import("../gguf/format.zig");
+        const Context = struct { kind: store_mod.StoreKind, file: format.File };
+        fn kind(ptr: *anyopaque) store_mod.StoreKind {
+            return @as(*Context, @ptrCast(@alignCast(ptr))).kind;
+        }
+        fn file(ptr: *anyopaque) ?*const format.File {
+            return &@as(*Context, @ptrCast(@alignCast(ptr))).file;
+        }
+        // The census must never materialize or describe a tensor. Deliberately
+        // leave the unrelated I/O slots unavailable in this metadata fixture.
+        const vtable = blk: {
+            var table: store_mod.TensorStore.VTable = undefined;
+            table.kind = kind;
+            table.ggufFile = file;
+            break :blk table;
+        };
+    };
+    const a = std.testing.allocator;
+    var data = WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer data.lazy_weights.deinit(a);
+    try std.testing.expectEqual(@as(?u16, null), MetalCompute.modelPipelineFormats(&data, .{}));
+    var tensors = [_]T.format.TensorInfo{
+        .{ .name = "linear.weight", .dimensions = &.{}, .tensor_type = .{ .known = .Q4_0 }, .offset = 0, .data_offset = 0 },
+        // This tensor could be outside a linear-only JIT scope.
+        .{ .name = "embedding.weight", .dimensions = &.{}, .tensor_type = .{ .known = .Q6_K }, .offset = 0, .data_offset = 0 },
+    };
+    var context = T.Context{ .kind = .gguf, .file = .{ .header = undefined, .metadata = &.{}, .tensors = &tensors, .alignment = 32, .data_region_offset = 0 } };
+    data.tensor_store = .{ .ptr = &context, .vtable = &T.vtable };
+    const q8 = MetalCompute.pipelineFormatBit(.{ .known = .Q8_0 }).?;
+    const q4 = MetalCompute.pipelineFormatBit(.{ .known = .Q4_0 }).?;
+    const q6 = MetalCompute.pipelineFormatBit(.{ .known = .Q6_K }).?;
+    try std.testing.expectEqual(@as(?u16, q4 | q6 | q8), MetalCompute.modelPipelineFormats(&data, .{}));
+    tensors[1].tensor_type = .{ .unknown = 9999 };
+    try std.testing.expectEqual(@as(?u16, null), MetalCompute.modelPipelineFormats(&data, .{}));
+    context.kind = .safetensors;
+    try std.testing.expectEqual(@as(?u16, q8), MetalCompute.modelPipelineFormats(&data, .{}));
+    try std.testing.expectEqual(@as(?u16, null), MetalCompute.modelPipelineFormats(&data, .{ .config = .{ .mode = .shadow } }));
+    inline for (.{ gguf_tensor_types.KnownTensorType.Q2_K, .Q3_K, .Q4_0, .Q4_1, .Q4_K, .Q5_0, .Q5_1, .Q5_K, .Q6_K, .Q8_0, .Q8_1, .Q8_K }, 0..) |known, index| {
+        try std.testing.expectEqual(@as(?u16, @as(u16, 1) << @intCast(index)), MetalCompute.pipelineFormatBit(.{ .known = known }));
+    }
+    try data.lazy_weights.put(a, "custom.weight", .{ .tensor_ref = .{ .name = "custom.weight", .quantized = true } });
+    try std.testing.expectEqual(@as(?u16, null), MetalCompute.modelPipelineFormats(&data, .{}));
+    data.lazy_weights.getPtr("custom.weight").?.quantized_storage = .{ .tensor_type = .{ .known = .Q4_0 }, .shape = &.{}, .raw_bytes = &.{}, .allocator = a, .raw_owned = false };
+    try std.testing.expectEqual(@as(?u16, q4 | q8), MetalCompute.modelPipelineFormats(&data, .{}));
 }

@@ -15752,6 +15752,55 @@ const OwnedF32Output = struct {
     }
 };
 
+/// Grouped projection outputs keep the original all-shapes-before-all-buffers
+/// allocation order. Normal optional declines and errors retire the same owner.
+fn OwnedF32Outputs(comptime n: usize) type {
+    return struct {
+        compute: *CudaCompute,
+        shapes: [n]?[]i64 = @splat(null),
+        buffers: [n]buffer_mod.DeviceBuffer = @splat(.{}),
+        counts: [n]usize,
+
+        inline fn alloc2(compute: *CudaCompute, rows: usize, cols: [n]usize, counts: [n]usize) !@This() {
+            var result = @This(){ .compute = compute, .counts = counts };
+            errdefer result.deinit();
+            inline for (0..n) |i| result.shapes[i] = try allocShape2(compute.allocator, rows, cols[i]);
+            inline for (0..n) |i| result.buffers[i] = try allocDeviceBuffer(compute, counts[i] * @sizeOf(f32));
+            return result;
+        }
+
+        inline fn deinit(self: *@This()) void {
+            inline for (0..n) |reverse| self.buffers[n - 1 - reverse].free(&self.compute.ctx);
+            inline for (0..n) |reverse| {
+                const i = n - 1 - reverse;
+                if (self.shapes[i]) |shape| self.compute.allocator.free(shape);
+                self.shapes[i] = null;
+            }
+        }
+
+        /// Explicit fallback keeps its historical forward retirement order.
+        inline fn discard(self: *@This()) void {
+            inline for (&self.buffers) |*buffer| buffer.free(&self.compute.ctx);
+            inline for (&self.shapes) |*shape| {
+                if (shape.*) |value| self.compute.allocator.free(value);
+                shape.* = null;
+            }
+        }
+
+        inline fn intoExisting(self: *@This(), comptime i: usize, tensor: *CudaTensor) void {
+            tensor.* = .{ .buffer = self.buffers[i], .dtype = .f32, .shape = self.shapes[i].?, .elem_count = self.counts[i] };
+            self.shapes[i] = null;
+            self.buffers[i] = .{};
+        }
+
+        inline fn intoTensor(self: *@This(), comptime i: usize) !CT {
+            const tensor = try self.compute.allocator.create(CudaTensor);
+            self.intoExisting(i, tensor);
+            return tensor;
+        }
+    };
+}
+
 fn createTensor(
     self: *CudaCompute,
     device: buffer_mod.DeviceBuffer,
@@ -20528,24 +20577,11 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
 
     const q_count = try checkedMul(rows, q_out_dim);
     const kv_count = try checkedMul(rows, kv_out_dim);
-    const q_shape = try allocShape2(self.allocator, rows, q_out_dim);
-    var q_shape_owned = false;
-    errdefer if (!q_shape_owned) self.allocator.free(q_shape);
-    const k_shape = try allocShape2(self.allocator, rows, kv_out_dim);
-    var k_shape_owned = false;
-    errdefer if (!k_shape_owned) self.allocator.free(k_shape);
-    const v_shape = try allocShape2(self.allocator, rows, kv_out_dim);
-    var v_shape_owned = false;
-    errdefer if (!v_shape_owned) self.allocator.free(v_shape);
-    var q_device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
-    var q_device_owned = false;
-    errdefer if (!q_device_owned) q_device.free(&self.ctx);
-    var k_device = try allocDeviceBuffer(self, kv_count * @sizeOf(f32));
-    var k_device_owned = false;
-    errdefer if (!k_device_owned) k_device.free(&self.ctx);
-    var v_device = try allocDeviceBuffer(self, kv_count * @sizeOf(f32));
-    var v_device_owned = false;
-    errdefer if (!v_device_owned) v_device.free(&self.ctx);
+    var outputs = try OwnedF32Outputs(3).alloc2(self, rows, .{ q_out_dim, kv_out_dim, kv_out_dim }, .{ q_count, kv_count, kv_count });
+    defer outputs.deinit();
+    const q_device = outputs.buffers[0];
+    const k_device = outputs.buffers[1];
+    const v_device = outputs.buffers[2];
 
     var prefill_profile_scope = beginPrefillProfile(self, if (use_q4_0) .q4_qkv else if (use_bf16) .bf16_qkv else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
@@ -20848,17 +20884,11 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
         self.stats.launch_linear_qkv += 1;
     }
 
-    const q = try createTensor(self, q_device, q_shape, q_count);
-    q_shape_owned = true;
-    q_device_owned = true;
+    const q = try outputs.intoTensor(0);
     errdefer freeTensor(ctx, q);
-    const k = try createTensor(self, k_device, k_shape, kv_count);
-    k_shape_owned = true;
-    k_device_owned = true;
+    const k = try outputs.intoTensor(1);
     errdefer freeTensor(ctx, k);
-    const v = try createTensor(self, v_device, v_shape, kv_count);
-    v_shape_owned = true;
-    v_device_owned = true;
+    const v = try outputs.intoTensor(2);
     return .{ .first = q, .second = k, .third = v };
 }
 
@@ -20914,24 +20944,11 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
 
     if (isKnownQuant(weight_a_tensor, .Q4_K) and isKnownQuant(weight_b_tensor, .Q4_K) and isKnownQuant(weight_c_tensor, .Q4_K)) {
         const out_count = try checkedMul(rows, out_dim);
-        const shape_a = try allocShape2(self.allocator, rows, out_dim);
-        var shape_a_owned = false;
-        errdefer if (!shape_a_owned) self.allocator.free(shape_a);
-        const shape_b = try allocShape2(self.allocator, rows, out_dim);
-        var shape_b_owned = false;
-        errdefer if (!shape_b_owned) self.allocator.free(shape_b);
-        const shape_c = try allocShape2(self.allocator, rows, out_dim);
-        var shape_c_owned = false;
-        errdefer if (!shape_c_owned) self.allocator.free(shape_c);
-        var device_a = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-        var device_a_owned = false;
-        errdefer if (!device_a_owned) device_a.free(&self.ctx);
-        var device_b = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-        var device_b_owned = false;
-        errdefer if (!device_b_owned) device_b.free(&self.ctx);
-        var device_c = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-        var device_c_owned = false;
-        errdefer if (!device_c_owned) device_c.free(&self.ctx);
+        var outputs = try OwnedF32Outputs(3).alloc2(self, rows, .{ out_dim, out_dim, out_dim }, .{ out_count, out_count, out_count });
+        defer outputs.deinit();
+        const device_a = outputs.buffers[0];
+        const device_b = outputs.buffers[1];
+        const device_c = outputs.buffers[2];
         if (mxbaiQ4TiledVariant(rows, in_dim, out_dim)) |variant| {
             if (try launchQ4KTcHmmaTripleBias(
                 self,
@@ -20992,17 +21009,11 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
             self.dispatch_stats.note(self.allocator, .linear_triple, .q4_k, .q4_simt, .bias, tcUnavailableReason(), rows, in_dim, out_dim, 0);
         }
         self.stats.launch_linear += 1;
-        const first = try createTensor(self, device_a, shape_a, out_count);
-        shape_a_owned = true;
-        device_a_owned = true;
+        const first = try outputs.intoTensor(0);
         errdefer freeTensor(ctx, first);
-        const second = try createTensor(self, device_b, shape_b, out_count);
-        shape_b_owned = true;
-        device_b_owned = true;
+        const second = try outputs.intoTensor(1);
         errdefer freeTensor(ctx, second);
-        const third = try createTensor(self, device_c, shape_c, out_count);
-        shape_c_owned = true;
-        device_c_owned = true;
+        const third = try outputs.intoTensor(2);
         return .{ .first = first, .second = second, .third = third };
     }
 
@@ -21047,18 +21058,10 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     if (use_q4 and in_dim % 256 != 0) return error.InvalidShape;
 
     const out_count = try checkedMul(rows, out_dim);
-    const shape_a = try allocShape2(self.allocator, rows, out_dim);
-    var shape_a_owned = false;
-    errdefer if (!shape_a_owned) self.allocator.free(shape_a);
-    const shape_b = try allocShape2(self.allocator, rows, out_dim);
-    var shape_b_owned = false;
-    errdefer if (!shape_b_owned) self.allocator.free(shape_b);
-    var device_a = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-    var device_a_owned = false;
-    errdefer if (!device_a_owned) device_a.free(&self.ctx);
-    var device_b = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-    var device_b_owned = false;
-    errdefer if (!device_b_owned) device_b.free(&self.ctx);
+    var outputs = try OwnedF32Outputs(2).alloc2(self, rows, .{ out_dim, out_dim }, .{ out_count, out_count });
+    defer outputs.deinit();
+    const device_a = outputs.buffers[0];
+    const device_b = outputs.buffers[1];
 
     var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else if (use_q4_0) .q4_pair else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
@@ -21122,14 +21125,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable => {
                 self.stats.linear_pair_fallbacks += 1;
-                device_a.free(&self.ctx);
-                device_a_owned = true;
-                device_b.free(&self.ctx);
-                device_b_owned = true;
-                self.allocator.free(shape_a);
-                shape_a_owned = true;
-                self.allocator.free(shape_b);
-                shape_b_owned = true;
+                outputs.discard();
                 const first = try linearNoBias(ctx, input, weight_a, rows, in_dim, out_dim);
                 errdefer freeTensor(ctx, first);
                 const second = try linearNoBias(ctx, input, weight_b, rows, in_dim, out_dim);
@@ -21268,14 +21264,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
                 ) catch |err| switch (err) {
                     error.CudaKernelUnavailable => {
                         self.stats.linear_pair_fallbacks += 1;
-                        device_a.free(&self.ctx);
-                        device_a_owned = true;
-                        device_b.free(&self.ctx);
-                        device_b_owned = true;
-                        self.allocator.free(shape_a);
-                        shape_a_owned = true;
-                        self.allocator.free(shape_b);
-                        shape_b_owned = true;
+                        outputs.discard();
                         // The child projections own their profiling intervals.
                         if (prefill_profile_scope) |*scope| scope.end();
                         prefill_profile_scope = null;
@@ -21327,14 +21316,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
         ) catch |err| switch (err) {
             error.CudaKernelUnavailable => {
                 self.stats.linear_pair_fallbacks += 1;
-                device_a.free(&self.ctx);
-                device_a_owned = true;
-                device_b.free(&self.ctx);
-                device_b_owned = true;
-                self.allocator.free(shape_a);
-                shape_a_owned = true;
-                self.allocator.free(shape_b);
-                shape_b_owned = true;
+                outputs.discard();
                 const first = try linearNoBias(ctx, input, weight_a, rows, in_dim, out_dim);
                 errdefer freeTensor(ctx, first);
                 const second = try linearNoBias(ctx, input, weight_b, rows, in_dim, out_dim);
@@ -21346,13 +21328,9 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     }
 
     self.stats.launch_linear += 1;
-    const first = try createTensor(self, device_a, shape_a, out_count);
-    shape_a_owned = true;
-    device_a_owned = true;
+    const first = try outputs.intoTensor(0);
     errdefer freeTensor(ctx, first);
-    const second = try createTensor(self, device_b, shape_b, out_count);
-    shape_b_owned = true;
-    device_b_owned = true;
+    const second = try outputs.intoTensor(1);
     return .{ .first = first, .second = second };
 }
 
@@ -21619,18 +21597,15 @@ fn linearPairSpanQ4(
     if (tc_variant == null and !span_available) return null;
 
     const out_count = try checkedMul(rows, out_dim);
+    var transferred = false;
     const first_tensor = try self.allocator.create(CudaTensor);
-    errdefer self.allocator.destroy(first_tensor);
+    defer if (!transferred) self.allocator.destroy(first_tensor);
     const second_tensor = try self.allocator.create(CudaTensor);
-    errdefer self.allocator.destroy(second_tensor);
-    const first_shape = try allocShape2(self.allocator, rows, out_dim);
-    errdefer self.allocator.free(first_shape);
-    const second_shape = try allocShape2(self.allocator, rows, out_dim);
-    errdefer self.allocator.free(second_shape);
-    var first_device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-    errdefer first_device.free(&self.ctx);
-    var second_device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-    errdefer second_device.free(&self.ctx);
+    defer if (!transferred) self.allocator.destroy(second_tensor);
+    var outputs = try OwnedF32Outputs(2).alloc2(self, rows, .{ out_dim, out_dim }, .{ out_count, out_count });
+    defer outputs.deinit();
+    const first_device = outputs.buffers[0];
+    const second_device = outputs.buffers[1];
 
     const pair_op = spanQ4PairOp(mode);
     const pair_epilogue = spanQ4PairEpilogue(mode);
@@ -21698,18 +21673,9 @@ fn linearPairSpanQ4(
         self.dispatch_stats.note(self.allocator, pair_op, .q4_k, .q4_span_simt, pair_epilogue, span_fallback, rows, in_dim, out_dim, 0);
     }
 
-    first_tensor.* = .{
-        .buffer = first_device,
-        .dtype = .f32,
-        .shape = first_shape,
-        .elem_count = out_count,
-    };
-    second_tensor.* = .{
-        .buffer = second_device,
-        .dtype = .f32,
-        .shape = second_shape,
-        .elem_count = out_count,
-    };
+    outputs.intoExisting(0, first_tensor);
+    outputs.intoExisting(1, second_tensor);
+    transferred = true;
     return .{
         .first = first_tensor,
         .second = second_tensor,
@@ -31939,7 +31905,7 @@ test "CUDA immutable retention shares typed payload and metadata without GPU sub
 
 test "CUDA planned transfers reject host copies during capture before device submission" {
     var compute: CudaCompute = undefined;
-    compute.audio_scope = null;
+    compute.execution_scope = null;
     compute.debug_cuda_graph_capture_active = true;
     compute.debug_cuda_graph_capture_disabled = false;
     var tensor = CudaTensor{ .buffer = .{ .ptr = 4096, .len = 4 }, .dtype = .f32, .shape = @constCast(&[_]i64{1}), .elem_count = 1, .owns_buffer = false, .owns_shape = false, .physical_lease = @ptrFromInt(8) };
@@ -36225,4 +36191,138 @@ test "LightOnOCR3 CUDA burst readback retains admission source and unique pendin
     try fourth.copy(std.mem.sliceAsBytes(got[0..1]));
     try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -91))), got[0]);
     fourth.deinit();
+}
+
+test "CUDA grouped projection outputs retire optional declines and every partial transfer without a device" {
+    const Mock = struct {
+        var allocated: usize = 0;
+        var live: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn alloc(ptr: *driver_mod.CUdeviceptr, _: usize) callconv(.c) driver_mod.CUresult {
+            allocated += 1;
+            live += 1;
+            ptr.* = allocated * 256;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn free(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(live != 0);
+            live -= 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn init(a: std.mem.Allocator) CudaCompute {
+            allocated = 0;
+            live = 0;
+            var driver: driver_mod.CudaDriver = undefined;
+            driver.fns.cuCtxSetCurrent = current;
+            driver.fns.cuMemAlloc = alloc;
+            driver.fns.cuMemFree = free;
+            driver.fns.cuStreamIsCapturing = null;
+            return .{ .allocator = a, .kernels = .{}, .ctx = .{ .driver = driver, .device = 0, .ctx = @ptrFromInt(1), .stream = null, .info = .{} } };
+        }
+        fn release(self: *CudaCompute, ct: CT) void {
+            const tensor = tensorFromCt(ct);
+            tensor.buffer.free(&self.ctx);
+            self.allocator.free(tensor.shape);
+            self.allocator.destroy(tensor);
+        }
+        fn transfers(a: std.mem.Allocator) !void {
+            var self = init(a);
+            defer std.debug.assert(live == 0 and self.ctx.device_allocations.snapshot().live == 0);
+            var outputs = try OwnedF32Outputs(3).alloc2(&self, 2, .{ 2, 4, 6 }, .{ 4, 8, 12 });
+            defer outputs.deinit();
+            const first = try outputs.intoTensor(0);
+            defer release(&self, first);
+            const second = try outputs.intoTensor(1);
+            defer release(&self, second);
+            const third = try outputs.intoTensor(2);
+            defer release(&self, third);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, tensorFromCt(first).shape);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, tensorFromCt(second).shape);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 6 }, tensorFromCt(third).shape);
+            try std.testing.expectEqual(@as(usize, 16), tensorFromCt(first).buffer.len);
+            try std.testing.expectEqual(@as(usize, 32), tensorFromCt(second).buffer.len);
+            try std.testing.expectEqual(@as(usize, 48), tensorFromCt(third).buffer.len);
+        }
+        fn decline(a: std.mem.Allocator) !void {
+            var self = init(a);
+            defer std.debug.assert(live == 0 and self.ctx.device_allocations.snapshot().live == 0);
+            var input_shape = [_]i64{ 1, 4 };
+            var weight_shape = [_]i64{ 2, 4 };
+            var input = CudaTensor{ .buffer = .{ .ptr = 4096, .len = 16 }, .shape = &input_shape, .elem_count = 4, .dtype = .f32 };
+            var weight = CudaTensor{ .buffer = .{ .ptr = 8192, .len = 32 }, .shape = &weight_shape, .elem_count = 8, .dtype = .f32 };
+            // All symbols are absent. Admission succeeds, allocates Q/K/V,
+            // then the unavailable F32 fused kernel returns a normal null.
+            try std.testing.expectEqual(@as(?ops.LinearNoBiasTripleResult, null), try linearNoBiasQkv(&self, &input, &weight, &weight, &weight, 1, 4, 2, 2));
+            try std.testing.expectEqual(@as(usize, 3), allocated);
+            try std.testing.expectEqual(@as(usize, 0), live);
+        }
+        fn spanDecline(a: std.mem.Allocator) !void {
+            var self = init(a);
+            defer std.debug.assert(live == 0 and self.ctx.device_allocations.snapshot().live == 0);
+            var input_shape = [_]i64{ 1, 256 };
+            var weight_shape = [_]i64{ 256, 256 };
+            var bias_shape = [_]i64{256};
+            var input = CudaTensor{ .buffer = .{ .ptr = 4096, .len = 1024 }, .shape = &input_shape, .elem_count = 256, .dtype = .f32 };
+            var weight = CudaTensor{ .buffer = .{ .ptr = 8192, .len = 36864 }, .shape = &weight_shape, .elem_count = 65536, .dtype = .f32, .quant_type = .{ .known = .Q4_K } };
+            var bias = CudaTensor{ .buffer = .{ .ptr = 16384, .len = 1024 }, .shape = &bias_shape, .elem_count = 256, .dtype = .f32 };
+            try std.testing.expectEqual(@as(?ops.LinearPairResult, null), try linearPairSpanQ4(&self, &input, null, &weight, &bias, &weight, &bias, 1, 256, 256, .shared));
+            try std.testing.expectEqual(@as(usize, 2), allocated);
+            try std.testing.expectEqual(@as(usize, 0), live);
+        }
+    };
+    var guard = try TestEnvGuard.captureAndClear(std.testing.allocator, "ANTFLY_CUDA_DISABLE_FUSED_QKV");
+    defer guard.restore(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Mock.transfers, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Mock.decline, .{});
+    var variant_guard = try TestEnvGuard.captureAndClear(std.testing.allocator, "ANTFLY_CUDA_QMATMUL_VARIANT");
+    defer variant_guard.restore(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Mock.spanDecline, .{});
+    inline for (.{ @as(usize, 1), 17, 49 }) |limit| {
+        var self = Mock.init(std.testing.allocator);
+        try self.ctx.device_allocations.setLimit(limit);
+        try std.testing.expectError(error.ResourceLimitExceeded, OwnedF32Outputs(3).alloc2(&self, 2, .{ 2, 4, 6 }, .{ 4, 8, 12 }));
+        try std.testing.expectEqual(@as(usize, 0), Mock.live);
+        try std.testing.expectEqual(@as(usize, 0), self.ctx.device_allocations.snapshot().live);
+    }
+}
+
+test "CUDA grouped projection outputs preserve QKV values and release unavailable kernels on device" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    var guard = try TestEnvGuard.captureAndClear(std.testing.allocator, "ANTFLY_CUDA_DISABLE_FUSED_QKV");
+    defer guard.restore(std.testing.allocator);
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.temp_slot_config = .{};
+    const input = try fromFloat32ShapeOp(&compute, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 });
+    defer freeTensor(&compute, input);
+    const weight = try fromFloat32ShapeOp(&compute, &.{ 1, 0, -1, 0, 0, 1, 0, -1 }, &.{ 2, 4 });
+    defer freeTensor(&compute, weight);
+    const live = compute.ctx.device_allocations.snapshot().live;
+    {
+        const outputs = (try linearNoBiasQkv(&compute, input, weight, weight, weight, 2, 4, 2, 2)) orelse return error.TestUnexpectedResult;
+        const planes = [_]CT{ outputs.first, outputs.second, outputs.third };
+        defer for (planes) |ct| {
+            const tensor = tensorFromCt(ct);
+            freeCudaTensorStorageUncached(&compute, tensor);
+            compute.allocator.destroy(tensor);
+        };
+        for (planes, 0..) |ct, i| {
+            for (planes[0..i]) |previous| try std.testing.expect(tensorFromCt(previous).buffer.ptr != tensorFromCt(ct).buffer.ptr);
+            const actual = try toFloat32Op(&compute, ct, std.testing.allocator);
+            defer std.testing.allocator.free(actual);
+            try std.testing.expectEqualSlices(f32, &.{ -2, -2, -2, -2 }, actual);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, tensorFromCt(ct).shape);
+        }
+    }
+    try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+    const original = compute.kernels.linear_f32_qkv_nobias_tiled;
+    compute.kernels.linear_f32_qkv_nobias_tiled = null;
+    defer compute.kernels.linear_f32_qkv_nobias_tiled = original;
+    try std.testing.expectEqual(@as(?ops.LinearNoBiasTripleResult, null), try linearNoBiasQkv(&compute, input, weight, weight, weight, 2, 4, 2, 2));
+    try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+    const retained = try toFloat32Op(&compute, input, std.testing.allocator);
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, retained);
 }

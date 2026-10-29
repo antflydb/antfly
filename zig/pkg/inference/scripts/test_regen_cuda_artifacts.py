@@ -112,6 +112,23 @@ class RegenCudaArtifactsTest(unittest.TestCase):
                 self.assertEqual(native, wires, f"stale native wire layout: {symbol}")
         self.assertGreater(checked, 20)
 
+    def test_retired_unreachable_bf16_epilogues_have_no_source_slot_or_image(self) -> None:
+        source = (ARTIFACTS / "inference_cuda_kernels.cu").read_text()
+        slots = (ARTIFACTS.parent / "kernels.zig").read_text()
+        script = SCRIPT.read_text()
+        required = re.search(r"required_symbols=\(\n(.*?)\n\)", script, re.DOTALL).group(1).split()
+        for symbol in (
+            "termite_linear_q4_0_bias_f32_tc_hmma_bf16",
+            "termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16",
+            "termite_linear_q4_0_bias_add_f32_tc_hmma_bf16",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertNotIn(symbol, source)
+                self.assertNotRegex(slots, rf"(?m)^    {symbol.removeprefix('termite_')}: driver_mod.CUfunction")
+                self.assertNotIn(symbol, required)
+                for filename in ("inference_cuda_kernels.ptx", "inference_cuda_kernels.fatbin", "inference_cuda_kernels_sm89.cubin"):
+                    self.assertNotIn(symbol.encode(), (ARTIFACTS / filename).read_bytes())
+
     def test_artifact_modes_require_fresh_codegen_before_nvcc(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fake_zig = pathlib.Path(temporary) / "zig"

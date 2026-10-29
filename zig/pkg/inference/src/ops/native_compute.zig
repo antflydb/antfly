@@ -9013,48 +9013,17 @@ fn linearNoBiasQuantizedWithPolicy(
         if (storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
         switch (storage.tensor_type) {
             .known => |known| switch (known) {
-                .Q1_0 => return try typedDispatch(.Q1_0, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q4_0 => return try typedDispatch(.Q4_0, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q4_1 => return try typedDispatch(.Q4_1, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q5_0 => return try typedDispatch(.Q5_0, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q5_1 => return try typedDispatch(.Q5_1, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q8_1 => return try typedDispatch(.Q8_1, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q2_K => return try typedDispatch(.Q2_K, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q3_K => return try typedDispatch(.Q3_K, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q5_K => return try typedDispatch(.Q5_K, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q6_K => return try typedDispatch(.Q6_K, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .Q8_K => return try typedDispatch(.Q8_K, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .IQ4_NL => return try typedDispatch(.IQ4_NL, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
-                .IQ4_XS => return try typedDispatch(.IQ4_XS, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
+                inline .Q1_0, .Q4_0, .Q4_1, .Q5_0, .Q5_1, .Q8_1, .Q2_K, .Q3_K, .Q5_K, .Q6_K, .Q8_K, .IQ4_NL, .IQ4_XS => |kind| return try typedDispatch(kind, io, input, storage.raw_bytes, output, rows, in_dim, out_dim),
                 else => {}, // fall through to fn-ptr path below (e.g. I8_S)
             },
             else => {},
         }
     }
 
-    const dot_fn: *const fn ([]const f32, []const u8) f32 = switch (storage.tensor_type) {
-        .known => |known| switch (known) {
-            .Q1_0 => &dotQ1_0Block,
-            .Q4_0 => &dotQ4_0Block,
-            .Q4_1 => &dotQ4_1Block,
-            .Q5_0 => &dotQ5_0Block,
-            .Q5_1 => &dotQ5_1Block,
-            .Q8_0 => &dotQ8_0Block,
-            .Q8_1 => &dotQ8_1Block,
-            .Q2_K => &dotQ2_KBlock,
-            .Q3_K => &dotQ3_KBlock,
-            .Q4_K => &dotQ4_KBlock,
-            .Q5_K => &dotQ5_KBlock,
-            .Q6_K => &dotQ6_KBlock,
-            .Q8_K => &dotQ8_KBlock,
-            .I8_S => &dotI8SBlock,
-            .IQ4_NL => &dotIQ4NLBlock,
-            .IQ4_XS => &dotIQ4XSBlock,
-            else => return false,
-        },
-        .bitnet_tl2 => return false,
-        .unknown => return false,
-    };
+    const dot_fn = if (storage.tensor_type.eql(.{ .known = .I8_S }))
+        &dotI8SBlock
+    else
+        genericQuantPairDotFn(storage.tensor_type) orelse return false;
 
     if (storage.packed_expert) |packed_view| {
         try linearNoBiasPackedQuantized(input, storage, packed_view, output, rows, in_dim, out_dim, storage.tensor_type);
@@ -9064,6 +9033,69 @@ fn linearNoBiasQuantizedWithPolicy(
         try linearNoBiasQuantizedGeneric(io, input, storage.raw_bytes, output, rows, in_dim, out_dim, storage.tensor_type, dot_fn);
     }
     return true;
+}
+
+/// Fixed-cardinality host ownership for grouped projection admission and
+/// fallback. This never combines accumulator tiles or changes worker selection.
+fn NativeProjectionFamily(comptime n: usize) type {
+    return struct {
+        storage: [n]*const QuantizedStorage,
+        outputs: [n][]f32,
+        biases: [n]?[]const f32 = @splat(null),
+
+        inline fn admit(self: @This(), in_dim: usize, out_dim: usize) !bool {
+            inline for (1..n) |i| if (!self.storage[0].tensor_type.eql(self.storage[i].tensor_type)) return false;
+            inline for (self.storage) |storage| if (storage.packed_expert != null) return false;
+            inline for (self.storage) |storage| if (storage.shape.len != 2) return false;
+            inline for (self.storage) |storage| if (storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
+            inline for (self.biases) |bias| if (bias != null and bias.?.len < out_dim) return error.InvalidQuantizedLinearShape;
+            return true;
+        }
+
+        inline fn addBias(self: @This(), rows: usize, out_dim: usize) void {
+            inline for (0..n) |i| if (self.biases[i]) |bias| addLinearBiasRows(self.outputs[i], bias, rows, out_dim);
+        }
+
+        inline fn applyIndependent(self: @This(), io: ?std.Io, input: []const f32, rows: usize, in_dim: usize, out_dim: usize) !bool {
+            inline for (0..n) |i| {
+                if (!(try linearNoBiasQuantized(io, self.storage[i], input, self.outputs[i], rows, in_dim, out_dim))) return false;
+            }
+            self.addBias(rows, out_dim);
+            return true;
+        }
+
+        inline fn applyGenericPlanes(self: @This(), io: ?std.Io, input: []const f32, rows: usize, in_dim: usize, out_dim: usize, dot_fn: *const fn ([]const f32, []const u8) f32) !void {
+            inline for (0..n) |i| try linearNoBiasQuantizedGeneric(io, input, self.storage[i].raw_bytes, self.outputs[i], rows, in_dim, out_dim, self.storage[i].tensor_type, dot_fn);
+        }
+
+        inline fn applyGeneric(self: @This(), io: ?std.Io, input: []const f32, rows: usize, in_dim: usize, out_dim: usize, dot_fn: *const fn ([]const f32, []const u8) f32) !void {
+            if (n == 2) {
+                try linearNoBiasQuantizedGenericPair(io, input, self.storage[0].raw_bytes, dot_fn, self.storage[1].raw_bytes, dot_fn, self.outputs[0], self.outputs[1], rows, in_dim, out_dim, self.storage[0].tensor_type);
+            } else {
+                switch (self.storage[0].tensor_type) {
+                    .known => |known| switch (known) {
+                        inline .Q4_0, .Q4_1, .Q5_0, .Q5_1, .Q2_K, .Q3_K, .Q5_K, .Q6_K => |kind| {
+                            // Preserve the established single-row Q5_0 schedule
+                            // on portable ARM; typed traversal costs latency here.
+                            const portable_q5 = comptime kind == .Q5_0 and builtin.cpu.arch == .aarch64 and !native_aarch64_dotprod;
+                            if (portable_q5 and rows == 1) {
+                                try self.applyGenericPlanes(io, input, rows, in_dim, out_dim, dot_fn);
+                            } else {
+                                inline for (0..n) |i| try linearNoBiasQuantizedTyped(kind, io, input, self.storage[i].raw_bytes, self.outputs[i], rows, in_dim, out_dim);
+                            }
+                        },
+                        else => {
+                            // Keep the established schedule for formats outside
+                            // the qualified typed-dispatch performance matrix.
+                            try self.applyGenericPlanes(io, input, rows, in_dim, out_dim, dot_fn);
+                        },
+                    },
+                    else => unreachable,
+                }
+            }
+            self.addBias(rows, out_dim);
+        }
+    };
 }
 
 pub fn linearNoBiasQuantizedPair(
@@ -9078,11 +9110,11 @@ pub fn linearNoBiasQuantizedPair(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    if (!storage_a.tensor_type.eql(storage_b.tensor_type)) return false;
-    if (storage_a.packed_expert != null or storage_b.packed_expert != null) return false;
-    if (storage_a.shape.len != 2 or storage_b.shape.len != 2) return false;
-    if (storage_a.shape[0] != out_dim or storage_a.shape[1] != in_dim) return false;
-    if (storage_b.shape[0] != out_dim or storage_b.shape[1] != in_dim) return false;
+    const projections = NativeProjectionFamily(2){
+        .storage = .{ storage_a, storage_b },
+        .outputs = .{ output_a, output_b },
+    };
+    if (!(try projections.admit(in_dim, out_dim))) return false;
 
     if (storage_a.tensor_type.eql(.{ .known = .Q4_K }) or storage_a.tensor_type.eql(.{ .known = .Q5_K })) {
         // The old Q4_K pair helper shares some block reads, but it bypasses
@@ -9196,20 +9228,7 @@ pub fn linearNoBiasQuantizedPair(
                 }
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
-                try linearNoBiasQuantizedGenericPair(
-                    io,
-                    input,
-                    storage_a.raw_bytes,
-                    dot_fn,
-                    storage_b.raw_bytes,
-                    dot_fn,
-                    output_a,
-                    output_b,
-                    rows,
-                    in_dim,
-                    out_dim,
-                    storage_a.tensor_type,
-                );
+                try projections.applyGeneric(io, input, rows, in_dim, out_dim, dot_fn);
                 return true;
             }
         } else if (known == .Q2_K or known == .Q3_K) {
@@ -9252,20 +9271,7 @@ pub fn linearNoBiasQuantizedPair(
                 }
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
-                try linearNoBiasQuantizedGenericPair(
-                    io,
-                    input,
-                    storage_a.raw_bytes,
-                    dot_fn,
-                    storage_b.raw_bytes,
-                    dot_fn,
-                    output_a,
-                    output_b,
-                    rows,
-                    in_dim,
-                    out_dim,
-                    storage_a.tensor_type,
-                );
+                try projections.applyGeneric(io, input, rows, in_dim, out_dim, dot_fn);
                 return true;
             }
         } else if (known == .Q4_0 or known == .Q4_1 or known == .Q5_0 or known == .Q5_1) {
@@ -9296,26 +9302,12 @@ pub fn linearNoBiasQuantizedPair(
                 }
             }
             if (known == .Q4_0 or known == .Q4_1) {
-                if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
+                if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                 noteNativeQuantDispatch(.legacy_activation_pair);
                 return true;
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
-                try linearNoBiasQuantizedGenericPair(
-                    io,
-                    input,
-                    storage_a.raw_bytes,
-                    dot_fn,
-                    storage_b.raw_bytes,
-                    dot_fn,
-                    output_a,
-                    output_b,
-                    rows,
-                    in_dim,
-                    out_dim,
-                    storage_a.tensor_type,
-                );
+                try projections.applyGeneric(io, input, rows, in_dim, out_dim, dot_fn);
                 return true;
             }
         } else if (known == .Q8_0) {
@@ -9323,8 +9315,7 @@ pub fn linearNoBiasQuantizedPair(
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const row_blocks = in_dim / values_per_block;
             if (!shouldUseQ8_0GroupedActivationPair(rows, out_dim, row_blocks)) {
-                if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
+                if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                 return true;
             }
             // Avoid the runtime dot-function pair fallback for Q8_0; use the
@@ -9354,8 +9345,7 @@ pub fn linearNoBiasQuantizedPair(
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const row_blocks = in_dim / values_per_block;
             if (!shouldUseQ8_1GroupedActivationPair(rows, out_dim, row_blocks)) {
-                if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
+                if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                 return true;
             }
             if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
@@ -9413,8 +9403,7 @@ pub fn linearNoBiasQuantizedPair(
                     );
                     return true;
                 }
-                if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
+                if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                 return true;
             }
         } else if (known == .I2_S) {
@@ -9446,20 +9435,7 @@ pub fn linearNoBiasQuantizedPair(
             );
             return true;
         } else if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
-            try linearNoBiasQuantizedGenericPair(
-                io,
-                input,
-                storage_a.raw_bytes,
-                dot_fn,
-                storage_b.raw_bytes,
-                dot_fn,
-                output_a,
-                output_b,
-                rows,
-                in_dim,
-                out_dim,
-                storage_a.tensor_type,
-            );
+            try projections.applyGeneric(io, input, rows, in_dim, out_dim, dot_fn);
             return true;
         },
         .bitnet_tl2 => {
@@ -9556,15 +9532,12 @@ pub fn linearQuantizedTriple(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    if (!storage_a.tensor_type.eql(storage_b.tensor_type) or !storage_a.tensor_type.eql(storage_c.tensor_type)) return false;
-    if (storage_a.packed_expert != null or storage_b.packed_expert != null or storage_c.packed_expert != null) return false;
-    if (storage_a.shape.len != 2 or storage_b.shape.len != 2 or storage_c.shape.len != 2) return false;
-    if (storage_a.shape[0] != out_dim or storage_a.shape[1] != in_dim) return false;
-    if (storage_b.shape[0] != out_dim or storage_b.shape[1] != in_dim) return false;
-    if (storage_c.shape[0] != out_dim or storage_c.shape[1] != in_dim) return false;
-    if (bias_a != null and bias_a.?.len < out_dim) return error.InvalidQuantizedLinearShape;
-    if (bias_b != null and bias_b.?.len < out_dim) return error.InvalidQuantizedLinearShape;
-    if (bias_c != null and bias_c.?.len < out_dim) return error.InvalidQuantizedLinearShape;
+    const projections = NativeProjectionFamily(3){
+        .storage = .{ storage_a, storage_b, storage_c },
+        .outputs = .{ output_a, output_b, output_c },
+        .biases = .{ bias_a, bias_b, bias_c },
+    };
+    if (!(try projections.admit(in_dim, out_dim))) return false;
 
     if (storage_a.tensor_type.eql(.{ .known = .Q4_K }) or storage_a.tensor_type.eql(.{ .known = .Q5_K })) {
         if (storage_a.preparedBytes(.row_major_blocks) != null and storage_b.preparedBytes(.row_major_blocks) != null and storage_c.preparedBytes(.row_major_blocks) != null) {
@@ -9646,21 +9619,11 @@ pub fn linearQuantizedTriple(
             const row_blocks = in_dim / values_per_block;
             if (shouldUseQ6_KQ8KActivationQuant(rows, out_dim, row_blocks)) {
                 if (!shouldUseQ6KSharedActivationTriple(rows, out_dim, row_blocks)) {
-                    if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                    if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
-                    if (!(try linearNoBiasQuantized(io, storage_c, input, output_c, rows, in_dim, out_dim))) return false;
-                    if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-                    if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-                    if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+                    if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                     return true;
                 }
                 if (rows == 1) {
-                    if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                    if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
-                    if (!(try linearNoBiasQuantized(io, storage_c, input, output_c, rows, in_dim, out_dim))) return false;
-                    if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-                    if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-                    if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+                    if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                     return true;
                 }
                 const q8_block_size: usize = 292;
@@ -9739,12 +9702,7 @@ pub fn linearQuantizedTriple(
                 }
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
-                try linearNoBiasQuantizedGeneric(io, input, storage_a.raw_bytes, output_a, rows, in_dim, out_dim, storage_a.tensor_type, dot_fn);
-                try linearNoBiasQuantizedGeneric(io, input, storage_b.raw_bytes, output_b, rows, in_dim, out_dim, storage_b.tensor_type, dot_fn);
-                try linearNoBiasQuantizedGeneric(io, input, storage_c.raw_bytes, output_c, rows, in_dim, out_dim, storage_c.tensor_type, dot_fn);
-                if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-                if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-                if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+                try projections.applyGeneric(io, input, rows, in_dim, out_dim, dot_fn);
                 return true;
             }
         } else if (known == .Q2_K or known == .Q3_K) {
@@ -9798,12 +9756,7 @@ pub fn linearQuantizedTriple(
                 }
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
-                try linearNoBiasQuantizedGeneric(io, input, storage_a.raw_bytes, output_a, rows, in_dim, out_dim, storage_a.tensor_type, dot_fn);
-                try linearNoBiasQuantizedGeneric(io, input, storage_b.raw_bytes, output_b, rows, in_dim, out_dim, storage_b.tensor_type, dot_fn);
-                try linearNoBiasQuantizedGeneric(io, input, storage_c.raw_bytes, output_c, rows, in_dim, out_dim, storage_c.tensor_type, dot_fn);
-                if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-                if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-                if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+                try projections.applyGeneric(io, input, rows, in_dim, out_dim, dot_fn);
                 return true;
             }
         } else if (known == .Q4_0 or known == .Q4_1 or known == .Q5_0 or known == .Q5_1) {
@@ -9842,12 +9795,7 @@ pub fn linearQuantizedTriple(
                 }
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
-                try linearNoBiasQuantizedGeneric(io, input, storage_a.raw_bytes, output_a, rows, in_dim, out_dim, storage_a.tensor_type, dot_fn);
-                try linearNoBiasQuantizedGeneric(io, input, storage_b.raw_bytes, output_b, rows, in_dim, out_dim, storage_b.tensor_type, dot_fn);
-                try linearNoBiasQuantizedGeneric(io, input, storage_c.raw_bytes, output_c, rows, in_dim, out_dim, storage_c.tensor_type, dot_fn);
-                if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-                if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-                if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+                try projections.applyGeneric(io, input, rows, in_dim, out_dim, dot_fn);
                 return true;
             }
         } else if (known == .Q8_0) {
@@ -9855,12 +9803,7 @@ pub fn linearQuantizedTriple(
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const row_blocks = in_dim / values_per_block;
             if (!shouldUseQ8_0GroupedActivationTriple(rows, out_dim, row_blocks)) {
-                if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_c, input, output_c, rows, in_dim, out_dim))) return false;
-                if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-                if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-                if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+                if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                 return true;
             }
             try linearQ8_0Triple(
@@ -9896,12 +9839,7 @@ pub fn linearQuantizedTriple(
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const row_blocks = in_dim / values_per_block;
             if (!shouldUseQ8_1GroupedActivationTriple(rows, out_dim, row_blocks)) {
-                if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_c, input, output_c, rows, in_dim, out_dim))) return false;
-                if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-                if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-                if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+                if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                 return true;
             }
             if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
@@ -9978,21 +9916,11 @@ pub fn linearQuantizedTriple(
                     );
                     return true;
                 }
-                if (!(try linearNoBiasQuantized(io, storage_a, input, output_a, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_b, input, output_b, rows, in_dim, out_dim))) return false;
-                if (!(try linearNoBiasQuantized(io, storage_c, input, output_c, rows, in_dim, out_dim))) return false;
-                if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-                if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-                if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+                if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                 return true;
             }
         } else if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
-            try linearNoBiasQuantizedGeneric(io, input, storage_a.raw_bytes, output_a, rows, in_dim, out_dim, storage_a.tensor_type, dot_fn);
-            try linearNoBiasQuantizedGeneric(io, input, storage_b.raw_bytes, output_b, rows, in_dim, out_dim, storage_b.tensor_type, dot_fn);
-            try linearNoBiasQuantizedGeneric(io, input, storage_c.raw_bytes, output_c, rows, in_dim, out_dim, storage_c.tensor_type, dot_fn);
-            if (bias_a) |bias| addLinearBiasRows(output_a, bias, rows, out_dim);
-            if (bias_b) |bias| addLinearBiasRows(output_b, bias, rows, out_dim);
-            if (bias_c) |bias| addLinearBiasRows(output_c, bias, rows, out_dim);
+            try projections.applyGeneric(io, input, rows, in_dim, out_dim, dot_fn);
             return true;
         },
         else => {},
@@ -12355,21 +12283,7 @@ fn genericQuantPairDotFn(
 ) ?*const fn ([]const f32, []const u8) f32 {
     return switch (tensor_type) {
         .known => |known| switch (known) {
-            .Q1_0 => &dotQ1_0Block,
-            .Q4_0 => &dotQ4_0Block,
-            .Q4_1 => &dotQ4_1Block,
-            .Q5_0 => &dotQ5_0Block,
-            .Q5_1 => &dotQ5_1Block,
-            .Q8_0 => &dotQ8_0Block,
-            .Q8_1 => &dotQ8_1Block,
-            .Q2_K => &dotQ2_KBlock,
-            .Q3_K => &dotQ3_KBlock,
-            .Q4_K => &dotQ4_KBlock,
-            .Q5_K => &dotQ5_KBlock,
-            .Q6_K => &dotQ6_KBlock,
-            .Q8_K => &dotQ8_KBlock,
-            .IQ4_NL => &dotIQ4NLBlock,
-            .IQ4_XS => &dotIQ4XSBlock,
+            inline .Q1_0, .Q4_0, .Q4_1, .Q5_0, .Q5_1, .Q8_0, .Q8_1, .Q2_K, .Q3_K, .Q4_K, .Q5_K, .Q6_K, .Q8_K, .IQ4_NL, .IQ4_XS => |kind| &dotFnForKind(kind),
             else => null,
         },
         else => null,

@@ -19205,6 +19205,7 @@ fn probeMetalDeviceAvailable() bool {
 pub extern fn termite_metal_provider_create() ?*RawMetalProvider;
 pub extern fn termite_metal_provider_destroy(provider: ?*RawMetalProvider) void;
 pub extern fn termite_metal_decode_runtime_create() ?*RawMetalDecodeRuntime;
+pub extern fn termite_metal_decode_runtime_create_for_quant_formats(formats: u16) ?*RawMetalDecodeRuntime;
 pub extern fn termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
 pub extern fn termite_metal_decode_runtime_lightonocr3_batch_projection_available(runtime: ?*RawMetalDecodeRuntime, rows: usize, in_dim: usize) c_int;
 pub extern fn termite_metal_decode_runtime_clear_lightonocr3_vision_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
