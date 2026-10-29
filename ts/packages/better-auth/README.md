@@ -2,6 +2,14 @@
 
 Better Auth persistence and owner-scoped document search for Antfly. Embedded and remote entry points share the custom adapter, schema checks, and restricted content API.
 
+Initial release candidate (Node 24+):
+
+```sh
+npm install @antfly/better-auth@0.1.0-rc.1 @antfly/embedded@0.3.0-rc.6 better-auth@~1.7.14
+```
+
+For remote apps, omit the embedded package and install `@antfly/sdk@^0.2.2`. Use Antfly server 0.3.0-rc.6 or a later compatible release. Explicit embedded versions avoid the npm `latest` setup placeholder.
+
 ```ts
 import { betterAuth } from "better-auth";
 import { getDatabase, antflyAdapter, prepareAuthSchema, authDefaults } from "@antfly/better-auth/embedded";
@@ -17,4 +25,4 @@ Requires Better Auth 1.7.14+ within the 1.7 minor. Embedded requires Node 24+ an
 
 `pnpm test` runs transport/fault tests. `pnpm test:integration` requires a current `ANTFLY_LIBRARY` and runs native auth flows plus the upstream adapter suite. Build dependencies (`@antfly/sdk`, `@antfly/embedded`) first. Run `ANTFLY_AUTH_TEST_BINARY=/absolute/path/to/antfly pnpm test:remote` to exercise the remote transport and the same upstream suite; the fixture starts isolated disposable standalone servers. `AUTH_APP_URL=http://localhost:3000 node test/http-smoke.mjs` checks either running example over HTTP. No test run publishes packages.
 
-Before the first npm release, configure the package trusted publisher for `.github/workflows/ts-npm-publish.yml`. The `ts/antfly/better-auth/v*` tag runs supported-version native and remote checks before publishing. Release the updated SDK with transaction-outcome reads and the embedded binding with SQL write-status metadata alongside this integration. Remote deployment also requires the server fix for concurrent SQL connection-directory mutations included in this change.
+Before the first npm release, configure the package trusted publisher for `.github/workflows/ts-npm-publish.yml`. The `ts/antfly/better-auth/v*` tag runs supported-version native and remote checks before publishing. Publish SDK 0.2.2 and embedded/server 0.3.0-rc.6 before this integration. Auth prerelease tags publish to npm `next`; stable versions publish to `latest`.

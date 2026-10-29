@@ -1,6 +1,6 @@
 {
   "name": "@antfly/better-auth",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.1",
   "description": "Better Auth adapter and user-scoped content for Antfly",
   "type": "module",
   "license": "Apache-2.0",
@@ -39,12 +39,12 @@
     "test:remote": "vitest run --maxWorkers=1 test/remote.test.ts test/upstream.test.ts"
   },
   "dependencies": {
-    "@antfly/sdk": "workspace:*",
+    "@antfly/sdk": "workspace:^0.2.2",
     "@better-auth/core": "~1.7.14"
   },
   "peerDependencies": {
     "better-auth": "~1.7.14",
-    "@antfly/embedded": "^0.1.0"
+    "@antfly/embedded": "^0.3.0-rc.6"
   },
   "peerDependenciesMeta": {
     "@antfly/embedded": {

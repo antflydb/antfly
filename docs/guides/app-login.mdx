@@ -23,7 +23,15 @@ const requireUser = createUserContent({ auth, db, tables });
 // Mount auth routes and start listening only after schema setup succeeds.
 ```
 
-Install `@antfly/better-auth`, `@antfly/embedded`, and `better-auth@~1.7.14`. Define `authOptions` in a side-effect-free configuration module:
+The initial integration is a release candidate. Use matching published packages (Node 24+):
+
+```sh
+npm install @antfly/better-auth@0.1.0-rc.1 @antfly/embedded@0.3.0-rc.6 better-auth@~1.7.14
+```
+
+The default `@antfly/embedded` npm tag may still point to a setup placeholder; use the explicit release version. The integration requires SDK 0.2.2 or newer within 0.2, installed as a dependency. For remote apps, omit `@antfly/embedded` and install `@antfly/sdk@^0.2.2` explicitly.
+
+Define `authOptions` in a side-effect-free configuration module:
 
 ```ts
 import { authDefaults } from "@antfly/better-auth";
@@ -104,7 +112,7 @@ The embedded engine coordinates access with per-operation leases; concurrent pro
 
 Use `remoteDatabase(new AntflyClient(...))` from `@antfly/better-auth/remote` and the same adapter/schema/content helpers. No native library is imported. Set `rateLimit.storage` to `"database"`, or pass `remote: true` to `consumerAuthOptions`. Initialize schema once before starting multiple application instances.
 
-Use a server release containing the concurrent SQL connection-directory fix shipped with this integration, together with the updated SDK. SQL transactions must stay on one stable API owner endpoint. The transport retains the HTTP connection ID and active transaction session ID. Arbitrary round-robin routing is unsupported. For committed-but-pending writes, the transport reads the matching transaction receipt until visibility is confirmed. Fresh schema setup similarly checks the receipt’s table identity and schema generation before serving requests. Pending, repair-required, and uncertain writes are never replayed; unresolved outcomes fail closed.
+Use Antfly server 0.3.0-rc.6 or a later compatible release, together with SDK 0.2.2+. Earlier published SDKs lack the transaction-outcome method required by this integration. SQL transactions must stay on one stable API owner endpoint. The transport retains the HTTP connection ID and active transaction session ID. Arbitrary round-robin routing is unsupported. For committed-but-pending writes, the transport reads the matching transaction receipt until visibility is confirmed. Fresh schema setup similarly checks the receipt’s table identity and schema generation before serving requests. Pending, repair-required, and uncertain writes are never replayed; unresolved outcomes fail closed.
 
 See [the Next.js remote example](https://github.com/antflydb/antfly/tree/main/ts/examples/nextjs-auth). Next.js may use embedded Antfly only as a standalone persistent Node deployment with the same platform restrictions as Express.
 
