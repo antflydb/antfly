@@ -496,12 +496,11 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embe
 			return nil, fmt.Errorf("parse OCR reader config JSON: %w", err)
 		}
 		extractionConfig["ocr"] = map[string]any{
-			"enabled":    true,
-			"render_dpi": ocrRenderDPI,
+			"render": map[string]any{"dpi": ocrRenderDPI},
 			"quality": map[string]any{
 				"min_content_chars": ocrMinContentChars,
 			},
-			"config": readerConfig,
+			"reader": readerConfig,
 		}
 	}
 

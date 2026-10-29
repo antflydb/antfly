@@ -448,7 +448,8 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 		}
 		secretRef = "${secret:" + options.InferenceSecret + "}"
 	}
-	ocr := map[string]any{"enabled": false}
+	// Without a reader config, extraction keeps native text only.
+	var ocr map[string]any
 	if language != "" {
 		data, err := os.ReadFile(language)
 		if err != nil {
@@ -479,15 +480,18 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 			}
 			reader["api_key"] = secretRef
 		}
-		ocr = map[string]any{"enabled": true, "executor": "reader", "mode": "auto", "render_dpi": 150, "prompt_policy": "plain", "config": reader}
+		ocr = map[string]any{"mode": "auto", "render": map[string]any{"dpi": 150}, "reader": reader}
 	}
-	producer := map[string]any{"type": "document_extraction", "config": map[string]any{
+	extraction := map[string]any{
 		"source": map[string]any{"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"},
-		"ocr":    ocr,
-	}}
-	if options.SourceConnection != "" {
-		producer["config"].(map[string]any)["credentials"] = options.SourceConnection
 	}
+	if ocr != nil {
+		extraction["ocr"] = ocr
+	}
+	if options.SourceConnection != "" {
+		extraction["credentials"] = options.SourceConnection
+	}
+	producer := map[string]any{"type": "document_extraction", "config": extraction}
 	producerJSON, err := json.Marshal(producer)
 	if err != nil {
 		return nil, err

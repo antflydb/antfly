@@ -271,15 +271,6 @@ fn number(v: Value) u32 {
     return if (v == .integer and v.integer > 0 and v.integer <= std.math.maxInt(u32)) @intCast(v.integer) else 0;
 }
 
-fn producerEnabled(value: Value, fallback: bool) bool {
-    if (value == .bool) return value.bool;
-    if (value == .object) {
-        const enabled = get(value, "enabled");
-        return enabled != .bool or enabled.bool;
-    }
-    return fallback;
-}
-
 fn modelBackedProducer(producer: Value) bool {
     const producer_type = ProducerType.parse(str(get(producer, "type"))) orelse return false;
     const config = get(producer, "config");
@@ -289,10 +280,9 @@ fn modelBackedProducer(producer: Value) bool {
         // Labels may embed vocabulary prompts; media outputs may repair a
         // consumer. Both require destination inference evidence on restore.
         .generator, .extractor, .transcriber, .decision, .vector_labels, .media_output => true,
-        // Extraction uses the default OCR model for PDF fallback unless
-        // explicitly disabled; transcription is separately opt-in.
-        .document_extraction => producerEnabled(get(config, "ocr"), producerEnabled(get(config, "ocr_fallback"), true)) or
-            producerEnabled(get(config, "transcription"), producerEnabled(get(config, "transcribe_audio"), false)),
+        // Extraction needs a model only when an `ocr` or `transcription`
+        // block names one; native text extraction runs without inference.
+        .document_extraction => get(config, "ocr") == .object or get(config, "transcription") == .object,
         .reader => str(get(config, "model")).len > 0 or eq(provider, "antfly") or eq(provider, "openai") or eq(provider, "vertex") or eq(provider, "apple"),
         .copy => false,
     };
@@ -1840,11 +1830,9 @@ test "backup preflight implicit producer detection excludes deterministic produc
         .{ .json = "{\"producer\":{\"type\":\"copy\"}}", .model_count = 0 },
         .{ .json = "{\"kind\":\"asset\",\"source_artifact_name\":\"vectors\",\"producer\":{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}}", .model_count = 1 },
         .{ .json = "{\"kind\":\"asset\",\"source_artifact_name\":\"clips\",\"producer\":{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}}", .model_count = 1 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\"}}", .model_count = 1 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":false}}}", .model_count = 0 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":false}}}", .model_count = 0 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":false}}}}", .model_count = 0 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":false,\"transcription\":true}}}", .model_count = 1 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\"}}", .model_count = 0 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}}}", .model_count = 2 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"transcriber\":{\"provider\":\"apple\"}}}}}", .model_count = 2 },
     }) |case| {
         var report: Report = .{ .allocator = a };
         defer report.deinit();

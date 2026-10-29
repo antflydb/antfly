@@ -464,18 +464,18 @@ func TestVertexOCRProfilePinsModelAndCompatibleLocation(t *testing.T) {
 	var producer struct {
 		Config struct {
 			OCR struct {
-				Config struct {
+				Reader struct {
 					Model     string `json:"model"`
 					Location  string `json:"location"`
 					MaxTokens int    `json:"max_tokens"`
-				} `json:"config"`
+				} `json:"reader"`
 			} `json:"ocr"`
 		} `json:"config"`
 	}
 	if err := json.Unmarshal([]byte(units["producer_json"].(string)), &producer); err != nil {
 		t.Fatal(err)
 	}
-	reader := producer.Config.OCR.Config
+	reader := producer.Config.OCR.Reader
 	if reader.Model != "gemini-3.8-flash" || reader.Location != "global" || reader.MaxTokens != 32768 {
 		t.Fatalf("OCR profile must persist its model, location and output budget: %+v", reader)
 	}
@@ -496,18 +496,34 @@ func TestNativeOriginalLocatorsRequireAnExactGenerationAndBucket(t *testing.T) {
 }
 
 func TestSourceConnectionIsNativeProducerConfiguration(t *testing.T) {
-	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "", "", false, false, corpusIndexOptions{SourceConnection: "cloud-gcs-originals"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	enrichments := indexes[corpusTextIndex].(map[string]any)["enrichments"].([]any)
-	raw := enrichments[0].(map[string]any)["producer_json"].(string)
-	var producer map[string]any
-	if err := json.Unmarshal([]byte(raw), &producer); err != nil {
-		t.Fatal(err)
-	}
-	if producer["config"].(map[string]any)["credentials"] != "cloud-gcs-originals" {
-		t.Fatal("source connection not passed to native extraction")
+	for _, readerConfig := range []string{"", "lightonocr-reader.example.json"} {
+		t.Run("reader="+readerConfig, func(t *testing.T) {
+			indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "", readerConfig, false, false, corpusIndexOptions{SourceConnection: "cloud-gcs-originals"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			enrichments := indexes[corpusTextIndex].(map[string]any)["enrichments"].([]any)
+			raw := enrichments[0].(map[string]any)["producer_json"].(string)
+			var producer map[string]any
+			if err := json.Unmarshal([]byte(raw), &producer); err != nil {
+				t.Fatal(err)
+			}
+			config := producer["config"].(map[string]any)
+			if config["credentials"] != "cloud-gcs-originals" {
+				t.Fatal("source connection not passed to native extraction")
+			}
+			ocr, present := config["ocr"]
+			if readerConfig == "" {
+				if present {
+					t.Fatal("unconfigured OCR must be omitted from native extraction")
+				}
+			} else {
+				options, ok := ocr.(map[string]any)
+				if !ok || options["mode"] != "auto" || options["reader"] == nil {
+					t.Fatal("configured OCR reader was lost when selecting the source connection")
+				}
+			}
+		})
 	}
 }
 

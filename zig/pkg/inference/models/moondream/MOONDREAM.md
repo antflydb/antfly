@@ -73,7 +73,8 @@ The two text halves are tokenized separately without special tokens, as
 upstream does. Decoding stops on any token of `tok("<END>")` (upstream passes
 all three as EOS ids) or `<|endoftext|>`, then strips a trailing `<` or
 `<END>`. `/read` sends the request prompt as the question; an empty prompt
-becomes the caption question `Describe this image.`. Default `max_tokens` is
+becomes `Transcribe all text in this image.`, matching the OCR default of the
+other readers. Default `max_tokens` is
 256, as upstream.
 
 `/generate` takes exactly one image and uses the last user turn's text as the
