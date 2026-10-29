@@ -635,6 +635,7 @@ pub const ManagedEmbeddingEntry = struct {
     /// Invocation-local synchronous grant; never retain beyond this embedder
     /// or pass it to parallel workers/watchdogs without an owned child.
     runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+    http_control: ?httpx.socket.WriteControl = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     embedding_names: [][]u8 = &.{},
@@ -2279,9 +2280,15 @@ const CombinedCancellation = struct {
         return false;
     }
 
+    fn check(raw: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.request) |source| try source.check();
+        if (self.configured) |source| try source.check();
+    }
+
     fn token(self: *const @This()) ?CancellationToken {
         if (self.configured == null and self.request == null) return null;
-        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = check };
     }
 };
 
@@ -2332,6 +2339,14 @@ fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
 /// pools or the non-concurrent process singleton.
 fn embeddingHttpIo(entry: *const ManagedEmbeddingEntry) !std.Io {
     return entry.io orelse error.MissingEmbeddingHttpIo;
+}
+
+fn embeddingHttpContext(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) RequestContext {
+    var context = embeddingRequestContext(entry, task_type).request;
+    // Discovery/activation owns a separate preparation budget. A caller's
+    // explicit deadline narrows it; the default inference clock starts later.
+    context.deadline_ns = entry.deadline_ns;
+    return context;
 }
 
 fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) EmbeddingRequestContext {
@@ -2475,6 +2490,7 @@ fn applyAntflyEmbeddingRequestControls(
     provider.requested_dense_dimensions = if (entry.dimensions > 0) entry.dimensions else null;
     if (provider.model_identity != null) provider.numeric_dense_dimensions = null;
     provider.setRequestCancellation(entry.cancellation);
+    provider.socket_control = entry.http_control;
     provider.setRequestTimeoutMs(timeout_ms);
     provider.setMaxResponseBytes(remote_embedding_max_response_bytes);
 }
@@ -5776,6 +5792,7 @@ fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *http
     return cache.getOrDiscoverLeaseWithContext(http, entry.base_url, entry.model, .embed, headers, .{
         .deadline_ns = entry.deadline_ns,
         .cancellation = entry.cancellation orelse .none,
+        .execution_wait = entry.http_control,
     });
 }
 
@@ -5873,6 +5890,26 @@ fn embedWithEntryPartsForTask(
 
 fn embedWithEntryPartsForTaskOnce(
     alloc: std.mem.Allocator,
+    configured: *const ManagedEmbeddingEntry,
+    parts: []const template_mod.ContentPart,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]f32 {
+    var http_wait: request_context.HttpWait = .{ .context = embeddingHttpContext(configured, task_type) };
+    var invocation = configured.requestOverlay(alloc);
+    defer invocation.auth_header_cache.deinit(alloc);
+    invocation.http_control = http_wait.control();
+    const result = embedWithEntryPartsForTaskOnceHttpInvoke(alloc, &invocation, parts, dims, task_type) catch |err| {
+        try http_wait.ready();
+        return err;
+    };
+    errdefer alloc.free(result);
+    try http_wait.ready();
+    return result;
+}
+
+fn embedWithEntryPartsForTaskOnceHttpInvoke(
+    alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
     parts: []const template_mod.ContentPart,
     dims: u32,
@@ -5897,6 +5934,7 @@ fn embedWithEntryPartsForTaskOnce(
             .region = entry.region,
             .endpoint = entry.base_url,
             .request_format = entry.bedrock_request_format,
+            .socket_control = entry.http_control,
             .attempt_observer = embeddingAttemptObserver(entry),
             .input_type = effectiveInputType(entry, task_type),
             .truncate = entry.truncate,
@@ -5944,7 +5982,9 @@ fn embedWithEntryPartsForTaskOnce(
         var provider = antfly_provider_mod.Provider.init(alloc, http, entry.base_url);
         defer provider.deinit();
         provider.attempt_observer = embeddingAttemptObserver(entry);
+        provider.socket_control = entry.http_control;
         provider.setRequestCancellation(entry.cancellation);
+        provider.socket_control = entry.http_control;
         try provider.setSourceTable(entry.source_table);
         var auth_header_owned: ?[]u8 = null;
         defer if (auth_header_owned) |value| alloc.free(value);
@@ -6398,6 +6438,26 @@ test "managed embedder partitions and validates inline image data URIs" {
 /// identity by position and never receive an implicit document-level pool.
 fn embedPartItemsWithEntry(
     alloc: std.mem.Allocator,
+    configured: *const ManagedEmbeddingEntry,
+    items: []const template_mod.ContentPart,
+    dims: u32,
+    planned_lease: inference_work.CapabilityLease,
+) ![]const []const f32 {
+    var http_wait: request_context.HttpWait = .{ .context = embeddingHttpContext(configured, .retrieval_document) };
+    var invocation = configured.requestOverlay(alloc);
+    defer invocation.auth_header_cache.deinit(alloc);
+    invocation.http_control = http_wait.control();
+    const result = embedPartItemsWithEntryHttpInvoke(alloc, &invocation, items, dims, planned_lease) catch |err| {
+        try http_wait.ready();
+        return err;
+    };
+    errdefer db_embedder.freeDenseEmbeddingBatch(alloc, result);
+    try http_wait.ready();
+    return result;
+}
+
+fn embedPartItemsWithEntryHttpInvoke(
+    alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
     items: []const template_mod.ContentPart,
     dims: u32,
@@ -6430,7 +6490,9 @@ fn embedPartItemsWithEntry(
     var provider = antfly_provider_mod.Provider.init(alloc, http, entry.base_url);
     defer provider.deinit();
     provider.attempt_observer = embeddingAttemptObserver(entry);
+    provider.socket_control = entry.http_control;
     provider.setRequestCancellation(entry.cancellation);
+    provider.socket_control = entry.http_control;
     try provider.setSourceTable(entry.source_table);
     var auth_header_owned: ?[]u8 = null;
     defer if (auth_header_owned) |value| alloc.free(value);
@@ -6508,6 +6570,24 @@ fn embedSparseWithEntry(
 
 fn embedSparseBatchWithEntry(
     alloc: std.mem.Allocator,
+    configured: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+) ![]db_embedder.SparseEmbedding {
+    var http_wait: request_context.HttpWait = .{ .context = embeddingHttpContext(configured, .retrieval_document) };
+    var invocation = configured.requestOverlay(alloc);
+    defer invocation.auth_header_cache.deinit(alloc);
+    invocation.http_control = http_wait.control();
+    const result = embedSparseBatchWithEntryHttpInvoke(alloc, &invocation, texts) catch |err| {
+        try http_wait.ready();
+        return err;
+    };
+    errdefer db_embedder.freeSparseEmbeddingBatch(alloc, result);
+    try http_wait.ready();
+    return result;
+}
+
+fn embedSparseBatchWithEntryHttpInvoke(
+    alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
 ) ![]db_embedder.SparseEmbedding {
@@ -6542,7 +6622,9 @@ fn embedSparseBatchWithEntry(
             var provider = antfly_provider_mod.Provider.init(alloc, http, entry.base_url);
             defer provider.deinit();
             provider.attempt_observer = embeddingAttemptObserver(entry);
+            provider.socket_control = entry.http_control;
             provider.setRequestCancellation(entry.cancellation);
+            provider.socket_control = entry.http_control;
             try provider.setSourceTable(entry.source_table);
             var auth_header_owned: ?[]u8 = null;
             defer if (auth_header_owned) |value| alloc.free(value);
@@ -6945,17 +7027,41 @@ fn withQueryEmbeddingRetry(comptime Result: type, alloc: std.mem.Allocator, entr
 }
 
 fn waitQueryEmbeddingRetry(entry: *const ManagedEmbeddingEntry, deadline: u64) !void {
+    var wait: request_context.HttpWait = .{ .context = embeddingHttpContext(entry, .retrieval_query) };
     const wake = @min(deadline, monotonicNowNs() +| std.time.ns_per_s);
     while (monotonicNowNs() < wake) {
-        try ensureEntryDeadline(entry);
+        try wait.ready();
         const remaining = wake -| monotonicNowNs();
-        embeddingIo(entry).sleep(.fromNanoseconds(@intCast(@min(remaining, 50 * std.time.ns_per_ms))), .awake) catch return error.Cancelled;
+        wait.control().withWait(std.Io.sleep, .{ embeddingIo(entry), std.Io.Duration.fromNanoseconds(@intCast(@min(remaining, 50 * std.time.ns_per_ms))), std.Io.Clock.awake }) catch |err| {
+            try wait.ready();
+            return err;
+        };
     }
-    try ensureEntryDeadline(entry);
+    try wait.ready();
     if (monotonicNowNs() >= deadline) return error.Timeout;
 }
 
 fn embedBatchWithEntryForTaskOnce(
+    alloc: std.mem.Allocator,
+    configured: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
+    var http_wait: request_context.HttpWait = .{ .context = embeddingHttpContext(configured, task_type) };
+    var invocation = configured.requestOverlay(alloc);
+    defer invocation.auth_header_cache.deinit(alloc);
+    invocation.http_control = http_wait.control();
+    const result = embedBatchWithEntryForTaskOnceHttpInvoke(alloc, &invocation, texts, dims, task_type) catch |err| {
+        try http_wait.ready();
+        return err;
+    };
+    errdefer db_embedder.freeDenseEmbeddingBatch(alloc, result);
+    try http_wait.ready();
+    return result;
+}
+
+fn embedBatchWithEntryForTaskOnceHttpInvoke(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
@@ -7028,7 +7134,9 @@ fn embedBatchWithEntryForTaskOnce(
             var provider = antfly_provider_mod.Provider.init(alloc, http, entry.base_url);
             defer provider.deinit();
             provider.attempt_observer = embeddingAttemptObserver(entry);
+            provider.socket_control = entry.http_control;
             provider.setRequestCancellation(entry.cancellation);
+            provider.socket_control = entry.http_control;
             try provider.setSourceTable(entry.source_table);
             var auth_header_owned: ?[]u8 = null;
             defer if (auth_header_owned) |value| alloc.free(value);
@@ -7068,6 +7176,10 @@ fn embedBatchWithEntryForTaskOnce(
     }
 }
 
+// Nested parts/text dispatch can retain up to four invocation-local views.
+// Maintenance roots fund this packet before any accepted completion work.
+pub const invocation_http_retained_bytes = 4 * (@sizeOf(ManagedEmbeddingEntry) + @sizeOf(request_context.HttpWait));
+
 fn embeddingHttpCancellation(entry: *const ManagedEmbeddingEntry) ?httpx.CancellationToken {
     return if (entry.cancellation) |token|
         httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
@@ -7104,8 +7216,10 @@ fn embedBatchWithGemini(
     });
     defer provider.deinit();
     provider.attempt_observer = embeddingAttemptObserver(entry);
+    provider.socket_control = entry.http_control;
     var result = try provider.embedText(alloc, entry.model, texts, .{
         .task_type = effectiveProviderTaskType(entry, task_type),
+        .socket_control = entry.http_control,
         .request_format = entry.google_request_format,
         .task_encoding = entry.google_task_encoding,
         .batch_size = entry.google_batch_size,
@@ -7155,6 +7269,7 @@ fn embedBatchWithVertex(
     });
     defer provider.deinit();
     provider.attempt_observer = embeddingAttemptObserver(entry);
+    provider.socket_control = entry.http_control;
 
     var out = std.ArrayListUnmanaged([]const f32).empty;
     errdefer {
@@ -7169,6 +7284,7 @@ fn embedBatchWithVertex(
         try checkEntryDispatchDeadline(entry);
         var result = try provider.embedTextRequest(alloc, entry.model, texts[offset..end], .{
             .task_type = effectiveProviderTaskType(entry, task_type),
+            .socket_control = entry.http_control,
             .request_format = entry.google_request_format,
             .task_encoding = entry.google_task_encoding,
             .batch_size = entry.google_batch_size,
@@ -7258,6 +7374,7 @@ fn embedBatchWithCohereRequest(
     defer if (fallback_http) |*client| client.deinit();
     const client = try entry.httpClient(alloc, &fallback_http);
     var response = try client.post(url, .{
+        .socket_control = entry.http_control,
         .attempt_observer = embeddingAttemptObserver(entry),
         .json = body,
         .headers = &headers,
@@ -7323,6 +7440,7 @@ fn embedBatchWithBedrockRequest(
         .region = entry.region,
         .endpoint = entry.base_url,
         .request_format = entry.bedrock_request_format,
+        .socket_control = entry.http_control,
         .attempt_observer = embeddingAttemptObserver(entry),
         .input_type = effectiveInputType(entry, task_type),
         .truncate = entry.truncate,
@@ -7417,6 +7535,7 @@ fn embedBatchWithOpenAiCompatible(
     const client = try entry.httpClient(alloc, &fallback_http);
 
     var response = try client.post(url, .{
+        .socket_control = entry.http_control,
         .attempt_observer = embeddingAttemptObserver(entry),
         .json = json_body,
         .headers = headers_buf[0..header_count],
@@ -11159,4 +11278,21 @@ test "managed embedder cold activation precedes default probe and query inferenc
         if (!case.bounded) try std.testing.expectEqual(@as(u32, 1), service.activations.load(.monotonic));
         try std.testing.expectEqual(@as(u32, if (case.bounded) 0 else 1), service.embeddings.load(.monotonic));
     }
+}
+
+test "managed embedder HTTP waits preserve independent discovery and caller budgets" {
+    var entry: ManagedEmbeddingEntry = .{
+        .alloc = std.testing.allocator,
+        .io = std.testing.io,
+        .index_name = @constCast("index"),
+        .provider = .antfly,
+        .dimensions = 2,
+        .model = @constCast("model"),
+        .base_url = @constCast("http://localhost"),
+    };
+    try std.testing.expect(embeddingHttpContext(&entry, .retrieval_document).deadline_ns == null);
+    try std.testing.expect(embeddingRequestContext(&entry, .retrieval_document).request.deadline_ns != null);
+    const deadline = monotonicNowNs() + std.time.ns_per_s;
+    entry.deadline_ns = deadline;
+    try std.testing.expectEqual(@as(?u64, deadline), embeddingHttpContext(&entry, .retrieval_document).deadline_ns);
 }

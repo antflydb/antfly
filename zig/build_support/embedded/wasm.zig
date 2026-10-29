@@ -288,6 +288,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     });
     inference_execution_context_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_execution_context_mod.addImport("httpx", httpx_mod);
+    inference_execution_context_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     inference_execution_context_mod.addImport("antfly_inference_remote_capabilities", inference_remote_capabilities_mod);
     inference_execution_context_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
     inference_execution_context_mod.addImport("antfly_inference_execution_control", inference_execution_control_mod);

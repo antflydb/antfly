@@ -180,7 +180,8 @@ pub const CatalogService = struct {
         /// the joined model invocation's borrowed execution/authority scope.
         pub const retained_bytes = 3 * @sizeOf(Scope) + @sizeOf(builder_mod.Builder) +
             @sizeOf(manifest_mod.ManifestStore) + @sizeOf(progress_store_mod.ProgressStore) + @sizeOf(wal_mod.WalStore) +
-            @sizeOf(@import("../model_execution.zig").Scope);
+            @sizeOf(@import("../model_execution.zig").Scope) +
+            @import("antfly_local_sources").inference_managed_embedder.invocation_http_retained_bytes;
         catalog: CatalogService = undefined,
         artifacts: artifacts_mod.ArtifactStore = undefined,
         manifests: manifest_mod.ManifestStore = undefined,

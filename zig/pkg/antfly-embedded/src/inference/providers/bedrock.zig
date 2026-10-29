@@ -103,6 +103,7 @@ pub const Options = struct {
     /// Model invocation admission only; credential resolution is a distinct
     /// upstream operation and must not consume this model's quota.
     attempt_observer: ?httpx.AttemptObserver = null,
+    socket_control: ?httpx.socket.WriteControl = null,
     credential_source: CredentialSource = .default,
     region: []const u8,
     endpoint: []const u8,
@@ -215,6 +216,7 @@ pub const Provider = struct {
         defer freeHeaderPairs(alloc, headers);
         const options = httpx.RequestOptions{
             .attempt_observer = self.options.attempt_observer,
+            .socket_control = self.options.socket_control,
             .headers = headers,
             .body = body,
             .max_response_size = self.max_response_bytes,
@@ -371,6 +373,7 @@ pub const Provider = struct {
 
         var resp = try self.http.request(.POST, url, .{
             .attempt_observer = self.options.attempt_observer,
+            .socket_control = self.options.socket_control,
             .headers = signed,
             .body = json_body,
             .timeout_ms = try request_context.remainingTimeoutMs(self.http.io),

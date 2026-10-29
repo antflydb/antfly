@@ -611,3 +611,45 @@ provider mutation/retention and immutable artifact reads, and serial graph
 preparation checkpoints. The original cross-engine resource gates remain open,
 including the file-engine descriptor bound. Full GNU/full qualification remains
 waived.
+
+### Maintenance remote model HTTP waits
+
+Embedding dispatch now creates a request-local HTTP wait adapter and an owned
+credential-cache overlay. The adapter forwards the existing execution to
+outbound socket and pool waits without modifying persistent clients or cached
+model entries. Antfly JSON/numeric/framed requests, OpenAI-compatible and Cohere
+requests, and Gemini/Vertex and Bedrock model requests carry these controls.
+Remote media chunk requests use the same adapter. CPU returns to the actual
+saved class through checked reentry; response buffers remain transport-owned
+until that succeeds. Original fallible cancellation survives provider adapters
+and is rechecked before owned decoded output transfers to the caller.
+
+Capability discovery and model activation carry the operation's controls.
+Callers waiting on a shared discovery flight lend their own grants while
+retaining their own lifetime and flight reference. Retired-flight and query
+retry backoff also return CPU on the original executor. Discovery keeps its
+separate activation budget; only an explicit caller deadline narrows it, rather
+than starting the default inference timeout before a cold model is ready.
+
+Request overlays borrow shared cache synchronization and own their authorization
+cache allocations. Nested HTTP invocation packets are funded in the existing
+background/accepted-completion metadata reservation. Persistent models and
+clients retain no invocation control callbacks.
+
+Evidence is recorded in `serverless-model-http-v7-debug.json` and its log under
+the cumulative integration receipts. Real loopback HTTP fixtures exercise both
+OpenAI-compatible responses and cold Antfly discovery/model requests, including
+query/control progress during waits, retained metadata, and original authority
+rejection while response reentry waits behind another owner. A two-caller test
+proves shared discovery performs one catalog request while both callers return
+CPU, then completes both model invocations. Existing activation, caller-budget,
+framing, pinning, retry and model invocation tests provide regression coverage.
+Responses are deterministic fixtures; this does not qualify live cloud services,
+TLS across a deployment, downloaded models, or a rebuilt installed CLI.
+
+The maintenance milestone remains open for credential resolution/refresh and
+quota waits, provider/model construction and asset loading, lease renewal and
+remaining mutation/retention/immutable-artifact provider boundaries, and serial
+graph preparation checkpoints. Original cross-engine resource gates, including
+the file-engine descriptor bound, remain open. Full GNU/full qualification is
+still waived.

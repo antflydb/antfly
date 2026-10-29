@@ -454,6 +454,7 @@ pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
     attempt_observer: ?httpx.AttemptObserver = null,
+    socket_control: ?httpx.socket.WriteControl = null,
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
     request_timeout_ms: ?u64 = null,
@@ -595,6 +596,7 @@ pub const Provider = struct {
     ) httpx.RequestOptions {
         return .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .json = json_body,
             .headers = self.requestHeaders(),
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
@@ -618,6 +620,7 @@ pub const Provider = struct {
         self.request_header_storage[count] = .{ "Content-Type", content_type_value };
         return .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .borrowed_body_segments = body_segments,
             .headers = self.request_header_storage[0 .. count + 1],
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,

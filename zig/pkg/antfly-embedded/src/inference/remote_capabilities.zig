@@ -140,6 +140,7 @@ const CapabilityFlight = struct {
 };
 
 pub const WaitContext = struct {
+    execution_wait: ?httpx.socket.WriteControl = null,
     deadline_ns: ?u64 = null,
     cancellation: CancellationToken = .none,
 
@@ -279,9 +280,11 @@ pub const Cache = struct {
                     // new reference and prolong that retirement.
                     self.mutex.unlock(self.io);
                     try wait_context.check(monotonicNowNs(self.io));
-                    self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch |err| switch (err) {
-                        error.Canceled => return error.Canceled,
-                    };
+                    const sleep = if (wait_context.execution_wait) |control|
+                        control.withWait(std.Io.sleep, .{ self.io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake })
+                    else
+                        self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+                    try sleep;
                     continue;
                 }
                 flight.refs += 1;
@@ -664,12 +667,17 @@ fn waitForFlight(io: std.Io, flight: *CapabilityFlight, context: WaitContext) !v
             @min(capability_wait_poll_ns, deadline - now_ns)
         else
             capability_wait_poll_ns;
-        flight.ready.waitTimeout(io, .{ .duration = .{
+        const timeout: std.Io.Timeout = .{ .duration = .{
             .raw = std.Io.Duration.fromNanoseconds(@intCast(wait_ns)),
             .clock = .awake,
-        } }) catch |err| switch (err) {
+        } };
+        (if (context.execution_wait) |control|
+            control.withWait(std.Io.Event.waitTimeout, .{ &flight.ready, io, timeout })
+        else
+            flight.ready.waitTimeout(io, timeout)) catch |err| switch (err) {
             error.Timeout => continue,
             error.Canceled => return error.Canceled,
+            else => return err,
         };
     }
     try context.check(monotonicNowNs(io));
@@ -1289,6 +1297,7 @@ fn loadMissingModelInstance(
     const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = model, .task = kind }, .{});
     defer alloc.free(body);
     var response = http.post(url, .{
+        .socket_control = context.execution_wait,
         .headers = headers,
         .json = body,
         .max_retries = 0,
@@ -1354,6 +1363,7 @@ fn discoverWithContextOnce(
     const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
     var response = http.get(url, .{
+        .socket_control = context.execution_wait,
         .headers = headers,
         .timeout_ms = timeout_ms,
         .cancellation = httpx.CancellationToken.fromCallback(

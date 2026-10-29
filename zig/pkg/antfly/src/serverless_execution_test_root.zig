@@ -1207,3 +1207,202 @@ test "serverless execution manifest rejection during decoding retires the owned 
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }
+
+const ModelHttpTest = struct {
+    const sources = @import("antfly_local_sources");
+    const managed_mod = sources.inference_managed_embedder;
+    const http = sources.common_http_http_common;
+    const listener_mod = sources.common_http_std_http_listener;
+    const Context = @import("antfly_inference_execution_context").RequestContext;
+    const App = struct {
+        received: std.atomic.Value(bool) = .init(false),
+        catalogs: std.atomic.Value(usize) = .init(0),
+        block: std.atomic.Value(bool) = .init(false),
+        release: std.Io.Event = .unset,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (req.method == .GET) _ = self.catalogs.fetchAdd(1, .monotonic);
+            if (self.block.load(.acquire)) {
+                self.received.store(true, .release);
+                try self.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            }
+            const body = if (req.method == .GET)
+                "{\"embedders\":{\"text-embedding-3-small\":{\"inputs\":[\"text\"],\"inference_capabilities\":{\"task\":\"embed\",\"batch\":{\"mode\":\"native\",\"preferred_items\":1,\"max_items\":8,\"max_encoded_bytes\":1048576,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}"
+            else
+                "{\"data\":[{\"embedding\":[0.25,0.75]}]}";
+            return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = try alloc.dupe(u8, body) };
+        }
+    };
+    const Job = struct {
+        dense: sources.storage_db_enrichment_embedder.DenseEmbedder,
+        context: Context,
+        revoked: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.revoked.load(.acquire)) return error.ModelTransportRevoked;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            check(raw) catch return true;
+            return false;
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.context.cancellation = .{ .ptr = self, .check_fn = check, .is_cancelled_fn = canceled };
+            const result = self.dense.embedDenseWithContext(std.testing.allocator, "model", "text", 2, self.context) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer std.testing.allocator.free(result);
+            std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, result) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+};
+
+test "serverless execution remote model HTTP lends capacity and fences response reentry" {
+    const sources = @import("antfly_local_sources");
+    const managed_mod = sources.inference_managed_embedder;
+    const listener_mod = sources.common_http_std_http_listener;
+    const App = ModelHttpTest.App;
+    const Job = ModelHttpTest.Job;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Cache = @typeInfo(@typeInfo(@FieldType(managed_mod.InitOptions, "remote_capability_cache")).optional.child).pointer.child;
+    for ([_][]const u8{ "openai", "antfly" }) |provider_kind| {
+        for ([_]bool{ false, true }) |reject| {
+            var app = App{};
+            var listener = listener_mod.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+            defer listener.deinit();
+            try listener.start();
+            const url = try listener.baseUri(alloc);
+            defer alloc.free(url);
+            const indexes = try std.fmt.allocPrint(alloc, "{{\"model\":{{\"type\":\"embeddings\",\"field\":\"text\",\"dimension\":2,\"embedder\":{{\"provider\":\"{s}\",\"model\":\"text-embedding-3-small\",\"url\":\"{s}\"}}}}}}", .{ provider_kind, url });
+            defer alloc.free(indexes);
+            var cache = Cache.init(alloc, io);
+            defer cache.deinit();
+            var managed = try managed_mod.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes, .{ .io = io, .remote_capability_cache = &cache });
+            defer managed.deinit();
+            // Construction may probe the provider. Exercise cold discovery with
+            // the invocation scope rather than reusing that constructor lease.
+            cache.deinit();
+            cache = Cache.init(alloc, io);
+            var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+            defer scheduler.close();
+            var execution: Runnable.Execution = .{};
+            defer execution.finish();
+            try execution.startWithSlots(&scheduler, .{ .io = io, .retained_bytes = @import("serverless/catalog/service.zig").CatalogService.Scope.retained_bytes }, .background, 2);
+            var read: @import("api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = alloc };
+            const team = try read.team();
+            var job: Job = .{ .dense = managed.denseInterface(), .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .runnable = team.borrow } };
+            app.block.store(true, .release);
+            var future = try io.concurrent(Job.run, .{&job});
+            defer future.cancel(io);
+            defer app.release.set(io);
+            const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+            while (!app.received.load(.acquire) or scheduler.stats().runnable_slots != 0) {
+                if (job.done.load(.acquire)) return job.failure orelse error.ModelDidNotLendHttpWait;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.ModelDidNotLendHttpWait;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(scheduler.stats().retained_bytes > 0);
+            var query: Runnable.Execution = .{};
+            defer query.finish();
+            try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+            var health: Runnable.Execution = .{};
+            defer health.finish();
+            try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+            health.finish();
+            app.release.set(io);
+            if (reject) {
+                while (scheduler.stats().queued == 0) {
+                    if (job.done.load(.acquire)) return job.failure orelse error.ModelDidNotQueueForResponse;
+                    if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.ModelDidNotQueueForResponse;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                job.revoked.store(true, .release);
+                while (!job.done.load(.acquire)) {
+                    if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.ModelDidNotRejectResponse;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+            } else query.finish();
+            future.await(io);
+            if (reject) try std.testing.expectEqual(error.ModelTransportRevoked, job.failure.?) else if (job.failure) |err| return err;
+            try std.testing.expect(managed.entries[0].http_control == null);
+            query.finish();
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+    }
+}
+
+test "serverless execution remote model discovery waiter lends its own retained capacity" {
+    const sources = @import("antfly_local_sources");
+    const managed_mod = sources.inference_managed_embedder;
+    const Cache = @typeInfo(@typeInfo(@FieldType(managed_mod.InitOptions, "remote_capability_cache")).optional.child).pointer.child;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var app: ModelHttpTest.App = .{};
+    var listener = sources.common_http_std_http_listener.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = ModelHttpTest.App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const url = try listener.baseUri(alloc);
+    defer alloc.free(url);
+    const indexes = try std.fmt.allocPrint(alloc, "{{\"model\":{{\"type\":\"embeddings\",\"field\":\"text\",\"dimension\":2,\"embedder\":{{\"provider\":\"antfly\",\"model\":\"text-embedding-3-small\",\"url\":\"{s}\"}}}}}}", .{url});
+    defer alloc.free(indexes);
+    var cache = Cache.init(alloc, io);
+    defer cache.deinit();
+    var managed = try managed_mod.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes, .{ .io = io, .remote_capability_cache = &cache });
+    defer managed.deinit();
+    cache.deinit();
+    cache = Cache.init(alloc, io);
+    app.catalogs.store(0, .release);
+    app.block.store(true, .release);
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+    defer scheduler.close();
+    var executions: [2]Runnable.Execution = @splat(.{});
+    defer for (&executions) |*execution| execution.finish();
+    var reads: [2]@import("api/runnable_local_read.zig").Read = undefined;
+    var jobs: [2]ModelHttpTest.Job = undefined;
+    var futures: [2]std.Io.Future(void) = undefined;
+    var active: usize = 0;
+    defer for (futures[0..active]) |*future| future.cancel(io);
+    defer app.release.set(io);
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+    for (0..2) |index| {
+        try executions[index].start(&scheduler, .{ .io = io, .retained_bytes = @import("serverless/catalog/service.zig").CatalogService.Scope.retained_bytes }, .background);
+        reads[index] = .{ .execution = &executions[index], .allocator = alloc };
+        jobs[index] = .{ .dense = managed.denseInterface(), .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .runnable = (try reads[index].team()).borrow } };
+        futures[index] = try io.concurrent(ModelHttpTest.Job.run, .{&jobs[index]});
+        active += 1;
+        while (scheduler.stats().resource_blocked != index + 1 or !app.received.load(.acquire)) {
+            if (jobs[index].done.load(.acquire)) return jobs[index].failure orelse error.DiscoveryDidNotWait;
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.DiscoveryWaiterKeptCpu;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+    var query: Runnable.Execution = .{};
+    defer query.finish();
+    try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+    var control: Runnable.Execution = .{};
+    defer control.finish();
+    try control.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+    control.finish();
+    query.finish();
+    app.release.set(io);
+    for (&futures, &jobs) |*future, *job| {
+        future.await(io);
+        if (job.failure) |err| return err;
+    }
+    active = 0;
+    try std.testing.expectEqual(@as(usize, 1), app.catalogs.load(.acquire));
+    try std.testing.expect(managed.entries[0].http_control == null);
+    for (&executions) |*execution| execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}

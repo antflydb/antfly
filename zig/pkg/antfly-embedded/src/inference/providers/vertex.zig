@@ -57,6 +57,7 @@ pub fn maxEmbeddingBatchSize(format: RequestFormat, model: []const u8, configure
 }
 
 pub const EmbedOptions = struct {
+    socket_control: ?httpx.socket.WriteControl = null,
     task_type: []const u8,
     request_format: RequestFormat = .embed_content,
     task_encoding: TaskEncoding = .prompt,
@@ -70,6 +71,7 @@ pub const GeminiProvider = struct {
     allocator: Allocator,
     http: *httpx.Client,
     attempt_observer: ?httpx.AttemptObserver = null,
+    socket_control: ?httpx.socket.WriteControl = null,
     base_url: []const u8,
     api_key_header: [2][]const u8,
     tools_json: ?[]const u8 = null,
@@ -186,6 +188,7 @@ pub const GeminiProvider = struct {
         const headers = [_][2][]const u8{self.api_key_header};
         var response = try self.http.post(url, .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .json = json_body,
             .headers = &headers,
             .timeout_ms = options.timeout_ms,
@@ -242,6 +245,7 @@ pub const GeminiProvider = struct {
         const headers = [_][2][]const u8{self.api_key_header};
         var resp = try self.http.post(url, .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .json = json_body,
             .headers = &headers,
             .max_response_size = self.max_response_bytes,
@@ -277,6 +281,7 @@ pub const Provider = struct {
     allocator: Allocator,
     http: *httpx.Client,
     attempt_observer: ?httpx.AttemptObserver = null,
+    socket_control: ?httpx.socket.WriteControl = null,
     base_url: []const u8,
     project_id: []const u8,
     location: []const u8,
@@ -402,6 +407,7 @@ pub const Provider = struct {
 
         var response = try self.http.post(url, .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .json = request_body,
             .headers = headers.items,
             .timeout_ms = try control.remainingTimeoutMs(),
@@ -528,6 +534,7 @@ pub const Provider = struct {
         try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
         var response = try self.http.post(url, .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .json = json_body,
             .headers = headers.items,
             .timeout_ms = try control.remainingTimeoutMs(),
@@ -621,6 +628,7 @@ pub const Provider = struct {
 
         var resp = try self.http.post(url, .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .json = json_body,
             .headers = headers.items,
             .max_response_size = self.max_response_bytes,
@@ -1180,7 +1188,7 @@ fn embedContent(alloc: Allocator, http: *httpx.Client, observer: ?httpx.AttemptO
         .outputDimensionality = options.dimensions,
     }, .{ .emit_null_optional_fields = false });
     defer alloc.free(body);
-    var response = try http.post(url, .{ .attempt_observer = observer, .json = body, .headers = headers, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = control.cancellation });
+    var response = try http.post(url, .{ .socket_control = options.socket_control, .attempt_observer = observer, .json = body, .headers = headers, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = control.cancellation });
     defer response.deinit();
     if (!response.ok()) return mapEmbeddingStatus(response.status.code);
     const Response = struct { embedding: struct { values: []const f32 } };
