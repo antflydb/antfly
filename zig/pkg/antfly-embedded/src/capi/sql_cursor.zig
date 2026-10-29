@@ -114,10 +114,10 @@ fn prepare(cursor: *Cursor, handle: *h.Handle, table_name: []const u8, request_j
     cursor.session_id = request.session_id;
     cursor.compiled = try sql.compiler.compile(cursor.budget.allocator(), request.statement, .{});
     errdefer cursor.compiled.deinit();
-    switch (cursor.compiled.statement) {
-        .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint => return error.UnsupportedSqlExecution,
-        else => {},
-    }
+    // Cursor entry uses read-only storage intent even though registry access
+    // is exclusive. Unsupported shapes fall back to materialized execution;
+    // they must never execute a mutation through the streaming path.
+    if (cursor.compiled.statement != .select) return error.UnsupportedSqlExecution;
     try api.requireEmbeddedSqlCatalogOwnership(handle, cursor.compiled.statement);
     if (session) |value| if (value.failed) return error.SqlTransactionAborted;
     cursor.adapter = .{ .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
@@ -129,7 +129,7 @@ pub fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, o
     h.capi.clearLastError();
     out.* = .{};
     out_id.* = 0;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);
