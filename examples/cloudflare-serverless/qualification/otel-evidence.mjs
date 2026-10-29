@@ -78,10 +78,36 @@ export async function sanitizeOtel(envelope, source, signal) {
  }
  return rows;
 }
+// A console log may belong to a callee method span nested below the RPC
+// invocation span. Resolve only explicit provider parent links, never clocks.
+export function attributeOtelInvocations(rows){
+ const nodes=new Map(),roots=new Map(),failures=[];
+ const key=r=>r.trace_id_sha256&&r.span_id_sha256?r.trace_id_sha256+'/'+r.span_id_sha256:null;
+ for(const r of rows)if(r.signal==='traces'&&key(r)){
+  const k=key(r),old=nodes.get(k);if(old&&['script','version_id','parent_span_id_sha256','invocation_id_sha256','start','end','handler','terminal','outcome'].some(f=>old[f]!==r[f]))failures.push('ProviderSpanConflict');else nodes.set(k,r);
+  if(r.terminal&&r.invocation_id_sha256)roots.set(r.invocation_id_sha256,r);
+ }
+ if(nodes.size>20000)return{rows:[],failures:['ProviderSpanBudgetExceeded']};
+ return{rows:rows.map(r=>{
+  if(r.signal!=='logs'||r.invocation_id_sha256)return r;
+  let at=key(r),root;const seen=new Set();
+  for(let depth=0;at&&depth<64;depth++){
+   if(seen.has(at)){failures.push('ProviderSpanCycle');break;}seen.add(at);
+   const node=nodes.get(at);if(!node)break;
+   if(node.script!==r.script||node.version_id!==r.version_id){failures.push('ProviderSpanScopeMismatch');break;}
+   if(node.terminal&&node.invocation_id_sha256){root=node;break;}
+   at=node.parent_span_id_sha256?node.trace_id_sha256+'/'+node.parent_span_id_sha256:null;
+  }
+  if(!root)return r;
+  if(root.script!==r.script||root.version_id!==r.version_id){failures.push('ProviderSpanScopeMismatch');return r;}
+  return{...r,invocation_id_sha256:root.invocation_id_sha256,identity_source:'provider-span-parentage'};
+ }),failures:[...new Set(failures)]};
+}
+
 // This reports readiness only. Gate adoption additionally requires independent
 // platform accounting, immutable evidence and a validated settlement contract.
 export function reconcileOtel(rows, expected, {version} = {}) {
- const failures=[],terminals=rows.filter(r=>r.terminal),ids=new Map();
+ const attributed=attributeOtelInvocations(rows);rows=attributed.rows;const failures=[...attributed.failures],terminals=rows.filter(r=>r.terminal),ids=new Map();
  for(const row of terminals){if(!row.invocation_id_sha256||!row.trace_id_sha256||!row.span_id_sha256)failures.push('ProviderIdentityMissing');else {const prior=ids.get(row.invocation_id_sha256);if(prior&&JSON.stringify(prior)!==JSON.stringify(row))failures.push('ProviderIdentityConflict');ids.set(row.invocation_id_sha256,row);}if(!row.version_id)failures.push('ProviderVersionMissing');if(row.handler==='unknown'||!row.outcome||row.start==null||row.end==null||row.end<row.start||row.dropped||row.warning||!Number.isFinite(row.event?.cpuTime)||row.event.cpuTime<0||!Number.isFinite(row.event?.wallTime)||row.event.wallTime<0)failures.push('TerminalMetadataIncomplete');if(row.outcome&&row.outcome!=='ok')failures.push('InvocationFailed');}
  for(const row of rows){for(const log of row.event?.logs??[])for(const message of log.message??[]){let value;try{value=JSON.parse(message);}catch{value=null;}if(value?.failure_code&&resourceFailureCode(value.failure_code))failures.push('ResourceFailureObserved');}for(const exception of row.event?.exceptions??[])if(resourceFailureCode(exception.message))failures.push('ResourceFailureObserved');if(row.dropped||row.warning&&(row.terminal||row.warning_type!=='span_not_ended'))failures.push('TelemetryDroppedOrWarning');}
  const unique=[...ids.values()];
