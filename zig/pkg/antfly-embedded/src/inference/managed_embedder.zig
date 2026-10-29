@@ -1491,6 +1491,17 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryForTask(alloc, &request_entry, text, request_entry.dimensions, .retrieval_query);
     }
 
+    /// Borrow a request's execution authority for one synchronous query. The
+    /// shared entry and its credential/cache owners remain unchanged.
+    pub fn embedQueryWithContext(self: *const ManagedEmbedder, alloc: std.mem.Allocator, index_name: []const u8, text: []const u8, context: RequestContext) ![]f32 {
+        const configured = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedWithEntryForTask(alloc, &entry, text, entry.dimensions, .retrieval_query);
+    }
+
     /// Digest the effective dense-text embedding operation. Table and index
     /// names are intentionally excluded so equivalent configurations share
     /// results; the server-derived scope prevents cross-principal reuse.
@@ -1574,6 +1585,21 @@ pub const ManagedEmbedder = struct {
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
         return embedWithEntryPartsForTask(alloc, &request_entry, parts, request_entry.dimensions, .retrieval_query) catch |err| return err;
+    }
+
+    pub fn embedQueryWithTemplateAndContext(self: *const ManagedEmbedder, alloc: std.mem.Allocator, index_name: []const u8, text: []const u8, embedding_template: []const u8, context: RequestContext) ![]f32 {
+        const configured = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
+        applyRequestContext(&entry, context, &cancellation);
+        const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, &entry);
+        defer alloc.free(rendered);
+        try embeddingHttpContext(&entry, .retrieval_query).check();
+        try validateRenderedTemplate(alloc, rendered);
+        const parts = try template_mod.textToParts(alloc, rendered);
+        defer template_mod.freeContentParts(alloc, parts);
+        return try embedWithEntryPartsForTask(alloc, &entry, parts, entry.dimensions, .retrieval_query);
     }
 
     fn findQueryEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {

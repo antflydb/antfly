@@ -867,3 +867,59 @@ mistaken for a model loader owned by the node scheduler. The wider maintenance
 work and original cross-engine resource gates, including file-engine descriptor
 recovery, remain open. Full GNU/full qualification remains waived; the installed
 CLI is not rebuilt by these focused tests.
+
+
+### Serverless semantic-query context and native media waits
+
+Normal serverless ingress now creates a stack-stable read adapter on its existing
+execution for public table queries, table search, and namespace search. The
+trusted request context carries that team through public-query, joined-query and
+graph-search adapters into semantic query resolution. It also retains diagnostics,
+the original deadline and fallible cancellation. Expected lifetime rejection is
+checked before adapters translate or log generic query errors.
+
+ManagedEmbedder exposes synchronous context-bearing dense and template query
+entry points. Each applies the invocation context to a request overlay and
+combines configured and invocation cancellation. A cached query embedder retains
+its own cache/credential owners without retaining a request runnable, cancellation
+callback or transport-wait pointer. Per-table construction receives the same
+request scope, including discovery before query dispatch. The existing
+cancellation-only API remains available for callers without an I/O context.
+
+The native inference server now creates a local download-wait adapter for each
+synchronous media fetch and for the full lifetime of a pinned range pipeline.
+Physical transport waits use the current worker's ResourceWait/CheckpointScope;
+watchdogs only inspect request lifetime. The same control reaches HTTP, S3 and
+allowed local files through scraping. Parsing, allocation, result transfer and
+source-cache work remain runnable. Refused CPU return remains sticky in the
+native checkpoint scope, and final checks recover the original cause before
+optional per-item fallback or result transfer. Neither a request callback nor a
+borrowed grant is stored in an asynchronous loader or cached transport.
+
+Evidence: `semantic-invocation-waits-v3-debug.json` exercises the normal handler,
+actual filesystem-backed catalog/WAL/publication and vector query execution,
+and a real loopback model/template HTTP listener. Across all three semantic
+routes it checks dense and remote-template calls with successful query results,
+source cancellation while queued for reentry, and expiration of the original
+request deadline. Another query and the health control route progress while the
+model/template request is parked. Rejected template fetches never dispatch an
+embedding request; response retirement releases request admission, retained
+bytes and roots. Cached embedder request fields remain unchanged. The fixture
+uses direct handler ingress plus real provider transport, rather than an
+external client over a deployed serverless listener.
+
+`native-media-download-waits-v1-debug.json` records 47 filtered native tests,
+including actual multi-chunk file downloads through the native server helper,
+rejection at every physical return, exact original refusal after optional
+fallback checks, and existing independent-loader/model-file regressions. The
+production worker entry also passes its semantic compile check. Native media
+loan boundaries use deterministic callbacks around actual file I/O; this is not
+native live-network/cloud, TLS or latency/throughput qualification.
+
+Remaining in the remote-asset milestone: asset-producer provider/capability
+paths still need transport wait controls through their full invocation lifetime.
+The wider maintenance work (credential subprocesses, lease renewal, remaining
+mutation/retention/immutable-artifact boundaries and serial graph preparation)
+and original cross-engine gates remain open, including file-engine descriptor
+recovery. Full GNU/full qualification remains waived. These checks do not rebuild
+the installed CLI or establish completion of the full design.

@@ -1805,7 +1805,40 @@ fn remainingInferenceDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
     return @intCast(timeout_ms);
 }
 
-fn inferenceDownloadContext(context: *const InferenceDownloadRequestContext) !scraping.DownloadContext {
+// This scope lives at the synchronous fetch's final address. TLS transitions
+// belong to that worker; HTTP monitors inspect the immutable request only.
+const InferenceDownloadWait = struct {
+    request: *const InferenceDownloadRequestContext,
+    wait: ?@import("../execution_control.zig").ResourceWait = null,
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+        from(raw).request.control.check() catch |err| return if (err == error.Timeout) error.Timeout else error.Canceled;
+    }
+    fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
+        try check(raw);
+        return remainingInferenceDeadlineMs(from(raw).request.control.deadline_ns, embedTimingNowNs()) catch return error.Timeout;
+    }
+    fn begin(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        try self.request.control.check();
+        if (self.wait != null) return error.InvalidRunnableTransition;
+        self.wait = try @import("../execution_control.zig").ResourceWait.init();
+    }
+    fn end(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        var wait = self.wait orelse return error.InvalidRunnableTransition;
+        self.wait = null;
+        try wait.finish();
+        try self.request.control.check();
+    }
+    fn control(self: *@This()) httpx.socket.WriteControl {
+        return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining, .wait_begin_fn = begin, .wait_end_fn = end };
+    }
+};
+
+fn inferenceDownloadContext(context: *const InferenceDownloadRequestContext, wait: ?*InferenceDownloadWait) !scraping.DownloadContext {
     try context.control.check();
     const CancellationAdapter = struct {
         fn isCancelled(raw: *const anyopaque) bool {
@@ -1818,6 +1851,7 @@ fn inferenceDownloadContext(context: *const InferenceDownloadRequestContext) !sc
         .io = context.io,
         .timeout_ms = try remainingInferenceDeadlineMs(context.control.deadline_ns, embedTimingNowNs()),
         .cancellation = .{
+            .execution_wait = if (wait) |scope| scope.control() else null,
             .ptr = context,
             .is_cancelled_fn = CancellationAdapter.isCancelled,
         },
@@ -1831,10 +1865,11 @@ fn downloadContentForInferenceRequest(
     security: *const scraping.ContentSecurityConfig,
     s3_credentials: ?*const scraping.S3CredentialsConfig,
 ) !scraping.DownloadedContent {
-    const download_context = if (request_context) |*context|
-        try inferenceDownloadContext(context)
-    else
-        null;
+    var wait: InferenceDownloadWait = undefined;
+    const download_context = if (request_context) |*context| blk: {
+        wait = .{ .request = context };
+        break :blk try inferenceDownloadContext(context, &wait);
+    } else null;
     const downloaded = (if (download_context) |context|
         scraping.downloadContentAllocWithContext(alloc, context, url, security, s3_credentials)
     else
@@ -2112,7 +2147,68 @@ test "inference download context carries request cancellation" {
             .cancellation = .{ .ptr = &state, .is_cancelled_fn = State.isCancelled },
         },
     };
-    try std.testing.expectError(error.Cancelled, inferenceDownloadContext(&request_context));
+    try std.testing.expectError(error.Cancelled, inferenceDownloadContext(&request_context, null));
+}
+
+test "inference download physical waits retain original execution authority" {
+    const State = struct {
+        parked: bool = false,
+        returns: usize = 0,
+        reject_at: ?usize = null,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn check(raw: *anyopaque) !void {
+            try std.testing.expect(!from(raw).parked);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self = from(raw);
+            try std.testing.expect(!self.parked);
+            self.parked = true;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self = from(raw);
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.returns += 1;
+            if (self.reject_at == self.returns) return error.NativeDownloadRevoked;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = try a.alloc(u8, 2 * 1024 * 1024 + 9);
+    defer a.free(body);
+    @memset(body, 'x');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "media.txt", .data = body });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "media.txt", a);
+    defer a.free(path);
+    const url = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(url);
+    const security: scraping.ContentSecurityConfig = .{ .allowed_paths = &.{root} };
+    var returns: usize = 0;
+    var reject_at: usize = 0;
+    while (reject_at <= returns) : (reject_at += 1) {
+        var state: State = .{ .reject_at = if (reject_at == 0) null else reject_at };
+        var scope = @import("../execution_control.zig").CheckpointScope.init(.{ .context = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end });
+        defer scope.deinit();
+        const result = downloadContentForInferenceRequest(a, .{ .io = std.testing.io }, url, &security, null);
+        if (reject_at == 0) {
+            var downloaded = try result;
+            defer downloaded.deinit(a);
+            try std.testing.expectEqualSlices(u8, body, downloaded.data);
+            returns = state.returns;
+            try std.testing.expect(returns >= 7);
+        } else {
+            try std.testing.expectError(error.NativeDownloadRevoked, result);
+            // Native optional per-item fallback must not erase CPU refusal.
+            try std.testing.expectError(error.NativeDownloadRevoked, (InferenceExecutionControl{}).check());
+            try std.testing.expectEqual(reject_at, state.returns);
+        }
+        try std.testing.expect(!state.parked);
+    }
 }
 
 test "dense embed parser contexts reject expired image fetches" {
@@ -13525,7 +13621,8 @@ pub const Node = struct {
             const transport_allocator = transport_bound.allocator();
             var security = effectiveRequestContentSecurity(self);
             const download_context = InferenceDownloadRequestContext{ .io = io, .control = control };
-            const remote = try scraping.PinnedRange.create(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, if (reference.version_kind == .strong_etag) .strong_etag else .s3_version_id, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{});
+            var download_wait: InferenceDownloadWait = .{ .request = &download_context };
+            const remote = try scraping.PinnedRange.create(transport_allocator, try inferenceDownloadContext(&download_context, &download_wait), reference.uri, reference.version, if (reference.version_kind == .strong_etag) .strong_etag else .s3_version_id, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{});
             defer remote.destroy();
             const Range = struct {
                 fn read(raw: *anyopaque, offset: u64, out: []u8, check: media.source.Control) !usize {

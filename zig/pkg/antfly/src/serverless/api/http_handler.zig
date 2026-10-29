@@ -433,6 +433,18 @@ pub const HttpHandler = struct {
     }
 
     fn dispatchRoute(self: *HttpHandler, req: HttpRequest, route: http_routes.Route, request_context: api_operation.RequestContext, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !HttpResponse {
+        var query_context = request_context;
+        query_context.cancellation = req.cancellation;
+        var read: @import("../../api/runnable_local_read.zig").Read = undefined;
+        var team: @import("antfly_runtime_abi").runnable_abi.Team = undefined;
+        if (execution) |active| switch (route) {
+            .table_query_request, .query_search, .table_query_search => {
+                read = .{ .execution = active, .allocator = self.alloc };
+                team = try read.team();
+                query_context.execution_team = &team;
+            },
+            else => {},
+        };
         return switch (route) {
             .health => try self.handleHealth(),
             .healthz => try self.handleHealthz(),
@@ -471,11 +483,11 @@ pub const HttpHandler = struct {
             .publish_head => |value| try self.handlePublishHead(value.namespace, req.body),
             .query => |value| try self.handleQuery(value.namespace, req.cancellation),
             .table_query => |value| try self.handleTableQuery(value.table_name, req.cancellation),
-            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body, request_context),
+            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body, query_context),
             .table_query_published => |value| try self.handleTableQueryPublished(value.table_name, req.cancellation),
             .table_query_latest => |value| try self.handleTableQueryLatest(value.table_name, req.cancellation),
-            .query_search => |value| try self.handleQuerySearch(value.namespace, req.body, req.cancellation),
-            .table_query_search => |value| try self.handleTableQuerySearch(value.table_name, req.body, req.cancellation),
+            .query_search => |value| try self.handleQuerySearch(value.namespace, req.body, query_context),
+            .table_query_search => |value| try self.handleTableQuerySearch(value.table_name, req.body, query_context),
             .table_query_graph_neighbors => |value| try self.handleTableQueryGraphNeighbors(value.table_name, req.body, req.cancellation),
             .table_query_graph_traverse => |value| try self.handleTableQueryGraphTraverse(value.table_name, req.body, req.cancellation),
             .table_query_graph_shortest_path => |value| try self.handleTableQueryGraphShortestPath(value.table_name, req.body, req.cancellation),
@@ -1664,9 +1676,10 @@ pub const HttpHandler = struct {
         namespace: []const u8,
         table_name: ?[]const u8,
         body: []const u8,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) !SearchExecution {
+        const cancellation = request_context.cancellation;
+        const diagnostics = request_context.diagnostics;
         try cancellation.check();
         var status = try self.catalog.buildStatus(namespace);
         errdefer status.deinit(self.alloc);
@@ -1678,7 +1691,7 @@ pub const HttpHandler = struct {
             plan.request.offset = 0;
             plan.request.limit = std.math.maxInt(usize);
         }
-        try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
+        try self.resolveSemanticQueryRequest(table_name, &plan, request_context);
 
         var session = try self.query.openHeadSessionWithCancellation(namespace, cancellation);
         errdefer session.deinit();
@@ -1707,7 +1720,8 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, request_context: api_operation.RequestContext) anyerror![]u8 {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
             return error.InvalidQueryRequest;
@@ -1732,7 +1746,7 @@ pub const HttpHandler = struct {
             return error.GraphQueryModeUnsupported;
         }
 
-        if (self.executeForeignPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation) catch |err| switch (err) {
+        if (self.executeForeignPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, request_context) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             else => return err,
@@ -1750,10 +1764,10 @@ pub const HttpHandler = struct {
                 var owned = parsed_join;
                 owned.deinit(self.alloc);
             }
-            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation, null);
+            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, request_context);
         }
 
-        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation, null);
+        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, request_context);
     }
 
     fn executeForeignPublicTableQueryJsonValueAlloc(
@@ -1761,8 +1775,9 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         body: []const u8,
         raw_request: std.json.Value,
-        cancellation: CancellationToken,
+        request_context: api_operation.RequestContext,
     ) anyerror!?[]u8 {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         if (raw_request != .object) return error.InvalidQueryRequest;
         if (!public_search_request.hasNonNullField(raw_request.object, "foreign_sources"))
@@ -2112,8 +2127,7 @@ pub const HttpHandler = struct {
         self: *HttpHandler,
         table_name: []const u8,
         body: []const u8,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) anyerror![]u8 {
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
             return error.InvalidQueryRequest;
@@ -2123,8 +2137,7 @@ pub const HttpHandler = struct {
             table_name,
             body,
             raw_request.value,
-            cancellation,
-            diagnostics,
+            request_context,
         );
     }
 
@@ -2133,14 +2146,14 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         body: []const u8,
         raw_request: std.json.Value,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) anyerror![]u8 {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        const graph_response = self.handleTablePublicGraphQueryRequestValue(table_name, namespace, body, raw_request, cancellation, diagnostics) catch |err| switch (err) {
+        const graph_response = self.handleTablePublicGraphQueryRequestValue(table_name, namespace, body, raw_request, request_context) catch |err| switch (err) {
             // Once the graph boundary has recognized the request, unsupported
             // semantics are an exact-execution capability response, not a
             // malformed request or an internal server failure.
@@ -2165,7 +2178,8 @@ pub const HttpHandler = struct {
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, diagnostics) catch |err| {
+        var execution = self.executePublishedSearch(namespace, table_name, body, request_context) catch |err| {
+            try request_context.ensureExecutionActive();
             switch (err) {
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
@@ -2843,9 +2857,9 @@ pub const HttpHandler = struct {
         body: []const u8,
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) anyerror![]u8 {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
@@ -2859,7 +2873,7 @@ pub const HttpHandler = struct {
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
 
-        const primary_json = self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation, diagnostics) catch |err| {
+        const primary_json = self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, request_context) catch |err| {
             std.log.warn("serverless joined query rejected rewritten left input table={s} err={}", .{ table_name, err });
             return err;
         };
@@ -3315,8 +3329,7 @@ pub const HttpHandler = struct {
             namespace,
             body,
             raw_request.value,
-            cancellation,
-            null,
+            .{ .cancellation = cancellation },
         );
     }
 
@@ -3326,9 +3339,10 @@ pub const HttpHandler = struct {
         namespace: []const u8,
         body: []const u8,
         raw_request: std.json.Value,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) !?HttpResponse {
+        const cancellation = request_context.cancellation;
+        const diagnostics = request_context.diagnostics;
         try cancellation.check();
         if (raw_request != .object) return error.InvalidQueryRequest;
         if (raw_request.object.get("graph_searches")) |legacy_graph_request| {
@@ -3447,19 +3461,22 @@ pub const HttpHandler = struct {
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
-            var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation, diagnostics) catch |err| switch (err) {
-                error.InvalidQueryRequest,
-                error.EmbeddingIndexNotFound,
-                error.InvalidEmbeddingDimensions,
-                error.PermanentPromptFailure,
-                error.TransientPromptFailure,
-                error.VectorQueryRequired,
-                error.VectorDimsMismatch,
-                error.SparseQueryRequired,
-                => return error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
-                error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
-                else => return err,
+            var execution = self.executePublishedSearch(namespace, table_name, search_body, request_context) catch |err| blk: {
+                try request_context.ensureExecutionActive();
+                break :blk switch (err) {
+                    error.InvalidQueryRequest,
+                    error.EmbeddingIndexNotFound,
+                    error.InvalidEmbeddingDimensions,
+                    error.PermanentPromptFailure,
+                    error.TransientPromptFailure,
+                    error.VectorQueryRequired,
+                    error.VectorDimsMismatch,
+                    error.SparseQueryRequired,
+                    => return error.InvalidQueryRequest,
+                    error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
+                    error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
+                    else => return err,
+                };
             };
             defer execution.deinit(self.alloc);
 
@@ -4353,14 +4370,15 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+    fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8, request_context: api_operation.RequestContext) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, null, body, cancellation, null) catch |err| {
+        var execution = self.executePublishedSearch(namespace, null, body, request_context) catch |err| {
+            try request_context.ensureExecutionActive();
             switch (err) {
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
@@ -4442,7 +4460,7 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleTableQuerySearch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+    fn handleTableQuerySearch(self: *HttpHandler, table_name: []const u8, body: []const u8, request_context: api_operation.RequestContext) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             else => return try textResponse(self.alloc, 500, "query failed"),
@@ -4451,7 +4469,7 @@ pub const HttpHandler = struct {
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
-        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, null) catch |err| switch (err) {
+        var execution = self.executePublishedSearch(namespace, table_name, body, request_context) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.EmbeddingIndexNotFound,
             error.InvalidEmbeddingDimensions,
@@ -4571,7 +4589,8 @@ pub const HttpHandler = struct {
         return try self.tableQueryGraphShortestPathResponse(&session, table_name, namespace, req);
     }
 
-    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan, cancellation: CancellationToken) !void {
+    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan, request_context: api_operation.RequestContext) !void {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         const semantic_search = plan.request.semantic_search orelse return;
         if (plan.request.vector != null) return error.InvalidQueryRequest;
@@ -4581,6 +4600,12 @@ pub const HttpHandler = struct {
         _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
         defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
 
+        const model_context: ?managed_embedder.RequestContext = if (self.io) |io| .{
+            .io = io,
+            .deadline_ns = request_context.deadline_ns,
+            .cancellation = cancellation,
+            .runnable = if (request_context.execution_team) |team| team.borrow else null,
+        } else if (request_context.execution_team != null) return error.MissingBackendRuntimeIo else null;
         const index_name = (plan.vectorSource() orelse return error.InvalidQueryRequest).index_name;
         if (table_name) |name| {
             var table = (try self.catalog.getTableAlloc(self.alloc, name)) orelse return error.InvalidQueryRequest;
@@ -4588,13 +4613,21 @@ pub const HttpHandler = struct {
 
             var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
                 .io = self.io,
+                .deadline_ns = request_context.deadline_ns,
+                .cancellation = cancellation,
+                .runnable = if (model_context) |context| context.runnable else null,
                 .remote_content = self.remote_content,
                 .provider_runtime = self.embedding_provider_runtime,
             });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {
                 plan.request.vector = if (plan.request.embedding_template) |value|
-                    try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
+                    if (model_context) |context|
+                        try runtime.embedQueryWithTemplateAndContext(self.alloc, index_name, semantic_search, value, context)
+                    else
+                        try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
+                else if (model_context) |context|
+                    try runtime.embedQueryWithContext(self.alloc, index_name, semantic_search, context)
                 else
                     try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
                 return;
@@ -4603,7 +4636,12 @@ pub const HttpHandler = struct {
 
         const runtime = self.managed_query_embedder orelse return error.InvalidQueryRequest;
         plan.request.vector = if (plan.request.embedding_template) |value|
-            try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
+            if (model_context) |context|
+                try runtime.embedQueryWithTemplateAndContext(self.alloc, index_name, semantic_search, value, context)
+            else
+                try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
+        else if (model_context) |context|
+            try runtime.embedQueryWithContext(self.alloc, index_name, semantic_search, context)
         else
             try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
     }
@@ -6497,7 +6535,9 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         var guard = http_types.RequestGuard{ .context = request };
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (err) {
+        var query_request = request;
+        query_request.cancellation = guard.token();
+        return self.executePublicTableQueryJsonAlloc(table_name, body, query_request) catch |err| switch (err) {
             error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -6526,6 +6566,7 @@ pub const HttpHandler = struct {
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.Canceled => return error.Canceled,
             else => {
+                guard.checkpoint() catch |cause| return if (cause == error.DeadlineExceeded) error.DeadlineExceeded else error.Canceled;
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },
@@ -11761,7 +11802,7 @@ test "serverless local table query routes a foreign right join before plain sear
         "orders",
         body,
         raw.value,
-        .none,
+        .{},
     )) == null);
 
     var parsed_join = (try parseSupportedJoinRequestValueAlloc(alloc, body, raw.value)).?;
@@ -11969,7 +12010,7 @@ test "http handler executes direct foreign table query through registry" {
         "pg_customers",
         body,
         raw_request.value,
-        .none,
+        .{},
     )).?;
     defer alloc.free(json);
 
@@ -15827,4 +15868,184 @@ test "serverless graph metric compact admission charges actual final backing" {
     try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, small.chargeRetained(partial));
     const zero = try graph_query_mod.GraphQueryEngine.compactMaterializationBytes(0, rows, n);
     try std.testing.expectEqual(@as(usize, 0), zero);
+}
+
+test "serverless execution semantic query routes lend invocation capacity and fence results" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const sources = @import("antfly_local_sources");
+    const App = struct {
+        received: std.atomic.Value(bool) = .init(false),
+        block_get: std.atomic.Value(bool) = .init(false),
+        block_post: std.atomic.Value(bool) = .init(false),
+        posts: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+        fn execute(raw: *anyopaque, a: Allocator, req: sources.common_http_http_common.HttpRequest) !sources.common_http_http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (req.method == .POST) _ = self.posts.fetchAdd(1, .monotonic);
+            if (if (req.method == .GET) self.block_get.load(.acquire) else self.block_post.load(.acquire)) {
+                self.received.store(true, .release);
+                try self.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            }
+            return .{ .status = 200, .content_type = try a.dupe(u8, "text/plain"), .body = try a.dupe(u8, if (req.method == .GET) "alpha" else "{\"data\":[{\"embedding\":[1,0]}]}") };
+        }
+    };
+    const Job = struct {
+        handler: *HttpHandler,
+        request: HttpRequest,
+        done: std.atomic.Value(bool) = .init(false),
+        revoked: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.revoked.load(.acquire)) return error.SemanticRequestRevoked;
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.request.cancellation = .{ .ptr = self, .check_fn = check };
+            var response = self.handler.handle(self.request) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer response.deinit(std.testing.allocator);
+            if (response.status != 200 or std.mem.indexOf(u8, response.body, "doc-a") == null) {
+                std.debug.print("semantic route {s}: {d} {s}\n", .{ self.request.path, response.status, response.body });
+                self.failure = error.UnexpectedSemanticQueryResult;
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var app: App = .{};
+    var listener = sources.common_http_std_http_listener.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const url = try listener.baseUri(alloc);
+    defer alloc.free(url);
+    const indexes = try std.fmt.allocPrint(alloc, "{{\"semantic_idx\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"{s}\"}}}}}}", .{url});
+    defer alloc.free(indexes);
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    var catalog_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-semantic-execution");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-semantic-execution");
+    const wal_root = tmpPath(&wal_root_buf, "wal-semantic-execution");
+    const catalog_root = tmpPath(&catalog_root_buf, "catalog-semantic-execution");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(catalog_root);
+
+    var fs_artifacts = try @import("../artifacts/mod.zig").FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+
+    var fs_progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    var fs_wal = try @import("../wal/mod.zig").FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var fs_catalog = try @import("../catalog/fs_store.zig").FsStore.init(alloc, std.mem.span(catalog_root));
+    var catalog_store = fs_catalog.catalogStore();
+    defer catalog_store.deinit();
+
+    var builder = build_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = api_service.Service.init(alloc, &wal_store, &builder);
+    var catalog = catalog_mod.CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &catalog_store);
+    defer catalog.deinit();
+    var query = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer query.deinit();
+    var runtime_status = api_types.RuntimeStatusResult{
+        .role = .combined,
+        .tick_interval_ms = 1,
+        .validated = true,
+        .targets = try alloc.alloc(api_types.RuntimeStorageTarget, 0),
+    };
+    defer runtime_status.deinit(alloc);
+    var handler = HttpHandler.init(alloc, &api, &catalog, &manifest_store, &progress_store, &query, &runtime_status);
+
+    handler.io = io;
+    var remote_content: scraping.RemoteContentConfig = .{ .security = .{ .block_private_ips = false } };
+    handler.remote_content = &remote_content;
+    const create_body = try std.fmt.allocPrint(alloc, "{{\"created_at_ns\":1,\"schema\":{{\"default_type\":\"doc\"}},\"indexes\":{s}}}", .{indexes});
+    defer alloc.free(create_body);
+    var create = try handler.handle(.{ .method = .put, .path = "/tables/docs", .body = create_body });
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), create.status);
+    var ingest = try handler.handle(.{ .method = .put, .path = "/tables/docs/ingest-batch", .body = "{\"timestamp_ns\":2,\"mutations\":[{\"kind\":\"upsert\",\"doc_id\":\"doc-a\",\"document\":{\"body\":\"alpha\",\"embedding\":[1,0]}}]}" });
+    defer ingest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), ingest.status);
+    var build = try handler.handle(.{ .method = .post, .path = "/internal/v1/tables/docs/build" });
+    defer build.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), build.status);
+    var managed = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes, .{ .io = io, .remote_content = &remote_content });
+    defer managed.deinit();
+    handler.setManagedDenseQueryEmbedder(&managed, "semantic_idx");
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_wait_ms = 5000 });
+    defer scheduler.close();
+    handler.runnable_scheduler = &scheduler;
+    const Terminal = enum { success, revoked, expired };
+    for ([_][]const u8{ "/tables/docs/query", "/tables/docs/query/search", "/internal/v1/namespaces/docs/query/search" }) |path| {
+        for ([_]bool{ false, true }) |templated| {
+            for (std.enums.values(Terminal)) |terminal| {
+                app.received.store(false, .release);
+                app.block_get.store(templated, .release);
+                app.block_post.store(!templated, .release);
+                app.release = .unset;
+                const previous_posts = app.posts.load(.acquire);
+                const body = try std.fmt.allocPrint(alloc, "{{\"semantic_search\":{f},\"limit\":1{s}}}", .{ std.json.fmt(if (templated) url else "alpha", .{}), if (templated) ",\"embedding_template\":\"{{remoteText url=this}}\"" else "" });
+                defer alloc.free(body);
+                var job: Job = .{ .handler = &handler, .request = .{ .method = .post, .path = path, .body = body, .deadline_ns = platform_time.monotonicNs() + if (terminal == .expired) @as(u64, 500 * std.time.ns_per_ms) else 5 * std.time.ns_per_s } };
+                var future = try io.concurrent(Job.run, .{&job});
+                defer future.cancel(io);
+                defer app.release.set(io);
+                const until = platform_time.monotonicNs() + 3 * std.time.ns_per_s;
+                while (!app.received.load(.acquire) or scheduler.stats().runnable_slots != 0) {
+                    if (job.done.load(.acquire)) return job.failure orelse error.SemanticQueryDidNotWait;
+                    if (platform_time.monotonicNs() >= until) return error.SemanticQueryKeptCapacity;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                try std.testing.expect(scheduler.stats().retained_bytes >= HttpHandler.requestRetainedBytes());
+                var other_query = try handler.handle(.{ .method = .get, .path = "/health" });
+                try std.testing.expectEqual(@as(u16, 200), other_query.status);
+                other_query.deinit(alloc);
+                var held: Runnable.Execution = .{};
+                defer held.finish();
+                try held.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+                var health = try handler.handle(.{ .method = .get, .path = "/healthz" });
+                try std.testing.expectEqual(@as(u16, 200), health.status);
+                health.deinit(alloc);
+                app.release.set(io);
+                if (terminal == .success) held.finish() else {
+                    while (scheduler.stats().queued == 0) {
+                        if (job.done.load(.acquire)) return job.failure orelse error.SemanticQueryDidNotQueue;
+                        if (platform_time.monotonicNs() >= until) return error.SemanticQueryDidNotQueue;
+                        try io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                    if (terminal == .revoked) job.revoked.store(true, .release);
+                    while (!job.done.load(.acquire)) {
+                        if (platform_time.monotonicNs() >= until) return error.SemanticQueryDidNotReject;
+                        try io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                }
+                future.await(io);
+                if (terminal == .success) {
+                    if (job.failure) |err| return err;
+                } else try std.testing.expectEqual(if (terminal == .revoked) error.SemanticRequestRevoked else error.DeadlineExceeded, job.failure.?);
+                if (templated and terminal != .success) try std.testing.expectEqual(previous_posts, app.posts.load(.acquire));
+                try std.testing.expect(managed.entries[0].runnable == null and managed.entries[0].cancellation == null and managed.entries[0].http_control == null);
+                held.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+                try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
+            }
+        }
+    }
 }
