@@ -227,8 +227,12 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
                 print(f"{wait_mode}: batch {ordinal} drain", flush=True)
                 db.run_until_idle()
             print(f"{wait_mode}: batch {ordinal} complete", flush=True)
+        print(f"{wait_mode}: verify readiness", flush=True)
+        stats = db.stats()
         for field in ("name_embedding", "fact_embedding"):
             print(f"{wait_mode}: verify {field}", flush=True)
+            index = _index(stats, field)
+            assert index["replay_applied_sequence"] >= index["replay_target_sequence"] > 0, index
             expected = {key for key, doc in latest.items() if field in doc}
             vector = next(doc[field] for doc in latest.values() if field in doc)
             result = db.search({"embeddings": {field: vector}, "indexes": [field], "limit": len(latest)})
