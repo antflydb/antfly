@@ -53,6 +53,7 @@ pub const AntflyRootImports = struct {
     shared_inference_core: bool = false,
     darwin_release_memory: bool = false,
     darwin_shared_storage_sdk27: bool = false,
+    darwin_cross_release_memory: bool = false,
     sanitize_thread: bool = false,
     boundary_profile: @import("../embedded/storage_boundary.zig").Profile = .all,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,

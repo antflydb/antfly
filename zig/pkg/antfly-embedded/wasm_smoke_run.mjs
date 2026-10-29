@@ -89,6 +89,17 @@ if (deleted.deleted !== 1) throw new Error("delete failed");
 const stats = api.stats();
 if (typeof stats.doc_count !== "number") throw new Error("stats failed");
 
+// Repeated large analyzed fields exercise contribution reuse in the actual
+// single-threaded wasm32 runtime, including its wide diagnostic counters.
+const body = "portablecounter ".repeat(700);
+api.putMany({ "cache:a": { body }, "cache:b": { body } });
+api.runUntilIdle();
+const reusedSearch = api.search({
+    full_text_search: { match: { field: "body", text: "portablecounter" } },
+    limit: 10,
+});
+if (api.searchTotalHits(reusedSearch) !== 2) throw new Error("repeated analyzed field search failed");
+
 api.close();
 if (api.exports.antfly_embedded_smoke_run() !== 0) {
     throw new Error("hosted text index did not survive close/reopen");
