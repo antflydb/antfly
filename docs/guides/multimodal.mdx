@@ -270,11 +270,28 @@ pages or make OCR output independently reprocessable. Use a
 ```
 
 The built-in parser targets unencrypted, born-digital PDFs. Pages with no native
-text use the local `antflydb/Florence-2-base` reader by default. Install it with:
+text, such as scans and photos, are read with OCR. Use
+[LightOnOCR-3](/docs/guides/lightonocr3), which transcribes pages into Markdown
+with tables and formulas:
 
 ```bash
-antfly inference pull antflydb/Florence-2-base
+antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9
 ```
+
+```json
+{
+  "name": "document_units_v1",
+  "kind": "asset",
+  "field": "url",
+  "content_type": "application/json",
+  "producer_json": "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"prompt_policy\":\"plain\",\"config\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}}"
+}
+```
+
+LightOnOCR-3 takes no instruction prompt, so set `prompt_policy` to `plain`.
+Without an `ocr` model, extraction uses the smaller `antflydb/Florence-2-base`
+reader. Any reader provider works here, including
+[Apple Vision](/docs/guides/apple-native-ocr) on macOS.
 
 If the model is absent, the page records a failed OCR outcome instead of
 silently disappearing. Install the model and explicitly reprocess the artifact

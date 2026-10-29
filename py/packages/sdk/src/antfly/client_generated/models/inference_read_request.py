@@ -21,7 +21,7 @@ class InferenceReadRequest:
     """Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
 
     Attributes:
-        model (str): Name of reader model from models_dir/readers/ Example: antflydb/Florence-2-base.
+        model (str): Name of reader model from models_dir/readers/ Example: lightonai/LightOnOCR-3-0.8B.
         retain_artifact (bool | Unset): Request an opaque, process-local reading handle for extraction reuse. Retention
             is best effort; inspect document.artifact_id and artifact_ttl_ms. Default: False.
         documents (list[DocumentSource] | Unset): Complete documents, mutually exclusive with images. Each source is

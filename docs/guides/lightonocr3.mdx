@@ -3,7 +3,7 @@ title: LightOnOCR-3 document OCR
 description: Run LightOnOCR-3-0.8B and 4B document parsers through Antfly's native inference runtime
 ---
 
-LightOnOCR-3-0.8B and 4B are Apache-2.0 document parsers based on Qwen3.5. Each
+LightOnOCR-3 is Antfly's recommended OCR model. The 0.8B and 4B checkpoints are Apache-2.0 document parsers based on Qwen3.5. Each
 transcribes page images into Markdown, including HTML tables and LaTeX formulas.
 Antfly uses the integrated safetensors checkpoint with the native Qwen vision
 and hybrid-attention decoder paths.
@@ -16,7 +16,7 @@ antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671b
 
 The pull installs the upstream configuration, tokenizer, chat template, image
 processor, and weights, plus a `model_manifest.json` declaring generation and
-reading. Runtime lookup also accepts `lightonocr3-0.8b`.
+reading. Refer to the model as `lightonai/LightOnOCR-3-0.8B`; the short alias `lightonocr3-0.8b` also resolves.
 
 The larger model uses the same image-only prompt and `/read` API:
 
@@ -24,7 +24,7 @@ The larger model uses the same image-only prompt and `/read` API:
 antfly inference pull lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a
 ```
 
-Use `lightonocr3-4b` as the model name. The 0.8B model needs about 1.7 GB for
+Refer to it as `lightonai/LightOnOCR-3-4B`. The 0.8B model needs about 1.7 GB for
 weights and the 4B model about 9.1 GB, plus working memory. Both run on CPU,
 Metal, and CUDA.
 
@@ -36,7 +36,7 @@ Send a rendered PDF page or other document image to the inference service:
 curl http://localhost:8080/ai/v1/read \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "lightonocr3-0.8b",
+    "model": "lightonai/LightOnOCR-3-0.8B",
     "images": [{"url": "data:image/png;base64,..."}],
     "max_tokens": 1024
   }'
@@ -56,6 +56,26 @@ the same request and from concurrent requests on the GPU.
 per page and rejects truncated output. Use `/generate` with a larger budget
 for dense pages; its content should contain the image and either no text or
 the exact `grounding` keyword, with thinking disabled.
+
+## Read documents during ingestion
+
+To OCR scanned PDF pages as they are indexed, name the model in a
+`document_extraction` enrichment. `prompt_policy` must be `plain`, because the
+model takes no instruction prompt:
+
+```json
+{
+  "type": "document_extraction",
+  "config": {
+    "ocr": {
+      "prompt_policy": "plain",
+      "config": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}
+    }
+  }
+}
+```
+
+[Multimodal Embeddings](/docs/guides/multimodal) shows the full enrichment.
 
 ## Image size
 

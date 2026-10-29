@@ -111,9 +111,9 @@ def sync_detailed(
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **Florence-2**: OCR, captioning, and visual question answering
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
     - **PaddleOCR**: Text detection and recognition with page-space regions
-    - **LightOnOCR-3**: Document OCR to Markdown
     - **Donut**: Document understanding with structured output (receipts, forms)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
@@ -188,9 +188,9 @@ def sync(
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **Florence-2**: OCR, captioning, and visual question answering
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
     - **PaddleOCR**: Text detection and recognition with page-space regions
-    - **LightOnOCR-3**: Document OCR to Markdown
     - **Donut**: Document understanding with structured output (receipts, forms)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
@@ -260,9 +260,9 @@ async def asyncio_detailed(
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **Florence-2**: OCR, captioning, and visual question answering
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
     - **PaddleOCR**: Text detection and recognition with page-space regions
-    - **LightOnOCR-3**: Document OCR to Markdown
     - **Donut**: Document understanding with structured output (receipts, forms)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
@@ -335,9 +335,9 @@ async def asyncio(
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **Florence-2**: OCR, captioning, and visual question answering
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
     - **PaddleOCR**: Text detection and recognition with page-space regions
-    - **LightOnOCR-3**: Document OCR to Markdown
     - **Donut**: Document understanding with structured output (receipts, forms)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened

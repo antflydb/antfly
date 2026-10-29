@@ -5144,9 +5144,9 @@ export interface paths {
          *     Models are auto-discovered from `models_dir/readers/` at startup.
          *     Use the `/ai/v1/models` endpoint to list available models.
          *
-         *     - **Florence-2**: OCR, captioning, and visual question answering
+         *     - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+         *     - **Florence-2**: Lightweight OCR, captioning, and visual question answering
          *     - **PaddleOCR**: Text detection and recognition with page-space regions
-         *     - **LightOnOCR-3**: Document OCR to Markdown
          *     - **Donut**: Document understanding with structured output (receipts, forms)
          *     - **Pix2Struct**: Visual question answering with natural-language prompts
          *     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened fields
@@ -5581,7 +5581,7 @@ export interface paths {
          *     ## Readers
          *
          *     - Vision2Seq models from `models_dir/readers/`
-         *     - Florence-2, PaddleOCR, LightOnOCR-3, Donut, Pix2Struct, and Moondream for OCR and document understanding
+         *     - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document understanding
          *
          *     ## Transcribers
          *
@@ -23238,7 +23238,7 @@ export interface components {
         InferenceReadRequest: {
             /**
              * @description Name of reader model from models_dir/readers/
-             * @example antflydb/Florence-2-base
+             * @example lightonai/LightOnOCR-3-0.8B
              */
             model: string;
             /**
