@@ -20,6 +20,8 @@ on:
       - 'ts/antfly/components/v*'
       - 'ts/antfly/design-system/v*'
       - 'ts/antfly/web/v*'
+      - 'ts/antfly/langchain/v*'
+      - 'ts/antfly/langgraph-store/v*'
 
 permissions:
   contents: read
@@ -116,3 +118,28 @@ jobs:
             *) channel=latest ;;
           esac
           pnpm --filter @antfly/better-auth publish --access public --no-git-checks --provenance --tag "$channel"
+
+      - name: Verify LangChain package consumer
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/langchain/v') || startsWith(github.ref, 'refs/tags/ts/antfly/langgraph-store/v')
+        working-directory: ts
+        run: pnpm --filter @antfly/langchain test:package
+
+      - name: Verify LangChain registry dependencies
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/langchain/v')
+        working-directory: ts
+        run: node packages/langchain/scripts/verify-release.mjs langchain
+
+      - name: Verify LangGraph registry dependencies
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/langgraph-store/v')
+        working-directory: ts
+        run: node packages/langchain/scripts/verify-release.mjs langgraph-store
+
+      - name: Publish LangChain integration
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/langchain/v')
+        working-directory: ts
+        run: pnpm --filter @antfly/langchain publish --access public --no-git-checks --provenance
+
+      - name: Publish LangGraph memory integration
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/langgraph-store/v')
+        working-directory: ts
+        run: pnpm --filter @antfly/langgraph-store publish --access public --no-git-checks --provenance
