@@ -30,7 +30,7 @@ const (
 	DefaultEmbeddingPull    = DefaultEmbeddingModel
 	DefaultEmbeddingDims    = 768
 	DefaultChunkerModel     = "fixed-bert-tokenizer"
-	DefaultOCRModel         = "lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9"
+	DefaultOCRModel         = "lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a"
 	DefaultRecognizerModel  = "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d"
 	DefaultAutographIndex   = "autograph_relations"
 	DefaultAutographAsset   = "relations_v1"
