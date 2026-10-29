@@ -29,6 +29,7 @@ pub const FsStore = struct {
     alloc: Allocator,
     root_dir: []u8,
     mutex: std.atomic.Mutex = .unlocked,
+    durable_dirs: @import("objectstore").durable_directory.Cache = .{},
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !FsStore {
         var io_impl = threadedIo();
@@ -41,6 +42,7 @@ pub const FsStore = struct {
     }
 
     pub fn deinit(self: *FsStore) void {
+        self.durable_dirs.deinit(self.alloc);
         self.alloc.free(self.root_dir);
         self.* = undefined;
     }
@@ -62,36 +64,8 @@ pub const FsStore = struct {
     }
 
     fn appendControlled(self: *FsStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8, execution: ?*Execution) !u64 {
-        if (execution) |active| try lockAtomicWithExecution(&self.mutex, active) else lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        var lock_io_impl = threadedIo();
-        defer lock_io_impl.deinit();
-        const lock_io = lock_io_impl.io();
-        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
-        defer namespace_lock.close(lock_io);
-        try namespace_lock.lock(lock_io, .exclusive);
-        defer namespace_lock.unlock(lock_io);
-
-        const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
-        defer self.alloc.free(log_path);
-        const next_path = try nextLsnPathAlloc(self.alloc, self.root_dir, namespace);
-        defer self.alloc.free(next_path);
-        try ensureParentDir(log_path);
-        const current = try scanLog(log_path, null);
-        const lsn = if (current) |info|
-            try nextAfter(info.latest)
-        else if (try readNextState(self.alloc, next_path)) |state|
-            state.next_lsn
-        else
-            1;
-        const encoded = try record_codec.encodeRecordAlloc(self.alloc, lsn, timestamp_ns, payload);
-        defer self.alloc.free(encoded);
-        const previous_bytes = if (current) |info| info.bytes else 0;
-        var next = try PreparedNextState.init(self.alloc, next_path, try nextAfter(lsn), previous_bytes + encoded.len);
-        defer next.deinit(self.alloc);
-        try writeAppendedLogStreaming(self.alloc, log_path, previous_bytes, encoded);
-        try next.write(next_path);
-        return lsn;
+        const context = if (execution) |owner| (Context{}).withExecution(owner) else Context{};
+        return (try self.appendOperation(namespace, timestamp_ns, payload, null, null, context)).?;
     }
 
     pub fn appendIdempotent(
@@ -129,60 +103,97 @@ pub const FsStore = struct {
         operation_id: []const u8,
         expected_latest_lsn: ?u64,
     ) !?u64 {
-        if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
-            return error.InvalidWalOperationId;
-        if (payload.len > record_codec.idempotent_payload_max) return error.WalRecordTooLarge;
+        return self.appendOperation(namespace, timestamp_ns, payload, operation_id, expected_latest_lsn, .{});
+    }
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        var lock_io_impl = threadedIo();
-        defer lock_io_impl.deinit();
-        const lock_io = lock_io_impl.io();
-        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
-        defer namespace_lock.close(lock_io);
-        try namespace_lock.lock(lock_io, .exclusive);
-        defer namespace_lock.unlock(lock_io);
+    fn appendOperation(self: *FsStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8, operation_id: ?[]const u8, expected_latest_lsn: ?u64, context: Context) !?u64 {
+        if (operation_id) |id| {
+            if (id.len == 0 or id.len > std.math.maxInt(u16)) return error.InvalidWalOperationId;
+            if (payload.len > record_codec.idempotent_payload_max) return error.WalRecordTooLarge;
+        }
+        var native: Provider.Native = undefined;
+        try native.init(context, .none);
+        defer native.deinit();
+        var guard: Provider.Guard = .{ .original = native.operation };
+        defer guard.deinit();
+        try guard.lock(&self.mutex);
+        const op = guard.operation();
+        const io = try op.receiver();
+        const namespace_lock = try self.lockNamespace(namespace, &op);
+        defer namespace_lock.close(io);
+        var locked = true;
+        defer if (locked) namespace_lock.unlock(io);
         const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(log_path);
         const next_path = try nextLsnPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(next_path);
-        try ensureParentDir(log_path);
-        const current = try scanLog(log_path, .{ .operation_id = operation_id, .timestamp_ns = timestamp_ns, .payload = payload });
-        if (current) |info| if (info.existing_lsn) |existing| {
-            try writeNextState(self.alloc, next_path, try nextAfter(info.latest), info.bytes);
-            return existing;
+        const match: ?OperationMatch = if (operation_id) |id| .{ .operation_id = id, .timestamp_ns = timestamp_ns, .payload = payload } else null;
+        const current = try scanLogOperation(log_path, match, &op);
+        var lsn: u64 = undefined;
+        if (current) |info| {
+            lsn = try nextAfter(info.latest);
+            if (info.existing_lsn) |existing| {
+                var next = try PreparedNextState.init(self.alloc, next_path, lsn, info.bytes);
+                defer next.deinit(self.alloc);
+                try next.writeControlled(next_path, io, op.control());
+                namespace_lock.unlock(io);
+                locked = false;
+                try guard.finish();
+                return existing;
+            }
+        } else lsn = if (try readNextStateOperation(next_path, &op)) |state| state.next_lsn else 1;
+        if (expected_latest_lsn) |expected| if (lsn - 1 != expected) {
+            namespace_lock.unlock(io);
+            locked = false;
+            try guard.finish();
+            return null;
         };
-        const lsn = if (current) |info|
-            try nextAfter(info.latest)
-        else if (try readNextState(self.alloc, next_path)) |state|
-            state.next_lsn
-        else
-            1;
-        if (expected_latest_lsn) |expected| {
-            if (lsn - 1 != expected) return null;
-        }
-        const encoded = try record_codec.encodeIdempotentRecordAlloc(self.alloc, lsn, timestamp_ns, payload, operation_id);
+        const encoded = if (operation_id) |id| try record_codec.encodeIdempotentRecordAlloc(self.alloc, lsn, timestamp_ns, payload, id) else try record_codec.encodeRecordAlloc(self.alloc, lsn, timestamp_ns, payload);
         defer self.alloc.free(encoded);
         const previous_bytes = if (current) |info| info.bytes else 0;
         var next = try PreparedNextState.init(self.alloc, next_path, try nextAfter(lsn), previous_bytes + encoded.len);
         defer next.deinit(self.alloc);
-        try writeAppendedLogStreaming(self.alloc, log_path, previous_bytes, encoded);
-        try next.write(next_path);
+        try writeAppendedLogOperation(self.alloc, log_path, previous_bytes, encoded, &op);
+        try next.writeControlled(next_path, io, op.control());
+        namespace_lock.unlock(io);
+        locked = false;
+        try guard.finish();
         return lsn;
     }
 
+    fn lockNamespace(self: *FsStore, namespace: []const u8, op: *const Provider.Operation) !std.Io.File {
+        const io = try op.receiver();
+        const control = op.control();
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, ".wal.lock" });
+        defer self.alloc.free(path);
+        try self.durable_dirs.ensureWithControl(self.alloc, io, std.fs.path.dirname(path).?, control);
+        var rejected = false;
+        const file = try control.withOwnedWait(&rejected, fs_paths.createFilePortable, .{ io, path, std.Io.Dir.CreateFileOptions{ .truncate = false, .read = true } }, discardLockFile);
+        errdefer file.close(io);
+        while (!try control.withWait(std.Io.File.tryLock, .{ file, io, std.Io.File.Lock.exclusive })) try op.sleep(1);
+        return file;
+    }
+
     pub fn readFromAlloc(self: *FsStore, alloc: Allocator, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
+        return self.readFromFor(alloc, namespace, start_lsn, .{});
+    }
+    fn readFromFor(self: *FsStore, alloc: Allocator, namespace: []const u8, start_lsn: u64, context: Context) ![]wal_types.Record {
+        var native: Provider.Native = undefined;
+        try native.init(context, .none);
+        defer native.deinit();
+        const op = &native.operation;
         const log_path = try logPathAlloc(alloc, self.root_dir, namespace);
         defer alloc.free(log_path);
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        const file = std.Io.Dir.cwd().openFile(io, log_path, .{}) catch |err| switch (err) {
+        const io = try op.receiver();
+        const control = op.control();
+        try op.ready();
+        var rejected = false;
+        const file = control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, log_path, std.Io.Dir.OpenFileOptions{} }, discardFile) catch |err| switch (err) {
             error.FileNotFound => return alloc.alloc(wal_types.Record, 0),
             else => return err,
         };
         defer file.close(io);
-        var scanner: LogScanner = .{ .file = file, .io = io, .length = try file.length(io) };
+        var scanner: LogScanner = .{ .file = file, .io = io, .control = control, .operation = op, .length = try control.withWait(std.Io.File.length, .{ file, io }) };
         var out: std.ArrayList(wal_types.Record) = .empty;
         errdefer {
             for (out.items) |record| {
@@ -195,44 +206,60 @@ pub const FsStore = struct {
             if (record.lsn < start_lsn) continue;
             const payload = try alloc.alloc(u8, record.payload_len);
             errdefer alloc.free(payload);
-            try readExact(file, io, payload, record.payload_offset);
+            try readExactOperation(file, io, payload, record.payload_offset, op);
             const id = if (record.operation_id_len != 0) blk: {
                 const owned = try alloc.alloc(u8, record.operation_id_len);
                 errdefer alloc.free(owned);
-                try readExact(file, io, owned, record.operation_id_offset);
+                try readExactOperation(file, io, owned, record.operation_id_offset, op);
                 break :blk owned;
             } else null;
             errdefer if (id) |owned| alloc.free(owned);
             try out.append(alloc, .{ .lsn = record.lsn, .timestamp_ns = record.timestamp_ns, .payload = payload, .operation_id = id });
         }
+        try op.ready();
         return out.toOwnedSlice(alloc);
     }
 
     pub fn latestLsn(self: *FsStore, namespace: []const u8) !u64 {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        var lock_io_impl = threadedIo();
-        defer lock_io_impl.deinit();
-        const lock_io = lock_io_impl.io();
-        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
-        defer namespace_lock.close(lock_io);
-        try namespace_lock.lock(lock_io, .exclusive);
-        defer namespace_lock.unlock(lock_io);
+        return self.latestFor(namespace, .{});
+    }
+    fn latestFor(self: *FsStore, namespace: []const u8, context: Context) !u64 {
+        var native: Provider.Native = undefined;
+        try native.init(context, .none);
+        defer native.deinit();
+        var guard: Provider.Guard = .{ .original = native.operation };
+        defer guard.deinit();
+        try guard.lock(&self.mutex);
+        const op = guard.operation();
+        const io = try op.receiver();
+        const namespace_lock = try self.lockNamespace(namespace, &op);
+        defer namespace_lock.close(io);
+        var locked = true;
+        defer if (locked) namespace_lock.unlock(io);
+        const result = try self.latestOperation(namespace, &op);
+        namespace_lock.unlock(io);
+        locked = false;
+        try guard.finish();
+        return result;
+    }
+    fn latestOperation(self: *FsStore, namespace: []const u8, op: *const Provider.Operation) !u64 {
+        const io = try op.receiver();
+        const control = op.control();
         const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(log_path);
         const next_path = try nextLsnPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(next_path);
-        const next_state = try readNextState(self.alloc, next_path);
-        if (!fileExists(log_path)) return if (next_state) |state| state.next_lsn -| 1 else 0;
-        if (next_state) |state| {
-            if (state.log_byte_len) |expected_len| {
-                if (try fileSize(log_path) == expected_len) return state.next_lsn -| 1;
-            }
-        }
-        const info = (try scanLog(log_path, null)) orelse return error.InvalidWal;
-        const latest = info.latest;
-        try writeNextState(self.alloc, next_path, try nextAfter(latest), info.bytes);
-        return latest;
+        const state = try readNextStateOperation(next_path, op);
+        const stat = control.withWait(std.Io.Dir.statFile, .{ std.Io.Dir.cwd(), io, log_path, std.Io.Dir.StatFileOptions{} }) catch |err| switch (err) {
+            error.FileNotFound => return if (state) |next| next.next_lsn -| 1 else 0,
+            else => return err,
+        };
+        if (state) |next| if (next.log_byte_len) |length| if (stat.size == length) return next.next_lsn -| 1;
+        const info = (try scanLogOperation(log_path, null, op)) orelse return error.InvalidWal;
+        var next = try PreparedNextState.init(self.alloc, next_path, try nextAfter(info.latest), info.bytes);
+        defer next.deinit(self.alloc);
+        try next.writeControlled(next_path, io, control);
+        return info.latest;
     }
 
     pub fn truncatePrefix(self: *FsStore, namespace: []const u8, keep_from_lsn: u64) !u64 {
@@ -285,7 +312,7 @@ pub const FsStore = struct {
         var scanner: LogScanner = .{ .file = source, .io = io, .control = control, .length = try control.withWait(std.Io.File.length, .{ source, io }) };
         const tmp_path = try temporaryPath(self.alloc, log_path);
         defer self.alloc.free(tmp_path);
-        defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        defer cleanupTemporary(io, tmp_path);
         const output = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, tmp_path, std.Io.Dir.CreateFileOptions{ .truncate = true } }, discardFile);
         var output_open = true;
         defer if (output_open) output.close(io);
@@ -326,7 +353,30 @@ pub const FsStore = struct {
         file.close(args[0]);
     }
 
+    fn appendFor(raw: *anyopaque, ns: []const u8, timestamp: u64, bytes: []const u8, context: Context) !u64 {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return (try self.appendOperation(ns, timestamp, bytes, null, null, context)).?;
+    }
+    fn idempotentFor(raw: *anyopaque, ns: []const u8, timestamp: u64, bytes: []const u8, id: []const u8, context: Context) !u64 {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return (try self.appendOperation(ns, timestamp, bytes, id, null, context)).?;
+    }
+    fn conditionalFor(raw: *anyopaque, ns: []const u8, timestamp: u64, bytes: []const u8, id: []const u8, expected: u64, context: Context) !?u64 {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return self.appendOperation(ns, timestamp, bytes, id, expected, context);
+    }
+    fn replayFor(raw: *anyopaque, alloc: Allocator, ns: []const u8, start: u64, context: Context) ![]wal_types.Record {
+        return @as(*FsStore, @ptrCast(@alignCast(raw))).readFromFor(alloc, ns, start, context);
+    }
+    fn latestContext(raw: *anyopaque, ns: []const u8, context: Context) !u64 {
+        return @as(*FsStore, @ptrCast(@alignCast(raw))).latestFor(ns, context);
+    }
     const vtable: wal_store.WalStore.VTable = .{
+        .append_for = appendFor,
+        .append_idempotent_for = idempotentFor,
+        .append_idempotent_if_latest_for = conditionalFor,
+        .read_from_alloc_for = replayFor,
+        .latest_lsn_for = latestContext,
         .deinit = erasedDeinit,
         .append = erasedAppend,
         .append_with_execution = erasedAppendWithExecution,
@@ -396,37 +446,6 @@ fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
-fn fileExists(path: []const u8) bool {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    _ = std.Io.Dir.cwd().statFile(io_impl.io(), path, .{}) catch return false;
-    return true;
-}
-
-fn fileSize(path: []const u8) !u64 {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    return (try std.Io.Dir.cwd().statFile(io_impl.io(), path, .{})).size;
-}
-
-/// No serialization lease is held across checked CPU reentry. Waking only
-/// grants permission to retry: CPU must be reacquired before claiming the mutex.
-fn lockAtomicWithExecution(mutex: *std.atomic.Mutex, execution: *Execution) !void {
-    const entry = execution.entry orelse return error.InvalidRunnableTransition;
-    const io = entry.options.io;
-    const class = try execution.retainedClass();
-    while (true) {
-        try execution.checkpoint();
-        if (mutex.tryLock()) return;
-        try execution.park(.resource_blocked);
-        const waited = io.sleep(.fromMilliseconds(1), .awake);
-        // A failed sleep still requires the original checked reentry. Failure
-        // leaves the mutex unowned, so no result or lock can escape admission.
-        try execution.enter(class);
-        try waited;
-    }
-}
-
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
@@ -458,6 +477,7 @@ const RecordLocation = struct {
 /// The on-disk format is unchanged. Scan only fixed headers and verify every
 /// range against the pinned file length; payload size never drives scratch.
 const LogScanner = struct {
+    operation: ?*const Provider.Operation = null,
     control: WriteControl = .{},
     file: std.Io.File,
     io: std.Io,
@@ -478,6 +498,7 @@ const LogScanner = struct {
         @memcpy(bytes, self.buffer[@intCast(offset - self.buffered_offset)..][0..bytes.len]);
     }
     fn next(self: *LogScanner) !?RecordLocation {
+        if (self.operation) |op| try op.ready();
         if (self.offset == self.length) return null;
         if (self.offset > self.length or self.length - self.offset < 20) return error.InvalidWal;
         var header: [20]u8 = undefined;
@@ -511,38 +532,49 @@ fn readExact(file: std.Io.File, io: std.Io, bytes: []u8, offset: u64) !void {
     if (try file.readPositionalAll(io, bytes, offset) != bytes.len) return error.InvalidWal;
 }
 
+fn readExactOperation(file: std.Io.File, io: std.Io, bytes: []u8, offset: u64, op: *const Provider.Operation) !void {
+    var copied: usize = 0;
+    while (copied < bytes.len) {
+        try op.ready();
+        const end = copied + @min(bytes.len - copied, 32 * 1024);
+        try op.control().withWait(readExact, .{ file, io, bytes[copied..end], offset + copied });
+        copied = end;
+    }
+    try op.ready();
+}
+
 const OperationMatch = struct { operation_id: []const u8, timestamp_ns: u64, payload: []const u8 };
 const LogInfo = struct { latest: u64 = 0, bytes: u64, existing_lsn: ?u64 = null };
-fn scanLog(path: []const u8, match: ?OperationMatch) !?LogInfo {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+fn scanLogOperation(path: []const u8, match: ?OperationMatch, op: *const Provider.Operation) !?LogInfo {
+    const io = try op.receiver();
+    const control = op.control();
+    var rejected = false;
+    const file = control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, FsStore.discardFile) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer file.close(io);
-    var scanner: LogScanner = .{ .file = file, .io = io, .length = try file.length(io) };
+    var scanner: LogScanner = .{ .file = file, .io = io, .control = control, .operation = op, .length = try control.withWait(std.Io.File.length, .{ file, io }) };
     var info: LogInfo = .{ .bytes = scanner.length };
     while (try scanner.next()) |record| {
         info.latest = record.lsn;
         if (match) |wanted| if (info.existing_lsn == null and record.operation_id_len == wanted.operation_id.len and
-            try matchesRange(file, io, record.operation_id_offset, wanted.operation_id))
+            try matchesRange(file, io, record.operation_id_offset, wanted.operation_id, op))
         {
             if (record.timestamp_ns != wanted.timestamp_ns or record.payload_len != wanted.payload.len or
-                !try matchesRange(file, io, record.payload_offset, wanted.payload)) return error.WalIdempotencyConflict;
+                !try matchesRange(file, io, record.payload_offset, wanted.payload, op)) return error.WalIdempotencyConflict;
             info.existing_lsn = record.lsn;
         };
     }
     return info;
 }
 
-fn matchesRange(file: std.Io.File, io: std.Io, offset: u64, expected: []const u8) !bool {
+fn matchesRange(file: std.Io.File, io: std.Io, offset: u64, expected: []const u8, op: *const Provider.Operation) !bool {
     var scratch: [4096]u8 = undefined;
     var position: usize = 0;
     while (position < expected.len) {
         const count = @min(expected.len - position, scratch.len);
-        try readExact(file, io, scratch[0..count], offset + position);
+        try readExactOperation(file, io, scratch[0..count], offset + position, op);
         if (!std.mem.eql(u8, scratch[0..count], expected[position..][0..count])) return false;
         position += count;
     }
@@ -575,26 +607,45 @@ fn renameTemporary(io: std.Io, temporary: []const u8, path: []const u8) !void {
     try std.Io.Dir.rename(std.Io.Dir.cwd(), temporary, std.Io.Dir.cwd(), path, io);
 }
 
+fn cleanupTemporary(io: std.Io, path: []const u8) void {
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
 fn writeAppendedLogStreaming(alloc: Allocator, path: []const u8, existing_bytes: u64, contents: []const u8) !void {
-    const tmp_path = try temporaryPath(alloc, path);
-    defer alloc.free(tmp_path);
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-    var output = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
-    var output_open = true;
-    defer if (output_open) output.close(io);
-    if (existing_bytes != 0) {
-        const source = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer source.close(io);
-        var scratch: [32 * 1024]u8 = undefined;
-        try copyRange(source, output, io, 0, 0, existing_bytes, &scratch);
+    var native: Provider.Native = undefined;
+    try native.init(.{}, .none);
+    defer native.deinit();
+    return writeAppendedLogOperation(alloc, path, existing_bytes, contents, &native.operation);
+}
+fn writeAppendedLogOperation(alloc: Allocator, path: []const u8, existing_bytes: u64, contents: []const u8, op: *const Provider.Operation) !void {
+    const temporary = try temporaryPath(alloc, path);
+    defer alloc.free(temporary);
+    const io = try op.receiver();
+    const control = op.control();
+    defer cleanupTemporary(io, temporary);
+    var rejected = false;
+    const output = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, temporary, std.Io.Dir.CreateFileOptions{ .truncate = true } }, FsStore.discardFile);
+    {
+        defer output.close(io);
+        if (existing_bytes != 0) {
+            const source = try control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, FsStore.discardFile);
+            defer source.close(io);
+            var scratch: [32 * 1024]u8 = undefined;
+            try copyRangeControlled(source, output, io, 0, 0, existing_bytes, &scratch, control);
+        }
+        var copied: usize = 0;
+        while (copied < contents.len) {
+            try op.ready();
+            const end = copied + @min(contents.len - copied, 32 * 1024);
+            try control.withWait(std.Io.File.writePositionalAll, .{ output, io, contents[copied..end], existing_bytes + copied });
+            copied = end;
+        }
+        // Persist the complete replacement before its rename and NEXT_LSN.
+        try control.withWait(std.Io.File.sync, .{ output, io });
     }
-    try output.writePositionalAll(io, contents, existing_bytes);
-    output.close(io);
-    output_open = false;
-    try renameTemporary(io, tmp_path, path);
+    try control.withWait(renameTemporary, .{ io, temporary, path });
+    try control.withWait(fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(path).? });
 }
 
 fn writeFileAtomically(alloc: Allocator, path: []const u8, contents: []const u8) !void {
@@ -641,41 +692,30 @@ fn nextLsnPathAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u
     return try std.fs.path.join(alloc, &.{ root_dir, namespace, "NEXT_LSN" });
 }
 
-fn openNamespaceLock(
-    alloc: Allocator,
-    root_dir: []const u8,
-    namespace: []const u8,
-    io: std.Io,
-) !std.Io.File {
-    const path = try std.fs.path.join(alloc, &.{ root_dir, namespace, ".wal.lock" });
-    defer alloc.free(path);
-    try ensureParentDir(path);
-    return try fs_paths.createFilePortable(io, path, .{ .truncate = false, .read = true });
-}
-
 const NextState = struct {
     next_lsn: u64,
     log_byte_len: ?u64,
 };
 
-fn readNextState(_: Allocator, path: []const u8) !?NextState {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+fn readNextStateOperation(path: []const u8, op: *const Provider.Operation) !?NextState {
+    const io = try op.receiver();
+    const control = op.control();
+    var rejected = false;
+    const file = control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, FsStore.discardFile) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer file.close(io);
-    const length = try file.length(io);
+    const length = try control.withWait(std.Io.File.length, .{ file, io });
     var scratch: [128]u8 = undefined;
     if (length > scratch.len) return error.InvalidWal;
     const raw = scratch[0..@intCast(length)];
-    try readExact(file, io, raw, 0);
+    try readExactOperation(file, io, raw, 0, op);
     var fields = std.mem.tokenizeAny(u8, raw, " \t\r\n");
     const next_lsn = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidWal, 10);
     const log_byte_len = if (fields.next()) |value| try std.fmt.parseInt(u64, value, 10) else null;
     if (fields.next() != null) return error.InvalidWal;
+    if (next_lsn == 0) return error.InvalidWal;
     return .{ .next_lsn = next_lsn, .log_byte_len = log_byte_len };
 }
 
@@ -698,7 +738,7 @@ const PreparedNextState = struct {
         self.* = undefined;
     }
     fn writeControlled(self: *const PreparedNextState, path: []const u8, io: std.Io, control: WriteControl) !void {
-        defer std.Io.Dir.cwd().deleteFile(io, self.temporary_path) catch {};
+        defer cleanupTemporary(io, self.temporary_path);
         var rejected = false;
         const file = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, self.temporary_path, std.Io.Dir.CreateFileOptions{ .truncate = true } }, FsStore.discardFile);
         {
@@ -1042,9 +1082,11 @@ test "fs wal streaming operations keep heap independent of existing log size" {
     {
         var store = try FsStore.init(budget.allocator(), std.mem.span(root));
         defer store.deinit();
-        const baseline = budget.live;
         // Duplicate comparison streams even a payload exceeding this budget.
         try std.testing.expectEqual(@as(u64, 2), try store.appendIdempotent("docs", 2, large, "large-operation"));
+        // The bounded directory cache now owns its durable namespace proof.
+        // Compare scratch retirement after that single persistent admission.
+        const baseline = budget.live;
         large[0] ^= 1;
         try std.testing.expectError(error.WalIdempotencyConflict, store.appendIdempotent("docs", 2, large, "large-operation"));
         large[0] ^= 1;

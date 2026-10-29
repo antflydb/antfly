@@ -92,6 +92,56 @@ pub const FsStore = struct {
         };
     }
 
+    fn putFor(raw: *anyopaque, manifest: manifest_types.Manifest, context: Context) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        var native: Provider.Native = undefined;
+        try native.init(context, .none);
+        defer native.deinit();
+        var guard: Provider.Guard = .{ .original = native.operation };
+        defer guard.deinit();
+        try guard.lock(&self.mutex);
+        const op = guard.operation();
+        const io = try op.receiver();
+        var view = scoped(raw, op.context, .none);
+        const namespace_dir = try std.fs.path.join(self.alloc, &.{ self.root_dir, manifest.namespace });
+        defer self.alloc.free(namespace_dir);
+        try self.durable_dirs.ensureWithControl(self.alloc, io, namespace_dir, op.control());
+        var mutation_lock = try view.lockManifestMutations(io, manifest.namespace);
+        defer mutation_lock.close(io);
+        var mutation_locked = true;
+        defer if (mutation_locked) mutation_lock.unlock(io);
+        const path = try manifestPathAlloc(self.alloc, self.root_dir, manifest.namespace, manifest.version);
+        defer self.alloc.free(path);
+        const encoded = try manifest_codec.encodeAlloc(self.alloc, manifest);
+        defer self.alloc.free(encoded);
+        const parent = std.fs.path.dirname(path) orelse ".";
+        try self.durable_dirs.ensureWithControl(self.alloc, io, parent, op.control());
+        const existing = op.readFile(self.alloc, path, encoded.len) catch |err| switch (err) {
+            error.FileNotFound => null,
+            error.StreamTooLong => return error.ManifestVersionAlreadyExists,
+            else => return err,
+        };
+        if (existing) |bytes| {
+            defer self.alloc.free(bytes);
+            if (!std.mem.eql(u8, bytes, encoded)) return error.ManifestVersionAlreadyExists;
+            try op.control().withWait(fs_paths.syncDirPortable, .{ io, parent });
+        } else {
+            writeManifestFor(self.alloc, path, encoded, manifest.publication_fencing_token, &op) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    const winner = try op.readFile(self.alloc, path, encoded.len);
+                    defer self.alloc.free(winner);
+                    if (!std.mem.eql(u8, winner, encoded)) return error.ManifestVersionAlreadyExists;
+                    try op.control().withWait(fs_paths.syncDirPortable, .{ io, parent });
+                },
+                else => return err,
+            };
+        }
+        // Release the cross-process lock before leaving protected CPU return.
+        mutation_lock.unlock(io);
+        mutation_locked = false;
+        try guard.finish();
+    }
+
     pub fn getAlloc(self: *FsStore, alloc: Allocator, namespace: []const u8, version: u64) !manifest_types.Manifest {
         const path = try manifestPathAlloc(alloc, self.root_dir, namespace, version);
         defer alloc.free(path);
@@ -297,6 +347,7 @@ pub const FsStore = struct {
         try view.operation.?.ready();
     }
     const vtable: manifest_store.ManifestStore.VTable = .{
+        .put_for = putFor,
         .get_alloc_for = getFor,
         .list_versions_for = listFor,
         .delete_version_for = deleteFor,
@@ -421,6 +472,40 @@ fn writeFileAtomically(path: []const u8, contents: []const u8, publication_token
     try std.Io.Dir.renamePreserve(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
     owns_temp = false;
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+}
+
+fn cleanupTemporary(io: std.Io, path: []const u8) void {
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+fn discardCreatedFile(file: std.Io.File, args: anytype) void {
+    file.close(args[1]);
+}
+fn writeManifestFor(a: Allocator, path: []const u8, contents: []const u8, token: u64, op: *const Provider.Operation) !void {
+    const io = try op.receiver();
+    const control = op.control();
+    var nonce: [16]u8 = undefined;
+    io.random(&nonce);
+    const temporary = try std.fmt.allocPrint(a, "{s}.tmp-{x:0>16}-{s}", .{ path, token, std.fmt.bytesToHex(&nonce, .lower) });
+    defer a.free(temporary);
+    defer cleanupTemporary(io, temporary);
+    var rejected = false;
+    const file = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, temporary, std.Io.Dir.CreateFileOptions{ .exclusive = true } }, discardCreatedFile);
+    {
+        defer file.close(io);
+        var offset: usize = 0;
+        while (offset < contents.len) {
+            try op.ready();
+            const end = offset + @min(contents.len - offset, 64 * 1024);
+            try control.withWait(std.Io.File.writeStreamingAll, .{ file, io, contents[offset..end] });
+            offset = end;
+        }
+        try control.withWait(std.Io.File.sync, .{ file, io });
+    }
+    try control.withWait(std.Io.Dir.renamePreserve, .{ std.Io.Dir.cwd(), temporary, std.Io.Dir.cwd(), path, io });
+    try control.withWait(fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(path) orelse "." });
+    try op.ready();
 }
 
 fn temporaryPublicationToken(name: []const u8) ?u64 {

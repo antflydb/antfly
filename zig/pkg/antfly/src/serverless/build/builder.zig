@@ -1140,7 +1140,16 @@ pub const Builder = struct {
         manifests.allocator = alloc;
         var wal = self.wal.*;
         wal.allocator = alloc;
+        var progress = self.progress.*;
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+        if (cancellation != null) {
+            const context = bridge.readContext();
+            manifests.context = context;
+            wal.context = context;
+            progress.context = context;
+        }
         var bounded = self.*;
+        bounded.progress = &progress;
         bounded.alloc = alloc;
         bounded.artifacts = &artifacts;
         bounded.manifests = &manifests;
@@ -1184,7 +1193,9 @@ pub const Builder = struct {
         var cancellation_bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
 
         const start_lsn = current.wal_end_lsn + 1;
-        const records = try self.wal.readFromAlloc(namespace, start_lsn);
+        var protected_wal = self.wal.*;
+        protected_wal.context = cancellation_bridge.readContext();
+        const records = try protected_wal.readFromAlloc(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
         if (records.len == 0) return null;
         if (records.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
@@ -1214,6 +1225,7 @@ pub const Builder = struct {
                 var pages = graph_segment_mod.page_store.PageStore{
                     .artifacts = self.artifacts,
                     .cancellation = cancellation_bridge.token(),
+                    .read_context = cancellation_bridge.readContext(),
                     .remaining_read_bytes = &read_remaining,
                     .remaining_write_bytes = &write_remaining,
                 };

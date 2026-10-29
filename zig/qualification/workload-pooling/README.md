@@ -1619,3 +1619,67 @@ graph checkpoints, framework/vendor and registry preparation, mapped-page-fault
 scope and the unresolved file-engine FD recovery gate still require their
 complete production milestones and evidence. This milestone does not qualify
 installed-native or live-cloud operation.
+
+### Native immutable manifests and WAL acceptance/recovery (2026-10-29)
+
+The native manifest backend implements contextual immutable publication through
+`ManifestStore.put`. Encoding and immutable-byte comparison retain CPU; path
+proofs, file locking, writes, synchronization and rename use the original I/O
+receiver and execution. Publication retains the existing fencing-token temporary
+names, exclusive temporary creation and non-overwriting final rename. A matching
+retry synchronizes its publication directory; differing immutable bytes fail.
+Shared mutation ownership is released before ordinary CPU reentry.
+
+Native WAL append, idempotent and conditional append, replay and latest-LSN
+recovery now use operation-local contexts through the public `WalStore` facade.
+The execution-only append API attaches its existing local I/O receiver. Admitted
+operations never manufacture a replacement receiver; explicit legacy operations
+own one fallback receiver for the operation rather than reopening one per helper.
+The namespace lock and shared store mutex retain protected CPU return through
+mutation, and callers release those locks before normal checked reentry.
+
+Append writes and synchronizes the complete replacement log, renames it, and
+synchronizes the parent before installing a synchronized `NEXT_LSN` receipt.
+Idempotent recovery streams the existing operation identity and payload before
+returning its original LSN. Conditional misses preserve the original latest-LSN
+fence. Latest-LSN reads check the receipt against the log length and repair stale
+or absent receipts by streaming fixed headers. The namespace directory proof cache
+has 64 entries and retires with the store. Scanner and copy scratch remain fixed
+at 8 KiB and 32 KiB, independent of existing log size.
+
+Replay owns its file descriptor and pinned length through all reads, so a
+concurrent atomic replacement cannot change the replay cut. Allocations and
+record parsing run on CPU; positional reads lend CPU in bounded chunks. Rejected
+reads retire every partially built record. File descriptors close on all paths,
+and temporary cleanup blocks task cancellation while removing owned files.
+
+The normal builder's existing context reaches these backend callbacks. Prediction
+also binds its operation-local manifest, WAL and progress copies before metadata
+preparation, then carries source-pin authority through WAL replay and facts-page
+reads. Shared backend handles never retain the prediction caller's context.
+
+Focused evidence includes a normal native catalog build/status path under an
+admitted execution and real filesystem gates for manifest publication, ordinary,
+idempotent and conditional append, replay, latest-LSN reads and receipt recovery.
+The 32 gated operation/mode combinations exercise independent query/health
+progress, cooperative cancellation, actual task cancellation and deadlines,
+physical joining, temporary cleanup, old-file replay after replacement, immutable
+retry/conflict and conditional/idempotent WAL semantics. A gate after durable log
+replacement but before its receipt verifies that refused acknowledgement preserves
+the committed record and a fresh idempotent retry returns its original LSN. These
+are local filesystem integration checks, not power-loss or installed-CLI tests.
+
+`native-publication-recovery-v7.json` records 70/70 successful build steps and
+70/70 execution-lifecycle tests, including all 32 gated operation/mode
+combinations and the admitted native catalog's pending-tail prediction and
+incremental build. SQL admission and background targets pass. Formatting,
+license headers and the Apache product boundary pass.
+`native-publication-recovery-final.json` binds committed source snapshots to
+the successful run's exact input hashes. This native publication/recovery
+milestone is integrated.
+
+The full goal remains open. Serial graph checkpoint preparation, framework/vendor
+and registry preparation, mapped-page-fault scope, and the unresolved file-engine
+FD recovery gate still require completed production milestones. Full GNU
+qualification remains waived; installed-native and live-cloud qualification are
+not claimed here.

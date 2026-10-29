@@ -3107,8 +3107,17 @@ test "serverless catalog service tracks namespaces and reports build status" {
     defer fs_catalog_store.deinit();
 
     var builder = builder_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
-    var catalog = CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &fs_catalog_store);
-    defer catalog.deinit();
+    var original_catalog = CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &fs_catalog_store);
+    defer original_catalog.deinit();
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .publication_slots = 1, .max_bytes = 64 * 1024 * 1024, .max_wait_ms = 5000 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) + CatalogService.Scope.retained_bytes }, .background);
+    var scope: CatalogService.Scope = .{};
+    const context = (@import("antfly_local_sources").serverless_query_lake_read_context.Context{ .io = std.testing.io }).withExecution(&execution);
+    const catalog = scope.bind(&original_catalog, context);
 
     try std.testing.expect(try catalog.ensureNamespace("docs", 100));
     try std.testing.expect(!(try catalog.ensureNamespace("docs", 200)));
@@ -3170,6 +3179,23 @@ test "serverless catalog service tracks namespaces and reports build status" {
     try std.testing.expectEqual(published.artifacts.len, after.retained_artifacts);
     try std.testing.expect(!after.compaction_recommended);
     try std.testing.expect(after.enrichment_complete);
+    // Exercise prediction after a published head exists, so its protected WAL
+    // replay and facts-page context are used by the normal status caller.
+    const encoded_c = try api_codec.encodeMutationAlloc(alloc, .{ .kind = api_types.MutationKind.upsert, .doc_id = "doc-c", .body = "payload-c" });
+    defer alloc.free(encoded_c);
+    try std.testing.expectEqual(@as(u64, 3), try catalog.wal.append("docs", 333, encoded_c));
+    var pending = try catalog.buildStatus("docs");
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), pending.latest_wal_lsn);
+    try std.testing.expectEqual(@as(u64, 2), pending.published_wal_end_lsn);
+    try std.testing.expectEqual(@as(u64, 1), pending.pending_records);
+    var incremental = try catalog.buildNamespace("docs");
+    defer incremental.deinit(alloc);
+    try std.testing.expect(incremental.published);
+    var updated = try catalog.manifests.getAlloc("docs", 2);
+    defer updated.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), updated.stats.document_count);
+    try std.testing.expect(wal_store.context == null and manifest_store.context == null and progress_store.context == null);
 }
 
 test "serverless catalog service stores per-namespace policy" {

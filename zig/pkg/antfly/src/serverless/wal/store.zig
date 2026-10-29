@@ -26,6 +26,9 @@ pub const WalStore = struct {
     context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        append_for: ?*const fn (*anyopaque, []const u8, u64, []const u8, Context) anyerror!u64 = null,
+        append_idempotent_for: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, Context) anyerror!u64 = null,
+        append_idempotent_if_latest_for: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, u64, Context) anyerror!?u64 = null,
         latest_lsn_for: ?*const fn (*anyopaque, []const u8, Context) anyerror!u64 = null,
         read_from_alloc_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, Context) anyerror![]wal_types.Record = null,
         deinit: *const fn (Allocator, *anyopaque) void,
@@ -45,12 +48,14 @@ pub const WalStore = struct {
     }
 
     pub fn append(self: *WalStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
+        if (self.context) |context| if (self.vtable.append_for) |call| return call(self.ptr, namespace, timestamp_ns, payload, context);
         return try self.vtable.append(self.ptr, namespace, timestamp_ns, payload);
     }
 
     /// Converted stores may loan CPU only at their verified wait boundaries.
     /// Legacy providers retain the grant throughout their physical operation.
     pub fn appendWithExecution(self: *WalStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8, execution: *Execution) !u64 {
+        if (self.context) |context| if (self.vtable.append_for) |call| return call(self.ptr, namespace, timestamp_ns, payload, context.withExecution(execution));
         if (self.vtable.append_with_execution) |append_fn| return append_fn(self.ptr, namespace, timestamp_ns, payload, execution);
         return self.append(namespace, timestamp_ns, payload);
     }
@@ -65,6 +70,7 @@ pub const WalStore = struct {
         payload: []const u8,
         operation_id: []const u8,
     ) !u64 {
+        if (self.context) |context| if (self.vtable.append_idempotent_for) |call| return call(self.ptr, namespace, timestamp_ns, payload, operation_id, context);
         const append_fn = self.vtable.append_idempotent orelse return error.IdempotentAppendUnsupported;
         return try append_fn(self.ptr, namespace, timestamp_ns, payload, operation_id);
     }
@@ -84,6 +90,7 @@ pub const WalStore = struct {
         operation_id: []const u8,
         expected_latest_lsn: u64,
     ) !?u64 {
+        if (self.context) |context| if (self.vtable.append_idempotent_if_latest_for) |call| return call(self.ptr, namespace, timestamp_ns, payload, operation_id, expected_latest_lsn, context);
         const append_fn = self.vtable.append_idempotent_if_latest orelse
             return error.ConditionalIdempotentAppendUnsupported;
         return try append_fn(

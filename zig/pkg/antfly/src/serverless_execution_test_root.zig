@@ -3195,3 +3195,213 @@ test "serverless execution artifact uploads verification and sealing join origin
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
 }
+
+test "serverless execution native publication and WAL recovery retain ownership through physical retirement" {
+    const local = @import("antfly_local_sources");
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const manifests = @import("serverless/manifest/mod.zig");
+    const wal_mod = @import("serverless/wal/mod.zig");
+    const ManifestFs = @import("serverless/manifest/fs_store.zig").FsStore;
+    const WalFs = @import("serverless/wal/fs_store.zig").FsStore;
+    const Stage = enum { manifest, append, idempotent, receipt, conditional, replay, latest, repair };
+    const Mode = enum { success, canceled, io_canceled, deadline };
+    const Fixture = struct {
+        threaded: std.Io.Threaded,
+        reading: bool,
+        skip_syncs: usize = 0,
+        armed: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.Io.Event = .unset,
+        fn from(raw: ?*anyopaque) *@This() {
+            return @fieldParentPtr("threaded", @as(*std.Io.Threaded, @ptrCast(@alignCast(raw.?))));
+        }
+        fn gate(self: *@This()) void {
+            if (!self.armed.swap(false, .acq_rel)) return;
+            self.entered.store(true, .release);
+            self.release.waitUncancelable(self.threaded.io());
+        }
+        fn sync(raw: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const self = from(raw);
+            if (!self.reading) {
+                // Directory proofs precede the actual durable file boundary.
+                const stat = file.stat(self.threaded.io()) catch null;
+                if (stat != null and stat.?.kind == .file) {
+                    if (self.skip_syncs != 0) self.skip_syncs -= 1 else self.gate();
+                }
+            }
+            return self.threaded.io().vtable.fileSync(raw, file);
+        }
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self = from(raw);
+            if (self.reading) self.gate();
+            return self.threaded.io().vtable.fileReadPositional(raw, file, data, offset);
+        }
+    };
+    const candidate: manifests.Manifest = .{ .namespace = "docs", .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 1, .publication_fencing_token = 1, .stats = .{}, .artifacts = &.{} };
+    const Job = struct {
+        manifest: *manifests.ManifestStore,
+        wal: *wal_mod.WalStore,
+        stage: Stage,
+        records: ?[]wal_mod.Record = null,
+        lsn: ?u64 = null,
+        cause: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.execute() catch |err| {
+                self.cause = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
+            switch (self.stage) {
+                .manifest => try self.manifest.put(candidate),
+                .append => self.lsn = try self.wal.append("docs", 2, "tail"),
+                .idempotent, .receipt => self.lsn = try self.wal.appendIdempotent("docs", 2, "tail", "operation"),
+                .conditional => self.lsn = (try self.wal.appendIdempotentIfLatest("docs", 2, "tail", "operation", 1)) orelse return error.UnexpectedWalConflict,
+                .replay => self.records = try self.wal.readFromAlloc("docs", 1),
+                .latest, .repair => self.lsn = try self.wal.latestLsn("docs"),
+            }
+        }
+        fn deinit(self: *@This()) void {
+            if (self.records) |records| wal_mod.freeRecords(std.testing.allocator, records);
+            self.records = null;
+        }
+    };
+    const a = std.testing.allocator;
+    for (std.enums.values(Stage)) |stage| for (std.enums.values(Mode)) |mode| {
+        errdefer std.debug.print("native publication stage={s} mode={s}\n", .{ @tagName(stage), @tagName(mode) });
+        var directory = try local.common_test_directory.TestDirectory.init("native-publication-recovery");
+        defer directory.cleanup();
+        var fixture: Fixture = .{ .threaded = .init(a, .{}), .reading = stage == .replay or stage == .latest, .skip_syncs = if (stage == .receipt) 1 else 0 };
+        defer fixture.threaded.deinit();
+        var io = fixture.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.fileSync = Fixture.sync;
+        vtable.fileReadPositional = Fixture.read;
+        io.vtable = &vtable;
+        var manifest_backend = try ManifestFs.init(a, directory.path());
+        defer manifest_backend.deinit();
+        var wal_backend = try WalFs.init(a, directory.path());
+        defer wal_backend.deinit();
+        var manifest = manifest_backend.manifestStore();
+        var wal = wal_backend.walStore();
+        try std.testing.expectEqual(@as(u64, 1), try wal.append("docs", 1, "seed"));
+        if (stage == .repair) {
+            const path = try std.fs.path.join(a, &.{ directory.path(), "docs", "NEXT_LSN" });
+            defer a.free(path);
+            try std.Io.Dir.cwd().deleteFile(io, path);
+        }
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .publication_slots = 1, .read_isolation = false });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = io }, .background);
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var bridge: maintenance.GraphBridge = .{ .maintenance = .{ .io = io, .execution = &execution, .requested = &canceled, .deadline_ns = if (mode == .deadline) @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s else null } };
+        const original = bridge.readContext();
+        manifest.context = original;
+        wal.context = original;
+        var job: Job = .{ .manifest = &manifest, .wal = &wal, .stage = stage };
+        defer job.deinit();
+        fixture.armed.store(true, .release);
+        var task = try io.concurrent(Job.run, .{&job});
+        defer {
+            fixture.release.set(io);
+            task.cancel(io);
+        }
+        const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (!fixture.entered.load(.acquire)) {
+            if (job.done.load(.acquire)) return job.cause orelse error.NativeProviderWasNotEntered;
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.NativeProviderWasNotEntered;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        query.finish();
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        if (stage == .replay and mode == .success) {
+            // A replacement may land while replay owns the old file. Its
+            // pinned length and descriptor must still produce the old cut.
+            try std.testing.expectEqual(@as(u64, 2), try wal_backend.append("docs", 2, "concurrent"));
+        }
+        if (mode == .canceled or mode == .deadline) {
+            if (mode == .canceled) canceled.store(true, .release) else while (@import("antfly_platform").time.monotonicNs() < bridge.maintenance.?.deadline_ns.?) try io.sleep(.fromMilliseconds(1), .awake);
+            try std.testing.expect(!job.done.load(.acquire));
+        }
+        if (mode == .io_canceled) {
+            const Release = struct {
+                fn run(gate: *Fixture, worker: *Job, receiver: std.Io) !void {
+                    defer gate.release.set(receiver);
+                    try receiver.sleep(.fromMilliseconds(3), .awake);
+                    // Actual task cancellation must join this physical gate.
+                    try std.testing.expect(!worker.done.load(.acquire));
+                }
+            };
+            var release = try io.concurrent(Release.run, .{ &fixture, &job, io });
+            task.cancel(io);
+            try release.await(io);
+        } else {
+            fixture.release.set(io);
+            task.await(io);
+        }
+        var retry_execution: Runnable.Execution = .{};
+        defer retry_execution.finish();
+        var retry: maintenance.GraphBridge = .{ .maintenance = .{ .io = io, .execution = &retry_execution } };
+        if (mode == .success) {
+            if (job.cause) |err| return err;
+            if (job.records) |records| {
+                try std.testing.expectEqual(@as(usize, 1), records.len);
+                try std.testing.expectEqualStrings("seed", records[0].payload);
+            }
+        } else {
+            try std.testing.expectEqual(if (mode == .deadline) error.DeadlineExceeded else error.Canceled, job.cause.?);
+            try std.testing.expect(job.records == null and job.lsn == null);
+            if (stage == .receipt) {
+                // The log rename is already durable while NEXT_LSN is still
+                // unacknowledged. Refusal must preserve this accepted record.
+                const committed = try wal_backend.readFromAlloc(a, "docs", 1);
+                defer wal_mod.freeRecords(a, committed);
+                try std.testing.expectEqual(@as(usize, 2), committed.len);
+                try std.testing.expectEqualStrings("operation", committed[1].operation_id.?);
+                try std.testing.expectEqualStrings("tail", committed[1].payload);
+            }
+            const names = try std.fs.path.join(a, &.{ directory.path(), "docs", if (stage == .manifest) "manifests" else "" });
+            defer a.free(names);
+            var dir = try std.Io.Dir.cwd().openDir(io, names, .{ .iterate = true });
+            defer dir.close(io);
+            var entries = dir.iterate();
+            while (try entries.next(io)) |entry| try std.testing.expect(std.mem.indexOf(u8, entry.name, ".tmp-") == null);
+            execution.finish();
+            try std.testing.expectError(if (mode == .deadline) error.DeadlineExceeded else error.InvalidRunnableTransition, original.checkLifetime());
+            try retry_execution.start(&scheduler, .{ .io = io }, .background);
+            manifest.context = retry.readContext();
+            wal.context = retry.readContext();
+            try job.execute();
+            try std.testing.expectError(if (mode == .deadline) error.DeadlineExceeded else error.InvalidRunnableTransition, original.checkLifetime());
+        }
+        if (stage == .manifest) {
+            var loaded = try manifest.getAlloc("docs", 1);
+            defer loaded.deinit(a);
+            try std.testing.expectEqual(@as(u64, 1), loaded.publication_fencing_token);
+            // Identical retries remain idempotent; differing bytes are refused.
+            try manifest.put(candidate);
+            var conflict = candidate;
+            conflict.built_at_ns = 2;
+            try std.testing.expectError(error.ManifestVersionAlreadyExists, manifest.put(conflict));
+        }
+        if (stage == .idempotent or stage == .receipt or stage == .conditional) {
+            try std.testing.expectEqual(@as(u64, 2), try wal.appendIdempotent("docs", 2, "tail", "operation"));
+            try std.testing.expectError(error.WalIdempotencyConflict, wal.appendIdempotent("docs", 2, "different", "operation"));
+            try std.testing.expectEqual(@as(?u64, null), try wal.appendIdempotentIfLatest("docs", 3, "other", "other", 1));
+        }
+        execution.finish();
+        retry_execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
