@@ -213,6 +213,24 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
     assert.equal((await json("/mail/outbox", null, "alice")).messages[0].id, outboxId);
     assert.equal((await json("/mail/outbox", null, "bob")).messages.length, 0);
     assert.equal((await call("/mail/outbox/" + outboxId, null, "bob")).status, 404);
+    const oversizedHeader = "From: customer@example.net\r\nX-Padding: " +
+      "a".repeat(70000) + "\r\n\r\nbody";
+    const excessiveParts = "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n" +
+      Array.from({ length: 130 }, () => "--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n").join("") +
+      "--x--\r\n";
+    for (const invalid of [oversizedHeader, excessiveParts])
+      assert.equal(await mail.inject(alice.mailbox.address, "customer@example.net", invalid), "accepted");
+    assert.equal(await mail.duplicateQueued(), 2);
+    assert.equal(await mail.flush(), '["ack","ack","ack","ack"]');
+    const quarantined = (await json("/mail/messages", null, "alice")).messages
+      .filter((message) => message.quarantined);
+    assert.equal(quarantined.length, 2);
+    for (const message of quarantined) {
+      assert.equal(message.subject, "Message quarantined");
+      assert.deepEqual(message.attachments, []);
+      assert.match(message.text, /could not be decoded within the mailbox limits/);
+      assert.equal((await call("/mail/messages/" + message.id, null, "bob")).status, 404);
+    }
     await mf.dispose();
     mf = await fixture(persist);
     assert.equal((await json("/api/me", null, "alice")).mailbox.id, alice.mailbox.id);

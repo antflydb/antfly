@@ -152,6 +152,18 @@ test("MIME parsing preserves envelope delivery and treats sender HTML as untrust
   assert.ok(!Object.hasOwn(result, "html"));
   assert.ok(!JSON.stringify(result).includes("<script>"));
 });
+test("MIME parser enforces header and part budgets with stable limit codes", async () => {
+  const envelope = { from: "sender@example.net", to: "actual@example.test" };
+  const encode = (value) => new TextEncoder().encode(value);
+  const small = "From: sender@example.net\r\nX-Padding: " + "a".repeat(60000) + "\r\n\r\nbody";
+  assert.match((await parseMail(encode(small), envelope, 123)).text, /body/);
+  const large = "From: sender@example.net\r\nX-Padding: " + "a".repeat(70000) + "\r\n\r\nbody";
+  await assert.rejects(parseMail(encode(large), envelope, 123), { code: "EMAXHEADERSIZE" });
+  const parts = "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n" +
+    Array.from({ length: 130 }, () => "--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n").join("") +
+    "--x--\r\n";
+  await assert.rejects(parseMail(encode(parts), envelope, 123), { code: "EMAXPARTCOUNT" });
+});
 test("mail boundaries reject oversized input, header injection and invalid recipients", async () => {
   await assert.rejects(boundedBytes(new Blob(["12345"]).stream(), 4), /SizeExceeded/);
   const outbox = new MailOutbox(new Store());

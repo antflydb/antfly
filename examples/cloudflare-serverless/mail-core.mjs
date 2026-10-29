@@ -69,7 +69,7 @@ export async function parseMail(raw, envelope, receivedAt) {
   const parsed = await PostalMime.parse(raw, {
     maxNestingDepth: 12,
     maxPartCount: 128,
-    maxHeaderSize: 64 * 1024,
+    maxHeadersSize: 64 * 1024,
     maxRfc822NestingDepth: 2,
     maxForwardedAddresses: 32,
   });

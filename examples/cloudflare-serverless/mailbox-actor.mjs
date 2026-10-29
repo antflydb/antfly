@@ -105,7 +105,12 @@ export class Mailbox extends R2CommitCoordinator {
             "MailAttachmentBudgetExceeded",
             "MailSizeExceeded",
           ].includes(error?.message) &&
-          error?.name !== "PostalMimeError"
+          ![
+            "EMAXNESTINGDEPTH",
+            "EMAXHEADERSIZE",
+            "EMAXPARTCOUNT",
+            "EMAXFORWARDEDADDRESSES",
+          ].includes(error?.code)
         )
           throw error;
         parsed = {
