@@ -1082,3 +1082,98 @@ test "serverless multiprovider native collection reclaims late orphan uploads an
     try std.testing.expectEqualStrings("keep", kept.body);
     try fixture.verify();
 }
+
+test "serverless multiprovider native collection scale preserves a retained tail and receipts" {
+    const enabled = std.c.getenv("ANTFLY_NATIVE_GC_SCALE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "50000")) return error.InvalidNativeCollectionScale;
+    const a = std.testing.allocator;
+    const codec = @import("../api/codec.zig");
+    var fixture: TestFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    fixture.wal.document_index_enabled = true;
+    const body: [1024]u8 = @splat('x');
+    const rows = 50_000;
+    var first: ?[]const []const u8 = null;
+    defer if (first) |values| {
+        for (values) |value| a.free(value);
+        a.free(values);
+    };
+    var begin: usize = 0;
+    while (begin < rows) : (begin += 128) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const temporary = arena.allocator();
+        const end = @min(rows, begin + 128);
+        const payloads = try temporary.alloc([]const u8, end - begin);
+        for (payloads, begin..) |*payload, i| payload.* = try codec.encodeMutationAlloc(temporary, .{ .kind = .upsert, .doc_id = try std.fmt.allocPrint(temporary, "doc-{d:0>8}", .{i}), .body = &body });
+        const receipt = try fixture.wal.appendBatchIdempotent("docs", 1, payloads, try std.fmt.allocPrint(temporary, "batch-{d}", .{begin}));
+        try std.testing.expectEqual(@as(u64, end), receipt.end_lsn);
+        if (begin == 0) {
+            const saved = try a.alloc([]const u8, payloads.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (saved[0..initialized]) |value| a.free(value);
+                a.free(saved);
+            }
+            for (saved, payloads) |*out, value| {
+                out.* = try a.dupe(u8, value);
+                initialized += 1;
+            }
+            first = saved;
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 25_000), try fixture.wal.truncatePrefix("docs", 25_001));
+    const before_objects = fixture.memory.buckets.get("db").?.count();
+    var marked: usize = 0;
+    var deleted: usize = 0;
+    var peak_operations: u64 = 0;
+    var newer = false;
+    var finished = false;
+    var steps: usize = 0;
+    for (0..20_000) |_| {
+        fixture.memory.resetOperationCount();
+        const result = try fixture.collector.step("docs", null);
+        peak_operations = @max(peak_operations, fixture.memory.operationCount());
+        marked += result.marked_pages;
+        deleted += result.deleted_objects;
+        steps += 1;
+        if (!newer and try fixture.wal.collectionStatus("docs", null) != null) {
+            const encoded = try codec.encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "newer", .body = "newer" });
+            defer a.free(encoded);
+            try std.testing.expectEqual(@as(u64, 50_001), try fixture.wal.appendIdempotent("docs", 2, encoded, "newer"));
+            newer = true;
+        }
+        // This is a deterministic CPU/I/O scale fixture, not a real-clock or
+        // provider SLO. The separate live test uses the actual grace period.
+        fixture.now_ns += 250 * std.time.ns_per_ms;
+        if (result.phase == .waiting) fixture.now_ns += Collector.grace_ns;
+        if (result.phase == .finished) {
+            finished = true;
+            break;
+        }
+    }
+    try std.testing.expect(newer and finished and marked > 128 and deleted > 0);
+    try std.testing.expect(peak_operations <= 1024);
+    var after: u64 = 25_000;
+    while (after < rows) {
+        const end = @min(rows, after + 128);
+        const records = try fixture.wal.readRangeAlloc(a, "docs", .{ .start_lsn = after + 1, .end_lsn = end, .max_records = 128 });
+        defer @import("types.zig").freeRecords(a, records);
+        for (records, @as(usize, @intCast(after))..) |record, i| {
+            const id = try std.fmt.allocPrint(a, "doc-{d:0>8}", .{i});
+            defer a.free(id);
+            const expected = try codec.encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = id, .body = &body });
+            defer a.free(expected);
+            try std.testing.expectEqual(@as(u64, i + 1), record.lsn);
+            try std.testing.expectEqual(@as(u64, 1), record.timestamp_ns);
+            try std.testing.expectEqualSlices(u8, expected, record.payload);
+        }
+        after = end;
+    }
+    const replay = try fixture.wal.appendBatchIdempotent("docs", 1, first.?, "batch-0");
+    try std.testing.expectEqual(@as(u64, 1), replay.start_lsn);
+    try std.testing.expectEqual(@as(u64, 128), replay.end_lsn);
+    try std.testing.expectEqual(@as(u64, 50_001), try fixture.wal.latestLsn("docs"));
+    std.debug.print("native GC scale: rows=50000 retained=25000 steps={d} marked={d} deleted={d} peak_operations={d} before_objects={d} after_objects={d}\n", .{ steps, marked, deleted, peak_operations, before_objects, fixture.memory.buckets.get("db").?.count() });
+}
