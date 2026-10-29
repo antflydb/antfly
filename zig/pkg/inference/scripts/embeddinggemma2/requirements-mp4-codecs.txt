@@ -1,0 +1,2 @@
+# Independent fixture generation and FFmpeg reference decoding only.
+av==16.0.1

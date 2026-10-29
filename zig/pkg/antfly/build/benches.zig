@@ -191,7 +191,21 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     graph_bench_mod.addImport("antfly_zig", antfly_mod);
-    const graph_bench = b.addExecutable(.{ .name = "antfly-graph-bench", .root_module = graph_bench_mod });
+    const graph_bench = b.addExecutable(.{
+        .name = "antfly-graph-bench",
+        .root_module = graph_bench_mod,
+        // This consumer code-generates the source DB. Account for its full
+        // storage closure before overlapping it with compiled runtime owners.
+        // Retain the conservative storage envelope until separately measured.
+        .max_rss = @import("runtime_memory.zig").runtimeCompileMaxRss(.storage_kernel, .{
+            .host = b.graph.host.result,
+            .target = target.result,
+            .optimize = optimize,
+            .strip = graph_bench_mod.strip orelse false,
+            .cpu_inference = false,
+            .sanitize_thread = options.antfly_imports.sanitize_thread,
+        }),
+    });
     b.step("antfly-graph-bench", "Build and install graph preparation and query benchmarks").dependOn(&b.addInstallArtifact(graph_bench, .{}).step);
 
     const lsm_backend_bench_mod = b.createModule(.{

@@ -94,7 +94,13 @@ pub fn add(
             }
         } else {
             test_metadata.link(module);
-            benchmark = b.addExecutable(.{ .name = "storage_boundary_bench", .root_module = module });
+            benchmark = b.addExecutable(.{
+                .name = "storage_boundary_bench",
+                .root_module = module,
+                // The physical engine has its own reservation; account for
+                // this independently compiled boundary consumer as well.
+                .max_rss = 4 * 1024 * 1024 * 1024,
+            });
         }
         if (index == 3) {
             inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|

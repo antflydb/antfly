@@ -82,7 +82,7 @@ class BoundedZigBuildTest(unittest.TestCase):
             [
                 os.environ.get("ZIG", "zig"),
                 "test",
-                "pkg/antfly/build/runtime_memory.zig",
+                "build_memory_profile_test.zig",
             ],
             cwd=SCRIPT.parents[1],
             check=True,
@@ -118,6 +118,27 @@ class BoundedZigBuildTest(unittest.TestCase):
             self.assertEqual(int(outer.group(1)), 120)
             self.assertLess(defaults["IDLE"], defaults["HARD"])
             self.assertLess(defaults["HARD"], int(outer.group(1)) * 60)
+
+    def test_base_benchmark_gate_uses_qualified_compiler_and_memory_admission(self):
+        workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text()
+        job = workflow.split("  zig-base-tests:\n", 1)[1].split(
+            "  zig-full-tests:\n", 1
+        )[0]
+        compiler = job.split("      - name: Install glibc-linked Zig\n", 1)[1].split(
+            "      - name:", 1
+        )[0]
+        self.assertIn("steps.toolchain.outputs.zig_nix_attribute", compiler)
+        self.assertIn("steps.toolchain.outputs.zig_version", compiler)
+        self.assertIn("dynamically linked", compiler)
+        benchmark = job.split(
+            "      - name: Compile consolidated storage and graph benchmark contracts\n",
+            1,
+        )[1].split("      - name:", 1)[0]
+        self.assertIn("python3 tools/run_bounded_zig_build.py", benchmark)
+        self.assertIn("--build-file ./build.zig", benchmark)
+        self.assertIn("antfly-storage-bench antfly-graph-bench", benchmark)
+        self.assertIn("-Doptimize=debug -Dcpu=baseline", benchmark)
+        self.assertNotIn("-j1", benchmark)
 
     def test_ci_scheduler_caps_admit_the_storage_compile_claim(self):
         # Production runtime construction owns the reservation. The root build

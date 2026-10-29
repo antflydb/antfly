@@ -1874,6 +1874,20 @@ pub fn build(b: *std.Build) void {
     const run_audio_tests = b.addRunArtifact(audio_tests);
     const audio_test_step = b.step("test-audio", "Run shared audio tests");
     audio_test_step.dependOn(&run_audio_tests.step);
+    // The TNS regression is optimization-sensitive: run it in ReleaseFast even
+    // when the surrounding suite uses Debug or ReleaseSafe.
+    const audio_tns_tests = b.addTest(.{
+        .name = "audio-tns-optimized-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/src/aacplus/tns_test.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = .fast,
+        }),
+    });
+    const run_audio_tns_tests = b.addRunArtifact(audio_tns_tests);
+    b.step("test-audio-tns", "Run optimized AAC TNS arithmetic regressions").dependOn(&run_audio_tns_tests.step);
+    audio_test_step.dependOn(&run_audio_tns_tests.step);
+    default_test_step.dependOn(&run_audio_tns_tests.step);
 
     const audio_open_corpus = b.addExecutable(.{
         .name = "audio_open_corpus",
@@ -2187,7 +2201,10 @@ pub fn build(b: *std.Build) void {
     audio_module_tests_all.root_module.link_libc = true;
     const run_audio_codecs = b.addRunArtifact(audio_module_tests_all);
     audio_module_test_step.dependOn(&run_audio_codecs.step);
-    b.step("test-audio-codecs", "Run the complete shared audio codec suite").dependOn(&run_audio_codecs.step);
+    audio_module_test_step.dependOn(&run_audio_tns_tests.step);
+    const audio_codec_test_step = b.step("test-audio-codecs", "Run the complete shared audio codec suite");
+    audio_codec_test_step.dependOn(&run_audio_codecs.step);
+    audio_codec_test_step.dependOn(&run_audio_tns_tests.step);
 
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{

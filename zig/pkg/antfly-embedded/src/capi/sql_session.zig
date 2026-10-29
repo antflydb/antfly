@@ -380,7 +380,7 @@ pub fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) callconv(.c) h.ca
         return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_session_open), .{ .name = "antfly_db_sql_session_open" }), .{ ptr, out });
     h.capi.clearLastError();
     out.* = 0;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);

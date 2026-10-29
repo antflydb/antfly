@@ -17,6 +17,7 @@
 //! never document/source authority. Exact bytes and complete analyzer pipelines
 //! determine identity. A miss always uses the ordinary compiler.
 const std = @import("std");
+const atomic = @import("antfly_platform").atomic;
 const resources = @import("../storage/resource_manager.zig");
 const analysis = @import("analysis.zig");
 pub const Hit = struct { term: []const u8, positions: []const u32 };
@@ -86,8 +87,8 @@ pub const Cache = struct {
     manager: *resources.ResourceManager,
     metadata: resources.Reservation,
     reclaimer: u64 = 0,
-    hits: std.atomic.Value(u64) = .init(0),
-    tokens_reused: std.atomic.Value(u64) = .init(0),
+    hits: atomic.Value(u64) = .init(0),
+    tokens_reused: atomic.Value(u64) = .init(0),
     entries: [slots]Entry = @splat(.{}),
 
     pub fn create(manager: *resources.ResourceManager) !*Cache {

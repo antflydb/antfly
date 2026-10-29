@@ -1166,9 +1166,10 @@ resize coefficients, and token IDs. Only the final embedding vector is downloade
 synchronized before NVDEC unmaps them. Decoder errors discard cached surfaces;
 successful clips reuse the decoder.
 
-The supported envelope is progressive 8-bit SDR H.264 MP4, at most 60 seconds,
+The supported envelope is progressive 8-bit 4:2:0 SDR MP4 with H.264 (avc1),
+HEVC Main (hvc1/hev1), or AV1 Main (av01), at most 60 seconds,
 256 MiB, 4096 pixels per side, and 18,000 packets. HTTP/CLI request budgets can
-be narrower. Rotation, non-square pixels, HDR, interlacing, other codecs, and
+be narrower. Rotation, non-square pixels, 10-bit video, HDR, interlacing, other codecs, and
 mixed text/image/audio/video groups are rejected. The existing Gemma4 generation
 sampler and still-image preprocessing are unchanged. NVDEC's `libnvcuvid.so.1`
 is required at runtime; no FFmpeg process or runtime CUDA compiler is needed.
@@ -1546,3 +1547,68 @@ than the entire stream. Failed event creation/recording conservatively falls
 back to a stream drain. Event recording covers successful and failed execution
 exits, including final output reads. Model unload and lost-context cleanup retain
 their existing admission and ownership contracts.
+
+### MP4 codec and AAC qualification
+
+`src/testdata/video/codecs/receipt.json` pins the synthetic AVC/HEVC/AV1 fixtures
+and independent FFmpeg decoded-pixel hashes. CUDA tests compare selected YUV420
+pixels exactly, switch codecs at the same geometry, and check cancellation and
+reservation cleanup. HEVC/AV1 require NVDEC support on the deployment GPU; the
+portable MP4 reader still defaults to AVC/JPEG. Before backend selection,
+contract pixel accounting takes the maximum across viable portable and CUDA
+tracks, including mixed-codec MP4 files. `hev1` may supply its parameter sets
+in timed samples; `hvc1` requires them in its decoder configuration.
+Gemma4's sampler is unchanged.
+
+AAC-LC in M4A/MP4 or ADTS, and HE-AAC v1/v2 in M4A, use the existing native CPU
+audio decoder before the CUDA audio encoder. They do not use NVDEC. Qualification
+checks sample count/rate, bit-identical streaming/full decode, mean absolute PCM
+error at most 1e-4 against FFmpeg, and the audio library's 50 dB PCM SNR floor
+for the owned HE-AAC/PS fixtures. AAC-LC SNR is recorded separately: transient
+and speech fixtures can fall below 50 dB while meeting the absolute-error bound.
+CUDA embeddings must match a WAV containing the exact native decoded F32 samples
+with max error 1e-5.
+
+Independent acceptance additionally requires AAC embeddings versus the pinned
+FFmpeg-derived F32 WAV to have cosine similarity >= 0.995 and max component error
+<= 0.01, for every repeat and every audio fixture. These fixed global bounds mean
+at most 0.1 Euclidean drift for normalized unit vectors and at most 1% of unit
+norm in any component. This is bounded interoperability, not bit-exact decoder
+or pretrained-model reference parity. The corpus covers tones, silence, quiet
+audio, transients, a synthetic musical sequence, English/Spanish speech, HE-AAC
+v1/v2, ADTS, and audio extracted from a muxed MP4.
+
+A corpus-level retrieval gate requires each silence/transient/music/speech AAC
+embedding to rank its matching independent WAV first. Each mismatched reference
+must also fail the same cosine/component acceptance predicate. Reports retain
+all vectors, PCM errors, reference scores, and top-1 margins; a reference request
+failure or failed comparison fails qualification. No per-fixture embedding
+threshold exceptions or noisy-sample exclusions are used.
+
+Install fixture-generation dependencies from
+`scripts/embeddinggemma2/requirements-mp4-codecs.txt` into a worktree-local venv.
+Build the standalone PCM qualification helper from the repository root, keeping
+all caches and output in the worktree:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR="$PWD/zig/.zig-cache/global" zig build-exe \
+  -OReleaseFast --dep audio \
+  -Mroot=zig/pkg/inference/scripts/embeddinggemma2/aac_pcm_qualification.zig \
+  -OReleaseFast --dep antfly_media -Maudio=zig/lib/audio/src/mod.zig \
+  -OReleaseFast -Mantfly_media=zig/lib/media/src/mod.zig \
+  -lc -femit-bin=zig/zig-out/bin/aac-pcm-qualification
+python3 zig/pkg/inference/scripts/embeddinggemma2/qualify_mp4_codecs.py \
+  --binary zig/zig-out/bin/antfly-inference-http-server \
+  --model-dir /path/to/embeddinggemma2 \
+  --pcm-probe zig/zig-out/bin/aac-pcm-qualification \
+  --output .benchmark-results/mp4-codecs/qualification.json
+```
+
+The default scratch budget is 4096 MiB for the combined AAC/video cohort. For
+long-video admission checks, use the generated 60-second fixture directory with
+`--fixtures <directory> --video-only --scratch-budget-mb 1024`. The runner checks
+repeats, normalized finite 768-dimensional vectors, malformed input, deadlines,
+recovery, mixed traffic, and idle admission accounting. Its process-memory guard
+defaults to the production automatic physical/cgroup envelope; an explicit
+`--process-memory-budget-mb` covers the entire shared leaf cgroup, including
+unrelated compilers, rather than just the inference worker.

@@ -23,6 +23,68 @@ const ast = dependencies.sql_ast;
 pub const compiler = dependencies.sql_compiler;
 pub const runtime = dependencies.sql_runtime;
 
+/// Live preparation bytes shared by callers of one database, including plans
+/// queued for its API/writer gate. The owner is a stable path gate (or a pinned
+/// non-Lite root handle), never a serving runtime that admission can replace.
+pub const PreparationAdmission = struct {
+    limit: usize = runtime.resource_limits.preparation_bytes,
+    used: std.atomic.Value(usize) = .init(0),
+    test_after_prepare: if (@import("builtin").is_test) ?struct {
+        ptr: *anyopaque,
+        notify: *const fn (*anyopaque, usize, usize, bool) void,
+    } else void = if (@import("builtin").is_test) null else {},
+
+    pub fn budget(self: *PreparationAdmission, backing: std.mem.Allocator) dependencies.sql_memory_budget {
+        return .{
+            .backing = backing,
+            .limit = runtime.resource_limits.preparation_bytes,
+            .admission = .{ .ptr = self, .reserve = reserve, .release = release },
+        };
+    }
+    fn reserve(ptr: *anyopaque, bytes: usize) bool {
+        if (bytes == 0) return true;
+        const self: *PreparationAdmission = @ptrCast(@alignCast(ptr));
+        var used = self.used.load(.monotonic);
+        while (true) {
+            if (bytes > self.limit -| used) return false;
+            used = self.used.cmpxchgWeak(used, used + bytes, .acq_rel, .monotonic) orelse return true;
+        }
+    }
+    fn release(ptr: *anyopaque, bytes: usize) void {
+        if (bytes == 0) return;
+        const self: *PreparationAdmission = @ptrCast(@alignCast(ptr));
+        const previous = self.used.fetchSub(bytes, .release);
+        std.debug.assert(previous >= bytes);
+    }
+};
+
+/// Locking mode does not indicate whether SQL publishes persistent changes.
+/// EXPLAIN is read-only (ANALYZE rejects mutations); COMMIT can flush staged DML.
+pub fn statementMayMutate(statement: ast.Statement) bool {
+    return switch (statement) {
+        .select, .explain, .begin, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => false,
+        else => true,
+    };
+}
+
+test "capi SQL storage intent follows compiled statements including EXPLAIN and COMMIT" {
+    for ([_]struct { text: []const u8, mutates: bool }{
+        .{ .text = "SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN INSERT INTO t (_id) VALUES ('x')", .mutates = false },
+        .{ .text = "EXPLAIN ANALYZE SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN ANALYZE INSERT INTO t (_id) VALUES ('x')", .mutates = false },
+        .{ .text = "/* SELECT */ INSERT INTO t (_id) VALUES ('x')", .mutates = true },
+        .{ .text = "BEGIN READ ONLY", .mutates = false },
+        .{ .text = "ROLLBACK", .mutates = false },
+        .{ .text = "COMMIT", .mutates = true },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.text, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.mutates, statementMayMutate(compiled.statement));
+    }
+}
+
 /// Highlight JSON is a SQL JSONB value. Build it directly in the cursor's
 /// region, owning strings before the captured search result is released.
 pub fn highlightsValueLeaky(a: std.mem.Allocator, items: anytype) !?std.json.Value {
