@@ -33,10 +33,10 @@ export async function sanitizeLogpushProbe(row,source){
  const event=row.Event&&typeof row.Event==='object'?row.Event:{},request=(event.request??event.Request)&&typeof(event.request??event.Request)==='object'?(event.request??event.Request):{};
  let ray;try{ray=new Headers(request.headers??request.Headers??{}).get('cf-ray');}catch{}
  const type=['fetch','scheduled','alarm','queue','email','worker_rpc','hibernatable_web_socket'].includes(row.EventType)?row.EventType:'unknown';
- const knownKeys=new Set(['Request','Response','RpcMethod','RpcMethodName','RequestId','RayId','Id','request','response','rpcMethod','requestId','rayId','id','type','scheduledTime','cron','queue','batchSize','webSocket','rpcMethodName']);
+ const knownKeys=new Set(['ID','RequestID','RayID','Request','Response','RpcMethod','RpcMethodName','RequestId','RayId','Id','request','response','rpcMethod','requestId','rayId','id','type','scheduledTime','cron','queue','batchSize','webSocket','rpcMethodName']);
  return{script:source,timestamp,event_type:type,entrypoint:row.Entrypoint==='Probe'?'Probe':row.Entrypoint==='default'?'default':'other',version_id:[row.ScriptVersion?.id,row.ScriptVersion?.Id,row.ScriptVersion?.ID].find(uuid)??null,version_shape:{type:row.ScriptVersion===null?'null':typeof row.ScriptVersion,known_keys:row.ScriptVersion&&typeof row.ScriptVersion==='object'?Object.keys(row.ScriptVersion).filter(key=>['id','Id','ID','tag','Tag','message','Message'].includes(key)):[],unknown_keys:row.ScriptVersion&&typeof row.ScriptVersion==='object'?Object.keys(row.ScriptVersion).filter(key=>!['id','Id','ID','tag','Tag','message','Message'].includes(key)).length:0},
   event_keys:Object.keys(event).filter(k=>knownKeys.has(k)).sort(),unknown_event_keys:Object.keys(event).filter(k=>!knownKeys.has(k)).length,
-  identity_candidates:{event_request_id_sha256:await identity(event.requestId??event.RequestId),event_id_sha256:await identity(event.id??event.Id),event_ray_id_sha256:await identity(event.rayId??event.RayId),request_ray_id_sha256:await identity(ray)},probes,
+  identity_candidates:{event_request_id_sha256:await identity(event.requestId??event.RequestId??event.RequestID),event_id_sha256:await identity(event.id??event.Id??event.ID),event_ray_id_sha256:await identity(event.rayId??event.RayId??event.RayID),request_ray_id_sha256:await identity(ray)},probes,
   event:sanitizeTailEvent({outcome:row.Outcome,cpuTime:row.CPUTimeMs,wallTime:row.WallTimeMs,scriptVersion:row.ScriptVersion,logs,exceptions,truncated:rawLogs.length>256})??{}};
 }
 async function readBody(request){
@@ -66,7 +66,7 @@ export default {async fetch(request,env){
    if(bytes.length<=4096){let challenge;try{challenge=JSON.parse(text);}catch{}if(['test','tests'].includes(challenge?.content)&&Object.keys(challenge).length===1)return Response.json({validation:true,qualification:false});}
    if(lines.length>1000)fail('TelemetryRecordBudgetExceeded');
    const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=JSON.parse(line);}catch{fail('TelemetryJsonInvalid');}rejectionShape={json_type:row===null?'null':Array.isArray(row)?'array':typeof row,content:row?.content==='tests'?'tests':row?.content==='test'?'test':row&&Object.hasOwn(row,'content')?'other':'absent',has_script_name:typeof row?.ScriptName==='string',keys:row&&typeof row==='object'?Object.keys(row).filter(key=>['content','test','filename','ScriptName','Event','Logs'].includes(key)):[],key_count:row&&typeof row==='object'?Object.keys(row).length:0};rows.push(await sanitizeLogpushProbe(row,env.SOURCE_WORKER));}
-   const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');
+   const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');
    await env.LOGS.put(prefix+'batches/'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});
    return Response.json({stored:true,records:rows.length,qualification:false});
   }
