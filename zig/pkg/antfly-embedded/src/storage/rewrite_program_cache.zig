@@ -23,7 +23,7 @@ const contract = @import("db/relational_rewrite_contract.zig");
 const staging = @import("db/restore_staging_contract.zig");
 const resources = @import("resource_manager.zig");
 const RequestContext = @import("../api/operation.zig").RequestContext;
-const Waiters = @import("admission_waiter.zig").Fifo(void);
+const Waiters = @import("antfly_platform").sync.admission_waiter.Fifo(void);
 
 pub const Cache = struct {
     mutex: std.Io.Mutex = .init,

@@ -18,7 +18,7 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const rows = @import("../rowsource/types.zig");
-const projection = @import("document_query.zig");
+const projection = @import("document/query.zig");
 
 pub const Page = struct {
     a: A,

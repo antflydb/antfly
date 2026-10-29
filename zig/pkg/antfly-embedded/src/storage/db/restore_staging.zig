@@ -21,6 +21,7 @@ const server_test_adapter = if (builtin.is_test) @import("antfly_server_test_sou
 const builtin = @import("builtin");
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const identity = @import("doc_identity.zig");
 const activation = @import("relational_integrity_activation.zig");
 const catalog_mod = @import("relational_integrity_catalog.zig");
@@ -135,10 +136,7 @@ test "restore graph empty generation rejects physical artifacts before staging" 
 }
 
 pub fn optional(txn: anytype) !?[]const u8 {
-    return txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(txn.get(key));
 }
 pub fn requireScope(alloc: Allocator, txn: anytype, expected: ?Digest, allow_importing: bool) !void {
     const raw = (try optional(txn)) orelse {

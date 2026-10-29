@@ -16,6 +16,34 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Map a lookup's `error.NotFound` to `null`; other errors pass through.
+/// An already optional payload stays single-optional: absent and missing
+/// both become `null`.
+pub fn missingAsNull(result: anytype) MissingAsNull(@TypeOf(result)) {
+    return result catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
+    };
+}
+
+fn MissingAsNull(comptime Result: type) type {
+    const info = @typeInfo(Result).error_union;
+    if (@typeInfo(info.payload) == .optional) return info.error_set!info.payload;
+    return info.error_set!?info.payload;
+}
+
+test "missingAsNull maps only NotFound to null" {
+    const Lookup = error{ NotFound, Corrupt }!u32;
+    const found: Lookup = 7;
+    const missing: Lookup = error.NotFound;
+    const corrupt: Lookup = error.Corrupt;
+    try std.testing.expectEqual(@as(?u32, 7), try missingAsNull(found));
+    try std.testing.expectEqual(@as(?u32, null), try missingAsNull(missing));
+    try std.testing.expectError(error.Corrupt, missingAsNull(corrupt));
+    const absent: error{NotFound}!?u32 = null;
+    try std.testing.expectEqual(@as(?u32, null), try missingAsNull(absent));
+}
+
 /// Receives validated finite scores while native record storage is borrowed.
 /// Missing and deleted keys emit no value. A failure may leave partial output.
 pub const ScoreSink = struct {

@@ -172,12 +172,12 @@ pub const Overlay = struct {
         try self.effects.put(self.allocator, try self.allocator.dupe(u8, key), null);
     }
     pub fn sourceSettled(self: *Overlay, document: []const u8) !bool {
-        const authority = (try @import("artifact_publication.zig").authority(self)) orelse return self.legacy_completion;
-        const obligations = @import("artifact_producer_obligations.zig");
+        const authority = (try @import("artifact/publication.zig").authority(self)) orelse return self.legacy_completion;
+        const obligations = @import("artifact/producer_obligations.zig");
         const progress = (try obligations.load(self)) orelse return false;
         try progress.requireAuthority(authority);
         if (!progress.baseline_complete) return false;
-        return @import("artifact_completion_progress.zig").groupReady(self.allocator, self, self.completion_root, document);
+        return @import("artifact/completion_progress.zig").groupReady(self.allocator, self, self.completion_root, document);
     }
     pub fn eventRevision(self: *Overlay, definition: index.Definition) !u64 {
         if (self.native_revision) |value| return value;

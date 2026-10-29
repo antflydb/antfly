@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const casbin = @import("antfly_casbin");
 const storage = @import("usermgr_storage");
 const user_manager = @import("antfly_local_sources").usermgr_user_manager;
@@ -101,10 +102,7 @@ pub const StorageUserStore = struct {
             };
             const instance_key = try std.fmt.allocPrint(alloc, "userinstance:{s}", .{username});
             defer alloc.free(instance_key);
-            const instance_bytes = txn.get(users_namespace, instance_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const instance_bytes = try missingAsNull(txn.get(users_namespace, instance_key));
             var instance_id: [16]u8 = @splat(0);
             if (instance_bytes) |bytes| {
                 if (bytes.len != instance_id.len) return error.InvalidUserIdentity;
@@ -145,10 +143,7 @@ pub const StorageUserStore = struct {
         errdefer txn.abort();
         const key = try std.fmt.allocPrint(self.alloc, "userpass:{s}", .{username});
         defer self.alloc.free(key);
-        const existed = txn.get(users_namespace, key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existed = try missingAsNull(txn.get(users_namespace, key));
         if (existed != null) {
             try txn.delete(users_namespace, key);
             const metadata_key = try std.fmt.allocPrint(self.alloc, "usermeta:{s}", .{username});
@@ -217,10 +212,7 @@ pub const StorageUserStore = struct {
         errdefer txn.abort();
         const key = try std.fmt.allocPrint(self.alloc, "apikey:{s}", .{key_id});
         defer self.alloc.free(key);
-        const existed = txn.get(users_namespace, key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existed = try missingAsNull(txn.get(users_namespace, key));
         if (existed != null) {
             try txn.delete(users_namespace, key);
             try txn.commit();

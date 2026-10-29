@@ -18,6 +18,7 @@
 //! Each page drops its cursor before committing a bounded destination batch;
 //! no whole-memtable snapshot, primary row decode or per-parent lookup occurs.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const time = @import("antfly_platform").time;
 const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
@@ -89,10 +90,7 @@ fn walk(alloc: Allocator, io: ?std.Io, source: *docstore.DocStore, destination: 
 }
 
 pub fn copyToUnpublished(alloc: Allocator, io: ?std.Io, source: *docstore.DocStore, destination: *docstore.DocStore, lower: []const u8, upper: []const u8) !void {
-    const raw = source.get(alloc, catalog.key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw = try missingAsNull(source.get(alloc, catalog.key));
     defer if (raw) |bytes| alloc.free(bytes);
     if (raw) |bytes| {
         var decoded = try catalog.decode(alloc, bytes);

@@ -27,7 +27,7 @@ const derived_executor_mod = @import("derived/derived_executor.zig");
 const derived_types = @import("derived/derived_types.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
-const document_child_range_effects = @import("document_child_range_effects.zig");
+const document_child_range_effects = @import("document/child_range_effects.zig");
 const durable_outbox_store = @import("durable_outbox_store.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
@@ -41,7 +41,7 @@ const graph_edge_ttl_tombstone = @import("graph_edge_ttl_tombstone.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const internal_keys = @import("../internal_keys.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const merge_state_mod = @import("merge_state.zig");
 const platform = @import("antfly_platform");
 const platform_clock = @import("antfly_platform").clock;
@@ -63,6 +63,7 @@ const row_policy_bundle_mod = @import("row_policy_bundle.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const schema_registry_mod = @import("schema_registry.zig");
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const table_catalog_mod = @import("table_catalog.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
@@ -986,11 +987,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var namespace: [24]u8 = undefined;
                 doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
                 if (req.artifact_catalog) |install| {
-                    if (!install.binding.compatible(binding) or !std.mem.eql(u8, &install.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
-                } else try @import("artifact_inventory.zig").requireCompatibleReady(S.ownerField(self, "alloc").*, &read, namespace, binding);
-                if (!try self.artifactMaterializationsReady(&read, try @import("artifact_inventory.zig").catalogs(&read))) return error.ArtifactCatalogDrift;
+                    if (!install.binding.compatible(binding) or !std.mem.eql(u8, &install.binding.digest, &(try @import("artifact/inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
+                } else try @import("artifact/inventory.zig").requireCompatibleReady(S.ownerField(self, "alloc").*, &read, namespace, binding);
+                if (!try self.artifactMaterializationsReady(&read, try @import("artifact/inventory.zig").catalogs(&read))) return error.ArtifactCatalogDrift;
                 if (prepared_artifacts.receiver_binding) |prepared_binding| {
-                    const inventory = @import("artifact_inventory.zig");
+                    const inventory = @import("artifact/inventory.zig");
                     const observed = try inventory.status(S.ownerField(self, "alloc").*, &read, namespace);
                     if (!observed.ready or !std.meta.eql(observed.ordered, @as(?inventory.Binding, prepared_binding))) return error.ArtifactCatalogDrift;
                 }
@@ -1847,10 +1848,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         defer S.ownerField(self, "alloc").*.free(state);
                         const contender = try internal_keys.graphGlobalEdgeContenderKeyAlloc(S.ownerField(self, "alloc").*, clear.index_name, graph_entry.config.coverage_generation, entry.key, @intCast(graph_mod.direct_source_priority), state);
                         defer S.ownerField(self, "alloc").*.free(contender);
-                        const direct = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, contender) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
+                        const direct = try missingAsNull(S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, contender));
                         defer if (direct) |raw| S.ownerField(self, "alloc").*.free(raw);
                         if (direct == null) continue;
                     }
@@ -1970,16 +1968,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             // Typed online artifact afterimages participate in the same primary,
             // derived replay and page-receipt transaction as ordinary artifacts.
-            var transferred_artifact_position_bytes: [@import("artifact_publication.zig").Position.encoded_len]u8 = undefined;
+            var transferred_artifact_position_bytes: [@import("artifact/publication.zig").Position.encoded_len]u8 = undefined;
             if (transferred_artifacts.len != 0) {
                 const entry = opts.ordered_apply_receipt orelse return error.InvalidMergePage;
-                transferred_artifact_position_bytes = try (@import("artifact_publication.zig").Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode();
+                transferred_artifact_position_bytes = try (@import("artifact/publication.zig").Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode();
             }
-            var receiver_artifact_namespace: @import("artifact_publication.zig").Namespace = undefined;
+            var receiver_artifact_namespace: @import("artifact/publication.zig").Namespace = undefined;
             doc_identity.encodeNamespace(&receiver_artifact_namespace, S.ownerField(self, "core").*.identity_namespace);
             for (transferred_artifacts) |effect| {
                 if (@import("group_source_transfer.zig").isKey(effect.key)) continue;
-                const revision_key = @import("artifact_publication.zig").artifactRevisionKey(receiver_artifact_namespace, effect.key);
+                const revision_key = @import("artifact/publication.zig").artifactRevisionKey(receiver_artifact_namespace, effect.key);
                 const owned_revision_key = try S.ownerField(self, "alloc").*.dupe(u8, &revision_key);
                 owned_store_keys.append(S.ownerField(self, "alloc").*, owned_revision_key) catch |err| {
                     S.ownerField(self, "alloc").*.free(owned_revision_key);
@@ -2068,10 +2066,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const job_key = try cleanup_contract.ownerJobKeyAlloc(S.ownerField(self, "alloc").*, write.key);
                 var key_owned = true;
                 defer if (key_owned) S.ownerField(self, "alloc").*.free(job_key);
-                const pending = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, job_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const pending = try missingAsNull(S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, job_key));
                 defer if (pending) |value| S.ownerField(self, "alloc").*.free(value);
                 var needs_revival = pending != null;
                 if (!needs_revival and try S.ownerField(self, "core").*.store.mayHaveGraphRetirements()) {
@@ -2313,14 +2308,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!S.ownerField(self, "core").*.byteRange().contains(route)) return error.KeyOutOfRange;
                 if (command.action == .activate) {
                     const entry = opts.ordered_apply_receipt orelse return error.InvalidGroupedSourceCommand;
-                    const inventory = @import("artifact_inventory.zig");
-                    const publication = @import("artifact_publication.zig");
+                    const inventory = @import("artifact/inventory.zig");
+                    const publication = @import("artifact/publication.zig");
                     const catalogs = try inventory.catalogs(&group_overlay);
                     const active = try publication.authority(&group_overlay);
                     const status = try inventory.status(group_alloc, &group_overlay, namespace);
                     const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                     if (!ready) {
-                        try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
+                        try @import("artifact/catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
                         const ordered = if (status.ready and status.ordered.?.effect_protocol == 16) blk: {
                             var installed = (try inventory.load(group_alloc, &group_overlay)).?;
                             defer installed.deinit();
@@ -2333,8 +2328,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } else if (command.action == .retire) {
                     // Never prune source-owned unit pointers from an incomplete
                     // immutable copy; membership arrives atomically at admission.
-                    try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
-                    const retired = try @import("group_source_retirement.zig").applyPage(internal_keys, group_alloc, &group_overlay, plan, table, @import("group_source_baseline.zig").retirementGeneration(@import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), try (try @import("artifact_inventory.zig").catalogs(&group_overlay)).semanticDigest(group_alloc)), command.backfill.?.page.?, .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end });
+                    try @import("artifact/catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
+                    const retired = try @import("group_source_retirement.zig").applyPage(internal_keys, group_alloc, &group_overlay, plan, table, @import("group_source_baseline.zig").retirementGeneration(@import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), try (try @import("artifact/inventory.zig").catalogs(&group_overlay)).semanticDigest(group_alloc)), command.backfill.?.page.?, .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end });
                     group_staged.deleted = retired.deleted_sources;
                     for (retired.changed_artifacts) |key| try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
                 } else if (command.action == .backfill) {
@@ -2705,11 +2700,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var read = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer read.abort();
                 if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace))) return error.IdentityNamespaceMismatch;
-                if (!std.mem.eql(u8, &command.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
-                ordered_artifact_value = try @import("artifact_inventory.zig").prepareOrdered(S.ownerField(self, "alloc").*, &read, command, entry.index);
-                if (ordered_artifact_value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("artifact_inventory.zig").ordered_key, .value = value });
-                if (try @import("artifact_reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").key);
-                try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
+                if (!std.mem.eql(u8, &command.binding.digest, &(try @import("artifact/inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
+                ordered_artifact_value = try @import("artifact/inventory.zig").prepareOrdered(S.ownerField(self, "alloc").*, &read, command, entry.index);
+                if (ordered_artifact_value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("artifact/inventory.zig").ordered_key, .value = value });
+                if (try @import("artifact/reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact/reconcile_intent.zig").key);
+                try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact/reconcile_intent.zig").resolver_cursor_key);
             }
             var split_sequence_buf: [8]u8 = undefined;
             var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
@@ -2793,10 +2788,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (page_plan != .unchanged) {
                     const chunks = @import("merge_page_chunks.zig");
-                    const manifest = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, chunks.manifest_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const manifest = try missingAsNull(S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, chunks.manifest_key));
                     defer if (manifest) |value| S.ownerField(self, "alloc").*.free(value);
                     if (manifest) |value| {
                         const count = try chunks.slotCount(value);
@@ -2867,7 +2859,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Local producer receipts are fenced by the latest primary mutation,
             // not by the immutable document identity. Stamp in the primary batch.
             if (S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(S.ownerField(self, "core").*.store)) {
-                const readiness = @import("artifact_producer_readiness.zig");
+                const readiness = @import("artifact/producer_readiness.zig");
                 for (identity_upsert_keys.items, identity_upsert_write_indexes.items) |document, write_index| {
                     // An identical logical row creates no producer replay debt.
                     if (!derived_changed_flags[write_index]) continue;
@@ -3005,10 +2997,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (S.ownerField(self, "root_incarnation").* == 0 or explicit_embedding_artifact_writes.items.len == 0) break :blk 0;
                 var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer probe.abort();
-                if (try @import("artifact_publication.zig").authority(&probe) == null) break :blk 0;
+                if (try @import("artifact/publication.zig").authority(&probe) == null) break :blk 0;
                 break :blk S.ownerField(self, "root_incarnation").*;
             };
-            var authored_acceptance = try @import("artifact_authored_acceptance.zig").Prepared.init(
+            var authored_acceptance = try @import("artifact/authored_acceptance.zig").Prepared.init(
                 S.ownerField(self, "alloc").*,
                 authored_root,
                 explicit_embedding_artifact_writes.items,
@@ -3303,10 +3295,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // A read-only handle can predate the writer's import. Its local flag
             // cannot observe publication, so consult the shared durable fence.
             if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) {
-                const pending = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, graph_merge_import_recovery_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const pending = try missingAsNull(S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, graph_merge_import_recovery_key));
                 if (pending) |record| {
                     S.ownerField(self, "alloc").*.free(record);
                     return error.GraphMaintenanceInProgress;
@@ -3348,10 +3337,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
-                const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const old_bytes: ?[]const u8 = try missingAsNull(probe.getLeased(store_key));
                 if (old_bytes) |bytes| {
                     if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
                     const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
@@ -3623,7 +3609,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (@import("../artifact_footprint.zig").isKey(key)) return true;
             if (@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(key)) return true;
             if (@import("retirement_set_summary.zig").isKey(key)) return true;
-            if (@import("native_topology_receipt.zig").isKey(key)) return true;
+            if (@import("native/topology_receipt.zig").isKey(key)) return true;
             const generation_admission = @import("relational_integrity_generation_admission.zig");
             return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
                 std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key) or
@@ -3771,24 +3757,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn replicationMutationBarrier(self: anytype) ?*MutationBarrier {
-            var barrier: ?*MutationBarrier = null;
-            const mirrors = .{
-                S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
-                S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
-                S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
-            };
-            inline for (mirrors) |maybe_mirror| {
-                if (maybe_mirror) |mirror| {
-                    if (mirror.mutation_barrier) |candidate| {
-                        if (barrier) |configured| {
-                            std.debug.assert(configured == candidate);
-                        } else {
-                            barrier = candidate;
-                        }
-                    }
-                }
-            }
-            return barrier;
+            const local = S.ownerField(self, "local_execution");
+            return execution_resources.sharedMutationBarrier(.{
+                local.*.replication_async_effect_mirror,
+                local.*.replication_async_batch_mirror,
+                local.*.replication_async_metadata_mirror,
+            });
         }
 
         pub fn resolveTransactionIntentsInternal(
@@ -4362,7 +4336,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return false;
             }
             const enabled = if (getenv("ANTFLY_ASYNC_INDEX_PROFILE")) |raw_z|
-                envBoolEnabled(raw_z)
+                platform.env.flagValue(raw_z)
             else
                 benchMetricsEnabled();
             D.async_index_profile_enabled_cache.*.store(if (enabled) 2 else 1, .release);
@@ -4387,7 +4361,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 D.bench_metrics_enabled_cache.*.store(1, .release);
                 return false;
             };
-            const enabled = envBoolEnabled(raw_z);
+            const enabled = platform.env.flagValue(raw_z);
             D.bench_metrics_enabled_cache.*.store(if (enabled) 2 else 1, .release);
             return enabled;
         }
@@ -4692,16 +4666,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try change_journal_mod.encodeRecord(alloc, record);
         }
 
-        pub fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
-            const configured = pending orelse return;
-            if (configured.load(.acquire)) return error.PortableRuntimeActivationPending;
-        }
-
-        pub fn envBoolEnabled(raw: []const u8) bool {
-            return !(std.mem.eql(u8, raw, "0") or
-                std.ascii.eqlIgnoreCase(raw, "false") or
-                std.ascii.eqlIgnoreCase(raw, "no"));
-        }
+        pub const enforcePortableRuntimeGateOptional = execution_resources.enforcePortableRuntimeGateOptional;
 
         pub fn getenv(name: [*:0]const u8) ?[]const u8 {
             return platform.env.getenv(name);
@@ -4890,7 +4855,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn orderedCoverageActive(store: *docstore_mod.DocStore) !bool {
             var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
             defer probe.abort();
-            return try @import("artifact_publication.zig").authority(&probe) != null;
+            return try @import("artifact/publication.zig").authority(&probe) != null;
         }
 
         pub fn preflightReplicationMirrorSyncCommitContext(ctx: *const BatchExecutionContext, mirror: ?ReplicationAsyncEffectMirror) !void {

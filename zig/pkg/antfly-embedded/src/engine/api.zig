@@ -425,15 +425,7 @@ fn freeFieldList(alloc: Allocator, fields: [][]const u8) void {
     if (fields.len > 0) alloc.free(fields);
 }
 
-fn appendJsonString(
-    alloc: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    value: []const u8,
-) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+const appendJsonString = @import("../api/json_helpers.zig").appendJsonString;
 
 fn namedMutationJson(alloc: Allocator, field_name: []const u8, name: []const u8) ![]u8 {
     return try namedBoolMutationJson(alloc, field_name, name, true);

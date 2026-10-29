@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const platform_time = @import("antfly_platform").time;
@@ -36,8 +37,8 @@ const SchemaSpool = @import("schema_spool.zig").Spool;
 const public_table_schema = @import("../schema/mod.zig");
 const source_snapshot = @import("source_snapshot.zig");
 const db_types = @import("db/types.zig");
-const artifact_ids = @import("db/artifact_ids.zig");
-const producer_provenance = @import("db/artifact_producer_provenance.zig");
+const artifact_ids = @import("db/artifact/ids.zig");
+const producer_provenance = @import("db/artifact/producer_provenance.zig");
 const source_proof_batch = @import("db/source_proof_batch.zig");
 const enrichment_artifact_codec = @import("db/enrichment/artifact_codec.zig");
 const index_manager = @import("db/catalog/index_manager.zig");
@@ -457,7 +458,7 @@ pub const SourceCopyProof = struct {
     }
 };
 pub const CohortProof = struct {
-    seal: @import("db/native_backup_seal.zig").Handle,
+    seal: @import("db/native/backup_seal.zig").Handle,
     namespace: doc_identity.Namespace,
 
     pub fn encode(self: CohortProof) ![168]u8 {
@@ -531,7 +532,7 @@ pub fn exportPortableToWriterWithOptions(
     };
     var scan = try store.beginReadTxn();
     defer scan.abort();
-    try @import("db/artifact_reconcile_intent.zig").requireAbsent(&scan);
+    try @import("db/artifact/reconcile_intent.zig").requireAbsent(&scan);
     const source_summary: ?[]SourceGenerationAdmissionSummaryEntry = if (options.source_generation_summary_output) |output|
         try sourceGenerationAdmissionSummaryTxnAlloc(output.alloc, &scan, options.cohort.?)
     else
@@ -798,7 +799,7 @@ test "portable backup namespace seeks preserve adjacent binary and legacy keys" 
 }
 
 fn exportSourceProofs(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput, range: @import("byte_range.zig").ByteRange, namespace: [24]u8) !void {
-    const publication = @import("db/artifact_publication.zig");
+    const publication = @import("db/artifact/publication.zig");
     const active = (try publication.authority(scan)) orelse return;
     if (!std.mem.eql(u8, &active.namespace, &namespace)) return error.SourceSnapshotCutMismatch;
     const scoped = try std.mem.concat(alloc, u8, &.{ producer_provenance.prefix, &active.namespace });
@@ -884,27 +885,15 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     // A retirement can have already removed its last catalog binding while
     // still retaining cross-table cleanup authority. The catalog alone cannot
     // establish that this is a portable, table-local image.
-    const retirement = scan.get(@import("db/relational_integrity_retirement.zig").key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const retirement = try missingAsNull(scan.get(@import("db/relational_integrity_retirement.zig").key));
     if (retirement != null) return error.CoordinatedConstraintPortableBackupUnsupported;
-    const generation_retirement = scan.get(@import("db/relational_integrity_generation_retirement.zig").key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const generation_retirement = try missingAsNull(scan.get(@import("db/relational_integrity_generation_retirement.zig").key));
     if (generation_retirement != null) return error.CoordinatedConstraintPortableBackupUnsupported;
     const generation_gc = @import("db/relational_integrity_generation_retirement.zig");
-    const gc_progress = scan.get(generation_gc.gc_progress_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const gc_progress = try missingAsNull(scan.get(generation_gc.gc_progress_key));
     if (gc_progress != null) return error.CoordinatedConstraintPortableBackupUnsupported;
     inline for (.{ generation_gc.activation_receipt_key, generation_gc.completed_pending_key, generation_gc.acknowledged_receipt_key }) |authority_key| {
-        const authority = scan.get(authority_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const authority = try missingAsNull(scan.get(authority_key));
         if (authority != null) return error.CoordinatedConstraintPortableBackupUnsupported;
     }
     // Replicated GC may remove physical tombstones, but the permanent
@@ -924,10 +913,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         if (std.mem.startsWith(u8, entry.key, admitted_prefix) and cohort == null and source_copy == null)
             return error.CoordinatedConstraintPortableBackupUnsupported;
     }
-    const topology_fence = scan.get(@import("db/relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const topology_fence = try missingAsNull(scan.get(@import("db/relational_integrity_topology.zig").fence_key));
     if (cohort) |proof| {
         _ = try proof.encode();
         const fence = try @import("db/relational_integrity_topology.zig").Fence.decode(topology_fence orelse return error.BackupIntegrityFailure);
@@ -939,10 +925,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     // relocate globally routed claims. Do not silently export declarations
     // while dropping their enforcement records. Native coordinated snapshots
     // retain these records; portable support needs its distributed barrier.
-    const integrity_catalog = scan.get(@import("db/relational_integrity_catalog.zig").key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const integrity_catalog = try missingAsNull(scan.get(@import("db/relational_integrity_catalog.zig").key));
     if (cohort == null and source_copy == null) try requireUncoordinatedIntegrityState(alloc, scan, integrity_catalog);
     if (out.stats) |stats| stats.snapshot_passes += 1;
     const backup_id = @as([16]u8, @splat(0)); // zero UUID for now
@@ -1282,10 +1265,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                 errdefer if (owned_value_pending) alloc.free(owned_value);
                 const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, user_key);
                 defer alloc.free(timestamp_key);
-                const timestamp_value = scan.get(timestamp_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const timestamp_value = try missingAsNull(scan.get(timestamp_key));
 
                 const owned_key = try alloc.dupe(u8, user_key);
                 var owned_key_pending = true;
@@ -1454,10 +1434,7 @@ fn requireUncoordinatedIntegrityState(alloc: Allocator, scan: *DocStore.Txn, raw
         if (catalog.bindings.len != 0 or catalog.next_generation != 1 or !std.mem.allEqual(u8, &catalog.checks_digest, 0))
             return error.CoordinatedConstraintPortableBackupUnsupported;
     }
-    const activation = scan.get(@import("db/relational_integrity_activation_contract.zig").key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const activation = try missingAsNull(scan.get(@import("db/relational_integrity_activation_contract.zig").key));
     if (activation != null) return error.CoordinatedConstraintPortableBackupUnsupported;
     const integrity = @import("db/relational_integrity_contract.zig");
     var cursor = try scan.openCursor();
@@ -2592,10 +2569,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
-    const raw_state = store.get(owned, cohort_import_checkpoint_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw_state = try missingAsNull(store.get(owned, cohort_import_checkpoint_key));
     const proof_digest = try proof.digest();
     var state: CohortImportCheckpoint = if (raw_state) |bytes| (try std.json.parseFromSlice(CohortImportCheckpoint, owned, bytes, .{})).value else .{ .scope = scope, .proof_digest = proof_digest };
     if (!std.mem.eql(u8, &state.scope, &scope) or !std.mem.eql(u8, &state.proof_digest, &proof_digest)) return error.RestoreStagingScopeChanged;
@@ -2681,10 +2655,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
     if (state.ordinal >= state.object_count or state.footer_offset >= size) return error.InvalidRestoreSourceCheckpoint;
     const locator = try store.get(owned, try cohortObjectKey(owned, state.ordinal));
     const object = (try std.json.parseFromSlice(CohortObject, owned, locator, .{})).value;
-    const cache_bytes = store.get(owned, cohort_import_cache_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const cache_bytes = try missingAsNull(store.get(owned, cohort_import_cache_key));
     const cached = if (cache_bytes) |bytes| (try std.json.parseFromSlice(CohortCachedBlock, owned, bytes, .{})).value else null;
     const import_artifacts = proof == .cohort and isCohortArtifactBlock(object.kind);
     const use_cache = (object.kind == .document_batch or import_artifacts) and cached != null and cached.?.ordinal == state.ordinal;
@@ -2723,10 +2694,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         const keys = try owned.alloc([]const u8, selected.len);
         for (selected, keys) |entry, *key| {
             const physical = if (entry.value_flags & backup_codec.doc_value_flag_relational_row != 0) try internal_keys.relationalRowKeyAlloc(owned, entry.key) else try internal_keys.documentKeyAlloc(owned, entry.key);
-            const existing = store.get(owned, physical) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing = try missingAsNull(store.get(owned, physical));
             if (existing != null) return error.InvalidBackupRequest;
             key.* = entry.key;
             state.saw_relational = state.saw_relational or entry.value_flags & backup_codec.doc_value_flag_relational_row != 0;
@@ -2772,10 +2740,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         for (entries[local_start..end]) |entry| {
             try cancellation.check();
             if ((try seen.getOrPut(owned, entry.key)).found_existing) return error.InvalidBackupRequest;
-            const existing = store.get(owned, entry.key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing = try missingAsNull(store.get(owned, entry.key));
             if (existing != null) return error.InvalidBackupRequest;
             try writes.append(owned, .{ .key = entry.key, .value = entry.value });
         }
@@ -2794,10 +2759,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             if (state.saw_rows) return error.InvalidBackupManifest;
             const entries = try backup_codec.decodeKeyValueBatch(owned, block.payload);
             for (entries) |entry| {
-                const previous = store.get(owned, entry.key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const previous = try missingAsNull(store.get(owned, entry.key));
                 if (previous != null) return error.InvalidMetadataBatch;
             }
             try validateMetadataEntries(alloc, entries, &archive);
@@ -3094,18 +3056,12 @@ pub fn validateCompleteEmbeddedDatabaseImageAlloc(alloc: Allocator, store: *DocS
     return validateCompleteDatabaseImageWithProofs(alloc, store, null, null, true);
 }
 fn validateCompleteDatabaseImageWithProofs(alloc: Allocator, store: *DocStore, cohort: ?CohortProof, source_copy: ?SourceCopyProof, embedded_database: bool) !void {
-    const raw_source = store.get(alloc, source_copy_proof_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw_source = try missingAsNull(store.get(alloc, source_copy_proof_key));
     defer if (raw_source) |bytes| alloc.free(bytes);
     if (source_copy) |proof| {
         if (!std.mem.eql(u8, raw_source orelse return error.BackupIntegrityFailure, &try proof.encode())) return error.BackupIntegrityFailure;
     } else if (raw_source != null) return error.SourceCopyRestoreUnsupported;
-    const raw_proof = store.get(alloc, cohort_proof_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw_proof = try missingAsNull(store.get(alloc, cohort_proof_key));
     defer if (raw_proof) |bytes| alloc.free(bytes);
     if (cohort) |proof| {
         if (!std.mem.eql(u8, raw_proof orelse return error.BackupIntegrityFailure, &try proof.encode())) return error.BackupIntegrityFailure;
@@ -3114,10 +3070,7 @@ fn validateCompleteDatabaseImageWithProofs(alloc: Allocator, store: *DocStore, c
 
     const runtime_schema = try storage_schema.loadSchema(store, alloc);
     defer if (runtime_schema) |schema| storage_schema.freeSchema(alloc, schema);
-    const schema_json = store.get(alloc, "\x00\x00__metadata__:schema_json") catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const schema_json = try missingAsNull(store.get(alloc, "\x00\x00__metadata__:schema_json"));
     defer if (schema_json) |value| alloc.free(value);
 
     // A public schema is never a standalone durable contract: it is the source
@@ -4155,7 +4108,7 @@ fn validateSourceProofBatch(alloc: Allocator, payload: []const u8, archive: *Por
 
 test "ordered artifact inventory source proof export restores inert selected evidence" {
     const alloc = std.testing.allocator;
-    const publication = @import("db/artifact_publication.zig");
+    const publication = @import("db/artifact/publication.zig");
     var source_tmp = std.testing.tmpDir(.{});
     defer source_tmp.cleanup();
     var destination_tmp = std.testing.tmpDir(.{});
@@ -4396,7 +4349,7 @@ test "relational index system source snapshot certificate survives transfer rest
     const io = std.testing.io;
     const DB = @import("db/mod.zig").DB;
     const retained = @import("retained_effects.zig");
-    const native = @import("db/native_backup.zig");
+    const native = @import("db/native/backup.zig");
     const cut: source_snapshot.Cut = .{ .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .applied_index = 11, .retained_start = 0 };
     const padding = try alloc.alloc(u8, 3 * 1024 * 1024);
     defer alloc.free(padding);
@@ -7464,19 +7417,13 @@ test "export skips derived data" {
 
     // Summary should NOT exist
     {
-        const val = dst.get(alloc, summary_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const val = try missingAsNull(dst.get(alloc, summary_key));
         try std.testing.expectEqual(null, val);
     }
 
     // Incoming edge should NOT exist
     {
-        const val = dst.get(alloc, rev_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const val = try missingAsNull(dst.get(alloc, rev_key));
         try std.testing.expectEqual(null, val);
     }
 }

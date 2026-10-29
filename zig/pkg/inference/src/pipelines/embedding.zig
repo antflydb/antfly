@@ -3771,13 +3771,7 @@ fn residentQwen3EmbeddingEligibleForBackend(backend: backends.BackendType, cfg: 
     return gpt_arch.denseQwen3PrefillEligible(cfg);
 }
 
-fn envFlagEnabled(value: []const u8) bool {
-    return value.len > 0 and
-        !std.mem.eql(u8, value, "0") and
-        !std.ascii.eqlIgnoreCase(value, "false") and
-        !std.ascii.eqlIgnoreCase(value, "off") and
-        !std.ascii.eqlIgnoreCase(value, "no");
-}
+const envFlagEnabled = platform.env.flagValue;
 
 fn logEmbedTensorShapes(explicit: bool, label: []const u8, tensors: []const Tensor) void {
     if (!embedTimingEnabled(explicit)) return;

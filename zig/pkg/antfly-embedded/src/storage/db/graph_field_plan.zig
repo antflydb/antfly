@@ -18,7 +18,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 
 const Builder = struct {

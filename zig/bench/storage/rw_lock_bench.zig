@@ -16,7 +16,7 @@ const std = @import("std");
 const antfly = @import("antfly-zig");
 
 const db_mod = antfly.db;
-const apply_rw_lock_mod = db_mod.apply_rw_lock;
+const WriterPreferringRwLock = db_mod.WriterPreferringRwLock;
 const platform_time = antfly.platform_time;
 
 const Config = struct {
@@ -235,7 +235,7 @@ fn freeWrites(alloc: std.mem.Allocator, writes: []db_mod.types.BatchWrite) void 
     alloc.free(writes);
 }
 
-fn deltaStats(after: apply_rw_lock_mod.ApplyRwLock.Stats, before: apply_rw_lock_mod.ApplyRwLock.Stats) apply_rw_lock_mod.ApplyRwLock.Stats {
+fn deltaStats(after: WriterPreferringRwLock.Stats, before: WriterPreferringRwLock.Stats) WriterPreferringRwLock.Stats {
     return .{
         .shared_lock_calls = after.shared_lock_calls -| before.shared_lock_calls,
         .shared_contended_calls = after.shared_contended_calls -| before.shared_contended_calls,
@@ -248,7 +248,7 @@ fn deltaStats(after: apply_rw_lock_mod.ApplyRwLock.Stats, before: apply_rw_lock_
     };
 }
 
-fn printSummary(cfg: Config, elapsed_ns: u64, searches: u64, failed: u64, stats: apply_rw_lock_mod.ApplyRwLock.Stats) void {
+fn printSummary(cfg: Config, elapsed_ns: u64, searches: u64, failed: u64, stats: WriterPreferringRwLock.Stats) void {
     std.debug.print(
         "rw_lock_bench docs={d} write_batches={d} batch_size={d} search_threads={d} sync={s} elapsed_ms={d:.3} searches={d} failed={d}\n",
         .{

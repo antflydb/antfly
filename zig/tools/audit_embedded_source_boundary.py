@@ -250,7 +250,7 @@ def check_local_observation_contracts(relative: str, source: str) -> None:
             raise ValueError(
                 f"{relative} exposes server routing in local visibility hook"
             )
-    if relative == "storage/db/document_child_range_effects.zig":
+    if relative == "storage/db/document/child_range_effects.zig":
         if re.search(r"\broute_status\b", masked) or any(
             match[0] == '"remote_committed"' for match in LITERALS.finditer(production)
         ):
@@ -266,25 +266,24 @@ def check_replication_contract(relative: str, source: str) -> None:
         "storage/db/replication_contract.zig",
         "storage/db/commit_integration.zig",
         "storage/db/db.zig",
-        "storage/db/document_child_range_effects.zig",
-        "storage/db/document_child_range_outbox.zig",
+        "storage/db/document/child_range_effects.zig",
+        "storage/db/document/child_range_outbox.zig",
         "storage/db/portable_activation_recovery.zig",
         "storage/db/quarantine_recovery.zig",
         "storage/db/independent_maintenance.zig",
         "storage/db/index_repair_scheduler.zig",
         "storage/db/graph_cleanup_owner.zig",
-        "storage/db/native_projection_owner.zig",
+        "storage/db/native/projection_owner.zig",
         "storage/db/runtime_restart_owner.zig",
         "storage/db/cleanup_job_owner.zig",
         "storage/db/query_visibility.zig",
-        "storage/db/coalesced_job_admission.zig",
         "storage/db/dense_publication_admission.zig",
         "storage/db/local_runtime_owner.zig",
         "storage/db/embedding_activity_cache.zig",
         "storage/db/source_pin_cleanup_owner.zig",
         "storage/db/applied_sequence_coalescer.zig",
         "storage/db/bulk_ingest_session.zig",
-        "storage/db/document_collectors.zig",
+        "storage/db/document/collectors.zig",
         "storage/db/owned_keys.zig",
         "storage/db/graph_field_plan.zig",
         "storage/db/replay_vector_collectors.zig",

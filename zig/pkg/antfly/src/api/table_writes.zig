@@ -27757,11 +27757,7 @@ const extractIndexConfigJsonWithOptions = table_index_config.extractIndexConfigJ
 pub const normalizeManagedEmbeddingIndexDimensionJsonWithOptions = table_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions;
 pub const normalizeManagedEmbeddingIndexDimensionsJsonWithOptions = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions;
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+const appendJsonString = @import("antfly_local_sources").api_json_helpers.appendJsonString;
 
 const nextTxnTimestamp = @import("antfly_local_sources").api_local_table_writes.nextTxnTimestamp;
 

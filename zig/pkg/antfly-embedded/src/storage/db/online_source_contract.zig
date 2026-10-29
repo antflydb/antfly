@@ -129,7 +129,7 @@ pub fn namespaceBytes(value: identity.Namespace) [24]u8 {
 }
 
 pub const Command = union(enum) {
-    admit: struct { scope: Scope, limit: u64 = 256 * 1024 * 1024, artifact_catalog: ?@import("artifact_inventory.zig").Binding = null },
+    admit: struct { scope: Scope, limit: u64 = 256 * 1024 * 1024, artifact_catalog: ?@import("artifact/inventory.zig").Binding = null },
     acknowledge: struct { scope: Scope, previous: u64, next: u64 },
     release: Scope,
     final_fence: struct { scope: Scope, expected_sequence: u64 },

@@ -7604,11 +7604,7 @@ fn adoptDenseBatchResult(
     return vectors;
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
-}
+const appendJsonString = @import("../api/json_helpers.zig").appendJsonString;
 
 fn appendCoveragePolicyIfPresent(
     alloc: std.mem.Allocator,

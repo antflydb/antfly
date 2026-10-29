@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const runtime = @import("../background_runtime.zig");
-const admission = @import("coalesced_job_admission.zig");
+const admission = @import("antfly_platform").sync.coalesced_job_admission;
 /// Supervision only. DB's run-one-pass port retains schema-version fencing and
 /// durable building/failed/ready transitions. The durable owner lane must drain
 /// before this owner or its borrowed operation context is destroyed.

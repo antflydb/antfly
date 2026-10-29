@@ -1092,9 +1092,7 @@ fn sleepMs(ms: u64) void {
 }
 
 fn envEnabled(comptime env_name: []const u8) bool {
-    const value_z = std.c.getenv(env_name ++ "\x00") orelse return false;
-    const value = std.mem.span(value_z);
-    return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "false");
+    return @import("antfly_platform").env.getenvBoolDefault(env_name ++ "\x00", false);
 }
 
 fn envRequiredOwned(alloc: std.mem.Allocator, env_name: []const u8) ![]u8 {

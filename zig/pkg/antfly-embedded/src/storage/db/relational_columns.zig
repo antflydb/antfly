@@ -18,6 +18,7 @@
 //! one read snapshot. Bounded range compaction publishes replacements
 //! atomically and compare-clears only the dirty images covered by its snapshot.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const store_mod = @import("../docstore.zig");
 const backend_erased = @import("../backend_erased.zig");
 const ReadScratch = @import("../../segment_source.zig").Scratch;
@@ -1000,18 +1001,12 @@ pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !boo
     var start = try db.core.store.beginWriteTxn();
     var start_live = true;
     defer if (start_live) start.abort();
-    const current = start.get(manifest_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const current = try missingAsNull(start.get(manifest_key));
     if (current) |bytes| {
         const manifest = Manifest.decode(bytes) catch Manifest{ .ready = false, .generation = 0, .sequence = 0, .blocks = 0 };
         if (manifest.ready and !force) {
             const bootstrapping = (try bootstrapBoundary(&start, manifest)) != null;
-            const abandoned = start.get(building_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const abandoned = try missingAsNull(start.get(building_key));
             if (abandoned) |token| {
                 // Revoke the abandoned builder before incrementally reclaiming
                 // its prefix. The durable job survives another cancellation.
@@ -1039,10 +1034,7 @@ pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !boo
             return try compact(db, alloc, namespace, adaptive);
         }
     }
-    const old = start.get(counter_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const old = try missingAsNull(start.get(counter_key));
     const previous = if (old) |bytes| blk: {
         if (bytes.len != 8) return error.InvalidColumnSegment;
         break :blk std.mem.readInt(u64, bytes[0..8], .little);
@@ -1291,10 +1283,7 @@ fn retireBlock(txn: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64,
     std.mem.writeInt(u64, &identity, block, .little);
     try txn.put(key, try checked(alloc, &identity));
     const defer_key = try deferredKey(alloc, generation, block);
-    const encoded = txn.get(defer_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const encoded = try missingAsNull(txn.get(defer_key));
     if (encoded) |bytes| {
         const state = try Deferred.decode(bytes);
         try deleteIfPresent(txn, try timerKey(alloc, generation, state.due(), block));
@@ -1354,10 +1343,7 @@ const Selection = struct { id: ?[]const u8 = null, progress: bool = false, timed
 fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, manifest: Manifest, manifest_bytes: []const u8, store_revision: u64) !Selection {
     const maintenance = &db.relational_column_maintenance;
     const now = maintenanceNow();
-    const mutation = read.get(keys.relational_columnar_mutation_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const mutation = try missingAsNull(read.get(keys.relational_columnar_mutation_key));
     const version = if (mutation) |bytes| blk: {
         if (bytes.len != 8) return error.InvalidColumnSegment;
         break :blk std.mem.readInt(u64, bytes[0..8], .little);
@@ -1402,10 +1388,7 @@ fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, ma
     }
     var dirty = try read.openCursor();
     defer dirty.close();
-    const saved = read.get(discovery_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const saved = try missingAsNull(read.get(discovery_key));
     const discovery_resume = if (saved) |encoded| blk: {
         const body = try verified(encoded);
         if (body.len < 12 or std.mem.readInt(u32, body[8..12], .little) != body.len - 12) return error.InvalidColumnSegment;
@@ -1432,10 +1415,7 @@ fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, ma
         examined += 1;
         next_id = range.end;
         const defer_key = try deferredKey(alloc, manifest.generation, range.block);
-        const encoded = read.get(defer_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const encoded = try missingAsNull(read.get(defer_key));
         const previous = if (encoded) |bytes| try Deferred.decode(bytes) else null;
         const debt = maintenance.debtSlot(manifest.generation, range.block).load(.monotonic);
         {
@@ -1834,10 +1814,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     const selection = if (adaptive and bootstrap == null) try selectReady(db, &read, scratch, manifest, manifest_bytes, store_revision) else Selection{};
     var dirty = try read.openCursor();
     defer dirty.close();
-    const saved_cursor = read.get(maintenance_cursor_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const saved_cursor = try missingAsNull(read.get(maintenance_cursor_key));
     const resume_id = if (saved_cursor) |encoded| blk: {
         const body = verified(encoded) catch break :blk "";
         if (body.len < 12 or std.mem.readInt(u64, body[0..8], .little) != manifest.generation or
@@ -1850,17 +1827,11 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     if (adaptive and bootstrap == null) pending_entry = if (selection.id) |id| .{ .key = try std.mem.concat(scratch, u8, &.{ dirty_prefix, id }), .value = "" } else null;
     const any_dirty = if (pending_entry) |entry| std.mem.startsWith(u8, entry.key, dirty_prefix) else false;
     const candidate_prefix = try mergeQueueKey(scratch, manifest.generation, "");
-    const turn_bytes = read.get(maintenance_turn_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const turn_bytes = try missingAsNull(read.get(maintenance_turn_key));
     const turn: u64 = if (turn_bytes) |bytes| if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .little) else 0 else 0;
     var candidate_cursor = try read.openCursor();
     defer candidate_cursor.close();
-    const saved_merge = read.get(merge_cursor_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const saved_merge = try missingAsNull(read.get(merge_cursor_key));
     const merge_resume = if (saved_merge) |bytes| verified(bytes) catch "" else "";
     const candidate_lower = if (std.mem.startsWith(u8, merge_resume, candidate_prefix)) try std.mem.concat(scratch, u8, &.{ merge_resume, "\x00" }) else candidate_prefix;
     var queued_candidate = try candidate_cursor.seekAtOrAfter(candidate_lower);
@@ -2024,10 +1995,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
                 // The retained root still owns its original admission age,
                 // but its directory start moved. Repoint the due index in the
                 // same publication so a partial build cannot orphan its timer.
-                const deferred = publish.get(try deferredKey(scratch, manifest.generation, old_range.block)) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const deferred = try missingAsNull(publish.get(try deferredKey(scratch, manifest.generation, old_range.block)));
                 if (deferred) |encoded| {
                     const state = try Deferred.decode(encoded);
                     try publish.put(try timerKey(scratch, manifest.generation, state.due(), old_range.block), try directoryValue(scratch, old_range.block, continuation));

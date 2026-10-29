@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const transform = @import("relational_row_transform.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const alloc = std.testing.allocator;
 

@@ -1151,7 +1151,7 @@ test "resolver curation ordered review commits outcomes replay and receipts toge
     try std.testing.expect(unit_plan.accepted);
     try std.testing.expectEqualStrings(unit, unit_plan.source_key.?);
     try std.testing.expectEqualStrings("source", try unit_command.ownerDocumentAlloc(a));
-    try std.testing.expectEqualStrings("source", try @import("artifact_publication_owner.zig").documentAlloc(a, try unit_command.receiptKey(a)));
+    try std.testing.expectEqualStrings("source", try @import("artifact/publication_owner.zig").documentAlloc(a, try unit_command.receiptKey(a)));
     const replication = @import("replication_effects.zig");
     for ([_]bool{ false, true }) |ordered| {
         const payload = if (ordered) try replication.encodeRaftBatchMutationRequestAlloc(a, .{ .resolver_review = command }, .{ .term = 1, .index = 1 }) else try replication.encodeBatchMutationRequestAlloc(a, .{ .resolver_review = command });

@@ -59,6 +59,8 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const raft_engine_mod = options.antfly_imports.raft_engine;
     const httpx_mod = options.antfly_imports.httpx;
     const platform_mod = options.antfly_imports.platform;
+    // Final executables own the release-metadata object (see build_info.link).
+    const build_info = options.antfly_imports.build_info;
     const bloom_mod = options.antfly_imports.bloom;
     const vector_mod = options.antfly_imports.vector;
     const structlog_mod = options.antfly_imports.structlog;
@@ -160,6 +162,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     db_split_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(db_split_bench_mod);
 
     const db_split_bench = b.addExecutable(.{
         .name = "db_split_bench",
@@ -228,6 +231,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     hbc_storage_read_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(hbc_storage_read_bench_mod);
     const hbc_storage_read_bench = b.addExecutable(.{
         .name = "hbc_storage_read_bench",
         .root_module = hbc_storage_read_bench_mod,
@@ -376,6 +380,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(bench_mod);
 
     const bench = b.addExecutable(.{
         .name = "bench",
@@ -423,6 +428,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     compat_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(compat_mod);
 
     const compat = b.addExecutable(.{
         .name = "compat_runner",
@@ -441,6 +447,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     search_benchmark_index_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(search_benchmark_index_mod);
     const search_benchmark_index = b.addExecutable(.{
         .name = "search_benchmark_index",
         .root_module = search_benchmark_index_mod,
@@ -453,6 +460,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     search_benchmark_query_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(search_benchmark_query_mod);
     const search_benchmark_query = b.addExecutable(.{
         .name = "search_benchmark_query",
         .root_module = search_benchmark_query_mod,
@@ -557,6 +565,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     search_benchmark_codec_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(search_benchmark_codec_bench_mod);
     const search_benchmark_codec_bench = b.addExecutable(.{
         .name = "search_benchmark_codec_bench",
         .root_module = search_benchmark_codec_bench_mod,
@@ -572,6 +581,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     search_benchmark_bitpack_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(search_benchmark_bitpack_bench_mod);
     const search_benchmark_bitpack_bench = b.addExecutable(.{
         .name = "search_benchmark_bitpack_bench",
         .root_module = search_benchmark_bitpack_bench_mod,
@@ -587,6 +597,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     search_impact_layout_analyze_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(search_impact_layout_analyze_mod);
     const search_impact_layout_analyze = b.addExecutable(.{
         .name = "search_impact_layout_analyze",
         .root_module = search_impact_layout_analyze_mod,
@@ -601,6 +612,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     wand_skip_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(wand_skip_bench_mod);
     const wand_skip_bench = b.addExecutable(.{
         .name = "wand_skip_bench",
         .root_module = wand_skip_bench_mod,
@@ -634,6 +646,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     merge_cycle_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(merge_cycle_mod);
 
     const merge_cycle = b.addExecutable(.{
         .name = "merge_cycle_bench",
@@ -649,6 +662,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     merge_cost_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(merge_cost_mod);
 
     const merge_cost = b.addExecutable(.{
         .name = "merge_cost_bench",
@@ -664,6 +678,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     hbc_parity_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(hbc_parity_mod);
 
     const hbc_parity = b.addExecutable(.{
         .name = "hbc_parity",
@@ -722,6 +737,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     dense_stack_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(dense_stack_bench_mod);
     const capi_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/root.zig"),
         .target = target,
@@ -754,6 +770,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     @import("../../../build_support/embedded/storage.zig").configureLmdb(b, storage_bench_root_mod, lmdb_engine_mod, false);
     storage_bench_mod.addImport("antfly-zig", storage_bench_root_mod);
     storage_bench_mod.addImport("antfly_platform", platform_mod);
+    build_info.link(storage_bench_mod);
 
     const storage_bench = b.addExecutable(.{
         .name = "storage_bench",
@@ -781,6 +798,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             .optimize = optimize,
         });
         module.addImport("antfly-zig", storage_bench_root_mod);
+        build_info.link(module);
         const artifact = b.addExecutable(.{
             .name = workload[0],
             .root_module = module,
@@ -797,6 +815,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     rw_lock_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(rw_lock_bench_mod);
 
     const rw_lock_bench = b.addExecutable(.{
         .name = "rw_lock_bench",
@@ -812,6 +831,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     provisioned_warmup_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(provisioned_warmup_bench_mod);
 
     const provisioned_warmup_bench = b.addExecutable(.{
         .name = "provisioned_warmup_bench",
@@ -827,6 +847,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     public_query_guardrail_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(public_query_guardrail_mod);
     public_query_guardrail_mod.addImport("httpx", httpx_mod);
     const public_query_guardrail_build_options = b.addOptions();
     public_query_guardrail_build_options.addOption(bool, "standalone_only", false);
@@ -849,6 +870,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     public_query_standalone_guardrail_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(public_query_standalone_guardrail_mod);
     public_query_standalone_guardrail_mod.addImport("httpx", httpx_mod);
     const public_query_standalone_guardrail_build_options = b.addOptions();
     public_query_standalone_guardrail_build_options.addOption(bool, "standalone_only", true);
@@ -865,6 +887,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     raft_apply_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(raft_apply_bench_mod);
     raft_apply_bench_mod.addImport("raft_engine", raft_engine_mod);
 
     const raft_apply_bench = b.addExecutable(.{
@@ -881,6 +904,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     managed_host_wal_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(managed_host_wal_bench_mod);
     managed_host_wal_bench_mod.addImport("raft_engine", raft_engine_mod);
 
     const managed_host_wal_bench = b.addExecutable(.{
@@ -909,6 +933,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     lmdb_commit_compare_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(lmdb_commit_compare_mod);
 
     const lmdb_commit_compare = b.addExecutable(.{
         .name = "lmdb_commit_compare",
@@ -924,6 +949,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     sparse_split_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(sparse_split_bench_mod);
 
     const sparse_split_bench = b.addExecutable(.{
         .name = "sparse_split_bench",
@@ -939,6 +965,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     rabitq_bench_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(rabitq_bench_mod);
     rabitq_bench_mod.addImport("antfly_vector", vector_mod);
 
     const rabitq_bench = b.addExecutable(.{
@@ -955,6 +982,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = optimize,
     });
     recall_harness_mod.addImport("antfly-zig", antfly_mod);
+    build_info.link(recall_harness_mod);
 
     const recall_harness = b.addExecutable(.{
         .name = "recall_harness",

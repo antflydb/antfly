@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const builtin = @import("builtin");
 const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
@@ -935,10 +936,7 @@ pub const Store = struct {
 
     fn recoverPersistedJobsLocked(self: *Store, opened: *OpenedStore) !void {
         var recovered_max_job_id: u64 = 0;
-        const quarantine_count = opened.docstore.get(self.alloc, quarantine_job_count_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const quarantine_count = try missingAsNull(opened.docstore.get(self.alloc, quarantine_job_count_key));
         defer if (quarantine_count) |value| self.alloc.free(value);
         if (quarantine_count) |value| {
             if (value.len == 8) {

@@ -136,7 +136,7 @@ Text indexing currently resolves dynamic fields in this order:
 4. schema-present `infer_types` fallback for opted-in open dynamic objects
 5. open `additionalProperties: true` text fallback
 
-This ordering is enforced in [go/pkg/antfly-embedded/src/storage/db/document_mapper.zig](pkg/antfly-embedded/src/storage/db/document_mapper.zig).
+This ordering is enforced in [go/pkg/antfly-embedded/src/storage/db/document/mapper.zig](pkg/antfly-embedded/src/storage/db/document/mapper.zig).
 
 Query-time analyzer resolution now uses the same compiled runtime schema for
 explicit fields and compiled dynamic rules when a `match` or `match_phrase`

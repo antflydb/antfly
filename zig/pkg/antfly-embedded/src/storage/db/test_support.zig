@@ -31,6 +31,8 @@ const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
+const docstore_mod = @import("../docstore.zig");
+const mem_backend = @import("../mem_backend.zig");
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -939,3 +941,276 @@ pub fn ConcurrentWriteProbe(comptime DB: type) type {
         }
     };
 }
+
+/// In-memory DocStore for tests. Heap-allocated so the store keeps a stable
+/// pointer to its backend; deinit closes the store before the backend.
+pub const MemDocStore = struct {
+    backend: mem_backend.Backend,
+    store: docstore_mod.DocStore,
+
+    pub fn open(alloc: Allocator) !*MemDocStore {
+        const self = try std.heap.page_allocator.create(MemDocStore);
+        errdefer std.heap.page_allocator.destroy(self);
+        self.backend = mem_backend.Backend.init(alloc, .{});
+        errdefer self.backend.close();
+        self.store = try docstore_mod.DocStore.openRuntime(alloc, try self.backend.runtimeStore(alloc, .{}));
+        return self;
+    }
+
+    pub fn deinit(self: *MemDocStore) void {
+        self.store.close();
+        self.backend.close();
+        std.heap.page_allocator.destroy(self);
+    }
+};
+
+/// Index and enrichment configs shared by DB tests.
+pub const test_index = struct {
+    pub const citations_alg: types.IndexConfig = .{
+        .name = "citations_alg",
+        .kind = .graph,
+        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
+    };
+    pub const dense_idx: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    pub const dense_idx_dims2_external: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    };
+    pub const dense_idx_dims2_l2_external: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    pub const dense_idx_dims3_external: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    };
+    pub const document_vectors: types.IndexConfig = .{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    };
+    pub const dv_v1: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    };
+    pub const dv_v1_chunked_named: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    };
+    pub const dv_v1_chunked: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+    };
+    pub const dv_v1_dims2: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+    };
+    pub const dv_v1_dims2_l2: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    };
+    pub const dv_v1_dims3_generated: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    };
+    pub const dv_v1_dims3_l2: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    };
+    pub const ft_chunks: types.IndexConfig = .{
+        .name = "ft_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+    };
+    pub const ft_document_chunks: types.IndexConfig = .{
+        .name = "ft_document_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
+    };
+    pub const ft_v1: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+    pub const ft_v1_stored: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    };
+    pub const ft_v1_title: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    };
+    pub const full_text_index_v0: types.IndexConfig = .{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+    pub const gr_v1: types.IndexConfig = .{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    };
+    pub const graph_idx: types.IndexConfig = .{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    };
+    pub const graph_idx_eigenvector: types.IndexConfig = .{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    };
+    pub const graph_idx_hits_authority: types.IndexConfig = .{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    };
+    pub const graph_idx_hits_authority_manual: types.IndexConfig = .{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    };
+    pub const graph_idx_manual_degree_manual: types.IndexConfig = .{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    };
+    pub const graph_idx_pagerank_2_iterations: types.IndexConfig = .{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    };
+    pub const graph_idx_pagerank_3_iterations: types.IndexConfig = .{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    };
+    pub const graph_v1: types.IndexConfig = .{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    };
+    pub const prov_graph: types.IndexConfig = .{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    };
+    pub const relations_graph: types.IndexConfig = .{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    };
+    pub const semantic: types.IndexConfig = .{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
+        ,
+    };
+    pub const semantic_idx: types.IndexConfig = .{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
+    };
+    pub const semantic_template_chunked_idx: types.IndexConfig = .{
+        .name = "semantic_template_chunked_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
+    };
+    pub const sp_v1: types.IndexConfig = .{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    };
+    pub const title_dense: types.IndexConfig = .{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    };
+};
+
+pub const test_enrichment = struct {
+    pub const body_chunks_v1: types.EnrichmentConfig = .{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 8,
+        .chunk_overlap = 2,
+    };
+    pub const document_chunk_dense_v1: types.EnrichmentConfig = .{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    };
+    pub const document_chunks_v1: types.EnrichmentConfig = .{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    };
+    pub const document_units_v1: types.EnrichmentConfig = .{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    };
+    pub const document_units_v1_filenames: types.EnrichmentConfig = .{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    };
+    pub const fallback_relations_v1: types.EnrichmentConfig = .{
+        .name = "fallback_relations_v1",
+        .kind = .asset,
+        .field = "fallback_relations",
+        .content_type = "application/json",
+    };
+    pub const primary_relations_v1: types.EnrichmentConfig = .{
+        .name = "primary_relations_v1",
+        .kind = .asset,
+        .field = "primary_relations",
+        .content_type = "application/json",
+    };
+    pub const summary_v1: types.EnrichmentConfig = .{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    };
+};

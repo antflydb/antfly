@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const backend_types = @import("antfly_local_sources").storage_backend_types;
 const mem_backend_mod = @import("antfly_local_sources").storage_mem_backend;
 const lsm_backend_mod = @import("antfly_local_sources").storage_lsm_backend_mod;
@@ -80,14 +81,8 @@ fn expectNamespaceEqual(
     defer lsm_txn.abort();
 
     for (keys) |key| {
-        const mem_value = mem_txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        const lsm_value = lsm_txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const mem_value = try missingAsNull(mem_txn.get(key));
+        const lsm_value = try missingAsNull(lsm_txn.get(key));
 
         if (mem_value == null or lsm_value == null) {
             try std.testing.expectEqual(mem_value == null, lsm_value == null);
@@ -101,27 +96,15 @@ fn expectNamespaceEqual(
     var lsm_cur = try lsm_txn.openCursor();
     defer lsm_cur.close();
 
-    var mem_entry = mem_cur.first() catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    var lsm_entry = lsm_cur.first() catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    var mem_entry = try missingAsNull(mem_cur.first());
+    var lsm_entry = try missingAsNull(lsm_cur.first());
     while (mem_entry != null or lsm_entry != null) {
         try std.testing.expectEqual(mem_entry == null, lsm_entry == null);
         if (mem_entry == null) break;
         try std.testing.expectEqualStrings(mem_entry.?.key, lsm_entry.?.key);
         try std.testing.expectEqualStrings(mem_entry.?.value, lsm_entry.?.value);
-        mem_entry = mem_cur.next() catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        lsm_entry = lsm_cur.next() catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        mem_entry = try missingAsNull(mem_cur.next());
+        lsm_entry = try missingAsNull(lsm_cur.next());
     }
 }
 
@@ -328,10 +311,7 @@ test "lsm backend simulation matches memory backend under random operations" {
                 const mem_value = mem_txn.get(namespace, key) catch |err| switch (err) {
                     error.NotFound => null,
                 };
-                const lsm_value = lsm_txn.get(namespace, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const lsm_value = try missingAsNull(lsm_txn.get(namespace, key));
                 if (mem_value == null or lsm_value == null) {
                     try std.testing.expectEqual(mem_value == null, lsm_value == null);
                 } else {
@@ -396,10 +376,7 @@ test "lsm backend simulation matches memory backend across random reopen cycles"
                 const mem_value = mem_txn.get(namespace, key) catch |err| switch (err) {
                     error.NotFound => null,
                 };
-                const lsm_value = lsm_txn.get(namespace, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const lsm_value = try missingAsNull(lsm_txn.get(namespace, key));
                 if (mem_value == null or lsm_value == null) {
                     try std.testing.expectEqual(mem_value == null, lsm_value == null);
                 } else {

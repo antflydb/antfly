@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
-const document_query = @import("../document_query.zig");
+const document_query = @import("../document/query.zig");
 const search_exec = @import("search_exec.zig");
 const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 

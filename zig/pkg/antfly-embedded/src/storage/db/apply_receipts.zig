@@ -78,6 +78,21 @@ pub fn replicationAppliedSequenceWrite(lsn: u64, value_buf: *[replication_applie
     };
 }
 
+/// Stage the ordered-apply receipt and the standby replication LSN marker in
+/// `txn`, each only when set. The caller commits them with its mutations.
+pub fn stageApplyMarkers(txn: anytype, receipt: ?OrderedApplyReceipt, replication_lsn: ?u64) !void {
+    if (receipt) |identity| {
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
+        try txn.put(marker.key, marker.value);
+    }
+    if (replication_lsn) |lsn| {
+        var value_buf: [replication_applied_lsn_value_len]u8 = undefined;
+        const marker = replicationAppliedSequenceWrite(lsn, &value_buf);
+        try txn.put(marker.key, marker.value);
+    }
+}
+
 pub fn readReplicationAppliedSequence(alloc: Allocator, store: *docstore_mod.DocStore) !u64 {
     const raw = store.get(alloc, internal_keys.replication_applied_lsn_key[0..]) catch |err| switch (err) {
         error.NotFound => return 0,

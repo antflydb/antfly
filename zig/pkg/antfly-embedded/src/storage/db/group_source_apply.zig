@@ -50,7 +50,7 @@ pub fn stage(a: A, overlay: *mutations.Overlay, command: contract.Command, next_
             for (observed.units) |document| if (!try overlay.sourceSettled(document)) return error.ArtifactPublicationPending;
             for (observed.retired) |document| if (!try overlay.sourceSettled(document)) return error.ArtifactPublicationPending;
             try state.finish(a, overlay, value.held.group, value.held.partition, value.held.lease, value.held.now_ms, value.publication);
-            for (observed.retired) |document| try @import("artifact_completion_progress.zig").clearGroupReady(overlay, overlay.completion_root, document);
+            for (observed.retired) |document| try @import("artifact/completion_progress.zig").clearGroupReady(overlay, overlay.completion_root, document);
         },
         .acknowledge => {
             const value = command.acknowledge.?;

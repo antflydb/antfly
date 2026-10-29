@@ -25,6 +25,7 @@
 //!   src/store/db/db.go — isDocumentExpiredByTimestamp
 
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
@@ -255,10 +256,7 @@ test "cleanupExpired deletes expired, preserves unexpired" {
     try std.testing.expectEqual(@as(u32, 1), deleted);
 
     // doc1 should be gone
-    const doc1 = store.get(alloc, doc1_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const doc1 = try missingAsNull(store.get(alloc, doc1_key));
     try std.testing.expect(doc1 == null);
 
     // doc2 should still exist

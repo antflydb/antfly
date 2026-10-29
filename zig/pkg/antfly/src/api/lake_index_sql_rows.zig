@@ -2045,15 +2045,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
 }
 
 pub fn prefixSuccessor(a: A, prefix: []const u8) !?[]const u8 {
-    var end = prefix.len;
-    while (end != 0) {
-        end -= 1;
-        if (prefix[end] == 0xff) continue;
-        const upper = try a.dupe(u8, prefix[0 .. end + 1]);
-        upper[end] += 1;
-        return upper;
-    }
-    return null;
+    return local.storage_internal_keys.nextPrefixAlloc(a, prefix);
 }
 
 fn boundKey(a: A, tuple: local.storage_db_relational_index_keys.TuplePlan, json: []const std.json.Value) ![]const u8 {

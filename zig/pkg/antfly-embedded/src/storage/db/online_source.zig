@@ -51,7 +51,7 @@ pub const Progress = struct {
     snapshot_phase: SnapshotPhase = .prepared,
     local_seal_digest: [32]u8 = @splat(0),
     local_cleanup_complete: bool = false,
-    artifact_catalog: ?@import("artifact_inventory.zig").Binding = null,
+    artifact_catalog: ?@import("artifact/inventory.zig").Binding = null,
 };
 
 fn key(slot: usize) [prefix.len + 1]u8 {
@@ -292,7 +292,7 @@ pub fn stageCertificate(txn: anytype, scope: Scope, certificate: @import("../sou
     // An authority activated after the immutable pin cannot be represented by
     // a provenance-free certificate. Reject it in the replicated publication
     // transaction, not only in the donor's off-lock preparation path.
-    if (try @import("artifact_publication.zig").authority(txn) != null and !certificate.provenance_required)
+    if (try @import("artifact/publication.zig").authority(txn) != null and !certificate.provenance_required)
         return error.OnlineMergeProvenanceTransferRequired;
     const certificate_digest = try certificate.digest();
     const found = try find(txn, scope) orelse return error.OnlineSourceScopeChanged;
@@ -333,25 +333,25 @@ pub fn stagePinned(txn: anytype, scope: Scope, seal_digest: [32]u8) !void {
 /// The caller owns the native apply fence and commits this with its Raft/standby
 /// marker and outbox. For final_fence it must additionally check transaction
 /// drainage under that same apply fence before calling stage.
-fn admitRetention(txn: anytype, scope: Scope, limit: u64, binding: ?@import("artifact_inventory.zig").Binding) !u64 {
+fn admitRetention(txn: anytype, scope: Scope, limit: u64, binding: ?@import("artifact/inventory.zig").Binding) !u64 {
     if (binding) |expected| if (expected.effect_protocol == 16) {
-        var ordered = (try @import("artifact_inventory.zig").load(std.heap.page_allocator, txn)) orelse return error.ArtifactCatalogDrift;
+        var ordered = (try @import("artifact/inventory.zig").load(std.heap.page_allocator, txn)) orelse return error.ArtifactCatalogDrift;
         defer ordered.deinit();
         if (!std.meta.eql(ordered.value.command.binding, expected)) return error.ArtifactCatalogDrift;
         return retained.admitWithArtifactCapabilities(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), limit, true, true, true);
     };
     return retained.admitWithDirectVectors(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), limit, try directVectorMode(txn, binding));
 }
-fn directVectorMode(txn: anytype, binding: ?@import("artifact_inventory.zig").Binding) !bool {
+fn directVectorMode(txn: anytype, binding: ?@import("artifact/inventory.zig").Binding) !bool {
     const expected = binding orelse return false;
     // Never silently admit the wider effect language into a direct-only
     // retained journal. Extended capture must select its own admission path.
     if (expected.effect_protocol != 14) return error.OnlineMergeArtifactTailsUnsupported;
     const alloc = std.heap.page_allocator;
-    var ordered = (try @import("artifact_inventory.zig").load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
+    var ordered = (try @import("artifact/inventory.zig").load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
     defer ordered.deinit();
     if (!std.meta.eql(ordered.value.command.binding, expected)) return error.ArtifactCatalogDrift;
-    const vectors = try @import("artifact_reconcile.zig").hasDirectVectors(alloc, ordered.value.command.catalogs);
+    const vectors = try @import("artifact/reconcile.zig").hasDirectVectors(alloc, ordered.value.command.catalogs);
     if (vectors and !@import("online_vector_artifacts.zig").isEnabled()) return error.OnlineMergeArtifactTailsUnsupported;
     // The certified effect language covers document-owned base artifacts,
     // including explicit embeddings and values left by dropped indexes. It
@@ -415,7 +415,7 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
             // Publication can race the snapshot even after its certificate
             // was accepted. The final source cut is the last replicated point
             // at which that race can be fenced before a receiver finishes.
-            if (try @import("artifact_publication.zig").authority(txn) != null and
+            if (try @import("artifact/publication.zig").authority(txn) != null and
                 (progress.published_certificate == null or !progress.published_certificate.?.provenance_required))
                 return error.OnlineMergeProvenanceTransferRequired;
             const active = try topology.current(txn) orelse return error.IntegrityTopologyChanged;

@@ -45,7 +45,7 @@ const Allocator = std.mem.Allocator;
 const geo_mod = @import("../../../search/geo.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const runtime_schema = @import("../../schema.zig");
-const document_content_hash = @import("../document_content_hash.zig");
+const document_content_hash = @import("../document/content_hash.zig");
 
 pub const magic: [4]u8 = "AROW".*;
 pub const ordinal_version: u32 = 2;
@@ -1323,7 +1323,7 @@ pub const OrdinalRowView = struct {
             if (normalize) {
                 const json = try self.reconstructValueAlloc(scratch);
                 defer scratch.free(json);
-                return @import("../document_query.zig").writeRawScanFields(scratch, writer, json);
+                return @import("../document/query.zig").writeRawScanFields(scratch, writer, json);
             }
         }
         while (try iterator.next()) |cell| {

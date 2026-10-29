@@ -21,10 +21,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 
 pub const SnapshotAdmission = struct {
-    lock: apply_rw_lock_mod.ApplyRwLock = .{},
+    lock: WriterPreferringRwLock = .{},
 
     pub const MutationLease = struct {
         admission: *SnapshotAdmission,

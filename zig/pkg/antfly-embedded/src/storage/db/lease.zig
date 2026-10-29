@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../backend_erased.zig");
 const lsm_backend = @import("../lsm_backend.zig");
@@ -88,10 +89,7 @@ pub const Lease = struct {
         var committed = false;
         defer if (!committed) txn.abort();
 
-        const current_raw = txn.get(self.key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const current_raw = try missingAsNull(txn.get(self.key));
 
         var epoch: u64 = 1;
         var kind: AcquireKind = .acquired;

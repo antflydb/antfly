@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const data_raft_protocol = @import("../../common/data_raft_protocol.zig");
 const backend_erased = @import("antfly_local_sources").storage_backend_erased;
 const docstore = @import("antfly_local_sources").storage_docstore;
@@ -2783,10 +2784,7 @@ pub fn appendOperationEffects(
     var online_reservation: ?arbitration.Reservation = null;
     for (operations) |op| if (op == .topology_guard) {
         var online_key_buf: [160]u8 = undefined;
-        const raw = store.get(alloc, try arbitration.reservationKey(&online_key_buf, group_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(store.get(alloc, try arbitration.reservationKey(&online_key_buf, group_id)));
         defer if (raw) |value| alloc.free(value);
         if (raw) |value| online_reservation = try arbitration.Reservation.decode(value);
         break;
@@ -2808,10 +2806,7 @@ pub fn appendOperationEffects(
     if (needs_raft_batch_protocol) {
         const page_key = try groupMergePageKeyAlloc(alloc, group_id);
         defer alloc.free(page_key);
-        const raw = store.get(alloc, page_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(store.get(alloc, page_key));
         defer if (raw) |value| alloc.free(value);
         if (raw) |value| page_progress = try pages.decode(alloc, value);
     }

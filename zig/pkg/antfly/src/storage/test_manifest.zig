@@ -24,8 +24,6 @@
 comptime {
     _ = @import("antfly_local_sources").storage_engine;
     _ = @import("antfly_local_sources").storage_logical_source;
-    _ = @import("antfly_local_sources").storage_conditional_source;
-    _ = @import("antfly_local_sources").storage_source_proof_registry;
     _ = @import("antfly_local_sources").storage_document_projection;
     _ = @import("antfly_local_sources").storage_db_artifact_graph_completion;
     _ = @import("antfly_local_sources").storage_db_artifact_input_test;
@@ -48,6 +46,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_group_source_worker;
     _ = @import("antfly_local_sources").storage_db_group_sources;
     _ = @import("antfly_local_sources").storage_db_resolver_authority;
+    _ = @import("antfly_local_sources").storage_db_field_projection_source;
     _ = @import("antfly_local_sources").storage_db_resolver_curation;
     _ = @import("antfly_local_sources").storage_db_resolver_query_context;
     _ = @import("antfly_local_sources").storage_db_resolver_static_profiles;
@@ -69,7 +68,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_publication_recovery_owner;
 
     _ = @import("antfly_local_sources").storage_db_embedding_activity_cache;
-    _ = @import("antfly_local_sources").storage_db_coalesced_job_admission;
     _ = @import("antfly_local_sources").storage_db_dense_publication_admission;
     _ = @import("antfly_local_sources").storage_db_local_runtime_owner;
 
@@ -144,12 +142,10 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_relational_index_gc;
     _ = @import("antfly_local_sources").storage_db_relational_row_cursor;
     _ = @import("antfly_local_sources").storage_db_relational_predicate;
-    _ = @import("antfly_local_sources").storage_admission_waiter;
     _ = @import("restore_owner.zig");
     _ = @import("antfly_local_sources").storage_restore_decoder_cache;
     _ = @import("antfly_local_sources").storage_artifact_payload;
     _ = @import("antfly_local_sources").storage_dense_work_admission;
-    _ = @import("antfly_local_sources").storage_maintenance_signal;
     _ = @import("antfly_local_sources").storage_projection_page_cache;
     _ = @import("antfly_local_sources").storage_projection_read_trace;
     _ = @import("antfly_local_sources").storage_vector_payload_store;
@@ -193,7 +189,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_algebraic_token;
     _ = @import("antfly_local_sources").storage_db_algebraic_value;
     _ = @import("antfly_local_sources").storage_db_algebraic_vector;
-    _ = @import("antfly_local_sources").storage_db_apply_rw_lock;
     _ = @import("antfly_local_sources").storage_db_artifact_ids;
     _ = @import("antfly_local_sources").storage_db_backfill_state;
     _ = @import("antfly_local_sources").storage_db_batcher;
@@ -207,6 +202,18 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_column_scan_plan;
     _ = @import("antfly_local_sources").storage_db_config;
     _ = @import("antfly_local_sources").storage_db_db;
+    _ = @import("antfly_local_sources").storage_db_db_apply;
+    _ = @import("antfly_local_sources").storage_db_db_repair;
+    _ = @import("antfly_local_sources").storage_db_db_enrichment;
+    _ = @import("antfly_local_sources").storage_db_db_artifact;
+    _ = @import("antfly_local_sources").storage_db_db_document;
+    _ = @import("antfly_local_sources").storage_db_db_search;
+    _ = @import("antfly_local_sources").storage_db_db_transaction;
+    _ = @import("antfly_local_sources").storage_db_db_restore;
+    _ = @import("antfly_local_sources").storage_db_db_split;
+    _ = @import("antfly_local_sources").storage_db_db_dense;
+    _ = @import("antfly_local_sources").storage_db_db_relational;
+    _ = @import("antfly_local_sources").storage_db_db_graph;
     _ = @import("antfly_local_sources").storage_db_commit_integration;
     _ = @import("antfly_local_sources").storage_db_dense_exact;
     _ = @import("antfly_local_sources").storage_db_derived_apply_state;
@@ -444,7 +451,7 @@ comptime {
     _ = @import("lsm_vopr.zig");
     _ = @import("antfly_local_sources").storage_maintenance;
     _ = @import("antfly_local_sources").storage_mem_backend;
-    _ = @import("antfly_local_sources").storage_mem_ordered;
+    _ = @import("antfly_local_sources").storage_mem_backend_ordered;
     _ = @import("antfly_local_sources").storage_object_storage;
     _ = @import("antfly_local_sources").storage_persistent;
     _ = @import("antfly_local_sources").storage_posting_segment_store;
@@ -453,6 +460,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_resource_manager;
     _ = @import("antfly_local_sources").storage_retained_effects;
     _ = @import("antfly_local_sources").storage_source_proof_registry;
+    _ = @import("antfly_local_sources").storage_source_value_identity;
     _ = @import("antfly_local_sources").storage_source_pin_state;
     _ = @import("antfly_local_sources").storage_source_snapshot;
     _ = @import("antfly_local_sources").storage_rowsource_identity;

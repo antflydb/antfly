@@ -5095,7 +5095,7 @@ test "bounded postings schema projection fits small node allowance" {
     const a = std.testing.allocator;
     const schema_api = @import("schema/mod.zig");
     const runtime_schema = @import("storage/schema.zig");
-    const mapper = @import("storage/db/document_mapper.zig");
+    const mapper = @import("storage/db/document/mapper.zig");
     var parsed = try schema_api.parseValidatedTableSchema(a,
         \\{ "default_type":"doc", "document_schemas":{"doc":{"schema":{"type":"object","properties":{"content":{"type":"string","x-antfly-types":["text","substring"]}}}}} }
     );
@@ -5183,7 +5183,7 @@ test "bounded postings field maps use explicit reclaiming scratch behind opaque 
 test "bounded postings prepared segment owners unwind partial allocation failures" {
     const Scenario = struct {
         fn run(a: Allocator) !void {
-            const mapper = @import("storage/db/document_mapper.zig");
+            const mapper = @import("storage/db/document/mapper.zig");
             const Stable = @import("storage/lite/test_allocator.zig").NoResizeAllocator;
             var output_owner = Stable{ .backing = a };
             var scratch_owner = Stable{ .backing = a };

@@ -18,6 +18,7 @@ comptime {
     _ = @import("sql_describe.zig");
 }
 const handles = @import("handles.zig");
+const capi_exports = @import("exports.zig");
 pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
 pub const testPathReplacementAdmission = @import("lite_connection.zig").testPathReplacementAdmission;
 pub const std = handles.std;
@@ -906,6 +907,21 @@ fn catalogOwnershipError(err: anyerror) capi.ErrorCode {
 /// null handle or one that is being closed. Must be taken exactly once per
 /// export, at entry: the lock is not reentrant, so internal helpers must not
 /// call it again.
+/// `enterHandle` for a C entry point. On failure the handle is already left
+/// and `code` holds the error to return.
+pub fn enterChecked(ptr: ?*anyopaque, access: HandleAccess, comptime fn_name: []const u8, code: *capi.ErrorCode) ?HandleGuard {
+    const guard = enterHandle(ptr, access) orelse {
+        code.* = capi.mapErrorContext(error.InvalidArgument, fn_name ++ ": invalid or closed database handle");
+        return null;
+    };
+    if (guard.entry_error) |entry_error| {
+        guard.leave();
+        code.* = capi.ensureError(entry_error, fn_name);
+        return null;
+    }
+    return guard;
+}
+
 pub fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
     return enterHandleInternal(ptr, access, false);
 }
@@ -2368,8 +2384,7 @@ pub const JsonGraphNode = struct {
 };
 
 pub fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_open), .{ .name = "antfly_db_open" }), .{ path, out_handle });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_open, @src().fn_name, .{ path, out_handle });
     capi.clearLastError();
     const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
@@ -2409,8 +2424,7 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
 }
 
 pub fn antfly_db_close(handle_ptr: ?*anyopaque) callconv(.c) void {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_close), .{ .name = "antfly_db_close" }), .{handle_ptr});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_close, @src().fn_name, .{handle_ptr});
     // Stale ids and concurrent or repeated closes are no-ops.
     closeHandleId(handle_ptr);
 }
@@ -2419,51 +2433,43 @@ pub fn antfly_db_close(handle_ptr: ?*anyopaque) callconv(.c) void {
 /// ANTFLY_THREADING_SERIALIZED: every handle may be used from any thread,
 /// concurrently. See zig/CAPI.md "Thread Safety".
 pub fn antfly_threading_mode() callconv(.c) u32 {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_threading_mode), .{ .name = "antfly_threading_mode" }), .{});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_threading_mode, @src().fn_name, .{});
     return capi.threading_serialized;
 }
 
 pub fn antfly_abi_version() callconv(.c) u32 {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_abi_version), .{ .name = "antfly_abi_version" }), .{});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_abi_version, @src().fn_name, .{});
     return abi_version;
 }
 
 pub fn antfly_open_options_size() callconv(.c) u32 {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_open_options_size), .{ .name = "antfly_open_options_size" }), .{});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_open_options_size, @src().fn_name, .{});
     return @intCast(@sizeOf(capi.OpenOptions));
 }
 
 /// Detail for the latest ErrorCode call on this thread; copy immediately.
 pub fn antfly_last_error_detail() callconv(.c) [*:0]const u8 {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_last_error_detail), .{ .name = "antfly_last_error_detail" }), .{});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_last_error_detail, @src().fn_name, .{});
     return capi.lastErrorDetail();
 }
 
 pub fn antfly_last_error_code() callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_last_error_code), .{ .name = "antfly_last_error_code" }), .{});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_last_error_code, @src().fn_name, .{});
     return capi.lastErrorCode();
 }
 
 pub fn antfly_error_code_name(code: c_int) callconv(.c) [*:0]const u8 {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_error_code_name), .{ .name = "antfly_error_code_name" }), .{code});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_error_code_name, @src().fn_name, .{code});
     return capi.errorCodeName(code);
 }
 
 pub fn antfly_error_code_description(code: c_int) callconv(.c) [*:0]const u8 {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_error_code_description), .{ .name = "antfly_error_code_description" }), .{code});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_error_code_description, @src().fn_name, .{code});
     return capi.errorCodeDescription(code);
 }
 
 pub fn antfly_open_options_init(options: ?*capi.OpenOptions) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_open_options_init), .{ .name = "antfly_open_options_init" }), .{options});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_open_options_init, @src().fn_name, .{options});
     capi.clearLastError();
     const opts = options orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": options pointer must not be null");
     opts.* = .{};
@@ -2977,8 +2983,7 @@ pub fn cStringSpan(path: ?[*:0]const u8) ?[]const u8 {
 }
 
 pub fn antfly_db_open_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_open_with_options), .{ .name = "antfly_db_open_with_options" }), .{ path, options, out_handle });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_open_with_options, @src().fn_name, .{ path, options, out_handle });
     capi.clearLastError();
     const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
@@ -2988,8 +2993,7 @@ pub fn antfly_db_open_with_options(path: ?[*:0]const u8, options: ?*const capi.O
 }
 
 pub fn antfly_db_create_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_create_with_options), .{ .name = "antfly_db_create_with_options" }), .{ path, options, out_handle });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_create_with_options, @src().fn_name, .{ path, options, out_handle });
     capi.clearLastError();
     const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
@@ -2998,70 +3002,44 @@ pub fn antfly_db_create_with_options(path: ?[*:0]const u8, options: ?*const capi
     return openGenericHandle(path_slice, resolved, true, out);
 }
 
-pub fn antfly_lite_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_open), .{ .name = "antfly_lite_open" }), .{ path, out_handle });
+/// Shared body of the `antfly_lite_open*` / `antfly_lite_create*` entry points.
+fn openLitePath(comptime fn_name: []const u8, path: ?[*:0]const u8, resolved: LiteResolvedOpenOptions, create: bool, out_handle: ?*?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
+        return capi.mapErrorContext(error.InvalidArgument, fn_name ++ ": path pointer must not be null");
     };
-    return openLiteHandle(path_slice, .{}, false, out_handle);
+    return openLiteHandle(path_slice, resolved, create, out_handle);
+}
+
+pub fn antfly_lite_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_open, @src().fn_name, .{ path, out_handle });
+    return openLitePath(@src().fn_name, path, .{}, false, out_handle);
 }
 
 pub fn antfly_lite_create(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_create), .{ .name = "antfly_lite_create" }), .{ path, out_handle });
-    capi.clearLastError();
-    const path_slice = cStringSpan(path) orelse {
-        if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
-    };
-    return openLiteHandle(path_slice, .{}, true, out_handle);
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_create, @src().fn_name, .{ path, out_handle });
+    return openLitePath(@src().fn_name, path, .{}, true, out_handle);
 }
 
 pub fn antfly_lite_open_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_open_hosted), .{ .name = "antfly_lite_open_hosted" }), .{ path, out_handle });
-    capi.clearLastError();
-    const path_slice = cStringSpan(path) orelse {
-        if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
-    };
-    return openLiteHandle(path_slice, .{ .profile = .hosted }, false, out_handle);
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_open_hosted, @src().fn_name, .{ path, out_handle });
+    return openLitePath(@src().fn_name, path, .{ .profile = .hosted }, false, out_handle);
 }
 
 pub fn antfly_lite_create_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_create_hosted), .{ .name = "antfly_lite_create_hosted" }), .{ path, out_handle });
-    capi.clearLastError();
-    const path_slice = cStringSpan(path) orelse {
-        if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
-    };
-    return openLiteHandle(path_slice, .{ .profile = .hosted }, true, out_handle);
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_create_hosted, @src().fn_name, .{ path, out_handle });
+    return openLitePath(@src().fn_name, path, .{ .profile = .hosted }, true, out_handle);
 }
 
 pub fn antfly_lite_open_readonly(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_open_readonly), .{ .name = "antfly_lite_open_readonly" }), .{ path, out_handle });
-    capi.clearLastError();
-    const path_slice = cStringSpan(path) orelse {
-        if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
-    };
-    return openLiteHandle(path_slice, .{ .open_mode = .query_readonly }, false, out_handle);
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_open_readonly, @src().fn_name, .{ path, out_handle });
+    return openLitePath(@src().fn_name, path, .{ .open_mode = .query_readonly }, false, out_handle);
 }
 
 pub fn antfly_lite_open_status_only(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_open_status_only), .{ .name = "antfly_lite_open_status_only" }), .{ path, out_handle });
-    capi.clearLastError();
-    const path_slice = cStringSpan(path) orelse {
-        if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
-    };
-    return openLiteHandle(path_slice, .{ .open_mode = .status_only }, false, out_handle);
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_open_status_only, @src().fn_name, .{ path, out_handle });
+    return openLitePath(@src().fn_name, path, .{ .open_mode = .status_only }, false, out_handle);
 }
 
 pub fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
@@ -3079,15 +3057,11 @@ fn databaseMinimumReaderVersion(handle: *Handle) u32 {
 }
 
 pub fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_capabilities_json), .{ .name = "antfly_db_capabilities_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_capabilities_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const profile = handle.lite_profile orelse .native;
@@ -3108,15 +3082,11 @@ pub const directory_storage_status: lite_backend.StorageStatus = .{
 };
 
 pub fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_status_json), .{ .name = "antfly_db_status_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_status_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const storage: lite_backend.StorageStatus = if (handle.owned_lite_backend) |*backend|
@@ -3158,14 +3128,10 @@ pub fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) ca
 }
 
 pub fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_backup), .{ .name = "antfly_db_backup" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_backup, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .maintain, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const out_buf_ptr = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
     const handle = guard.handle;
@@ -3181,14 +3147,10 @@ pub fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callcon
 }
 
 pub fn antfly_db_backup_json(handle_ptr: ?*anyopaque, options: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_backup_json), .{ .name = "antfly_db_backup_json" }), .{ handle_ptr, options, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_backup_json, @src().fn_name, .{ handle_ptr, options, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .maintain, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const out_buf_ptr = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
     const handle = guard.handle;
@@ -3207,14 +3169,10 @@ pub fn antfly_db_backup_json(handle_ptr: ?*anyopaque, options: capi.Slice, out_b
 }
 
 pub fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_import_backup), .{ .name = "antfly_db_import_backup" }), .{ handle_ptr, backup });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_import_backup, @src().fn_name, .{ handle_ptr, backup });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
@@ -3279,8 +3237,7 @@ pub fn antfly_restore_backup_json(
     replace: bool,
     out_buf: ?*capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_restore_backup_json), .{ .name = "antfly_restore_backup_json" }), .{ dest_path, options, backup, replace, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_restore_backup_json, @src().fn_name, .{ dest_path, options, backup, replace, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
     const path = cStringSpan(dest_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
@@ -3316,8 +3273,7 @@ pub fn antfly_restore_backup_file_json(
     replace: bool,
     out_buf: ?*capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_restore_backup_file_json), .{ .name = "antfly_restore_backup_file_json" }), .{ dest_path, options, backup_path, replace, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_restore_backup_file_json, @src().fn_name, .{ dest_path, options, backup_path, replace, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
     const destination = cStringSpan(dest_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
@@ -3346,15 +3302,11 @@ pub fn antfly_restore_backup_file_json(
 }
 
 pub fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_check_json), .{ .name = "antfly_lite_check_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_check_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
@@ -3365,8 +3317,7 @@ pub fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) c
 }
 
 pub fn antfly_lite_check_file_json(path: ?[*:0]const u8, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_check_file_json), .{ .name = "antfly_lite_check_file_json" }), .{ path, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_check_file_json, @src().fn_name, .{ path, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
     const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
@@ -3382,15 +3333,11 @@ pub fn antfly_lite_copy_stable_snapshot_json(
     replace: bool,
     out_buf: ?*capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_copy_stable_snapshot_json), .{ .name = "antfly_lite_copy_stable_snapshot_json" }), .{ handle_ptr, dest_path, replace, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_copy_stable_snapshot_json, @src().fn_name, .{ handle_ptr, dest_path, replace, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .maintain, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
@@ -3407,8 +3354,7 @@ pub fn antfly_lite_copy_stable_snapshot_file_json(
     replace: bool,
     out_buf: ?*capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_copy_stable_snapshot_file_json), .{ .name = "antfly_lite_copy_stable_snapshot_file_json" }), .{ src_path, dest_path, replace, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_copy_stable_snapshot_file_json, @src().fn_name, .{ src_path, dest_path, replace, out_buf });
     capi.clearLastError();
     _ = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
     var handle_ptr: ?*anyopaque = null;
@@ -3432,15 +3378,11 @@ pub fn prepareLiteCompact(handle: *Handle) !void {
 }
 
 pub fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_compact_json), .{ .name = "antfly_lite_compact_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_compact_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .write, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
@@ -3456,15 +3398,11 @@ pub fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer)
 }
 
 pub fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_lite_vacuum_json), .{ .name = "antfly_lite_vacuum_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_lite_vacuum_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .write, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     @import("entity_sink.zig").collectEmbeddingCache(handle.parent_handle orelse handle, true) catch |err| return capi.mapError(err);
@@ -3480,15 +3418,11 @@ pub const LiteReplayGeneratedEnrichmentsReport = struct {
 };
 
 pub fn antfly_db_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_replay_generated_enrichments_json), .{ .name = "antfly_db_replay_generated_enrichments_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_replay_generated_enrichments_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .maintain, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const replayed = handle.database().*.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
@@ -3706,14 +3640,10 @@ pub fn antfly_db_set_readable_lease_hook(
     callback_ctx: ?*anyopaque,
     callback: ?ReadableLeaseHookFn,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_set_readable_lease_hook), .{ .name = "antfly_db_set_readable_lease_hook" }), .{ handle_ptr, group_id, callback_ctx, callback });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_set_readable_lease_hook, @src().fn_name, .{ handle_ptr, group_id, callback_ctx, callback });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .exclusive, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (callback) |hook| {
@@ -3729,8 +3659,7 @@ pub fn antfly_db_set_readable_lease_hook(
 }
 
 pub fn antfly_buffer_free(buffer: ?*capi.Buffer) callconv(.c) void {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_buffer_free), .{ .name = "antfly_buffer_free" }), .{buffer});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_buffer_free, @src().fn_name, .{buffer});
     const out = buffer orelse return;
     freeRawBuffer(out.ptr, out.len);
     out.* = .{};
@@ -3742,16 +3671,14 @@ pub fn wipeBufferBytes(buffer: capi.Buffer) void {
 }
 
 pub fn antfly_buffer_free_zero(buffer: ?*capi.Buffer) callconv(.c) void {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_buffer_free_zero), .{ .name = "antfly_buffer_free_zero" }), .{buffer});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_buffer_free_zero, @src().fn_name, .{buffer});
     const out = buffer orelse return;
     wipeBufferBytes(out.*);
     antfly_buffer_free(out);
 }
 
 pub fn antfly_dense_search_result_free(result: *capi.DenseSearchResult) callconv(.c) void {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_dense_search_result_free), .{ .name = "antfly_dense_search_result_free" }), .{result});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_dense_search_result_free, @src().fn_name, .{result});
     if (result.hits_ptr) |hits_ptr| {
         const hits = hits_ptr[0..result.hit_count];
         for (hits) |hit| {
@@ -3765,8 +3692,7 @@ pub fn antfly_dense_search_result_free(result: *capi.DenseSearchResult) callconv
 }
 
 pub fn antfly_packed_dense_search_result_free(result: *capi.PackedDenseSearchResult) callconv(.c) void {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_packed_dense_search_result_free), .{ .name = "antfly_packed_dense_search_result_free" }), .{result});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_packed_dense_search_result_free, @src().fn_name, .{result});
     if (result.hits_ptr) |hits_ptr| {
         const hits = hits_ptr[0..result.hit_count];
         std.heap.c_allocator.free(hits);
@@ -4481,8 +4407,7 @@ pub fn searchTextOwned(
 }
 
 pub fn antfly_scan_hash_result_free(result: *capi.ScanHashResult) callconv(.c) void {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_scan_hash_result_free), .{ .name = "antfly_scan_hash_result_free" }), .{result});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_scan_hash_result_free, @src().fn_name, .{result});
     if (result.entries_ptr) |entries_ptr| {
         const entries = entries_ptr[0..result.entry_count];
         for (entries) |entry| {
@@ -4502,14 +4427,10 @@ pub fn antfly_db_begin_transaction_with_id(
     participants_ptr: ?[*]const capi.Slice,
     participant_count: usize,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_begin_transaction_with_id), .{ .name = "antfly_db_begin_transaction_with_id" }), .{ handle_ptr, txn_id_ptr, timestamp_ns, participants_ptr, participant_count });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_begin_transaction_with_id, @src().fn_name, .{ handle_ptr, txn_id_ptr, timestamp_ns, participants_ptr, participant_count });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .write, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
@@ -4525,14 +4446,10 @@ pub fn antfly_db_write_transaction(
     predicates_ptr: ?[*]const capi.VersionPredicate,
     predicate_count: usize,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_write_transaction), .{ .name = "antfly_db_write_transaction" }), .{ handle_ptr, txn_id_ptr, writes_ptr, write_count, predicates_ptr, predicate_count });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_write_transaction, @src().fn_name, .{ handle_ptr, txn_id_ptr, writes_ptr, write_count, predicates_ptr, predicate_count });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .write, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
@@ -4550,14 +4467,10 @@ pub fn antfly_db_batch(
     timestamp_ns: u64,
     sync_level: u8,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_batch), .{ .name = "antfly_db_batch" }), .{ handle_ptr, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_batch, @src().fn_name, .{ handle_ptr, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .write, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": write and predicate pointers must not be null when their counts are nonzero");
@@ -4570,14 +4483,10 @@ pub fn antfly_db_batch_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_json), .{ .name = "antfly_db_batch_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_batch_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .write, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
@@ -4598,14 +4507,10 @@ pub fn antfly_db_resolve_intents(
     status: u8,
     commit_version: u64,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_resolve_intents), .{ .name = "antfly_db_resolve_intents" }), .{ handle_ptr, txn_id_ptr, status, commit_version });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_resolve_intents, @src().fn_name, .{ handle_ptr, txn_id_ptr, status, commit_version });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .write, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
@@ -4624,14 +4529,10 @@ pub fn antfly_db_get_transaction_status(
     txn_id_ptr: ?*const [16]u8,
     out_status: ?*u8,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_transaction_status), .{ .name = "antfly_db_get_transaction_status" }), .{ handle_ptr, txn_id_ptr, out_status });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_transaction_status, @src().fn_name, .{ handle_ptr, txn_id_ptr, out_status });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const out = out_status orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = 0;
@@ -4647,14 +4548,10 @@ pub fn antfly_db_get_commit_version(
     txn_id_ptr: ?*const [16]u8,
     out_commit_version: ?*u64,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_commit_version), .{ .name = "antfly_db_get_commit_version" }), .{ handle_ptr, txn_id_ptr, out_commit_version });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_commit_version, @src().fn_name, .{ handle_ptr, txn_id_ptr, out_commit_version });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const out = out_commit_version orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = 0;
@@ -4669,14 +4566,10 @@ pub fn antfly_db_get_timestamp(
     key: capi.Slice,
     out_timestamp: *u64,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_timestamp), .{ .name = "antfly_db_get_timestamp" }), .{ handle_ptr, key, out_timestamp });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_timestamp, @src().fn_name, .{ handle_ptr, key, out_timestamp });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     out_timestamp.* = handle.database().*.getTimestamp(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
@@ -4713,14 +4606,10 @@ pub fn antfly_db_lookup_json(
     key: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_lookup_json), .{ .name = "antfly_db_lookup_json" }), .{ handle_ptr, key, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_lookup_json, @src().fn_name, .{ handle_ptr, key, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.prepareLookupRequest(key.bytes(), .{}) catch |err| return capi.mapError(err);
@@ -4738,14 +4627,10 @@ pub fn antfly_db_get_raw(
     key: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_raw), .{ .name = "antfly_db_get_raw" }), .{ handle_ptr, key, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_raw, @src().fn_name, .{ handle_ptr, key, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const result = handle.database().*.get(std.heap.c_allocator, key.bytes()) catch |err| return capi.mapError(err);
@@ -4768,14 +4653,10 @@ pub fn antfly_db_lookup_artifact_json(
     artifact_id_b64: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_lookup_artifact_json), .{ .name = "antfly_db_lookup_artifact_json" }), .{ handle_ptr, artifact_id_b64, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_lookup_artifact_json, @src().fn_name, .{ handle_ptr, artifact_id_b64, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.prepareLookupRequest(artifact_id_b64.bytes(), .{}) catch |err| return capi.mapError(err);
@@ -4797,8 +4678,7 @@ pub fn antfly_decode_artifact_id_json(
     artifact_id_b64: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_decode_artifact_id_json), .{ .name = "antfly_decode_artifact_id_json" }), .{ artifact_id_b64, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_decode_artifact_id_json, @src().fn_name, .{ artifact_id_b64, out_buf });
     capi.clearLastError();
     const alloc = std.heap.c_allocator;
     const artifact_id = decodeBase64Alloc(alloc, artifact_id_b64.bytes()) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -4818,14 +4698,10 @@ pub fn antfly_db_get_schema_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_schema_json), .{ .name = "antfly_db_get_schema_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_schema_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (handle.database().*.getSchemaJson(std.heap.c_allocator) catch |err| return capi.mapError(err)) |schema_json| {
@@ -4840,14 +4716,10 @@ pub fn antfly_db_set_schema_json(
     handle_ptr: ?*anyopaque,
     schema_json: capi.Slice,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_set_schema_json), .{ .name = "antfly_db_set_schema_json" }), .{ handle_ptr, schema_json });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_set_schema_json, @src().fn_name, .{ handle_ptr, schema_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     @import("sql_ddl.zig").invalidate(handle);
@@ -4856,14 +4728,10 @@ pub fn antfly_db_set_schema_json(
 }
 
 pub fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_run_until_idle), .{ .name = "antfly_db_run_until_idle" }), .{handle_ptr});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_run_until_idle, @src().fn_name, .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .maintain, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     @import("entity_sink.zig").runUntilIdle(handle) catch |err| return capi.mapError(err);
@@ -4963,15 +4831,11 @@ pub fn antfly_db_run_until_idle_json(
     handle_ptr: ?*anyopaque,
     out_buf_ptr: ?*capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_run_until_idle_json), .{ .name = "antfly_db_run_until_idle_json" }), .{ handle_ptr, out_buf_ptr });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_run_until_idle_json, @src().fn_name, .{ handle_ptr, out_buf_ptr });
     capi.clearLastError();
     const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .maintain, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     @import("entity_sink.zig").runUntilIdle(handle) catch |err| {
@@ -5003,15 +4867,11 @@ pub fn antfly_db_pending_work_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf_ptr: ?*capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_pending_work_stats_json), .{ .name = "antfly_db_pending_work_stats_json" }), .{ handle_ptr, out_buf_ptr });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_pending_work_stats_json, @src().fn_name, .{ handle_ptr, out_buf_ptr });
     capi.clearLastError();
     const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     out_buf.* = pendingWorkStatsJson(handle) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -5026,11 +4886,8 @@ pub fn antflyDbExtractEnrichmentsJson(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antflyDbExtractEnrichmentsJson), .{ .name = "antfly_db_extract_enrichments_json" }), .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -5055,11 +4912,8 @@ pub fn antflyDbComputeEnrichmentsJson(
         return @call(.auto, @extern(*const @TypeOf(antflyDbComputeEnrichmentsJson), .{ .name = "antfly_db_compute_enrichments_json" }), .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
     out_buf.* = .{};
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -5080,14 +4934,10 @@ pub fn antfly_db_update_range(
     start: capi.Slice,
     end: capi.Slice,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_update_range), .{ .name = "antfly_db_update_range" }), .{ handle_ptr, start, end });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_update_range, @src().fn_name, .{ handle_ptr, start, end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.updateRange(.{
@@ -5101,14 +4951,10 @@ pub fn antfly_db_get_range_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_range_json), .{ .name = "antfly_db_get_range_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_range_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     var payload = JsonRange.init(handle.alloc, handle.database().*.getRange()) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -5121,14 +4967,10 @@ pub fn antfly_db_get_split_state_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_split_state_json), .{ .name = "antfly_db_get_split_state_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_split_state_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const state = handle.database().*.getSplitState(handle.alloc) catch |err| return capi.mapError(err);
@@ -5144,14 +4986,10 @@ pub fn antfly_db_set_split_state_json(
     handle_ptr: ?*anyopaque,
     state_json: capi.Slice,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_set_split_state_json), .{ .name = "antfly_db_set_split_state_json" }), .{ handle_ptr, state_json });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_set_split_state_json, @src().fn_name, .{ handle_ptr, state_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const ParsedState = struct {
@@ -5186,14 +5024,10 @@ pub fn antfly_db_set_split_state_json(
 }
 
 pub fn antfly_db_clear_split_state(handle_ptr: ?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_state), .{ .name = "antfly_db_clear_split_state" }), .{handle_ptr});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_clear_split_state, @src().fn_name, .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.clearSplitState() catch |err| return capi.mapError(err);
@@ -5204,14 +5038,10 @@ pub fn antfly_db_get_split_delta_seq(
     handle_ptr: ?*anyopaque,
     out_seq: *u64,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_split_delta_seq), .{ .name = "antfly_db_get_split_delta_seq" }), .{ handle_ptr, out_seq });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_split_delta_seq, @src().fn_name, .{ handle_ptr, out_seq });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     out_seq.* = handle.database().*.getSplitDeltaSeq();
@@ -5222,14 +5052,10 @@ pub fn antfly_db_get_split_delta_final_seq(
     handle_ptr: ?*anyopaque,
     out_seq: *u64,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_split_delta_final_seq), .{ .name = "antfly_db_get_split_delta_final_seq" }), .{ handle_ptr, out_seq });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_split_delta_final_seq, @src().fn_name, .{ handle_ptr, out_seq });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     out_seq.* = handle.database().*.getSplitDeltaFinalSeq(handle.alloc) catch |err| return capi.mapError(err);
@@ -5240,14 +5066,10 @@ pub fn antfly_db_set_split_delta_final_seq(
     handle_ptr: ?*anyopaque,
     seq: u64,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_set_split_delta_final_seq), .{ .name = "antfly_db_set_split_delta_final_seq" }), .{ handle_ptr, seq });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_set_split_delta_final_seq, @src().fn_name, .{ handle_ptr, seq });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.setSplitDeltaFinalSeq(seq) catch |err| return capi.mapError(err);
@@ -5255,14 +5077,10 @@ pub fn antfly_db_set_split_delta_final_seq(
 }
 
 pub fn antfly_db_clear_split_delta_final_seq(handle_ptr: ?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_delta_final_seq), .{ .name = "antfly_db_clear_split_delta_final_seq" }), .{handle_ptr});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_clear_split_delta_final_seq, @src().fn_name, .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.clearSplitDeltaFinalSeq() catch |err| return capi.mapError(err);
@@ -5274,14 +5092,10 @@ pub fn antfly_db_list_split_delta_entries_after_json(
     after_seq: u64,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_list_split_delta_entries_after_json), .{ .name = "antfly_db_list_split_delta_entries_after_json" }), .{ handle_ptr, after_seq, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_list_split_delta_entries_after_json, @src().fn_name, .{ handle_ptr, after_seq, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const entries = handle.database().*.listSplitDeltaEntriesAfter(handle.alloc, after_seq) catch |err| return capi.mapError(err);
@@ -5303,14 +5117,10 @@ pub fn antfly_db_list_split_delta_entries_after_json(
 }
 
 pub fn antfly_db_clear_split_delta_entries(handle_ptr: ?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_delta_entries), .{ .name = "antfly_db_clear_split_delta_entries" }), .{handle_ptr});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_clear_split_delta_entries, @src().fn_name, .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.clearSplitDeltaEntries() catch |err| return capi.mapError(err);
@@ -5321,14 +5131,10 @@ pub fn antfly_db_list_indexes_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_list_indexes_json), .{ .name = "antfly_db_list_indexes_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_list_indexes_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const configs = handle.database().*.listIndexes(handle.alloc) catch |err| return capi.mapError(err);
@@ -5352,14 +5158,10 @@ pub fn antfly_db_list_enrichments_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_list_enrichments_json), .{ .name = "antfly_db_list_enrichments_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_list_enrichments_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const configs = handle.database().*.listEnrichments(handle.alloc) catch |err| return capi.mapError(err);
@@ -5373,14 +5175,10 @@ pub fn antfly_db_scan_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_scan_json), .{ .name = "antfly_db_scan_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_scan_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -5447,14 +5245,10 @@ pub fn antfly_db_scan_hashes(
     request_json: capi.Slice,
     out_result: *capi.ScanHashResult,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_scan_hashes), .{ .name = "antfly_db_scan_hashes" }), .{ handle_ptr, request_json, out_result });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_scan_hashes, @src().fn_name, .{ handle_ptr, request_json, out_result });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -5516,14 +5310,10 @@ pub fn antfly_db_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_stats_json), .{ .name = "antfly_db_stats_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_stats_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const bytes = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
@@ -5796,15 +5586,11 @@ pub fn searchPublicQueryJson(
 /// SQL over the embedded database catalog. Output is always freed by
 /// antfly_buffer_free, including structured SQL diagnostics on failure.
 pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out_buf: *capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_json), .{ .name = "antfly_db_sql_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_sql_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
     out_buf.* = .{};
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .exclusive, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": SQL sessions require a root database handle");
@@ -5954,14 +5740,10 @@ pub fn antfly_db_search_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_json), .{ .name = "antfly_db_search_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (requestLooksLikePublicQueryJson(request_json.bytes())) {
@@ -6128,14 +5910,10 @@ pub fn antfly_db_search_dense(
     offset: u32,
     out_result: *capi.PackedDenseSearchResult,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_dense), .{ .name = "antfly_db_search_dense" }), .{ handle_ptr, index_name, vector_ptr, vector_len, k, limit, offset, out_result });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_dense, @src().fn_name, .{ handle_ptr, index_name, vector_ptr, vector_len, k, limit, offset, out_result });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (vector_ptr == null or vector_len == 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": query vector must be nonempty and have a non-null pointer");
@@ -6162,14 +5940,10 @@ pub fn antfly_db_search_dense_profile(
     offset: u32,
     out_profile: *capi.DenseSearchProfile,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_dense_profile), .{ .name = "antfly_db_search_dense_profile" }), .{ handle_ptr, index_name, vector_ptr, vector_len, k, limit, offset, out_profile });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_dense_profile, @src().fn_name, .{ handle_ptr, index_name, vector_ptr, vector_len, k, limit, offset, out_profile });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     if (vector_ptr == null or vector_len == 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": query vector must be nonempty and have a non-null pointer");
@@ -6207,14 +5981,10 @@ pub fn antfly_db_search_dense_profile(
 }
 
 pub fn antfly_db_dense_noop(handle_ptr: ?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_dense_noop), .{ .name = "antfly_db_dense_noop" }), .{handle_ptr});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_dense_noop, @src().fn_name, .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     _ = guard.handle;
     return .ok;
@@ -6224,14 +5994,10 @@ pub fn antfly_db_dense_fixed_packed_result(
     handle_ptr: ?*anyopaque,
     out_result: *capi.PackedDenseSearchResult,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_dense_fixed_packed_result), .{ .name = "antfly_db_dense_fixed_packed_result" }), .{ handle_ptr, out_result });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_dense_fixed_packed_result, @src().fn_name, .{ handle_ptr, out_result });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
 
@@ -6246,14 +6012,10 @@ pub fn antfly_db_search_dense_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_dense_wire), .{ .name = "antfly_db_search_dense_wire" }), .{ handle_ptr, request_buf, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_dense_wire, @src().fn_name, .{ handle_ptr, request_buf, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
 
@@ -6281,14 +6043,10 @@ pub fn antfly_db_search_dense_wire_profile(
     out_buf: *capi.Buffer,
     out_profile: *capi.DenseWireSearchProfile,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_dense_wire_profile), .{ .name = "antfly_db_search_dense_wire_profile" }), .{ handle_ptr, request_buf, out_buf, out_profile });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_dense_wire_profile, @src().fn_name, .{ handle_ptr, request_buf, out_buf, out_profile });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
 
@@ -6336,14 +6094,10 @@ pub fn antfly_db_search_text_match(
     offset: u32,
     out_result: *capi.DenseSearchResult,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_text_match), .{ .name = "antfly_db_search_text_match" }), .{ handle_ptr, index_name, field, text, limit, offset, out_result });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_text_match, @src().fn_name, .{ handle_ptr, index_name, field, text, limit, offset, out_result });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     var owned = searchTextMatchOwned(handle, index_name.bytes(), field.bytes(), text.bytes(), "", 1.0, limit, offset) catch |err| return capi.mapError(err);
@@ -6381,14 +6135,10 @@ pub fn antfly_db_search_text_match_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_text_match_wire), .{ .name = "antfly_db_search_text_match_wire" }), .{ handle_ptr, request_buf, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_text_match_wire, @src().fn_name, .{ handle_ptr, request_buf, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
 
@@ -6407,14 +6157,10 @@ pub fn antfly_db_search_text_term_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_text_term_wire), .{ .name = "antfly_db_search_text_term_wire" }), .{ handle_ptr, request_buf, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_text_term_wire, @src().fn_name, .{ handle_ptr, request_buf, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
 
@@ -6433,14 +6179,10 @@ pub fn antfly_db_search_text_match_phrase_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_text_match_phrase_wire), .{ .name = "antfly_db_search_text_match_phrase_wire" }), .{ handle_ptr, request_buf, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_text_match_phrase_wire, @src().fn_name, .{ handle_ptr, request_buf, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
 
@@ -6459,14 +6201,10 @@ pub fn antfly_db_search_hits_json(
     request_json: capi.Slice,
     out_result: *capi.DenseSearchResult,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_search_hits_json), .{ .name = "antfly_db_search_hits_json" }), .{ handle_ptr, request_json, out_result });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_search_hits_json, @src().fn_name, .{ handle_ptr, request_json, out_result });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -7049,14 +6787,10 @@ pub fn antfly_db_execute_graph_queries_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_execute_graph_queries_json), .{ .name = "antfly_db_execute_graph_queries_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_execute_graph_queries_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -7127,14 +6861,10 @@ pub fn antfly_db_aggregate_hits_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_aggregate_hits_json), .{ .name = "antfly_db_aggregate_hits_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_aggregate_hits_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     var parsed = std.json.parseFromSlice(JsonAggregateHitsRequest, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -7392,8 +7122,7 @@ pub fn legacyGraphWeightBound(value: f64) ?f64 {
 
 /// Render using the durable resolver's exact template and Unicode tables. No writes.
 pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, mention_json: capi.Slice, out_buffer: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_render_resolver_key_json), .{ .name = "antfly_db_render_resolver_key_json" }), .{ handle_ptr, resolver_name, mention_json, out_buffer });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_render_resolver_key_json, @src().fn_name, .{ handle_ptr, resolver_name, mention_json, out_buffer });
     capi.clearLastError();
     const out = out_buffer orelse return capi.mapErrorContext(error.InvalidArgument, "resolver key output pointer must not be null");
     out.* = .{};
@@ -7452,8 +7181,7 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
 /// Extract ad-hoc text (or accept extraction JSON) and resolve against the
 /// durable resolver, including aliases and ANN. Never publishes query artifacts.
 pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice, out_buffer: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_resolve_query_json), .{ .name = "antfly_db_resolve_query_json" }), .{ handle_ptr, resolver_name, request_json, out_buffer });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_resolve_query_json, @src().fn_name, .{ handle_ptr, resolver_name, request_json, out_buffer });
     capi.clearLastError();
     const out = out_buffer orelse return capi.mapErrorContext(error.InvalidArgument, "query resolution output pointer must not be null");
     out.* = .{};
@@ -7562,8 +7290,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
 /// Persist a resolver-level redirect and enqueue corpus re-resolution atomically.
 /// Call run_until_idle before expecting all existing mention edges to be re-keyed.
 pub fn antfly_db_merge_resolver_keys_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, merge_json: capi.Slice) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_merge_resolver_keys_json), .{ .name = "antfly_db_merge_resolver_keys_json" }), .{ handle_ptr, resolver_name, merge_json });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_merge_resolver_keys_json, @src().fn_name, .{ handle_ptr, resolver_name, merge_json });
     capi.clearLastError();
     var out: capi.Buffer = .{};
     defer antfly_buffer_free(&out);
@@ -8621,8 +8348,7 @@ pub fn antfly_db_resolver_reviews_json(handle_ptr: ?*anyopaque, request_json: ca
 }
 
 pub fn antfly_db_list_resolver_identities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_list_resolver_identities_json), .{ .name = "antfly_db_list_resolver_identities_json" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_list_resolver_identities_json, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
     const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
@@ -8647,8 +8373,7 @@ pub fn antfly_db_list_resolver_identities_json(handle_ptr: ?*anyopaque, out_buf:
 
 /// Explicit irreversible identity deletion is allowed only after retirement.
 pub fn antfly_db_drop_resolver_identity(handle_ptr: ?*anyopaque, name: capi.Slice, out_deleted: ?*bool) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_drop_resolver_identity), .{ .name = "antfly_db_drop_resolver_identity" }), .{ handle_ptr, name, out_deleted });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_drop_resolver_identity, @src().fn_name, .{ handle_ptr, name, out_deleted });
     capi.clearLastError();
     const out = out_deleted orelse return capi.mapError(error.InvalidArgument);
     out.* = false;
@@ -8662,8 +8387,7 @@ pub fn antfly_db_drop_resolver_identity(handle_ptr: ?*anyopaque, name: capi.Slic
 /// Explicitly reset redirects or map every stored alias endpoint into a new namespace.
 /// The resolver, identity state and replay cursors commit together.
 pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_set_resolver_namespace_json), .{ .name = "antfly_db_set_resolver_namespace_json" }), .{ handle_ptr, resolver_name, request_json });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_set_resolver_namespace_json, @src().fn_name, .{ handle_ptr, resolver_name, request_json });
     capi.clearLastError();
     const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
     defer guard.leave();
@@ -8701,8 +8425,7 @@ var test_index_before_wait_quantum: ?*const fn (?*anyopaque) anyerror!void = nul
 /// Registration captures the admitted generation atomically. Optional waiting
 /// retains it while releasing API/path admission between maintenance quanta.
 pub fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_add_index_json), .{ .name = "antfly_db_add_index_json" }), .{ handle_ptr, config_json });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_add_index_json, @src().fn_name, .{ handle_ptr, config_json });
     capi.clearLastError();
     var request = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, config_json.bytes(), .{}) catch |err| return capi.mapError(err);
     defer request.deinit();
@@ -8751,11 +8474,8 @@ fn addIndexJsonRegistered(
     generation: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     var arena = std.heap.ArenaAllocator.init(handle.alloc);
@@ -8921,14 +8641,10 @@ pub fn antfly_db_cancel_replacement(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_cancel_replacement), .{ .name = "antfly_db_cancel_replacement" }), .{ handle_ptr, name, out_deleted });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_cancel_replacement, @src().fn_name, .{ handle_ptr, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = false;
@@ -8942,14 +8658,10 @@ pub fn antfly_db_delete_index(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_delete_index), .{ .name = "antfly_db_delete_index" }), .{ handle_ptr, name, out_deleted });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_delete_index, @src().fn_name, .{ handle_ptr, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = false;
@@ -8962,14 +8674,10 @@ pub fn antfly_db_add_enrichment_json(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_add_enrichment_json), .{ .name = "antfly_db_add_enrichment_json" }), .{ handle_ptr, config_json });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_add_enrichment_json, @src().fn_name, .{ handle_ptr, config_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     var parsed = std.json.parseFromSlice(db_mod.types.EnrichmentConfig, handle.alloc, config_json.bytes(), .{
@@ -8987,14 +8695,10 @@ pub fn antfly_db_delete_enrichment(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_delete_enrichment), .{ .name = "antfly_db_delete_enrichment" }), .{ handle_ptr, kind_slice, name, out_deleted });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_delete_enrichment, @src().fn_name, .{ handle_ptr, kind_slice, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = false;
@@ -9012,14 +8716,10 @@ pub fn antfly_db_get_edges_json(
     direction: u8,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_edges_json), .{ .name = "antfly_db_get_edges_json" }), .{ handle_ptr, index_name, key, edge_type, direction, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_edges_json, @src().fn_name, .{ handle_ptr, index_name, key, edge_type, direction, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const dir: db_mod.types.GraphEdgeDirection = switch (direction) {
@@ -9049,14 +8749,10 @@ pub fn antfly_db_traverse_edges_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_traverse_edges_json), .{ .name = "antfly_db_traverse_edges_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_traverse_edges_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -9118,14 +8814,10 @@ pub fn antfly_db_get_neighbors_json(
     direction: u8,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_neighbors_json), .{ .name = "antfly_db_get_neighbors_json" }), .{ handle_ptr, index_name, key, edge_type, direction, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_neighbors_json, @src().fn_name, .{ handle_ptr, index_name, key, edge_type, direction, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const dir: db_mod.types.GraphEdgeDirection = switch (direction) {
@@ -9155,14 +8847,10 @@ pub fn antfly_db_find_shortest_path_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_find_shortest_path_json), .{ .name = "antfly_db_find_shortest_path_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_find_shortest_path_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -9219,14 +8907,10 @@ pub fn antfly_db_find_k_shortest_paths_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_find_k_shortest_paths_json), .{ .name = "antfly_db_find_k_shortest_paths_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_find_k_shortest_paths_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -9291,14 +8975,10 @@ pub fn antfly_db_match_pattern_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_match_pattern_json), .{ .name = "antfly_db_match_pattern_json" }), .{ handle_ptr, request_json, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_match_pattern_json, @src().fn_name, .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const JsonPatternNodeFilter = struct {
@@ -9391,14 +9071,10 @@ pub fn antfly_db_create_shadow_index_manager(
     split_key: capi.Slice,
     original_range_end: capi.Slice,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_create_shadow_index_manager), .{ .name = "antfly_db_create_shadow_index_manager" }), .{ handle_ptr, split_key, original_range_end });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_create_shadow_index_manager, @src().fn_name, .{ handle_ptr, split_key, original_range_end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.createShadowIndexManager(split_key.bytes(), original_range_end.bytes()) catch |err| return capi.mapError(err);
@@ -9406,14 +9082,10 @@ pub fn antfly_db_create_shadow_index_manager(
 }
 
 pub fn antfly_db_close_shadow_index_manager(handle_ptr: ?*anyopaque) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_close_shadow_index_manager), .{ .name = "antfly_db_close_shadow_index_manager" }), .{handle_ptr});
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_close_shadow_index_manager, @src().fn_name, .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .exclusive, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.closeShadowIndexManager() catch |err| return capi.mapError(err);
@@ -9424,14 +9096,10 @@ pub fn antfly_db_get_shadow_index_dir(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_get_shadow_index_dir), .{ .name = "antfly_db_get_shadow_index_dir" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_get_shadow_index_dir, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const dir = handle.database().*.getShadowIndexDir();
@@ -9444,14 +9112,10 @@ pub fn antfly_db_find_median_key(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_find_median_key), .{ .name = "antfly_db_find_median_key" }), .{ handle_ptr, out_buf });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_find_median_key, @src().fn_name, .{ handle_ptr, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .read, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     const key = handle.database().*.findMedianKey(handle.alloc) catch |err| return capi.mapError(err);
@@ -9469,14 +9133,10 @@ pub fn antfly_db_split(
     dest_dir2: capi.Slice,
     prepare_only: bool,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_split), .{ .name = "antfly_db_split" }), .{ handle_ptr, curr_start, curr_end, split_key, dest_dir1, dest_dir2, prepare_only });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_split, @src().fn_name, .{ handle_ptr, curr_start, curr_end, split_key, dest_dir1, dest_dir2, prepare_only });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.split(
@@ -9497,14 +9157,10 @@ pub fn antfly_db_finalize_split(
     new_start: capi.Slice,
     new_end: capi.Slice,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_finalize_split), .{ .name = "antfly_db_finalize_split" }), .{ handle_ptr, new_start, new_end });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_finalize_split, @src().fn_name, .{ handle_ptr, new_start, new_end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .catalog, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.finalizeSplit(.{
@@ -9519,14 +9175,10 @@ pub fn antfly_db_snapshot(
     id: capi.Slice,
     out_size: *u64,
 ) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_snapshot), .{ .name = "antfly_db_snapshot" }), .{ handle_ptr, id, out_size });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_snapshot, @src().fn_name, .{ handle_ptr, id, out_size });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
+    var entry_code: capi.ErrorCode = undefined;
+    const guard = enterChecked(handle_ptr, .write, @src().fn_name, &entry_code) orelse return entry_code;
     defer guard.leave();
     const handle = guard.handle;
     out_size.* = handle.database().*.snapshot(id.bytes()) catch |err| return capi.mapError(err);
@@ -9811,134 +9463,7 @@ test "capi resolver replacement public waits retain admission generation across 
 }
 
 comptime {
-    @import("exports.zig").publish(@This(), &.{
-        "antfly_db_memory_json",
-        "antfly_db_open",
-        "antfly_db_close",
-        "antfly_threading_mode",
-        "antfly_abi_version",
-        "antfly_open_options_size",
-        "antfly_last_error_detail",
-        "antfly_last_error_code",
-        "antfly_error_code_name",
-        "antfly_error_code_description",
-        "antfly_open_options_init",
-        "antfly_db_open_with_options",
-        "antfly_db_create_with_options",
-        "antfly_lite_open",
-        "antfly_lite_create",
-        "antfly_lite_open_hosted",
-        "antfly_lite_create_hosted",
-        "antfly_lite_open_readonly",
-        "antfly_lite_open_status_only",
-        "antfly_db_capabilities_json",
-        "antfly_db_status_json",
-        "antfly_db_backup",
-        "antfly_db_backup_json",
-        "antfly_db_import_backup",
-        "antfly_restore_backup_json",
-        "antfly_restore_backup_file_json",
-        "antfly_lite_check_json",
-        "antfly_lite_check_file_json",
-        "antfly_lite_copy_stable_snapshot_json",
-        "antfly_lite_copy_stable_snapshot_file_json",
-        "antfly_lite_compact_json",
-        "antfly_lite_vacuum_json",
-        "antfly_db_replay_generated_enrichments_json",
-        "antfly_db_set_readable_lease_hook",
-        "antfly_buffer_free",
-        "antfly_buffer_free_zero",
-        "antfly_dense_search_result_free",
-        "antfly_packed_dense_search_result_free",
-        "antfly_scan_hash_result_free",
-        "antfly_db_begin_transaction_with_id",
-        "antfly_db_write_transaction",
-        "antfly_db_batch",
-        "antfly_db_batch_json",
-        "antfly_db_resolve_intents",
-        "antfly_db_get_transaction_status",
-        "antfly_db_get_commit_version",
-        "antfly_db_get_timestamp",
-        "antfly_db_lookup_json",
-        "antfly_db_get_raw",
-        "antfly_db_lookup_artifact_json",
-        "antfly_decode_artifact_id_json",
-        "antfly_db_get_schema_json",
-        "antfly_db_set_schema_json",
-        "antfly_db_run_until_idle",
-        "antfly_db_run_until_idle_json",
-        "antfly_db_pending_work_stats_json",
-        "antfly_db_update_range",
-        "antfly_db_get_range_json",
-        "antfly_db_get_split_state_json",
-        "antfly_db_set_split_state_json",
-        "antfly_db_clear_split_state",
-        "antfly_db_get_split_delta_seq",
-        "antfly_db_get_split_delta_final_seq",
-        "antfly_db_set_split_delta_final_seq",
-        "antfly_db_clear_split_delta_final_seq",
-        "antfly_db_list_split_delta_entries_after_json",
-        "antfly_db_clear_split_delta_entries",
-        "antfly_db_list_indexes_json",
-        "antfly_db_list_enrichments_json",
-        "antfly_db_scan_json",
-        "antfly_db_scan_hashes",
-        "antfly_db_stats_json",
-        "antfly_db_sql_json",
-        "antfly_db_search_json",
-        "antfly_db_search_dense",
-        "antfly_db_search_dense_profile",
-        "antfly_db_dense_noop",
-        "antfly_db_dense_fixed_packed_result",
-        "antfly_db_search_dense_wire",
-        "antfly_db_search_dense_wire_profile",
-        "antfly_db_search_text_match",
-        "antfly_db_search_text_match_wire",
-        "antfly_db_search_text_term_wire",
-        "antfly_db_search_text_match_phrase_wire",
-        "antfly_db_search_hits_json",
-        "antfly_db_execute_graph_queries_json",
-        "antfly_db_aggregate_hits_json",
-        "antfly_db_render_resolver_key_json",
-        "antfly_db_resolve_query_json",
-        "antfly_db_merge_resolver_keys_json",
-        "antfly_db_unmerge_resolver_key_json",
-        "antfly_db_suppress_resolver_keys_json",
-        "antfly_db_unsuppress_resolver_key_json",
-        "antfly_db_resolver_curation_json",
-        "antfly_db_resolver_reviews_json",
-        "antfly_db_curate_entity_json",
-        "antfly_db_propose_curation_json",
-        "antfly_db_list_curation_proposals_json",
-        "antfly_db_get_curation_proposal_json",
-        "antfly_db_decide_curation_proposal_json",
-        "antfly_db_entity_merge_json",
-        "antfly_db_entity_unmerge_json",
-        "antfly_db_entity_suppress_json",
-        "antfly_db_entity_unsuppress_json",
-        "antfly_db_entity_redirects_json",
-        "antfly_db_list_resolver_identities_json",
-        "antfly_db_drop_resolver_identity",
-        "antfly_db_set_resolver_namespace_json",
-        "antfly_db_add_index_json",
-        "antfly_db_cancel_replacement",
-        "antfly_db_delete_index",
-        "antfly_db_add_enrichment_json",
-        "antfly_db_delete_enrichment",
-        "antfly_db_get_edges_json",
-        "antfly_db_traverse_edges_json",
-        "antfly_db_get_neighbors_json",
-        "antfly_db_find_shortest_path_json",
-        "antfly_db_find_k_shortest_paths_json",
-        "antfly_db_match_pattern_json",
-        "antfly_db_create_shadow_index_manager",
-        "antfly_db_close_shadow_index_manager",
-        "antfly_db_get_shadow_index_dir",
-        "antfly_db_find_median_key",
-        "antfly_db_split",
-        "antfly_db_finalize_split",
-        "antfly_db_snapshot",
-    });
+    capi_exports.publishAll(@This());
 }
 
 test "inline resolver replacement C API admits the same public name with fresh artifacts" {

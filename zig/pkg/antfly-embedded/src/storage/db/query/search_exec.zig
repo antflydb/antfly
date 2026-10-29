@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const aggregations_mod = @import("../aggregations.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
-const artifact_ids = @import("../artifact_ids.zig");
+const artifact_ids = @import("../artifact/ids.zig");
 const runtime_schema_mod = @import("../../schema.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -41,7 +41,7 @@ const runtime_preflight = @import("../runtime_preflight.zig");
 const control_contract = @import("control_contract.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
-const mapper_mod = @import("../document_mapper.zig");
+const mapper_mod = @import("../document/mapper.zig");
 const schema_api = @import("../../../schema/mod.zig");
 const persistent_mod = @import("../../persistent.zig");
 const hbc_mod = @import("../../hbc_adapter.zig");
@@ -20190,14 +20190,14 @@ const ValueExecution = struct {
         hash.update(std.mem.asBytes(&provider));
         const key = hash.final();
         self.tuning_key = key;
-        if (source_read_hints.get(key, @import("../native_query_cut.zig").nowMs())) |hint| {
+        if (source_read_hints.get(key, @import("../native/query_cut.zig").nowMs())) |hint| {
             const max_rows = self.source_tuner.max_rows;
             self.source_tuner = hint;
             self.source_tuner.max_rows = max_rows;
         }
     }
     fn publishTuning(self: *@This()) void {
-        if (self.tuning_key) |key| source_read_hints.put(key, self.source_tuner, @import("../native_query_cut.zig").nowMs());
+        if (self.tuning_key) |key| source_read_hints.put(key, self.source_tuner, @import("../native/query_cut.zig").nowMs());
     }
     fn observeOriginal(self: *@This(), rows: usize, bytes: u64) void {
         if (rows == 0) return;
@@ -20946,7 +20946,7 @@ const ValueProducer = struct {
         if (resolved.local_id != 0 or segment.reader.doc_count != count) return null;
         const membership = value_query.membership;
         const key = membership.key(scope, owner.req.index_name, segment.id, count, self.matcher.spec);
-        var pin = membership.retained.borrow(key, @import("../native_query_cut.zig").nowMs()) orelse return null;
+        var pin = membership.retained.borrow(key, @import("../native/query_cut.zig").nowMs()) orelse return null;
         if (!pin.facts().complete) {
             pin.deinit();
             return null;
@@ -20983,7 +20983,7 @@ const ValueProducer = struct {
         }
         const scope = owner.req.value_search_scope;
         const membership = value_query.membership;
-        const now = if (scope != null) @import("../native_query_cut.zig").nowMs() else 0;
+        const now = if (scope != null) @import("../native/query_cut.zig").nowMs() else 0;
         const cache_key = if (scope) |cut| membership.key(cut, owner.req.index_name, lease.entry.id, count, self.matcher.spec) else null;
         var cached = if (cache_key) |key| membership.retained.borrow(key, now) else null;
         defer if (cached) |*pin| pin.deinit();
@@ -21157,7 +21157,7 @@ const ValueProducer = struct {
             facts.known = roaring.RoaringBitmap.init(a);
             changed = true;
         }
-        if (changed) membership.retained.put(cache_key.?, scope.?.expires_ms, @import("../native_query_cut.zig").nowMs(), facts);
+        if (changed) membership.retained.put(cache_key.?, scope.?.expires_ms, @import("../native/query_cut.zig").nowMs(), facts);
         return result;
     }
 };
@@ -35564,7 +35564,7 @@ test "external lake ordinal identity projection avoids stored key I/O and preser
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    const mapper = @import("../document_mapper.zig");
+    const mapper = @import("../document/mapper.zig");
     const docs = try ca.alloc(mapper.MapperDoc, 4000);
     var random = std.Random.DefaultPrng.init(73);
     for (docs, 0..) |*doc, i| {
@@ -36023,7 +36023,7 @@ test "logical value fusion preserves per-leaf scores and constrained retained fa
 
     // A cached subset, including a verified nonmatch, cannot stand for an
     // entire segment when a subsequent request has a broader candidate set.
-    const now = @import("../native_query_cut.zig").nowMs();
+    const now = @import("../native/query_cut.zig").nowMs();
     const scope = value_query.membership.Scope.init("fusion-partial-test", "cut", @as(u64, 77), now + 60000);
     const request: types.SearchRequest = .{ .value_search_execution = .{ .allow_scan = true }, .value_search_scope = scope };
     var partial: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = request, .load_ctx = &loader, .load = Loader.load };
@@ -36379,7 +36379,7 @@ test "text live visibility refines posting candidates and skips an all-visible f
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const mapper = @import("../document_mapper.zig");
+    const mapper = @import("../document/mapper.zig");
     const docs = try scratch.alloc(mapper.MapperDoc, 10_000);
     for (docs, 0..) |*doc, i| doc.* = .{
         .key = try std.fmt.allocPrint(scratch, "doc:{d}", .{i}),

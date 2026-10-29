@@ -17,6 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const storage_engine = @import("engine.zig");
 pub const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
@@ -295,10 +296,7 @@ pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
 const owner_catalog_initialized_key = "\x00\x00__metadata__:owner_catalog_initialized";
 
 fn loadOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
-    return db.core.store.get(alloc, owner_catalog_initialized_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(db.core.store.get(alloc, owner_catalog_initialized_key));
 }
 
 fn persistOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !void {
@@ -1092,10 +1090,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
 
 pub fn loadLocalTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
     if (comptime storage_engine.enabled) return storage_engine.call("writeLoadLocalTableSchemaJson", .{ alloc, db });
-    return db.core.store.get(alloc, local_schema_json_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(db.core.store.get(alloc, local_schema_json_key));
 }
 
 pub fn freeOwnedBatchWrites(alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite) void {
@@ -1438,7 +1433,7 @@ pub fn backupStorageKernelOwnerDb(
     return backupStorageKernelOwnerDbWithControl(alloc, db, db_path, group_id, backup_root, backup_id, format, null, null, .{ .deadline_ns = std.math.maxInt(u64) });
 }
 
-pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
+pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native/backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
     if (comptime storage_engine.enabled) return storage_engine.call("writeBackupStorageKernelOwnerDbWithControl", .{ alloc, db, db_path, group_id, backup_root, backup_id, format, cohort, sealed, control });
     try control.ensureActive();
     if (cohort) |fence| {
@@ -1549,7 +1544,7 @@ pub fn validateGroupedSourceBatch(
         defer arena.deinit();
         const scratch = arena.allocator();
         if (schema) |view| if (view.storageMode() == .relational) {
-            var prepared = try @import("db/document_mapper.zig").PreparedRelationalWrite.init(scratch, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout());
+            var prepared = try @import("db/document/mapper.zig").PreparedRelationalWrite.init(scratch, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout());
             defer prepared.deinit(scratch);
             try prepared.requireLogicalRoot();
             _ = plan.prepareRow(scratch, write.key, prepared.parsedValue()) catch |err| switch (err) {
@@ -2247,7 +2242,7 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
 
 pub const PortableCohortSource = struct {
     db: *db_mod.DB,
-    handle: @import("db/native_backup_seal.zig").Handle,
+    handle: @import("db/native/backup_seal.zig").Handle,
     cancellation: @import("../api/operation.zig").CancellationToken,
     source_generation_summary_output: ?*?[]portable_backup.SourceGenerationAdmissionSummaryEntry = null,
 };

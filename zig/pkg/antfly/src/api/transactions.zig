@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const platform_sync = @import("antfly_platform").sync;
 const batch_api = @import("antfly_local_sources").api_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
@@ -1150,10 +1151,7 @@ pub const DurableSessionStore = struct {
         const lease_key = try makeSessionLeaseKey(self.alloc, session.txn_id);
         defer self.alloc.free(lease_key);
 
-        const current_raw = txn.get(session_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const current_raw = try missingAsNull(txn.get(session_key));
         if (expected_owner) |owner| {
             const raw = current_raw orelse return false;
             var current = try decodeSessionRecord(self.alloc, session.txn_id, raw);
@@ -1163,10 +1161,7 @@ pub const DurableSessionStore = struct {
 
         const owner_id = try ownerLeaseId(self.alloc, session.owner_node_id);
         defer self.alloc.free(owner_id);
-        const lease_raw = txn.get(lease_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const lease_raw = try missingAsNull(txn.get(lease_key));
         if (lease_raw) |raw| {
             const parsed = try std.json.parseFromSlice(lease_mod.LeaseRecord, self.alloc, raw, .{ .allocate = .alloc_always });
             defer parsed.deinit();
@@ -5588,11 +5583,7 @@ fn requireString(obj: std.json.ObjectMap, key: []const u8) []const u8 {
     };
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
-}
+const appendJsonString = @import("antfly_local_sources").api_json_helpers.appendJsonString;
 
 test "transaction commit parser keeps read set and table batches" {
     var req = try parseCommitRequest(std.testing.allocator,

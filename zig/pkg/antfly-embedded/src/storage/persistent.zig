@@ -37,6 +37,7 @@
 //!   4. WAL.truncate(LSN)
 
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const platform_sync = @import("antfly_platform").sync;
 const projection_seal = @import("projection_seal.zig");
 const builtin = @import("builtin");
@@ -79,11 +80,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 }
 
 fn envEnabled(name: [*:0]const u8) bool {
-    const raw_z = getenv(name) orelse return false;
-    const raw = std.mem.span(raw_z);
-    return !(std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "false") or
-        std.ascii.eqlIgnoreCase(raw, "no"));
+    return @import("antfly_platform").env.getenvBoolDefault(name, false);
 }
 
 fn benchPersistentPublishEnabled() bool {
@@ -1520,10 +1517,7 @@ pub const PersistentIndex = struct {
             defer read_txn.abort();
 
             // Read committed_lsn
-            const lsn_bytes = read_txn.get(.meta, meta_committed_lsn) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const lsn_bytes = try missingAsNull(read_txn.get(.meta, meta_committed_lsn));
             if (lsn_bytes) |lb| {
                 if (lb.len >= 8) committed_lsn = std.mem.readInt(u64, lb[0..8], .little);
             }
@@ -1532,10 +1526,7 @@ pub const PersistentIndex = struct {
             defer alloc.free(active_ids);
             for (active_ids) |seg_id| {
                 const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
-                const seg_bytes = read_txn.get(.segments, &seg_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const seg_bytes = try missingAsNull(read_txn.get(.segments, &seg_key));
                 var segment_data: ?index_mod.SegmentData = if (seg_bytes) |bytes| blk: {
                     break :blk if (segment_files) |*store|
                         try store.publishExisting(seg_id, bytes)
@@ -1603,10 +1594,7 @@ pub const PersistentIndex = struct {
                 };
                 segment_data = null;
 
-                const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const deletion_bytes = try missingAsNull(read_txn.get(.deletions, &seg_key));
                 if (deletion_bytes) |bytes| {
                     var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
                     if (!bitmap.isEmpty()) {
@@ -1617,10 +1605,7 @@ pub const PersistentIndex = struct {
                 }
             }
 
-            const next_seg_id_bytes = read_txn.get(.meta, meta_next_seg_id) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const next_seg_id_bytes = try missingAsNull(read_txn.get(.meta, meta_next_seg_id));
             if (next_seg_id_bytes) |bytes| {
                 if (bytes.len >= @sizeOf(u64)) {
                     writer.next_segment_id = @max(
@@ -2624,10 +2609,7 @@ pub const PersistentIndex = struct {
             defer alloc.free(seg_bytes);
 
             const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, entry.seg_id));
-            const deletion_bytes = source_txn.get(.deletions, &seg_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const deletion_bytes = try missingAsNull(source_txn.get(.deletions, &seg_key));
 
             if (collect_doc_keys) {
                 var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
@@ -2696,10 +2678,7 @@ pub const PersistentIndex = struct {
         const segment_bytes = try self.readSegmentBytesAlloc(&txn, alloc, seg_id);
         errdefer alloc.free(segment_bytes);
 
-        const deletion_bitmap_bytes = txn.get(.deletions, &seg_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const deletion_bitmap_bytes = try missingAsNull(txn.get(.deletions, &seg_key));
 
         return .{
             .seg_id = seg_id,

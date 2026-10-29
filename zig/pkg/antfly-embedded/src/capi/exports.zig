@@ -14,7 +14,24 @@
 // limitations under the License.
 
 //! Public C symbols are emitted only by the compiled local storage owner.
-pub fn publish(comptime namespace: type, comptime names: []const []const u8) void {
-    if (!@import("../storage/engine_selection.zig").enabled)
-        for (names) |name| @export(&@field(namespace, name), .{ .name = name });
+const std = @import("std");
+
+/// True in consumer builds, where public C symbols live in the storage owner.
+pub const forwarding = @import("../storage/engine_selection.zig").enabled;
+
+/// Publish every public `antfly_*` function declared in `namespace`.
+pub fn publishAll(comptime namespace: type) void {
+    if (forwarding) return;
+    const names = @typeInfo(namespace).@"struct".decl_names;
+    @setEvalBranchQuota(names.len * 200);
+    for (names) |name| {
+        if (!std.mem.startsWith(u8, name, "antfly_")) continue;
+        if (@typeInfo(@TypeOf(@field(namespace, name))) != .@"fn") continue;
+        @export(&@field(namespace, name), .{ .name = name });
+    }
+}
+
+/// Call the storage owner's copy of public C function `f`, named `name`.
+pub inline fn forward(comptime f: anytype, comptime name: []const u8, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    return @call(.auto, @extern(*const @TypeOf(f), .{ .name = name }), args);
 }

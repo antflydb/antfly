@@ -1072,7 +1072,7 @@ const FanoutRows = struct {
 };
 
 fn differentialScenario(a: Allocator) !void {
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const raw = "{\"a\":{\"numbers\":[1.00,1e2,-0,9223372036854775808,1e999],\"text\":\"escape\\n\\u0061\",\"other\":true},\"items\":[{\"x\":{\"m\":1,\"n\":2},\"z\":4},{\"x\":{\"m\":3},\"z\":5},null],\"omit\":null}";
     const selections = [_][]const []const u8{
         &.{"a"},                    &.{"a.numbers"},                                 &.{"a.text"},
@@ -1136,7 +1136,7 @@ test "public graph metric borrowed wire streaming projection preserves ordered c
 
 test "public graph metric borrowed wire streaming whole terminal has bounded scratch" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
@@ -1194,7 +1194,7 @@ test "public graph metric borrowed wire streaming sparse overlays preserve base 
 
 test "public graph metric borrowed wire streaming sparse wide object stays within bounded scratch" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
@@ -1216,7 +1216,7 @@ test "public graph metric borrowed wire streaming sparse wide object stays withi
 
 test "public graph metric borrowed wire streaming siblings reuse bounded key arenas" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const counters = @import("../../lite/test_allocator.zig");
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
@@ -1279,7 +1279,7 @@ test "public graph metric borrowed wire streaming scratch retires oversized buff
 }
 
 fn fanoutOrderingScenario(a: Allocator) !void {
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const raw = "{\"items\":[{\"x\":{\"m\":1.00,\"n\":2},\"nested\":[{\"z\":3},{\"q\":4}]},null,{\"x\":{},\"nested\":[]},{\"other\":5},{\"x\":[{\"m\":6}]}],\"empty\":[]}";
     const selections = [_][]const []const u8{
         &.{"items.x"},
@@ -1326,7 +1326,7 @@ test "public graph metric borrowed wire streaming fanout preserves ordered array
 
 test "public graph metric borrowed wire streaming fanout bounds navigation maps and terminal scanner scratch" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const counters = @import("../../lite/test_allocator.zig");
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
@@ -1389,7 +1389,7 @@ test "public graph metric borrowed wire streaming fanout validates unprepared si
 
 test "public graph metric borrowed wire deep streaming fanout retains only one prepared item" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
     var field = std.Io.Writer.Allocating.init(a);
@@ -1439,7 +1439,7 @@ test "public graph metric borrowed wire direct writer streams compact vectors wi
 
 test "public graph metric borrowed wire multi component fanout reuses item preparation scratch" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
     try input.writer.writeAll("{\"items\":[");
@@ -1500,7 +1500,7 @@ test "public graph metric borrowed wire primed nested fanout survives replacemen
 
 test "public graph metric borrowed wire nested fanout ownership bounds priming and reuses immutable suffix plans" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const counters = @import("../../lite/test_allocator.zig");
     const fields: []const []const u8 = &.{"items.x.x.x.x.x.x.x.x.m"};
     var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = fields, .include_all_fields = false })).?;
@@ -1536,7 +1536,7 @@ test "public graph metric borrowed wire nested fanout ownership bounds priming a
 
 test "public graph metric borrowed wire replaced fanouts retire scratch under row quota" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const counters = @import("../../lite/test_allocator.zig");
     var input: std.Io.Writer.Allocating = .init(a);
     defer input.deinit();
@@ -1566,7 +1566,7 @@ test "public graph metric borrowed wire replaced fanouts retire scratch under ro
 
 test "public graph metric borrowed wire nested cursor arenas reuse across parent rows" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const counters = @import("../../lite/test_allocator.zig");
     const fields: []const []const u8 = &.{"items.x.x.x.m"};
     var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = fields, .include_all_fields = false })).?;
@@ -1749,7 +1749,7 @@ test "public graph metric borrowed wire streaming writer retires sparse tables a
 
 test "public graph metric borrowed wire validated fanout extents preserve ordered projections and failure cleanup" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     var raw: std.Io.Writer.Allocating = .init(a);
     defer raw.deinit();
     try raw.writer.writeAll("{\"items\":[{\"x\":[{\"m\":1,\"huge\":\"");
@@ -1774,7 +1774,7 @@ test "public graph metric borrowed wire validated fanout extents preserve ordere
 
 test "public graph metric borrowed wire lossy validated fanout index bounds scratch across many arrays" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const counters = @import("../../lite/test_allocator.zig");
     var raw: std.Io.Writer.Allocating = .init(a);
     defer raw.deinit();
@@ -1797,7 +1797,7 @@ test "public graph metric borrowed wire lossy validated fanout index bounds scra
 
 test "public graph metric borrowed wire escaped scalar emission uses fixed scratch and standard Unicode semantics" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const counters = @import("../../lite/test_allocator.zig");
     var raw = std.Io.Writer.Allocating.init(a);
     defer raw.deinit();
@@ -1839,7 +1839,7 @@ test "public graph metric borrowed wire escaped scalar emission uses fixed scrat
 
 test "public graph metric borrowed wire exact escaped output stays within bounded scratch for arena owners" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const counters = @import("../../lite/test_allocator.zig");
     var raw = std.Io.Writer.Allocating.init(a);
     defer raw.deinit();
@@ -1985,7 +1985,7 @@ test "public graph metric borrowed wire canonical span reuse respects source bou
 
 test "logical value conditional validated canonical strings preserve normalization and scope" {
     const a = std.testing.allocator;
-    const query = @import("../document_query.zig");
+    const query = @import("../document/query.zig");
     const Ranges = View.ValidatedRanges;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

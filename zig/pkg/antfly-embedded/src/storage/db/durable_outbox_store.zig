@@ -17,6 +17,7 @@
 //! mutation/apply fence when reading or clearing. Publication and HA policy
 //! are deliberately absent from this owner.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const docstore = @import("../docstore.zig");
 const outbox = @import("durable_outbox.zig");
@@ -69,10 +70,7 @@ pub fn clearPublished(store: *docstore.DocStore, key: []const u8) !void {
 }
 
 fn readOptional(alloc: Allocator, store: *docstore.DocStore, key: []const u8) !?[]u8 {
-    return store.get(alloc, key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(store.get(alloc, key));
 }
 
 test "storage.hot_standby durable outbox storage pages legacy and mutation obligations without broad deletion" {

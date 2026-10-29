@@ -571,7 +571,7 @@ pub fn reassignNamespaceWithMetadataAlloc(
     {
         var read = try store.beginReadTxn();
         defer read.abort();
-        try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+        try @import("artifact/reconcile_intent.zig").requireAbsent(&read);
     }
     try validateStoreAlloc(alloc, store);
 
@@ -584,10 +584,10 @@ pub fn reassignNamespaceWithMetadataAlloc(
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try @import("artifact_reconcile_intent.zig").requireAbsent(&txn);
+        try @import("artifact/reconcile_intent.zig").requireAbsent(&txn);
         if (try loadNamespaceTxn(&txn)) |previous| {
-            if (!previous.eql(namespace)) try @import("artifact_inventory.zig").invalidateOrdered(&txn);
-        } else try @import("artifact_inventory.zig").invalidateOrdered(&txn);
+            if (!previous.eql(namespace)) try @import("artifact/inventory.zig").invalidateOrdered(&txn);
+        } else try @import("artifact/inventory.zig").invalidateOrdered(&txn);
         try writeNamespaceTxn(&txn, namespace);
 
         for (ordinal_rows.items.items) |row| {
@@ -761,7 +761,7 @@ pub fn lookupOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, doc_ids: []const [
     }
     std.sort.pdq(PendingOrdinalLookup, pending, {}, PendingOrdinalLookup.lessThan);
 
-    var reads = try @import("document_read_scratch.zig").Scratch.init(descriptor_alloc, pending.len);
+    var reads = try @import("document/read_scratch.zig").Scratch.init(descriptor_alloc, pending.len);
     defer reads.deinit();
     const read_keys = reads.keys;
     const read_values = reads.values;

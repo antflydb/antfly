@@ -25,6 +25,7 @@
 //! delta path for incremental writes.
 
 const std = @import("std");
+const missingAsNull = @import("../storage/backend_types.zig").missingAsNull;
 
 /// DAAT reuses its current document's decision. Unordered spill passes may
 /// evict and re-probe, without retaining archive-sized decision bitmaps.
@@ -1352,13 +1353,6 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     return std.c.getenv(name);
 }
 
-fn envBoolEnabled(raw_z: [*:0]const u8) bool {
-    const raw = std.mem.span(raw_z);
-    return !(std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "false") or
-        std.ascii.eqlIgnoreCase(raw, "no"));
-}
-
 fn sparseSearchProfileEnabled() bool {
     const cached = sparse_search_profile_enabled_cache.load(.monotonic);
     if (cached != 0) return cached == 2;
@@ -1371,7 +1365,7 @@ fn sparseSearchProfileEnabled() bool {
         sparse_search_profile_enabled_cache.store(1, .monotonic);
         return false;
     };
-    const enabled = envBoolEnabled(raw_z);
+    const enabled = @import("antfly_platform").env.flagValue(std.mem.span(raw_z));
     sparse_search_profile_enabled_cache.store(if (enabled) 2 else 1, .monotonic);
     return enabled;
 }
@@ -2590,10 +2584,7 @@ pub const SparseIndex = struct {
         if (opts.lsm_options.backend.read_only) {
             var txn = try opened.store.beginRead();
             defer txn.abort();
-            const ndn_data = txn.get(metaKey(meta_next_doc_num)) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const ndn_data = try missingAsNull(txn.get(metaKey(meta_next_doc_num)));
             if (ndn_data) |d| {
                 next_doc_num = std.mem.readInt(u64, d[0..8], .little);
             }
@@ -2619,10 +2610,7 @@ pub const SparseIndex = struct {
             var txn = try opened.store.beginWrite();
             errdefer txn.abort();
 
-            const ndn_data = txn.get(metaKey(meta_next_doc_num)) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const ndn_data = try missingAsNull(txn.get(metaKey(meta_next_doc_num)));
             if (ndn_data) |d| {
                 next_doc_num = std.mem.readInt(u64, d[0..8], .little);
             }
@@ -4003,10 +3991,7 @@ pub const SparseIndex = struct {
                 // Bulk-built rows live in immutable docmaps and may have no
                 // mutable forward key. Check the complete identity lookup before
                 // treating a write as a new document.
-                const existing: ?u64 = self.lookupDocNumByDocId(&txn, write.doc_id) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const existing: ?u64 = try missingAsNull(self.lookupDocNumByDocId(&txn, write.doc_id));
                 if (existing != null) {
                     self.write_profile.existence_check_ns += elapsedSince(phase_start_ns);
                     txn.abort();
@@ -4188,10 +4173,7 @@ pub const SparseIndex = struct {
         var term_max_doc_id: ?[]const u8 = null;
 
         var phase_start_ns = nowNs();
-        const meta_data = txnGet(txn, self.dbi, mk) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const meta_data = try missingAsNull(txnGet(txn, self.dbi, mk));
         if (meta_data) |data| {
             const tm = decodeTermMeta(data);
             chunk_count = tm.chunk_count;
@@ -4201,10 +4183,7 @@ pub const SparseIndex = struct {
         }
         for (postings) |posting| max_weight = @max(max_weight, posting.weight);
         var range_key_buf: [256]u8 = undefined;
-        const existing_range_data = txnGet(txn, self.dbi, termRangeKey(&range_key_buf, term_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_range_data = try missingAsNull(txnGet(txn, self.dbi, termRangeKey(&range_key_buf, term_id)));
         if (existing_range_data) |data| {
             const range = try decodeChunkRangeMeta(data);
             updateBorrowedRangeBounds(&term_min_doc_id, &term_max_doc_id, range.min_doc_id, range.max_doc_id);
@@ -4216,10 +4195,7 @@ pub const SparseIndex = struct {
             const last_chunk_idx = chunk_count - 1;
             var ck_buf: [256]u8 = undefined;
             phase_start_ns = nowNs();
-            const chunk_data = txnGet(txn, self.dbi, invChunkKey(&ck_buf, term_id, last_chunk_idx)) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const chunk_data = try missingAsNull(txnGet(txn, self.dbi, invChunkKey(&ck_buf, term_id, last_chunk_idx)));
             if (chunk_data) |data| {
                 const decoded = try decodeChunk(alloc, data);
                 self.write_profile.chunk_read_ns += elapsedSince(phase_start_ns);
@@ -4242,10 +4218,7 @@ pub const SparseIndex = struct {
                     var chunk_min_doc_id: ?[]const u8 = null;
                     var chunk_max_doc_id: ?[]const u8 = null;
                     var meta_ck_buf: [256]u8 = undefined;
-                    const existing_chunk_range_data = txnGet(txn, self.dbi, invChunkMetaKey(&meta_ck_buf, term_id, last_chunk_idx)) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const existing_chunk_range_data = try missingAsNull(txnGet(txn, self.dbi, invChunkMetaKey(&meta_ck_buf, term_id, last_chunk_idx)));
                     if (existing_chunk_range_data) |range_data| {
                         const range = try decodeChunkRangeMeta(range_data);
                         updateBorrowedRangeBounds(&chunk_min_doc_id, &chunk_max_doc_id, range.min_doc_id, range.max_doc_id);
@@ -4382,10 +4355,7 @@ pub const SparseIndex = struct {
         if (preferred_doc_num) |doc_num_u32| {
             const doc_num: u64 = doc_num_u32;
             var rev_buf: [256]u8 = undefined;
-            const existing = txn.get(revKey(&rev_buf, doc_num)) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing = try missingAsNull(txn.get(revKey(&rev_buf, doc_num)));
             if (existing == null or std.mem.eql(u8, existing.?, doc_id)) {
                 if (doc_num >= self.next_doc_num) self.next_doc_num = doc_num + 1;
                 return doc_num;
@@ -4414,10 +4384,7 @@ pub const SparseIndex = struct {
         var max_weight: f32 = weight;
         var created_term = false;
 
-        const meta_data = txnGet(txn, self.dbi, mk) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const meta_data = try missingAsNull(txnGet(txn, self.dbi, mk));
         if (meta_data) |d| {
             const tm = decodeTermMeta(d);
             chunk_count = tm.chunk_count;

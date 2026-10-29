@@ -270,7 +270,7 @@ test "storage.hot_standby initial hidden FK HA payload preserves exact Raft rece
 fn validatePageFields(request: db_types.BatchRequest) !void {
     try @import("resolver_review.zig").validateRequest(request);
     try @import("merge_proof_adoption.zig").validateRequest(request);
-    try @import("artifact_inventory.zig").validateRequest(request);
+    try @import("artifact/inventory.zig").validateRequest(request);
     try @import("online_source_contract.zig").validateRequest(request);
     try @import("merge_page_contract.zig").validateRequest(request);
     if (request.merge_checkpoint) |checkpoint| {
@@ -618,13 +618,13 @@ pub fn encodeArtifactCatalogMutationRequestAlloc(alloc: Allocator, request: db_t
 
 pub fn encodeArtifactPublicationMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
     if (request.artifact_publication == null or entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
-    try @import("artifact_publication.zig").validateRequest(alloc, request);
+    try @import("artifact/publication.zig").validateRequest(alloc, request);
     return encodeBatchPayloadAlloc(alloc, BatchMutationPayload{ .schema_version = 14, .request = request, .artifact_publication_raft_entry = entry });
 }
 
 pub fn encodeArtifactPublicationTransportMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.OrderedApplyReceipt) ![]u8 {
     if (request.artifact_publication_transport == null or entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
-    try @import("artifact_publication_transport.zig").validateBatchRequest(request);
+    try @import("artifact/publication_transport.zig").validateBatchRequest(request);
     return encodeBatchPayloadAlloc(alloc, BatchMutationPayload{ .schema_version = 16, .request = request, .artifact_publication_transport_raft_entry = entry });
 }
 
@@ -685,7 +685,7 @@ test "storage.hot_standby ordered artifact inventory standby finalization carrie
 
 test "storage.hot_standby ordered artifact inventory standby baseline keeps discovery and apply cuts distinct" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
+    const publication = @import("artifact/publication.zig");
     const row = try @import("../internal_keys.zig").relationalRowKeyAlloc(alloc, "row\x00\xff");
     defer alloc.free(row);
     var command: publication.Command = .{
@@ -717,7 +717,7 @@ test "storage.hot_standby ordered artifact inventory standby baseline keeps disc
 
 test "storage.hot_standby ordered artifact inventory standby validation retains epoch repairs and exact apply identity" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
+    const publication = @import("artifact/publication.zig");
     var command: publication.Command = .{
         .mode = .validate_inputs,
         .namespace = @splat(1),
@@ -746,7 +746,7 @@ test "storage.hot_standby ordered artifact inventory standby validation retains 
 
 test "storage.hot_standby ordered artifact inventory standby census preserves page claims and exact apply identity" {
     const alloc = std.testing.allocator;
-    const publication = @import("artifact_publication.zig");
+    const publication = @import("artifact/publication.zig");
     var command: publication.Command = .{
         .mode = .census,
         .namespace = @splat(1),
@@ -844,12 +844,12 @@ pub fn decodeBatchMutationRequest(
     if ((parsed.value.schema_version == 16) != (parsed.value.artifact_publication_transport_raft_entry != null)) return error.InvalidBatchRequest;
     if (parsed.value.artifact_publication_transport_raft_entry) |entry| {
         if (entry.term == 0 or entry.index == 0 or parsed.value.restore_staging_bootstrap != null) return error.InvalidBatchRequest;
-        try @import("artifact_publication_transport.zig").validateBatchRequest(parsed.value.request);
+        try @import("artifact/publication_transport.zig").validateBatchRequest(parsed.value.request);
     }
     if ((parsed.value.schema_version == 14) != (parsed.value.artifact_publication_raft_entry != null)) return error.InvalidBatchRequest;
     if (parsed.value.artifact_publication_raft_entry) |entry| {
         if (entry.term == 0 or entry.index == 0 or parsed.value.restore_staging_bootstrap != null) return error.InvalidBatchRequest;
-        try @import("artifact_publication.zig").validateRequest(alloc, parsed.value.request);
+        try @import("artifact/publication.zig").validateRequest(alloc, parsed.value.request);
     }
     if ((parsed.value.schema_version == 12) != (parsed.value.artifact_catalog_raft_entry != null)) return error.InvalidArtifactCatalogCommand;
     if (parsed.value.artifact_catalog_raft_entry) |entry| if (entry.term == 0 or entry.index == 0) return error.InvalidArtifactCatalogCommand;
@@ -874,7 +874,7 @@ fn validateNativeTopologyPayload(alloc: Allocator, payload: BatchMutationPayload
         payload.initial_child_raft_entry != null or payload.graph_retirement_raft_entry != null or
         payload.restore_generation_admission_raft_entry != null or payload.online_source_applied_index != null or
         payload.restore_staging_bootstrap != null) return error.InvalidControlReceiptPosition;
-    try @import("native_topology_receipt.zig").validateRequest(alloc, payload.request);
+    try @import("native/topology_receipt.zig").validateRequest(alloc, payload.request);
     if (!stamp.namespace.eql(payload.request.relational_topology.?.fence.namespace)) return error.IdentityNamespaceMismatch;
 }
 

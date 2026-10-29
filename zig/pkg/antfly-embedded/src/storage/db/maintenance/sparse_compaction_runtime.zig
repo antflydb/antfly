@@ -17,7 +17,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
@@ -39,7 +39,7 @@ const UnsupportedSparseCompactionRuntime = struct {
     pub fn init(
         _: Allocator,
         _: *index_manager_mod.IndexManager,
-        _: *apply_rw_lock_mod.ApplyRwLock,
+        _: *WriterPreferringRwLock,
         _: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !@This() {
@@ -86,7 +86,7 @@ const PlatformSparseCompactionRuntime = struct {
     /// Borrowed backend-neutral executor owned by BackendRuntime.
     io: ?Io,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     config: Config,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -101,7 +101,7 @@ const PlatformSparseCompactionRuntime = struct {
     pub fn init(
         alloc: Allocator,
         index_manager: *index_manager_mod.IndexManager,
-        apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        apply_mutex: *WriterPreferringRwLock,
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !SparseCompactionRuntime {
@@ -261,7 +261,7 @@ const PlatformSparseCompactionRuntime = struct {
 /// apply lock.
 const MandatoryApplyRetirement = struct {
     io: Io,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     previous_cancel_protection: Io.CancelProtection,
     apply_lock_held: bool = true,
     cancellation_protected: bool = true,
@@ -384,7 +384,7 @@ test "sparse compaction propagates backend cancellation before task start" {
     var io_impl = Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var apply_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_lock: WriterPreferringRwLock = .{};
     var runtime: SparseCompactionRuntime = .{
         .alloc = std.testing.allocator,
         .io = io,
@@ -450,7 +450,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
         }
     };
     const Blocker = struct {
-        apply_lock: *apply_rw_lock_mod.ApplyRwLock,
+        apply_lock: *WriterPreferringRwLock,
         held: *std.atomic.Value(bool),
         release: *const std.atomic.Value(bool),
 
@@ -467,7 +467,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
     });
     defer io_impl.deinit();
     const io = io_impl.io();
-    var apply_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+    var apply_lock: WriterPreferringRwLock = .{};
     var runtime: SparseCompactionRuntime = .{
         .alloc = std.testing.allocator,
         .io = io,

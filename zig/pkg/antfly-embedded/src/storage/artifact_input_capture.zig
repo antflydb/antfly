@@ -17,7 +17,7 @@
 //! including coordinated transaction resolution, rather than at one API path.
 const std = @import("std");
 const keys = @import("internal_keys.zig");
-const publication = @import("db/artifact_publication.zig");
+const publication = @import("db/artifact/publication.zig");
 const authority = @import("source_authority.zig");
 
 pub const Capture = struct {
@@ -123,7 +123,7 @@ pub const Capture = struct {
         if (self.selected == null) return;
         if (artifact) {
             if (self.artifacts.contains(key)) return;
-            const document = try @import("db/artifact_publication_owner.zig").documentAlloc(alloc, key);
+            const document = try @import("db/artifact/publication_owner.zig").documentAlloc(alloc, key);
             var owned = true;
             defer if (owned) alloc.free(document);
             const owner = try self.artifact_owners.getOrPut(alloc, document);
@@ -132,17 +132,17 @@ pub const Capture = struct {
             // including insertions and deletions beyond their current cursor.
             // The manifest need not exist: its revision is a prefix witness,
             // not proof that an inventory or producer output was completed.
-            if (try @import("db/artifact_chunk_manifest.zig").keyForMemberAlloc(alloc, key)) |stream| {
+            if (try @import("db/artifact/chunk_manifest.zig").keyForMemberAlloc(alloc, key)) |stream| {
                 defer alloc.free(stream);
                 try self.rememberArtifact(alloc, stream);
             }
-            if (@import("db/artifact_generation_scope.zig").isHead(key)) {
+            if (@import("db/artifact/generation_scope.zig").isHead(key)) {
                 // Head publication changes logical stream membership even if
                 // every legacy physical key is unchanged. Invalidate both the
                 // exact head proof and the whole-stream reconstruction witness.
                 const stream = try alloc.dupe(u8, key);
                 defer alloc.free(stream);
-                stream[keys.findComponentTerminator(stream, 1).? + 2] = try @import("db/artifact_generation_scope.zig").manifestKindForHead(key);
+                stream[keys.findComponentTerminator(stream, 1).? + 2] = try @import("db/artifact/generation_scope.zig").manifestKindForHead(key);
                 try self.rememberArtifact(alloc, stream);
             }
             if (@import("db/online_graph_artifacts.zig").isKey(key)) {
@@ -195,13 +195,13 @@ pub const Capture = struct {
         const encoded = try position.encode();
         const replay_sequence = if (!self.replay_ambiguous and self.replay_sequence != null and self.replay_next != null and
             self.replay_sequence.? != std.math.maxInt(u64) and self.replay_next.? == self.replay_sequence.? + 1) self.replay_sequence else null;
-        if (replay_sequence == null) try @import("db/artifact_source_gap.zig").record(txn);
+        if (replay_sequence == null) try @import("db/artifact/source_gap.zig").record(txn);
         const materialization = try (publication.Materialization{ .position = position, .replay_sequence = replay_sequence }).encode();
         var iter = self.documents.keyIterator();
         while (iter.next()) |document| {
             try txn.put(&publication.inputRevisionKey(expected.namespace, document.*), &encoded);
             try txn.put(&publication.materializationRevisionKey(expected.namespace, document.*), &materialization);
-            _ = try @import("db/artifact_producer_obligations.zig").mark(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected, document.*, position);
+            _ = try @import("db/artifact/producer_obligations.zig").mark(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected, document.*, position);
         }
         var artifacts = self.artifacts.keyIterator();
         while (artifacts.next()) |artifact| try txn.put(&publication.artifactRevisionKey(expected.namespace, artifact.*), &encoded);
@@ -219,11 +219,11 @@ pub const Capture = struct {
                 // preserving its PRIMARY position rather than substituting
                 // this artifact publication's materialization position.
                 const input_position = try publication.inputRevision(txn, expected.namespace, document.*);
-                _ = try @import("db/artifact_producer_obligations.zig").mark(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected, document.*, input_position);
+                _ = try @import("db/artifact/producer_obligations.zig").mark(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected, document.*, input_position);
             }
         }
-        if (try @import("db/artifact_producer_obligations.zig").load(txn) != null)
-            try @import("db/artifact_producer_validation.zig").invalidate(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected);
+        if (try @import("db/artifact/producer_obligations.zig").load(txn) != null)
+            try @import("db/artifact/producer_validation.zig").invalidate(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected);
         self.staged = true;
     }
 };
@@ -271,10 +271,10 @@ test "ordered artifact inventory input capture requires same transaction authori
         defer txn.deinit();
         try authority.bind(&txn, kind, namespace);
         try publication.stageAuthority(&txn, activation);
-        const obligations = @import("db/artifact_producer_obligations.zig");
+        const obligations = @import("db/artifact/producer_obligations.zig");
         const active = (try publication.authority(&txn)).?;
         try obligations.begin(alloc, &txn, active);
-        try @import("db/artifact_producer_validation.zig").begin(alloc, &txn, active);
+        try @import("db/artifact/producer_validation.zig").begin(alloc, &txn, active);
         var capture: Capture = .{};
         defer capture.deinit(alloc);
         try capture.touch(alloc, &txn, document, "row");
@@ -305,7 +305,7 @@ test "ordered artifact inventory input capture requires same transaction authori
         const original_work = (try obligations.lookupWork(alloc, &txn, active, "doc")).?;
         try obligations.complete(alloc, &txn, active, original_work);
         try std.testing.expectEqual(@as(u64, 0), (try obligations.load(&txn)).?.pending_documents);
-        const manifests = @import("db/artifact_chunk_manifest.zig");
+        const manifests = @import("db/artifact/chunk_manifest.zig");
         const root = try manifests.keyAlloc(alloc, "doc", "chunks");
         defer alloc.free(root);
         const unit = try manifests.scopedKeyAlloc(alloc, "doc", "chunks", "unit\x00");
@@ -332,7 +332,7 @@ test "ordered artifact inventory input capture requires same transaction authori
         defer alloc.free(head);
         head[keys.findComponentTerminator(head, 1).? + 2] = keys.producer_generation_head_kind;
         try chunk_capture.touch(alloc, &txn, head, null);
-        const extraction = try @import("db/artifact_generation_scope.zig").extractionKeyAlloc(alloc, "doc", "chunks");
+        const extraction = try @import("db/artifact/generation_scope.zig").extractionKeyAlloc(alloc, "doc", "chunks");
         defer alloc.free(extraction);
         const extraction_head = try alloc.dupe(u8, extraction);
         defer alloc.free(extraction_head);

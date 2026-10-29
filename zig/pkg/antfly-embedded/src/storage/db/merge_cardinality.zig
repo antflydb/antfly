@@ -17,6 +17,7 @@
 //! outside that ownership. The bounded record and row effects commit together;
 //! cancellation restores the continuously maintained base count in O(1).
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const Store = @import("../docstore.zig").DocStore;
 const KV = @import("../docstore.zig").KVPair;
@@ -47,19 +48,13 @@ pub fn prepare(alloc: Allocator, store: *Store, req: types.BatchRequest, checkpo
     const admitted_checkpoint = if (checkpoint_applied) req.merge_checkpoint else null;
     var txn = try store.beginProbeTxn();
     defer txn.abort();
-    const raw = txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw = try missingAsNull(txn.get(key));
     if (raw == null and admitted_checkpoint == null) return false;
     if (raw) |value| {
         if (value.len != 17 or value[16] > 2) return error.InvalidRangeDocumentCount;
         if (value[16] == 2 and admitted_checkpoint == null) return false;
     }
-    const state_raw = txn.get(merge.key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const state_raw = try missingAsNull(txn.get(merge.key));
     var state = if (state_raw) |value| try merge.decodeAlloc(alloc, value) else null;
     defer if (state) |*value| value.deinit(alloc);
     if (admitted_checkpoint) |checkpoint| if (checkpoint.kind == .accept and

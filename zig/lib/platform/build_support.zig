@@ -74,6 +74,8 @@ pub fn addTests(b: *std.Build, options: struct {
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
     link_libc: bool,
+    /// Deterministic scheduler for the rw_lock interleaving tests.
+    vopr: *std.Build.Module,
 }) struct {
     unit: *std.Build.Step.Run,
     process: ?*std.Build.Step,
@@ -102,6 +104,15 @@ pub fn addTests(b: *std.Build, options: struct {
         .optimize = optimize,
     }) });
     const run_entropy_tests = b.addRunArtifact(entropy_tests);
+    // Lock helpers, the writer-preferring rw lock, admission waiters and
+    // coalesced signals.
+    const sync_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/sync.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "vopr", .module = options.vopr }},
+    }) });
+    const run_sync_tests = b.addRunArtifact(sync_tests);
     const resource_policy_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = options.root.path(b, "src/resource_policy.zig"),
         .target = target,
@@ -112,6 +123,7 @@ pub fn addTests(b: *std.Build, options: struct {
     run_unit.step.dependOn(&run_resource_policy_tests.step);
     run_unit.step.dependOn(&run_atomic_tests.step);
     run_unit.step.dependOn(&run_entropy_tests.step);
+    run_unit.step.dependOn(&run_sync_tests.step);
     const one_shot = b.createModule(.{
         .root_source_file = options.root.path(b, "src/one_shot_process.zig"),
         .target = target,

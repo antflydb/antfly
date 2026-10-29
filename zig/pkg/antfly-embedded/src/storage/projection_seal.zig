@@ -26,7 +26,7 @@ pub const Seal = struct {
     applied_sequence: u64,
     /// Issued only by complete snapshot construction plus fenced replay, never
     /// by ordinary incremental replay or a clean external sidecar.
-    baseline: ?@import("db/artifact_source_gap.zig").Guard = null,
+    baseline: ?@import("db/artifact/source_gap.zig").Guard = null,
     pub const Encoded = [254]u8;
 
     pub fn sameIdentity(self: Seal, other: Seal) bool {
@@ -56,7 +56,7 @@ pub const Seal = struct {
 
     pub fn decode(raw: []const u8) !Seal {
         if (raw.len != @sizeOf(Encoded) or !std.mem.eql(u8, raw[0..4], "APS2") or raw[68] > 1 or (raw[68] == 0 and !std.mem.allEqual(u8, raw[69..222], 0))) return error.InvalidProjectionSeal;
-        const result: Seal = .{ .root = std.mem.readInt(u128, raw[4..20], .little), .namespace = raw[20..44].*, .generation = std.mem.readInt(u64, raw[44..52], .little), .config_hash = std.mem.readInt(u64, raw[52..60], .little), .applied_sequence = std.mem.readInt(u64, raw[60..68], .little), .baseline = if (raw[68] == 1) @import("db/artifact_source_gap.zig").Guard.decode(raw[69..222]) catch return error.InvalidProjectionSeal else null };
+        const result: Seal = .{ .root = std.mem.readInt(u128, raw[4..20], .little), .namespace = raw[20..44].*, .generation = std.mem.readInt(u64, raw[44..52], .little), .config_hash = std.mem.readInt(u64, raw[52..60], .little), .applied_sequence = std.mem.readInt(u64, raw[60..68], .little), .baseline = if (raw[68] == 1) @import("db/artifact/source_gap.zig").Guard.decode(raw[69..222]) catch return error.InvalidProjectionSeal else null };
         if (!std.mem.eql(u8, raw, &try result.encode())) return error.InvalidProjectionSeal;
         return result;
     }

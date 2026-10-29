@@ -75,7 +75,7 @@ pub fn rawDescriptor(alloc: std.mem.Allocator, reader: anytype, object_size: u64
     const public_key = try alloc.alloc(u8, key_len);
     defer alloc.free(public_key);
     try exact(reader, position.object, key_offset, public_key);
-    const ids = @import("artifact_ids.zig");
+    const ids = @import("artifact/ids.zig");
     var ref = (try ids.decodeArtifactPublicIdAlloc(alloc, public_key)) orelse return error.SourceSnapshotCorrupt;
     defer ref.deinit(alloc);
     const key: ?[]u8 = if (ref.kind == .embedding) vector: {

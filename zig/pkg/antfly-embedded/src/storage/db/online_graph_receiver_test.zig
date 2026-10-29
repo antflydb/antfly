@@ -25,7 +25,7 @@ const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 test "online graph snapshot receiver rebinds native effects without changing source receipts after restart" {
     const alloc = std.testing.allocator;
     const pages = @import("merge_page_contract.zig");
-    const inventory = @import("artifact_inventory.zig");
+    const inventory = @import("artifact/inventory.zig");
     const source_catalog = @import("merge_artifact_catalog.zig");
     var source_dir = try TestDirectory.init("graph-copy-source-layout");
     defer source_dir.cleanup();

@@ -16,7 +16,7 @@
 //! Attempt-bound source layouts. The receiver installs these once, atomically
 //! with its page receipt, rather than consulting a live donor during apply.
 const std = @import("std");
-const inventory = @import("artifact_inventory.zig");
+const inventory = @import("artifact/inventory.zig");
 const pages = @import("merge_page_contract.zig");
 pub const key = "\x00\x00__metadata__:raftmerge:artifact_source_catalog";
 pub const Record = struct {

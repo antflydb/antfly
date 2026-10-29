@@ -1173,25 +1173,25 @@
       "source": "const reader = try std.Thread.spawn(.{}, Reader.run, .{ &idx, &stop });"
     },
     {
-      "file": "zig/pkg/antfly/src/storage/db/apply_rw_lock.zig",
+      "file": "zig/lib/platform/src/rw_lock.zig",
       "line": 357,
       "category": "test/helper",
       "source": "const writer_thread = try std.Thread.spawn(.{}, Context.writer, .{&ctx});"
     },
     {
-      "file": "zig/pkg/antfly/src/storage/db/apply_rw_lock.zig",
+      "file": "zig/lib/platform/src/rw_lock.zig",
       "line": 360,
       "category": "test/helper",
       "source": "const reader_thread = try std.Thread.spawn(.{}, Context.reader, .{&ctx});"
     },
     {
-      "file": "zig/pkg/antfly/src/storage/db/apply_rw_lock.zig",
+      "file": "zig/lib/platform/src/rw_lock.zig",
       "line": 568,
       "category": "test/helper",
       "source": "const writer_thread = try std.Thread.spawn(.{}, Context.writerThread, .{&ctx});"
     },
     {
-      "file": "zig/pkg/antfly/src/storage/db/apply_rw_lock.zig",
+      "file": "zig/lib/platform/src/rw_lock.zig",
       "line": 619,
       "category": "test/helper",
       "source": "const writer_thread = try std.Thread.spawn(.{}, Context.writer, .{&ctx});"
@@ -1611,7 +1611,7 @@
       "source": "const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, &cache });"
     },
     {
-      "file": "zig/pkg/antfly/src/storage/mem_ordered.zig",
+      "file": "zig/pkg/antfly-embedded/src/storage/mem_backend/ordered.zig",
       "line": 755,
       "category": "test/helper",
       "source": "for (&threads, &workers) |*t, *w| t.* = try std.Thread.spawn(.{}, Worker.run, .{w});"

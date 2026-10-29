@@ -21,7 +21,7 @@ const runtime_preflight = @import("runtime_preflight.zig");
 const runtime_callbacks = @import("runtime_callbacks.zig");
 const structured_filter_validation = @import("query/structured_filter_validation.zig");
 const replication_contract = @import("replication_contract.zig");
-const document_artifact_child_range = @import("document_artifact_child_range.zig");
+const document_artifact_child_range = @import("document/artifact_child_range.zig");
 
 pub const types = @import("types.zig");
 pub const coordinated_ttl = @import("../coordinated_ttl.zig");
@@ -35,7 +35,7 @@ pub const logical_snapshot_manifest_file_name = @import("../backup_codec.zig").l
 pub const query_metrics = @import("query_metrics.zig");
 pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
 pub const documentExtractionStoredUnitFingerprintAlloc = @import("enrichment/document_unit_fingerprint.zig").storedPayloadLegacyFingerprintAlloc;
-pub const document_query = @import("document_query.zig");
+pub const document_query = @import("document/query.zig");
 
 /// Physical DB values may occur in legacy-only lazy declarations in shared
 /// source files. Making the type opaque keeps those declarations parseable

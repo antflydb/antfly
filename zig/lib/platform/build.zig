@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
+        .vopr = b.dependency("vopr", .{ .target = target, .optimize = optimize }).module("vopr"),
     });
     const test_step = b.step("test", "Run supervisor unit and process-lifecycle tests (Python 3 on POSIX)");
     test_step.dependOn(&tests.unit.step);

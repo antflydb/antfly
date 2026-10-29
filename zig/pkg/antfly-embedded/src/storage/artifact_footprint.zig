@@ -17,6 +17,7 @@
 //! Mutations never infer absence. Only a complete bounded key walk, whose
 //! per-family mutation epoch still matches at commit, may certify absence.
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const keys = @import("internal_keys.zig");
 pub const key = "\x00\x00__metadata__:artifact_footprint_v1";
 pub const scan_key = "\x00\x00__metadata__:artifact_footprint_scan_v1";
@@ -196,10 +197,7 @@ pub fn reconcilePage(alloc: std.mem.Allocator, store: anytype) !bool {
     defer read.abort();
     const initial = try load(&read);
     if (initial.certified == all) return true;
-    const previous = read.get(scan_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const previous = try missingAsNull(read.get(scan_key));
     var scan: Scan = if (previous) |raw| try Scan.decode(raw) else .{ .epochs = initial.epochs };
     var cursor = try read.openPhysicalCursorAdapter();
     defer cursor.close();
@@ -225,10 +223,7 @@ pub fn reconcilePage(alloc: std.mem.Allocator, store: anytype) !bool {
     if (count != 0) scan.cursor = last.items;
     var write = try store.beginWriteTxn();
     errdefer write.abort();
-    const current_progress = write.get(scan_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const current_progress = try missingAsNull(write.get(scan_key));
     const same = if (previous) |old| if (current_progress) |now| std.mem.eql(u8, old, now) else false else current_progress == null;
     if (!same) {
         write.abort();

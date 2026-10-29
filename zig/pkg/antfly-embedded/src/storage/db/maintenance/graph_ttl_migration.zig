@@ -16,6 +16,7 @@
 //! Bounded, transactional relocation of the legacy mixed expiry/promotion
 //! family. Reader epoch 4 excludes writers that could append old expiry keys.
 const std = @import("std");
+const missingAsNull = @import("../../backend_types.zig").missingAsNull;
 const erased = @import("../../backend_erased.zig");
 const keys = @import("../../internal_keys.zig");
 const expiration = @import("../graph_edge_ttl_expiration.zig");
@@ -27,10 +28,7 @@ pub const Limits = struct { keys: usize = 4096, bytes: usize = 4 * 1024 * 1024 }
 const Move = struct { old: []const u8, key: []const u8, value: []const u8 };
 
 fn optionalGet(txn: anytype, key: []const u8) !?[]const u8 {
-    return txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(txn.get(key));
 }
 fn same(a: ?[]const u8, b: ?[]const u8) bool {
     return if (a) |left| if (b) |right| std.mem.eql(u8, left, right) else false else b == null;

@@ -1074,7 +1074,7 @@ fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {
     };
     var plan = try tuples.TuplePlan.init(test_alloc, table, &layout, &keys);
     defer plan.deinit();
-    var prepared = try @import("document_mapper.zig").PreparedRelationalWrite.init(test_alloc, "a", "{\"id\":7,\"price\":9007199254740993,\"label\":\"ALPHA\"}", null, table, &layout);
+    var prepared = try @import("document/mapper.zig").PreparedRelationalWrite.init(test_alloc, "a", "{\"id\":7,\"price\":9007199254740993,\"label\":\"ALPHA\"}", null, table, &layout);
     defer prepared.deinit(test_alloc);
     var encoded = try plan.encodeAlloc(test_alloc, try prepared.typedView(table, &layout));
     defer encoded.deinit(test_alloc);
@@ -1088,7 +1088,7 @@ fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {
     defer old_layout.deinit();
     var projected = try plan.projectSource(test_alloc, historical, &old_layout);
     defer projected.deinit();
-    var old_prepared = try @import("document_mapper.zig").PreparedRelationalWrite.init(test_alloc, "a", "{\"id\":7,\"price\":9007199254740993,\"label\":\"ALPHA\"}", null, historical, &old_layout);
+    var old_prepared = try @import("document/mapper.zig").PreparedRelationalWrite.init(test_alloc, "a", "{\"id\":7,\"price\":9007199254740993,\"label\":\"ALPHA\"}", null, historical, &old_layout);
     defer old_prepared.deinit(test_alloc);
     var old_encoded = try projected.encodeAlloc(test_alloc, try old_prepared.typedView(historical, &old_layout));
     defer old_encoded.deinit(test_alloc);
@@ -1132,7 +1132,7 @@ test "relational index system expression keys fence declarations dependency chan
     @memset(wide, 'x');
     const json = try std.json.Stringify.valueAlloc(alloc, .{ .label = wide }, .{});
     defer alloc.free(json);
-    var prepared = try @import("document_mapper.zig").PreparedRelationalWrite.init(alloc, "a", json, null, table, &layout);
+    var prepared = try @import("document/mapper.zig").PreparedRelationalWrite.init(alloc, "a", json, null, table, &layout);
     defer prepared.deinit(alloc);
     var output = std.ArrayList(u8).empty;
     defer output.deinit(alloc);
@@ -1555,7 +1555,7 @@ fn partialPreparationAllocations(test_alloc: std.mem.Allocator) !void {
         "{\"id\":9007199254740994,\"label\":null}",
         "{\"id\":9007199254740994,\"label\":\"Alpha\"}",
     }, 0..) |json, i| {
-        var prepared = try @import("document_mapper.zig").PreparedRelationalWrite.init(test_alloc, "a", json, null, view.tableSchema().*, view.physicalLayout());
+        var prepared = try @import("document/mapper.zig").PreparedRelationalWrite.init(test_alloc, "a", json, null, view.tableSchema().*, view.physicalLayout());
         defer prepared.deinit(test_alloc);
         _ = try batch.appendPrepared(&prepared);
         const key = try batch.key(i, 0);

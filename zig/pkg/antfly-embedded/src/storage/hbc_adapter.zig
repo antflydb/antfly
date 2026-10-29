@@ -29,6 +29,7 @@
 //!   "hbc_vecs"   - vector metadata and legacy/index-local raw vectors keyed by vector ID
 
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -53,7 +54,7 @@ const backend_types = @import("backend_types.zig");
 const hbc_backend = @import("hbc_backend.zig");
 const posting_segment_store_mod = @import("posting_segment_store.zig");
 const resource_manager_mod = @import("resource_manager.zig");
-const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const lsm_backend = @import("lsm_backend/mod.zig");
 const platform_time = @import("antfly_platform").time;
 const vec = @import("antfly_vector").vector;
@@ -523,7 +524,7 @@ fn releaseMetadataCacheEntry(alloc: Allocator, entry: *MetadataCacheEntry) void 
 
 const BorrowedNodeLease = union(enum) {
     locked: struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         node: *const Node,
     },
     retained: struct {
@@ -549,7 +550,7 @@ const BorrowedNodeLease = union(enum) {
 
 const BorrowedQuantizedLease = union(enum) {
     locked: struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         quantized: *const QuantizedSet,
     },
     retained: struct {
@@ -575,7 +576,7 @@ const BorrowedQuantizedLease = union(enum) {
 
 const BorrowedVectorLease = union(enum) {
     locked: struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         vector: []const f32,
     },
     retained: struct {
@@ -601,7 +602,7 @@ const BorrowedVectorLease = union(enum) {
 
 const BorrowedMetadataLease = union(enum) {
     locked: struct {
-        lock: *apply_rw_lock_mod.ApplyRwLock,
+        lock: *WriterPreferringRwLock,
         metadata: []const u8,
     },
     retained: struct {
@@ -828,7 +829,7 @@ fn noteHbcKindEviction(stats: *HbcCacheStats, kind: HbcCacheKind) void {
 
 /// Read-optimized ownership fence for the process-wide HBC cache maps.
 ///
-/// `ApplyRwLock` intentionally provides a writer-preferring service fence for
+/// `WriterPreferringRwLock` intentionally provides a writer-preferring service fence for
 /// apply/runtime coordination, but its shared path takes two mutexes and
 /// updates several global telemetry atomics. A vector query can perform
 /// hundreds of cache lookups, so that design turns read-only hits into one
@@ -1020,7 +1021,7 @@ const CacheRwLock = struct {
         self.writer_gate.unlock();
     }
 
-    fn snapshot(self: *const @This()) apply_rw_lock_mod.ApplyRwLock.Stats {
+    fn snapshot(self: *const @This()) WriterPreferringRwLock.Stats {
         return .{
             // Deliberately zero: exact shared telemetry would reintroduce a
             // globally written cache line on every vector hit.
@@ -2753,10 +2754,7 @@ const ExperimentalPostingReadState = struct {
     fn resolveValueAlloc(self: *ExperimentalPostingReadState, alloc: Allocator, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !?ExperimentalPostingResolvedValue {
         if (self.materialized.get(experimentalPostingValueKey(posting_id, kind))) |stored|
             return if (stored.bytes) |bytes| .{ .bytes = bytes } else null;
-        return self.resolveSegmentValueAlloc(alloc, self.segments.len, posting_id, kind) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(self.resolveSegmentValueAlloc(alloc, self.segments.len, posting_id, kind));
     }
 
     fn hasValue(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !bool {
@@ -5320,7 +5318,7 @@ pub const HBCIndex = struct {
     // the shared side for progress. Shared acquisition and odd-generation
     // waits are cooperative through std.Io. Best-effort searches remain
     // lock-free.
-    published_snapshot_mu: apply_rw_lock_mod.ApplyRwLock = .{},
+    published_snapshot_mu: WriterPreferringRwLock = .{},
     published_mutation_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Seqlock-style epoch for optimistic complete-snapshot searches. Every
     /// mutation, including an aborted one that leaves the durable generation
@@ -5395,7 +5393,7 @@ pub const HBCIndex = struct {
     cache_enabled: bool = true,
     retained_vector_cache_enabled: bool = true,
     bypass_external_vector_cache: bool = false,
-    cache_mu: apply_rw_lock_mod.ApplyRwLock,
+    cache_mu: WriterPreferringRwLock,
     active_searches: std.atomic.Value(u32),
     // Invalidations advance this epoch before touching the shared cache. A
     // rerank batch can therefore admit vectors read from one primary snapshot
@@ -9369,10 +9367,7 @@ pub const HBCIndex = struct {
             return if (captured) |blob| blob.bytes() else null;
         }
         const generation = self.experimental_posting_mutation_base_generation orelse return null;
-        return generation.value(vector_id, .vector_metadata) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        return try missingAsNull(generation.value(vector_id, .vector_metadata));
     }
 
     fn setCapturedExactVectorMutation(
@@ -11020,10 +11015,7 @@ pub const HBCIndex = struct {
         for (vector_ids.items, metadata_values.items, projection_values.items, 0..) |*vector_id, *metadata_value, *projection, i| {
             const offset = i * @sizeOf(u64);
             vector_id.* = std.mem.readInt(u64, member_id_bytes[offset..][0..@sizeOf(u64)], .little);
-            metadata_value.* = generation.value(vector_id.*, .vector_metadata) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            metadata_value.* = try missingAsNull(generation.value(vector_id.*, .vector_metadata));
             projection.* = .{};
         }
         projection_source.loader(
@@ -13217,19 +13209,13 @@ pub const HBCIndex = struct {
         if (comptime Child == vectorindex_store.NamespaceReadTxn) {
             if (txn.read_lease != null) {
                 for (keys, values) |key, *value| {
-                    value.* = self.getNamespaced(txn, namespace, key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    value.* = try missingAsNull(self.getNamespaced(txn, namespace, key));
                 }
                 return;
             }
         } else if (self.experimental_posting_mutation_base_generation != null) {
             for (keys, values) |key, *value| {
-                value.* = self.getNamespaced(txn, namespace, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                value.* = try missingAsNull(self.getNamespaced(txn, namespace, key));
             }
             return;
         }
@@ -18216,10 +18202,7 @@ pub const HBCIndex = struct {
                     } else {
                         for (ids, 0..) |id, i| {
                             if (resolved[i]) continue;
-                            values[i] = state.value(id, .vector_metadata) catch |err| switch (err) {
-                                error.NotFound => null,
-                                else => return err,
-                            };
+                            values[i] = try missingAsNull(state.value(id, .vector_metadata));
                         }
                     }
                     return;

@@ -718,6 +718,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_proof_registry.zig"),
         .target = antfly_test_mod.resolved_target,
         .optimize = antfly_test_mod.optimize,
+        .imports = &.{.{ .name = "antfly_platform", .module = antfly_test_mod.import_table.get("antfly_platform").? }},
     }) });
     const source_proof_run = b.addRunArtifact(source_proof_tests);
     logical_db_step.dependOn(&source_proof_run.step);

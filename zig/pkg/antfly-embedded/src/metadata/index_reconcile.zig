@@ -830,8 +830,4 @@ pub fn skipPublicIndexMetadataField(kind: db_mod.types.IndexKind, field: []const
     return table_index_config.isCatalogMetadataField(kind, field);
 }
 
-pub fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+pub const appendJsonString = @import("../api/json_helpers.zig").appendJsonString;

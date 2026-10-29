@@ -17,7 +17,7 @@ const std = @import("std");
 
 test "ordered artifact inventory private batch roundtrip rejects public and mixed requests" {
     const alloc = std.testing.allocator;
-    const inventory = @import("../storage/db/artifact_inventory.zig");
+    const inventory = @import("../storage/db/artifact/inventory.zig");
     const catalogs: inventory.Catalogs = .{ .indexes = "AIDX\x02\x00\x00\x00\x00\x00\x00\x00", .enrichments = "[]", .resolvers = "[]" };
     const request: db_mod.types.BatchRequest = .{ .artifact_catalog = .{ .namespace = @splat(1), .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) }, .catalogs = catalogs } };
     const encoded = try encodeBatchRequest(alloc, request);
@@ -61,7 +61,7 @@ test "ordered artifact inventory private batch roundtrip rejects public and mixe
 }
 test "artifact publication upload control is private, bounded, and single purpose" {
     const alloc = std.testing.allocator;
-    const transport = @import("../storage/db/artifact_publication_transport.zig");
+    const transport = @import("../storage/db/artifact/publication_transport.zig");
     const hash = transport.chunkDigest(0, "data");
     const hashes = [_]transport.Digest{hash};
     const request: db_mod.types.BatchRequest = .{ .artifact_publication_transport = .{ .action = .begin, .namespace = @splat(1), .publication_digest = @splat(2), .command_digest = @splat(3), .encoded_len = 4, .chunk_hashes = &hashes } };
@@ -93,7 +93,7 @@ test "artifact publication upload control is private, bounded, and single purpos
 }
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const ant_json = @import("antfly-json");
-const document_mapper = @import("../storage/db/document_mapper.zig");
+const document_mapper = @import("../storage/db/document/mapper.zig");
 const public_limits = @import("antfly_public_limits");
 const merge_pages = @import("../storage/db/merge_page_contract.zig");
 const MergePageEffects = struct { writes: []db_mod.types.BatchWrite, deletes: [][]const u8 };
@@ -448,9 +448,9 @@ pub const OwnedBatchRequest = struct {
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
-    artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
-    artifact_publication: ?std.json.Parsed(@import("../storage/db/artifact_publication.zig").Command) = null,
-    artifact_publication_transport: ?std.json.Parsed(@import("../storage/db/artifact_publication_transport.zig").Request) = null,
+    artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact/inventory.zig").Command) = null,
+    artifact_publication: ?std.json.Parsed(@import("../storage/db/artifact/publication.zig").Command) = null,
+    artifact_publication_transport: ?std.json.Parsed(@import("../storage/db/artifact/publication_transport.zig").Request) = null,
     merge_proof_adoption: ?std.json.Parsed(@import("../storage/db/merge_proof_adoption.zig").Command) = null,
     transaction_participants: [][]const u8 = &.{},
     split_checkpoint_range_start: ?[]u8 = null,
@@ -463,7 +463,7 @@ pub const OwnedBatchRequest = struct {
     merge_artifacts: ?std.json.Parsed([]const db_mod.types.BatchWrite) = null,
     merge_page: ?std.json.Parsed(merge_pages.Command) = null,
     merge_page_effects: ?std.json.Parsed(MergePageEffects) = null,
-    merge_source_catalogs: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Catalogs) = null,
+    merge_source_catalogs: ?std.json.Parsed(@import("../storage/db/artifact/inventory.zig").Catalogs) = null,
     req: db_mod.types.BatchRequest = .{},
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
@@ -813,7 +813,7 @@ fn parseBatchRequestWithOptions(
         if (marker != .object) return error.InvalidBatchRequest;
         const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
         if (kind != .string) return error.InvalidBatchRequest;
-        break :control @as(?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command), try std.json.parseFromValue(@import("../storage/db/artifact_inventory.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+        break :control @as(?std.json.Parsed(@import("../storage/db/artifact/inventory.zig").Command), try std.json.parseFromValue(@import("../storage/db/artifact/inventory.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (artifact_catalog) |*control| control.deinit();
     var group_source = if (root.get("_group_source")) |value| control: {
@@ -846,10 +846,10 @@ fn parseBatchRequestWithOptions(
         if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
         const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
         if (kind != .string or !std.mem.eql(u8, kind.string, "artifact_publication_v1")) return error.InvalidBatchRequest;
-        const publication_parsed = try std.json.parseFromValue(@import("../storage/db/artifact_publication.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        const publication_parsed = try std.json.parseFromValue(@import("../storage/db/artifact/publication.zig").Command, alloc, value, .{ .allocate = .alloc_always });
         errdefer publication_parsed.deinit();
         try publication_parsed.value.validate(alloc);
-        break :control @as(?std.json.Parsed(@import("../storage/db/artifact_publication.zig").Command), publication_parsed);
+        break :control @as(?std.json.Parsed(@import("../storage/db/artifact/publication.zig").Command), publication_parsed);
     } else null;
     errdefer if (artifact_publication) |*control| control.deinit();
     var artifact_publication_transport = if (root.get("_artifact_publication_transport")) |value| control: {
@@ -858,10 +858,10 @@ fn parseBatchRequestWithOptions(
         if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
         const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
         if (kind != .string or !std.mem.eql(u8, kind.string, "artifact_publication_transport_v1")) return error.InvalidBatchRequest;
-        const transport_parsed = try std.json.parseFromValue(@import("../storage/db/artifact_publication_transport.zig").Request, alloc, value, .{ .allocate = .alloc_always });
+        const transport_parsed = try std.json.parseFromValue(@import("../storage/db/artifact/publication_transport.zig").Request, alloc, value, .{ .allocate = .alloc_always });
         errdefer transport_parsed.deinit();
         try transport_parsed.value.validate();
-        break :control @as(?std.json.Parsed(@import("../storage/db/artifact_publication_transport.zig").Request), transport_parsed);
+        break :control @as(?std.json.Parsed(@import("../storage/db/artifact/publication_transport.zig").Request), transport_parsed);
     } else null;
     errdefer if (artifact_publication_transport) |*control| control.deinit();
     var merge_proof_adoption = if (root.get("_merge_proof_adoption")) |value| control: {
@@ -1212,7 +1212,7 @@ fn parseBatchRequestWithOptions(
     var merge_receiver_base_end: ?[]u8 = null;
     errdefer if (merge_receiver_base_end) |value| alloc.free(value);
     var merge_range_start: ?[]u8 = null;
-    var merge_source_catalogs: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Catalogs) = null;
+    var merge_source_catalogs: ?std.json.Parsed(@import("../storage/db/artifact/inventory.zig").Catalogs) = null;
     errdefer if (merge_source_catalogs) |*value| value.deinit();
     errdefer if (merge_range_start) |value| alloc.free(value);
     var merge_range_end: ?[]u8 = null;
@@ -1280,7 +1280,7 @@ fn parseBatchRequestWithOptions(
         } else null;
         if (object.get("page_source_catalogs")) |catalogs_value| {
             if (page_source == null) return error.InvalidBatchRequest;
-            merge_source_catalogs = try std.json.parseFromValue(@import("../storage/db/artifact_inventory.zig").Catalogs, alloc, catalogs_value, .{ .allocate = .alloc_always });
+            merge_source_catalogs = try std.json.parseFromValue(@import("../storage/db/artifact/inventory.zig").Catalogs, alloc, catalogs_value, .{ .allocate = .alloc_always });
         }
         const page_receiver: ?db_mod.DocIdentityNamespace = if (object.get("page_receiver_namespace")) |receiver_value| blk: {
             var owned = try std.json.parseFromValue(db_mod.DocIdentityNamespace, alloc, receiver_value, .{});
@@ -1591,7 +1591,7 @@ fn parseBatchRequestWithOptions(
     try merge_pages.validateRequest(result_value.req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(result_value.req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
-    try @import("../storage/db/artifact_inventory.zig").validateRequest(result_value.req);
+    try @import("../storage/db/artifact/inventory.zig").validateRequest(result_value.req);
     if (requiresRowSemanticsEnvelope(result_value.req.writes, result_value.req.predicates) and !versioned) return error.InvalidBatchRequest;
     return result_value;
 }
@@ -1650,8 +1650,8 @@ pub fn encodeOwnerBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.Batch
 fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest, local_owner: bool) ![]u8 {
     try @import("../storage/db/resolver_review.zig").validateRequest(req);
     try @import("../storage/db/group_source_contract.zig").validateRequest(req);
-    try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
-    try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
+    try @import("../storage/db/artifact/publication.zig").validateRequest(alloc, req);
+    try @import("../storage/db/artifact/publication_transport.zig").validateBatchRequest(req);
     if (req.row_policy_publication) |publication| {
         if (publication.table_id == 0 or publication.expected_generation == 0 or publication.expected_catalog_epoch == 0 or publication.owner_group_id == 0 or
             req.row_policy_install_bundle.len == 0 or req.row_policy_install_bundle.len > @import("../system_catalog/policies.zig").max_install_snapshot_bytes or
@@ -1666,7 +1666,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     try @import("../storage/range_protection.zig").validateRequest(req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(req);
-    try @import("../storage/db/artifact_inventory.zig").validateRequest(req);
+    try @import("../storage/db/artifact/inventory.zig").validateRequest(req);
     try merge_pages.validateRequest(req);
     if (req.merge_checkpoint) |checkpoint| {
         if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null)) return error.InvalidBatchRequest;

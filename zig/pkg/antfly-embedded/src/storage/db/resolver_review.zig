@@ -72,7 +72,7 @@ pub const Command = struct {
     pub fn ownerDocumentAlloc(self: Command, a: A) ![]u8 {
         const resolution = try keys.resolutionArtifactKeyAlloc(a, self.document, self.resolution_artifact);
         defer a.free(resolution);
-        return @import("artifact_publication_owner.zig").documentAlloc(a, resolution);
+        return @import("artifact/publication_owner.zig").documentAlloc(a, resolution);
     }
 };
 pub const Receipt = struct { digest: [32]u8, accepted: bool, sequence: u64 };

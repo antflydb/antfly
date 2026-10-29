@@ -19,6 +19,7 @@
 //! ordinary MergeCoordinator after promotion.
 
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const db_types = @import("types.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore = @import("../docstore.zig");
@@ -47,10 +48,7 @@ pub fn protectForSplit(alloc: std.mem.Allocator, store: *docstore.DocStore) !voi
         else => return err,
     };
     defer alloc.free(old);
-    const current = store.get(alloc, key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const current = try missingAsNull(store.get(alloc, key));
     defer if (current) |value| alloc.free(value);
     const raw = current orelse old;
     var state = try decodeAlloc(alloc, raw);

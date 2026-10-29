@@ -2779,11 +2779,7 @@ fn findTableStorageStatus(
     return null;
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+const appendJsonString = @import("antfly_local_sources").api_json_helpers.appendJsonString;
 
 fn deinitJsonValue(alloc: std.mem.Allocator, value: *std.json.Value) void {
     json_helpers.deinitJsonValue(alloc, value);

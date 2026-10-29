@@ -18,6 +18,7 @@
 //! and each source row. Live mutations already maintain the selected generation,
 //! so changed/deleted candidates can be skipped without losing coverage.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const platform_time = @import("antfly_platform").time;
 const catalog = @import("relational_index_catalog.zig");
 const plans = @import("relational_index_plan.zig");
@@ -44,16 +45,7 @@ fn digest(bytes: []const u8) Digest {
 }
 
 fn prefixEnd(alloc: Allocator, prefix: []const u8) ![]const u8 {
-    var len = prefix.len;
-    while (len > 0) {
-        len -= 1;
-        if (prefix[len] != 255) {
-            const end = try alloc.dupe(u8, prefix[0 .. len + 1]);
-            end[len] += 1;
-            return end;
-        }
-    }
-    return error.InvalidRelationalIndexProgress;
+    return (try @import("../internal_keys.zig").nextPrefixAlloc(alloc, prefix)) orelse error.InvalidRelationalIndexProgress;
 }
 
 pub const State = enum(u8) { building = 0, ready = 1, failed = 2 };
@@ -167,10 +159,7 @@ pub fn progressKey(id: records.Id) [progress_prefix.len + records.Id.encoded_len
 }
 
 fn getOptional(txn: anytype, key: []const u8) !?[]const u8 {
-    return txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return try missingAsNull(txn.get(key));
 }
 
 pub fn ownership(txn: *docstore.DocStore.Txn) !Digest {

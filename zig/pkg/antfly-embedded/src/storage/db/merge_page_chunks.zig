@@ -17,6 +17,7 @@
 //! actually received, not by the number of attempts. A new attempt overwrites
 //! slots; their transfer header prevents mixing old and new row contents.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const pages = @import("merge_page_contract.zig");
 const types = @import("types.zig");
 const KV = @import("../docstore.zig").KVPair;
@@ -101,10 +102,7 @@ pub fn prepare(alloc: std.mem.Allocator, reader: anytype, request: types.BatchRe
         .apply => {},
     }
     result.expected_progress = checksum(raw_progress);
-    const raw_manifest = reader.get(manifest_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw_manifest = try missingAsNull(reader.get(manifest_key));
     const allocated_slots: u32 = if (raw_manifest) |raw| try slotCount(raw) else 0;
     const slot: u32 = @intCast(chunk.offset / pages.chunk_bytes);
     const transfer = pages.transferDigest(request);

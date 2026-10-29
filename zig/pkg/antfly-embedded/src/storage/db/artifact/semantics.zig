@@ -1,0 +1,224 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Logical compatibility for artifact definitions. Eligibility is checked
+//! separately against the negotiated effect protocol and producer readiness.
+const std = @import("std");
+const Hash = std.crypto.hash.sha2.Sha256;
+
+fn frame(hash: *Hash, bytes: []const u8) void {
+    var size: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size, bytes.len, .little);
+    hash.update(&size);
+    hash.update(bytes);
+}
+fn number(data: []const u8, offset: *usize) !u32 {
+    if (offset.* > data.len or data.len - offset.* < 4) return error.InvalidArtifactCatalogCommand;
+    const result = std.mem.readInt(u32, data[offset.*..][0..4], .little);
+    offset.* += 4;
+    return result;
+}
+fn string(data: []const u8, offset: *usize) ![]const u8 {
+    const len = try number(data, offset);
+    if (len > data.len - offset.*) return error.InvalidArtifactCatalogCommand;
+    const result = data[offset.*..][0..len];
+    offset.* += len;
+    return result;
+}
+fn canonical(hash: *Hash, alloc: std.mem.Allocator, value: std.json.Value) anyerror!void {
+    frame(hash, @tagName(value));
+    switch (value) {
+        .object => |object| {
+            const keys = try alloc.alloc([]const u8, object.count());
+            defer alloc.free(keys);
+            for (object.keys(), 0..) |key, i| keys[i] = key;
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn less(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.less);
+            for (keys) |key| {
+                frame(hash, key);
+                try canonical(hash, alloc, object.get(key).?);
+            }
+        },
+        .array => |array| for (array.items) |item| {
+            try canonical(hash, alloc, item);
+        },
+        else => {
+            const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            defer alloc.free(encoded);
+            frame(hash, encoded);
+        },
+    }
+    frame(hash, "end");
+}
+pub fn digest(alloc: std.mem.Allocator, indexes: []const u8, enrichments: []const u8, resolvers: []const u8) ![32]u8 {
+    var hash = Hash.init(.{});
+    frame(&hash, "antfly-row-derived-definitions-v1");
+    if (indexes.len == 0) {
+        try producerDefinitions(&hash, alloc, enrichments, resolvers);
+        return hash.finalResult();
+    }
+    if (indexes.len < 12 or !std.mem.eql(u8, indexes[0..4], "AIDX")) return error.InvalidArtifactCatalogCommand;
+    var offset: usize = 4;
+    const version = try number(indexes, &offset);
+    if (version != 1 and version != 2) return error.InvalidArtifactCatalogCommand;
+    const count = try number(indexes, &offset);
+    if (count > (indexes.len - offset) / 9) return error.InvalidArtifactCatalogCommand;
+    const Entry = struct { name: []const u8, digest: [32]u8 };
+    const entries = try alloc.alloc(Entry, count);
+    defer alloc.free(entries);
+    for (entries) |*entry| {
+        const name = try string(indexes, &offset);
+        if (offset >= indexes.len) return error.InvalidArtifactCatalogCommand;
+        const kind = indexes[offset];
+        offset += 1;
+        const config = try string(indexes, &offset);
+        if (version == 2) {
+            if (indexes.len - offset < 8) return error.InvalidArtifactCatalogCommand;
+            offset += 8; // Physical generation is deliberately owner-local.
+        }
+        var definition = Hash.init(.{});
+        frame(&definition, name);
+        frame(&definition, &.{kind});
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, config, .{});
+        defer parsed.deinit();
+        try canonical(&definition, alloc, parsed.value);
+        entry.* = .{ .name = name, .digest = definition.finalResult() };
+    }
+    if (offset != indexes.len) return error.InvalidArtifactCatalogCommand;
+    std.mem.sort(Entry, entries, {}, struct {
+        fn less(_: void, a: Entry, b: Entry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.less);
+    for (entries, 0..) |entry, i| {
+        if (i != 0 and std.mem.eql(u8, entries[i - 1].name, entry.name)) return error.InvalidArtifactCatalogCommand;
+        frame(&hash, &entry.digest);
+    }
+    try producerDefinitions(&hash, alloc, enrichments, resolvers);
+    return hash.finalResult();
+}
+
+fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []const u8, resolvers: []const u8) !void {
+    for ([_][]const u8{ enrichments, resolvers }, [_][]const u8{ "enrichments", "resolvers" }) |raw, family| {
+        if (raw.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer parsed.deinit();
+        // Reader envelopes fence physical representations; the logical
+        // producer identity still binds every resolver definition below.
+        var projection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer projection_arena.deinit();
+        const raw_rows = if (std.mem.eql(u8, family, "resolvers"))
+            @import("../catalog/resolver_catalog.zig").catalogRows(parsed.value) catch return error.InvalidArtifactCatalogCommand
+        else
+            parsed.value;
+        const rows = raw_rows;
+        if (rows != .array) return error.InvalidArtifactCatalogCommand;
+        const dictionary = if (parsed.value == .object) parsed.value.object.get("projections") else null;
+        if (rows.array.items.len == 0) continue; // Preserve main/v14 empty-family identity.
+        const Entry = struct { name: []const u8, value: std.json.Value };
+        const entries = try alloc.alloc(Entry, rows.array.items.len);
+        defer alloc.free(entries);
+        for (rows.array.items, entries) |raw_value, *entry| {
+            if (raw_value != .object) return error.InvalidArtifactCatalogCommand;
+            var value = raw_value;
+            if (dictionary) |projections| if (value.object.get("projection_ref")) |reference| {
+                if (reference != .string or projections != .object) return error.InvalidArtifactCatalogCommand;
+                const projection = projections.object.get(reference.string) orelse return error.InvalidArtifactCatalogCommand;
+                if (projection != .object) return error.InvalidArtifactCatalogCommand;
+                const curation = projection.object.get("curation_json") orelse return error.InvalidArtifactCatalogCommand;
+                if (curation != .string) return error.InvalidArtifactCatalogCommand;
+                // Borrow immutable aliases, strings and shared projection data.
+                // Only the row's field map changes; serializing and reparsing
+                // whole catalogs multiplies the maintenance working set.
+                value.object = try value.object.clone(projection_arena.allocator());
+                _ = value.object.swapRemove("projection_ref");
+                if (curation.string.len != 0) try value.object.put(projection_arena.allocator(), "curation_json", curation);
+            };
+            const name = value.object.get("name") orelse return error.InvalidArtifactCatalogCommand;
+            if (name != .string or name.string.len == 0) return error.InvalidArtifactCatalogCommand;
+            entry.* = .{ .name = name.string, .value = value };
+        }
+        std.mem.sort(Entry, entries, {}, struct {
+            fn less(_: void, a: Entry, b: Entry) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.less);
+        frame(hash, family);
+        for (entries, 0..) |entry, index| {
+            if (index != 0 and std.mem.eql(u8, entries[index - 1].name, entry.name)) return error.InvalidArtifactCatalogCommand;
+            // Resolver config_generation is an explicit re-resolution input,
+            // unlike owner-local index coverage generations; retain it.
+            try canonical(hash, alloc, entry.value);
+        }
+        frame(hash, "end-producer-family");
+    }
+}
+
+test "ordered artifact inventory semantic producer catalogs ignore order but bind generation and definition" {
+    const alloc = std.testing.allocator;
+    const first = "[{\"name\":\"b\",\"source_field\":\"body\"},{\"name\":\"a\",\"source_field\":\"title\"}]";
+    const reordered = "[{\"source_field\":\"title\",\"name\":\"a\"},{\"source_field\":\"body\",\"name\":\"b\"}]";
+    try std.testing.expectEqualDeep(try digest(alloc, "", first, ""), try digest(alloc, "", reordered, "[]"));
+    try std.testing.expectEqualDeep(try digest(alloc, "", "", ""), try digest(alloc, "", "[]", "[]"));
+    const one = try digest(alloc, "", "", "[{\"name\":\"resolver\",\"config_generation\":1}]");
+    const two = try digest(alloc, "", "", "[{\"name\":\"resolver\",\"config_generation\":2}]");
+    try std.testing.expect(!std.mem.eql(u8, &one, &two));
+    try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(alloc, "", "[{\"name\":\"a\"},{\"name\":\"a\"}]", ""));
+}
+
+test "ordered artifact inventory semantic producer catalogs accept versioned resolver envelopes" {
+    const a = std.testing.allocator;
+    const resolver_catalog = @import("../catalog/resolver_catalog.zig");
+    const definitions = "[{\"name\":\"resolver\",\"config_generation\":1}]";
+    const legacy = try digest(a, "", "", definitions);
+    const empty = try digest(a, "", "", "[]");
+    for (2..resolver_catalog.supported_reader_version + 1) |reader_version| {
+        const version: u32 = @intCast(reader_version);
+        const envelope = try @import("../catalog/resolver_catalog.zig").versionedCatalog(a, definitions, version);
+        defer a.free(envelope);
+        try std.testing.expectEqualDeep(legacy, try digest(a, "", "", envelope));
+        const empty_envelope = try @import("../catalog/resolver_catalog.zig").versionedCatalog(a, "[]", version);
+        defer a.free(empty_envelope);
+        try std.testing.expectEqualDeep(empty, try digest(a, "", "", empty_envelope));
+    }
+    for ([_][]const u8{
+        "{\"version\":1,\"resolvers\":[]}",
+        "{\"version\":4}",
+        "{\"version\":4,\"resolvers\":{}}",
+        "{\"version\":4,\"resolvers\":[{\"name\":\"a\"},{\"name\":\"a\"}]}",
+    }) |invalid| try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "", invalid));
+    const future = try std.fmt.allocPrint(a, "{{\"version\":{d},\"resolvers\":[]}}", .{resolver_catalog.supported_reader_version + 1});
+    defer a.free(future);
+    try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "", future));
+    try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "{\"version\":4,\"enrichments\":[]}", "[]"));
+    const changed = try digest(a, "", "", "{\"version\":4,\"resolvers\":[{\"name\":\"resolver\",\"config_generation\":2}]}");
+    try std.testing.expect(!std.mem.eql(u8, &legacy, &changed));
+}
+
+test "resolver catalog native snapshot references preserve logical producer identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const catalog = @import("../catalog/resolver_catalog.zig");
+    const cfg: catalog.ResolverConfig = .{ .name = "concepts", .table = "entities", .key_template = "{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .curation_json = "{\"suppress\":{\"keys\":[\"noise\"]}}", .namespace_curation_table_id = 7, .namespace_curation_generation = 1, .curation_revision = 1 };
+    const expanded = try std.json.Stringify.valueAlloc(a, &[_]catalog.ResolverConfig{cfg}, .{});
+    const compact = try catalog.serializeCatalog(a, &.{cfg});
+    const left = try digest(a, "", "", expanded);
+    const right = try digest(a, "", "", compact);
+    try std.testing.expectEqualSlices(u8, &left, &right);
+}

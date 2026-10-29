@@ -187,7 +187,7 @@ class StorageTestShardAuditTest(unittest.TestCase):
         )
         self.assertEqual(
             [],
-            audit.audit_runtime_partition(source, ["db restore", "db dense"]),
+            audit.audit_runtime_partition([source], ["db restore", "db dense"]),
         )
 
     def test_rejects_stale_runtime_partition_filter(self):
@@ -198,7 +198,7 @@ class StorageTestShardAuditTest(unittest.TestCase):
                 "runtime partition filter matches no tests: db restore",
                 "runtime partition selects no tests",
             ],
-            audit.audit_runtime_partition(source, ["db restore"]),
+            audit.audit_runtime_partition([source], ["db restore"]),
         )
 
     def test_rejects_runtime_partition_without_a_complement(self):
@@ -206,7 +206,17 @@ class StorageTestShardAuditTest(unittest.TestCase):
         self.write("db.zig", 'test "db restore snapshot" {}\n')
         self.assertEqual(
             ["runtime partition leaves no tests for its complement"],
-            audit.audit_runtime_partition(source, ["db restore"]),
+            audit.audit_runtime_partition([source], ["db restore"]),
+        )
+
+    def test_runtime_partition_spans_every_source(self):
+        self.write("db.zig", 'test "db transaction" {}\n')
+        self.write("db_restore.zig", 'test "db restore snapshot" {}\n')
+        self.assertEqual(
+            [],
+            audit.audit_runtime_partition(
+                [self.root / "db.zig", self.root / "db_restore.zig"], ["db restore"]
+            ),
         )
 
     def test_rejects_qualified_runtime_partition_filter(self):
@@ -220,7 +230,7 @@ class StorageTestShardAuditTest(unittest.TestCase):
                 "runtime partition filter must target a declared name: storage.db",
                 "runtime partition selects no tests",
             ],
-            audit.audit_runtime_partition(source, ["storage.db"]),
+            audit.audit_runtime_partition([source], ["storage.db"]),
         )
 
 

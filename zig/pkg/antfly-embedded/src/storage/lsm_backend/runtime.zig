@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const bloom = @import("bloom");
@@ -3025,10 +3026,7 @@ fn getCurrentPointRetainedLocked(
                 _ = lockBackend(BackendType, backend);
             };
             if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(backend);
-            return getOwnedDirectoryPoint(backend, directory, held_values, allocator, namespace, key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            return try missingAsNull(getOwnedDirectoryPoint(backend, directory, held_values, allocator, namespace, key));
         }
         // Only flat oracle fixtures can reach the fallback with SSTs.
         if (run_store.count(backend) == 0) return null;
@@ -12507,15 +12505,9 @@ test "lsm async reuse single directory reads preserve tombstones namespaces and 
                 var values: PointResultValues = .empty;
                 defer releaseHeldValues(&values, a);
                 var hint: ?BorrowedReadHint = null;
-                const expected: ?[]const u8 = getFromDirectoryPointCandidatesPlanned(&backend, directory, &hint, &pins, &values, a, a, .{ .name = ns }, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const expected: ?[]const u8 = try missingAsNull(getFromDirectoryPointCandidatesPlanned(&backend, directory, &hint, &pins, &values, a, a, .{ .name = ns }, key));
                 hint = null;
-                const actual: ?[]const u8 = getFromDirectoryPointCandidates(&backend, directory, &hint, &pins, &values, a, a, .{ .name = ns }, key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const actual: ?[]const u8 = try missingAsNull(getFromDirectoryPointCandidates(&backend, directory, &hint, &pins, &values, a, a, .{ .name = ns }, key));
                 if (expected) |value| try std.testing.expectEqualStrings(value, actual.?) else try std.testing.expect(actual == null);
                 if (backlog == 0 and ns != null and std.mem.eql(u8, ns.?, "docs")) {
                     if (std.mem.eql(u8, key, "a")) try std.testing.expect(actual == null);

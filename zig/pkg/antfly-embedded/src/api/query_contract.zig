@@ -18,7 +18,7 @@ const relationship_filter = @import("../graph/relationship_filter.zig");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
 const db_mod = @import("../storage/db/selected_root.zig").db;
-const document_query = @import("../storage/db/document_query.zig");
+const document_query = @import("../storage/db/document/query.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const graph_edge_type = @import("../graph/edge_type.zig");
 const graph_edge_weight = @import("../graph/edge_weight.zig");
@@ -162,7 +162,7 @@ pub const testing = if (builtin.is_test) struct {
         defer a.free(actual);
         try std.testing.expectEqualStrings(expected, actual);
         // A receipt is admitted only for the producer's exact public output.
-        const projected = try @import("../storage/db/document_query.zig").lookupJsonWithOutput(a, a, body, .{ .fields = &.{"body"}, .include_all_fields = false });
+        const projected = try @import("../storage/db/document/query.zig").lookupJsonWithOutput(a, a, body, .{ .fields = &.{"body"}, .include_all_fields = false });
         defer a.free(projected.json);
         const normalized = projected.json;
         hits[0].stored_data = @constCast(normalized);
@@ -681,11 +681,7 @@ fn appendJsonFieldU64(
     try out.appendSlice(alloc, rendered);
 }
 
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+const appendJsonString = @import("json_helpers.zig").appendJsonString;
 
 fn freeOwnedStringItems(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(@constCast(value));
@@ -4039,7 +4035,7 @@ fn hasFinalizedWireSources(req: db_mod.types.SearchRequest, hits: []const db_mod
     return false;
 }
 fn writeConditionalWireSource(a: std.mem.Allocator, writer: *std.Io.Writer, raw: []const u8) !void {
-    const query = @import("../storage/db/document_query.zig");
+    const query = @import("../storage/db/document/query.zig");
     var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{ "*", "-" ++ hierarchy_navigation.unit_fingerprint_field, "-" ++ hierarchy_navigation.grouped_unit_revision_envelope_field, "-_resolution_work" }, .include_all_fields = false })).?;
     defer plan.deinit();
     try query.writeLookupObject(a, writer, raw, &plan);

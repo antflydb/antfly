@@ -22,7 +22,7 @@ const groups = @import("../group_sources.zig");
 const state = @import("../group_source_state.zig");
 const identity = @import("../group_source_identity.zig");
 const prior = @import("../group_prior_context.zig");
-const context = @import("../artifact_producer_context.zig");
+const context = @import("../artifact/producer_context.zig");
 const keys = @import("../../internal_keys.zig");
 const requests = @import("enrichment_types.zig");
 const Store = @import("../../docstore.zig").DocStore;
@@ -57,7 +57,7 @@ pub fn capture(a: A, store: *Store, request: requests.GeneratedEnrichmentRequest
     }
     const epoch_key = try identity.unitHorizonEpochKey(owned, request.doc_key, config.horizon_segments);
     const epoch = read.getLeased(epoch_key) catch |err| if (err == error.NotFound) null else return err;
-    if (token) |value| try value.observe(epoch_key, epoch, try @import("../artifact_publication.zig").artifactRevision(&read, value.namespace, epoch_key));
+    if (token) |value| try value.observe(epoch_key, epoch, try @import("../artifact/publication.zig").artifactRevision(&read, value.namespace, epoch_key));
     const Read = struct {
         txn: *@TypeOf(read),
         a: A,
@@ -72,7 +72,7 @@ pub fn capture(a: A, store: *Store, request: requests.GeneratedEnrichmentRequest
             const selected = try keys.artifactNamedPrefixAlloc(self.a, unit, "asset", name);
             const artifact = self.txn.getLeased(selected) catch |err| if (err == error.NotFound) return null else return err;
             if (self.token != null) {
-                var proof = (try @import("../artifact_producer_provenance.zig").readCurrentForArtifact(self.a, self.txn, selected, artifact)) orelse return error.ArtifactPublicationPending;
+                var proof = (try @import("../artifact/producer_provenance.zig").readCurrentForArtifact(self.a, self.txn, selected, artifact)) orelse return error.ArtifactPublicationPending;
                 proof.deinit();
             }
             return artifact;

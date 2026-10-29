@@ -25,6 +25,7 @@
 //! Neither this module nor a write plan establishes query readiness.
 
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const internal = @import("../internal_keys.zig");
 const native = @import("../relational_index.zig");
 const plans = @import("relational_index_plan.zig");
@@ -277,10 +278,7 @@ pub const Writer = struct {
         if ((index.cover != null) != (payload.len != 0)) return error.InvalidRelationalIndexForwardValue;
         if (try index.tuple.prefixLen(tuple) != tuple.len) return error.InvalidRelationalIndexTuple;
         try appendReverseKey(self.alloc, &self.reverse_key, index.id(), document);
-        const old = txn.get(self.reverse_key.items) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const old = try missingAsNull(txn.get(self.reverse_key.items));
         if (old) |value| {
             const old_tuple = try reverseTuple(self.reverse_key.items, value);
             if (try index.tuple.prefixLen(old_tuple) != old_tuple.len) return error.InvalidRelationalIndexTuple;
@@ -295,10 +293,7 @@ pub const Writer = struct {
             // Ordinary updates and no-op keys retain their single lookup path.
             try self.old_forward.appendSlice(self.alloc, self.reverse_key.items[0 .. self.reverse_key.items.len - Id.encoded_len - 1]);
             try self.old_forward.append(self.alloc, internal.relational_row_kind);
-            const primary = txn.get(self.old_forward.items) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const primary = try missingAsNull(txn.get(self.old_forward.items));
             if (primary != null) return error.MissingRelationalIndexReverse;
             self.old_forward.clearRetainingCapacity();
         }
@@ -392,26 +387,17 @@ pub const Writer = struct {
         try self.encodeForwardValue(payload);
         try appendOwnershipFromReverse(self.alloc, &self.ownership_key, self.reverse_key.items);
         var changed: usize = 0;
-        const forward = txn.get(self.new_forward.items) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const forward = try missingAsNull(txn.get(self.new_forward.items));
         if (forward == null or !std.mem.eql(u8, forward.?, self.forward_value.items)) {
             try txn.put(self.new_forward.items, self.forward_value.items);
             changed += 1;
         }
-        const reverse = txn.get(self.reverse_key.items) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const reverse = try missingAsNull(txn.get(self.reverse_key.items));
         if (reverse == null or !std.mem.eql(u8, reverse.?, self.reverse_value.items)) {
             try txn.put(self.reverse_key.items, self.reverse_value.items);
             changed += 1;
         }
-        const ownership = txn.get(self.ownership_key.items) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const ownership = try missingAsNull(txn.get(self.ownership_key.items));
         if (ownership == null or ownership.?.len != 0) {
             try txn.put(self.ownership_key.items, "");
             changed += 1;
@@ -491,17 +477,11 @@ pub const RangeRepair = struct {
             } else if (internal.isRelationalIndexReverseKey(kv.key)) {
                 var ownership_key = std.ArrayList(u8).empty;
                 try appendOwnershipFromReverse(alloc, &ownership_key, kv.key);
-                const locator = read.get(ownership_key.items) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const locator = try missingAsNull(read.get(ownership_key.items));
                 if (locator == null or locator.?.len != 0) try writes.append(alloc, .{ .key = ownership_key.items, .value = "" });
                 var forward = std.ArrayList(u8).empty;
                 try appendForwardFromReverse(alloc, &forward, kv.key, kv.value);
-                const existing: ?[]const u8 = read.get(forward.items) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const existing: ?[]const u8 = try missingAsNull(read.get(forward.items));
                 if (existing) |value| {
                     _ = try forwardPayload(forward.items, value);
                 } else {
@@ -716,7 +696,7 @@ pub const Staged = struct {
 
 const schema = @import("../schema.zig");
 const schema_registry = @import("schema_registry.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const docstore = @import("../docstore.zig");
 
 fn testPlan(alloc: Allocator) !plans.View {

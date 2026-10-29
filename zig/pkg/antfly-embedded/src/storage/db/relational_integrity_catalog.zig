@@ -18,6 +18,7 @@
 //! monotonically increasing allocation counter prevents drop/readd from
 //! reviving old globally routed claims or child references.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 pub const key = "\x00\x00__metadata__:relational_integrity_catalog";
@@ -193,10 +194,7 @@ pub const Update = struct {
     /// Caller stages schema, outbox and this CAS in ONE transaction, then
     /// publishes the new immutable schema view only after durable commit.
     pub fn stage(self: Update, txn: anytype) !void {
-        const current = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const current = try missingAsNull(txn.get(key));
         if (self.expected) |old| {
             if (!std.mem.eql(u8, current orelse return error.IntegrityCatalogChanged, old)) return error.IntegrityCatalogChanged;
         } else if (current != null) return error.IntegrityCatalogChanged;

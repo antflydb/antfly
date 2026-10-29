@@ -81,13 +81,13 @@ class EmbeddedBoundaryTest(unittest.TestCase):
                 "storage/db/db.zig",
                 "storage/db/index_repair_scheduler.zig",
                 "storage/db/graph_cleanup_owner.zig",
-                "storage/db/native_projection_owner.zig",
+                "storage/db/native/projection_owner.zig",
                 "storage/db/runtime_restart_owner.zig",
                 "storage/db/cleanup_job_owner.zig",
                 "storage/db/query_visibility.zig",
                 "storage/db/source_pin_cleanup_owner.zig",
                 "storage/db/applied_sequence_coalescer.zig",
-                "storage/db/document_collectors.zig",
+                "storage/db/document/collectors.zig",
                 "storage/db/owned_keys.zig",
                 "storage/db/graph_field_plan.zig",
                 "storage/db/replay_vector_collectors.zig",
@@ -192,7 +192,7 @@ class EmbeddedBoundaryTest(unittest.TestCase):
                 check_replication_contract("storage/db/query_visibility.zig", changed)
 
     def test_local_child_range_planning_rejects_server_destination_policy(self):
-        path = "storage/db/document_child_range_effects.zig"
+        path = "storage/db/document/child_range_effects.zig"
         for source in (
             "const status = range.route_status;",
             'const status = "remote_committed";',

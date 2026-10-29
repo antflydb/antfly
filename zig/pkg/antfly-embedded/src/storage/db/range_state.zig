@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../backend_erased.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -54,19 +55,13 @@ pub fn initializeOwnerRange(alloc: Allocator, store: *docstore_mod.DocStore, ini
     {
         var read = try store.beginReadTxn();
         defer read.abort();
-        const present = read.get(range_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const present = try missingAsNull(read.get(range_key));
         if (present != null) return;
     }
     var txn = try store.beginWriteTxn();
     var txn_open = true;
     defer if (txn_open) txn.abort();
-    const present = txn.get(range_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const present = try missingAsNull(txn.get(range_key));
     if (present != null) return;
     if (try @import("doc_identity.zig").loadNamespaceTxn(&txn)) |namespace|
         if (!namespace.eql(initial.namespace)) return error.IdentityNamespaceMismatch;

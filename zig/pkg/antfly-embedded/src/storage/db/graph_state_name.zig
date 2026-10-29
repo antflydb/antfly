@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const artifact_ids = @import("artifact_ids.zig");
+const artifact_ids = @import("artifact/ids.zig");
 const types = @import("types.zig");
 
 const magic = "GSN1";

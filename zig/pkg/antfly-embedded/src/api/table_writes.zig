@@ -410,7 +410,7 @@ pub const BoundTableWriteSource = struct {
         db.abortBulkIngestSession();
     }
 
-    pub fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
+    pub fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native/backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         return try executeBackupPinControl(alloc, try self.activeDb(), group_id, request, control);

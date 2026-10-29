@@ -19,7 +19,7 @@
 const std = @import("std");
 const db_mod = struct {
     pub const types = @import("../storage/db/types.zig");
-    pub const DocumentArtifactChildRangeApplyBatch = @import("../storage/db/document_artifact_child_range.zig").ApplyBatch;
+    pub const DocumentArtifactChildRangeApplyBatch = @import("../storage/db/document/artifact_child_range.zig").ApplyBatch;
     pub const TextMemoryAttributionStats = @import("../storage/db/text_memory_stats.zig").TextMemoryAttributionStats;
 };
 const backend_types = @import("../storage/backend_types.zig");
@@ -181,7 +181,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             contract: table_drop_contract.DropCleanupContract,
         ) anyerror!?void = null,
-        backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) anyerror!?[]u8 = null,
+        backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native/backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) anyerror!?[]u8 = null,
         backup_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -831,7 +831,7 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, contract });
     }
 
-    pub fn backupPinControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) !?[]u8 {
+    pub fn backupPinControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native/backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) !?[]u8 {
         try control.ensureActive();
         const callback = self.vtable.backup_pin_control orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("backup_pin_control", self.boundary_dispatch, callback, .{ self.ptr, alloc, table_name, group_id, request, control });

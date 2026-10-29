@@ -34,7 +34,7 @@ const execution_resources = @import("execution_resources.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const internal_keys = @import("../internal_keys.zig");
 const json_helpers = @import("../../api/json_helpers.zig");
-const mapper = @import("document_mapper.zig");
+const mapper = @import("document/mapper.zig");
 const merge_state_mod = @import("merge_state.zig");
 const public_table_schema = @import("../../schema/mod.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
@@ -42,6 +42,7 @@ const relational_store = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const schema_registry_mod = @import("schema_registry.zig");
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
 const types = @import("types.zig");
@@ -158,7 +159,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub const PreparedMergeArtifacts = struct {
             effects: []const @import("merge_page_contract.zig").IntegrityEffect,
-            receiver_binding: ?@import("artifact_inventory.zig").Binding = null,
+            receiver_binding: ?@import("artifact/inventory.zig").Binding = null,
             arena: ?std.heap.ArenaAllocator = null,
 
             pub fn deinit(self: *@This()) void {
@@ -249,10 +250,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (keys.items, 0..) |key, index| {
                 const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
                 defer alloc.free(store_key);
-                const raw = read_txn.get(store_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw = try missingAsNull(read_txn.get(store_key));
                 const value = if (raw) |stored| blk: {
                     if (!internal_keys.isRelationalRowKey(store_key))
                         break :blk try alloc.dupe(u8, stored);
@@ -295,10 +293,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else blk: {
                     const timestamp_key = try makeTimestampKey(alloc, key);
                     defer alloc.free(timestamp_key);
-                    const timestamp = read_txn.get(timestamp_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const timestamp = try missingAsNull(read_txn.get(timestamp_key));
                     break :blk if (timestamp) |bytes|
                         if (bytes.len >= @sizeOf(u64)) std.mem.readInt(u64, bytes[0..8], .little) else 0
                     else
@@ -545,7 +540,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn prepareMergeArtifactEffects(self: anytype, alloc: Allocator, req: types.BatchRequest) !PreparedMergeArtifacts {
             const pages = @import("merge_page_contract.zig");
             const graph = @import("online_graph_artifacts.zig");
-            const inventory = @import("artifact_inventory.zig");
+            const inventory = @import("artifact/inventory.zig");
             const page = req.merge_page orelse return .{ .effects = &.{} };
             const unchanged: PreparedMergeArtifacts = .{ .effects = page.artifact_effects };
             const has_graph = for (page.artifact_effects) |effect| {
@@ -605,7 +600,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (effect.value) |value| payload_bytes +|= value.len;
                 // The receiver's revision witness is committed beside every
                 // imported value/tombstone, including an absent postimage.
-                payload_bytes +|= @sizeOf(@TypeOf(@import("artifact_publication.zig").artifactRevisionKey(@splat(0), ""))) + @import("artifact_publication.zig").Position.encoded_len;
+                payload_bytes +|= @sizeOf(@TypeOf(@import("artifact/publication.zig").artifactRevisionKey(@splat(0), ""))) + @import("artifact/publication.zig").Position.encoded_len;
                 operations +|= 2;
             };
             if (req.merge_page) |page| for (page.provenance_effects) |effect| {
@@ -1227,13 +1222,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer alloc.free(generated);
                 for (generated) |*request| {
                     if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
-                    const intent = @import("artifact_reprocess_intent.zig");
+                    const intent = @import("artifact/reprocess_intent.zig");
                     const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request.*));
                     defer alloc.free(key);
-                    const old = self.core.*.store.get(alloc, key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const old = try missingAsNull(self.core.*.store.get(alloc, key));
                     defer if (old) |raw| alloc.free(raw);
                     request.reprocess_generation = if (old) |raw| try intent.generationForConfig(raw, request.producer_json) else 0;
                     if (containsName(force_generated_artifact_names, requestEmbeddingName(request.*))) {
@@ -1270,13 +1262,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
                             defer producer.deinit(alloc);
                             if (producer.type == .document_extraction) {
-                                const intent = @import("artifact_reprocess_intent.zig");
+                                const intent = @import("artifact/reprocess_intent.zig");
                                 const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
                                 defer alloc.free(manifest_key);
-                                const manifest = S.ownerField(self, "core").*.store.get(alloc, manifest_key) catch |err| switch (err) {
-                                    error.NotFound => null,
-                                    else => return err,
-                                };
+                                const manifest = try missingAsNull(S.ownerField(self, "core").*.store.get(alloc, manifest_key));
                                 defer if (manifest) |raw| alloc.free(raw);
                                 const generation = if (manifest) |raw| try S.documentExtractionManifestGeneration(alloc, raw) else 0;
                                 const encoded = intent.encode(request.producer_json, std.math.add(u64, generation, 1) catch return error.ResourceLimitExceeded);

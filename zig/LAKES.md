@@ -1157,7 +1157,7 @@ Limits are 4096 units and 64 MiB each of input/output payload per row. Sparse me
 fails explicitly; dense media requires a compatible embedding provider.
 
 `api/native_retained_cut.zig` issues `native2:` capabilities for mutable native
-ordered/composed reads. `storage/db/native_query_cut.zig` validates each owner's
+ordered/composed reads. `storage/db/native/query_cut.zig` validates each owner's
 sealed generation; the internal `_native_cut` envelope travels with search,
 preflight, text statistics and algebraic partials. Public callers cannot forge the
 internal envelope. Capture retains immutable files and bounded committed WAL

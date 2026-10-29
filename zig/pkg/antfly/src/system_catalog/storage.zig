@@ -17,6 +17,7 @@
 //! routing resolves a qualified name with point reads. Derived indexes are rebuilt
 //! from authoritative records at projection initialization and snapshot install.
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const docstore = @import("antfly_local_sources").storage_docstore;
 const domain = @import("antfly_local_sources").system_catalog_domain;
 const settings = @import("antfly_local_sources").system_catalog_settings;
@@ -176,10 +177,7 @@ fn putPolicyInstallSnapshot(alloc: std.mem.Allocator, txn: *docstore.DocStore.Tx
     const encoded = try std.json.Stringify.valueAlloc(alloc, snapshot, .{});
     defer alloc.free(encoded);
     if (encoded.len > 4 * 1024 * 1024) return error.RowPolicyLimitExceeded;
-    const existing = txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const existing = try missingAsNull(txn.get(key));
     if (existing) |prior| {
         if (!std.mem.eql(u8, prior, encoded)) return error.RowPolicyCatalogChanged;
         return;
@@ -784,10 +782,7 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         defer alloc.free(key);
         var id: [8]u8 = undefined;
         std.mem.writeInt(u64, &id, r.id, .little);
-        const previous = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(txn.get(key));
         if (previous) |value| if (!std.mem.eql(u8, value, &id)) return error.InvalidCatalogRecord;
         try txn.put(key, &id);
     }

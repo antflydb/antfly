@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const h = @import("handles.zig");
+const capi_exports = @import("exports.zig");
 const api = @import("db.zig");
 const sql = @import("sql.zig");
 const d = h.antfly.capi_dependencies;
@@ -41,8 +42,7 @@ fn describePrepared(handle: *h.Handle, request_json: []const u8, alloc: std.mem.
     return api.stringifyJson(.{ .columns = description.binding.columns, .parameter_types = description.binding.parameter_types });
 }
 pub fn antfly_db_sql_describe_json(ptr: ?*anyopaque, request: h.capi.Slice, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_describe_json), .{ .name = "antfly_db_sql_describe_json" }), .{ ptr, request, out });
+    if (comptime capi_exports.forwarding) return capi_exports.forward(antfly_db_sql_describe_json, @src().fn_name, .{ ptr, request, out });
     h.capi.clearLastError();
     out.* = .{};
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
@@ -57,7 +57,5 @@ pub fn antfly_db_sql_describe_json(ptr: ?*anyopaque, request: h.capi.Slice, out:
 }
 
 comptime {
-    @import("exports.zig").publish(@This(), &.{
-        "antfly_db_sql_describe_json",
-    });
+    capi_exports.publishAll(@This());
 }

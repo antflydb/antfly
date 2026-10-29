@@ -22,6 +22,7 @@
 //!   - Commit resolves intents → real keys; abort deletes intents
 
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
@@ -719,10 +720,7 @@ pub const TxnManager = struct {
         schema_lease_value[0] = @intFromBool(binding.version != null);
         if (binding.version) |version|
             std.mem.writeInt(u32, schema_lease_value[1..5], version, .little);
-        const previous_lease = self.getAlloc(self.alloc, &schema_lease_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous_lease = try missingAsNull(self.getAlloc(self.alloc, &schema_lease_key));
         defer if (previous_lease) |value| self.alloc.free(value);
         if (previous_lease) |value| if (extra_batch.schema_binding != null and !std.mem.eql(u8, value, &schema_lease_value))
             return error.SchemaInUse;
@@ -1322,14 +1320,8 @@ pub const TxnManager = struct {
         const replay_key = makeTransactionReplicationReplayOutboxKey(txn_id);
         var out: ReplicationOutbox = .{};
         errdefer out.deinit(alloc);
-        out.batch_payload = self.getAlloc(alloc, &batch_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        out.replay_payload = self.getAlloc(alloc, &replay_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        out.batch_payload = try missingAsNull(self.getAlloc(alloc, &batch_key));
+        out.replay_payload = try missingAsNull(self.getAlloc(alloc, &replay_key));
         return out;
     }
 
@@ -1481,10 +1473,7 @@ pub const TxnManager = struct {
                 const index_key = makeSidecarKey(participant_index_prefix, txn_id);
                 if (read.get(&index_key)) |raw_index| {
                     const indexed = try ParticipantIndex.decode(raw_index);
-                    const legacy = read.get(&resolved_key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const legacy = try missingAsNull(read.get(&resolved_key));
                     if (legacy != null) {
                         const members = try resolvedParticipantsInRead(self.alloc, &read, txn_id);
                         defer freeParticipantList(self.alloc, members);
@@ -1637,10 +1626,7 @@ pub const TxnManager = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         const index_key = makeSidecarKey(participant_index_prefix, txn_id);
-        const raw = self.getAlloc(scratch, &index_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const raw = try missingAsNull(self.getAlloc(scratch, &index_key));
         var indexed = if (raw) |bytes| try ParticipantIndex.decode(bytes) else ParticipantIndex{};
         var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
         var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -1691,10 +1677,7 @@ pub const TxnManager = struct {
         var members = resolved.keyIterator();
         while (members.next()) |participant| {
             const key = makeParticipantIndexKey(resolved_index_prefix, txn_id, participant.*);
-            const existing = self.getAlloc(scratch, &key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const existing = try missingAsNull(self.getAlloc(scratch, &key));
             if (existing) |value| {
                 if (!std.mem.eql(u8, value, participant.*)) return error.InvalidTxnRecord;
             } else {
@@ -1927,10 +1910,7 @@ pub const TxnManager = struct {
                         if (pred.expected_version == 0) return error.InvalidArgument;
                         if (relational_primary == null) {
                             const table_catalog = @import("db/table_catalog.zig");
-                            const catalog_bytes = self.getAlloc(self.alloc, table_catalog.key) catch |err| switch (err) {
-                                error.NotFound => null,
-                                else => return err,
-                            };
+                            const catalog_bytes = try missingAsNull(self.getAlloc(self.alloc, table_catalog.key));
                             defer if (catalog_bytes) |bytes| self.alloc.free(bytes);
                             if (catalog_bytes) |bytes| {
                                 const catalog = try table_catalog.Catalog.decode(bytes);
@@ -1981,10 +1961,7 @@ pub const TxnManager = struct {
                         const writer_key = range_protection.indexWriterKey(digest);
                         try self.checkReadGuardCursor(&cursor, &writer_key, exclude_txn);
                     }
-                    const current = self.getAlloc(self.alloc, pred.key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    const current = try missingAsNull(self.getAlloc(self.alloc, pred.key));
                     defer if (current) |bytes| self.alloc.free(bytes);
                     if (pred.expected_value) |expected| {
                         if (!std.mem.eql(u8, current orelse return TxnError.VersionConflict, expected)) return TxnError.VersionConflict;
@@ -2230,10 +2207,7 @@ pub const TxnManager = struct {
             if (write_set.contains(predicate.key) or (try seen.getOrPut(self.alloc, predicate.key)).found_existing) continue;
             const member = try std.mem.concat(self.alloc, u8, &.{ &member_prefix, predicate.key });
             try appendOwnedBytes(self.alloc, owned_keys, member);
-            const old = self.getAlloc(self.alloc, member) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            const old = try missingAsNull(self.getAlloc(self.alloc, member));
             defer if (old) |bytes| self.alloc.free(bytes);
             var identity_buf: [33]u8 = undefined;
             const identity = readPredicateIdentity(predicate, &identity_buf);
@@ -2845,10 +2819,7 @@ fn resolvedParticipantsInRead(alloc: Allocator, read: *backend_erased.ReadTxn, t
     const scratch = arena.allocator();
     var names: std.StringHashMapUnmanaged(void) = .empty;
     const legacy_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-    const legacy = read.get(&legacy_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const legacy = try missingAsNull(read.get(&legacy_key));
     if (legacy) |bytes| for (try decodeParticipantList(scratch, bytes)) |name| try names.put(scratch, name, {});
     const prefix = makeSidecarKey(resolved_index_prefix, txn_id);
     var cursor = try read.openCursor();
@@ -4889,10 +4860,7 @@ test "late committed resolve after stale auto-abort does not silently lose write
     try std.testing.expectError(TxnError.DecisionConflict, mgr.resolveIntents(txn_id, .committed, 4_000));
     try std.testing.expectEqual(TxnStatus.aborted, try mgr.getTransactionStatus(txn_id));
 
-    const doc = getVisibleDoc(&store, alloc, "doc:late_commit_after_abort") catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const doc = try missingAsNull(getVisibleDoc(&store, alloc, "doc:late_commit_after_abort"));
     defer if (doc) |value| alloc.free(value);
 
     const ts = try ttl.readTimestamp(&store, alloc, "doc:late_commit_after_abort");

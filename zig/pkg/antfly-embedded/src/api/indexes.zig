@@ -17,7 +17,7 @@ pub const std = @import("std");
 pub const index_metadata = @import("index_metadata.zig");
 pub const db_mod = @import("../storage/db/selected_root.zig").db;
 pub const managed_embedder = @import("../inference/managed_embedder.zig");
-pub const document_content_hash = @import("../storage/db/document_content_hash.zig");
+pub const document_content_hash = @import("../storage/db/document/content_hash.zig");
 pub const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 pub fn sortArtifactEnrichmentsByDependency(configs: []db_mod.types.EnrichmentConfig) void {
     std.mem.sort(db_mod.types.EnrichmentConfig, configs, {}, artifactEnrichmentLessThan);

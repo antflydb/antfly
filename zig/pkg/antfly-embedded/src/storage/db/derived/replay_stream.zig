@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const MemDocStore = @import("../test_support.zig").MemDocStore;
 const Allocator = std.mem.Allocator;
 const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
@@ -64,18 +65,16 @@ pub fn iterateFrom(alloc: Allocator, store: *docstore_mod.DocStore, from_sequenc
 test "replay stream append iterate and truncate" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
-    try appendReplayOpaque(alloc, &store, 1, "one");
-    try appendReplayOpaque(alloc, &store, 2, "two");
-    try std.testing.expectEqual(@as(u64, 2), lastReplaySequence(&store, 0));
-    try std.testing.expectEqual(@as(u64, 3), nextReplaySequence(&store, 1));
+    try appendReplayOpaque(alloc, store, 1, "one");
+    try appendReplayOpaque(alloc, store, 2, "two");
+    try std.testing.expectEqual(@as(u64, 2), lastReplaySequence(store, 0));
+    try std.testing.expectEqual(@as(u64, 3), nextReplaySequence(store, 1));
 
-    const entries = try iterateReplayFrom(alloc, &store, 2);
+    const entries = try iterateReplayFrom(alloc, store, 2);
     defer {
         for (entries) |*entry| entry.deinit(alloc);
         alloc.free(entries);
@@ -84,8 +83,8 @@ test "replay stream append iterate and truncate" {
     try std.testing.expectEqual(@as(u64, 2), entries[0].sequence);
     try std.testing.expectEqualStrings("two", entries[0].payload);
 
-    try truncateReplayUpTo(alloc, &store, 1);
-    const after = try iterateReplayFrom(alloc, &store, 1);
+    try truncateReplayUpTo(alloc, store, 1);
+    const after = try iterateReplayFrom(alloc, store, 1);
     defer {
         for (after) |*entry| entry.deinit(alloc);
         alloc.free(after);

@@ -20,6 +20,7 @@
 //! Physical row envelopes retain their schema version; consumers must possess
 //! that immutable schema registry. Derived indexes/artifacts are not this log.
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const internal_keys = @import("internal_keys.zig");
 const integrity = @import("db/relational_integrity_contract.zig");
 const retained_frame = @import("retained_frame.zig");
@@ -874,10 +875,7 @@ pub const Capture = struct {
         defer alloc.free(timestamps);
         var size: usize = 48;
         for (keys, values, timestamps) |key, *value, *timestamp| {
-            value.* = txn.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
+            value.* = try missingAsNull(txn.get(key));
             timestamp.* = 0;
             if (integrity.isKey(key)) {
                 _ = integrity.parseKey(key) catch return error.RetainedEffectsCorrupt;
@@ -902,10 +900,7 @@ pub const Capture = struct {
                 const timestamp_key = try alloc.dupe(u8, key);
                 defer alloc.free(timestamp_key);
                 timestamp_key[timestamp_key.len - 1] = internal_keys.ttl_kind;
-                const raw_timestamp = txn.get(timestamp_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const raw_timestamp = try missingAsNull(txn.get(timestamp_key));
                 if (raw_timestamp) |raw| {
                     if (raw.len != 8) return error.RetainedEffectsCorrupt;
                     timestamp.* = std.mem.readInt(u64, raw[0..8], .little);

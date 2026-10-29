@@ -20,6 +20,7 @@
 //! user-controlled IDs never share a delimiter namespace with derived records.
 
 const std = @import("std");
+const missingAsNull = @import("backend_types.zig").missingAsNull;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -186,10 +187,7 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     // already published cut: replay consumers may have passed it. Consensus
     // duplicate detection happens before opening this mutation transaction.
     if (sequence == std.math.maxInt(u64)) return error.InvalidBatchRequest;
-    const previous = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const previous = try missingAsNull(txn.get(internal_keys.replay_meta_next_sequence_key[0..]));
     if (previous) |raw| {
         if (raw.len != 8) return error.CorruptReplayMetadata;
         if (sequence < std.mem.readInt(u64, raw[0..8], .little)) return error.InvalidBatchRequest;
@@ -279,10 +277,7 @@ pub const DocStoreOptions = struct {
 fn applyGraphRetirement(txn: anytype, alloc: Allocator, key: []const u8, value: []const u8, maybe: *?bool) anyerror!void {
     const generation = try @import("graph_cleanup_contract.zig").retirementGeneration(value);
     if (generation != 0) {
-        const previous = txn.get(internal_keys.graph_endpoint_cleanup_generation_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(txn.get(internal_keys.graph_endpoint_cleanup_generation_key));
         if (previous != null and previous.?.len != 8) return error.InvalidGraphRetirement;
         const prior = if (previous) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
         if (generation > prior) {
@@ -389,10 +384,7 @@ fn retirementSuppressesRelationship(txn: anytype, alloc: Allocator, key: []const
 
 fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationToken) !internal_keys.ColumnarMutationToken {
     if (cached.*) |token| return token;
-    const old = txn.get(internal_keys.relational_columnar_mutation_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const old = try missingAsNull(txn.get(internal_keys.relational_columnar_mutation_key));
     const previous = if (old) |bytes| blk: {
         if (bytes.len != 8) return error.InvalidColumnMutationVersion;
         break :blk std.mem.readInt(u64, bytes[0..8], .little);
@@ -411,10 +403,7 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
     const decoded_endpoint = if (endpoint) |value| (try @import("graph_cleanup_contract.zig").decode(key, value)).endpoint else null;
     const ref = try std.mem.concat(alloc, u8, &.{ internal_keys.graph_endpoint_cleanup_ref_prefix, key[internal_keys.graph_endpoint_cleanup_prefix.len..] });
     defer alloc.free(ref);
-    const raw_count = txn.get(internal_keys.graph_endpoint_cleanup_count_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw_count = try missingAsNull(txn.get(internal_keys.graph_endpoint_cleanup_count_key));
     var count: u64 = 0;
     if (raw_count) |raw| {
         if (raw.len != 8) return error.InvalidGraphSegment;
@@ -718,10 +707,7 @@ pub const DocStore = struct {
 
             if (self.write) |*write| {
                 for (keys, 0..) |key, i| {
-                    values[i] = write.get(key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                    values[i] = try missingAsNull(write.get(key));
                 }
                 return;
             }
@@ -1613,10 +1599,7 @@ pub const DocStore = struct {
 
     fn updateGraphOwningTable(txn: anytype, key: []const u8, value: []const u8) !void {
         if (!std.mem.eql(u8, key, internal_keys.graph_owning_table_key)) return;
-        const previous = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const previous = try missingAsNull(txn.get(key));
         if (previous) |name| if (std.mem.eql(u8, name, value)) return;
         try txn.put(internal_keys.graph_directory_reset_key, &.{0});
         for ([_][]const u8{ internal_keys.graph_incoming_ready_key, internal_keys.graph_incoming_cursor_key, internal_keys.graph_endpoint_cleanup_count_key }) |metadata_key| {
@@ -1904,10 +1887,7 @@ pub const DocStore = struct {
             try txn.put(internal_keys.graph_directory_reset_key, &.{0});
             try txn.delete(internal_keys.graph_incoming_legacy_ready_key);
         } else |err| if (err != error.NotFound) return err;
-        const reset = txn.get(internal_keys.graph_directory_reset_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const reset = try missingAsNull(txn.get(internal_keys.graph_directory_reset_key));
         if (reset) |phase| {
             if (phase.len != 1 or phase[0] > 2) return error.InvalidGraphRetirement;
             if (phase[0] < 2) {
@@ -1948,10 +1928,7 @@ pub const DocStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const checkpoint = txn.get(internal_keys.graph_incoming_cursor_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const checkpoint = try missingAsNull(txn.get(internal_keys.graph_incoming_cursor_key));
         const start = if (checkpoint) |key| try std.mem.concat(alloc, u8, &.{ key, &.{0} }) else &.{internal_keys.user_namespace};
         var entries = std.ArrayListUnmanaged(KVPair).empty;
         var last: ?[]const u8 = null;
@@ -2011,10 +1988,7 @@ pub const DocStore = struct {
     }
 
     pub fn ensureGraphIncomingDirectory(self: *DocStore) !void {
-        const ready = self.get(self.alloc, internal_keys.graph_incoming_ready_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const ready = try missingAsNull(self.get(self.alloc, internal_keys.graph_incoming_ready_key));
         if (ready) |value| {
             self.alloc.free(value);
             return;

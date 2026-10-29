@@ -16,6 +16,7 @@
 //! Receiver-owned preparation. The existing replicated checkpoint/page
 //! appliers remain the only mutation and exact cleanup-prefix authority.
 const std = @import("std");
+const missingAsNull = @import("../backend_types.zig").missingAsNull;
 const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const wire = @import("online_merge_io_contract.zig");
 const pages = @import("merge_page_contract.zig");
@@ -65,10 +66,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
     defer db.core.unlockApplyShared();
     var txn = try db.core.store.beginReadTxn();
     defer txn.abort();
-    const state_raw = txn.get(@import("merge_state.zig").key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const state_raw = try missingAsNull(txn.get(@import("merge_state.zig").key));
     var state = if (state_raw) |raw| try merge.decodeAlloc(alloc, raw) else null;
     defer if (state) |*value| value.deinit(alloc);
     try cancellation.check();
@@ -191,10 +189,7 @@ fn checkpoint(db: *DB, alloc: Allocator, request: wire.Request, state: ?merge.St
         if (!source.namespace.eql(request.scope.fence.namespace) or source.retention == null or source.retention.?.epoch != request.scope.consumer_epoch or
             !(command.page_receiver_namespace orelse return error.InvalidMergePage).eql(request.scope.receiver_namespace)) return error.MergeCopyFenced;
     } else if (command.page_source != null or command.page_receiver_namespace != null) return error.InvalidMergePage;
-    const raw_receipt = txn.get(pages.key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw_receipt = try missingAsNull(txn.get(pages.key));
     var receipt = if (raw_receipt) |raw| try pages.decode(alloc, raw) else null;
     defer if (receipt) |*value| value.deinit();
     if (command.kind == .bootstrap_complete or command.kind == .finalize) {

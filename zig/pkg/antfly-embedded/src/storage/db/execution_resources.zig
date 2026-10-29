@@ -19,7 +19,7 @@
 
 const materialized_sources = @import("materialized_sources.zig");
 
-const document_child_range_outbox = @import("document_child_range_outbox.zig");
+const document_child_range_outbox = @import("document/child_range_outbox.zig");
 
 const std = @import("std");
 
@@ -49,7 +49,7 @@ const graph_asset_state = @import("graph_asset_state.zig");
 
 const graph_edge_contender = @import("graph_edge_contender.zig");
 
-const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 
 const snapshot_admission_mod = @import("snapshot_admission.zig");
 
@@ -59,7 +59,7 @@ const internal_keys = @import("../internal_keys.zig");
 
 const doc_identity = @import("doc_identity.zig");
 
-const document_content_hash = @import("document_content_hash.zig");
+const document_content_hash = @import("document/content_hash.zig");
 
 const doc_set = @import("doc_set.zig");
 
@@ -131,7 +131,7 @@ const platform_clock = @import("antfly_platform").clock;
 
 const platform_time = @import("antfly_platform").time;
 
-const ArtifactPublicationDispatcher = @import("artifact_publication.zig").Dispatcher;
+const ArtifactPublicationDispatcher = @import("artifact/publication.zig").Dispatcher;
 
 pub const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
 
@@ -185,7 +185,7 @@ pub const AsyncContext = struct {
     applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     // Heap-stable admission state shared by the DB wrapper and callbacks that
     // outlive DB.open's by-value return. Activation publishes this flag while
     // holding apply exclusive; every catalog-sensitive lease revalidates it
@@ -218,7 +218,7 @@ pub const AsyncContext = struct {
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_admission: @import("dense_publication_admission.zig").Owner = .{},
-    native_projection_owner: @import("native_projection_owner.zig").Owner = .{},
+    native_projection_owner: @import("native/projection_owner.zig").Owner = .{},
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     index_repair_replay_pinned: std.atomic.Value(bool) = .init(false),
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
@@ -641,7 +641,7 @@ pub const BatchExecutionContext = struct {
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
-    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    apply_mutex: *WriterPreferringRwLock,
     portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
@@ -1033,7 +1033,7 @@ pub const BatchExecutionOptions = struct {
     restore_replication_request: ?types.BatchRequest = null,
     /// Borrowed upload identity. Finalization retires staged bytes in the
     /// same transaction as either accepted effects or a durable rejection.
-    artifact_upload_finalize: ?@import("artifact_publication_transport.zig").Finalization = null,
+    artifact_upload_finalize: ?@import("artifact/publication_transport.zig").Finalization = null,
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
     snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease = null,
@@ -1109,7 +1109,7 @@ pub const ShadowState = struct {
 
 pub const LocalExecutionState = struct {
     /// Optional generation hint, accessed only under the physical query-pin guard.
-    native_query_reuse: ?@import("native_query_reuse.zig").State = null,
+    native_query_reuse: ?@import("native/query_reuse.zig").State = null,
     native_query_reuse_epoch: [16]u8 = @splat(0),
     native_query_reuse_epoch_ready: bool = false,
     table_storage: table_storage_mod.Settings = .{},
@@ -2266,7 +2266,7 @@ pub fn stopNativeProjectionMaintenance(ctx: *AsyncContext) void {
 
 const graph_restore_materialization = @import("graph_restore_materialization.zig");
 
-const document_child_range_effects = @import("document_child_range_effects.zig");
+const document_child_range_effects = @import("document/child_range_effects.zig");
 
 const durable_outbox = @import("durable_outbox.zig");
 
@@ -2281,6 +2281,52 @@ const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_
 pub const DurableReplicationOutbox = durable_outbox.DurableReplicationOutbox;
 
 pub const MutationBarrier = replication_mutation_barrier_mod.MutationBarrier;
+
+/// Every configured replication mirror shares one barrier. Return it, if any
+/// mirror has one. `mirrors` is a tuple of optional mirrors.
+pub fn sharedMutationBarrier(mirrors: anytype) ?*MutationBarrier {
+    var barrier: ?*MutationBarrier = null;
+    inline for (mirrors) |maybe_mirror| {
+        if (maybe_mirror) |mirror| {
+            if (mirror.mutation_barrier) |candidate| {
+                if (barrier) |configured| {
+                    std.debug.assert(configured == candidate);
+                } else {
+                    barrier = candidate;
+                }
+            }
+        }
+    }
+    return barrier;
+}
+
+/// Take a snapshot replay mutation lease, waiting through `io` when one is available.
+pub fn acquireSnapshotReplay(
+    admission: ?*snapshot_admission_mod.SnapshotAdmission,
+    io: ?std.Io,
+) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    const configured = admission orelse return null;
+    if (io) |value| return try configured.acquireMutationIo(value, @as(?types.CancellationToken, null));
+    return configured.acquireMutation();
+}
+
+/// Lock the apply mutex with the portable-runtime gate checked before and
+/// after, so an activation that starts while this caller waits is still seen.
+pub fn lockApplyGated(
+    mutex: *WriterPreferringRwLock,
+    pending: ?*const std.atomic.Value(bool),
+    comptime mode: enum { exclusive, shared },
+) !void {
+    try enforcePortableRuntimeGateOptional(pending);
+    if (mode == .exclusive) mutex.lockExclusive() else mutex.lockShared();
+    errdefer if (mode == .exclusive) mutex.unlockExclusive() else mutex.unlockShared();
+    try enforcePortableRuntimeGateOptional(pending);
+}
+
+pub fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
+    const configured = pending orelse return;
+    if (configured.load(.acquire)) return error.PortableRuntimeActivationPending;
+}
 
 pub const ReplicationDeferredCommitGate = replication_commit.ReplicationDeferredCommitGate;
 

@@ -473,13 +473,7 @@ fn isLowerHex(value: []const u8) bool {
     return true;
 }
 
-fn encodeHex(out: []u8, bytes: []const u8) void {
-    const alphabet = "0123456789abcdef";
-    for (bytes, 0..) |byte, i| {
-        out[i * 2] = alphabet[byte >> 4];
-        out[i * 2 + 1] = alphabet[byte & 0x0f];
-    }
-}
+const encodeHex = @import("antfly_hash").encodeHexLower;
 
 fn writeTestFile(path: []const u8, body: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(std.testing.io, parent);

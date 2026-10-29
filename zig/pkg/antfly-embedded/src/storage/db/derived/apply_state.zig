@@ -221,7 +221,7 @@ fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []co
             checkpoint.applied_sequence = if (mode == .advance) @max(previous_sequence, update.sequence) else update.sequence;
             mergeSequenceMetadata(&checkpoint, update, previous_sequence, mode == .set);
         }
-        if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact_projection_epoch.zig").revoke(&txn);
+        if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact/projection_epoch.zig").revoke(&txn);
         if (mode == .replace) {
             try putScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
         } else {
@@ -245,7 +245,7 @@ pub const ProjectionSnapshot = struct {
     alloc: Allocator,
     guard: CheckpointWriteGuard,
     checkpoint: CheckpointMap,
-    authority: @import("../artifact_publication.zig").Authority,
+    authority: @import("../artifact/publication.zig").Authority,
     epoch: u64,
 
     pub fn deinit(self: *@This()) void {
@@ -262,9 +262,9 @@ pub const ProjectionSnapshot = struct {
     /// Recheck in the evidence publication transaction. Raw physical resets,
     /// authority switches and reopen can revoke independently of this lock.
     pub fn requireCurrent(self: *const @This(), txn: anytype) !void {
-        const current = (try @import("../artifact_publication.zig").authority(txn)) orelse return error.ArtifactCatalogDrift;
+        const current = (try @import("../artifact/publication.zig").authority(txn)) orelse return error.ArtifactCatalogDrift;
         if (!std.meta.eql(self.authority, current)) return error.ArtifactCatalogDrift;
-        try @import("../artifact_projection_epoch.zig").requireCurrent(txn, self.epoch);
+        try @import("../artifact/projection_epoch.zig").requireCurrent(txn, self.epoch);
     }
 };
 
@@ -302,8 +302,8 @@ pub fn tryAcquireProjectionSnapshotWithStorage(
     defer runtime.deinit();
     var txn = try runtime.store.beginProbe();
     defer txn.abort();
-    const authority = (try @import("../artifact_publication.zig").authority(&txn)) orelse return null;
-    const epoch = try @import("../artifact_projection_epoch.zig").load(&txn);
+    const authority = (try @import("../artifact/publication.zig").authority(&txn)) orelse return null;
+    const epoch = try @import("../artifact/projection_epoch.zig").load(&txn);
     var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -422,7 +422,7 @@ pub fn saveAppliedSequence(store: anytype, index_name: []const u8, sequence: u64
 
 fn saveScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u64) !void {
     const previous = try loadScalarAppliedSequenceTxn(txn, index_name);
-    if (previous == null or sequence < previous.?) try @import("../artifact_projection_epoch.zig").revoke(txn);
+    if (previous == null or sequence < previous.?) try @import("../artifact/projection_epoch.zig").revoke(txn);
     try putScalarAppliedSequenceTxn(txn, index_name, sequence);
 }
 
@@ -445,7 +445,7 @@ pub fn saveAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u6
         checkpoint.applied_sequence = sequence;
         mergeSequenceMetadata(&checkpoint, .{ .index_name = index_name, .sequence = sequence }, previous_checkpoint.applied_sequence, true);
         if (invalidatesCompletion(previous_checkpoint, checkpoint) and sequence >= previous_checkpoint.applied_sequence)
-            try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
+            try @import("../artifact/projection_epoch.zig").revoke(mutable_txn);
         try saveProjectionMetadataTxn(mutable_txn, index_name, checkpoint);
     } else {
         // Do not resurrect a rejected record if a scalar-only update later
@@ -627,7 +627,7 @@ pub fn clearAppliedSequenceWithCheckpointWithStorage(
 
 pub fn clearAppliedSequenceTxn(txn: anytype, index_name: []const u8) !void {
     var mutable_txn = txn;
-    try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
+    try @import("../artifact/projection_epoch.zig").revoke(mutable_txn);
     var key_buf: [256]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
     mutable_txn.delete(key) catch |err| switch (err) {
@@ -839,8 +839,8 @@ fn loadProjectionCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: 
 test "ordered artifact inventory projection snapshot owns a coherent checkpoint and publication fence" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const publication = @import("../artifact_publication.zig");
-    const epoch = @import("../artifact_projection_epoch.zig");
+    const publication = @import("../artifact/publication.zig");
+    const epoch = @import("../artifact/projection_epoch.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-snapshot", .{tmp.sub_path});
@@ -907,8 +907,8 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
 test "ordered artifact inventory projection sidecar transitions revoke completion before publication" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const publication = @import("../artifact_publication.zig");
-    const epoch = @import("../artifact_projection_epoch.zig");
+    const publication = @import("../artifact/publication.zig");
+    const epoch = @import("../artifact/projection_epoch.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-epoch", .{tmp.sub_path});
@@ -998,7 +998,7 @@ fn revokeCompletion(alloc: Allocator, store: anytype) !void {
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
-    try @import("../artifact_projection_epoch.zig").revoke(&txn);
+    try @import("../artifact/projection_epoch.zig").revoke(&txn);
     try txn.commit();
 }
 
@@ -1409,8 +1409,8 @@ test "max replay updates preserve newer projection identity (#1207)" {
 
 test "projection metadata replacement recovers corrupt records and revokes proof (#1207)" {
     const a = std.testing.allocator;
-    const publication = @import("../artifact_publication.zig");
-    const epoch = @import("../artifact_projection_epoch.zig");
+    const publication = @import("../artifact/publication.zig");
+    const epoch = @import("../artifact/projection_epoch.zig");
     var backend = mem_backend.Backend.init(a, .{});
     defer backend.close();
     var runtime = try backend.runtimeStore(a, .{ .name = "docs" });

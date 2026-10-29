@@ -15,6 +15,7 @@
 
 //! Incremental metadata KV effects and bounded full-authority checkpoints.
 const std = @import("std");
+const missingAsNull = @import("antfly_local_sources").storage_backend_types.missingAsNull;
 const capture_mod = @import("antfly_local_sources").storage_txn_mutation_capture;
 pub const prefix = "\x00\x00__metadata__:standalone_ha:";
 pub const source_key = prefix ++ "source";
@@ -53,10 +54,7 @@ pub fn encode(alloc: std.mem.Allocator, capture: *capture_mod.Capture, txn: anyt
     try appendInt(alloc, &out, u32, @intCast(keys.len));
     for (keys) |key| {
         if (std.mem.startsWith(u8, key, prefix)) return error.InvalidMetadataHAEffect;
-        const value = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const value = try missingAsNull(txn.get(key));
         const added = key.len +| (if (value) |bytes| bytes.len else 0) +| 12;
         // Every admitted mutation must also fit the streaming seed row
         // envelope; accepting a larger value would make future seeding fail.

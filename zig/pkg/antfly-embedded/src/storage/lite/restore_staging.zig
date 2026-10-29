@@ -1053,15 +1053,7 @@ fn freeManifest(allocator: Allocator, manifest: backups_api.TableBackupManifest)
     owned.deinit(allocator);
 }
 
-fn appendJsonString(
-    allocator: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    value: []const u8,
-) !void {
-    const escaped = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
-    defer allocator.free(escaped);
-    try out.appendSlice(allocator, escaped);
-}
+const appendJsonString = @import("../../api/json_helpers.zig").appendJsonString;
 
 fn appendJsonU64(
     allocator: Allocator,
@@ -2841,9 +2833,9 @@ test "backup preflight artifact document admission precedes validation with exac
     for ([_]db_types.ArtifactKind{ .asset, .chunk }) |kind| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const key = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = kind, .chunk_id = if (kind == .chunk) 1 else null });
+        const key = try @import("../db/artifact/ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = kind, .chunk_id = if (kind == .chunk) 1 else null });
         defer a.free(key);
-        const key2 = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc2, .name = name, .kind = kind, .chunk_id = if (kind == .chunk) 1 else null });
+        const key2 = try @import("../db/artifact/ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc2, .name = name, .kind = kind, .chunk_id = if (kind == .chunk) 1 else null });
         defer a.free(key2);
         const payload = try backup_codec.encodeKeyValueBatch(a, &.{ .{ .key = key, .value = value }, .{ .key = key2, .value = value } });
         defer a.free(payload);
@@ -2881,7 +2873,7 @@ test "backup preflight document limit preserves authored vector artifact validat
     defer a.free(doc);
     const name = try a.dupe(u8, "vectors");
     defer a.free(name);
-    const key = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = .embedding });
+    const key = try @import("../db/artifact/ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = .embedding });
     defer a.free(key);
     const value = try @import("../db/enrichment/artifact_codec.zig").encodeAuthoredDenseEmbeddingAlloc(a, &.{ 1, 2 });
     defer a.free(value);
