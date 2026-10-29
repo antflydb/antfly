@@ -11,6 +11,12 @@ Run the resulting test binary normally for wire/oracle/graph checks. Set
 ANTFLY_CUDA_PROJECTION_BENCH=1 and filter to "CUDA projection original adapter
 qualification" for the opt-in AA/AB/BA host-submission assay. Preserve every
 result; an unchanged failed assay must not be automatically retried.
+Set ANTFLY_CUDA_PROJECTION_GPU_TIME=1 together with the benchmark flag to
+measure CUDA-event stream duration instead of host submission. Event pairs are
+created once; the recorded interval includes any host-enqueue starvation gaps.
+ANTFLY_CUDA_PROJECTION_GRAPH_TIME=1 instead captures each 32-call arm once and
+measures graph replay with CUDA events, separating within-batch enqueue gaps.
+Each original/candidate captured batch is checked against the device oracle.
 
 The output contains test-only copies of baseline adapters. Shared dependencies
 and referenced scalar constants must match, preventing accidental comparison

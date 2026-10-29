@@ -340,7 +340,7 @@ const Fixture = struct {
                 } else {
                     const row = (i - 2) / columns;
                     const column = (i - 2) % columns;
-                    const expected = @as(f32, @floatFromInt((row + 1) * (column + 1) * (plane + 1))) * (if ((row + generation) % 2 != 0) @as(f32, -1) else 1);
+                    const expected = @as(f32, @floatFromInt((row + 1) * (column + 1) * (plane + 1))) * (@as(f32, @floatFromInt(self.r.k)) / 256.0) * (if ((row + generation) % 2 != 0) @as(f32, -1) else 1);
                     try std.testing.expectEqual(expected, actual);
                 }
             }
@@ -370,7 +370,6 @@ pub fn device(comptime K: type, comptime Before: type) !void {
     defer ctx.deinit();
     var module = try K.load(&ctx);
     defer module.unload(&ctx);
-    const graph_mod = @import("../graph.zig");
     var checked: usize = 0;
     inline for (cases) |c| {
         const row_kernel = if (c.rows_kernel) |field| @field(module, field) else null;
@@ -416,18 +415,47 @@ pub fn device(comptime K: type, comptime Before: type) !void {
     std.debug.print("CUDA projection device oracle/guards/read-only/replay: {d} profiles; two mutable-operand graph replays each; original comparison={}\n", .{ checked, Before != K });
 }
 
-fn duration(comptime K: type, comptime Impl: type, comptime c: Case, module: *K, ctx: *context.CudaContext, r: Request) !u64 {
+const graph_mod = @import("../graph.zig");
+
+fn captureBatch(comptime K: type, comptime Impl: type, comptime c: Case, module: *K, ctx: *context.CudaContext, r: Request) !graph_mod.CapturedGraph {
+    try graph_mod.beginCapture(ctx);
+    var capturing = true;
+    errdefer if (capturing) {
+        const abandoned = ctx.endStreamCapture() catch null;
+        if (abandoned != null) ctx.destroyGraph(abandoned);
+    };
+    for (0..32) |_| try invoke(K, Impl, c, module, ctx, r);
+    const graph = try graph_mod.endCapture(ctx);
+    capturing = false;
+    return graph;
+}
+
+fn duration(comptime K: type, comptime Impl: type, comptime c: Case, module: *K, ctx: *context.CudaContext, r: Request, events: ?context.ProfileEventPair, graph: ?*const graph_mod.CapturedGraph) !u64 {
     const io = @import("../../../io/compat.zig").testingIo();
     try ctx.synchronize();
+    if (events) |pair| try ctx.recordProfileStart(pair);
     const start = std.Io.Clock.awake.now(io).nanoseconds;
-    for (0..32) |_| try invoke(K, Impl, c, module, ctx, r);
+    if (graph) |batch| {
+        try batch.launch(ctx);
+    } else {
+        for (0..32) |_| try invoke(K, Impl, c, module, ctx, r);
+    }
     const elapsed = std.Io.Clock.awake.now(io).nanoseconds - start;
+    if (events) |pair| {
+        try ctx.recordProfileEnd(pair);
+        try ctx.synchronize();
+        var elapsed_ms: f32 = 0;
+        try ctx.driver.check(ctx.driver.fns.cuEventElapsedTime(&elapsed_ms, pair.start, pair.end));
+        if (!(elapsed_ms > 0) or !std.math.isFinite(elapsed_ms)) return error.InvalidValue;
+        return @intFromFloat(@as(f64, elapsed_ms) * 1_000_000.0);
+    }
     try ctx.synchronize();
     return @intCast(elapsed);
 }
 
 // Qualification-only caller supplies the frozen original implementations.
-// Measure host submission, with synchronization outside each measured arm.
+// Measure host submission, or opt into CUDA event stream duration. Events are
+// created once; host synchronization stays outside the host submission metric.
 pub fn benchmark(comptime K: type, comptime Before: type) !void {
     @setEvalBranchQuota(100000);
     if (!@import("antfly_platform").env.getenvBoolDefault("ANTFLY_CUDA_PROJECTION_BENCH", false)) return;
@@ -436,17 +464,35 @@ pub fn benchmark(comptime K: type, comptime Before: type) !void {
     defer ctx.deinit();
     var module = try K.load(&ctx);
     defer module.unload(&ctx);
+    const graph_timing = @import("antfly_platform").env.getenvBoolDefault("ANTFLY_CUDA_PROJECTION_GRAPH_TIME", false);
+    const events = if (graph_timing or @import("antfly_platform").env.getenvBoolDefault("ANTFLY_CUDA_PROJECTION_GPU_TIME", false)) try ctx.createProfileEventPair() else null;
+    defer if (events) |pair| ctx.destroyProfileEventPair(pair);
     inline for (cases, 0..) |c, index| for ([_]usize{ 1, 8 }) |rows| {
         var fixture = try Fixture.init(c, &ctx, rows, 1536, 1025, 257);
         defer fixture.deinit(&ctx);
+        var before_graph: graph_mod.CapturedGraph = .{};
+        defer before_graph.deinit(&ctx);
+        var candidate_graph: graph_mod.CapturedGraph = .{};
+        defer candidate_graph.deinit(&ctx);
+        if (graph_timing) {
+            before_graph = try captureBatch(K, Before, c, &module, &ctx, fixture.r);
+            candidate_graph = try captureBatch(K, K, c, &module, &ctx, fixture.r);
+            for ([_]*const graph_mod.CapturedGraph{ &before_graph, &candidate_graph }) |batch| {
+                try fixture.reset(K, &module, &ctx);
+                try batch.launch(&ctx);
+                try fixture.check(c, &ctx, 0);
+            }
+        }
+        const before_batch = if (graph_timing) &before_graph else null;
+        const candidate_batch = if (graph_timing) &candidate_graph else null;
         for (0..3) |order| {
             for (0..8) |_| {
-                _ = try duration(K, Before, c, &module, &ctx, fixture.r);
-                _ = try duration(K, K, c, &module, &ctx, fixture.r);
+                _ = try duration(K, Before, c, &module, &ctx, fixture.r, events, before_batch);
+                _ = try duration(K, K, c, &module, &ctx, fixture.r, events, candidate_batch);
             }
             for (0..64) |sample| {
-                const first = if (order == 2) try duration(K, K, c, &module, &ctx, fixture.r) else try duration(K, Before, c, &module, &ctx, fixture.r);
-                const second = if (order == 1) try duration(K, K, c, &module, &ctx, fixture.r) else try duration(K, Before, c, &module, &ctx, fixture.r);
+                const first = if (order == 2) try duration(K, K, c, &module, &ctx, fixture.r, events, candidate_batch) else try duration(K, Before, c, &module, &ctx, fixture.r, events, before_batch);
+                const second = if (order == 1) try duration(K, K, c, &module, &ctx, fixture.r, events, candidate_batch) else try duration(K, Before, c, &module, &ctx, fixture.r, events, before_batch);
                 std.debug.print("CUDA_PROJECTION_TIMING {d} {d} {d} {d} {d} {d}\n", .{ index, rows, order, sample, first, second });
             }
         }
