@@ -1,31 +1,55 @@
 # LangChain.js validation
 
-Review fixes were validated on 2026-10-28 with Node 24, LangChain core 1.3.0,
-and LangGraph 1.5.3. The Python suite is the behavioral reference.
+Validation on 2026-10-28 used the Python LangChain suite as the behavioral
+reference. The branch packages are `@antfly/langchain` and
+`@antfly/langgraph-store` 0.1.0. The SDK used by the independent consumers is
+the published `@antfly/sdk@0.2.1`, not the workspace SDK.
 
-Current live profile: **62 LangChain tests and 7 LangGraph-store tests passed, zero skips**.
-Builds and TypeScript checks pass; lint passes with warnings for dynamic graph
-and test-backend types.
+| Environment | Checks | Result |
+| --- | --- | --- |
+| macOS, Node 24.19.0, workspace source | Builds, type checks, live integration suites | 62 LangChain + 7 LangGraph tests passed; zero skips |
+| macOS, Node 24.19.0, packed packages, pinned peers | ESM, CommonJS, strict `.mts`/`.cts` types, live smoke, all integration contracts | 62 + 7 passed; zero skips |
+| macOS, Node 24.19.0, packed packages, newer peers | Same checks | 62 + 7 passed; zero skips |
+| macOS, Node 25.9.0, packed packages, pinned peers | Live integration contracts | 62 + 7 passed; zero skips |
+| Linux ARM64, Node 24 container, packed packages, pinned peers | ESM, CommonJS, strict types, live integration contracts | 62 + 7 passed; zero skips |
+| Linux AMD64, Node 24.22.2 container, packed packages, pinned peers | ESM, CommonJS, strict types, live integration contracts | 62 + 7 passed; zero skips |
+| TypeScript SDK, workspace | SDK tests | 529 passed; 1 existing conditional skip |
 
-The tests exercise live Antfly retrieval, codecs, graph scopes, ownership, paths,
-counts, memory runtime isolation and multimodal integrity. Added regressions
-cover interrupted multimodal replacement at summary writes, cleanup and final
-commit; cached read metadata; bounded concurrent embeddings; native scoped
-single-field memory search and sticky exact multi-field fallback.
+Pinned peers: `@langchain/core@1.3.0`, `@langchain/classic@1.0.56`,
+`@langchain/openai@1.7.1`, `@langchain/langgraph@1.5.3`. The newer profile used
+core 1.3.1, classic 1.0.57, openai 1.8.0, and LangGraph 1.5.3. All package
+consumers installed compiled tarballs into isolated directories. Their copied
+test suites imported the installed packages through a one-line export shim, so
+the contract runs did not substitute workspace implementation source. Package
+inspection allowed only `dist`, README, LICENSE, and package metadata.
+Integration builds and type checks passed. Lint passed with warnings for dynamic
+graph and test-backend types.
 
-Raw command logs are local under `.state/langchain/` and are excluded from npm.
-Package contents are limited to dist, README, LICENSE and package metadata.
-The independent consumer verifies ESM/CommonJS, types and live persistence using
-local tarballs. A separate registry-only release gate checks real npm dependency
-availability. SDK 0.2.0 is still unavailable in the registry, so release remains
-blocked until the SDK foundations ship, followed by LangChain and LangGraph.
+The real-server checks exercised retrieval, reranking, codecs, graph scopes,
+ownership, paths, counts, memory isolation, native single-field semantic search,
+exact multi-field semantic pooling, and multimodal byte integrity. A separate
+process restarted Antfly between memory/graph writes and reads; native and
+multi-field recall, user namespace isolation, and graph traversal all survived.
+The multimodal example ingested one page and two figures, then verified all
+three retrieved originals after restart without reading its source fixtures.
+That test used fixed summaries and local text embeddings; it did not evaluate
+vision or generation quality.
 
-Review suggestions to change `[id]` citations, to replace exact multi-field
-pooling with vector-child records, and to change `not_submitted` commitment
-semantics were declined to retain Python compatibility. The exact abstention
-phrase remains part of the TS generation contract. Creation/update timestamps
-now use the same atomic transform strategy as Python.
+The LangChain registry-only release gate passed with published SDK 0.2.1.
+LangGraph store's registry-only gate stopped at npm's missing
+`@antfly/langchain@^0.1.0`, which is the expected publication dependency; its
+staged-package consumer and live contracts passed. No package was published as
+part of validation. Logs and consumer receipts are in
+`.state/langchain/validation-20261028/` and `.state/langchain/consumer-*` inside
+this worktree. They are excluded from package contents.
 
-Native vision model quality and hosted CI remain unverified. No npm artifacts
-were released during this review. Historical restart evidence remains in the
-path-free JSON files under validation; previous baseline was 57+6 live tests.
+The live server was a prebuilt local Antfly qualification binary from the Python
+suite, with BGE small English embeddings and MXBAI reranking. This does not
+qualify a fresh build of current Antfly main or hosted CI. There was no native
+vision model in the isolated model directory, and no paid generation call.
+
+Review suggestions to change `[id]` citations, replace exact multi-field
+pooling, or change `not_submitted` commitment semantics were declined to retain
+Python compatibility. The exact abstention phrase remains in the generation
+contract. Creation/update timestamps use the same atomic transform strategy as
+Python.

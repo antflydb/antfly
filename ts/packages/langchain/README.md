@@ -168,14 +168,18 @@ pnpm --filter @antfly/langchain... typecheck
 pnpm --filter @antfly/langchain... test
 pnpm --filter @antfly/langchain lint
 pnpm --filter @antfly/langchain test:package
+# Validate compiled integration tarballs against published @antfly/sdk@0.2.1:
+node packages/langchain/scripts/verify-package.mjs --registry-sdk --contracts
 # Dedicated server and installed embedding/reranking models required:
 ANTFLY_LIVE=1 pnpm --filter @antfly/langchain test
 ```
 
 Live tests create/remove uniquely named tables. Build before `test:package`: it
 packs SDK/integration, installs them into `.state/langchain/consumer-*` outside
-the workspace, and checks ESM/CJS/types. `ANTFLY_URL` also enables real-server
-retrieval/deletion. All other dependencies resolve from npm.
+the workspace, and checks ESM/CJS/types. `--registry-sdk` installs the published
+SDK rather than the workspace tarball. `--contracts` runs both integration test
+suites against the packed packages. `ANTFLY_URL` also enables real-server tests.
+Use `ANTFLY_SDK_VERSION` to select another published SDK version.
 
 See [VALIDATION.md](VALIDATION.md) for executed evidence. Distribution uses the
 `ts/antfly/langchain/v*` tag workflow after npm ownership/Trusted Publishing are
@@ -259,8 +263,9 @@ not graph identities. Call `refreshSchema()` after external graph changes; schem
 tools reuse the discovered schema. Explicit `vectorStore.validate()` refreshes
 metadata; ordinary read queries reuse successful validation until a query error.
 
-Local package checks deliberately include the development SDK tarball. Before a
-release, run `node scripts/verify-release.mjs langchain` (or `langgraph-store`).
-That separate gate requires dependencies from npm and checks SDK exports/types.
-Release order is SDK 0.2.0 foundations, LangChain, then LangGraph store. The SDK
-is currently declared 0.2.0 locally; its behavioral changes are in its changelog.
+Local package checks deliberately include the development SDK tarball unless
+`--registry-sdk` is set. Before a release, run
+`node scripts/verify-release.mjs langchain` (or `langgraph-store`). That separate
+gate requires dependencies from npm and checks SDK exports/types. SDK 0.2.1 is
+published. LangGraph store's registry-only gate requires LangChain to be
+published first.

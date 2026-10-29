@@ -1,10 +1,16 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const registrySDK = process.argv.includes("--registry-sdk");
+const contracts = process.argv.includes("--contracts");
+const registrySDKVersion = process.env.ANTFLY_SDK_VERSION ?? "0.2.1";
+const packedNames = registrySDK
+  ? ["langchain", "langgraph-store"]
+  : ["sdk", "langchain", "langgraph-store"];
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
 const state = resolve(root, ".state/langchain");
 mkdirSync(state, { recursive: true });
@@ -21,7 +27,7 @@ function run(command, args, cwd = consumer) {
     throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
   return result.stdout;
 }
-for (const name of ["sdk", "langchain", "langgraph-store"])
+for (const name of packedNames)
   run(
     "pnpm",
     ["pack", "--out", resolve(artifacts, `${name}.tgz`)],
@@ -43,13 +49,21 @@ run("npm", [
   "--ignore-scripts",
   "--no-audit",
   "--no-fund",
-  resolve(artifacts, "sdk.tgz"),
+  registrySDK ? `@antfly/sdk@${registrySDKVersion}` : resolve(artifacts, "sdk.tgz"),
   resolve(artifacts, "langchain.tgz"),
   resolve(artifacts, "langgraph-store.tgz"),
-  "@langchain/langgraph@1.5.3",
+  `@langchain/langgraph@${process.env.LANGGRAPH_VERSION ?? "1.5.3"}`,
   `@langchain/core@${core}`,
   "typescript@5.9.3",
   "@types/node@25.9.3",
+  ...(contracts
+    ? [
+        "vitest@4.1.9",
+        `@langchain/classic@${process.env.LANGCHAIN_CLASSIC_VERSION ?? "1.0.56"}`,
+        `@langchain/openai@${process.env.LANGCHAIN_OPENAI_VERSION ?? "1.7.1"}`,
+        "tsx@4.22.4",
+      ]
+    : []),
 ]);
 for (const [extension, statement] of [
   ["mjs", "import * as integration from '@antfly/langchain';"],
@@ -130,16 +144,40 @@ if((await store.getByIds(['owner'])).length) throw new Error('Installed-package 
   );
   run("node", ["live.mjs"]);
 }
+if (contracts) {
+  for (const name of ["langchain", "langgraph-store"]) {
+    const target = resolve(consumer, name);
+    mkdirSync(resolve(target, "src"), { recursive: true });
+    cpSync(resolve(root, `ts/packages/${name}/test`), resolve(target, "test"), { recursive: true });
+    cpSync(resolve(root, `ts/packages/${name}/examples`), resolve(target, "examples"), {
+      recursive: true,
+    });
+    writeFileSync(resolve(target, "src/index.ts"), `export * from '@antfly/${name}';`);
+    const output = run(
+      "node",
+      [resolve(consumer, "node_modules/vitest/vitest.mjs"), "run", "--maxWorkers=2"],
+      target
+    );
+    writeFileSync(resolve(consumer, `${name}-contracts.log`), output);
+  }
+}
+const installed = JSON.parse(
+  readFileSync(resolve(consumer, "node_modules/@antfly/sdk/package.json"), "utf8")
+);
+if (registrySDK && installed.version !== registrySDKVersion)
+  throw new Error("Registry SDK version mismatch");
 const receipt = {
   consumer,
   node: process.version,
+  sdk: { source: registrySDK ? "npm-registry" : "local-tarball", version: installed.version },
+  contracts: contracts ? "passed" : "not requested",
   core,
   esm: "passed",
   commonjs: "passed",
   types: "passed",
   live: process.env.ANTFLY_URL ? "passed" : "not requested",
   artifacts: Object.fromEntries(
-    ["sdk", "langchain", "langgraph-store"].map((name) => [
+    packedNames.map((name) => [
       name,
       createHash("sha256")
         .update(readFileSync(resolve(artifacts, `${name}.tgz`)))
