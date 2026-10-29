@@ -16,7 +16,23 @@
 // Transport for the existing objectstore.Client WASM ABI. A binding map is
 // supplied by the host, never resolved from untrusted account/bucket names.
 export class ObjectStoreError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, options) { super(message, options); this.status = status; }
+}
+// Normalize provider failures at every binding boundary. This performs one
+// physical attempt: a lost write response remains indeterminate, and only the
+// native receipt/conditional-commit protocol may recover it.
+export function r2BindingFailure(error) {
+  if (error instanceof ObjectStoreError) return error;
+  const match = /\((10001|10043|10054|10058)\)\s*$/.exec(String(error));
+  if (!match) return error;
+  const limited = match[1] === "10058";
+  const failure = new ObjectStoreError(limited ? 6 : 7, limited ? "ObjectStoreRateLimited" : "ObjectStoreTransportFailed", {cause:error});
+  failure.retryable = true;
+  failure.provider_code = Number(match[1]);
+  return failure;
+}
+export async function callR2Binding(run) {
+  try { return await run(); } catch (error) { throw r2BindingFailure(error); }
 }
 const fail = (status, message) => { throw new ObjectStoreError(status, message); };
 function integer(value, name) {
@@ -53,6 +69,7 @@ async function boundedBody(stream, limit) {
 export function createR2Transport(bindings, { maxResponseBytes = 8 * 1024 * 1024, maxPutBytes = 1024 * 1024 } = {}) {
   integer(maxResponseBytes, "response limit"); integer(maxPutBytes, "put limit");
   return async function objectCall(request, body = new Uint8Array()) {
+    try {
     if (request.guard_key != null || request.guard_etag != null) fail(3, "guarded writes require a transactional coordinator");
     const binding = Object.hasOwn(bindings, request.bucket) ? bindings[request.bucket] : undefined;
     if (!binding) fail(3, "unbound bucket");
@@ -122,5 +139,6 @@ export function createR2Transport(bindings, { maxResponseBytes = 8 * 1024 * 1024
       }
       default: fail(3, "unsupported object operation");
     }
+    } catch (error) { throw r2BindingFailure(error); }
   };
 }

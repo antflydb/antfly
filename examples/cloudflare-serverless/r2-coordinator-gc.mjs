@@ -15,6 +15,7 @@
 
 // This collector collects the coordinator's own native page tree. Its progress
 // is in newer tree revisions, protected by the same monotonic commit protocol.
+import {callR2Binding} from "../../zig/lib/objectstore/wasm/r2.mjs";
 import {metadataTreeRoot} from "./metadata-root.mjs";
 import {maintenanceMutationBudget} from "./maintenance-policy.mjs";
 const STATE = "__antfly_coord_gc/state", TASK = "__antfly_coord_gc/tasks/", MARK = "__antfly_coord_gc/marks/";
@@ -93,7 +94,7 @@ async function sweepCoordinator(store,bucket,plan){
   // Listing and bulk deletion may take seconds. Neither holds the coordinator
   // transaction or a WASM host. Proof is persisted before physical deletion.
   let page;
-  if(plan.state.phase!=="delete")page=await bucket.list({prefix:plan.prefix,cursor:plan.state.cursor??undefined,limit:plan.phase==="pages"?128:32});
+  if(plan.state.phase!=="delete")page=await callR2Binding(()=>bucket.list({prefix:plan.prefix,cursor:plan.state.cursor??undefined,limit:plan.phase==="pages"?128:32}));
   const prepared=await store.transaction(async tx=>{
     const state=await tx.get(STATE);
     if(!sameBoundary(state,plan))return{result:progress(state,plan.state.id)};
@@ -111,7 +112,7 @@ async function sweepCoordinator(store,bucket,plan){
     state.phase="delete";state.pending=intent;validateIntent(state,plan);tx.put(STATE,state);return{intent};
   });
   if(prepared.result)return prepared.result;
-  await bucket.delete(prepared.intent.keys.map(suffix=>plan.prefix+suffix));
+  await callR2Binding(()=>bucket.delete(prepared.intent.keys.map(suffix=>plan.prefix+suffix)));
   return store.transaction(async tx=>{
     const state=await tx.get(STATE);
     // Another delivery may have acknowledged the same immutable deletion, or

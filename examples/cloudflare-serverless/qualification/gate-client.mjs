@@ -15,12 +15,21 @@
 
 import{Agent}from'undici';
 import{resourceFailureCode}from'../performance.mjs';
+import{r2BindingFailure}from'../../../zig/lib/objectstore/wasm/r2.mjs';
 import{assertGateRun}from'./gate-scope.mjs';
 import{verifySealedRun}from'./gate-provenance.mjs';
 import {readFile} from 'node:fs/promises';
 import {InvocationLedger,attemptParameter} from './invocation-accounting.mjs';
 // Keep connections across the fixed 30-second arrivals, identically for both sides.
-const transportPolicy=Object.freeze({keep_alive_ms:60000,max_connections:128,constructor_reset_replay:'idempotent-warm-only',read_lease_replay:'idempotent-warm-only'});
+const transportPolicy=Object.freeze({keep_alive_ms:60000,max_connections:128,constructor_reset_replay:'idempotent-warm-only',read_lease_replay:'idempotent-warm-only',platform_transport_replay:'idempotent-warm-only'});
+// Warm replay is confined to reads and keyed mutations, within the original
+// attempt/deadline budgets. These are transport/reset envelopes from old hosts;
+// no database conflict, arbitrary internal error or cold request is replayed.
+export function retryablePlatformEnvelope(value){
+ if(typeof value!=="string"||resourceFailureCode(value))return false;
+ if(r2BindingFailure(value)!==value)return true;
+ return /^(?:Error: )?(?:Network connection lost\.|Internal error while starting up Durable Object storage caused object to be reset; reference = [a-z0-9]+)$/.test(value);
+}
 const constructorReset='A call to blockConcurrencyWhile() in a Durable Object waited for too long. The call was canceled and the Durable Object was reset.';
 const setupPolicy=Object.freeze({concurrent_tenants:1,publication_window_documents:64,deadline_ms:1800000});
 const dispatcher=new Agent({connections:transportPolicy.max_connections,keepAliveTimeout:transportPolicy.keep_alive_ms,keepAliveMaxTimeout:transportPolicy.keep_alive_ms});
@@ -54,7 +63,7 @@ export class GateClient {
    let response,body;try{transportAttempts++;response=await this.fetch(url,{method:'POST',headers:{Authorization:'Bearer '+this.token,'Content-Type':'application/json','X-Antfly-Tenant':tenant,'X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input),signal:AbortSignal.any([this.abortController.signal,AbortSignal.timeout(Math.max(1,Math.min(35000,scheduled+60000-Date.now())))])});
    this.invocations.response(invocation,response);body=await response.text();this.invocations.finish(invocation);}catch(error){this.invocations.finish(invocation,{transportError:true});lastTransportError=error;if(!this.abortController.signal.aborted&&phase!=="cold"&&idempotent&&networkFailure(error)){await new Promise(r=>setTimeout(r,250));continue;}throw error;}let value;try{value=JSON.parse(body);}catch{throw Error('non-JSON response: '+response.status);}
    last=value;if(resourceFailureCode(value.error))this.resourceErrors.push({phase,error:value.error});
-   if(phase!=="cold"&&(response.status===503||response.status===409&&(/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??'')||idempotent&&(value.error===constructorReset||value.error==='ManifestReadLeaseExpired')))){await new Promise(r=>setTimeout(r,250));continue;}
+   if(phase!=="cold"&&(response.status===503||response.status===409&&(/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??'')||idempotent&&(value.error===constructorReset||value.error==='ManifestReadLeaseExpired'||retryablePlatformEnvelope(value.error))))){await new Promise(r=>setTimeout(r,250));continue;}
    if(!response.ok)throw Error('HTTP '+response.status+': '+(value.error??'unknown'));
    const version=response.headers.get('X-Antfly-Version');if(version!==this.run.version)throw Error('mixed version: '+version);
    const finished=Date.now(),sample={tenant,phase,op:input.op??path,ms:finished-scheduled,scheduled_at:scheduled,started_at:started,finished_at:finished,scheduling_delay_ms:Math.max(0,started-scheduled),execution_ms:finished-started,attempts:transportAttempts,version,epoch};this.samples.push(sample);return{value,sample};

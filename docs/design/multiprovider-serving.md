@@ -533,3 +533,11 @@ Reports remain preserved; cold epochs were not consumed. Resume qualification
 with fresh stacks only after cancellation/recovery, convergence and diagnostic
 completeness are addressed. Resource caps, retries and gate thresholds are
 unchanged.
+
+
+The [runtime recovery follow-up](cloudflare-runtime-recovery.md) implements
+request-owned physical settlement reporting, typed R2 service failures,
+Queue-only native scheduled maintenance, code-version-preserving cold dispatch
+quiescence, exact bounded query subdivision and corrected diagnostic teardown
+ordering. It records the remaining sampled-provider/export permission boundary;
+those implementation and local test results do not qualify the live gate.

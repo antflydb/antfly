@@ -97,3 +97,14 @@ test('publication diagnostics retain content identities without accepting payloa
  const safe=sanitizeTailEvent({logs:[{message:[JSON.stringify({event:'antfly.publication_progress',checkpoint_sha256:'a'.repeat(64),receipt_sha256:'b'.repeat(64),posting_quantum:1024,body:'private-body',other:'private-value'})]}]});
  const metric=JSON.parse(safe.logs[0].message[0]);assert.equal(metric.checkpoint_sha256,'a'.repeat(64));assert.equal(metric.receipt_sha256,'b'.repeat(64));assert.equal(metric.posting_quantum,1024);assert.ok(!JSON.stringify(safe).includes('private'));
 });
+
+
+test('physical I/O coverage requires matched settlement and retains late resource failures',async()=>{
+ const{DiagnosticCoverage}=await import('../qualification/live-diagnostics.mjs');
+ const create=()=>{const c=new DiagnosticCoverage([{id:'baseline'},{id:'candidate'}]);for(const run of ['baseline','candidate'])for(const role of ['app','writer','reader','builder'])c.connected(run,role);return c;};
+ const id=crypto.randomUUID(),event=value=>sanitizeTailEvent({outcome:'ok',logs:[{message:[JSON.stringify(value)]}]}),start=event({event:'antfly.operation',io_draining:true,io_lifecycle_id:id}),end=event({event:'antfly.io_settled',io_lifecycle_id:id});
+ for(const order of [[start,end],[end,start]]){const c=create();c.observe('candidate','app',order[0]);assert.equal(c.report().passed,false);assert.doesNotThrow(()=>c.assertHealthy());c.observe('candidate','app',order[1]);c.observe('candidate','app',order[0]);assert.equal(c.report().passed,true);c.observe('candidate','app',event({event:'antfly.resource_failure',failure_code:'OutOfMemory'}));assert.equal(c.report().passed,false);assert.throws(()=>c.assertHealthy(),/DiagnosticsFailed/);}
+ const c=create();c.observe('candidate','writer',start);c.observe('candidate','reader',end);assert.equal(c.report().passed,false);assert.equal(c.report().streams.find(s=>s.role==='writer'&&s.run==='candidate').pending_io,1);
+ const missing=create();missing.observe('candidate','app',event({event:'antfly.operation',io_draining:true}));assert.equal(missing.report().passed,false);missing.observe('candidate','app',end);assert.equal(missing.report().passed,false);
+ const overflow=create();for(let i=0;i<4097;i++)overflow.observe('candidate','app',event({event:'antfly.io_settled',io_lifecycle_id:crypto.randomUUID()}));assert.equal(overflow.report().streams.find(s=>s.role==='app'&&s.run==='candidate').gap_reasons.io_lifecycle_capacity,1);
+});

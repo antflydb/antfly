@@ -49,11 +49,11 @@ async function lifecycle(action,id){await new Promise((resolve,reject)=>{const c
 try{
  for(const side of[baseline,candidate])if(side.run.paused)await lifecycle('resume',side.run.id);
  diagnostics=await startLiveDiagnostics([baseline.run,candidate.run],executionId,gate.dir);
- diagnosticGuard=setInterval(()=>{try{diagnostics.assertClean();}catch(error){baseline.stop(error);candidate.stop(error);}},1000);
+ diagnosticGuard=setInterval(()=>{try{diagnostics.assertHealthy();}catch(error){baseline.stop(error);candidate.stop(error);}},1000);
  await markPhase('setup');
  console.log('seeding',trial);await runPairedPhase([baseline,candidate],side=>side.seed(documents,{executionId:resumedSeedExecutionId??executionId}));console.log('seeded',trial);
  await markPhase('workload');
- workload=await runOfferedWorkload({sides:[baseline,candidate],seconds,period,documents,orderOffset:trial,onProgress:async state=>{console.log('minute',trial,state.minute,'pending rounds',state.pending_rounds);diagnostics.assertClean();await save();}});
+ workload=await runOfferedWorkload({sides:[baseline,candidate],seconds,period,documents,orderOffset:trial,onProgress:async state=>{console.log('minute',trial,state.minute,'pending rounds',state.pending_rounds);diagnostics.assertHealthy();await save();}});
  offered=seconds*1000;await runPairedPhase([baseline,candidate],side=>side.converge());await runPairedPhase([baseline,candidate],side=>side.verify(documents));await save();
  if(seconds>=3600||process.argv.includes('--cold')){
   let evidence;try{evidence=JSON.parse(await readFile(resolve(gate.dir,'evidence.json')));}catch{}
@@ -62,7 +62,7 @@ try{
   const prerequisites=evaluateWarmPrerequisites(report());
   if(!prerequisites.passed)throw Error('cold actors preserved; warm prerequisites failed: '+prerequisites.failures.join('; '));
   candidate.run.cold_execution_id=executionId;await writeFile(resolve(candidate.run.dir,'run.json'),JSON.stringify(candidate.run,null,2));
-  await lifecycle('pause',candidate.run.id);await new Promise(r=>setTimeout(r,31000));
+  await lifecycle('quiesce',candidate.run.id);await new Promise(r=>setTimeout(r,31000));diagnostics.assertClean();
   for(let epoch=1;epoch<=100;epoch++){const tenant=['a','b','c','d'][(epoch-1)%4],{value,sample}=await candidate.call(tenant,{op:'count',required_visibility:candidate.receipts[tenant]},'cold',{epoch});candidate.cold.push({...sample,count:value.count});candidate.physicalEpochs??={};candidate.physicalEpochs[tenant]=epoch;if(epoch%10===0){console.log('cold',trial,epoch);await save();}}
   await candidate.verify(documents);
  }

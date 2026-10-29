@@ -335,3 +335,25 @@ test('native protocol flags bind new profiles without changing historical optimi
   assert.equal(runtimePlacement({vars:{[flag]:'false'}}).native_optimizations[flag],false);
  }
 });
+
+
+test('warm platform-envelope retries preserve cold single attempts and keyed-write admission',async()=>{
+ const{retryablePlatformEnvelope,GateClient}=await import('../qualification/gate-client.mjs');
+ for(const message of ['get: internal error (10001)','Network connection lost.','Internal error while starting up Durable Object storage caused object to be reset; reference = abc123'])assert.equal(retryablePlatformEnvelope(message),true);
+ for(const message of ['internal error; reference = abc123','WalIdempotencyConflict','OutOfMemory (10001)','denied (10003)'])assert.equal(retryablePlatformEnvelope(message),false);
+ for(const phase of ['read','cold']){let calls=0;const version='version',client=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>++calls===1?Response.json({error:'get: provider internal error (10001)'},{status:409}):Response.json({count:'512'},{headers:{'X-Antfly-Version':version}})});
+  if(phase==='cold'){await assert.rejects(client.call('a',{op:'count'},phase),/HTTP 409/);assert.equal(calls,1);}else{assert.equal((await client.call('a',{op:'count'},phase)).sample.attempts,2);assert.equal(client.invocations.report().attempts.length,2);}
+ }
+ let calls=0;const unkeyed=new GateClient({origin:'https://fixture.invalid',version:'version'},'fixture',{fetch:async()=>{calls++;return Response.json({error:'get: provider internal error (10001)'},{status:409});}});
+ await assert.rejects(unkeyed.call('a',{op:'mutate'},'write'),/HTTP 409/);assert.equal(calls,1);
+});
+
+
+test('cold quiescence requires advertised Queue-only dispatch and preserves code versions',async()=>{
+ const{quiesceQueueMaintenance}=await import('../qualification/queue-quiescence.mjs');
+ let pauses=0;const callbacks={verify:async()=>[],pause:async()=>{pauses++;}},run={kind:'candidate',capabilities:{queued_maintenance:true},versions:{app:'app',builder:'builder'}};
+ for(const invalid of [{...run,kind:'baseline'},{...run,capabilities:{}},{...run,deleted:true}])await assert.rejects(quiesceQueueMaintenance(invalid,callbacks),/QueueOnlyMaintenanceRequired/);
+ await assert.rejects(quiesceQueueMaintenance(run,{...callbacks,verify:async()=>['altered bundle']}),/ProvenanceFailed/);assert.equal(pauses,0);
+ const versions=structuredClone(run.versions);await quiesceQueueMaintenance(run,callbacks);assert.equal(pauses,1);assert.equal(run.dispatch_paused,true);assert.deepEqual(run.versions,versions);
+ const failed={...run,paused:false};await assert.rejects(quiesceQueueMaintenance(failed,{...callbacks,pause:async()=>{throw Error('pause failed');}}),/pause failed/);assert.equal(failed.paused,false);
+});

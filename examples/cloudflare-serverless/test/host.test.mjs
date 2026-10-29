@@ -1166,3 +1166,36 @@ test('warm namespace affinity chooses an idle compatible kernel without waiting 
  let release,entered;const started=new Promise(r=>entered=r),held=pool.withHost(async host=>{entered();await new Promise(r=>release=r);return host.id;},{affinityKey:'b'});
  await started;assert.equal(await pool.withHost(host=>host.id,{affinityKey:'b'}),aId,'affinity must not queue behind a busy host');release();assert.equal(await held,bId);assert.equal(created,2);
 });
+
+
+test("cancelled native I/O retains its caller and reports one matching physical settlement",async()=>{
+ let release,entered;const held=new Promise(r=>release=r),started=new Promise(r=>entered=r),background=[],settled=[],metrics=[];
+ const {host}=await setup(undefined,raw=>async(req,body)=>{entered();await held;return raw(req,body);});
+ const controller=new AbortController(),work=host.request(request('latest'),{signal:controller.signal,background:p=>background.push(p),onIoSettled:m=>settled.push(m),onMetrics:m=>metrics.push(m)}).catch(e=>e);
+ await started;controller.abort();
+ try{const error=await work;assert.equal(error.message,'Canceled');assert.equal(background.length,1);assert.equal(background[0],error.ioSettled);assert.equal(settled.length,0);assert.equal(metrics[0].io_draining,true);assert.match(metrics[0].io_lifecycle_id,/^[a-f0-9-]{36}$/);
+  release();await error.ioSettled;assert.deepEqual(settled,[{event:'antfly.io_settled',io_lifecycle_id:metrics[0].io_lifecycle_id}]);assert.equal(host.draining(),null);assert.equal(host.usable(),false);
+ }finally{release();await work;await host.draining();}
+});
+
+test("R2 binding failures are typed without replaying ambiguous conditional writes",async()=>{
+ const {r2BindingFailure,callR2Binding}=await import('../../../zig/lib/objectstore/wasm/r2.mjs');
+ for(const code of [10001,10043,10054,10058]){
+  const original=Error('get: provider failure ('+code+')'),typed=r2BindingFailure(original);assert.equal(typed.cause,original);assert.equal(typed.provider_code,code);assert.equal(typed.status,code===10058?6:7);assert.equal(typed.retryable,true);
+  await assert.rejects(callR2Binding(async()=>{throw original;}),e=>e.cause===original);
+ }
+ for(const value of [Error('access denied (10003)'),Error('unrelated internal error'),new ObjectStoreError(2,'conflict')])assert.equal(r2BindingFailure(value),value);
+ const bucket=new Bucket(),rawPut=bucket.put.bind(bucket);let calls=0;
+ bucket.put=async(...args)=>{calls++;await rawPut(...args);throw Error('put: provider internal error (10001)');};
+ const transport=createR2Transport({database:bucket});await assert.rejects(transport({op:'put',bucket:'database',key:'once',if_none_match:true},Uint8Array.of(1)),e=>e.status===7&&e.cause.message.includes('10001'));
+ assert.equal(calls,1);assert.equal(bucket.objects.has('once'),true);
+});
+
+
+test('native receipt replay recovers an R2 internal error after its conditional commit',async()=>{
+ const bucket=new Bucket(),first=(await setup(bucket)).host;await first.request(append('before'));
+ const put=bucket.put.bind(bucket);let fail=true,ambiguous=0;
+ bucket.put=async(key,body,options)=>{const result=await put(key,body,options);if(fail&&key.endsWith('/HEAD')&&options?.onlyIf?.etagMatches){fail=false;ambiguous++;throw Error('put: provider internal error (10001)');}return result;};
+ const failed=(await setup(bucket)).host;await assert.rejects(failed.request(append('recover')),/ObjectStoreTransportFailed/);
+ const reopened=(await setup(bucket)).host,receipt=await reopened.request(append('recover'));assert.equal(ambiguous,1);assert.equal(receipt.visibility.slice(-16),'0000000000000002');const rows=await reopened.request(request('read'));assert.deepEqual(rows.records.map(payloadText),['before','recover']);
+});

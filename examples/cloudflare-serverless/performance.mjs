@@ -17,6 +17,14 @@
 // remains separate. Observers cannot affect a committed operation.
 const transportActivity=new WeakMap();
 export function resourceFailureCode(error){
+ // A typed provider wrapper must not hide a resource failure in its cause.
+ const seen=new Set();let current=error;
+ for(let depth=0;depth<4&&current&&!seen.has(current);depth++){
+  seen.add(current);const code=resourceFailureText(current);if(code)return code;current=current.cause;
+ }
+ return null;
+}
+function resourceFailureText(error){
  const value=String(error??'');
  if(/\bSQLITE_NOMEM\b/.test(value))return 'SQLITE_NOMEM';
  if(/\bOutOfMemory\b|out of memory/i.test(value))return 'OutOfMemory';
@@ -66,4 +74,4 @@ export function countMetadataRpc(counters,request){
 
 // Lease expiry retires the failed lane; a new request can acquire fresh rights.
 // Return backpressure without replaying an operation or hiding resource errors.
-export function retryableRuntimeFailure(error){if(error?.overloaded===true)return false;if(error?.retryable===true&&!/OutOfMemory|MemoryLimitExceeded|CPULimitExceeded|memory limit|CPU.*limit/i.test(String(error)))return true;return /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|ObjectIoBudgetExceeded|PublicationExecutionBudgetExceeded|ManifestReadLeaseExpired|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));}
+export function retryableRuntimeFailure(error){const resource=resourceFailureCode(error);if(resource&&resource!=="SQLITE_NOMEM")return false;if(error?.overloaded===true)return false;if(error?.retryable===true&&!/OutOfMemory|MemoryLimitExceeded|CPULimitExceeded|memory limit|CPU.*limit/i.test(String(error)))return true;return /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|ObjectIoBudgetExceeded|PublicationExecutionBudgetExceeded|ManifestReadLeaseExpired|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));}

@@ -62,9 +62,14 @@ try{
  else await runPairedPhase(sides,async s=>{for(const tenant of['a','b','c','d']){s.receipts[tenant]=(await s.call(tenant,{op:'status'},'coverage-admission')).value.visibility;console.log(JSON.stringify({stage:'admission',side:s.run.kind,tenant}));}await s.converge(300000);});
  report.stage='workload';report.workload_started_at=Date.now();
  report.workload=await runOfferedWorkload({sides,seconds,documents,orderOffset:trial,onProgress:async state=>{console.log(JSON.stringify({stage:'workload',...state,tail_clean:live.report().passed}));await save();}});
- report.stage='verification';await runPairedPhase(sides,async s=>{await s.converge();for(const tenant of['a','b','c','d']){if((await s.call(tenant,{op:'count',required_visibility:s.receipts[tenant]},'coverage-verify')).value.count!==String(documents))throw Error('ProbeCountMismatch');}});
+ report.stage='verification';await save();await runPairedPhase(sides,async s=>{await s.converge();for(const tenant of['a','b','c','d']){if((await s.call(tenant,{op:'count',required_visibility:s.receipts[tenant]},'coverage-verify')).value.count!==String(documents))throw Error('ProbeCountMismatch');}});
 }catch(e){report.fatal=safeError(e);for(const s of sides)s.stop(e);await save();}
-finally{const paused=await pause();if(paused.some(r=>r.status==='rejected'))report.fatal??='ProbePauseFailed';if(live)try{report.diagnostics=await live.finish();}catch{report.fatal??='ProbeTailFinalizationFailed';}}
+finally{
+ // Close the measured diagnostic interval before deployment teardown. Pausing
+ // redeploys the builder and can close provider tails; it is outside this run.
+ try{if(live)report.diagnostics=await live.finish();}catch{report.fatal??='ProbeTailFinalizationFailed';}
+ finally{const paused=await pause();if(paused.some(r=>r.status==='rejected'))report.fatal??='ProbePauseFailed';}
+}
 
 if(interrupted)report.fatal??='CoverageProbeInterrupted';
 if(report.workload_started_at&&sides.length===2&&!interrupted){
@@ -103,4 +108,4 @@ if(report.workload_started_at&&sides.length===2&&!interrupted){
 }
 report.stage='complete';report.finished_at=Date.now();await save();
 console.log(JSON.stringify({directory,qualification:false,window_failures:report.window_failures,counter_failures:report.counter_failures,reconciliation:report.reconciliation.map(r=>({side:r.side,complete:r.complete,failures:r.failures})),fatal:report.fatal}));
-if(report.fatal||report.window_failures.length||report.counter_failures.length||report.reconciliation.some(r=>!r.complete))process.exitCode=1;
+if(report.fatal||report.diagnostics?.passed!==true||report.window_failures.length||report.counter_failures.length||report.reconciliation.some(r=>!r.complete))process.exitCode=1;

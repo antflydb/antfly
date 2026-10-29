@@ -15,6 +15,7 @@
 
 import{assertGateRun,assertGateConfig}from'./gate-scope.mjs';
 import{drainBucket}from'./drain-bucket.mjs';
+import{quiesceQueueMaintenance}from'./queue-quiescence.mjs';
 import{verifySealedRun,assertUnusedRecovery,runtimePlacement}from'./gate-provenance.mjs';
 import{verifyWalTailReaders}from'./wal-compatibility.mjs';
 import{verifyInlineMetadataReaders}from'./metadata-compatibility.mjs';
@@ -26,7 +27,7 @@ import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 const cwd=fileURLToPath(new URL('../',import.meta.url)),cli=resolve(cwd,'node_modules/wrangler/bin/wrangler.js');
 const gate=JSON.parse(await readFile(process.argv[2])),action=process.argv[3],selection=process.argv[4];
-if(gate.schema!==1||!/^gate-[a-z0-9]+$/.test(gate.id)||!['seal','deploy','enable-wal-inline','enable-inline-metadata','upload-token','pause','resume','cleanup'].includes(action))throw Error('invalid lifecycle manifest/action');
+if(gate.schema!==1||!/^gate-[a-z0-9]+$/.test(gate.id)||!['seal','deploy','enable-wal-inline','enable-inline-metadata','upload-token','pause','quiesce','resume','cleanup'].includes(action))throw Error('invalid lifecycle manifest/action');
 const paths=gate.trials.flatMap(t=>[t.baseline,t.candidate]).filter(path=>!selection||path.includes(selection));
 const save=run=>writeFile(resolve(run.dir,'run.json'),JSON.stringify(run,null,2));
 async function command(run,args,{input,allowExists=false,allowMissing=false}={}){
@@ -83,7 +84,7 @@ async function lifecycle(path){
   }
   run.wal_inline_tail_enabled=true;delete run.wal_inline_tail_activating;run.deployed=true;await save(run);return;
  }
- if(action==='resume'){assertUnusedRecovery(run);const builder=run.services.find(s=>s.role==='builder'),config=JSON.parse(await readFile(builder.config));config.triggers={crons:['* * * * *']};config.vars.AUTO_GC='true';await writeFile(builder.config,JSON.stringify(config,null,2));const output=await command(run,['deploy','--no-bundle','--config',builder.config]);run.versions.builder=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];await command(run,['queues','resume-delivery',run.id,'--config',builder.config]);run.paused=false;await save(run);return;}
+ if(action==='resume'){assertUnusedRecovery(run);const builder=run.services.find(s=>s.role==='builder'),config=JSON.parse(await readFile(builder.config));config.triggers={crons:['* * * * *']};config.vars.AUTO_GC='true';await writeFile(builder.config,JSON.stringify(config,null,2));const output=await command(run,['deploy','--no-bundle','--config',builder.config]);run.versions.builder=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];await command(run,['queues','resume-delivery',run.id,'--config',builder.config]);run.paused=false;run.dispatch_paused=false;await save(run);return;}
  if(action==='seal'){
   run.deployed=false;await save(run);
   const placementPolicies=await Promise.all(run.services.map(async service=>JSON.stringify(runtimePlacement(JSON.parse(await readFile(service.config))))));
@@ -105,10 +106,14 @@ async function lifecycle(path){
  }
  if(action==='upload-token'){
   if(!run.deployed)throw Error('deploy before installing the disposable token');const token=(await readFile(run.token_file,'utf8')).trim();if(!/^[a-f0-9]{64}$/.test(token))throw Error('invalid disposable gate token');await command(run,['secret','put','API_TOKEN','--config',run.config],{input:token});let version;
-  for(let i=0;i<120;i++){try{const response=await fetch(new URL('/_qualification/version',run.origin),{method:'POST',headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(10000)});if(response.ok){version=(await response.json()).version;if(version&&version!==run.version)break;}}catch{}await new Promise(r=>setTimeout(r,500));}
+  for(let i=0;i<120;i++){try{const response=await fetch(new URL('/_qualification/version',run.origin),{method:'POST',headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(10000)});if(response.ok){const info=await response.json();version=info.version;if(version&&version!==run.version){run.capabilities={queued_maintenance:info.capabilities?.queued_maintenance===true};break;}}}catch{}await new Promise(r=>setTimeout(r,500));}
   if(!version||version===run.version)throw Error('secret version did not converge');run.version=version;run.versions.app=version;run.token_installed=true;await save(run);return;
  }
  const builder=run.services.find(s=>s.role==='builder');
+ if(action==='quiesce'){
+  await quiesceQueueMaintenance(run,{verify:verifySealedRun,pause:()=>command(run,['queues','pause-delivery',run.id,'--config',builder.config])});
+  await save(run);return;
+ }
  await command(run,['queues','pause-delivery',run.id,'--config',builder.config],{allowMissing:action==='cleanup'});
  if(action==='pause'){
   const config=JSON.parse(await readFile(builder.config));config.triggers={crons:[]};config.vars.AUTO_GC='false';await writeFile(builder.config,JSON.stringify(config,null,2));const output=await command(run,['deploy','--no-bundle','--config',builder.config]);run.versions.builder=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];run.paused=true;await save(run);return;

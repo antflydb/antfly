@@ -123,7 +123,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
     });
   }
   async function request(value, { transport: requestTransport = transport, signal,
-    inference, drainTransport, onMetrics: requestMetrics = onMetrics, deadlineMs = clock() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
+    inference, drainTransport, background, onIoSettled, onMetrics: requestMetrics = onMetrics, deadlineMs = clock() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
     const unusable = poisoned || invalidClock;
     if (busy || unusable) throw new Error(unusable ? "WASM instance is unusable" : "WASM instance is busy");
     if (typeof requestTransport !== "function") throw new TypeError("request transport required");
@@ -137,7 +137,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
     activeTransport = requestTransport;
     activeOptions = { signal, deadlineMs, maxOperations, maxTransferBytes, inference };
     operations = 0; inferenceCalls = 0; transferred = 0;
-    let requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0, clockRefreshes = 0, clockRegressionMs = 0;
+    let ioLifecycleId, requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0, clockRefreshes = 0, clockRegressionMs = 0;
     const started = performance.now();
     const readStateHitsBefore=Number(wasm.antfly_host_read_state_cache_hits?.()??0),readStateExtensionsBefore=Number(wasm.antfly_host_read_state_cache_extensions?.()??0);
     const manifestCacheHitsBefore=Number(wasm.antfly_host_manifest_cache_hits?.()??0);
@@ -186,7 +186,15 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
           const io = pending;
           let auxiliary;
           try { auxiliary = drainTransport?.(); } catch (error) { auxiliary = Promise.reject(error); }
-          draining = Promise.allSettled([io, auxiliary]).then(() => { pending = null; draining = null; });
+          // Logical cancellation cannot cancel a binding mutation. Keep its
+          // caller alive and give diagnostics an exact completion identity.
+          // The poisoned host and pool reservation remain owned until settled.
+          if (typeof onIoSettled === "function") ioLifecycleId = crypto.randomUUID();
+          draining = Promise.allSettled([io, auxiliary]).then(() => {
+            pending = null; draining = null;
+            if (ioLifecycleId) try { onIoSettled({event:"antfly.io_settled",io_lifecycle_id:ioLifecycleId}); } catch {}
+          });
+          if (typeof background === "function") try { background(draining); } catch {}
           Object.defineProperty(error, "ioSettled", {value:draining});
           throw error;
         } finally { waitMs += performance.now() - waitStarted; }
@@ -222,7 +230,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
       activeOptions = null;
       busy = false;
       const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, clock_refreshes: clockRefreshes, clock_regression_ms: clockRegressionMs, operations, inference_calls: inferenceCalls,
-        transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs, io_draining: Boolean(draining),
+        transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs, io_draining: Boolean(draining), ...(ioLifecycleId ? {io_lifecycle_id:ioLifecycleId} : {}),
         wasm_linear_bytes: wasm.memory.buffer.byteLength,
         decoded_manifest_cache_hits: Number(wasm.antfly_host_manifest_cache_hits?.() ?? 0)-manifestCacheHitsBefore,
         read_state_cache_bytes: wasm.antfly_host_read_state_cache_bytes?.() ?? 0,

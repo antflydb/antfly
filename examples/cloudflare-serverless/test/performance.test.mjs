@@ -937,3 +937,10 @@ test('app observers retain the fused-admission setting and isolate its configura
  const{AppReadViews}=await import('../app-read-views.mjs'),configs=[],views=new AppReadViews(config=>{configs.push(config);return{open:async()=>config.FUSED_READ_ADMISSION};}),env={DATABASE:{},ANTFLY_INCARNATION:'fused-app',LOCAL_METADATA_READS:'true',FUSED_READ_ADMISSION:'true'};
  assert.equal(await views.get(env).open({}),'true');assert.equal(configs[0].FUSED_READ_ADMISSION,'true');assert.equal(await views.get({...env,FUSED_READ_ADMISSION:'false'}).open({}),'false');assert.equal(configs.length,2);
 });
+
+
+test('typed provider wrappers retain resource causes and cannot make them replayable',async()=>{
+ const{resourceFailureCode,retryableRuntimeFailure}=await import('../performance.mjs'),{r2BindingFailure}=await import('../../../zig/lib/objectstore/wasm/r2.mjs');
+ for(const code of ['OutOfMemory','MemoryLimitExceeded','CPULimitExceeded','SQLITE_NOMEM']){const error=r2BindingFailure(Error(code+' (10001)'));assert.equal(resourceFailureCode(error),code);assert.equal(retryableRuntimeFailure(error),code==='SQLITE_NOMEM');}
+ const cycle=Error('not a resource failure');cycle.cause=cycle;assert.equal(resourceFailureCode(cycle),null);
+});

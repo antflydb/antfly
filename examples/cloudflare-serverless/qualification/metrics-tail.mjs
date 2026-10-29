@@ -16,7 +16,7 @@
 // Persist only numeric diagnostics. Raw HTTP events, headers, bodies and stderr
 // never reach stdout. The input frame exists only in bounded transient memory.
 import{resourceFailureCode}from'../performance.mjs';
-const events=new Set(['antfly.publication_batch_plan','antfly.publication_progress','antfly.compaction_plan','antfly.resource_failure','antfly.operation','antfly.trace','antfly.actor_started','antfly.coordinator','antfly.coordinator_group','antfly.coordinator_snapshot','antfly.coordinator_snapshot_native','antfly.checkpoint_hint','antfly.checkpoint_deferred','antfly.wal_prepare','antfly.wal_group','antfly.publication_feedback','antfly.reader_metadata','antfly.app_metadata']);
+const events=new Set(['antfly.io_settled','antfly.publication_batch_plan','antfly.publication_progress','antfly.compaction_plan','antfly.resource_failure','antfly.operation','antfly.trace','antfly.actor_started','antfly.coordinator','antfly.coordinator_group','antfly.coordinator_snapshot','antfly.coordinator_snapshot_native','antfly.checkpoint_hint','antfly.checkpoint_deferred','antfly.wal_prepare','antfly.wal_group','antfly.publication_feedback','antfly.reader_metadata','antfly.app_metadata']);
 const ops=new Set(['coordinate','lookup','list','count','search','status','latest','mutate','publish','compact','reindex','enrich','gc_prepare','gc_trace','gc_wal','collect','collect_metadata']);
 const spans=new Set(['parse','dispatch','kernel_queue','wasm_instantiate','wal_prepare','native_wal_plan','native_wal_finalize','wal_snapshot','durable_commit','wal_commit','recovery','writer_rpc','queue_admission','queue_delivery','point_read_capacity_promotion','native:openReadView',...['objectCall','openReadView','beginPublication','openPublication','openPublicationPlan','publicationCall','finalizePublication','abortPublication'].map(v=>'rpc:'+v)]);
 const labels={phase:new Set(['text','sparse','vector','facts','finalize','completed','cancelled','superseded','idle']),role:new Set(['interactive','maintenance','app','writer','reader','builder']),runtime_role:new Set(['shared','app','app-reader','writer','reader','builder']),action:new Set(['begin','observe','observe_committed','observe_read','read','commit','commit_wal','checkpoint','trace','retire_logs']),operation_outcome:new Set(['ok','error']),outcome:new Set(['ok','error','needs_admission']),owner_identity:new Set(['actor-version','ephemeral'])};
@@ -34,7 +34,7 @@ function metric(value,depth=0){
   if(typeof v==='string'&&stringAllowed(key,v)){out[key]=v;continue;}
   if(['checkpoint_sha256','receipt_sha256'].includes(key)&&typeof v==='string'&&/^[a-f0-9]{64}$/.test(v)){out[key]=v;continue;}
   if(key==='job_id'&&typeof v==='string'&&/^[a-f0-9]{32}$/.test(v)){out[key]=v;continue;}
-  if(['trace_id','actor_instance_id'].includes(key)&&typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v)){out[key]=v;continue;}
+  if(['trace_id','actor_instance_id','io_lifecycle_id'].includes(key)&&typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v)){out[key]=v;continue;}
   if(['error','failure_code'].includes(key)){if(v!=null)out[key]=errorCode(v);continue;}
   if(!/^[a-z_]{1,64}$/.test(key)&&key!=='physical_r2')continue;
   const safe=metric(v,depth+1);if(safe!==undefined)out[key]=safe;

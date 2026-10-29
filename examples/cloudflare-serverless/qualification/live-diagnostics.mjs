@@ -26,7 +26,7 @@ import{assertGateRun}from'./gate-scope.mjs';
 import{resourceFailureCode}from'../performance.mjs';
 const roles=['app','writer','reader','builder'];
 export class DiagnosticCoverage{
- constructor(runs){this.streams=runs.flatMap(run=>roles.map(role=>({run:run.id,role,connected:false,active_connections:0,replica_disconnects:0,gap:false,events:0,resource_failures:0,gap_reasons:{}})));}
+ constructor(runs){this.ioLifecycles=new WeakMap();this.streams=runs.flatMap(run=>roles.map(role=>({run:run.id,role,connected:false,active_connections:0,replica_disconnects:0,gap:false,events:0,resource_failures:0,gap_reasons:{}})));}
  stream(run,role){const row=this.streams.find(s=>s.run===run&&s.role===role);if(!row)throw Error('UnknownDiagnosticStream');return row;}
  connected(run,role){const row=this.stream(run,role);row.connected=true;row.active_connections++;}
  disconnected(run,role,reason,code){const row=this.stream(run,role);if(row.active_connections<1)throw Error('DiagnosticConnectionUnderflow');row.active_connections--;row.replica_disconnects++;if(Number.isInteger(code))row.last_close_code=code;if(row.active_connections===0)this.lost(run,role,reason,code);}
@@ -37,12 +37,21 @@ export class DiagnosticCoverage{
   for(const error of event.exceptions??[])if(resourceFailureCode(error.message))row.resource_failures++;
   for(const log of event.logs??[])for(const message of log.message??[]){let value;try{value=JSON.parse(message);}catch{continue;}
    if(resourceFailureCode(value.failure_code)||resourceFailureCode(value.error)||value.physical?.resource_failures>0||value.physical?.edge_cache_resource_errors>0)row.resource_failures++;
-   // The host reports actual abandoned binding I/O. Completed native
-   // cancellations have no such uncertainty and retain ordinary retry policy.
-   if(value.io_draining===true)this.lost(run,role,'native_io_draining');
+   // Completion must match the same physical lifetime, role and execution.
+   // Retain completed IDs to tolerate duplicate tail replicas and reordering.
+   if(value.io_draining===true||value.event==='antfly.io_settled'||value.io_lifecycle_id){
+    const id=value.io_lifecycle_id;
+    if(typeof id!=='string'||!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(id)){this.lost(run,role,'native_io_draining');continue;}
+    const state=value.event==='antfly.io_settled'?2:typeof value.io_draining==='boolean'?1:0;
+    if(!state){this.lost(run,role,'invalid_io_lifecycle');continue;}
+    let records=this.ioLifecycles.get(row);if(!records)this.ioLifecycles.set(row,records=new Map());
+    if(!records.has(id)&&records.size>=4096){this.lost(run,role,'io_lifecycle_capacity');continue;}
+    records.set(id,(records.get(id)??0)|state);
+   }
   }
  }
- report(){const streams=this.streams.map(row=>({...row}));return{passed:streams.length===8&&streams.every(s=>s.connected&&!s.gap&&s.resource_failures===0),streams};}
+ report({allowPending=false}={}){const streams=this.streams.map(row=>{const states=[...(this.ioLifecycles.get(row)?.values()??[])];const pending=states.filter(s=>s===1).length,unmatched=states.filter(s=>s===2).length;return{...row,gap:row.gap||!allowPending&&(pending>0||unmatched>0),gap_reasons:{...row.gap_reasons,...(!allowPending&&(pending||unmatched)?{io_lifetime_incomplete:pending+unmatched}:{})},pending_io:pending,unmatched_io_settlements:unmatched};});return{passed:streams.length===8&&streams.every(s=>s.connected&&!s.gap&&s.resource_failures===0&&(allowPending||s.pending_io===0&&s.unmatched_io_settlements===0)),streams};}
+ assertHealthy(){if(!this.report({allowPending:true}).passed)throw Error('LiveResourceDiagnosticsFailed');}
  assertClean(){if(!this.report().passed)throw Error('LiveResourceDiagnosticsFailed');}
 }
 async function accountToken(){
@@ -106,7 +115,7 @@ export async function startLiveDiagnostics(runs,executionId,dir,{authenticate=ac
   coverage.assertClean();
  }catch(error){await close().catch(()=>{});throw error;}
  return{
-  report:()=>coverage.report(),assertClean:()=>coverage.assertClean(),
+  report:()=>coverage.report(),assertClean:()=>coverage.assertClean(),assertHealthy:()=>coverage.assertHealthy(),
   async finish(){const cleanup_errors=await close(),artifacts=[];for(const s of journals){const hash=createHash('sha256');let bytes=0;for await(const chunk of createReadStream(s.path)){bytes+=chunk.length;if(bytes>256*1024*1024)throw Error('DiagnosticJournalExceeded');hash.update(chunk);}artifacts.push({path:s.path,bytes,sha256:hash.digest('hex')});}const report={...coverage.report(),passed:coverage.report().passed&&cleanup_errors.length===0,cleanup_errors,artifacts};await writeFile(resolve(directory,'audit.json'),JSON.stringify(report,null,2));return report;},
  };
 }

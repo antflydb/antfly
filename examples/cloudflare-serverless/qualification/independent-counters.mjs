@@ -28,6 +28,13 @@ export async function readCounterToken(){
   child.on('error',()=>bad(Error('CounterCredentialLookupFailed')));child.on('exit',code=>{if(code!==0||overflow)return bad(Error('CounterCredentialLookupFailed'));try{const auth=JSON.parse(text);if(!['oauth','api_token'].includes(auth.type)||typeof auth.token!=='string')throw Error();ok(auth.token);}catch{bad(Error('CounterCredentialLookupFailed'));}});
  });
 }
+// Fixed taxonomy only: provider messages can contain arbitrary strings.
+export function counterFailureDiagnostic(value,status=200){
+ const messages=(Array.isArray(value?.errors)?value.errors:[]).slice(0,16).map(e=>String(e?.message??'')).join(' ');
+ const kind=status===401||status===403?'authorization':status===429||/rate.?limit|quota|too many|limit.*exceed/i.test(messages)?'rate_limit':/unknown field|cannot query|not defined|does not exist|invalid.*field/i.test(messages)?'schema':/timeout|timed out|deadline/i.test(messages)?'timeout':'provider_error';
+ return{kind,http_status:status,error_codes:(Array.isArray(value?.errors)?value.errors:[]).slice(0,16).map(e=>e.code).filter(Number.isSafeInteger)};
+}
+function counterQueryFailure(value,status){return Object.assign(Error('IndependentCounterQueryFailed'),{diagnostic:counterFailureDiagnostic(value,status)});}
 export function counterQuery(run,role,timeframe){
  assertGateRun(run);if(!['app','writer','reader','builder'].includes(role)||!Number.isSafeInteger(timeframe?.from)||!Number.isSafeInteger(timeframe?.to)||timeframe.from<0||timeframe.to<=timeframe.from||timeframe.to-timeframe.from>60000)throw Error('CounterScopeMismatch');
  const worker=run.id+(role==='app'?'':'-'+role),from=new Date(timeframe.from).toISOString(),to=new Date(timeframe.to).toISOString();
@@ -35,7 +42,7 @@ export function counterQuery(run,role,timeframe){
 }
 export function parseCounter(value,run,role,timeframe){
  counterQuery(run,role,timeframe);
- if(value?.errors!=null&&(!Array.isArray(value.errors)||value.errors.length)||!Array.isArray(value?.data?.viewer?.accounts)||value.data.viewer.accounts.length!==1)throw Error('IndependentCounterQueryFailed');
+ if(value?.errors!=null&&(!Array.isArray(value.errors)||value.errors.length)||!Array.isArray(value?.data?.viewer?.accounts)||value.data.viewer.accounts.length!==1)throw counterQueryFailure(value,200);
  const rows=value.data.viewer.accounts[0].workersInvocationsAdaptive;
  if(!Array.isArray(rows)||rows.length>1)throw Error('IndependentCounterSchemaUnknown');
  const base={worker:run.id+(role==='app'?'':'-'+role),timeframe:{...timeframe},source:'independent-platform-counter',dataset:'workersInvocationsAdaptive'};
@@ -51,11 +58,11 @@ export async function collectIndependentCounters(run,token,timeframe,{fetch:requ
   const body=JSON.stringify(counterQuery(run,role,timeframe));
   try{
    const response=await request('https://api.cloudflare.com/client/v4/graphql',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body,signal:AbortSignal.timeout(30000)});
-   if(!response.ok){await response.body?.cancel();throw Error('IndependentCounterQueryFailed');}
+   if(!response.ok){await response.body?.cancel();throw counterQueryFailure(null,response.status);}
    let bytes=0;const chunks=[];for await(const chunk of response.body){bytes+=chunk.byteLength;if(bytes>65536)throw Error('IndependentCounterResponseExceeded');chunks.push(chunk);}
    let value;try{value=JSON.parse(Buffer.concat(chunks));}catch{throw Error('IndependentCounterSchemaUnknown');}
    const count=parseCounter(value,run,role,timeframe);result.roles[role]=count;if(!count.complete)result.failures.push({role,reason:count.reason});
-  }catch(error){const allowed=['IndependentCounterQueryFailed','IndependentCounterSchemaUnknown','IndependentCounterResponseExceeded'];result.failures.push({role,reason:allowed.includes(error?.message)?error.message:'IndependentCounterTransportFailed'});}
+  }catch(error){const allowed=['IndependentCounterQueryFailed','IndependentCounterSchemaUnknown','IndependentCounterResponseExceeded'];result.failures.push({role,reason:allowed.includes(error?.message)?error.message:'IndependentCounterTransportFailed',...(error.diagnostic?{diagnostic:error.diagnostic}:{})});}
  }
  return result;
 }
@@ -71,7 +78,7 @@ export function parseDurableCounter(value,run,role,binding,timeframe){
  durableCounterQuery(run,role,binding?.id,timeframe);
  const worker=run.id+'-'+role;
  if(binding.worker!==worker||binding.source!=='platform-namespace-api')throw Error('CounterScopeMismatch');
- if(value?.errors!=null&&(!Array.isArray(value.errors)||value.errors.length)||value?.data?.viewer?.accounts?.length!==1)throw Error('IndependentCounterQueryFailed');
+ if(value?.errors!=null&&(!Array.isArray(value.errors)||value.errors.length)||value?.data?.viewer?.accounts?.length!==1)throw counterQueryFailure(value,200);
  const rows=value.data.viewer.accounts[0].durableObjectsInvocationsAdaptiveGroups;
  if(!Array.isArray(rows)||rows.length>1)throw Error('IndependentCounterSchemaUnknown');
  const base={worker,timeframe:{...timeframe},source:'independent-platform-counter',dataset:'durableObjectsInvocationsAdaptiveGroups',namespace_binding:{...binding},event_types:[...durableTypes]};
@@ -84,7 +91,7 @@ export function parseDurableCounter(value,run,role,binding,timeframe){
 }
 async function counterJson(request,url,token,body){
  const response=await request(url,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(30000)});
- if(!response.ok){await response.body?.cancel();throw Error('IndependentCounterQueryFailed');}
+ if(!response.ok){await response.body?.cancel();throw counterQueryFailure(null,response.status);}
  let size=0;const parts=[];for await(const part of response.body){size+=part.byteLength;if(size>65536)throw Error('IndependentCounterResponseExceeded');parts.push(part);}
  try{return JSON.parse(Buffer.concat(parts));}catch{throw Error('IndependentCounterSchemaUnknown');}
 }
@@ -110,7 +117,7 @@ export async function collectInvocationPopulations(run,token,timeframe,{fetch:re
   const binding=bindings.get(role);if(!binding)throw Error('NamespaceBindingUnknown');
   const value=await counterJson(request,'https://api.cloudflare.com/client/v4/graphql',token,durableCounterQuery(run,role,binding.id,timeframe)),counter=parseDurableCounter(value,run,role,binding,timeframe);
   result.roles[role].populations.push(counter);if(!counter.complete)result.failures.push({role,population:'durable',reason:counter.reason});
- }catch(error){const known=['NamespaceBindingUnknown','IndependentCounterQueryFailed','IndependentCounterSchemaUnknown','IndependentCounterResponseExceeded'];result.failures.push({role,population:'durable',reason:known.includes(error?.message)?error.message:'IndependentCounterTransportFailed'});}
+ }catch(error){const known=['NamespaceBindingUnknown','IndependentCounterQueryFailed','IndependentCounterSchemaUnknown','IndependentCounterResponseExceeded'];result.failures.push({role,population:'durable',reason:known.includes(error?.message)?error.message:'IndependentCounterTransportFailed',...(error.diagnostic?{diagnostic:error.diagnostic}:{})});}
  return result;
 }
 export function reconcileCounterPopulations(run,role,rows,counter,timeframe){

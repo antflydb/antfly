@@ -56,7 +56,7 @@ export async function verifyPersistedProbe(directory,runs){
     if(row.invocation){if(invocations.has(row.invocation_id_sha256))return false;invocations.add(row.invocation_id_sha256);}
     coverage.observe(scope.run.id,scope.role,row.event);
    }
-   const observation=coverage.stream(scope.run.id,scope.role);
+   const observation=coverage.report().streams.find(s=>s.run===scope.run.id&&s.role===scope.role);
    const errors=window.rows.filter(row=>row.invocation&&row.event.outcome!=='ok').length;
    if(invocations.size!==window.invocations||observation.resource_failures!==window.resource_failures||observation.gap!==window.gap||errors!==window.invocation_errors)return false;
    resources+=observation.resource_failures;gaps+=Number(observation.gap);invocationErrors+=errors;

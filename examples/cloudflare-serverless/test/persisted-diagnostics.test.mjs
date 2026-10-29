@@ -83,3 +83,11 @@ test('persisted evidence independently verifies all eight roles and both snapsho
   report.resource_failures=1;await writeFile(audit,JSON.stringify(report));assert.equal(await verifyPersistedProbe(directory,runs),false);
  }finally{await rm(directory,{recursive:true,force:true});}
 });
+
+
+test('query sampling splits exact disjoint windows but never accepts ingestion sampling',async()=>{
+ const whole={from:1000,to:6000},rows=[row('left',{timestamp:1500}),row('right',{timestamp:5500})],requests=[];
+ const fetch=async(url,options)=>{const q=JSON.parse(options.body);requests.push(q);const selected=rows.filter(r=>r.timestamp>=q.timeframe.from&&r.timestamp<=q.timeframe.to),wide=q.timeframe.to-q.timeframe.from>3000;return Response.json({success:true,result:{run:{status:'COMPLETED'},statistics:{abr_level:wide?2:1},...(q.view==='calculations'?{calculations:[{alias:'events',aggregates:[{count:selected.length,value:selected.length,sampleInterval:1}]}]}:{events:{count:selected.length,events:selected}})}});};
+ const result=await collectPersistedWindow(run,'app',token,whole,{fetch});assert.equal(result.events,2);assert.equal(result.query_slices.length,2);assert.equal(result.query_slices[0].timeframe.to+1,result.query_slices[1].timeframe.from);assert.equal(result.queries,7);assert.equal(result.reconciled,true);assert.deepEqual(result.timeframe,whole);
+ let calls=0;await assert.rejects(collectPersistedWindow(run,'app',token,whole,{fetch:async()=>{calls++;return Response.json({success:true,result:{run:{status:'COMPLETED'},statistics:{abr_level:1},calculations:[{alias:'events',aggregates:[{count:2,value:2,sampleInterval:1.01}]}]}});}}),/IngestionSampled/);assert.equal(calls,1);
+});

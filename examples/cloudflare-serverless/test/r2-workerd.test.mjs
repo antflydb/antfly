@@ -34,6 +34,8 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
         for(const key of ["sql","kv"])Object.defineProperty(ctx.storage,key,{get(){throw Error("UnexpectedPlatformDatabaseAccess:"+key);}});
         super(ctx,env);
       }
+      collectMetadata(...args){this.metadataCalls=(this.metadataCalls??0)+1;return super.collectMetadata(...args);}
+      maintenanceDiagnostics(){return{collect_metadata:this.metadataCalls??0};}
       commitMutations(inputs,deadline){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs,deadline);}
       mutationDiagnostics(){return this.groupSizes??[];}
       openReadView(options){this.views=(this.views??0)+1;return super.openReadView(options);}
@@ -53,6 +55,14 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
     }
     export default {async fetch(request,env,ctx){
       const path=new URL(request.url).pathname,stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION),source=(env.LEGACY_COMMITS??env.COMMITS).getByName(env.ANTFLY_INCARNATION);
+      if(path==="/scheduled-queue"){
+        const sent=[],local={...env,MAINTENANCE:{async send(message){sent.push(message);}}};
+        const denied={getByName(){throw Error("ScheduledDatabaseIoForbidden");}};
+        await worker.scheduled({scheduledTime:3600000},{...local,COMMITS:denied,READERS:denied,BUILDERS:denied,DATABASE:new Proxy({}, {get(){throw Error("ScheduledDatabaseIoForbidden");}})});
+        const hints=structuredClone(sent);sent.length=0;let ack=false,retry=false;
+        await worker.queue({messages:[{body:hints[0],ack(){ack=true;},retry(){retry=true;}}]},local);
+        return Response.json({hints,sent,ack,retry,metadata:await stub.maintenanceDiagnostics()});
+      }
       if(path==="/runtime-capabilities"){for(const [binding,op] of [["READERS","mutate"],["BUILDERS","lookup"]]){try{await env[binding].getByName(JSON.stringify(["runtime-v1",env.ANTFLY_INCARNATION,0])).execute({op});return Response.json({rejected:false});}catch(error){if(!String(error).includes("RuntimeCapabilityUnsupported"))throw error;}}return Response.json({rejected:true});}
       if(path==="/latency-counts")return Response.json(await stub.latencyDiagnostics());
       if(path==="/mutation-groups"){const tenant=request.headers.get("X-Antfly-Tenant"),name=tenant?JSON.parse(env.ANTFLY_TENANTS)[tenant].incarnation:env.ANTFLY_INCARNATION;return Response.json(await env.COMMITS.getByName(name).mutationDiagnostics());}
@@ -268,4 +278,11 @@ for(const adaptive of[false,true])test('native publication checkpoints survive b
   assert.equal(after.begins-before.begins,1);assert.equal(after.finals-before.finals,1,'ordinary records retain prepared batching under the continuation flag');
 
  }finally{await f.close();}
+});
+
+
+test('R2 Cron dispatch performs no database I/O and Queue delivery owns maintenance recovery',{timeout:30000},async()=>{
+ const f=await fixture('queued-scheduled');
+ try{const result=await f.call({},'/scheduled-queue');assert.deepEqual(result.hints,[{incarnation:'queued-scheduled',kind:'maintenance_tick',scheduled_time:3600000}]);assert.equal(result.ack,true);assert.equal(result.retry,false);assert.equal(result.metadata.collect_metadata,1);assert.ok(result.sent.every(m=>m.incarnation==='queued-scheduled'));}
+ finally{await f.close();}
 });

@@ -63,3 +63,11 @@ test('namespace discovery failures and ambiguous bindings remain accounting fail
   const report=await collectInvocationPopulations(run,'private-test-token-value',timeframe,{fetch:async url=>Response.json(url.includes('/namespaces?')?result:data())});assert.ok(report.failures.some(f=>f.reason==='NamespaceBindingUnknown'));assert.ok(!JSON.stringify(report).includes('private-test-token-value'));
  }
 });
+
+
+test('counter failures retain only fixed actionable categories without provider text',async()=>{
+ const{counterFailureDiagnostic}=await import('../qualification/independent-counters.mjs');
+ for(const [message,kind] of [['unknown field private-secret','schema'],['query timed out private-secret','timeout'],['rate limit exceeded private-secret','rate_limit']]){const value=counterFailureDiagnostic({errors:[{message,code:123}]});assert.equal(value.kind,kind);assert.deepEqual(value.error_codes,[123]);assert.ok(!JSON.stringify(value).includes('private-secret'));}
+ assert.equal(counterFailureDiagnostic({errors:{}},403).kind,'authorization');
+ const result=await collectIndependentCounters(run,'private-disposable-token',timeframe,{fetch:async()=>Response.json({errors:[{message:'unknown field private-secret'}]})});assert.equal(result.failures[0].diagnostic.kind,'schema');assert.ok(!JSON.stringify(result).includes('private-secret'));
+});

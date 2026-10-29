@@ -78,14 +78,37 @@ export function sanitizePersistedEvent(row, worker, timeframe) {
 // Complete one small window with before/after aggregate reconciliation.
 // A repeat after ingestion settlement must produce the same digest; even that
 // does not establish that the platform stored every invocation (see design).
-export async function collectPersistedWindow(run, role, token, timeframe, {fetch: request = fetch, signal, clock = Date.now} = {}) {
+export async function collectPersistedWindow(run, role, token, timeframe, options = {}) {
+  persistedWindowQuery(run,role,timeframe);
+  const clock=options.clock??Date.now,started=clock(),budget={queries:0,bytes:0,deadline:started+120000};
+  const pieces=[];
+  async function collect(window){
+    try{pieces.push(await collectPersistedSlice(run,role,token,window,options,budget));}
+    catch(error){
+      // Query-time approximation can be avoided with exact disjoint slices.
+      // Ingestion sampling is irreversible and must never take this path.
+      if(error.message!=='DiagnosticQuerySampled'||window.to-window.from<2000)throw error;
+      const middle=Math.floor((window.from+window.to)/2);
+      await collect({from:window.from,to:middle});await collect({from:middle+1,to:window.to});
+    }
+  }
+  await collect(timeframe);
+  if(pieces.length===1)return pieces[0];
+  const rows=pieces.flatMap(p=>p.rows).sort((a,b)=>a.event_id_sha256.localeCompare(b.event_id_sha256));
+  if(rows.length>20000||new Set(rows.map(r=>r.event_id_sha256)).size!==rows.length)fail('DiagnosticCountMismatch');
+  const invocations=rows.filter(r=>r.invocation);if(new Set(invocations.map(r=>r.invocation_id_sha256)).size!==invocations.length)fail('DiagnosticInvocationRepeated');
+  const coverage=new DiagnosticCoverage([run]);for(const row of rows)coverage.observe(run.id,role,row.event);
+  const observed=coverage.report().streams.find(s=>s.run===run.id&&s.role===role);
+  return{...pieces[0],timeframe:{...timeframe},collected_started_at:started,collected_finished_at:clock(),events:rows.length,invocations:invocations.length,invocation_errors:invocations.filter(r=>r.event.outcome!=='ok').length,resource_failures:observed.resource_failures,gap:observed.gap,queries:budget.queries,transferred_bytes:budget.bytes,query_slices:pieces.map(p=>({timeframe:p.timeframe,events:p.events,rows_sha256:p.rows_sha256})),rows_sha256:digest(JSON.stringify(rows)),rows};
+}
+async function collectPersistedSlice(run, role, token, timeframe, {fetch: request = fetch, signal, clock = Date.now}, budget) {
   persistedWindowQuery(run, role, timeframe);
   if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{20,256}$/.test(token)) fail('InvalidObservabilityToken');
   const worker = run.id + (role === 'app' ? '' : '-' + role);
   const collected_started_at=clock();let queries = 0, transferred = 0;
   async function query(view, offset) {
-    if (++queries > 64) fail('DiagnosticQueryBudgetExceeded');
-    const remaining=collected_started_at+120000-clock();if(remaining<=0)fail('DiagnosticWindowDeadline');
+    if (++queries > 64 || ++budget.queries > 64) fail('DiagnosticQueryBudgetExceeded');
+    const remaining=Math.min(collected_started_at+120000,budget.deadline)-clock();if(remaining<=0)fail('DiagnosticWindowDeadline');
     let response;
     try {
       response = await request('https://api.cloudflare.com/client/v4/accounts/' + run.account + '/workers/observability/telemetry/query', {
@@ -97,8 +120,8 @@ export async function collectPersistedWindow(run, role, token, timeframe, {fetch
     if (!response.ok) { await response.body?.cancel(); fail('DiagnosticQueryStatus' + response.status); }
     let bytes = 0; const chunks = [];
     try{for await (const chunk of response.body) {
-      bytes += chunk.byteLength; transferred += chunk.byteLength;
-      if (bytes > 4 * 1024 * 1024 || transferred > 64 * 1024 * 1024) fail('DiagnosticQueryResponseExceeded');
+      bytes += chunk.byteLength; transferred += chunk.byteLength; budget.bytes += chunk.byteLength;
+      if (bytes > 4 * 1024 * 1024 || transferred > 64 * 1024 * 1024 || budget.bytes > 64 * 1024 * 1024) fail('DiagnosticQueryResponseExceeded');
       chunks.push(chunk);
     }}catch(error){fail(error.message==='DiagnosticQueryResponseExceeded'?error.message:'DiagnosticQueryReadFailed');}
     let value; try { value = JSON.parse(Buffer.concat(chunks).toString()); } catch { fail('DiagnosticQueryResponseMalformed'); }
@@ -140,7 +163,7 @@ export async function collectPersistedWindow(run, role, token, timeframe, {fetch
   rows.sort((a, b) => a.event_id_sha256.localeCompare(b.event_id_sha256));
   const coverage = new DiagnosticCoverage([run]);
   for (const row of rows) coverage.observe(run.id, role, row.event);
-  const observed = coverage.stream(run.id, role);
+  const observed = coverage.report().streams.find(s=>s.run===run.id&&s.role===role);
   return {schema: 3, qualification: false, worker, role, timeframe: {...timeframe},
     collected_started_at,collected_finished_at:clock(),
     reconciled: true, events: rows.length, invocations: rows.filter(row => row.invocation).length,

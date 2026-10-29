@@ -106,6 +106,7 @@ async function continueMaintenance(env,message,kind,result){
  else if(message.body.maintenance)await env.COMMITS.getByName(env.ANTFLY_INCARNATION).finishMaintenance(kind,message.body.maintenance);
 }
 export default {
+  maintenanceDispatch: "queue",
   async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
     if (request.method === "GET" && path === "/" && env.ASSETS) return env.ASSETS.fetch(request);
@@ -178,6 +179,13 @@ export default {
       if (message.body?.incarnation !== env.ANTFLY_INCARNATION) { message.ack(); continue; }
       let publishing = !message.body.kind || ["publish","reindex"].includes(message.body.kind);
       try {
+        if(message.body.kind==="maintenance_tick"){
+          if(env.COORDINATOR_BACKEND!=="r2"||!Number.isSafeInteger(message.body.scheduled_time)||message.body.scheduled_time<0||message.body.scheduled_time>Date.now()+60000){message.ack();continue;}
+          // The Queue owns all scheduled database work. Cron only dispatches
+          // hints, so paused delivery really fences new maintenance admission.
+          await scheduledTenant({scheduledTime:message.body.scheduled_time},env);
+          message.ack();continue;
+        }
         if(message.body.maintenance&&!await env.COMMITS.getByName(env.ANTFLY_INCARNATION).validMaintenance(message.body.kind,message.body.maintenance,message.body.job_id)){message.ack();continue;}
         if (["collect_metadata", "migrate_coordinator"].includes(message.body.kind)) {
           if (message.body.kind === "collect_metadata" && !message.body.job_id) {message.ack();continue;}
@@ -228,10 +236,19 @@ export default {
   // Recovery also covers a crash between WAL acceptance and queue admission.
   async scheduled(controller, rootEnv) {
     for(const env of tenantEnvs(rootEnv)){
+      if(env.COORDINATOR_BACKEND==="r2"){
+        if(!env.MAINTENANCE)throw Error("maintenance queue is not configured");
+        await env.MAINTENANCE.send({incarnation:env.ANTFLY_INCARNATION,...(env.ANTFLY_TENANT?{tenant:env.ANTFLY_TENANT}:{}),kind:"maintenance_tick",scheduled_time:controller.scheduledTime});
+      }else await scheduledTenant(controller,env);
+    }
+  },
+};
+
+async function scheduledTenant(controller,env){
     if (env.COORDINATOR_MIGRATION_REQUIRED === "true") {
       const status = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).migrationStatus();
       if (!["none", "active"].includes(status.phase)) await enqueue(env, "migrate_coordinator");
-      if (status.phase !== "active") continue;
+      if (status.phase !== "active") return;
     }
     const pendingEmbedding=env.EMBEDDING_MODEL&&BigInt((await run(env,{op:"status"})).pending_embeddings??"0")>0n;
     await enqueue(env,"publish",undefined,0,undefined,Boolean(pendingEmbedding));
@@ -244,6 +261,5 @@ export default {
     if (env.AUTO_GC === "true" && Math.floor(controller.scheduledTime / 60000) % 15 === 0) await enqueue(env, "collect");
     if (env.EMBEDDING_MODEL && env.EMBEDDING_CHECKPOINTS !== "false") await pruneEmbeddingCheckpoints(env);
     if (env.AUTO_COMPACT === "true" && Math.floor(controller.scheduledTime / 60000) % 60 === 0) await enqueue(env, "compact");
-    }
-  },
-};
+
+}
