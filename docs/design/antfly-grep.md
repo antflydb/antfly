@@ -1794,3 +1794,15 @@ Distributed row-profile logs may be incomplete at the coordinator; functional
 output, score and total-count equality is checked independently. The media driver
 can select workloads, including eight 512×512 images, and stops at `ModelRequired`
 after source authorization, revision, digest, MIME, byte and pixel checks.
+
+After the measured runtime was qualified, the follow-up merged main
+`207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563`. The measured production and benchmark sources remain
+byte-identical to the pinned runtime. Merged-tree native validation passes all
+91 build steps (226 reported native tests plus the custom-runner suites), with
+no failures or leaks. The full license workflow also passes: header checks,
+Apache boundary checks and the boundary/header/provenance/asset unit tests.
+Three upstream inference qualification scripts retained their Apache SPDX tags
+and gained the complete required preamble. The numerical tables above remain
+measurements of the explicitly pinned executables, rather than a new build
+of the later main merge. Full merged-head CI still requires the repository's
+maintainer approval signal.
