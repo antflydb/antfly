@@ -281,6 +281,33 @@ class ShardTests(unittest.TestCase):
         self.assertIn("| `shared` | 3.00 | 8.00 | 10.00 |", text)
         self.assertIn("| teardown | 10.00 |", text)
 
+    def test_full_api_suite_uses_every_planned_lane_without_raising_parallelism(self):
+        import re
+
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/zig-tests.yml"
+        ).read_text()
+        full = workflow.split("  e2e-full-tests:\n", 1)[1].split("  e2e-full:\n", 1)[0]
+        choices = re.findall(r"'(\[[^'\n]+\])'", full.split("    env:\n", 1)[0])
+        suites = json.loads(choices[-1])
+        lanes = {
+            name.removeprefix("antfly-")
+            for name in suites
+            if name.startswith("antfly-")
+        }
+        self.assertEqual(
+            lanes, {name for name in shards.SHARDS if name not in {"all", "ordinary"}}
+        )
+        self.assertIn("max-parallel: 2", full)
+        self.assertIn("--antfly-ci-plan", full)
+        self.assertIn('--antfly-ci-shard "${suite#antfly-}"', full)
+        self.assertIn("ANTFLY_E2E_FULL_LAKE", full)
+        self.assertNotIn("base-marker", full)
+        self.assertIn("antfly-e2e-full-timings-", full)
+        self.assertIn(
+            'test "$PLAN_RESULT" = "success"', workflow.split("  e2e-full:\n", 1)[1]
+        )
+
     def test_workflow_requires_all_shards_plan_and_fd_lane(self):
         workflow = (
             Path(__file__).resolve().parents[2] / ".github/workflows/zig-tests.yml"

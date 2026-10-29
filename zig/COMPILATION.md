@@ -2030,3 +2030,25 @@ Npm publication requires a successful main Zig qualification for the exact
 peeled tag commit, including full E2E and supported Better Auth jobs from its
 latest attempt. It does not start a compiler or reuse results from another
 commit. Release optimization and its independent qualification are unchanged.
+
+### Full API E2E and allocator admission follow-up (2026-10-29)
+
+Main run 40895786941's unpartitioned full API lane reached only 78% after
+roughly 140 minutes and was canceled at the unchanged 150-minute job limit.
+Individual passing cases were still progressing; this was not one hung test.
+Full API E2E now consumes the same six fixture-preserving ordinary/recovery
+lanes and common measured planner as base E2E. The full collection includes
+lake/Iceberg dependencies and no base marker exclusion. Actual collection
+verified all 1,268 cases are assigned and selected exactly once. The existing
+two-job matrix limit, process admission, runner sizes and deadlines are retained.
+Healthy full lanes feed their measurements back to the common duration history.
+
+Main Python SDK run 40824291080 also returned `WouldBlock` from a write with
+a configured busy timeout. Detached allocator verification released its writer
+lease and reacquired it through a raw nonblocking lock. Foreground proof
+completion now uses the requesting connection's existing admission policy;
+background and shutdown proofs remain nonblocking. No mutation has begun at
+this point, so the wait never replays partially committed work. A deterministic
+real-lock regression covers a competing writer, immediate failure and background
+yield; it and both resolver concurrency cases pass 20/20 seeded Debug runs
+(25 physical tests per run, zero failures/skips/leaks).
