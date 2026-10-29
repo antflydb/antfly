@@ -44,7 +44,7 @@ sys.modules[spec.name] = bench
 spec.loader.exec_module(bench)
 label, binary_arg, source = sys.argv[1:]
 binary = Path(binary_arg).resolve()
-base = root / ".benchmark-results/lake/highlight-layouts"
+base = root / ".benchmark-results/lake/highlight-refinements-v3"
 shared = base / "input"
 shared.mkdir(parents=True, exist_ok=True)
 out = base / label
@@ -62,6 +62,9 @@ if not archive.exists():
         use_dictionary=False,
         row_group_size=1,
     )
+observed = pq.read_table(archive)
+assert observed.column("id").to_pylist() == list(range(len(bodies)))
+assert observed.column("body").to_pylist() == bodies
 fixture = bench.import_fixture(
     shared / "fixture", [archive], "highlight-refinements-v3"
 )
