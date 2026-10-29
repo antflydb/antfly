@@ -301,7 +301,9 @@ pub const Plan = struct {
         // Transport reuses the one owned input extent. Stream the canonical
         // parsed-number fingerprint without retaining another payload buffer.
         self.encoded = owned;
-        var hasher = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&.{});
+        // Batch short JSON writes without retaining a payload-sized buffer.
+        var hash_buffer: [4096]u8 = undefined;
+        var hasher = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&hash_buffer);
         try std.json.Stringify.value(request, .{}, &hasher.writer);
         try hasher.writer.flush();
         self.fingerprint = std.fmt.bytesToHex(hasher.hasher.finalResult(), .lower);
