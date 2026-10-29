@@ -123,7 +123,7 @@ processing passes from earlier streaming chunks remain committed.
 
 ## Model instances
 
-Antfly inference owns the shared model cache. Antfarm and other clients use the
+Antfly Inference owns the shared model cache. Antfarm and other clients use the
 same model-instance API:
 
 - `GET /ai/v1/models/instances` lists loading and loaded instances without

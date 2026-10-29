@@ -215,6 +215,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("replay-allocation-bench", "Build the allocation-counted replay benchmark")
         .dependOn(&b.addInstallArtifact(replay_allocation_bench, .{}).step);
 
+    const batch_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/storage_batch_contract_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, batch_contract_mod, true, true);
+    const batch_contract_tests = b.addTest(.{
+        .name = "storage-batch-contract-tests",
+        .root_module = batch_contract_mod,
+        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("storage-batch-contract-test", "Verify collector OOM ownership and bounded provider batches without HTTP discovery")
+        .dependOn(&addFilteredTestRunArtifact(b, batch_contract_tests).step);
+
     const functions_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/functions_test_root.zig"),
         .target = target,
@@ -7164,8 +7179,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.enrichment.",
             "storage.engine.",
             "storage.logical_source.",
-            "storage.conditional_source.",
-            "storage.source_proof_registry.",
+            "storage.db.field_projection_source.",
+            "storage.source_value_identity.",
             "storage.document_projection.",
             "storage.filesystem_capacity.",
             "storage.generation_publication.",
