@@ -455,7 +455,7 @@ pub const Plan = struct {
         const work = @import("../sql/memory_budget.zig").reclaimingAllocator(self.a);
         var items: std.ArrayList(analysis.Token) = .empty;
         for (self.terms, 0..) |term, term_index| {
-            if (term_index % 4 == 0) prefetchTerms(self.view, self.terms[term_index..], 0);
+            if (term_index % 4 == 0) prefetchTerms(self.view, self.terms[term_index + 1 ..], 0, false);
             var cursor: Occurrences = .{};
             defer cursor.deinit(work);
             while (try cursor.next(work, &self, term, control)) |token| try items.append(out, token);
@@ -474,7 +474,7 @@ pub const Plan = struct {
         var items: std.ArrayList(analysis.Token) = .empty;
         const work = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
         for (self.terms, 0..) |term, term_index| {
-            if (term_index % 4 == 0) prefetchTerms(self.view, self.terms[term_index..], 0);
+            if (term_index % 4 == 0) prefetchTerms(self.view, self.terms[term_index + 1 ..], 0, false);
             var cursor: Occurrences = .{};
             defer cursor.deinit(work);
             const retained = try out.dupe(u8, term.text);
@@ -507,11 +507,18 @@ fn prefetch(view: View, refs: []const Ref) void {
         bytes += ref.wire;
     }
 }
-fn prefetchTerms(view: View, terms: []const Plan.Term, first: u32) void {
+fn prefetchTerms(view: View, terms: []const Plan.Term, first: u32, skip_required: bool) void {
     var hints: usize = 0;
+    var required = skip_required;
     for (terms) |term| {
         const block = seekBlock(term.blocks, first);
         if (block == term.blocks.len) continue;
+        // The caller reads the first required head synchronously. Hint only
+        // future work so a one-block selection incurs no scheduler overhead.
+        if (required) {
+            required = false;
+            continue;
+        }
         prefetch(view, term.blocks[block .. block + 1]);
         hints += 1;
         if (hints == 4) break;
@@ -614,7 +621,7 @@ pub const Iterator = struct {
     pub fn seek(self: *Iterator, first: u32) !void {
         self.len = 0;
         try self.control.check();
-        prefetchTerms(self.plan.view, self.plan.terms, first);
+        prefetchTerms(self.plan.view, self.plan.terms, first, true);
         for (self.states, self.plan.terms, 0..) |*state, term, i| {
             try self.control.check();
             self.retired_reads += state.cursor.decoded;
@@ -844,11 +851,11 @@ test "highlight occurrence block seeks preserve crossing spans and prefetch only
     const complete = try all.materialize(a, .none);
     defer complete.deinit();
     try std.testing.expectEqual(@as(usize, 4096), complete.items.len);
-    try std.testing.expect(range.hint_count >= all.terms.len);
-    for (all.terms, 0..) |term, i| {
-        try std.testing.expectEqual(term.blocks[0].offset, range.hints[i].start);
-        try std.testing.expectEqual(@as(u64, term.blocks[0].wire), range.hints[i].len);
-    }
+    try std.testing.expect(range.hint_count != 0);
+    // The next term's first block overlaps the current term's synchronous
+    // read. Never enqueue that current head just before demanding it.
+    try std.testing.expectEqual(all.terms[1].blocks[0].offset, range.hints[0].start);
+    for (range.hints[0..range.hint_count]) |hint| try std.testing.expect(hint.start != all.terms[0].blocks[0].offset);
     // A long earlier span must remain visible to a later fragment seek.
     tokens[0].end_byte = 25000;
     var overlapping = segment.MemorySegmentSink.init(a);
