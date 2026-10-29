@@ -3394,3 +3394,10 @@ and encoder failures.
 [The AT register](unified-execution-at-outcomes.md) records a shared specialized
 TL1/TL2 host owner, its original-versus-candidate command and output checks,
 and two corrected C/Zig FFN ABI mismatches with real-device regression tests.
+
+### AU CUDA projection launch families
+
+[The AU register](unified-execution-au-outcomes.md) records three compile-time
+owners for 25 argmax/pair/QKV adapters, unchanged native schedules and public
+signatures, independent original-versus-candidate wire/device/replay checks,
+and the controlled Glowworm host-submission assay.
