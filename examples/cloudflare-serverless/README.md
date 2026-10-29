@@ -794,3 +794,11 @@ Local comparisons use `qualification/shared-publication-latency.mjs` and
 `qualification/shared-pipeline-latency.mjs`; copy hash-verified previous modules
 to `dist/qualification/shared-pipeline-lab/before/` before comparing. See
 [the shared engine design](../../docs/design/shared-object-publication.md).
+
+
+## Authenticated mail application
+
+[Antfly Mail](MAIL.md) is a separate application entry point with Better Auth
+login, per-user mailboxes, Email Worker ingestion, private R2 attachments, Antfly
+search and a durable Cloudflare Email Service outbox. Its configuration and
+local captured-mail tests do not alter these operator or qualification profiles.

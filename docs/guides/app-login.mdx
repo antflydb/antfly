@@ -124,10 +124,11 @@ See [the Next.js remote example](https://github.com/antflydb/antfly/tree/main/ts
 | Embedded runtime | Node 24+, macOS arm64, glibc Linux arm64/x64 |
 | Embedded deployment | One persistent process; Docker `node:24-slim`, VPS, or volume-backed host |
 | Remote recipe | Node runtime, Next.js; stable Antfly API owner |
+| Workers recipe | Dedicated native metadata owner on R2; see the Cloudflare mail example |
 | Authentication | Email/password, database sessions, verification/recovery, email change, account deletion, Google configuration |
 | Content | Owner-scoped CRUD and full-text search |
 | Plugins | Schema extension supported; additional plugin workflows require qualification |
-| Not yet | Windows, Alpine/musl, Bun, Deno, Workers/Cloudflare, browser-native/desktop auth packaging, non-TypeScript integrations |
+| Not yet | Windows, Alpine/musl, Bun, Deno, browser-native/desktop auth packaging, non-TypeScript integrations |
 
 `createTestAuth()` from `@antfly/better-auth/testing` provides an isolated temporary database and cleanup. Pass a second argument of `true` to capture consumer-flow mail. Always call `close()` in teardown. Real password hashing remains enabled.
 
@@ -138,3 +139,21 @@ Repository maintainers own the adapter alongside the TypeScript SDK. Supported-v
 ## Prior art
 
 [Convex's Better Auth integration](https://labs.convex.dev/better-auth) is prior art for keeping identities and application data in one backend while retaining Better Auth's client APIs. This integration follows the same separation: Better Auth owns authentication, and Antfly supplies persistence and narrowly scoped content access. It uses stable user identities, completes account transactions before external effects, and distinguishes extensible schema configuration from tested runtime/framework/plugin support.
+
+## Cloudflare Workers
+
+Use the separate `@antfly/better-auth/workers` entry for a Workers-native Antfly
+metadata store. It does not emulate SQL or load the embedded Node addon. The
+host must supply fenced, serializable, durable multi-key transactions; an
+eventually consistent KV binding cannot implement this contract. Provision once
+with `prepareWorkersAuth`; `createWorkersAuth` installs the structured adapter.
+Enable `nodejs_compat`, keep the auth actor private, and derive application
+mailbox/content ownership from verified sessions rather than tenant headers.
+
+The [Cloudflare mail example](https://github.com/antflydb/antfly/blob/feat/cloudflare-mail-auth/examples/cloudflare-serverless/MAIL.md)
+implements the native R2 host and tests actual workerd login, ownership and
+persisted reopen. It is a separate recipe from `remoteDatabase`, which retains
+its stable SQL API-owner requirement. Shared mailbox memberships and account
+content deletion are not yet implemented in that example; its account-deletion
+endpoint is disabled. No live email-domain qualification is implied by local
+runtime tests.
