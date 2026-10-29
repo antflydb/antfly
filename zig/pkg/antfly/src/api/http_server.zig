@@ -18180,6 +18180,7 @@ pub const ApiHttpServer = struct {
         const source = self.table_writes orelse return error.NotFound;
         try ensureTableOperationActive(request);
         const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            error.ReadTransientFailure => return error.InferenceUnavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.InvalidArgument, error.NotFound => return error.NotFound,
             else => {
