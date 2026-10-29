@@ -13,20 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Screenshots Shots Shots - Search your local screenshots, PDFs, and images with CLIP
-//
-// This example scans a local folder for screenshots, PDFs, and images,
-// indexes them using CLIP embeddings via file:// URLs, and lets you search
-// them with natural language queries. File content is NOT stored in Antfly —
-// only the path is stored, and the server fetches files at enrichment time.
-//
-// Prerequisites:
-// - Antfly running with inference
-// - CLIP model: antfly inference pull openai/clip-vit-base-patch32
-//
-// Run: go run main.go [folder] [query...]
-
-// ANCHOR: imports
 package main
 
 import (
@@ -34,7 +20,6 @@ import (
 	"fmt"
 	"log"
 	"mime"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +29,9 @@ import (
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
-// ANCHOR_END: imports
+// Local mode indexes screenshots, PDFs, and images from a folder. Documents
+// store only a file:// URL; remoteMedia reads the file at enrichment time, so
+// the image data is not copied into Antfly.
 
 var supportedExts = map[string]string{
 	".png":  "image/png",
@@ -58,65 +45,44 @@ var supportedExts = map[string]string{
 	".pdf":  "application/pdf",
 }
 
-func main() {
-	// Parse args: [folder] [query...]
-	folder := "."
-	queries := []string{"screenshot of a terminal", "chart or graph", "text document"}
-
-	args := os.Args[1:]
-	if len(args) >= 1 {
-		folder = args[0]
+// searchLocalFolder indexes the supported files under folder into the
+// "screenshots" table and runs each query against it.
+func searchLocalFolder(ctx context.Context, client *antfly.AntflyClient, folder string, queries []string) {
+	if len(queries) == 0 {
+		queries = []string{"screenshot of a terminal", "chart or graph", "text document"}
 	}
-	if len(args) >= 2 {
-		queries = args[1:]
-	}
-
 	absFolder, err := filepath.Abs(folder)
 	if err != nil {
 		log.Fatalf("Invalid folder path: %v", err)
 	}
 	fmt.Printf("Scanning folder: %s\n", absFolder)
 
-	// Discover files
 	files, err := discoverFiles(absFolder)
 	if err != nil {
 		log.Fatalf("Failed to scan folder: %v", err)
 	}
 	fmt.Printf("Found %d supported files (.png, .jpg, .pdf, etc.)\n", len(files))
-
 	if len(files) == 0 {
 		fmt.Println("No supported files found. Put some screenshots or images in the folder and try again.")
 		return
 	}
 
-	ctx := context.Background()
-
-	antflyURL := os.Getenv("ANTFLY_URL")
-	if antflyURL == "" {
-		antflyURL = "http://localhost:8080/db/v1"
-	}
-
-	client, err := antfly.NewAntflyClient(antflyURL, http.DefaultClient)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// ANCHOR: create_table
-	// Step 1: Create the table with CLIP embeddings index
+	// Create the table with CLIP embeddings index
 	// The template uses remoteMedia to fetch file content at enrichment time
 	// via file:// URLs — the image data itself is NOT stored in Antfly.
 	fmt.Println("\nCreating table 'screenshots' with CLIP embeddings index...")
 
-	var embedderConfig oapi.EmbedderConfig
-	embedderConfig.Provider = oapi.EmbedderProviderAntfly
-	embedderConfig.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{
+	embedderConfig, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model: "openai/clip-vit-base-patch32",
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	indexConfig, err := antfly.NewCreateIndexRequest(oapi.EmbeddingsIndexConfig{
 		Dimension: 512,
 		Template:  "{{remoteMedia url=file_url}}{{filename}}",
-		Embedder:  embedderConfig,
+		Embedder:  *embedderConfig,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -136,15 +102,14 @@ func main() {
 	} else {
 		fmt.Println("Created table 'screenshots'")
 	}
-	// ANCHOR_END: create_table
 
 	if err := client.WaitForTable(ctx, "screenshots", 30*time.Second); err != nil {
 		log.Fatalf("Error waiting for shards: %v", err)
 	}
 	fmt.Println("Shards ready")
 
-	// ANCHOR: ingest
-	// Step 2: Insert documents with file:// URLs pointing to local files.
+	// ANCHOR: local_ingest
+	// Insert documents with file:// URLs pointing to local files.
 	// Only metadata is stored — remoteMedia fetches content during enrichment.
 	fmt.Printf("\nIngesting %d files...\n", len(files))
 	startTime := time.Now()
@@ -173,10 +138,10 @@ func main() {
 
 	elapsed := time.Since(startTime)
 	fmt.Printf("\n  Done: %d files in %.1fs\n", ingested, elapsed.Seconds())
-	// ANCHOR_END: ingest
+	// ANCHOR_END: local_ingest
 
-	// ANCHOR: search
-	// Step 3: Search with natural language
+	// ANCHOR: local_search
+	// Search with natural language
 	fmt.Println("\n--- Search Results ---")
 
 	for _, q := range queries {
@@ -213,7 +178,7 @@ func main() {
 			}
 		}
 	}
-	// ANCHOR_END: search
+	// ANCHOR_END: local_search
 }
 
 type fileInfo struct {
