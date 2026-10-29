@@ -1155,6 +1155,45 @@ test "serverless multiprovider native collection scale preserves a retained tail
     }
     try std.testing.expect(newer and finished and marked > 128 and deleted > 0);
     try std.testing.expect(peak_operations <= 1024);
+    const job_end_objects = fixture.memory.buckets.get("db").?.count();
+    const Cleanup = struct {
+        fn run(value: *TestFixture, peak: *u64) !usize {
+            var removed: usize = 0;
+            for (0..20_000) |_| {
+                value.memory.resetOperationCount();
+                const result = try value.collector.step("docs", null);
+                peak.* = @max(peak.*, value.memory.operationCount());
+                removed += result.deleted_objects;
+                if (result.phase == .idle) return removed;
+            }
+            return error.CollectionCleanupDidNotFinish;
+        }
+    };
+    var cleanup_deleted = try Cleanup.run(&fixture, &peak_operations);
+    const after_cleanup_first = fixture.memory.buckets.get("db").?.count();
+    try std.testing.expect(after_cleanup_first < before_objects);
+    fixture.collector.wake("docs");
+    var second_finished = false;
+    var second_steps: usize = 0;
+    for (0..20_000) |_| {
+        fixture.memory.resetOperationCount();
+        const result = try fixture.collector.step("docs", null);
+        peak_operations = @max(peak_operations, fixture.memory.operationCount());
+        second_steps += 1;
+        fixture.now_ns += 250 * std.time.ns_per_ms;
+        if (result.phase == .waiting) fixture.now_ns += Collector.grace_ns;
+        if (result.phase == .finished) {
+            second_finished = true;
+            break;
+        }
+    }
+    try std.testing.expect(second_finished);
+    cleanup_deleted += try Cleanup.run(&fixture, &peak_operations);
+    const after_objects = fixture.memory.buckets.get("db").?.count();
+    // The same retained roots cannot accumulate completed private job state
+    // across cycles. A small fixed allowance covers newer-epoch path copies.
+    try std.testing.expect(after_objects <= after_cleanup_first + 16);
+    try std.testing.expect(peak_operations <= 1024);
     var after: u64 = 25_000;
     while (after < rows) {
         const end = @min(rows, after + 128);
@@ -1175,5 +1214,12 @@ test "serverless multiprovider native collection scale preserves a retained tail
     try std.testing.expectEqual(@as(u64, 1), replay.start_lsn);
     try std.testing.expectEqual(@as(u64, 128), replay.end_lsn);
     try std.testing.expectEqual(@as(u64, 50_001), try fixture.wal.latestLsn("docs"));
-    std.debug.print("native GC scale: rows=50000 retained=25000 steps={d} marked={d} deleted={d} peak_operations={d} before_objects={d} after_objects={d}\n", .{ steps, marked, deleted, peak_operations, before_objects, fixture.memory.buckets.get("db").?.count() });
+    const point = try fixture.wal.readPointAlloc(a, "docs", "newer", .{ .start_lsn = 25_001, .end_lsn = 50_001 });
+    defer if (point.record) |record| {
+        a.free(record.payload);
+        if (record.operation_id) |id| a.free(id);
+    };
+    try std.testing.expect(point.indexed and point.record != null);
+    try std.testing.expectEqual(@as(u64, 50_001), point.record.?.lsn);
+    std.debug.print("native GC scale: rows=50000 retained=25000 cycles=2 steps={d} second_steps={d} marked={d} deleted={d} cleanup_deleted={d} peak_operations={d} before_objects={d} job_end_objects={d} after_cleanup_first={d} after_objects={d}\n", .{ steps, second_steps, marked, deleted, cleanup_deleted, peak_operations, before_objects, job_end_objects, after_cleanup_first, after_objects });
 }
