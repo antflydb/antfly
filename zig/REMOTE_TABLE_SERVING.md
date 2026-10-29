@@ -2130,7 +2130,10 @@ Compatible original strings from 256 bytes through 4 KiB now retain analyzed
 source offsets in an inline source descriptor (`AFSI1`). These descriptors and
 payloads are compressed together in the existing indexed doc-value block, so
 repeated analyzer fingerprints and navigation metadata share block compression.
-No per-small-field remote object or read is introduced. Larger strings retain
+No per-small-field remote object or read is introduced. Term navigation is
+admitted only when it can fit, and total encoded variants plus their descriptors
+are capped at twice the source length. Rejected small captures do not open or
+append to a private spill run. Larger strings retain
 independently readable 64-KiB pages; smaller and unsupported strings retain
 query-time analysis. The 256-byte threshold is an internal cost policy, not a
 public API guarantee. Original UTF-8 bytes, analyzer signatures and compaction

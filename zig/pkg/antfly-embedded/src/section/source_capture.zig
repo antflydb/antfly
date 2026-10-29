@@ -33,7 +33,7 @@ pub const Capture = struct {
             return l.doc == r.doc and std.mem.eql(u8, l.field, r.field);
         }
     };
-    pub const Request = struct { key: Key, signature: [32]u8 };
+    pub const Request = struct { key: Key, signature: [32]u8, text_bytes: usize };
     a: A,
     active: bool,
     io: ?std.Io,
@@ -75,9 +75,27 @@ pub const Capture = struct {
             self.reused += 1;
             return null;
         };
-        return .{ .key = key, .signature = signature };
+        return .{ .key = key, .signature = signature, .text_bytes = text.len };
     }
     pub fn record(self: *Capture, request: Request, tokens: []const analysis.Token) !void {
+        var scratch = std.heap.ArenaAllocator.init(@import("../sql/memory_budget.zig").reclaimingAllocator(self.a));
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var staged = segment.MemorySegmentSink.init(sa);
+        defer staged.deinit();
+        var small: ?offsets.Encoded = null;
+        if (request.text_bytes <= 4096) {
+            var used: usize = 0;
+            if (self.entries.get(request.key)) |held| for (held.items) |variant| {
+                used +|= variant.bytes +| 52;
+            };
+            const allowance = request.text_bytes * 2 -| used;
+            if (allowance <= 52 or !try column.smallOffsetMetadataFits(sa, tokens, allowance - 52)) return;
+            var output = staged.sink();
+            const encoded = try offsets.write(sa, &output, tokens);
+            if (encoded.bytes > allowance - 52) return;
+            small = encoded;
+        }
         if (self.spool == null) {
             if (self.io) |io| {
                 self.spool = try Run.createWithResources(self.a, io, self.directory, self.resources);
@@ -86,9 +104,8 @@ pub const Capture = struct {
         }
         var sink = if (self.spool) |run| run.sink() else self.memory.sink();
         const begin = sink.len();
-        var scratch = std.heap.ArenaAllocator.init(@import("../sql/memory_budget.zig").reclaimingAllocator(self.a));
-        defer scratch.deinit();
-        const encoded = try offsets.write(scratch.allocator(), &sink, tokens);
+        const encoded = if (small) |value| value else try offsets.write(sa, &sink, tokens);
+        if (small != null) try sink.appendSlice(staged.out.items);
         if (self.spool) |run| try run.seal(begin);
         const slot = try self.entries.getOrPut(self.a, request.key);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
@@ -150,4 +167,33 @@ test "highlight indexing capture shares analyzer identity spills and outlives pr
         var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
         try std.testing.checkAllAllocationFailures(stable.allocator(), RunTest.run, .{ value, spill });
     }
+}
+
+test "highlight small offset admission rejects diverse metadata before spilling and preserves useful variants" {
+    const a = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    for (0..100) |i| {
+        var buffer: [24]u8 = undefined;
+        try body.appendSlice(a, try std.fmt.bufPrint(&buffer, "word{d:0>4} ", .{i}));
+    }
+    var root: std.json.ObjectMap = .empty;
+    defer root.deinit(a);
+    try root.put(a, "body", .{ .string = body.items });
+    var capture = Capture.init(a, true, std.testing.io, ".", null);
+    defer capture.deinit();
+    const request = (try capture.wants(0, "body", body.items, .{ .object = root }, &analysis.simple_analyzer)).?;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const tokens = try analysis.simple_analyzer.analyzeWithSourceOffsets(arena.allocator(), body.items);
+    try capture.record(request, tokens);
+    try std.testing.expect(capture.spool == null);
+    try std.testing.expectEqual(@as(usize, 0), (try capture.variants(0, "body")).items.len);
+    body.clearRetainingCapacity();
+    for (0..128) |_| try body.appendSlice(a, "running ");
+    root.getPtr("body").?.* = .{ .string = body.items };
+    const useful = (try capture.wants(1, "body", body.items, .{ .object = root }, &analysis.simple_analyzer)).?;
+    const repeated = try analysis.simple_analyzer.analyzeWithSourceOffsets(arena.allocator(), body.items);
+    try capture.record(useful, repeated);
+    try std.testing.expectEqual(@as(usize, 1), (try capture.variants(1, "body")).items.len);
 }

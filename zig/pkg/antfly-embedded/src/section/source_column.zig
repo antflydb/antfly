@@ -59,6 +59,22 @@ pub fn eligibleAnalyzer(analyzer: *const analysis.Analyzer) bool {
     };
     return true;
 }
+/// A small field's term navigation alone must fit its storage allowance.
+/// Reject diverse inputs before building an occurrence run; repeated terms
+/// share one dictionary entry and remain economical.
+pub fn smallOffsetMetadataFits(a: A, tokens: []const analysis.Token, allowance: usize) !bool {
+    var distinct: std.StringHashMapUnmanaged(void) = .empty;
+    defer distinct.deinit(a);
+    var bytes: usize = 32;
+    for (tokens) |token| {
+        const slot = try distinct.getOrPut(a, token.term);
+        if (!slot.found_existing) {
+            bytes +|= 48 +| token.term.len;
+            if (bytes > allowance) return false;
+        }
+    }
+    return true;
+}
 pub const Variant = struct { signature: [32]u8, offset: usize, bytes: usize, root_raw: u32, count: u32 };
 pub const Variants = struct { view: View, items: []const Variant };
 /// The standalone writer shares the indexing producer's codec. Native lake
@@ -98,6 +114,9 @@ fn copyRange(sink: *Sink, view: View, offset: u64, length: usize) !void {
 /// ordinary indexed doc-value stream. All offsets are section-relative.
 pub fn writeTextPrepared(a: A, sink: *Sink, start: usize, text: []const u8, captured: Variants) ![]u8 {
     if (text.len > 4096 or captured.items.len == 0) return writePagedText(a, sink, start, text, captured);
+    var offset_bytes: usize = 0;
+    for (captured.items) |variant| offset_bytes +|= variant.bytes +| 52;
+    if (offset_bytes > text.len * 2) return typed.encodeBinary(a, .{ .string = text });
     // Small fields share compression and repeated analyzer/dictionary metadata
     // with the enclosing indexed doc-value block. No separate per-row reads.
     var memory = @import("../segment.zig").MemorySegmentSink.init(a);
