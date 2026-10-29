@@ -96,3 +96,6 @@ AY's projection timing fixtures cover CUDA launch-family consolidation. Its
 selected EmbeddingGemma/LightOn device tests establish useful pre-migration
 correctness coverage. They do not constitute a full-model performance comparison
 or qualification of this future migration. AV's Metal GPU p95 miss remains open.
+
+The remaining recurrent/audio/projection/training-row implementation and its
+performance limits are recorded in [BA outcomes](unified-execution-ba-outcomes.md).

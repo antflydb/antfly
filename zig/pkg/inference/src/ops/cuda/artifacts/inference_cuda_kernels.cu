@@ -14830,8 +14830,8 @@ extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
 
 #include "../kernels/gliner25_boundary.cuh"
 #include "../kernels/training_validation.cuh"
-#include "../kernels/gliner25_layer_norm.cuh"
-#include "../kernels/gliner25_softmax.cuh"
+#include "../kernels/training_welford_layer_norm.cuh"
+#include "../kernels/training_row_softmax.cuh"
 #include "../kernels/gliner25_attention.cuh"
 
 // Laya inference kernels. Keep outside compiler-owned generated regions.

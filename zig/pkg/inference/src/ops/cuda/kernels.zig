@@ -3961,8 +3961,9 @@ pub const KernelModule = struct {
         ctx.noteKernelLaunch();
     }
 
-    /// Descriptors and byte extents are checked by the shared boundary planner.
-    pub fn launchGliner25Softmax(self: *const KernelModule, ctx: *context_mod.CudaContext, buffers: [3]buffer_mod.DeviceBuffer, rows: u32, width: u32, backward: bool) !void {
+    /// Persistent row reduction with a separately rounded dy*probability backward input.
+    /// The legacy device symbol is retained for serialized artifact compatibility.
+    pub fn launchTrainingPersistentSoftmaxF32(self: *const KernelModule, ctx: *context_mod.CudaContext, buffers: [3]buffer_mod.DeviceBuffer, rows: u32, width: u32, backward: bool) !void {
         const function = self.gliner25_softmax_f32 orelse return error.CudaKernelUnavailable;
         if (rows == 0 or width == 0 or width > 1024) return error.InvalidCudaState;
         const count = try std.math.mul(usize, rows, width);
@@ -3989,16 +3990,20 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, blocks, 1, 1, lanes, warps, 1, 0, ctx.stream, &params, null));
     }
 
-    /// Descriptors and byte extents are checked by the shared boundary planner.
-    pub fn launchGliner25LayerNorm(self: *const KernelModule, ctx: *context_mod.CudaContext, buffers: [6]buffer_mod.DeviceBuffer, rows: u32, width: u32, eps: f32, phase: u32) !void {
+    pub const TrainingLayerNormPhase = enum(u32) { forward, input_gradient, parameter_gradients };
+
+    /// Four values per lane, 128-lane Welford contract; distinct from inference LayerNorm.
+    /// Phase 0 forwards, 1 writes dX/statistics, 2 reduces packed dGamma/dBeta.
+    /// Descriptors and extents are admitted by the shared boundary planner.
+    pub fn launchTrainingWelfordLayerNormF32(self: *const KernelModule, ctx: *context_mod.CudaContext, buffers: [6]buffer_mod.DeviceBuffer, rows: u32, width: u32, eps: f32, phase: TrainingLayerNormPhase) !void {
         const function = self.gliner25_layer_norm_f32 orelse return error.CudaKernelUnavailable;
-        if (rows == 0 or width == 0 or width % 4 != 0 or phase > 2) return error.InvalidCudaState;
+        if (rows == 0 or width == 0 or width % 4 != 0) return error.InvalidCudaState;
         var pointers: [6]driver_mod.CUdeviceptr = undefined;
         for (buffers, 0..) |buffer, i| pointers[i] = buffer.ptr;
         var row_count = rows;
         var dimension = width;
         var epsilon = eps;
-        var pass = phase;
+        var pass: u32 = @backingInt(phase);
         var params: [10]?*anyopaque = undefined;
         for (&pointers, 0..) |*pointer, i| params[i] = @ptrCast(pointer);
         params[6] = @ptrCast(&row_count);
@@ -4006,10 +4011,10 @@ pub const KernelModule = struct {
         params[8] = @ptrCast(&epsilon);
         params[9] = @ptrCast(&pass);
         const partitions: u32 = if (rows < 64) 1 else if (rows < 128) 8 else if (rows < 256) 16 else 32;
-        const blocks = if (phase == 2) std.math.divCeil(u32, width, 32) catch return error.InvalidCudaState else rows;
-        const threads_x: u32 = if (phase == 2) 32 else 128;
-        const threads_y: u32 = if (phase == 2) partitions else 1;
-        const shared_bytes: u32 = if (phase == 2) partitions * 33 * 8 else 32;
+        const blocks = if (phase == .parameter_gradients) std.math.divCeil(u32, width, 32) catch return error.InvalidCudaState else rows;
+        const threads_x: u32 = if (phase == .parameter_gradients) 32 else 128;
+        const threads_y: u32 = if (phase == .parameter_gradients) partitions else 1;
+        const shared_bytes: u32 = if (phase == .parameter_gradients) partitions * 33 * 8 else 32;
         try ctx.makeCurrent();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, blocks, 1, 1, threads_x, threads_y, 1, shared_bytes, ctx.stream, &params, null));
     }

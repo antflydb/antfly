@@ -66,6 +66,7 @@ class Device:
 
     def launch(self, fn, args, grid, threads=256, shared_bytes=0):
         gx, gy = (grid, 1) if isinstance(grid, int) else grid
+        tx, ty = (threads, 1) if isinstance(threads, int) else threads
         argv = (C.c_void_p * len(args))(*(C.addressof(a) for a in args))
         self.call(
             "cuLaunchKernel",
@@ -73,8 +74,8 @@ class Device:
             C.c_uint(gx),
             C.c_uint(gy),
             C.c_uint(1),
-            C.c_uint(threads),
-            C.c_uint(1),
+            C.c_uint(tx),
+            C.c_uint(ty),
             C.c_uint(1),
             C.c_uint(shared_bytes),
             self.stream,

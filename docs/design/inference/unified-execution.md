@@ -3430,3 +3430,6 @@ AZ continues the device-family migration with shared row/statistics programs,
 BF16 projection consumers and chronological-attention schedules. See
 [AZ outcomes](unified-execution-az-outcomes.md) for net owner accounting, original
 instruction comparisons, device/model qualification and retained timing misses.
+
+[BA: shared recurrent, audio, BF16 projection and training row programs](unified-execution-ba-outcomes.md)
+records the next model-family consolidation and native device qualification.

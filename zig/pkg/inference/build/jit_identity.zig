@@ -91,6 +91,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     // include closure so Zig's watch/cache graph sees those edits as well.
     const metal_dependencies = [_][]const u8{
         "src/backends/metal_param_abi.h",
+        "src/backends/metal_gdn_source.h",
         "src/backends/metal_buffer_observation.h",
         "src/backends/metal_mtp_head.h",
         "src/backends/metal_mtp_head_impl.h",
@@ -151,8 +152,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/kernels/primitive_scatter.cuh",
         "src/ops/cuda/kernels/dense_fast_attention_online.cuh",
         "src/ops/cuda/kernels/training_validation.cuh",
-        "src/ops/cuda/kernels/gliner25_layer_norm.cuh",
-        "src/ops/cuda/kernels/gliner25_softmax.cuh",
+        "src/ops/cuda/kernels/training_welford_layer_norm.cuh",
+        "src/ops/cuda/kernels/training_row_softmax.cuh",
         "src/ops/cuda/kernels/gliner25_attention.cuh",
     };
     run.addArg(b.fmt("{d}", .{qualification.len + contracts.len + if (backend == .cuda) cuda_dependencies.len else metal_dependencies.len}));

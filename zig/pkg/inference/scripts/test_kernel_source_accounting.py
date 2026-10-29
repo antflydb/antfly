@@ -33,19 +33,19 @@ class SourceAccountingTest(unittest.TestCase):
         self.assertEqual(sum(row["bytes_removed"] for row in receipt["groups"].values()), 2 * expected_bytes)
 
     def test_native_metal_owners_and_runtime_qualification_have_distinct_budgets(self):
-        owner = "zig/pkg/inference/src/graph/templates/native.metal"
+        owners = ["zig/pkg/inference/src/graph/templates/native.metal", "zig/pkg/inference/src/backends/metal_gdn_source.h"]
         tool = "zig/pkg/inference/src/quant_kernel_metal_runtime_check.zig"
         payload = "one native owner\n"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in (owner, tool):
+            for name in (*owners, tool):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(payload)
-            with mock.patch.object(accounting.subprocess, "check_output", side_effect=["0" * 40, owner + "\n" + tool + "\n", "", "1" * 40]), mock.patch.object(accounting.subprocess, "run", return_value=SimpleNamespace(stdout=b"")):
+            with mock.patch.object(accounting.subprocess, "check_output", side_effect=["0" * 40, "\n".join([*owners, tool]) + "\n", "", "1" * 40]), mock.patch.object(accounting.subprocess, "run", return_value=SimpleNamespace(stdout=b"")):
                 receipt = accounting.account(root, "baseline")
-        self.assertEqual(receipt["authored_production"]["bytes_removed"], -len(payload))
-        self.assertEqual(receipt["groups"]["authored_metal_shader"]["bytes_removed"], -len(payload))
+        self.assertEqual(receipt["authored_production"]["bytes_removed"], -2 * len(payload))
+        self.assertEqual(receipt["groups"]["authored_metal_shader"]["bytes_removed"], -2 * len(payload))
         self.assertEqual(receipt["groups"]["tests_and_benchmark_tooling"]["bytes_removed"], -len(payload))
 
     def test_private_shader_goldens_are_not_production_savings(self):

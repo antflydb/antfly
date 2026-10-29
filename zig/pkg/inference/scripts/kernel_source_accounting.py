@@ -161,7 +161,7 @@ def shader(text):
 def account(root, baseline):
     root = Path(root).resolve()
     baseline = subprocess.check_output(['git', 'rev-parse', '--verify', baseline + '^{commit}'], cwd=root, text=True).strip()
-    paths = set(subprocess.check_output(['git', 'diff', '--name-only', baseline], cwd=root, text=True).splitlines())
+    paths = set(subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', baseline], cwd=root, text=True).splitlines())
     paths.update(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=root, text=True).splitlines())
 
     def old(path):
@@ -213,6 +213,8 @@ def account(root, baseline):
                 (sb, b) = shader(b)
                 row['groups'].append(add('authored_metal_shader', sa, sb))
                 group = 'authored_metal_host_bindings'
+            elif name.endswith('/backends/metal_gdn_source.h'):
+                group = 'authored_metal_shader'
             elif '/graph/templates/' in name and path.suffix == '.metal':
                 group = 'authored_metal_shader'
             elif path.suffix in {'.cu', '.cuh'}:

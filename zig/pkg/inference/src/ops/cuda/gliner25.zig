@@ -866,14 +866,14 @@ pub fn residentTrainingInstruction(ctx: *anyopaque, instruction: *const program.
                 defer api.freeTensor(ctx, stats);
                 buffers[4] = tensor(inputs[3]).buffer;
                 buffers[5] = tensor(stats).buffer;
-                try self.kernels.launchGliner25LayerNorm(&self.ctx, buffers, rows, attrs.dim, attrs.eps, 1);
+                try self.kernels.launchTrainingWelfordLayerNormF32(&self.ctx, buffers, rows, attrs.dim, attrs.eps, .input_gradient);
                 if (control) |c| try c.check();
-                try self.kernels.launchGliner25LayerNorm(&self.ctx, buffers, rows, attrs.dim, attrs.eps, 2);
+                try self.kernels.launchTrainingWelfordLayerNormF32(&self.ctx, buffers, rows, attrs.dim, attrs.eps, .parameter_gradients);
                 self.stats.launch_other += 2;
                 if (self.layer_norm_backward_observer) |observer|
                     try observer.observe(observer.context, .{ inputs[0], inputs[1], inputs[2], inputs[3] }, output, rows, attrs.dim, attrs.eps);
             } else {
-                try self.kernels.launchGliner25LayerNorm(&self.ctx, buffers, rows, attrs.dim, attrs.eps, 0);
+                try self.kernels.launchTrainingWelfordLayerNormF32(&self.ctx, buffers, rows, attrs.dim, attrs.eps, .forward);
                 self.stats.launch_other += 1;
             }
             break :blk output;
@@ -963,7 +963,7 @@ pub fn residentTrainingInstruction(ctx: *anyopaque, instruction: *const program.
             if (!backward and !r.fuse_backward) break :blk try api.primSoftmaxOp(ctx, inputs[0], r.dim);
             const output = try allocate(self, shape, .f32, limits.primitive);
             errdefer api.freeTensor(self, output);
-            try self.kernels.launchGliner25Softmax(&self.ctx, .{
+            try self.kernels.launchTrainingPersistentSoftmaxF32(&self.ctx, .{
                 tensor(output).buffer,
                 tensor(inputs[0]).buffer,
                 tensor(inputs[if (backward) 1 else 0]).buffer,
