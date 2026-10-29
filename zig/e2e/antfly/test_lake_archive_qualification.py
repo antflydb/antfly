@@ -1954,7 +1954,15 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                 client.ready(bench.readiness_indexes({"definition": definition}))
                 original.rename(unavailable)
                 try:
-                    for descending in (False, True):
+                    for fields, descending in (
+                        (fields, descending)
+                        for fields in (
+                            ["id", "bucket"],
+                            ["*", "-wide", "-body"],
+                            ["-wide", "-body"],
+                        )
+                        for descending in (False, True)
+                    ):
                         response = client.query(
                             {
                                 "request": {
@@ -1962,7 +1970,7 @@ def test_wide_covering_projection_uses_compact_identity_and_selected_columns(
                                         "match": "quasar",
                                         "field": "body",
                                     },
-                                    "fields": ["id", "bucket"],
+                                    "fields": fields,
                                     "order_by": [{"field": "id", "desc": descending}],
                                     "limit": 32,
                                 }
@@ -2028,11 +2036,19 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     unicode_body = "unicodecase " + unicode_payload + " needle"
     regular_body = "running " * 32768
     diverse_body = " ".join(f"broad{i:05d}" for i in range(8192)) + " "
+    clustered_body = "needle " + "needle other " * 16384
     rows = pa.table(
         {
-            "id": list(range(count + 5)),
+            "id": list(range(count + 6)),
             "body": [body] * count
-            + [sparse_body, selective_body, unicode_body, regular_body, diverse_body],
+            + [
+                sparse_body,
+                selective_body,
+                unicode_body,
+                regular_body,
+                diverse_body,
+                clustered_body,
+            ],
         }
     )
     root = tmp_path / "fixture"
@@ -2223,9 +2239,21 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                             diverse_body,
                             "broad",
                         ),
+                        (
+                            count + 5,
+                            {
+                                "disjuncts": [
+                                    {"match": "needle", "field": "body"},
+                                    {"match": "other", "field": "body"},
+                                ]
+                            },
+                            clustered_body,
+                            "mixed",
+                        ),
                     ):
                         request = {
                             "full_text_search": pattern,
+                            "filter_query": {"term": {"path": "/id", "value": row_id}},
                             "highlight": {
                                 "fields": ["body"],
                                 "max_fragments": 3,
@@ -2256,15 +2284,18 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                                 ]
                                 == fragment["text"]
                             )
-                            stride = 8 if term == "running" else 11
+                            import re
+
                             begin = fragment["offset"]
                             end = begin + len(fragment["text"])
                             expected_spans = []
-                            for token_start in range(
-                                begin // stride * stride, end, stride
-                            ):
-                                token_end = token_start + stride - 1
-                                assert original[token_start:token_end].startswith(term)
+                            for match in re.finditer(r"\w+", original):
+                                token_start, token_end = match.span()
+                                if token_end <= begin:
+                                    continue
+                                if token_start >= end:
+                                    break
+                                assert term == "mixed" or match.group().startswith(term)
                                 left, right = (
                                     max(begin, token_start),
                                     min(end, token_end),

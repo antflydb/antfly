@@ -576,7 +576,7 @@ pub fn prepareStoredMatches(a: Allocator, source: @import("../section/source_col
     const plan = (try prepareStoredPlan(a, source, signature, matchers, program, control)) orelse return null;
     // Tiny and highly diverse matches retain the simpler vector kernel. Dense
     // monotone postings use bounded source-order merging and fragment state.
-    if (plan.ordered and plan.count >= 4096 and (plan.count > plan.terms.len *| 8 or plan.source_blocks.len != 0)) return .{ .stream = plan };
+    if (plan.ordered and plan.count >= 4096 and (plan.count > plan.selectedTermCount() *| 8 or plan.source_blocks.len != 0)) return .{ .stream = plan };
     const vector = try plan.materializeOwned(control);
     return .{ .vector = vector };
 }
@@ -610,9 +610,9 @@ const SpanStream = struct {
     iterator: *@import("../section/source_offsets.zig").Iterator,
     pending: ?Span = null,
     fn next(self: *SpanStream) !?Span {
-        var result = self.pending orelse if (try self.iterator.next()) |token| Span{ .start = token.start_byte, .end = token.end_byte } else return null;
+        var result = self.pending orelse if (try self.iterator.nextSpan()) |token| Span{ .start = token.start_byte, .end = token.end_byte } else return null;
         self.pending = null;
-        while (try self.iterator.next()) |token| {
+        while (try self.iterator.nextSpan()) |token| {
             const span: Span = .{ .start = token.start_byte, .end = token.end_byte };
             if (span.start > result.end) {
                 self.pending = span;
@@ -1893,6 +1893,19 @@ test "highlight diverse source lane bounds decoded heads preserves exact results
     var matches = (try prepareStoredMatches(a, stored, try column.fingerprint(a, &analysis_mod.simple_analyzer), &.{.{ .prefix = "term" }}, null, .none)).?;
     defer matches.deinit();
     try std.testing.expect(matches == .stream);
+    try std.testing.expectEqual(@as(usize, 8192), matches.stream.selectedTermCount());
+    try std.testing.expectEqual(@as(usize, 0), matches.stream.terms.len);
+    try std.testing.expectEqual(@as(usize, 1024), matches.stream.source_mask.?.len);
+    try std.testing.expectEqual(@as(usize, 0), matches.stream.density_terms.len);
+    {
+        var spans = try @import("../section/source_offsets.zig").Iterator.init(a, &matches.stream, .none);
+        defer spans.deinit();
+        try std.testing.expect((try spans.nextSpan()) != null);
+        try std.testing.expect(spans.resolved == null);
+        try spans.reset();
+        const full = (try spans.next()).?;
+        try std.testing.expectEqualStrings("term00000", full.term);
+    }
     const vector = try matches.stream.materialize(a, .none);
     defer vector.deinit();
     const expected = try highlightSelectedStored(a, a, stored, vector.items, 3, 100, .none);
@@ -1907,7 +1920,7 @@ test "highlight diverse source lane bounds decoded heads preserves exact results
         try std.testing.expectEqualSlices(Span, old.highlights, new.highlights);
     }
     try std.testing.expect(profile.block_reads <= 16);
-    std.debug.print("DIVERSE_SOURCE_LANE terms={d} occurrences={d} decoded_blocks={d} kernel_peak={d} exact=true\n", .{ matches.stream.terms.len, matches.stream.count, profile.block_reads, budget.peak });
+    std.debug.print("DIVERSE_SOURCE_LANE terms={d} occurrences={d} decoded_blocks={d} kernel_peak={d} exact=true\n", .{ matches.stream.selectedTermCount(), matches.stream.count, profile.block_reads, budget.peak });
     freeFragments(budget.allocator(), actual);
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     const Faults = struct {
@@ -1984,4 +1997,44 @@ test "highlight randomized stored fragment geometry preserves exact greedy outpu
         };
     }
     std.debug.print("FRAGMENT_GEOMETRY cases={d} tokens=4096 disjoint_and_crossing=true\n", .{checked});
+}
+
+test "highlight suffix block density prunes a mixed field after an early dense cluster" {
+    const a = std.testing.allocator;
+    const column = @import("../section/source_column.zig");
+    const segment = @import("../segment.zig");
+    const View = @import("../segment_source.zig").View;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, "needle ");
+    for (0..16384) |_| try body.appendSlice(a, "needle other ");
+    var memory = segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try column.Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = body.items }, &.{&analysis_mod.simple_analyzer});
+    try std.testing.expect(try writer.finish());
+    var cursor = column.Cursor.init(try column.Reader.init(a, try View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len)));
+    defer cursor.deinit();
+    const stored = (try cursor.text(0)).?;
+    var plan = (try stored.planTokens(a, try column.fingerprint(a, &analysis_mod.simple_analyzer), .{}, .none)).?;
+    defer plan.deinit();
+    const vector = try plan.materialize(a, .none);
+    defer vector.deinit();
+    const expected = try highlightSelectedStored(a, a, stored, vector.items, 3, 100, .none);
+    defer freeFragments(a, expected);
+    var profile: StreamProfile = .{};
+    const actual = try streamFragments(a, a, stored, &plan, 3, 100, .none, &profile);
+    defer freeFragments(a, actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |old, new| {
+        try std.testing.expectEqual(old.offset, new.offset);
+        try std.testing.expectEqualStrings(old.text, new.text);
+        try std.testing.expectEqualSlices(Span, old.highlights, new.highlights);
+    }
+    try std.testing.expect(profile.pruned);
+    try std.testing.expect(profile.spans <= 3072);
+    try std.testing.expect(profile.block_reads <= 12);
+    std.debug.print("CLUSTER_DENSITY terms={d} occurrences={d} visited={d} blocks={d} pruned={any} exact=true\n", .{ plan.terms.len, plan.count, profile.spans, profile.block_reads, profile.pruned });
 }

@@ -3858,15 +3858,25 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
     for (req.fields) |field| if (field.len == 0 or field[0] != '-') {
         positive = true;
     };
-    if (req.fields.len != 0 and !positive) return null;
     var names: std.ArrayList([]const u8) = .empty;
-    for (table.columns) |column| for (req.fields) |pattern| {
-        if (pattern.len == 0 or pattern[0] == '-') continue;
-        if (projectionMayUse(pattern, column.path)) {
-            try names.append(a, column.path);
-            break;
-        }
-    };
+    for (table.columns) |column| {
+        const selected = if (!positive) req.fields.len != 0 else for (req.fields) |pattern| {
+            if (pattern.len == 0 or pattern[0] == '-') continue;
+            if (projectionMayUse(pattern, column.path)) break true;
+        } else false;
+        if (!selected) continue;
+        // A descendant exclusion cannot remove its containing JSON root: the
+        // projector still needs that root to preserve object/null semantics.
+        const excluded = for (req.fields) |pattern| {
+            if (pattern.len < 2 or pattern[0] != '-') continue;
+            const path = pattern[1..];
+            // Nested masks retain physical roots so the final projector can
+            // distinguish an empty object from an absent parent.
+            if (std.mem.indexOfScalar(u8, path, '.') != null) continue;
+            if (std.mem.eql(u8, path, "*") or std.mem.eql(u8, path, column.path) or (column.path.len > path.len and std.mem.startsWith(u8, column.path, path) and column.path[path.len] == '.')) break true;
+        } else false;
+        if (!excluded) try names.append(a, column.path);
+    }
     // Scalar outputs are independent of the public source mask. Bind once
     // through the same admitted program and include every potential operand;
     // archive column hydration remains a conservative provider fallback.
@@ -3995,7 +4005,12 @@ test "external lake hydration projection narrows includes and retains exclusion 
     } };
     const fields = (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "amount", "nested.*", "-body" } })).?;
     try std.testing.expectEqualSlices([]const u8, &.{ "amount", "nested.value" }, fields);
-    try std.testing.expect((try projectionColumns(arena.allocator(), table, .{ .fields = &.{"-body"} })) == null);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "nested.value" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{"-body"} })).?);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "nested.value" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "*", "-body" } })).?);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "body" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "*", "-nested" } })).?);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "body", "nested.value" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "*", "-nested.value" } })).?);
+    const root_table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{.{ .name = "nested", .path = "nested", .type = .json }} };
+    try std.testing.expectEqualSlices([]const u8, &.{"nested"}, (try projectionColumns(arena.allocator(), root_table, .{ .fields = &.{ "*", "-nested.private" } })).?);
     try std.testing.expect((try projectionColumns(arena.allocator(), table, .{})) == null);
     try std.testing.expectEqual(@as(usize, 0), (try projectionColumns(arena.allocator(), table, .{ .include_all_fields = false })).?.len);
     try std.testing.expectEqualSlices([]const u8, &.{"amount"}, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{"amount"}, .defer_stored_projection = true })).?);
@@ -5813,6 +5828,8 @@ test "external lake scalar outputs hydrate dependencies independently of the pub
     try std.testing.expectEqual(@as(usize, 2), both.len);
     try std.testing.expectEqualStrings("visible", both[0]);
     try std.testing.expectEqualStrings("hidden", both[1]);
+    req.fields = &.{ "*", "-hidden", "-unused" };
+    try std.testing.expectEqualSlices([]const u8, &.{ "visible", "hidden" }, (try projectionColumns(a, table, req)).?);
     req.fields = &.{};
     const hidden = (try projectionColumns(a, table, req)).?;
     try std.testing.expectEqual(@as(usize, 1), hidden.len);

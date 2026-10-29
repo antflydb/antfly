@@ -69,7 +69,7 @@ pub fn smallOffsetMetadataFits(a: A, tokens: []const analysis.Token, allowance: 
     for (tokens) |token| {
         const slot = try distinct.getOrPut(a, token.term);
         if (!slot.found_existing) {
-            bytes +|= 48 +| token.term.len;
+            bytes +|= 56 +| token.term.len;
             if (bytes > allowance) return false;
         }
     }
@@ -209,7 +209,7 @@ pub const Text = struct {
     pages: []const u8,
     variants: []const u8,
     variant_count: u32,
-    fn descriptor(view: View, bytes: []const u8) !?Text {
+    fn descriptor(view: ?View, bytes: []const u8) !?Text {
         if (std.mem.startsWith(u8, bytes, inline_magic)) {
             if (bytes.len < 9) return error.InvalidData;
             const length = std.mem.readInt(u32, bytes[5..9], .little);
@@ -218,7 +218,7 @@ pub const Text = struct {
             return try parse(try View.init(.{ .contiguous = payload }, 0, payload.len), bytes[9 + length ..]);
         }
         if (!std.mem.startsWith(u8, bytes, text_magic)) return null;
-        return try parse(view, bytes);
+        return try parse(view orelse return error.InvalidData, bytes);
     }
     fn parse(view: View, bytes: []const u8) !Text {
         var p: Parser = .{ .bytes = bytes };
@@ -412,9 +412,12 @@ pub const Reader = struct {
     }
     pub fn get(self: *Reader, doc: u32, chunk: u32) !?[]u8 {
         const bytes = (try self.directory.get(doc, chunk)) orelse return null;
-        if (!std.mem.startsWith(u8, bytes, text_magic)) return bytes;
-        defer self.directory.alloc.free(bytes);
-        const text = try Text.parse(self.source orelse return error.InvalidData, bytes);
+        var transferred = false;
+        defer if (!transferred) self.directory.alloc.free(bytes);
+        const text = (try Text.descriptor(self.source, bytes)) orelse {
+            transferred = true;
+            return bytes;
+        };
         const raw = try text.read(self.directory.alloc, 0, text.length, .none);
         defer self.directory.alloc.free(raw);
         return try typed.encodeBinary(self.directory.alloc, .{ .string = raw });
@@ -438,7 +441,7 @@ pub const Cursor = struct {
         const bytes = (try self.directory.get(doc)) orelse return null;
         self.chunk = self.directory.chunk;
         self.decode_count = self.directory.decode_count;
-        return try Text.descriptor(self.source orelse return error.InvalidData, bytes);
+        return try Text.descriptor(self.source, bytes);
     }
     pub fn get(self: *Cursor, doc: u32) !?[]const u8 {
         self.directory.reader.alloc.free(self.full);
@@ -446,7 +449,7 @@ pub const Cursor = struct {
         const bytes = (try self.directory.get(doc)) orelse return null;
         self.chunk = self.directory.chunk;
         self.decode_count = self.directory.decode_count;
-        const value = (try Text.descriptor(self.source orelse return error.InvalidData, bytes)) orelse return bytes;
+        const value = (try Text.descriptor(self.source, bytes)) orelse return bytes;
         const a = self.directory.reader.alloc;
         const raw = try value.read(a, 0, value.length, self.control);
         defer a.free(raw);
@@ -494,7 +497,7 @@ pub const Writer = struct {
     }
     pub fn copy(self: *Writer, doc: u32, cursor: *Cursor, original: u32) !void {
         if (try cursor.directory.get(original)) |descriptor| if (std.mem.startsWith(u8, descriptor, inline_magic)) {
-            _ = try Text.descriptor(cursor.source orelse return error.InvalidData, descriptor);
+            _ = try Text.descriptor(cursor.source, descriptor);
             return self.append(doc, try self.a.dupe(u8, descriptor));
         };
         if (try cursor.text(original)) |text| {
@@ -684,4 +687,31 @@ test "highlight inline small field offsets share indexed blocks and survive comp
     try Run.run(a, body);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{body});
+}
+
+fn inlineReaderScenario(a: A) !void {
+    const phrase = "running needle ";
+    const body = try a.alloc(u8, phrase.len * 64);
+    defer a.free(body);
+    for (0..64) |i| @memcpy(body[i * phrase.len ..][0..phrase.len], phrase);
+    var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var output = memory.sink();
+    var writer = try Writer.init(a, &output);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = body }, &.{&analysis.simple_analyzer});
+    try std.testing.expect(try writer.finish());
+    var reader = try Reader.init(a, try View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len));
+    defer reader.deinit();
+    const encoded = (try reader.get(0, 1024)).?;
+    defer a.free(encoded);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const decoded = try typed.decodeBinary(arena.allocator(), encoded);
+    try std.testing.expectEqualStrings(body, decoded.string);
+}
+
+test "highlight inline source Reader materializes typed JSON and releases allocations on failure" {
+    try inlineReaderScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, inlineReaderScenario, .{});
 }

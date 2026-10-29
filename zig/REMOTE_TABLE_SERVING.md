@@ -2100,8 +2100,8 @@ separate from local Debug timing and provider qualification.
 
 ### Exact layout bounds and small-field offset blocks
 
-Stored-source recipe **v9**, native reader protocol **95** and runtime ABI **71**
-fence `AFSC0005` / `AFST5` source columns and `AFOV0004` offset navigation.
+Stored-source recipe **v10**, native reader protocol **96** and runtime ABI **72**
+fence `AFSC0005` / `AFST5` source columns and `AFOV0005` offset navigation.
 Publication rebuilds the affected native text representation rather than mixing
 old and new offset semantics.
 
@@ -2112,7 +2112,12 @@ and both clamped edge windows, rather than bounding every possible window
 alignment. This lets equally spaced seven-byte words with an eight-byte stride
 prune exactly as six-byte words with a seven-byte stride do. Variable layouts,
 multiple selected terms and UTF-8 boundary expansion retain the conservative
-spacing bounds and exact scan fallback. No approximate snippet ranking is used.
+spacing bounds and exact scan fallback. Each inverted block records local
+minimum start spacing and end-to-start gap, including the transition from the
+previous block. Navigation computes suffix minima once. Expired blocks then
+stop weakening future density bounds: an early dense cluster does not force a
+scan through a regular remainder. Prefix maximum ends remain unchanged for
+crossing-span seeks. No approximate snippet ranking is used.
 
 A diverse ordered vector also contains a source-order lane: independently
 compressed blocks of delta-coded start, length, position and dictionary term ID.
@@ -2120,9 +2125,15 @@ Their prefix maximum ends support exact seeks even across long overlapping
 spans. Broad selections use that lane instead of decoding one head block per
 selected term. Sparse selections retain inverted occurrence reads; the lane is
 chosen only for at least 64 selected terms covering at least one eighth of the
-source occurrences. Term dictionary navigation remains proportional to the
-selected vocabulary; the fragment kernel retains one occurrence block, bounded
-windows and the output spans. It does not retain a decoded token vector for each
+source occurrences. Broad plans retain a dictionary-ID bitset and compact
+12-byte density summaries for repeated-term blocks; singleton terms need only an
+aggregate count. They do not retain selected term strings or inverted read
+references. The span-only iterator tests the bitset directly, without a binary
+search for every occurrence. Public full-token iteration and materialization
+lazily expand the selected inverted navigation when term strings are required.
+A selection that proves too sparse falls back using the already matched bitset,
+without evaluating patterns again. The fragment kernel retains one occurrence
+block, bounded windows and the output spans. It does not retain a decoded token vector for each
 selected term. Reads and future-block hints use the existing cancellation,
 read-admission and shared source-I/O scheduling paths.
 
@@ -2146,3 +2157,29 @@ scalar vectors are final result storage, with owned payload bytes and explicit
 row leases. SQL NUMERIC/array normalization, SQL nulls, declared `_type` and
 physical identity witnesses apply before publication to the result page. Pages
 can outlive the covering read wave without retaining its request or reader.
+
+
+### Request-owned projection plans and scalar delivery
+
+Final column encoding compiles simple masks against the immutable column names
+once per request/schema, preserving include order, wildcard/duplicate semantics,
+exclusions, internal-field removal and exact JSON sizing. The request owns at
+most four plans, including copies of names and masks; no plan holds a result-page
+lease, source payload or reader. Schema comparison uses names and order rather
+than pointer identity, so allocator reuse cannot bind a plan to the wrong page.
+Further schemas and nested masks use the existing exact projector. Preparation
+resets per-hit scratch, allocates one exact field descriptor array and emits
+small JSON scalars from inline storage. Canonical float formatting and integers
+above `2^53` retain their original precision.
+
+Physical hydration honors whole-field negative masks, including `*` followed by
+exclusions and exclusion-only masks. This lets a covering index satisfy the
+selected fields even when a large excluded column is unavailable in the provider.
+Nested exclusions stay conservative to preserve empty-object and absent-parent
+semantics, and computed outputs always re-add their declared dependencies.
+Highlight dependencies remain independently selected before public projection.
+
+Owned `source_column.Reader.get` and the cursor share source-descriptor dispatch.
+Inline `AFSI1` values are decoded into ordinary typed JSON before whole-document
+materialization, just as paged `AFST5` values are. Descriptors and transient decode
+buffers are released on every error path; inline payloads need no external view.

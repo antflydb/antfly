@@ -431,10 +431,12 @@ pub const Prepared = struct {
     const Value = union(enum) {
         string: struct { bytes: []const u8, encoded_len: usize, plain: bool },
         raw: []const u8,
+        scalar: struct { bytes: [24]u8, len: u8 },
         fn length(self: @This()) !usize {
             return switch (self) {
                 .string => |v| v.encoded_len,
                 .raw => |v| v.len,
+                .scalar => |v| v.len,
             };
         }
         pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -453,9 +455,24 @@ pub const Prepared = struct {
                     try w.writer.writeAll(v);
                     w.endWriteRaw();
                 },
+                .scalar => |v| {
+                    try w.beginWriteRaw();
+                    try w.writer.writeAll(v.bytes[0..v.len]);
+                    w.endWriteRaw();
+                },
             }
         }
         fn prepare(a: A, value: std.json.Value, borrow_string: bool) !@This() {
+            switch (value) {
+                .integer, .float, .bool, .null => {
+                    var bytes: [24]u8 = @splat(0);
+                    var writer: std.Io.Writer = .fixed(&bytes);
+                    if (std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, &writer)) |_| {
+                        return .{ .scalar = .{ .bytes = bytes, .len = @intCast(writer.buffered().len) } };
+                    } else |_| {} // Preserve canonical fallback if a scalar needs more room.
+                },
+                else => {},
+            }
             if (borrow_string and value == .string) {
                 const stats = try stringStats(value.string);
                 if (stats.ascii or std.unicode.utf8ValidateSlice(value.string)) return .{ .string = .{ .bytes = value.string, .encoded_len = stats.length, .plain = stats.length == value.string.len + 2 } };
@@ -526,6 +543,104 @@ pub const Prepared = struct {
         for (self.fields) |field| {
             try w.objectField(field.name);
             try w.write(field.value);
+        }
+        try w.endObject();
+    }
+};
+
+/// Request-owned, bounded schema/projection plans. Entries own names and masks,
+/// never result pages, payloads, readers or request callbacks.
+pub const ProjectionCache = struct {
+    const Entry = struct {
+        arena: std.heap.ArenaAllocator,
+        names: []const []const u8,
+        fields: []const []const u8,
+        include_all: bool,
+        indices: []const usize,
+        header_bytes: usize,
+        fn matches(self: *const @This(), columns: []const rows.ColumnVector, options: anytype) bool {
+            if (self.include_all != options.include_all_fields or self.fields.len != options.fields.len or self.names.len != columns.len) return false;
+            for (self.fields, options.fields) |a, b| if (!std.mem.eql(u8, a, b)) return false;
+            for (self.names, columns) |name, column| if (!std.mem.eql(u8, name, column.name)) return false;
+            return true;
+        }
+    };
+    a: A,
+    entries: [4]?*Entry = @splat(null),
+    builds: usize = 0,
+    pub fn init(a: A) ProjectionCache {
+        return .{ .a = @import("../../sql/memory_budget.zig").reclaimingAllocator(a) };
+    }
+    pub fn deinit(self: *ProjectionCache) void {
+        for (self.entries) |entry| if (entry) |owned| {
+            owned.arena.deinit();
+            self.a.destroy(owned);
+        };
+    }
+    fn get(self: *ProjectionCache, page: *const Page, options: anytype) !?*const Entry {
+        for (options.fields) |field| if (std.mem.indexOfScalar(u8, field, '.') != null) return null;
+        for (self.entries) |entry| if (entry) |held| {
+            if (held.matches(page.columns, options)) return held;
+        };
+        const slot = for (&self.entries) |*entry| {
+            if (entry.* == null) break entry;
+        } else return null;
+        const entry = try self.a.create(Entry);
+        entry.* = .{ .arena = .init(self.a), .names = &.{}, .fields = &.{}, .include_all = options.include_all_fields, .indices = &.{}, .header_bytes = 2 };
+        errdefer {
+            entry.arena.deinit();
+            self.a.destroy(entry);
+        }
+        const a = entry.arena.allocator();
+        const names = try a.alloc([]const u8, page.columns.len);
+        for (names, page.columns) |*name, column| name.* = try a.dupe(u8, column.name);
+        entry.names = names;
+        const fields = try a.alloc([]const u8, options.fields.len);
+        for (fields, options.fields) |*field, value| field.* = try a.dupe(u8, value);
+        entry.fields = fields;
+        var indices: std.ArrayList(usize) = .empty;
+        const includes = for (options.fields) |field| {
+            if (field.len == 0 or field[0] != '-') break true;
+        } else false;
+        if (includes) {
+            for (options.fields, 0..) |field, ordinal| for (page.columns, 0..) |column, index| {
+                if (!std.mem.eql(u8, field, "*") and !std.mem.eql(u8, field, column.name)) continue;
+                if (Row.firstInclude(options.fields, column.name) != ordinal or Row.excluded(options.fields, column.name) or Row.internal(column.name)) continue;
+                try indices.append(a, index);
+            };
+        } else if (options.fields.len != 0 or options.include_all_fields) {
+            for (page.columns, 0..) |column, index| if (!Row.excluded(options.fields, column.name) and !Row.internal(column.name)) try indices.append(a, index);
+        }
+        entry.indices = try indices.toOwnedSlice(a);
+        for (entry.indices, 0..) |index, ordinal| {
+            entry.header_bytes = try std.math.add(usize, entry.header_bytes, try Prepared.stringLength(page.columns[index].name));
+            entry.header_bytes = try std.math.add(usize, entry.header_bytes, 1 + @as(usize, @intFromBool(ordinal != 0)));
+        }
+        slot.* = entry;
+        self.builds += 1;
+        return entry;
+    }
+    pub fn prepare(self: *ProjectionCache, row: Row, a: A, scratch: *std.heap.ArenaAllocator, options: anytype) !Prepared {
+        const entry = (try self.get(row.page, options)) orelse return row.prepare(a, scratch, options);
+        _ = scratch.reset(.retain_capacity);
+        const fields = try a.alloc(Prepared.Field, entry.indices.len);
+        var length = entry.header_bytes;
+        for (fields, entry.indices) |*field, index| {
+            const column = row.page.columns[index];
+            const value = try Prepared.Value.prepare(a, try row.cell(scratch.allocator(), column), column.values != .json and column.values != .decimal128 and column.values != .encoded);
+            field.* = .{ .name = column.name, .value = value };
+            length = try std.math.add(usize, length, try value.length());
+        }
+        return .{ .fields = fields, .encoded_len = length };
+    }
+    pub fn write(self: *ProjectionCache, row: Row, scratch: *std.heap.ArenaAllocator, options: anytype, w: *std.json.Stringify) !void {
+        const entry = (try self.get(row.page, options)) orelse return row.write(scratch, options, w);
+        _ = scratch.reset(.retain_capacity);
+        try w.beginObject();
+        for (entry.indices) |index| {
+            const column = row.page.columns[index];
+            try w.objectField(column.name);
+            try w.write(try row.cell(scratch.allocator(), column));
         }
         try w.endObject();
     }
@@ -826,6 +941,8 @@ fn preparedProjectionScenario(a: A) !void {
     defer scratch.deinit();
     const source: Row = .{ .page = page, .index = 0 };
     const Options = @import("types.zig").LookupOptions;
+    var cache = ProjectionCache.init(a);
+    defer cache.deinit();
     for ([_]Options{ .{}, .{ .fields = &.{"*"} }, .{ .fields = &.{ "nested.*", "-nested.private", "amount" } }, .{ .fields = &.{ "escaped\nkey", "escaped\nkey", "nullable" } }, .{ .fields = &.{"-amount"} } }) |options| {
         var preparation = std.heap.ArenaAllocator.init(a);
         defer preparation.deinit();
@@ -840,7 +957,18 @@ fn preparedProjectionScenario(a: A) !void {
         var w: std.json.Stringify = .{ .writer = &output };
         try source.write(&scratch, options, &w);
         try std.testing.expectEqualStrings(output.buffered(), encoded);
+        const cached = try cache.prepare(source, preparation.allocator(), &scratch, options);
+        _ = scratch.reset(.free_all);
+        const cached_json = try std.json.Stringify.valueAlloc(a, cached, .{});
+        defer a.free(cached_json);
+        try std.testing.expectEqualStrings(encoded, cached_json);
+        try std.testing.expectEqual(encoded.len, cached.encoded_len);
+        output = .fixed(&buffer);
+        w = .{ .writer = &output };
+        try cache.write(source, &scratch, options, &w);
+        try std.testing.expectEqualStrings(encoded, output.buffered());
     }
+    try std.testing.expectEqual(@as(usize, 4), cache.builds);
 }
 
 test "external lake prepared projection has exact escaped length and survives scratch reset and OOM" {
@@ -1049,4 +1177,50 @@ test "external lake native result page keeps JSON null separate from SQL NULL un
     };
     try Run.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "external lake projection cache reuses schema across closed pages without retaining leases" {
+    const a = std.testing.allocator;
+    var cache = ProjectionCache.init(a);
+    defer cache.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const options = @import("types.zig").LookupOptions{ .fields = &.{ "amount", "*", "-unused", "amount" } };
+    for (0..256) |i| {
+        const values = [_]i64{9007199254740993 + @as(i64, @intCast(i))};
+        const refs = [_]rows.RowRef{.{ .relational_key = "row" }};
+        const columns = [_]rows.ColumnVector{
+            .{ .name = "unused", .values = .{ .json = &.{"invalid JSON must remain unread"} } },
+            .{ .name = "amount", .values = .{ .i64 = &values } },
+            .{ .name = "flag", .values = .{ .bool = &.{true} } },
+        };
+        const page = try Page.copy(a, .{ .snapshot = .{ .table_id = "test", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+        defer page.release();
+        const prepared = try cache.prepare(.{ .page = page, .index = 0 }, scratch.allocator(), &scratch, options);
+        try std.testing.expectEqual(@as(usize, 2), prepared.fields.len);
+        for (prepared.fields) |field| try std.testing.expect(field.value == .scalar);
+        try std.testing.expectEqual(@as(usize, 1), page.refs.load(.monotonic));
+        const encoded = try std.json.Stringify.valueAlloc(a, prepared, .{});
+        defer a.free(encoded);
+        try std.testing.expectEqual(encoded.len, prepared.encoded_len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.builds);
+}
+
+test "external lake prepared inline scalars preserve canonical numeric extremes without allocation" {
+    const a = std.testing.allocator;
+    for ([_]std.json.Value{
+        .{ .integer = std.math.minInt(i64) },  .{ .integer = std.math.maxInt(i64) },
+        .{ .float = -1.7976931348623157e308 }, .{ .float = 5e-324 },
+        .{ .float = -0.0 },                    .{ .bool = true },
+        .null,
+    }) |value| {
+        const prepared = try Prepared.Value.prepare(std.testing.failing_allocator, value, false);
+        try std.testing.expect(prepared == .scalar);
+        const canonical = try std.json.Stringify.valueAlloc(a, value, .{});
+        defer a.free(canonical);
+        const encoded = try std.json.Stringify.valueAlloc(a, prepared, .{});
+        defer a.free(encoded);
+        try std.testing.expectEqualStrings(canonical, encoded);
+    }
 }
