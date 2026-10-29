@@ -1141,7 +1141,7 @@ pub const Owner = struct {
             var proof_lease: ?native.PathWriterLock = lease;
             lease_held = false;
             defer if (proof_lease) |*held| held.close();
-            try self.verifyAllocatorAssumeLocked(&proof_lease);
+            try self.verifyAllocatorAssumeLocked(&proof_lease, null);
             return true;
         }
         try @import("sql_commit.zig").recover(foreground);
@@ -1507,7 +1507,7 @@ pub const Owner = struct {
     /// the gate held on every path; proof teardown releases the path lease.
     /// Runtime pins keep the reader's borrowed allocator/executor alive while
     /// the graph walk runs with both publication locks released.
-    fn verifyAllocatorAssumeLocked(self: *Owner, lease: *?native.PathWriterLock) !void {
+    fn verifyAllocatorAssumeLocked(self: *Owner, lease: *?native.PathWriterLock, connection: ?*Connection) !void {
         const io = h.handleLockIo();
         const foreground = try self.refresh();
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
@@ -1544,7 +1544,11 @@ pub const Owner = struct {
         const verified = reader.completeAllocatorVerification();
         self.gate.mutex.lockUncancelable(io);
         try verified;
-        lease.* = try native.lockWriterPathWithIo(alloc, io, self.path);
+        // A foreground operation has not started its mutation yet. Preserve
+        // its connection-local busy policy when another process wins the
+        // writer lease during the detached proof. Background turns stay
+        // nonblocking and yield to that writer instead of consuming its budget.
+        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else try native.lockWriterPathWithIo(alloc, io, self.path);
         var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (self.current) |current| {
@@ -1617,7 +1621,7 @@ pub const Owner = struct {
             self.verification_cancel.requested.store(false, .release);
             self.allocator_proof_mutex.lockUncancelable(io);
             defer self.allocator_proof_mutex.unlock(io);
-            try self.verifyAllocatorAssumeLocked(&lease);
+            try self.verifyAllocatorAssumeLocked(&lease, null);
             if (lease == null) lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         }
     }
@@ -1684,6 +1688,7 @@ pub const Connection = struct {
     next_sql_cursor_id: u64 = 1,
     table_handles: @FieldType(h.Handle, "table_handles") = .empty,
     readable_lease_hook: ?h.ReadableLeaseHook = null,
+    test_path_lease_busy: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
@@ -1705,6 +1710,7 @@ pub const Connection = struct {
                 if (err != error.WouldBlock and err != error.FileBusy) return err;
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
+                if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
                 try io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake);
                 backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
             }
@@ -1743,7 +1749,7 @@ pub const Connection = struct {
                 root = try self.owner.refresh();
             }
             while (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
-                try self.owner.verifyAllocatorAssumeLocked(lease);
+                try self.owner.verifyAllocatorAssumeLocked(lease, self);
                 if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked();
                 root = try self.owner.refresh();
             }
@@ -2357,6 +2363,89 @@ test "capi SQL native read intent avoids allocator proofs with exclusive locking
     api.antfly_buffer_free(&output);
     const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
     try std.testing.expect((try file.check()).valid);
+}
+
+test "capi native allocator proof reacquisition honors per-connection busy admission" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const Scenario = enum { foreground, immediate, background };
+    for ([_]Scenario{ .foreground, .immediate, .background }) |scenario| {
+        var tmp = try api.TestDirectory.init("proof-writer-admission");
+        defer tmp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+        defer a.free(path);
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+        defer h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        owner.verification_cancel.requested.store(false, .release);
+        // Options belong to a connection, not to the shared storage owner.
+        // The background case must remain nonblocking even with this budget.
+        connection.options.busy_timeout_ms = if (scenario == .immediate) 0 else 5000;
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        const Probe = struct {
+            path: []const u8,
+            held: ?native.PathWriterLock = null,
+            failure: ?anyerror = null,
+            retries: usize = 0,
+            fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                // Win the actual writer lease while proof runs outside it.
+                self.held = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            }
+            fn release(self: *@This()) void {
+                if (self.held) |*held| held.close();
+                self.held = null;
+            }
+            fn busy(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.retries += 1;
+                // No sleeps or scheduler races: release only after a real
+                // failed reacquisition reaches the caller's admission policy.
+                self.release();
+            }
+        };
+        var probe: Probe = .{ .path = path };
+        defer probe.release();
+        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+        connection.test_path_lease_busy = .{ .ptr = &probe, .notify = Probe.busy };
+        defer {
+            owner.test_after_allocator_capture = null;
+            connection.test_path_lease_busy = null;
+        }
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        defer {
+            if (lease) |*held| held.close();
+            connection.gate.mutex.unlock(io);
+        }
+        const result = owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection);
+        if (probe.failure) |err| return err;
+        switch (scenario) {
+            .foreground => {
+                try result;
+                try std.testing.expectEqual(@as(usize, 1), probe.retries);
+                try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            },
+            .immediate => {
+                try std.testing.expectError(error.FileBusy, result);
+                try std.testing.expectEqual(@as(usize, 0), probe.retries);
+            },
+            .background => {
+                try std.testing.expectError(error.WouldBlock, result);
+                try std.testing.expectEqual(@as(usize, 0), probe.retries);
+            },
+        }
+    }
 }
 
 test "capi native allocator proof survives close and foreground runtime replacement" {

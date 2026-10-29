@@ -82,12 +82,12 @@ class AuthPublicationTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(args, [])
 
-    def test_xz_is_installed_before_zig(self):
-        workflow = (
-            ROOT / ".github/workflows/better-auth-compatibility.yml"
-        ).read_text()
-        self.assertLess(workflow.index("xz-utils"), workflow.index("name: Install Nix"))
-        self.assertIn("name: Install glibc-linked Zig", workflow)
+    def test_publication_requires_existing_same_commit_e2e_qualification(self):
+        workflow = (ROOT / ".github/workflows/ts-npm-publish.yml").read_text()
+        auth = workflow.split("  auth-checks:\n", 1)[1].split("  publish:\n", 1)[0]
+        self.assertIn("verify_auth_e2e.py", auth)
+        self.assertIn('--commit "$(git rev-parse HEAD)"', auth)
+        self.assertNotIn("better-auth-compatibility.yml", auth)
 
 
 if __name__ == "__main__":
