@@ -243,11 +243,19 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
         }
         var begin: usize = 0;
         var through: u32 = 0;
+        var previous_source: ?analysis.Token = null;
         while (begin < tokens.len) {
             const end = @min(tokens.len, begin + block_tokens);
             raw.clearRetainingCapacity();
             var start: i64 = 0;
+            var minimum_start: u32 = std.math.maxInt(u32);
+            var minimum_gap: u32 = std.math.maxInt(u32);
             for (tokens[begin..end], next[begin..end]) |token, ordinal| {
+                if (previous_source) |prior| {
+                    minimum_start = @min(minimum_start, token.start_byte -| prior.start_byte);
+                    minimum_gap = @min(minimum_gap, token.start_byte -| prior.end_byte);
+                }
+                previous_source = token;
                 const delta = @as(i64, token.start_byte) - start;
                 try variable(a, &raw, @bitCast((delta << 1) ^ (delta >> 63)));
                 try variable(a, &raw, token.end_byte - token.start_byte);
@@ -258,6 +266,8 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
             }
             var ref = try chunk(a, sink, base, raw.items, @intCast(end - begin));
             ref.through_end = through;
+            ref.minimum_start = if (minimum_start == std.math.maxInt(u32)) 0 else minimum_start;
+            ref.minimum_gap = if (minimum_gap == std.math.maxInt(u32)) 0 else minimum_gap;
             try refs.append(a, ref);
             begin = end;
         }
@@ -429,12 +439,14 @@ fn prepareInternal(a: A, view: View, source_length: u32, root_raw: u32, count: u
         try control.check();
         ref.* = try root.ref();
         if (ref.offset < lane_end or ref.offset > root_ref.offset or ref.wire == 0 or ref.wire > root_ref.offset - ref.offset or ref.count == 0 or ref.count > block_tokens or ref.raw == 0 or ref.raw > page_bytes or ref.through_end < lane_through or ref.through_end > source_length or (i + 1 < lane_refs.len and ref.count != block_tokens)) return error.InvalidData;
+        if (ref.minimum_start > source_length or ref.minimum_gap > source_length or (std.mem.readInt(u32, h[28..32], .little) & 0x40000000 != 0 and (i != 0 or ref.count > 1) and (ref.minimum_start == 0 or ref.minimum_gap == 0))) return error.InvalidData;
         lane_end = ref.offset + ref.wire;
         lane_through = ref.through_end;
         lane_total += ref.count;
     }
     if (lane_count != 0 and (lane_total != count or std.mem.readInt(u32, h[28..32], .little) & 0x80000000 == 0)) return error.InvalidData;
     if (root.at != root.bytes.len or term_count != (std.mem.readInt(u32, h[28..32], .little) & 0x3fffffff) or term_count > count or (term_count == 0) != (count == 0)) return error.InvalidData;
+    suffixBounds(lane_refs);
     const needed = try selectedPages(work, pages, selection);
     defer if (needed) |bits| work.free(bits);
     try control.check();
@@ -587,6 +599,17 @@ pub const Plan = struct {
     /// next starts after its gap; remaining starts are minimum_start apart.
     pub fn densityUpper(self: *const Plan, width: u64, first: u32, ceiling: u32, exact_boundaries: bool) ?u32 {
         if (!self.disjoint) return null;
+        // Any selected set is a subset of the source-order spans. Its density
+        // cannot exceed this union bound, even for a broad set of singleton
+        // terms whose individual conservative bounds cannot prune anything.
+        if (self.source_blocks.len != 0) {
+            const block = seekBlock(self.source_blocks, first);
+            if (block == self.source_blocks.len) return 0;
+            const remaining = @as(u64, self.source_count) - block * block_tokens;
+            const summary = self.source_blocks[block];
+            const bound = @min(self.count, spacingBound(remaining, width, summary.minimum_start, summary.minimum_gap));
+            if (bound <= ceiling) return @intCast(bound);
+        }
         if (exact_boundaries and self.terms.len == 1 and self.terms[0].regular_length != 0) {
             const term = self.terms[0];
             const stride: i64 = term.minimum_start;
@@ -607,6 +630,9 @@ pub const Plan = struct {
         if (self.source_mask != null) return densityBound(self.density_terms, self.source_singletons, width, first, ceiling);
         return densityBound(self.terms, 0, width, first, ceiling);
     }
+    fn spacingBound(remaining: u64, width: u64, minimum_start: u32, minimum_gap: u32) u64 {
+        return @min(remaining, if (remaining <= 1 or width <= @as(u64, minimum_gap) + 1) @as(u64, 1) else 2 + (width - 2 - minimum_gap) / minimum_start);
+    }
     fn densityBound(terms: anytype, singletons: u32, width: u64, first: u32, ceiling: u32) ?u32 {
         var total: u64 = singletons;
         if (total > ceiling) return null;
@@ -615,8 +641,7 @@ pub const Plan = struct {
             if (block == term.blocks.len) continue;
             const remaining = @as(u64, term.count) - block * block_tokens;
             const summary = term.blocks[block];
-            const bound = if (remaining <= 1) @as(u64, 1) else if (width <= @as(u64, summary.minimum_gap) + 1) @as(u64, 1) else 2 + (width - 2 - summary.minimum_gap) / summary.minimum_start;
-            total += @min(remaining, bound);
+            total += spacingBound(remaining, width, summary.minimum_start, summary.minimum_gap);
             if (total > ceiling) return null;
         }
         return @intCast(total);

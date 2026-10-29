@@ -2127,7 +2127,11 @@ selected term. Sparse selections retain inverted occurrence reads; the lane is
 chosen only for at least 64 selected terms covering at least one eighth of the
 source occurrences. Broad plans retain a dictionary-ID bitset and compact
 12-byte density summaries for repeated-term blocks; singleton terms need only an
-aggregate count. They do not retain selected term strings or inverted read
+aggregate count. Source-order blocks also attest suffix spacing for the union
+of all tokens. Any selected subset is bounded by that union, so dense broad
+selections can prune even when all matching terms occur only once. The reader
+uses either safe union or per-term bounds, whichever proves sufficient.
+They do not retain selected term strings or inverted read
 references. The span-only iterator tests the bitset directly, without a binary
 search for every occurrence. Public full-token iteration and materialization
 lazily expand the selected inverted navigation when term strings are required.
