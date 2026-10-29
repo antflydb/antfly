@@ -4005,7 +4005,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const serverless_execution_tests = b.addTest(.{
         .name = "serverless-execution-tests",
         .root_module = serverless_execution_root,
-        .filters = &.{ "serverless execution", "serverless object enrichment writes a stable idempotent WAL identity", "serverless builder publishes and lifecycle-binds configured graph metrics", "serverless lake graph metrics share one bounded HITS execution for a compatible pair", "serverless request deadlines preserve accepted WAL", "fs wal", "fs WAL", "serverless server module compiles", "serverless server starts managed runtime and serves listener requests", "serverless main process memory budget" },
+        .filters = &.{ "serverless graph metric runtime fanout", "serverless graph metric edge tiles", "serverless bounded graph metric", "serverless vector builder observes cancellation", "serverless execution", "serverless object enrichment writes a stable idempotent WAL identity", "serverless builder publishes and lifecycle-binds configured graph metrics", "serverless lake graph metrics share one bounded HITS execution for a compatible pair", "serverless request deadlines preserve accepted WAL", "fs wal", "fs WAL", "serverless server module compiles", "serverless server starts managed runtime and serves listener requests", "serverless main process memory budget" },
         .max_rss = 8 * 1024 * 1024 * 1024,
     });
     b.step("antfly-serverless-execution-test", "Verify serverless shared scheduler policy, protected health and owning release")

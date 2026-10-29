@@ -110,10 +110,19 @@ pub const Token = struct {
     };
 
     pub fn beginCpuPhase(self: Token, slots: usize) !CpuPhase {
+        if (slots == 0) return error.InvalidRunnableDemand;
         try self.ownerCheckpoint();
         var phase: CpuPhase = .{ .token = self };
         if (self.execution) |execution| {
-            phase.previous_slots = if (execution.entry) |entry| entry.slots else 1;
+            // An empty capsule is the existing explicitly disabled scheduler
+            // path. Opaque admitted executions must report their funded width.
+            phase.previous_slots = if (execution.entry == null and execution.borrowed == null) 1 else try execution.retainedSlots();
+            if (execution.borrowed != null) {
+                if (slots > phase.previous_slots) return error.InvalidRunnableDemand;
+                // Foreground callers already funded the team. Keep their
+                // grant intact until this synchronous borrower returns.
+                return phase;
+            }
             if (slots != phase.previous_slots) {
                 execution.resizeTeam(slots) catch |err| {
                     try self.check();

@@ -7079,8 +7079,9 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
         .cooperative = .{ .ptr = &probe, .check_fn = Probe.check },
     });
     defer first_result.deinit(alloc);
-    try std.testing.expect(probe.saw_team.load(.acquire));
-    try std.testing.expect(probe.saw_serial_after.load(.acquire));
+    // This two-node graph never launches parallel participants.
+    try std.testing.expect(!probe.saw_team.load(.acquire));
+    try std.testing.expect(!probe.saw_serial_after.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
     execution.finish();
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);

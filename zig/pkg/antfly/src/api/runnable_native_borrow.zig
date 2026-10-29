@@ -42,6 +42,7 @@ pub const Bridge = struct {
             .ptr = self,
             .class = try currentClass(self),
             .current_class = currentClass,
+            .current_slots = currentSlots,
             .cpu_borrow = if (self.borrow.cpu_borrow != null) cpuBorrow else null,
             .park_publication = if (self.borrow.park_publication != null) parkPublication else null,
             .resume_publication = if (self.borrow.resume_publication != null) resumePublication else null,
@@ -127,6 +128,11 @@ pub const Bridge = struct {
         const self = from(raw);
         if (self.resource_rejection) |cause| return cause;
         try self.borrow.checkLifetime();
+    }
+    fn currentSlots(raw: *anyopaque) !usize {
+        // The ABI borrow is a snapshot whose owner must keep its funded team
+        // stable until all synchronous borrowers have returned.
+        return from(raw).borrow.cpu_slots;
     }
     fn currentClass(raw: *anyopaque) !native.Class {
         return classFromAbi(@backingInt(try from(raw).borrow.currentClass()));

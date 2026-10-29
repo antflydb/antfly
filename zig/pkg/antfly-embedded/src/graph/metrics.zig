@@ -203,7 +203,42 @@ pub const Topology = struct {
     }
 };
 
+/// Coordinator-only hooks. Capacity changes before launch or after join;
+/// parallel workers receive lifetime cancellation only.
+pub const ParticipantControl = struct {
+    ptr: *anyopaque,
+    begin: *const fn (*anyopaque, usize) anyerror!void,
+    end: *const fn (*anyopaque) anyerror!void,
+    abandon: *const fn (*anyopaque) void,
+    checkpoint: *const fn (*anyopaque) anyerror!void,
+};
+
+const Participants = struct {
+    control: ?ParticipantControl,
+    active: bool = true,
+
+    fn begin(options: Options, width: usize) !Participants {
+        if (options.participants) |control| try control.begin(control.ptr, width);
+        return .{ .control = options.participants };
+    }
+
+    fn finish(self: *Participants) !void {
+        if (self.control) |control| try control.end(control.ptr);
+        self.active = false;
+    }
+
+    fn deinit(self: *Participants) void {
+        if (self.active) if (self.control) |control| control.abandon(control.ptr);
+    }
+};
+
+fn ownerCheckpoint(options: Options) !void {
+    try options.cancellation.check();
+    if (options.participants) |control| try control.checkpoint(control.ptr);
+}
+
 pub const Options = struct {
+    participants: ?ParticipantControl = null,
     damping: f64 = 0.85,
     tolerance: f64 = 0.000001,
     max_iterations: u32 = 50,
@@ -375,7 +410,7 @@ pub fn degreeTopologyAlloc(alloc: Allocator, topology: Topology, options: Option
     const scores = try alloc.alloc(f64, node_count);
     errdefer alloc.free(scores);
     for (scores, 0..) |*score, i| {
-        if (i % 4096 == 0) try options.cancellation.check();
+        if (i % 4096 == 0) try ownerCheckpoint(options);
         const incoming = topology.incoming_offsets[i + 1] - topology.incoming_offsets[i];
         const outgoing = topology.outgoing_offsets[i + 1] - topology.outgoing_offsets[i];
         score.* = @floatFromInt(@as(u64, incoming) + @as(u64, outgoing));
@@ -486,6 +521,7 @@ fn fillTiledAdjacency(
     const width = @min(parallelWidth(topology, options), parts);
     const offsets = if (incoming) topology.incoming_offsets else topology.outgoing_offsets;
     const neighbors = if (incoming) topology.incoming_sources else topology.outgoing_targets;
+    try ownerCheckpoint(options);
     if (width == 1) {
         var failure: ?anyerror = null;
         Worker.run(offsets, neighbors, input, source_scale, input_scale, output, base, parts, 0, 1, &partials, options.cancellation, &failure);
@@ -493,11 +529,15 @@ fn fillTiledAdjacency(
     } else {
         const io = options.io.?;
         var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var participants = try Participants.begin(options, width);
+        defer participants.deinit();
         var group: std.Io.Group = .init;
+        defer group.cancel(io);
         for (0..width) |worker| group.async(io, Worker.run, .{
             offsets, neighbors, input, source_scale, input_scale, output, base, parts, worker, width, &partials, options.cancellation, &failures[worker],
         });
         try group.await(io);
+        try participants.finish();
         for (failures[0..width]) |failure| if (failure) |err| return err;
     }
     var delta: f64 = 0;
@@ -547,7 +587,7 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
     const source_scale = try alloc.alloc(f64, node_count);
     defer alloc.free(source_scale);
     for (source_scale, 0..) |*scale, i| {
-        if (i % 4096 == 0) try options.cancellation.check();
+        if (i % 4096 == 0) try ownerCheckpoint(options);
         const out_degree = topology.outgoing_offsets[i + 1] - topology.outgoing_offsets[i];
         scale.* = if (out_degree == 0) 0 else options.damping / @as(f64, @floatFromInt(out_degree));
     }
@@ -561,7 +601,7 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
         errdefer alloc.free(owned);
         var mass = warm_start.Mass{};
         for (supplied, 0..) |value, i| {
-            if (i % 4096 == 0) try options.cancellation.check();
+            if (i % 4096 == 0) try ownerCheckpoint(options);
             mass.add(value) catch return error.InvalidGraphMetricTeleport;
         }
         const total = mass.total() catch return error.InvalidGraphMetricTeleport;
@@ -569,7 +609,7 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
         // the damped restart term vanishes and no fixed point exists.
         if (total == 0) return error.InvalidGraphMetricTeleport;
         for (supplied, owned, 0..) |value, *out, i| {
-            if (i % 4096 == 0) try options.cancellation.check();
+            if (i % 4096 == 0) try ownerCheckpoint(options);
             out.* = value / total;
         }
         break :blk owned;
@@ -586,7 +626,7 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
     var iteration: u32 = 0;
     var delta: f64 = 0;
     while (iteration < options.max_iterations) {
-        try options.cancellation.check();
+        try ownerCheckpoint(options);
         iteration += 1;
         const sink_mass = try pageRankSinkMass(scores, source_scale, options);
         if (teleport) |restart_mass| {
@@ -644,7 +684,7 @@ pub fn personalizedPageRankTopologyAlloc(
     @memset(teleport, 0);
     var unique_seeds: usize = 0;
     for (seed_ordinals, 0..) |ordinal, i| {
-        if (i % 4096 == 0) try options.cancellation.check();
+        if (i % 4096 == 0) try ownerCheckpoint(options);
         // Key-to-ordinal resolution (and skipping of unknown keys) belongs to
         // the storage layer; an out-of-range ordinal here is caller error.
         if (@as(usize, ordinal) >= node_count) return error.InvalidGraphMetricTeleport;
@@ -703,7 +743,7 @@ pub fn eigenvectorTopologyAlloc(alloc: Allocator, topology: Topology, options: O
     var iteration: u32 = 0;
     var delta: f64 = 0;
     while (iteration < options.max_iterations) {
-        try options.cancellation.check();
+        try ownerCheckpoint(options);
         iteration += 1;
         try fillAdjacencySums(topology, scores, next, true, 1, options);
         delta = try normalizeSwapAndDelta(&scores, &next, options);
@@ -742,7 +782,7 @@ pub fn hitsTopologyAlloc(alloc: Allocator, topology: Topology, options: Options)
     var iteration: u32 = 0;
     var delta: f64 = 0;
     while (iteration < options.max_iterations) {
-        try options.cancellation.check();
+        try ownerCheckpoint(options);
         iteration += 1;
         try fillAdjacencySums(topology, hubs, next_authorities, true, 1, options);
         const authority_norm = @sqrt(try normSquared(next_authorities, options));
@@ -801,6 +841,7 @@ fn pageRankSinkMass(scores: []const f64, source_scale: []const f64, options: Opt
     const parts = logicalReductionParts(scores.len);
     var partials: [reduction_partitions]f64 = @splat(0);
     const width = @min(vectorParallelWidth(scores.len, options), parts);
+    try ownerCheckpoint(options);
     if (width == 1) {
         var failure: ?anyerror = null;
         Worker.run(scores, source_scale, parts, 0, 1, &partials, options.cancellation, &failure);
@@ -808,11 +849,15 @@ fn pageRankSinkMass(scores: []const f64, source_scale: []const f64, options: Opt
     } else {
         const io = options.io.?;
         var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var participants = try Participants.begin(options, width);
+        defer participants.deinit();
         var group: std.Io.Group = .init;
+        defer group.cancel(io);
         for (0..width) |worker| group.async(io, Worker.run, .{
             scores, source_scale, parts, worker, width, &partials, options.cancellation, &failures[worker],
         });
         try group.await(io);
+        try participants.finish();
         for (failures[0..width]) |failure| if (failure) |err| return err;
     }
     var total: f64 = 0;
@@ -850,6 +895,7 @@ fn normSquared(values: []const f64, options: Options) !f64 {
     const parts = logicalReductionParts(values.len);
     var partials: [reduction_partitions]f64 = @splat(0);
     const width = @min(vectorParallelWidth(values.len, options), parts);
+    try ownerCheckpoint(options);
     if (width == 1) {
         var failure: ?anyerror = null;
         Worker.run(values, parts, 0, 1, &partials, options.cancellation, &failure);
@@ -857,11 +903,15 @@ fn normSquared(values: []const f64, options: Options) !f64 {
     } else {
         const io = options.io.?;
         var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var participants = try Participants.begin(options, width);
+        defer participants.deinit();
         var group: std.Io.Group = .init;
+        defer group.cancel(io);
         for (0..width) |worker| group.async(io, Worker.run, .{
             values, parts, worker, width, &partials, options.cancellation, &failures[worker],
         });
         try group.await(io);
+        try participants.finish();
         for (failures[0..width]) |failure| if (failure) |err| return err;
     }
     var total: f64 = 0;
@@ -889,6 +939,7 @@ fn scaleValues(values: []f64, denominator: f64, options: Options) !void {
         }
     };
     const width = vectorParallelWidth(values.len, options);
+    try ownerCheckpoint(options);
     if (width == 1) {
         var failure: ?anyerror = null;
         Worker.run(values, denominator, 0, values.len, options.cancellation, &failure);
@@ -897,7 +948,10 @@ fn scaleValues(values: []f64, denominator: f64, options: Options) !void {
     }
     const io = options.io.?;
     var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+    var participants = try Participants.begin(options, width);
+    defer participants.deinit();
     var group: std.Io.Group = .init;
+    defer group.cancel(io);
     for (0..width) |part| group.async(io, Worker.run, .{
         values,
         denominator,
@@ -907,6 +961,7 @@ fn scaleValues(values: []f64, denominator: f64, options: Options) !void {
         &failures[part],
     });
     try group.await(io);
+    try participants.finish();
     for (failures[0..width]) |failure| if (failure) |err| return err;
 }
 
@@ -954,6 +1009,7 @@ fn normalizeSwapAndDelta(current: *[]f64, next: *[]f64, options: Options) !f64 {
     const parts = logicalReductionParts(current.*.len);
     var partials: [reduction_partitions]f64 = @splat(0);
     const width = @min(vectorParallelWidth(current.*.len, options), parts);
+    try ownerCheckpoint(options);
     if (width == 1) {
         var failure: ?anyerror = null;
         Worker.run(current.*, next.*, norm, parts, 0, 1, &partials, options.cancellation, &failure);
@@ -961,11 +1017,15 @@ fn normalizeSwapAndDelta(current: *[]f64, next: *[]f64, options: Options) !f64 {
     } else {
         const io = options.io.?;
         var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var participants = try Participants.begin(options, width);
+        defer participants.deinit();
         var group: std.Io.Group = .init;
+        defer group.cancel(io);
         for (0..width) |worker| group.async(io, Worker.run, .{
             current.*, next.*, norm, parts, worker, width, &partials, options.cancellation, &failures[worker],
         });
         try group.await(io);
+        try participants.finish();
         for (failures[0..width]) |failure| if (failure) |err| return err;
     }
     var delta: f64 = 0;
@@ -1008,6 +1068,7 @@ fn swapAndDelta(current: *[]f64, next: *[]f64, options: Options) !f64 {
     const parts = logicalReductionParts(current.*.len);
     var partials: [reduction_partitions]f64 = @splat(0);
     const width = @min(vectorParallelWidth(current.*.len, options), parts);
+    try ownerCheckpoint(options);
     if (width == 1) {
         var failure: ?anyerror = null;
         Worker.run(current.*, next.*, parts, 0, 1, &partials, options.cancellation, &failure);
@@ -1015,11 +1076,15 @@ fn swapAndDelta(current: *[]f64, next: *[]f64, options: Options) !f64 {
     } else {
         const io = options.io.?;
         var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var participants = try Participants.begin(options, width);
+        defer participants.deinit();
         var group: std.Io.Group = .init;
+        defer group.cancel(io);
         for (0..width) |worker| group.async(io, Worker.run, .{
             current.*, next.*, parts, worker, width, &partials, options.cancellation, &failures[worker],
         });
         try group.await(io);
+        try participants.finish();
         for (failures[0..width]) |failure| if (failure) |err| return err;
     }
     var delta: f64 = 0;
@@ -1080,6 +1145,7 @@ fn replaceHitsAndDelta(
     const parts = logicalReductionParts(authorities.len);
     var partials: [reduction_partitions]f64 = @splat(0);
     const width = @min(vectorParallelWidth(authorities.len, options), parts);
+    try ownerCheckpoint(options);
     if (width == 1) {
         var failure: ?anyerror = null;
         Worker.run(authorities, hubs, next_authorities, next_hubs, authority_norm, hub_norm, parts, 0, 1, &partials, options.cancellation, &failure);
@@ -1087,11 +1153,15 @@ fn replaceHitsAndDelta(
     } else {
         const io = options.io.?;
         var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var participants = try Participants.begin(options, width);
+        defer participants.deinit();
         var group: std.Io.Group = .init;
+        defer group.cancel(io);
         for (0..width) |worker| group.async(io, Worker.run, .{
             authorities, hubs, next_authorities, next_hubs, authority_norm, hub_norm, parts, worker, width, &partials, options.cancellation, &failures[worker],
         });
         try group.await(io);
+        try participants.finish();
         for (failures[0..width]) |failure| if (failure) |err| return err;
     }
     var delta: f64 = 0;

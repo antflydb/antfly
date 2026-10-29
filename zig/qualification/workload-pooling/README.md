@@ -528,3 +528,39 @@ The full maintenance milestone remains open for remaining mutation/retention
 provider boundaries, immutable artifact reads and provider/model/kernel
 participation. Remote-provider behavior and the original cross-engine/resource
 gates also remain open; the full-qualification waiver still applies.
+
+### Maintenance kernel participant integration
+
+Graph materialization now admits each joined worker group at its actual width.
+Small kernels retain serial capacity even when the configured maximum is larger;
+iterative kernels restore their prior width before reductions, iteration
+checkpoints and encoding. The coordinator alone changes scheduler ownership.
+Workers retain lifetime cancellation, and error cleanup cancels and joins their
+group before restoring capacity. Both ordinary metric materialization and the
+shared paired-HITS publication path use these hooks. Serial vector construction
+uses cooperative owner checkpoints at its existing cancellation boundaries.
+
+Foreground maintenance borrows the ingress owner's funded width through the
+existing ABI/native adapter. It does not resize that owner or create another
+root. Requests exceeding the borrowed width fail before worker publication.
+Explicitly disabled scheduling retains its existing empty-capsule behavior.
+The native-only width callback does not change the public runnable ABI.
+
+Focused evidence lives in `serverless-kernel-participants-v5-debug.json` and its
+log under the cumulative integration receipts. Native scheduler fixtures cross
+both the 128-Ki-edge and 32-Ki-node thresholds for PageRank, eigenvector and both
+HITS outputs, compare encoded results byte-for-byte against serial execution,
+and exercise lease rejection, cleanup and an ingress-borrowed team. The existing
+paired-HITS fixture preserves its shared-work budget and durable artifact
+checks while correctly retaining one lane for its small graph. A vector fixture
+queues a real query behind the sole ordinary lane, proves it progresses at a
+construction checkpoint, checks protected control admission and verifies root
+retirement. These are production-code integration fixtures; the separate normal
+listener regression tests do not constitute a large-graph endpoint load test.
+
+The maintenance milestone remains open for invocation-scoped model execution,
+model construction/discovery/asset waits, serial graph preparation checkpoints,
+remaining provider mutation/retention boundaries and immutable artifact reads.
+Cross-engine resource gates, including
+the unresolved file-engine descriptor bound, remain open. Full GNU/full
+qualification remains waived; no cloud or all-engine qualification is claimed.

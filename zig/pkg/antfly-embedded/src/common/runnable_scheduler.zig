@@ -2029,6 +2029,7 @@ pub const Execution = struct {
         ptr: *anyopaque,
         class: Class,
         current_class: ?*const fn (*anyopaque) anyerror!Class = null,
+        current_slots: ?*const fn (*anyopaque) anyerror!usize = null,
         cpu_borrow: ?*const fn (*anyopaque, ?CpuBorrowBudget) anyerror!void = null,
         park_publication: ?*const fn (*anyopaque) anyerror!bool = null,
         resume_publication: ?*const fn (*anyopaque, ?AdmissionCheck) anyerror!void = null,
@@ -2049,6 +2050,17 @@ pub const Execution = struct {
     pub fn bindBorrowed(self: *Execution, borrow: Borrow) !void {
         if (self.entry != null or self.borrowed != null or self.child_pending) return error.InvalidRunnableTransition;
         self.borrowed = borrow;
+    }
+
+    /// Funded width, including opaque ingress-owned teams. A borrower may
+    /// consume this capacity but cannot resize its owner's grant.
+    pub fn retainedSlots(self: *const Execution) !usize {
+        if (self.borrowed) |borrow| return if (borrow.current_slots) |current| current(borrow.ptr) else error.UnsupportedOperation;
+        const entry = if (self.entry) |*value| value else return error.InvalidRunnableTransition;
+        const owner = entry.scheduler orelse return error.InvalidRunnableTransition;
+        owner.lock();
+        defer owner.mutex.unlock();
+        return entry.slots;
     }
 
     pub fn retainedClass(self: *const Execution) !Class {
