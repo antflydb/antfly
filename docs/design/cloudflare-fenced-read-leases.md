@@ -96,3 +96,36 @@ receiver before source attachment. Preserve the previous failed reports and
 control modules. A short comparison remains descriptive. Full qualification
 still requires all three paired hour-long trials, cold trials, exact/receipt
 checks, queue/lag/ANN checks and complete diagnostics with zero resource failures.
+
+### Local results (2026-10-29)
+
+Implementation commit: `543a3ea27a`. The rebuilt full native module hashes to
+`b8f632e776447ea49fc210a244ecc767350ac2f6ab5f3f7b08f100bbe4705105`.
+The isolated four-tenant, 512-document-per-tenant, 1 KiB body comparison used
+128 reads and 16 writes per variant with 20 ms injected binding delay:
+
+| Measurement | Reuse off | Reuse on |
+| --- | ---: | ---: |
+| Read p50 | 37.64 ms | 27.25 ms |
+| Read p95 | 58.93 ms | 50.67 ms |
+| App R2 reads | 512 | 140 |
+| Write p95 | 317.51 ms | 323.41 ms |
+
+This is about 14% lower read p95 and 73% fewer app R2 reads. It does not establish
+a write win; the isolated write result is slightly worse. A run concurrent with
+tests showed a larger read p95 difference (100.45 to 59.29 ms), illustrating why
+that result alone should not be used as the improvement estimate. Exact bodies,
+counts, and stronger fences after writes pass in both rebuilt variants.
+
+The original native memory failures remain preserved. Rebuilt runs passed at the
+same observation/query/pool caps. Validation reports 400 Node tests, 39 actual
+workerd tests, and 162 native object-store tests passed; two live-provider tests
+were skipped. A dedicated workerd regression verifies retained fenced cuts skip
+native authority observations and explicit fresh requests resume observation.
+The six preceding evidence closures still verify all 922 artifacts unchanged.
+
+Local closure: `examples/cloudflare-serverless/dist/qualification/fenced-read-leases-1793317282250/evidence.json`
+(19 artifacts, including copied native modules, failed runs, successful reports
+and test logs). The Cloudflare comparison is a separate fresh proposal,
+`gate-mvu6mu7h7d17`, with the approved control unchanged. Its outcome must be
+recorded independently; these local measurements do not pass the hosted gate.
