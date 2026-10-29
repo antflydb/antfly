@@ -15,9 +15,13 @@
 
 import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{reconcileTailCounterSnapshots}from'./tail-counter-evidence.mjs';import{attemptIdentity}from'./invocation-accounting.mjs';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-export async function observerCall(observer,path,body={}){
+export async function observerCall(observer,path,body={}, {fetch:request=fetch}={}){
  const token=(await readFile(observer.token_file,'utf8')).trim(),origin=new URL(observer.origin);if(origin.protocol!=='https:'||!origin.hostname.startsWith(observer.id+'.')||!origin.hostname.endsWith('.workers.dev'))throw Error('ObserverOriginInvalid');
- const response=await fetch(new URL(path,origin),{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(body),signal:AbortSignal.timeout(30000)});if(!response.ok){await response.body?.cancel();throw Error('ObserverHttpStatus'+response.status);}let bytes=0,parts=[];for await(const part of response.body){bytes+=part.byteLength;if(bytes>5*1024*1024)throw Error('ObserverResponseBudgetExceeded');parts.push(part);}return JSON.parse(Buffer.concat(parts));
+ const deadline=Date.now()+30000,readOnly=path==='/health'||path.endsWith('/page');
+ for(let attempt=0;;attempt++)try{
+  const response=await request(new URL(path,origin),{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(body),signal:AbortSignal.timeout(Math.max(1,deadline-Date.now()))});if(!response.ok){await response.body?.cancel();throw Error('ObserverHttpStatus'+response.status);}let bytes=0,parts=[];for await(const part of response.body){bytes+=part.byteLength;if(bytes>5*1024*1024)throw Error('ObserverResponseBudgetExceeded');parts.push(part);}return JSON.parse(Buffer.concat(parts));
+ }catch(error){const transport=error instanceof TypeError&&error.message==='fetch failed'||['ECONNRESET','EAI_AGAIN','UND_ERR_SOCKET','UND_ERR_CONNECT_TIMEOUT'].includes(error.cause?.code);if(!readOnly||!transport||attempt>=2||Date.now()>=deadline)throw error;await new Promise(ok=>setTimeout(ok,100));}
+
 }
 export async function collectObserverSource(observer,scope){
  const start=Date.now(),objects=[],seen=new Set(),cursors=new Set();let cursor=null,pages=0,bytes=0;
@@ -29,7 +33,7 @@ export async function reconcileObserverSource(first,second,{source,captureId,ver
  if(before.length!==1||after.length!==1||before[0].timestamp>=after[0].timestamp||after[0].timestamp-before[0].timestamp>3600000)return{qualification:false,complete:false,failures:['ObserverBoundaryWitnessMissing']};
  const timeframe={from:before[0].timestamp+1,to:after[0].timestamp-1},roots=new Map(),validSha=v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v);
  for(const row of rows){if(row.script!==source)failures.push('ObserverSourceMismatch');if(row.start<timeframe.from||row.start>timeframe.to)continue;if(row.dropped||row.warning&&(row.terminal||row.warning_type!=='span_not_ended'))failures.push('ObserverTelemetryIncomplete');if(!row.terminal)continue;
-  if(![row.invocation_id_sha256,row.trace_id_sha256,row.span_id_sha256].every(validSha)||row.version_id!==version||!Number.isSafeInteger(row.start)||!Number.isSafeInteger(row.end)||row.end<row.start||row.handler==='unknown'||row.outcome!=='ok'||!Number.isFinite(row.event?.cpuTime)||!Number.isFinite(row.event?.wallTime))failures.push('ObserverTerminalInvalid');
+  if(![row.invocation_id_sha256,row.trace_id_sha256,row.span_id_sha256].every(validSha)||row.version_id!==version||!Number.isSafeInteger(row.start)||!Number.isSafeInteger(row.end)||row.end<row.start||row.handler==='unknown'||!['ok','exception','canceled','exceededCpu','exceededMemory'].includes(row.outcome)||!Number.isFinite(row.event?.cpuTime)||!Number.isFinite(row.event?.wallTime))failures.push('ObserverTerminalInvalid');
   const prior=roots.get(row.invocation_id_sha256);if(prior&&JSON.stringify(prior)!==JSON.stringify(row))failures.push('ObserverIdentityConflict');roots.set(row.invocation_id_sha256,row);
  }
  if(objects.some(o=>o.value?.rejection))failures.push('ObserverIngestionRejected');
@@ -40,5 +44,5 @@ export async function reconcileObserverSource(first,second,{source,captureId,ver
  const{reconcileTailCounter}=await import('./tail-counter-evidence.mjs');let resourceFailures=0;for(const w of windows){const p=reconcileTailCounter(objects,rows,{source,version,counterVersion,captureId,timeframe:w.timeframe,settledAt:second.snapshot_finished_at,witnesses});resourceFailures+=p.resource_failures??0;}
  if(resourceFailures||resources)failures.push('ObserverResourceFailure');
  let attempts=null;if(ledger){const byAttempt=new Map();for(const r of roots.values()){if(r.handler!=='fetch'||!validSha(r.attempt_id_sha256)||byAttempt.has(r.attempt_id_sha256))failures.push('ObserverHttpIdentityInvalid');byAttempt.set(r.attempt_id_sha256,r);}if(ledger.schema!==1||ledger.overflow||!Array.isArray(ledger.attempts))failures.push('ObserverLedgerIncomplete');else{const ids=new Set();for(const a of ledger.attempts){const id=attemptIdentity(a.id);if(!id||ids.has(id)||a.finished_at==null||!byAttempt.has(id))failures.push('ObserverPhysicalAttemptMissing');ids.add(id);if(a.status>=200&&a.status<300&&a.version_id!==version)failures.push('ObserverResponseVersionMismatch');}if(byAttempt.size!==ids.size||[...byAttempt.keys()].some(k=>!ids.has(k)))failures.push('ObserverUnexpectedHttpInvocation');attempts=ledger.attempts.length;}}
- return{schema:1,qualification:false,source,timeframe,terminals:roots.size,native_terminals:selected.length,physical_attempts:attempts,resource_failures:resourceFailures,windows,complete:failures.length===0,failures:[...new Set(failures)]};
+ return{schema:1,qualification:false,source,timeframe,terminals:roots.size,native_terminals:selected.length,physical_attempts:attempts,outcomes:Object.fromEntries(['ok','exception','canceled','exceededCpu','exceededMemory'].map(outcome=>[outcome,[...roots.values()].filter(r=>r.outcome===outcome).length])),resource_failures:resourceFailures,windows,complete:failures.length===0,failures:[...new Set(failures)]};
 }
