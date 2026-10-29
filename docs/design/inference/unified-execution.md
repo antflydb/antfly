@@ -3380,3 +3380,11 @@ pipeline lifecycle owner and separately qualifying the remaining family work.
 ownership, shared Metal FFN phases, required/optional pipeline preparation,
 constructor cleanup and proven unreachable shader retirement. It separates host
 source, device source, compiled images, startup and model performance results.
+
+### AS Metal host FFN execution family
+
+[The AS register](unified-execution-as-outcomes.md) records one specialized owner
+for four host-backed K-block FFN routes, preserving their distinct normalization
+and projection schedules, public ABIs and error precedence. Its qualification
+compares original outputs and real Metal command traces and injects allocation
+and encoder failures.
