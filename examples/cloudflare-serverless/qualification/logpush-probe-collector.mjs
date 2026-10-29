@@ -40,7 +40,7 @@ export async function sanitizeLogpushProbe(row,source){
   identity_candidates:{event_request_id_sha256:await identity(event.requestId??event.RequestId??event.RequestID),event_id_sha256:await identity(event.id??event.Id??event.ID),event_ray_id_sha256:await identity(event.rayId??event.RayId??event.RayID),request_ray_id_sha256:await identity(ray)},probes,
   event:sanitizeTailEvent({outcome:row.Outcome,cpuTime:row.CPUTimeMs,wallTime:row.WallTimeMs,scriptVersion:row.ScriptVersion,logs,exceptions,truncated:rawLogs.length>256})??{}};
 }
-async function readBody(request){
+export async function readBody(request){
  if(!request.body)fail('TelemetryBodyMissing');
  const encoding=request.headers.get('Content-Encoding');if(encoding&&encoding!=='gzip')fail('TelemetryEncodingInvalid');
  async function bounded(stream){
@@ -57,7 +57,7 @@ async function readBody(request){
 export default {async fetch(request,env){
  if(!env.API_TOKEN||request.headers.get('Authorization')!=='Bearer '+env.API_TOKEN)return new Response('unauthorized',{status:401});
  const path=new URL(request.url).pathname;
- if(!uuid(env.CAPTURE_ID)||!/^antfly-1278-telemetry-[a-z0-9]+-source$/.test(env.SOURCE_WORKER??''))return Response.json({error:'TelemetryScopeInvalid'},{status:500});
+ if(!uuid(env.CAPTURE_ID)||!/^antfly-1278-(?:telemetry-[a-z0-9]+-source|g-[a-z0-9]+-[1-3]-[bc](?:-(?:writer|reader|builder))?)$/.test(env.SOURCE_WORKER??''))return Response.json({error:'TelemetryScopeInvalid'},{status:500});
  const prefix='probe-v1/'+env.CAPTURE_ID+'/';
  if(env.RETIRE_MODE==='true'&&!['/report','/page','/drain'].includes(path))return new Response('retired',{status:410});
  let rejectionShape;
