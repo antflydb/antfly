@@ -70,14 +70,14 @@
 // _ZZ39termite_linear_triple_bias_f32_tile4_r2E9partial_a has been demoted
 // _ZZ39termite_linear_triple_bias_f32_tile4_r2E9partial_b has been demoted
 // _ZZ39termite_linear_triple_bias_f32_tile4_r2E9partial_c has been demoted
-// _ZZ20termite_rms_norm_f32E7partial has been demoted
-// _ZZ25termite_rms_norm_f32_bf16E7partial has been demoted
-// _ZZ24termite_rms_norm_add_f32E7partial has been demoted
-// _ZZ29termite_rms_norm_add_f32_bf16E7partial has been demoted
-// _ZZ35termite_rms_norm_add_mul_scalar_f32E7partial has been demoted
-// _ZZ37termite_rms_norm_add_output_scale_f32E7partial has been demoted
-// _ZZ25termite_rms_norm_bare_f32E7partial has been demoted
-// _ZZ38termite_gemma4_a4b_rms_norm_triple_f32E7partial has been demoted
+// _ZZ20termite_rms_norm_f32E5shmem has been demoted
+// _ZZ25termite_rms_norm_f32_bf16E5shmem has been demoted
+// _ZZ24termite_rms_norm_add_f32E5shmem has been demoted
+// _ZZ29termite_rms_norm_add_f32_bf16E5shmem has been demoted
+// _ZZ35termite_rms_norm_add_mul_scalar_f32E5shmem has been demoted
+// _ZZ37termite_rms_norm_add_output_scale_f32E5shmem has been demoted
+// _ZZ25termite_rms_norm_bare_f32E5shmem has been demoted
+// _ZZ38termite_gemma4_a4b_rms_norm_triple_f32E5shmem has been demoted
 // _ZZ49termite_gemma4_a4b_parallel_ffn_post_residual_f32E14shared_partial has been demoted
 // _ZZ49termite_gemma4_a4b_parallel_ffn_post_residual_f32E14routed_partial has been demoted
 // _ZZ22termite_layer_norm_f32E4sums has been demoted
@@ -29144,100 +29144,99 @@ $L__BB90_38:
 	.param .f32 termite_rms_norm_f32_param_5
 )
 {
-	.reg .pred 	%p<9>;
+	.reg .pred 	%p<11>;
 	.reg .f32 	%f<22>;
-	.reg .b32 	%r<25>;
+	.reg .b32 	%r<24>;
 	.reg .b64 	%rd<14>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ20termite_rms_norm_f32E7partial[1024];
+	.shared .align 4 .b8 _ZZ20termite_rms_norm_f32E5shmem[1024];
 
 	ld.param.u64 	%rd4, [termite_rms_norm_f32_param_0];
 	ld.param.u64 	%rd6, [termite_rms_norm_f32_param_1];
 	ld.param.u64 	%rd5, [termite_rms_norm_f32_param_2];
-	ld.param.u32 	%r15, [termite_rms_norm_f32_param_3];
-	ld.param.u32 	%r14, [termite_rms_norm_f32_param_4];
+	ld.param.u32 	%r14, [termite_rms_norm_f32_param_3];
+	ld.param.u32 	%r13, [termite_rms_norm_f32_param_4];
 	ld.param.f32 	%f5, [termite_rms_norm_f32_param_5];
 	cvta.to.global.u64 	%rd1, %rd6;
-	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r15;
-	@%p1 bra 	$L__BB91_11;
+	mov.u32 	%r23, %tid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %ctaid.x;
+	setp.ge.u32 	%p1, %r3, %r14;
+	setp.eq.s32 	%p2, %r13, 0;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB91_11;
 
-	mov.u32 	%r24, %tid.x;
-	mul.lo.s32 	%r3, %r1, %r14;
+	mul.lo.s32 	%r4, %r3, %r13;
+	setp.ge.u32 	%p4, %r23, %r13;
 	mov.f32 	%f21, 0f00000000;
-	setp.lt.u32 	%p2, %r24, %r14;
-	@%p2 bra 	$L__BB91_2;
-	bra.uni 	$L__BB91_4;
+	@%p4 bra 	$L__BB91_4;
 
-$L__BB91_2:
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r22, %r24;
+	mov.f32 	%f21, 0f00000000;
+	mov.u32 	%r21, %r23;
 
 $L__BB91_3:
-	add.s32 	%r16, %r22, %r3;
-	mul.wide.u32 	%rd7, %r16, 4;
+	add.s32 	%r15, %r21, %r4;
+	mul.wide.u32 	%rd7, %r15, 4;
 	add.s64 	%rd8, %rd1, %rd7;
 	ld.global.f32 	%f8, [%rd8];
 	fma.rn.f32 	%f21, %f8, %f8, %f21;
-	add.s32 	%r22, %r22, %r4;
-	setp.lt.u32 	%p3, %r22, %r14;
-	@%p3 bra 	$L__BB91_3;
+	add.s32 	%r21, %r21, %r2;
+	setp.lt.u32 	%p5, %r21, %r13;
+	@%p5 bra 	$L__BB91_3;
 
 $L__BB91_4:
-	shl.b32 	%r17, %r24, 2;
-	mov.u32 	%r18, _ZZ20termite_rms_norm_f32E7partial;
-	add.s32 	%r7, %r18, %r17;
+	shl.b32 	%r16, %r23, 2;
+	mov.u32 	%r17, _ZZ20termite_rms_norm_f32E5shmem;
+	add.s32 	%r7, %r17, %r16;
 	st.shared.f32 	[%r7], %f21;
 	bar.sync 	0;
-	mov.u32 	%r8, %ntid.x;
-	shr.u32 	%r23, %r8, 1;
-	setp.eq.s32 	%p4, %r23, 0;
-	@%p4 bra 	$L__BB91_8;
+	shr.u32 	%r22, %r2, 1;
+	setp.eq.s32 	%p6, %r22, 0;
+	@%p6 bra 	$L__BB91_8;
 
 $L__BB91_5:
-	setp.ge.u32 	%p5, %r24, %r23;
-	@%p5 bra 	$L__BB91_7;
+	setp.ge.u32 	%p7, %r23, %r22;
+	@%p7 bra 	$L__BB91_7;
 
-	shl.b32 	%r19, %r23, 2;
-	add.s32 	%r20, %r7, %r19;
+	shl.b32 	%r18, %r22, 2;
+	add.s32 	%r19, %r7, %r18;
 	ld.shared.f32 	%f9, [%r7];
-	ld.shared.f32 	%f10, [%r20];
+	ld.shared.f32 	%f10, [%r19];
 	add.f32 	%f11, %f10, %f9;
 	st.shared.f32 	[%r7], %f11;
 
 $L__BB91_7:
 	bar.sync 	0;
-	shr.u32 	%r23, %r23, 1;
-	setp.ne.s32 	%p6, %r23, 0;
-	@%p6 bra 	$L__BB91_5;
+	shr.u32 	%r22, %r22, 1;
+	setp.ne.s32 	%p8, %r22, 0;
+	@%p8 bra 	$L__BB91_5;
 
 $L__BB91_8:
-	setp.ge.u32 	%p7, %r24, %r14;
-	@%p7 bra 	$L__BB91_11;
+	@%p4 bra 	$L__BB91_11;
 
-	ld.shared.f32 	%f12, [_ZZ20termite_rms_norm_f32E7partial];
+	ld.shared.f32 	%f12, [_ZZ20termite_rms_norm_f32E5shmem];
 	cvta.to.global.u64 	%rd2, %rd4;
 	cvta.to.global.u64 	%rd3, %rd5;
-	cvt.rn.f32.u32 	%f13, %r14;
+	cvt.rn.f32.u32 	%f13, %r13;
 	div.rn.f32 	%f14, %f12, %f13;
 	add.f32 	%f15, %f14, %f5;
 	rsqrt.approx.f32 	%f4, %f15;
 
 $L__BB91_10:
-	add.s32 	%r21, %r24, %r3;
-	mul.wide.u32 	%rd9, %r21, 4;
+	add.s32 	%r20, %r23, %r4;
+	mul.wide.u32 	%rd9, %r20, 4;
 	add.s64 	%rd10, %rd1, %rd9;
 	ld.global.f32 	%f16, [%rd10];
 	mul.f32 	%f17, %f4, %f16;
-	mul.wide.u32 	%rd11, %r24, 4;
+	mul.wide.u32 	%rd11, %r23, 4;
 	add.s64 	%rd12, %rd3, %rd11;
 	ld.global.f32 	%f18, [%rd12];
 	mul.f32 	%f19, %f17, %f18;
 	add.s64 	%rd13, %rd2, %rd9;
 	st.global.f32 	[%rd13], %f19;
-	add.s32 	%r24, %r24, %r8;
-	setp.lt.u32 	%p8, %r24, %r14;
-	@%p8 bra 	$L__BB91_10;
+	add.s32 	%r23, %r23, %r2;
+	setp.lt.u32 	%p10, %r23, %r13;
+	@%p10 bra 	$L__BB91_10;
 
 $L__BB91_11:
 	ret;
@@ -29254,111 +29253,110 @@ $L__BB91_11:
 	.param .f32 termite_rms_norm_f32_bf16_param_6
 )
 {
-	.reg .pred 	%p<9>;
+	.reg .pred 	%p<11>;
 	.reg .f32 	%f<22>;
-	.reg .b32 	%r<31>;
+	.reg .b32 	%r<30>;
 	.reg .b64 	%rd<18>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ25termite_rms_norm_f32_bf16E7partial[1024];
+	.shared .align 4 .b8 _ZZ25termite_rms_norm_f32_bf16E5shmem[1024];
 
 	ld.param.u64 	%rd5, [termite_rms_norm_f32_bf16_param_0];
 	ld.param.u64 	%rd6, [termite_rms_norm_f32_bf16_param_1];
 	ld.param.u64 	%rd8, [termite_rms_norm_f32_bf16_param_2];
 	ld.param.u64 	%rd7, [termite_rms_norm_f32_bf16_param_3];
-	ld.param.u32 	%r15, [termite_rms_norm_f32_bf16_param_4];
-	ld.param.u32 	%r14, [termite_rms_norm_f32_bf16_param_5];
+	ld.param.u32 	%r14, [termite_rms_norm_f32_bf16_param_4];
+	ld.param.u32 	%r13, [termite_rms_norm_f32_bf16_param_5];
 	ld.param.f32 	%f5, [termite_rms_norm_f32_bf16_param_6];
 	cvta.to.global.u64 	%rd1, %rd8;
-	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r15;
-	@%p1 bra 	$L__BB92_11;
+	mov.u32 	%r29, %tid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %ctaid.x;
+	setp.ge.u32 	%p1, %r3, %r14;
+	setp.eq.s32 	%p2, %r13, 0;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB92_11;
 
-	mov.u32 	%r30, %tid.x;
-	mul.lo.s32 	%r3, %r1, %r14;
+	mul.lo.s32 	%r4, %r3, %r13;
+	setp.ge.u32 	%p4, %r29, %r13;
 	mov.f32 	%f21, 0f00000000;
-	setp.lt.u32 	%p2, %r30, %r14;
-	@%p2 bra 	$L__BB92_2;
-	bra.uni 	$L__BB92_4;
+	@%p4 bra 	$L__BB92_4;
 
-$L__BB92_2:
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r28, %r30;
+	mov.f32 	%f21, 0f00000000;
+	mov.u32 	%r27, %r29;
 
 $L__BB92_3:
-	add.s32 	%r16, %r28, %r3;
-	mul.wide.u32 	%rd9, %r16, 4;
+	add.s32 	%r15, %r27, %r4;
+	mul.wide.u32 	%rd9, %r15, 4;
 	add.s64 	%rd10, %rd1, %rd9;
 	ld.global.f32 	%f8, [%rd10];
 	fma.rn.f32 	%f21, %f8, %f8, %f21;
-	add.s32 	%r28, %r28, %r4;
-	setp.lt.u32 	%p3, %r28, %r14;
-	@%p3 bra 	$L__BB92_3;
+	add.s32 	%r27, %r27, %r2;
+	setp.lt.u32 	%p5, %r27, %r13;
+	@%p5 bra 	$L__BB92_3;
 
 $L__BB92_4:
-	shl.b32 	%r17, %r30, 2;
-	mov.u32 	%r18, _ZZ25termite_rms_norm_f32_bf16E7partial;
-	add.s32 	%r7, %r18, %r17;
+	shl.b32 	%r16, %r29, 2;
+	mov.u32 	%r17, _ZZ25termite_rms_norm_f32_bf16E5shmem;
+	add.s32 	%r7, %r17, %r16;
 	st.shared.f32 	[%r7], %f21;
 	bar.sync 	0;
-	mov.u32 	%r8, %ntid.x;
-	shr.u32 	%r29, %r8, 1;
-	setp.eq.s32 	%p4, %r29, 0;
-	@%p4 bra 	$L__BB92_8;
+	shr.u32 	%r28, %r2, 1;
+	setp.eq.s32 	%p6, %r28, 0;
+	@%p6 bra 	$L__BB92_8;
 
 $L__BB92_5:
-	setp.ge.u32 	%p5, %r30, %r29;
-	@%p5 bra 	$L__BB92_7;
+	setp.ge.u32 	%p7, %r29, %r28;
+	@%p7 bra 	$L__BB92_7;
 
-	shl.b32 	%r19, %r29, 2;
-	add.s32 	%r20, %r7, %r19;
+	shl.b32 	%r18, %r28, 2;
+	add.s32 	%r19, %r7, %r18;
 	ld.shared.f32 	%f9, [%r7];
-	ld.shared.f32 	%f10, [%r20];
+	ld.shared.f32 	%f10, [%r19];
 	add.f32 	%f11, %f10, %f9;
 	st.shared.f32 	[%r7], %f11;
 
 $L__BB92_7:
 	bar.sync 	0;
-	shr.u32 	%r29, %r29, 1;
-	setp.ne.s32 	%p6, %r29, 0;
-	@%p6 bra 	$L__BB92_5;
+	shr.u32 	%r28, %r28, 1;
+	setp.ne.s32 	%p8, %r28, 0;
+	@%p8 bra 	$L__BB92_5;
 
 $L__BB92_8:
-	setp.ge.u32 	%p7, %r30, %r14;
-	@%p7 bra 	$L__BB92_11;
+	@%p4 bra 	$L__BB92_11;
 
-	ld.shared.f32 	%f12, [_ZZ25termite_rms_norm_f32_bf16E7partial];
+	ld.shared.f32 	%f12, [_ZZ25termite_rms_norm_f32_bf16E5shmem];
 	cvta.to.global.u64 	%rd2, %rd6;
 	cvta.to.global.u64 	%rd3, %rd5;
 	cvta.to.global.u64 	%rd4, %rd7;
-	cvt.rn.f32.u32 	%f13, %r14;
+	cvt.rn.f32.u32 	%f13, %r13;
 	div.rn.f32 	%f14, %f12, %f13;
 	add.f32 	%f15, %f14, %f5;
 	rsqrt.approx.f32 	%f4, %f15;
 
 $L__BB92_10:
-	add.s32 	%r21, %r30, %r3;
-	mul.wide.u32 	%rd11, %r21, 4;
+	add.s32 	%r20, %r29, %r4;
+	mul.wide.u32 	%rd11, %r20, 4;
 	add.s64 	%rd12, %rd1, %rd11;
 	ld.global.f32 	%f16, [%rd12];
 	mul.f32 	%f17, %f4, %f16;
-	mul.wide.u32 	%rd13, %r30, 4;
+	mul.wide.u32 	%rd13, %r29, 4;
 	add.s64 	%rd14, %rd4, %rd13;
 	ld.global.f32 	%f18, [%rd14];
 	mul.f32 	%f19, %f17, %f18;
 	add.s64 	%rd15, %rd3, %rd11;
 	st.global.f32 	[%rd15], %f19;
-	mov.b32 	%r22, %f19;
-	shr.u32 	%r23, %r22, 16;
-	and.b32  	%r24, %r23, 1;
-	add.s32 	%r25, %r22, %r24;
-	add.s32 	%r26, %r25, 32767;
-	shr.u32 	%r27, %r26, 16;
-	mul.wide.u32 	%rd16, %r21, 2;
+	mov.b32 	%r21, %f19;
+	shr.u32 	%r22, %r21, 16;
+	and.b32  	%r23, %r22, 1;
+	add.s32 	%r24, %r21, %r23;
+	add.s32 	%r25, %r24, 32767;
+	shr.u32 	%r26, %r25, 16;
+	mul.wide.u32 	%rd16, %r20, 2;
 	add.s64 	%rd17, %rd2, %rd16;
-	st.global.u16 	[%rd17], %r27;
-	add.s32 	%r30, %r30, %r8;
-	setp.lt.u32 	%p8, %r30, %r14;
-	@%p8 bra 	$L__BB92_10;
+	st.global.u16 	[%rd17], %r26;
+	add.s32 	%r29, %r29, %r2;
+	setp.lt.u32 	%p10, %r29, %r13;
+	@%p10 bra 	$L__BB92_10;
 
 $L__BB92_11:
 	ret;
@@ -29375,94 +29373,93 @@ $L__BB92_11:
 	.param .f32 termite_rms_norm_add_f32_param_6
 )
 {
-	.reg .pred 	%p<9>;
+	.reg .pred 	%p<11>;
 	.reg .f32 	%f<23>;
-	.reg .b32 	%r<25>;
+	.reg .b32 	%r<24>;
 	.reg .b64 	%rd<17>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ24termite_rms_norm_add_f32E7partial[1024];
+	.shared .align 4 .b8 _ZZ24termite_rms_norm_add_f32E5shmem[1024];
 
 	ld.param.u64 	%rd5, [termite_rms_norm_add_f32_param_0];
 	ld.param.u64 	%rd8, [termite_rms_norm_add_f32_param_1];
 	ld.param.u64 	%rd6, [termite_rms_norm_add_f32_param_2];
 	ld.param.u64 	%rd7, [termite_rms_norm_add_f32_param_3];
-	ld.param.u32 	%r15, [termite_rms_norm_add_f32_param_4];
-	ld.param.u32 	%r14, [termite_rms_norm_add_f32_param_5];
+	ld.param.u32 	%r14, [termite_rms_norm_add_f32_param_4];
+	ld.param.u32 	%r13, [termite_rms_norm_add_f32_param_5];
 	ld.param.f32 	%f5, [termite_rms_norm_add_f32_param_6];
 	cvta.to.global.u64 	%rd1, %rd8;
-	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r15;
-	@%p1 bra 	$L__BB93_11;
+	mov.u32 	%r23, %tid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %ctaid.x;
+	setp.ge.u32 	%p1, %r3, %r14;
+	setp.eq.s32 	%p2, %r13, 0;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB93_11;
 
-	mov.u32 	%r24, %tid.x;
-	mul.lo.s32 	%r3, %r1, %r14;
+	mul.lo.s32 	%r4, %r3, %r13;
+	setp.ge.u32 	%p4, %r23, %r13;
 	mov.f32 	%f22, 0f00000000;
-	setp.lt.u32 	%p2, %r24, %r14;
-	@%p2 bra 	$L__BB93_2;
-	bra.uni 	$L__BB93_4;
+	@%p4 bra 	$L__BB93_4;
 
-$L__BB93_2:
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r22, %r24;
+	mov.f32 	%f22, 0f00000000;
+	mov.u32 	%r21, %r23;
 
 $L__BB93_3:
-	add.s32 	%r16, %r22, %r3;
-	mul.wide.u32 	%rd9, %r16, 4;
+	add.s32 	%r15, %r21, %r4;
+	mul.wide.u32 	%rd9, %r15, 4;
 	add.s64 	%rd10, %rd1, %rd9;
 	ld.global.f32 	%f8, [%rd10];
 	fma.rn.f32 	%f22, %f8, %f8, %f22;
-	add.s32 	%r22, %r22, %r4;
-	setp.lt.u32 	%p3, %r22, %r14;
-	@%p3 bra 	$L__BB93_3;
+	add.s32 	%r21, %r21, %r2;
+	setp.lt.u32 	%p5, %r21, %r13;
+	@%p5 bra 	$L__BB93_3;
 
 $L__BB93_4:
-	shl.b32 	%r17, %r24, 2;
-	mov.u32 	%r18, _ZZ24termite_rms_norm_add_f32E7partial;
-	add.s32 	%r7, %r18, %r17;
+	shl.b32 	%r16, %r23, 2;
+	mov.u32 	%r17, _ZZ24termite_rms_norm_add_f32E5shmem;
+	add.s32 	%r7, %r17, %r16;
 	st.shared.f32 	[%r7], %f22;
 	bar.sync 	0;
-	mov.u32 	%r8, %ntid.x;
-	shr.u32 	%r23, %r8, 1;
-	setp.eq.s32 	%p4, %r23, 0;
-	@%p4 bra 	$L__BB93_8;
+	shr.u32 	%r22, %r2, 1;
+	setp.eq.s32 	%p6, %r22, 0;
+	@%p6 bra 	$L__BB93_8;
 
 $L__BB93_5:
-	setp.ge.u32 	%p5, %r24, %r23;
-	@%p5 bra 	$L__BB93_7;
+	setp.ge.u32 	%p7, %r23, %r22;
+	@%p7 bra 	$L__BB93_7;
 
-	shl.b32 	%r19, %r23, 2;
-	add.s32 	%r20, %r7, %r19;
+	shl.b32 	%r18, %r22, 2;
+	add.s32 	%r19, %r7, %r18;
 	ld.shared.f32 	%f9, [%r7];
-	ld.shared.f32 	%f10, [%r20];
+	ld.shared.f32 	%f10, [%r19];
 	add.f32 	%f11, %f10, %f9;
 	st.shared.f32 	[%r7], %f11;
 
 $L__BB93_7:
 	bar.sync 	0;
-	shr.u32 	%r23, %r23, 1;
-	setp.ne.s32 	%p6, %r23, 0;
-	@%p6 bra 	$L__BB93_5;
+	shr.u32 	%r22, %r22, 1;
+	setp.ne.s32 	%p8, %r22, 0;
+	@%p8 bra 	$L__BB93_5;
 
 $L__BB93_8:
-	setp.ge.u32 	%p7, %r24, %r14;
-	@%p7 bra 	$L__BB93_11;
+	@%p4 bra 	$L__BB93_11;
 
-	ld.shared.f32 	%f12, [_ZZ24termite_rms_norm_add_f32E7partial];
+	ld.shared.f32 	%f12, [_ZZ24termite_rms_norm_add_f32E5shmem];
 	cvta.to.global.u64 	%rd2, %rd5;
 	cvta.to.global.u64 	%rd3, %rd7;
 	cvta.to.global.u64 	%rd4, %rd6;
-	cvt.rn.f32.u32 	%f13, %r14;
+	cvt.rn.f32.u32 	%f13, %r13;
 	div.rn.f32 	%f14, %f12, %f13;
 	add.f32 	%f15, %f14, %f5;
 	rsqrt.approx.f32 	%f4, %f15;
 
 $L__BB93_10:
-	add.s32 	%r21, %r24, %r3;
-	mul.wide.u32 	%rd11, %r21, 4;
+	add.s32 	%r20, %r23, %r4;
+	mul.wide.u32 	%rd11, %r20, 4;
 	add.s64 	%rd12, %rd1, %rd11;
 	ld.global.f32 	%f16, [%rd12];
 	mul.f32 	%f17, %f4, %f16;
-	mul.wide.u32 	%rd13, %r24, 4;
+	mul.wide.u32 	%rd13, %r23, 4;
 	add.s64 	%rd14, %rd4, %rd13;
 	ld.global.f32 	%f18, [%rd14];
 	add.s64 	%rd15, %rd3, %rd11;
@@ -29470,9 +29467,9 @@ $L__BB93_10:
 	fma.rn.f32 	%f20, %f17, %f18, %f19;
 	add.s64 	%rd16, %rd2, %rd11;
 	st.global.f32 	[%rd16], %f20;
-	add.s32 	%r24, %r24, %r8;
-	setp.lt.u32 	%p8, %r24, %r14;
-	@%p8 bra 	$L__BB93_10;
+	add.s32 	%r23, %r23, %r2;
+	setp.lt.u32 	%p10, %r23, %r13;
+	@%p10 bra 	$L__BB93_10;
 
 $L__BB93_11:
 	ret;
@@ -29490,96 +29487,95 @@ $L__BB93_11:
 	.param .f32 termite_rms_norm_add_f32_bf16_param_7
 )
 {
-	.reg .pred 	%p<9>;
+	.reg .pred 	%p<11>;
 	.reg .f32 	%f<23>;
-	.reg .b32 	%r<31>;
+	.reg .b32 	%r<30>;
 	.reg .b64 	%rd<21>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ29termite_rms_norm_add_f32_bf16E7partial[1024];
+	.shared .align 4 .b8 _ZZ29termite_rms_norm_add_f32_bf16E5shmem[1024];
 
 	ld.param.u64 	%rd6, [termite_rms_norm_add_f32_bf16_param_0];
 	ld.param.u64 	%rd7, [termite_rms_norm_add_f32_bf16_param_1];
 	ld.param.u64 	%rd10, [termite_rms_norm_add_f32_bf16_param_2];
 	ld.param.u64 	%rd8, [termite_rms_norm_add_f32_bf16_param_3];
 	ld.param.u64 	%rd9, [termite_rms_norm_add_f32_bf16_param_4];
-	ld.param.u32 	%r15, [termite_rms_norm_add_f32_bf16_param_5];
-	ld.param.u32 	%r14, [termite_rms_norm_add_f32_bf16_param_6];
+	ld.param.u32 	%r14, [termite_rms_norm_add_f32_bf16_param_5];
+	ld.param.u32 	%r13, [termite_rms_norm_add_f32_bf16_param_6];
 	ld.param.f32 	%f5, [termite_rms_norm_add_f32_bf16_param_7];
 	cvta.to.global.u64 	%rd1, %rd10;
-	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r15;
-	@%p1 bra 	$L__BB94_11;
+	mov.u32 	%r29, %tid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %ctaid.x;
+	setp.ge.u32 	%p1, %r3, %r14;
+	setp.eq.s32 	%p2, %r13, 0;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB94_11;
 
-	mov.u32 	%r30, %tid.x;
-	mul.lo.s32 	%r3, %r1, %r14;
+	mul.lo.s32 	%r4, %r3, %r13;
+	setp.ge.u32 	%p4, %r29, %r13;
 	mov.f32 	%f22, 0f00000000;
-	setp.lt.u32 	%p2, %r30, %r14;
-	@%p2 bra 	$L__BB94_2;
-	bra.uni 	$L__BB94_4;
+	@%p4 bra 	$L__BB94_4;
 
-$L__BB94_2:
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r28, %r30;
+	mov.f32 	%f22, 0f00000000;
+	mov.u32 	%r27, %r29;
 
 $L__BB94_3:
-	add.s32 	%r16, %r28, %r3;
-	mul.wide.u32 	%rd11, %r16, 4;
+	add.s32 	%r15, %r27, %r4;
+	mul.wide.u32 	%rd11, %r15, 4;
 	add.s64 	%rd12, %rd1, %rd11;
 	ld.global.f32 	%f8, [%rd12];
 	fma.rn.f32 	%f22, %f8, %f8, %f22;
-	add.s32 	%r28, %r28, %r4;
-	setp.lt.u32 	%p3, %r28, %r14;
-	@%p3 bra 	$L__BB94_3;
+	add.s32 	%r27, %r27, %r2;
+	setp.lt.u32 	%p5, %r27, %r13;
+	@%p5 bra 	$L__BB94_3;
 
 $L__BB94_4:
-	shl.b32 	%r17, %r30, 2;
-	mov.u32 	%r18, _ZZ29termite_rms_norm_add_f32_bf16E7partial;
-	add.s32 	%r7, %r18, %r17;
+	shl.b32 	%r16, %r29, 2;
+	mov.u32 	%r17, _ZZ29termite_rms_norm_add_f32_bf16E5shmem;
+	add.s32 	%r7, %r17, %r16;
 	st.shared.f32 	[%r7], %f22;
 	bar.sync 	0;
-	mov.u32 	%r8, %ntid.x;
-	shr.u32 	%r29, %r8, 1;
-	setp.eq.s32 	%p4, %r29, 0;
-	@%p4 bra 	$L__BB94_8;
+	shr.u32 	%r28, %r2, 1;
+	setp.eq.s32 	%p6, %r28, 0;
+	@%p6 bra 	$L__BB94_8;
 
 $L__BB94_5:
-	setp.ge.u32 	%p5, %r30, %r29;
-	@%p5 bra 	$L__BB94_7;
+	setp.ge.u32 	%p7, %r29, %r28;
+	@%p7 bra 	$L__BB94_7;
 
-	shl.b32 	%r19, %r29, 2;
-	add.s32 	%r20, %r7, %r19;
+	shl.b32 	%r18, %r28, 2;
+	add.s32 	%r19, %r7, %r18;
 	ld.shared.f32 	%f9, [%r7];
-	ld.shared.f32 	%f10, [%r20];
+	ld.shared.f32 	%f10, [%r19];
 	add.f32 	%f11, %f10, %f9;
 	st.shared.f32 	[%r7], %f11;
 
 $L__BB94_7:
 	bar.sync 	0;
-	shr.u32 	%r29, %r29, 1;
-	setp.ne.s32 	%p6, %r29, 0;
-	@%p6 bra 	$L__BB94_5;
+	shr.u32 	%r28, %r28, 1;
+	setp.ne.s32 	%p8, %r28, 0;
+	@%p8 bra 	$L__BB94_5;
 
 $L__BB94_8:
-	setp.ge.u32 	%p7, %r30, %r14;
-	@%p7 bra 	$L__BB94_11;
+	@%p4 bra 	$L__BB94_11;
 
-	ld.shared.f32 	%f12, [_ZZ29termite_rms_norm_add_f32_bf16E7partial];
+	ld.shared.f32 	%f12, [_ZZ29termite_rms_norm_add_f32_bf16E5shmem];
 	cvta.to.global.u64 	%rd2, %rd7;
 	cvta.to.global.u64 	%rd3, %rd6;
 	cvta.to.global.u64 	%rd4, %rd9;
 	cvta.to.global.u64 	%rd5, %rd8;
-	cvt.rn.f32.u32 	%f13, %r14;
+	cvt.rn.f32.u32 	%f13, %r13;
 	div.rn.f32 	%f14, %f12, %f13;
 	add.f32 	%f15, %f14, %f5;
 	rsqrt.approx.f32 	%f4, %f15;
 
 $L__BB94_10:
-	add.s32 	%r21, %r30, %r3;
-	mul.wide.u32 	%rd13, %r21, 4;
+	add.s32 	%r20, %r29, %r4;
+	mul.wide.u32 	%rd13, %r20, 4;
 	add.s64 	%rd14, %rd1, %rd13;
 	ld.global.f32 	%f16, [%rd14];
 	mul.f32 	%f17, %f4, %f16;
-	mul.wide.u32 	%rd15, %r30, 4;
+	mul.wide.u32 	%rd15, %r29, 4;
 	add.s64 	%rd16, %rd5, %rd15;
 	ld.global.f32 	%f18, [%rd16];
 	add.s64 	%rd17, %rd4, %rd13;
@@ -29587,18 +29583,18 @@ $L__BB94_10:
 	fma.rn.f32 	%f20, %f17, %f18, %f19;
 	add.s64 	%rd18, %rd3, %rd13;
 	st.global.f32 	[%rd18], %f20;
-	mov.b32 	%r22, %f20;
-	shr.u32 	%r23, %r22, 16;
-	and.b32  	%r24, %r23, 1;
-	add.s32 	%r25, %r22, %r24;
-	add.s32 	%r26, %r25, 32767;
-	shr.u32 	%r27, %r26, 16;
-	mul.wide.u32 	%rd19, %r21, 2;
+	mov.b32 	%r21, %f20;
+	shr.u32 	%r22, %r21, 16;
+	and.b32  	%r23, %r22, 1;
+	add.s32 	%r24, %r21, %r23;
+	add.s32 	%r25, %r24, 32767;
+	shr.u32 	%r26, %r25, 16;
+	mul.wide.u32 	%rd19, %r20, 2;
 	add.s64 	%rd20, %rd2, %rd19;
-	st.global.u16 	[%rd20], %r27;
-	add.s32 	%r30, %r30, %r8;
-	setp.lt.u32 	%p8, %r30, %r14;
-	@%p8 bra 	$L__BB94_10;
+	st.global.u16 	[%rd20], %r26;
+	add.s32 	%r29, %r29, %r2;
+	setp.lt.u32 	%p10, %r29, %r13;
+	@%p10 bra 	$L__BB94_10;
 
 $L__BB94_11:
 	ret;
@@ -29616,108 +29612,107 @@ $L__BB94_11:
 	.param .f32 termite_rms_norm_add_mul_scalar_f32_param_7
 )
 {
-	.reg .pred 	%p<9>;
+	.reg .pred 	%p<11>;
 	.reg .f32 	%f<25>;
-	.reg .b32 	%r<25>;
+	.reg .b32 	%r<24>;
 	.reg .b64 	%rd<19>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ35termite_rms_norm_add_mul_scalar_f32E7partial[1024];
+	.shared .align 4 .b8 _ZZ35termite_rms_norm_add_mul_scalar_f32E5shmem[1024];
 
-	ld.param.u64 	%rd5, [termite_rms_norm_add_mul_scalar_f32_param_0];
-	ld.param.u64 	%rd9, [termite_rms_norm_add_mul_scalar_f32_param_1];
-	ld.param.u64 	%rd6, [termite_rms_norm_add_mul_scalar_f32_param_2];
-	ld.param.u64 	%rd7, [termite_rms_norm_add_mul_scalar_f32_param_3];
-	ld.param.u64 	%rd8, [termite_rms_norm_add_mul_scalar_f32_param_4];
-	ld.param.u32 	%r15, [termite_rms_norm_add_mul_scalar_f32_param_5];
-	ld.param.u32 	%r14, [termite_rms_norm_add_mul_scalar_f32_param_6];
-	ld.param.f32 	%f6, [termite_rms_norm_add_mul_scalar_f32_param_7];
-	cvta.to.global.u64 	%rd1, %rd9;
-	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r15;
-	@%p1 bra 	$L__BB95_11;
+	ld.param.u64 	%rd6, [termite_rms_norm_add_mul_scalar_f32_param_0];
+	ld.param.u64 	%rd10, [termite_rms_norm_add_mul_scalar_f32_param_1];
+	ld.param.u64 	%rd7, [termite_rms_norm_add_mul_scalar_f32_param_2];
+	ld.param.u64 	%rd8, [termite_rms_norm_add_mul_scalar_f32_param_3];
+	ld.param.u64 	%rd9, [termite_rms_norm_add_mul_scalar_f32_param_4];
+	ld.param.u32 	%r14, [termite_rms_norm_add_mul_scalar_f32_param_5];
+	ld.param.u32 	%r13, [termite_rms_norm_add_mul_scalar_f32_param_6];
+	ld.param.f32 	%f5, [termite_rms_norm_add_mul_scalar_f32_param_7];
+	cvta.to.global.u64 	%rd1, %rd10;
+	mov.u32 	%r23, %tid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %ctaid.x;
+	setp.ge.u32 	%p1, %r3, %r14;
+	setp.eq.s32 	%p2, %r13, 0;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB95_11;
 
-	mov.u32 	%r24, %tid.x;
-	mul.lo.s32 	%r3, %r1, %r14;
+	mul.lo.s32 	%r4, %r3, %r13;
+	setp.ge.u32 	%p4, %r23, %r13;
 	mov.f32 	%f24, 0f00000000;
-	setp.lt.u32 	%p2, %r24, %r14;
-	@%p2 bra 	$L__BB95_2;
-	bra.uni 	$L__BB95_4;
+	@%p4 bra 	$L__BB95_4;
 
-$L__BB95_2:
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r22, %r24;
+	mov.f32 	%f24, 0f00000000;
+	mov.u32 	%r21, %r23;
 
 $L__BB95_3:
-	add.s32 	%r16, %r22, %r3;
-	mul.wide.u32 	%rd10, %r16, 4;
-	add.s64 	%rd11, %rd1, %rd10;
-	ld.global.f32 	%f9, [%rd11];
-	fma.rn.f32 	%f24, %f9, %f9, %f24;
-	add.s32 	%r22, %r22, %r4;
-	setp.lt.u32 	%p3, %r22, %r14;
-	@%p3 bra 	$L__BB95_3;
+	add.s32 	%r15, %r21, %r4;
+	mul.wide.u32 	%rd11, %r15, 4;
+	add.s64 	%rd12, %rd1, %rd11;
+	ld.global.f32 	%f8, [%rd12];
+	fma.rn.f32 	%f24, %f8, %f8, %f24;
+	add.s32 	%r21, %r21, %r2;
+	setp.lt.u32 	%p5, %r21, %r13;
+	@%p5 bra 	$L__BB95_3;
 
 $L__BB95_4:
-	shl.b32 	%r17, %r24, 2;
-	mov.u32 	%r18, _ZZ35termite_rms_norm_add_mul_scalar_f32E7partial;
-	add.s32 	%r7, %r18, %r17;
+	shl.b32 	%r16, %r23, 2;
+	mov.u32 	%r17, _ZZ35termite_rms_norm_add_mul_scalar_f32E5shmem;
+	add.s32 	%r7, %r17, %r16;
 	st.shared.f32 	[%r7], %f24;
 	bar.sync 	0;
-	mov.u32 	%r8, %ntid.x;
-	shr.u32 	%r23, %r8, 1;
-	setp.eq.s32 	%p4, %r23, 0;
-	@%p4 bra 	$L__BB95_8;
+	shr.u32 	%r22, %r2, 1;
+	setp.eq.s32 	%p6, %r22, 0;
+	@%p6 bra 	$L__BB95_8;
 
 $L__BB95_5:
-	setp.ge.u32 	%p5, %r24, %r23;
-	@%p5 bra 	$L__BB95_7;
+	setp.ge.u32 	%p7, %r23, %r22;
+	@%p7 bra 	$L__BB95_7;
 
-	shl.b32 	%r19, %r23, 2;
-	add.s32 	%r20, %r7, %r19;
-	ld.shared.f32 	%f10, [%r7];
-	ld.shared.f32 	%f11, [%r20];
-	add.f32 	%f12, %f11, %f10;
-	st.shared.f32 	[%r7], %f12;
+	shl.b32 	%r18, %r22, 2;
+	add.s32 	%r19, %r7, %r18;
+	ld.shared.f32 	%f9, [%r7];
+	ld.shared.f32 	%f10, [%r19];
+	add.f32 	%f11, %f10, %f9;
+	st.shared.f32 	[%r7], %f11;
 
 $L__BB95_7:
 	bar.sync 	0;
-	shr.u32 	%r23, %r23, 1;
-	setp.ne.s32 	%p6, %r23, 0;
-	@%p6 bra 	$L__BB95_5;
+	shr.u32 	%r22, %r22, 1;
+	setp.ne.s32 	%p8, %r22, 0;
+	@%p8 bra 	$L__BB95_5;
 
 $L__BB95_8:
-	setp.ge.u32 	%p7, %r24, %r14;
-	@%p7 bra 	$L__BB95_11;
+	@%p4 bra 	$L__BB95_11;
 
-	ld.shared.f32 	%f13, [_ZZ35termite_rms_norm_add_mul_scalar_f32E7partial];
-	cvta.to.global.u64 	%rd12, %rd8;
-	ld.global.f32 	%f4, [%rd12];
-	cvta.to.global.u64 	%rd2, %rd5;
-	cvta.to.global.u64 	%rd3, %rd7;
-	cvta.to.global.u64 	%rd4, %rd6;
-	cvt.rn.f32.u32 	%f14, %r14;
-	div.rn.f32 	%f15, %f13, %f14;
-	add.f32 	%f16, %f15, %f6;
-	rsqrt.approx.f32 	%f5, %f16;
+	ld.shared.f32 	%f12, [_ZZ35termite_rms_norm_add_mul_scalar_f32E5shmem];
+	cvta.to.global.u64 	%rd2, %rd6;
+	cvta.to.global.u64 	%rd3, %rd8;
+	cvta.to.global.u64 	%rd4, %rd9;
+	cvta.to.global.u64 	%rd5, %rd7;
+	cvt.rn.f32.u32 	%f13, %r13;
+	div.rn.f32 	%f14, %f12, %f13;
+	add.f32 	%f15, %f14, %f5;
+	rsqrt.approx.f32 	%f4, %f15;
 
 $L__BB95_10:
-	add.s32 	%r21, %r24, %r3;
-	mul.wide.u32 	%rd13, %r21, 4;
+	add.s32 	%r20, %r23, %r4;
+	mul.wide.u32 	%rd13, %r20, 4;
 	add.s64 	%rd14, %rd1, %rd13;
-	ld.global.f32 	%f17, [%rd14];
-	mul.f32 	%f18, %f5, %f17;
-	mul.wide.u32 	%rd15, %r24, 4;
-	add.s64 	%rd16, %rd4, %rd15;
-	ld.global.f32 	%f19, [%rd16];
-	mul.f32 	%f20, %f18, %f19;
+	ld.global.f32 	%f16, [%rd14];
+	mul.f32 	%f17, %f4, %f16;
+	mul.wide.u32 	%rd15, %r23, 4;
+	add.s64 	%rd16, %rd5, %rd15;
+	ld.global.f32 	%f18, [%rd16];
+	mul.f32 	%f19, %f17, %f18;
+	ld.global.f32 	%f20, [%rd4];
 	add.s64 	%rd17, %rd3, %rd13;
 	ld.global.f32 	%f21, [%rd17];
-	fma.rn.f32 	%f22, %f4, %f20, %f21;
+	fma.rn.f32 	%f22, %f19, %f20, %f21;
 	add.s64 	%rd18, %rd2, %rd13;
 	st.global.f32 	[%rd18], %f22;
-	add.s32 	%r24, %r24, %r8;
-	setp.lt.u32 	%p8, %r24, %r14;
-	@%p8 bra 	$L__BB95_10;
+	add.s32 	%r23, %r23, %r2;
+	setp.lt.u32 	%p10, %r23, %r13;
+	@%p10 bra 	$L__BB95_10;
 
 $L__BB95_11:
 	ret;
@@ -29735,108 +29730,107 @@ $L__BB95_11:
 	.param .f32 termite_rms_norm_add_output_scale_f32_param_7
 )
 {
-	.reg .pred 	%p<9>;
+	.reg .pred 	%p<11>;
 	.reg .f32 	%f<25>;
-	.reg .b32 	%r<25>;
+	.reg .b32 	%r<24>;
 	.reg .b64 	%rd<19>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ37termite_rms_norm_add_output_scale_f32E7partial[1024];
+	.shared .align 4 .b8 _ZZ37termite_rms_norm_add_output_scale_f32E5shmem[1024];
 
-	ld.param.u64 	%rd5, [termite_rms_norm_add_output_scale_f32_param_0];
-	ld.param.u64 	%rd9, [termite_rms_norm_add_output_scale_f32_param_1];
-	ld.param.u64 	%rd6, [termite_rms_norm_add_output_scale_f32_param_2];
-	ld.param.u64 	%rd7, [termite_rms_norm_add_output_scale_f32_param_3];
-	ld.param.u64 	%rd8, [termite_rms_norm_add_output_scale_f32_param_4];
-	ld.param.u32 	%r15, [termite_rms_norm_add_output_scale_f32_param_5];
-	ld.param.u32 	%r14, [termite_rms_norm_add_output_scale_f32_param_6];
-	ld.param.f32 	%f6, [termite_rms_norm_add_output_scale_f32_param_7];
-	cvta.to.global.u64 	%rd1, %rd9;
-	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r15;
-	@%p1 bra 	$L__BB96_11;
+	ld.param.u64 	%rd6, [termite_rms_norm_add_output_scale_f32_param_0];
+	ld.param.u64 	%rd10, [termite_rms_norm_add_output_scale_f32_param_1];
+	ld.param.u64 	%rd7, [termite_rms_norm_add_output_scale_f32_param_2];
+	ld.param.u64 	%rd8, [termite_rms_norm_add_output_scale_f32_param_3];
+	ld.param.u64 	%rd9, [termite_rms_norm_add_output_scale_f32_param_4];
+	ld.param.u32 	%r14, [termite_rms_norm_add_output_scale_f32_param_5];
+	ld.param.u32 	%r13, [termite_rms_norm_add_output_scale_f32_param_6];
+	ld.param.f32 	%f5, [termite_rms_norm_add_output_scale_f32_param_7];
+	cvta.to.global.u64 	%rd1, %rd10;
+	mov.u32 	%r23, %tid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %ctaid.x;
+	setp.ge.u32 	%p1, %r3, %r14;
+	setp.eq.s32 	%p2, %r13, 0;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB96_11;
 
-	mov.u32 	%r24, %tid.x;
-	mul.lo.s32 	%r3, %r1, %r14;
+	mul.lo.s32 	%r4, %r3, %r13;
+	setp.ge.u32 	%p4, %r23, %r13;
 	mov.f32 	%f24, 0f00000000;
-	setp.lt.u32 	%p2, %r24, %r14;
-	@%p2 bra 	$L__BB96_2;
-	bra.uni 	$L__BB96_4;
+	@%p4 bra 	$L__BB96_4;
 
-$L__BB96_2:
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r22, %r24;
+	mov.f32 	%f24, 0f00000000;
+	mov.u32 	%r21, %r23;
 
 $L__BB96_3:
-	add.s32 	%r16, %r22, %r3;
-	mul.wide.u32 	%rd10, %r16, 4;
-	add.s64 	%rd11, %rd1, %rd10;
-	ld.global.f32 	%f9, [%rd11];
-	fma.rn.f32 	%f24, %f9, %f9, %f24;
-	add.s32 	%r22, %r22, %r4;
-	setp.lt.u32 	%p3, %r22, %r14;
-	@%p3 bra 	$L__BB96_3;
+	add.s32 	%r15, %r21, %r4;
+	mul.wide.u32 	%rd11, %r15, 4;
+	add.s64 	%rd12, %rd1, %rd11;
+	ld.global.f32 	%f8, [%rd12];
+	fma.rn.f32 	%f24, %f8, %f8, %f24;
+	add.s32 	%r21, %r21, %r2;
+	setp.lt.u32 	%p5, %r21, %r13;
+	@%p5 bra 	$L__BB96_3;
 
 $L__BB96_4:
-	shl.b32 	%r17, %r24, 2;
-	mov.u32 	%r18, _ZZ37termite_rms_norm_add_output_scale_f32E7partial;
-	add.s32 	%r7, %r18, %r17;
+	shl.b32 	%r16, %r23, 2;
+	mov.u32 	%r17, _ZZ37termite_rms_norm_add_output_scale_f32E5shmem;
+	add.s32 	%r7, %r17, %r16;
 	st.shared.f32 	[%r7], %f24;
 	bar.sync 	0;
-	mov.u32 	%r8, %ntid.x;
-	shr.u32 	%r23, %r8, 1;
-	setp.eq.s32 	%p4, %r23, 0;
-	@%p4 bra 	$L__BB96_8;
+	shr.u32 	%r22, %r2, 1;
+	setp.eq.s32 	%p6, %r22, 0;
+	@%p6 bra 	$L__BB96_8;
 
 $L__BB96_5:
-	setp.ge.u32 	%p5, %r24, %r23;
-	@%p5 bra 	$L__BB96_7;
+	setp.ge.u32 	%p7, %r23, %r22;
+	@%p7 bra 	$L__BB96_7;
 
-	shl.b32 	%r19, %r23, 2;
-	add.s32 	%r20, %r7, %r19;
-	ld.shared.f32 	%f10, [%r7];
-	ld.shared.f32 	%f11, [%r20];
-	add.f32 	%f12, %f11, %f10;
-	st.shared.f32 	[%r7], %f12;
+	shl.b32 	%r18, %r22, 2;
+	add.s32 	%r19, %r7, %r18;
+	ld.shared.f32 	%f9, [%r7];
+	ld.shared.f32 	%f10, [%r19];
+	add.f32 	%f11, %f10, %f9;
+	st.shared.f32 	[%r7], %f11;
 
 $L__BB96_7:
 	bar.sync 	0;
-	shr.u32 	%r23, %r23, 1;
-	setp.ne.s32 	%p6, %r23, 0;
-	@%p6 bra 	$L__BB96_5;
+	shr.u32 	%r22, %r22, 1;
+	setp.ne.s32 	%p8, %r22, 0;
+	@%p8 bra 	$L__BB96_5;
 
 $L__BB96_8:
-	setp.ge.u32 	%p7, %r24, %r14;
-	@%p7 bra 	$L__BB96_11;
+	@%p4 bra 	$L__BB96_11;
 
-	ld.shared.f32 	%f13, [_ZZ37termite_rms_norm_add_output_scale_f32E7partial];
-	cvta.to.global.u64 	%rd12, %rd8;
-	ld.global.f32 	%f4, [%rd12];
-	cvta.to.global.u64 	%rd2, %rd5;
-	cvta.to.global.u64 	%rd3, %rd7;
-	cvta.to.global.u64 	%rd4, %rd6;
-	cvt.rn.f32.u32 	%f14, %r14;
-	div.rn.f32 	%f15, %f13, %f14;
-	add.f32 	%f16, %f15, %f6;
-	rsqrt.approx.f32 	%f5, %f16;
+	ld.shared.f32 	%f12, [_ZZ37termite_rms_norm_add_output_scale_f32E5shmem];
+	cvta.to.global.u64 	%rd2, %rd6;
+	cvta.to.global.u64 	%rd3, %rd9;
+	cvta.to.global.u64 	%rd4, %rd8;
+	cvta.to.global.u64 	%rd5, %rd7;
+	cvt.rn.f32.u32 	%f13, %r13;
+	div.rn.f32 	%f14, %f12, %f13;
+	add.f32 	%f15, %f14, %f5;
+	rsqrt.approx.f32 	%f4, %f15;
 
 $L__BB96_10:
-	add.s32 	%r21, %r24, %r3;
-	mul.wide.u32 	%rd13, %r21, 4;
+	add.s32 	%r20, %r23, %r4;
+	mul.wide.u32 	%rd13, %r20, 4;
 	add.s64 	%rd14, %rd1, %rd13;
-	ld.global.f32 	%f17, [%rd14];
-	mul.f32 	%f18, %f5, %f17;
-	mul.wide.u32 	%rd15, %r24, 4;
-	add.s64 	%rd16, %rd4, %rd15;
-	ld.global.f32 	%f19, [%rd16];
-	add.s64 	%rd17, %rd3, %rd13;
-	ld.global.f32 	%f20, [%rd17];
-	fma.rn.f32 	%f21, %f18, %f19, %f20;
-	mul.f32 	%f22, %f4, %f21;
+	ld.global.f32 	%f16, [%rd14];
+	mul.f32 	%f17, %f4, %f16;
+	mul.wide.u32 	%rd15, %r23, 4;
+	add.s64 	%rd16, %rd5, %rd15;
+	ld.global.f32 	%f18, [%rd16];
+	add.s64 	%rd17, %rd4, %rd13;
+	ld.global.f32 	%f19, [%rd17];
+	fma.rn.f32 	%f20, %f17, %f18, %f19;
+	ld.global.f32 	%f21, [%rd3];
+	mul.f32 	%f22, %f20, %f21;
 	add.s64 	%rd18, %rd2, %rd13;
 	st.global.f32 	[%rd18], %f22;
-	add.s32 	%r24, %r24, %r8;
-	setp.lt.u32 	%p8, %r24, %r14;
-	@%p8 bra 	$L__BB96_10;
+	add.s32 	%r23, %r23, %r2;
+	setp.lt.u32 	%p10, %r23, %r13;
+	@%p10 bra 	$L__BB96_10;
 
 $L__BB96_11:
 	ret;
@@ -29851,94 +29845,93 @@ $L__BB96_11:
 	.param .f32 termite_rms_norm_bare_f32_param_4
 )
 {
-	.reg .pred 	%p<9>;
+	.reg .pred 	%p<11>;
 	.reg .f32 	%f<20>;
-	.reg .b32 	%r<25>;
+	.reg .b32 	%r<24>;
 	.reg .b64 	%rd<10>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ25termite_rms_norm_bare_f32E7partial[1024];
+	.shared .align 4 .b8 _ZZ25termite_rms_norm_bare_f32E5shmem[1024];
 
 	ld.param.u64 	%rd3, [termite_rms_norm_bare_f32_param_0];
 	ld.param.u64 	%rd4, [termite_rms_norm_bare_f32_param_1];
-	ld.param.u32 	%r15, [termite_rms_norm_bare_f32_param_2];
-	ld.param.u32 	%r14, [termite_rms_norm_bare_f32_param_3];
+	ld.param.u32 	%r14, [termite_rms_norm_bare_f32_param_2];
+	ld.param.u32 	%r13, [termite_rms_norm_bare_f32_param_3];
 	ld.param.f32 	%f5, [termite_rms_norm_bare_f32_param_4];
 	cvta.to.global.u64 	%rd1, %rd4;
-	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r15;
-	@%p1 bra 	$L__BB97_11;
+	mov.u32 	%r23, %tid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %ctaid.x;
+	setp.ge.u32 	%p1, %r3, %r14;
+	setp.eq.s32 	%p2, %r13, 0;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB97_11;
 
-	mov.u32 	%r24, %tid.x;
-	mul.lo.s32 	%r3, %r1, %r14;
+	mul.lo.s32 	%r4, %r3, %r13;
+	setp.ge.u32 	%p4, %r23, %r13;
 	mov.f32 	%f19, 0f00000000;
-	setp.lt.u32 	%p2, %r24, %r14;
-	@%p2 bra 	$L__BB97_2;
-	bra.uni 	$L__BB97_4;
+	@%p4 bra 	$L__BB97_4;
 
-$L__BB97_2:
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r22, %r24;
+	mov.f32 	%f19, 0f00000000;
+	mov.u32 	%r21, %r23;
 
 $L__BB97_3:
-	add.s32 	%r16, %r22, %r3;
-	mul.wide.u32 	%rd5, %r16, 4;
+	add.s32 	%r15, %r21, %r4;
+	mul.wide.u32 	%rd5, %r15, 4;
 	add.s64 	%rd6, %rd1, %rd5;
 	ld.global.f32 	%f8, [%rd6];
 	fma.rn.f32 	%f19, %f8, %f8, %f19;
-	add.s32 	%r22, %r22, %r4;
-	setp.lt.u32 	%p3, %r22, %r14;
-	@%p3 bra 	$L__BB97_3;
+	add.s32 	%r21, %r21, %r2;
+	setp.lt.u32 	%p5, %r21, %r13;
+	@%p5 bra 	$L__BB97_3;
 
 $L__BB97_4:
-	shl.b32 	%r17, %r24, 2;
-	mov.u32 	%r18, _ZZ25termite_rms_norm_bare_f32E7partial;
-	add.s32 	%r7, %r18, %r17;
+	shl.b32 	%r16, %r23, 2;
+	mov.u32 	%r17, _ZZ25termite_rms_norm_bare_f32E5shmem;
+	add.s32 	%r7, %r17, %r16;
 	st.shared.f32 	[%r7], %f19;
 	bar.sync 	0;
-	mov.u32 	%r8, %ntid.x;
-	shr.u32 	%r23, %r8, 1;
-	setp.eq.s32 	%p4, %r23, 0;
-	@%p4 bra 	$L__BB97_8;
+	shr.u32 	%r22, %r2, 1;
+	setp.eq.s32 	%p6, %r22, 0;
+	@%p6 bra 	$L__BB97_8;
 
 $L__BB97_5:
-	setp.ge.u32 	%p5, %r24, %r23;
-	@%p5 bra 	$L__BB97_7;
+	setp.ge.u32 	%p7, %r23, %r22;
+	@%p7 bra 	$L__BB97_7;
 
-	shl.b32 	%r19, %r23, 2;
-	add.s32 	%r20, %r7, %r19;
+	shl.b32 	%r18, %r22, 2;
+	add.s32 	%r19, %r7, %r18;
 	ld.shared.f32 	%f9, [%r7];
-	ld.shared.f32 	%f10, [%r20];
+	ld.shared.f32 	%f10, [%r19];
 	add.f32 	%f11, %f10, %f9;
 	st.shared.f32 	[%r7], %f11;
 
 $L__BB97_7:
 	bar.sync 	0;
-	shr.u32 	%r23, %r23, 1;
-	setp.ne.s32 	%p6, %r23, 0;
-	@%p6 bra 	$L__BB97_5;
+	shr.u32 	%r22, %r22, 1;
+	setp.ne.s32 	%p8, %r22, 0;
+	@%p8 bra 	$L__BB97_5;
 
 $L__BB97_8:
-	setp.ge.u32 	%p7, %r24, %r14;
-	@%p7 bra 	$L__BB97_11;
+	@%p4 bra 	$L__BB97_11;
 
-	ld.shared.f32 	%f12, [_ZZ25termite_rms_norm_bare_f32E7partial];
+	ld.shared.f32 	%f12, [_ZZ25termite_rms_norm_bare_f32E5shmem];
 	cvta.to.global.u64 	%rd2, %rd3;
-	cvt.rn.f32.u32 	%f13, %r14;
+	cvt.rn.f32.u32 	%f13, %r13;
 	div.rn.f32 	%f14, %f12, %f13;
 	add.f32 	%f15, %f14, %f5;
 	rsqrt.approx.f32 	%f4, %f15;
 
 $L__BB97_10:
-	add.s32 	%r21, %r24, %r3;
-	mul.wide.u32 	%rd7, %r21, 4;
+	add.s32 	%r20, %r23, %r4;
+	mul.wide.u32 	%rd7, %r20, 4;
 	add.s64 	%rd8, %rd1, %rd7;
 	ld.global.f32 	%f16, [%rd8];
 	mul.f32 	%f17, %f4, %f16;
 	add.s64 	%rd9, %rd2, %rd7;
 	st.global.f32 	[%rd9], %f17;
-	add.s32 	%r24, %r24, %r8;
-	setp.lt.u32 	%p8, %r24, %r14;
-	@%p8 bra 	$L__BB97_10;
+	add.s32 	%r23, %r23, %r2;
+	setp.lt.u32 	%p10, %r23, %r13;
+	@%p10 bra 	$L__BB97_10;
 
 $L__BB97_11:
 	ret;
@@ -29958,12 +29951,12 @@ $L__BB97_11:
 	.param .f32 termite_gemma4_a4b_rms_norm_triple_f32_param_9
 )
 {
-	.reg .pred 	%p<9>;
-	.reg .f32 	%f<26>;
-	.reg .b32 	%r<25>;
+	.reg .pred 	%p<11>;
+	.reg .f32 	%f<30>;
+	.reg .b32 	%r<24>;
 	.reg .b64 	%rd<26>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ38termite_gemma4_a4b_rms_norm_triple_f32E7partial[1024];
+	.shared .align 4 .b8 _ZZ38termite_gemma4_a4b_rms_norm_triple_f32E5shmem[1024];
 
 	ld.param.u64 	%rd8, [termite_gemma4_a4b_rms_norm_triple_f32_param_0];
 	ld.param.u64 	%rd9, [termite_gemma4_a4b_rms_norm_triple_f32_param_1];
@@ -29972,104 +29965,107 @@ $L__BB97_11:
 	ld.param.u64 	%rd11, [termite_gemma4_a4b_rms_norm_triple_f32_param_4];
 	ld.param.u64 	%rd12, [termite_gemma4_a4b_rms_norm_triple_f32_param_5];
 	ld.param.u64 	%rd13, [termite_gemma4_a4b_rms_norm_triple_f32_param_6];
-	ld.param.u32 	%r15, [termite_gemma4_a4b_rms_norm_triple_f32_param_7];
-	ld.param.u32 	%r14, [termite_gemma4_a4b_rms_norm_triple_f32_param_8];
+	ld.param.u32 	%r14, [termite_gemma4_a4b_rms_norm_triple_f32_param_7];
+	ld.param.u32 	%r13, [termite_gemma4_a4b_rms_norm_triple_f32_param_8];
 	ld.param.f32 	%f5, [termite_gemma4_a4b_rms_norm_triple_f32_param_9];
 	cvta.to.global.u64 	%rd1, %rd14;
-	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r15;
-	@%p1 bra 	$L__BB98_11;
+	mov.u32 	%r23, %tid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %ctaid.x;
+	setp.ge.u32 	%p1, %r3, %r14;
+	setp.eq.s32 	%p2, %r13, 0;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB98_11;
 
-	mov.u32 	%r24, %tid.x;
-	mul.lo.s32 	%r3, %r1, %r14;
-	mov.f32 	%f25, 0f00000000;
-	setp.lt.u32 	%p2, %r24, %r14;
-	@%p2 bra 	$L__BB98_2;
-	bra.uni 	$L__BB98_4;
+	mul.lo.s32 	%r4, %r3, %r13;
+	setp.ge.u32 	%p4, %r23, %r13;
+	mov.f32 	%f29, 0f00000000;
+	@%p4 bra 	$L__BB98_4;
 
-$L__BB98_2:
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r22, %r24;
+	mov.f32 	%f29, 0f00000000;
+	mov.u32 	%r21, %r23;
 
 $L__BB98_3:
-	add.s32 	%r16, %r22, %r3;
-	mul.wide.u32 	%rd15, %r16, 4;
+	add.s32 	%r15, %r21, %r4;
+	mul.wide.u32 	%rd15, %r15, 4;
 	add.s64 	%rd16, %rd1, %rd15;
 	ld.global.f32 	%f8, [%rd16];
-	fma.rn.f32 	%f25, %f8, %f8, %f25;
-	add.s32 	%r22, %r22, %r4;
-	setp.lt.u32 	%p3, %r22, %r14;
-	@%p3 bra 	$L__BB98_3;
+	fma.rn.f32 	%f29, %f8, %f8, %f29;
+	add.s32 	%r21, %r21, %r2;
+	setp.lt.u32 	%p5, %r21, %r13;
+	@%p5 bra 	$L__BB98_3;
 
 $L__BB98_4:
-	shl.b32 	%r17, %r24, 2;
-	mov.u32 	%r18, _ZZ38termite_gemma4_a4b_rms_norm_triple_f32E7partial;
-	add.s32 	%r7, %r18, %r17;
-	st.shared.f32 	[%r7], %f25;
+	shl.b32 	%r16, %r23, 2;
+	mov.u32 	%r17, _ZZ38termite_gemma4_a4b_rms_norm_triple_f32E5shmem;
+	add.s32 	%r7, %r17, %r16;
+	st.shared.f32 	[%r7], %f29;
 	bar.sync 	0;
-	mov.u32 	%r8, %ntid.x;
-	shr.u32 	%r23, %r8, 1;
-	setp.eq.s32 	%p4, %r23, 0;
-	@%p4 bra 	$L__BB98_8;
+	shr.u32 	%r22, %r2, 1;
+	setp.eq.s32 	%p6, %r22, 0;
+	@%p6 bra 	$L__BB98_8;
 
 $L__BB98_5:
-	setp.ge.u32 	%p5, %r24, %r23;
-	@%p5 bra 	$L__BB98_7;
+	setp.ge.u32 	%p7, %r23, %r22;
+	@%p7 bra 	$L__BB98_7;
 
-	shl.b32 	%r19, %r23, 2;
-	add.s32 	%r20, %r7, %r19;
+	shl.b32 	%r18, %r22, 2;
+	add.s32 	%r19, %r7, %r18;
 	ld.shared.f32 	%f9, [%r7];
-	ld.shared.f32 	%f10, [%r20];
+	ld.shared.f32 	%f10, [%r19];
 	add.f32 	%f11, %f10, %f9;
 	st.shared.f32 	[%r7], %f11;
 
 $L__BB98_7:
 	bar.sync 	0;
-	shr.u32 	%r23, %r23, 1;
-	setp.ne.s32 	%p6, %r23, 0;
-	@%p6 bra 	$L__BB98_5;
+	shr.u32 	%r22, %r22, 1;
+	setp.ne.s32 	%p8, %r22, 0;
+	@%p8 bra 	$L__BB98_5;
 
 $L__BB98_8:
-	setp.ge.u32 	%p7, %r24, %r14;
-	@%p7 bra 	$L__BB98_11;
+	@%p4 bra 	$L__BB98_11;
 
-	ld.shared.f32 	%f12, [_ZZ38termite_gemma4_a4b_rms_norm_triple_f32E7partial];
+	ld.shared.f32 	%f12, [_ZZ38termite_gemma4_a4b_rms_norm_triple_f32E5shmem];
+	cvt.rn.f32.u32 	%f13, %r13;
+	div.rn.f32 	%f14, %f12, %f13;
+	add.f32 	%f15, %f14, %f5;
+	rsqrt.approx.f32 	%f4, %f15;
 	cvta.to.global.u64 	%rd2, %rd10;
 	cvta.to.global.u64 	%rd3, %rd13;
 	cvta.to.global.u64 	%rd4, %rd9;
 	cvta.to.global.u64 	%rd5, %rd12;
 	cvta.to.global.u64 	%rd6, %rd8;
 	cvta.to.global.u64 	%rd7, %rd11;
-	cvt.rn.f32.u32 	%f13, %r14;
-	div.rn.f32 	%f14, %f12, %f13;
-	add.f32 	%f15, %f14, %f5;
-	rsqrt.approx.f32 	%f4, %f15;
 
 $L__BB98_10:
-	add.s32 	%r21, %r24, %r3;
-	mul.wide.u32 	%rd17, %r21, 4;
+	add.s32 	%r20, %r23, %r4;
+	mul.wide.u32 	%rd17, %r20, 4;
 	add.s64 	%rd18, %rd1, %rd17;
 	ld.global.f32 	%f16, [%rd18];
 	mul.f32 	%f17, %f4, %f16;
-	mul.wide.u32 	%rd19, %r24, 4;
+	mul.wide.u32 	%rd19, %r23, 4;
 	add.s64 	%rd20, %rd7, %rd19;
 	ld.global.f32 	%f18, [%rd20];
 	mul.f32 	%f19, %f17, %f18;
 	add.s64 	%rd21, %rd6, %rd17;
 	st.global.f32 	[%rd21], %f19;
+	ld.global.f32 	%f20, [%rd18];
+	mul.f32 	%f21, %f4, %f20;
 	add.s64 	%rd22, %rd5, %rd19;
-	ld.global.f32 	%f20, [%rd22];
-	mul.f32 	%f21, %f17, %f20;
+	ld.global.f32 	%f22, [%rd22];
+	mul.f32 	%f23, %f21, %f22;
 	add.s64 	%rd23, %rd4, %rd17;
-	st.global.f32 	[%rd23], %f21;
+	st.global.f32 	[%rd23], %f23;
+	ld.global.f32 	%f24, [%rd18];
+	mul.f32 	%f25, %f4, %f24;
 	add.s64 	%rd24, %rd3, %rd19;
-	ld.global.f32 	%f22, [%rd24];
-	mul.f32 	%f23, %f17, %f22;
+	ld.global.f32 	%f26, [%rd24];
+	mul.f32 	%f27, %f25, %f26;
 	add.s64 	%rd25, %rd2, %rd17;
-	st.global.f32 	[%rd25], %f23;
-	add.s32 	%r24, %r24, %r8;
-	setp.lt.u32 	%p8, %r24, %r14;
-	@%p8 bra 	$L__BB98_10;
+	st.global.f32 	[%rd25], %f27;
+	add.s32 	%r23, %r23, %r2;
+	setp.lt.u32 	%p10, %r23, %r13;
+	@%p10 bra 	$L__BB98_10;
 
 $L__BB98_11:
 	ret;

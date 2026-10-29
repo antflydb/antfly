@@ -1471,273 +1471,117 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(
 }
 
 // tile-codegen:begin rms_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)
-extern "C" __global__ void termite_rms_norm_f32(
-    float* dst,
-    const float* input,
-    const float* weight,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_rms_norm_f32(float* dst, const float* input, const float* weight, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[256];
     if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v * v; }
+    shmem[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        dst[base + i] = input[base + i] * scale * weight[i];
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
+    const float inv = rsqrtf(shmem[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = input[base + i] * inv * weight[i]; }
 }
-
-extern "C" __global__ void termite_rms_norm_f32_bf16(
-    float* dst,
-    unsigned short* dst_bf16,
-    const float* input,
-    const float* weight,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_rms_norm_f32_bf16(float* dst, unsigned short* dst_bf16, const float* input, const float* weight, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[256];
     if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v * v; }
+    shmem[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        float value = input[idx] * scale * weight[i];
-        dst[idx] = value;
-        dst_bf16[idx] = termite_f32_to_bf16(value);
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
+    const float inv = rsqrtf(shmem[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { const float y0 = input[base + i] * inv * weight[i]; dst[base + i] = y0; dst_bf16[base + i] = termite_f32_to_bf16(y0); }
 }
-
-extern "C" __global__ void termite_rms_norm_add_f32(
-    float* dst,
-    const float* input,
-    const float* weight,
-    const float* residual,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_rms_norm_add_f32(float* dst, const float* input, const float* weight, const float* residual, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[256];
     if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v * v; }
+    shmem[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        dst[idx] = input[idx] * norm_scale * weight[i] + residual[idx];
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
+    const float inv = rsqrtf(shmem[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = input[base + i] * inv * weight[i] + residual[base + i]; }
 }
-
-extern "C" __global__ void termite_rms_norm_add_f32_bf16(
-    float* dst,
-    unsigned short* dst_bf16,
-    const float* input,
-    const float* weight,
-    const float* residual,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_rms_norm_add_f32_bf16(float* dst, unsigned short* dst_bf16, const float* input, const float* weight, const float* residual, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[256];
     if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v * v; }
+    shmem[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        float value = input[idx] * norm_scale * weight[i] + residual[idx];
-        dst[idx] = value;
-        dst_bf16[idx] = termite_f32_to_bf16(value);
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
+    const float inv = rsqrtf(shmem[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { const float y0 = input[base + i] * inv * weight[i] + residual[base + i]; dst[base + i] = y0; dst_bf16[base + i] = termite_f32_to_bf16(y0); }
 }
-
-extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(
-    float* dst,
-    const float* input,
-    const float* weight,
-    const float* residual,
-    const float* scalar,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(float* dst, const float* input, const float* weight, const float* residual, const float* scalar, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[256];
     if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v * v; }
+    shmem[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
-    float output_scale = scalar[0];
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        dst[idx] = input[idx] * norm_scale * weight[i] * output_scale + residual[idx];
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
+    const float inv = rsqrtf(shmem[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = input[base + i] * inv * weight[i] * scalar[0] + residual[base + i]; }
 }
-
-extern "C" __global__ void termite_rms_norm_add_output_scale_f32(
-    float* dst,
-    const float* input,
-    const float* weight,
-    const float* residual,
-    const float* scalar,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_rms_norm_add_output_scale_f32(float* dst, const float* input, const float* weight, const float* residual, const float* scalar, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[256];
     if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v * v; }
+    shmem[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
-    float output_scale = scalar[0];
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        dst[idx] = (input[idx] * norm_scale * weight[i] + residual[idx]) * output_scale;
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
+    const float inv = rsqrtf(shmem[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = (input[base + i] * inv * weight[i] + residual[base + i]) * scalar[0]; }
 }
-
-extern "C" __global__ void termite_rms_norm_bare_f32(
-    float* dst,
-    const float* input,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_rms_norm_bare_f32(float* dst, const float* input, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[256];
     if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v * v; }
+    shmem[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        dst[base + i] = input[base + i] * scale;
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
+    const float inv = rsqrtf(shmem[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { dst[base + i] = input[base + i] * inv; }
 }
-
-// Gemma 4 A4B branches three RMSNorms from the same attention residual. Share
-// the denominator reduction while preserving the ordinary RMSNorm reduction
-// order, then materialize the three independently weighted outputs.
-extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(
-    float* first,
-    float* second,
-    float* third,
-    const float* input,
-    const float* first_weight,
-    const float* second_weight,
-    const float* third_weight,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
-    const unsigned int row = blockIdx.x;
+extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(float* first, float* second, float* third, const float* input, const float* first_weight, const float* second_weight, const float* third_weight, unsigned int rows, unsigned int dim, float eps) {
+    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;
+    __shared__ float shmem[256];
     if (row >= rows) return;
-    const unsigned int tid = threadIdx.x;
+    if (dim == 0u) return;
     const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        const float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < dim; i += tpg) { const float v = input[base + i]; sum += v * v; }
+    shmem[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        const unsigned int idx = base + i;
-        const float normalized = input[idx] * scale;
-        first[idx] = normalized * first_weight[i];
-        second[idx] = normalized * second_weight[i];
-        third[idx] = normalized * third_weight[i];
-    }
+    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; __syncthreads(); }
+    const float inv = rsqrtf(shmem[0] / float(dim) + eps);
+    for (unsigned int i = tid; i < dim; i += tpg) { first[base + i] = input[base + i] * inv * first_weight[i]; second[base + i] = input[base + i] * inv * second_weight[i]; third[base + i] = input[base + i] * inv * third_weight[i]; }
 }
 // tile-codegen:end rms_norm family
 

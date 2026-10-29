@@ -62,20 +62,32 @@ launches them yet; the OpenCL harness is the host-side reference for doing so.
 ## Production RMSNorm family (`rms_norm.zig`)
 
 The 17 Metal RMSNorm kernels in `metal_kernels.m` and the 8 in
-`inference_cuda_kernels.cu` are generated from descriptions into
-marker-delimited regions (`tile-codegen:begin/end rms_norm family`) with
-unchanged names, buffer slots and params structs, so host dispatch is
+`inference_cuda_kernels.cu` come from one table of descriptions and one
+renderer, written into marker-delimited regions
+(`tile-codegen:begin/end rms_norm family`). Names, buffer slots, params
+structs and CUDA argument order are unchanged, so host dispatch is
 untouched.
 
-- Metal is generated freely. `scripts/tile/check_metal_rms_norm.py <old.m>
-  <new.m>` compiles both versions' MSL as C++ against a small shim, runs every
-  kernel with one OS thread per GPU thread (real barriers and `simd_sum`)
-  over a grid of shapes and threadgroup sizes, requires bitwise-equal
-  outputs, and checks two kernels against an f64 reference.
-- CUDA renders byte-identical to the previous hand-written text, so the
-  checked-in PTX/fatbin/cubin stay valid without a CUDA toolkit. Merging the
-  CUDA table into the Metal one (one description per kernel) needs an
-  artifact regeneration with the pinned CUDA 13.2 toolchain.
+Both backends are checked against the previous hand-written kernels on the
+CPU, with no GPU: each script compiles the old and new sources as C++
+against a small shim, runs every block with one OS thread per GPU thread
+(real barriers, and `simd_sum` on Metal) over a grid of shapes and block
+sizes, and requires bit-identical outputs, plus an f64 reference check.
+
+```sh
+python scripts/tile/check_metal_rms_norm.py <old metal_kernels.m> <new metal_kernels.m>
+python scripts/tile/check_cuda_rms_norm.py <old inference_cuda_kernels.cu> <new inference_cuda_kernels.cu>
+```
+
+Changing CUDA source means regenerating the checked-in PTX/fatbin/cubin
+with the pinned toolkit (CUDA 13.2, V13.2.86). Without a local install, the
+PyPI wheels reproduce the checked-in artifacts byte for byte:
+
+```sh
+pip install nvidia-cuda-nvcc==13.2.86 nvidia-nvvm==13.2.86 nvidia-cuda-runtime==13.2.86 nvidia-cuda-cccl==13.2.86
+export CUDA_HOME=$(python -c 'import nvidia, os; print(os.path.join(nvidia.__path__[0], "cu13"))')
+PATH=$CUDA_HOME/bin:$PATH scripts/regen-cuda-artifacts.sh --check --all   # or --write
+```
 
 ## Commands
 

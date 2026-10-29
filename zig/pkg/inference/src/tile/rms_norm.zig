@@ -17,17 +17,12 @@
 //!
 //! Every kernel computes inv = rsqrt(sum(x^2) / dim + eps) per row and then
 //! one or more outputs from an `NExpr` over x, inv, weights, a residual and
-//! a scale. What differs between the hand-written kernels is the schedule
-//! (one thread, one thread per row, threadgroup tree, float4 + SIMD-group
-//! sums), where sum(x^2) comes from, the epilogue, and each kernel's ABI.
-//!
-//! - Metal: `metal_kernels` render into the marker region of
-//!   `src/backends/metal_kernels.m`, keeping every kernel's name, buffer
-//!   slots and params struct, so host dispatch is unchanged.
-//! - CUDA: `cuda_kernels` render byte-identical to the previous hand-written
-//!   kernels in `inference_cuda_kernels.cu`, so the checked-in PTX, fatbin
-//!   and cubin stay valid without a CUDA toolkit. Normalizing their
-//!   spelling is a follow-up that needs an artifact regeneration.
+//! a scale. Kernels differ in schedule (one thread, one thread per row,
+//! block tree, float4 + SIMD-group sums), where sum(x^2) comes from, the
+//! epilogue, and their ABI (names, buffer order, params). One table holds
+//! both backends; one renderer emits Metal (into `metal_kernels.m`) and CUDA
+//! (into `inference_cuda_kernels.cu`) with each kernel's ABI unchanged, so
+//! host dispatch is untouched.
 
 const std = @import("std");
 
@@ -41,8 +36,8 @@ pub const NExpr = union(enum) {
     weight: u8,
     residual,
     scale,
-    /// A named intermediate (`Let`).
-    ref: []const u8,
+    /// The value materialized by `Norm.staged`.
+    staged,
     add: [2]*const NExpr,
     mul: [2]*const NExpr,
 
@@ -60,7 +55,7 @@ pub const NExpr = union(enum) {
 
     pub const Names = struct {
         x: []const u8,
-        inv: []const u8,
+        inv: []const u8 = "inv",
         weights: [3][]const u8 = .{ "", "", "" },
         residual: []const u8 = "",
         scale: []const u8 = "",
@@ -82,7 +77,7 @@ pub const NExpr = union(enum) {
             .weight => |k| n.weights[k],
             .residual => n.residual,
             .scale => n.scale,
-            .ref => |name| name,
+            .staged => "staged",
             .add => |xs| renderPrec(xs[0].*, n, 1, false) ++ " + " ++ renderPrec(xs[1].*, n, 1, true),
             .mul => |xs| renderPrec(xs[0].*, n, 2, false) ++ " * " ++ renderPrec(xs[1].*, n, 2, true),
         };
@@ -98,25 +93,25 @@ fn weight(comptime k: u8) NExpr {
     return .{ .weight = k };
 }
 
-// ---------------------------------------------------------------- Metal
+pub const Backend = enum { metal, cuda };
 
 pub const Schedule = enum {
     /// Thread 0 does the whole (single) row.
     serial_single,
     /// One thread per row.
     serial_rows,
-    /// One threadgroup per row, shared-memory tree over `tpg` threads.
+    /// One block per row, shared-memory tree over the block.
     tree,
-    /// One threadgroup per row, float4 loads, SIMD-group sums.
+    /// One block per row, float4 loads, SIMD-group sums (Metal).
     simd4,
 };
 
 pub const Rows = enum {
     /// A single row; no row index.
     single,
-    /// Row = threadgroup index, not bounds-checked (params have no `rows`).
+    /// Row = block index, not bounds-checked (params have no row count).
     grid,
-    /// Row = threadgroup index, checked against `p.rows`.
+    /// Row = block index, checked against the row count.
     grid_checked,
 };
 
@@ -126,21 +121,32 @@ pub const Role = union(enum) {
     weight: u8,
     residual,
     output: u8,
+    /// bf16 copy of output k (CUDA).
+    output_bf16: u8,
     /// Per-row partial sums of squares, one per 8 elements.
     sumsq,
     /// Receives inv only.
     inv_out,
+    /// One-element scale buffer (CUDA).
+    scalar,
+    /// Metal: the `constant` params struct. CUDA: scalar arguments.
     params,
 };
 
 pub const Binding = struct { name: []const u8, role: Role };
 
-pub const MetalNorm = struct {
+pub const Norm = struct {
     name: []const u8,
+    backend: Backend,
     schedule: Schedule,
     rows: Rows = .single,
-    params_type: []const u8,
-    dim: []const u8 = "hidden_size",
+    /// Metal params struct.
+    params_type: []const u8 = "",
+    /// Params as written in the body: Metal fields, or CUDA argument names.
+    p_rows: []const u8 = "p.rows",
+    p_dim: []const u8 = "p.hidden_size",
+    p_eps: []const u8 = "p.eps",
+    p_scale: []const u8 = "p.scale",
     bindings: []const Binding,
     /// One expression per `.output` binding, in output index order.
     outputs: []const NExpr = &.{},
@@ -149,63 +155,157 @@ pub const MetalNorm = struct {
     /// simd4: shared memory is a local array, not a `threadgroup(0)` buffer.
     local_shared: bool = false,
     /// simd4: materialize this value in the output buffer (volatile store,
-    /// device barrier, reload) before evaluating `outputs` with `.ref("staged")`,
+    /// device barrier, reload) before evaluating `outputs` over `.staged`,
     /// so the rounding matches the unfused chain.
     staged: ?NExpr = null,
     /// Emitted before the kernel (params structs only this kernel uses).
     decl: ?[]const u8 = null,
 
-    fn binding(comptime k: MetalNorm, comptime role: std.meta.Tag(Role), comptime index: u8) []const u8 {
+    fn binding(comptime k: Norm, comptime role: std.meta.Tag(Role), comptime index: u8) ?[]const u8 {
         for (k.bindings) |b| {
             if (b.role != role) continue;
             switch (b.role) {
-                .weight, .output => |i| if (i == index) return b.name,
+                .weight, .output, .output_bf16 => |i| if (i == index) return b.name,
                 else => return b.name,
             }
         }
-        @compileError(k.name ++ ": no binding for role " ++ @tagName(role));
+        return null;
     }
 
-    fn has(comptime k: MetalNorm, comptime role: std.meta.Tag(Role)) bool {
-        for (k.bindings) |b| if (b.role == role) return true;
-        return false;
+    fn need(comptime k: Norm, comptime role: std.meta.Tag(Role), comptime index: u8) []const u8 {
+        return k.binding(role, index) orelse @compileError(k.name ++ ": no binding for " ++ @tagName(role));
     }
 
-    fn inputName(comptime k: MetalNorm) []const u8 {
-        return if (k.has(.input_half)) k.binding(.input_half, 0) else k.binding(.input, 0);
+    fn inputName(comptime k: Norm) []const u8 {
+        return k.binding(.input_half, 0) orelse k.need(.input, 0);
     }
 };
 
-fn metalSignature(comptime k: MetalNorm) []const u8 {
-    var args: []const u8 = "";
-    for (k.bindings, 0..) |b, slot| {
-        const arg = switch (b.role) {
+const Dialect = struct {
+    shared: []const u8,
+    barrier: []const u8,
+    rsqrt: []const u8,
+
+    fn of(comptime b: Backend) Dialect {
+        return switch (b) {
+            .metal => .{ .shared = "", .barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);", .rsqrt = "rsqrt" },
+            .cuda => .{ .shared = "    __shared__ float shmem[256];\n", .barrier = "__syncthreads();", .rsqrt = "rsqrtf" },
+        };
+    }
+};
+
+fn signature(comptime k: Norm) []const u8 {
+    var args: []const []const u8 = &.{};
+    for (k.bindings, 0..) |b, slot| switch (k.backend) {
+        .metal => args = args ++ .{switch (b.role) {
             .input, .weight, .residual, .sumsq => fmt("device const float *{s} [[buffer({d})]]", .{ b.name, slot }),
             .input_half => fmt("device const half *{s} [[buffer({d})]]", .{ b.name, slot }),
             .output, .inv_out => fmt("device float *{s} [[buffer({d})]]", .{ b.name, slot }),
             .params => fmt("constant {s} &p [[buffer({d})]]", .{ k.params_type, slot }),
-        };
-        args = args ++ (if (slot == 0) "" else ", ") ++ arg;
+            .output_bf16, .scalar => @compileError(k.name ++ ": CUDA-only binding"),
+        }},
+        .cuda => args = args ++ switch (b.role) {
+            .input, .weight, .residual, .sumsq, .scalar => .{"const float* " ++ b.name},
+            .output, .inv_out => .{"float* " ++ b.name},
+            .output_bf16 => .{"unsigned short* " ++ b.name},
+            .params => (if (k.rows == .grid_checked) .{"unsigned int " ++ k.p_rows} else .{}) ++ .{ "unsigned int " ++ k.p_dim, "float " ++ k.p_eps },
+            .input_half => @compileError(k.name ++ ": Metal-only binding"),
+        },
+    };
+    var s: []const u8 = switch (k.backend) {
+        .metal => "kernel void " ++ k.name ++ "(",
+        .cuda => "extern \"C\" __global__ void " ++ k.name ++ "(",
+    };
+    for (args, 0..) |a, i| s = s ++ (if (i == 0) "" else ", ") ++ a;
+    if (k.backend == .cuda) {
+        if (k.schedule != .tree) @compileError(k.name ++ ": CUDA renders the tree schedule only");
+        return s ++ ") {\n    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x; const unsigned int tpg = blockDim.x; (void)row;\n";
     }
-    const builtins = switch (k.schedule) {
+    s = s ++ switch (k.schedule) {
         .serial_single, .serial_rows => ", uint gid [[thread_position_in_grid]]",
         .tree => ", threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]]" ++
             (if (k.rows == .single) "" else ", uint row [[threadgroup_position_in_grid]]"),
         .simd4 => (if (k.local_shared) "" else ", threadgroup float *shmem [[threadgroup(0)]]") ++
             ", uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]",
     };
-    return "kernel void " ++ k.name ++ "(" ++ args ++ builtins ++ ") {\n";
+    return s ++ ") {\n";
 }
 
-fn scalarNames(comptime k: MetalNorm, comptime base: []const u8) NExpr.Names {
-    const load = if (k.has(.input_half)) "float(" ++ k.inputName() ++ "[" ++ base ++ "i])" else k.inputName() ++ "[" ++ base ++ "i]";
-    var n: NExpr.Names = .{ .x = load, .inv = "inv", .scale = "p.scale" };
+fn scalarNames(comptime k: Norm, comptime base: []const u8) NExpr.Names {
+    const load = if (k.binding(.input_half, 0) != null) "float(" ++ k.inputName() ++ "[" ++ base ++ "i])" else k.inputName() ++ "[" ++ base ++ "i]";
+    var n: NExpr.Names = .{ .x = load, .scale = if (k.binding(.scalar, 0)) |s| s ++ "[0]" else k.p_scale };
     for (k.bindings) |b| switch (b.role) {
         .weight => |w| n.weights[w] = b.name ++ "[i]",
         .residual => n.residual = b.name ++ "[" ++ base ++ "i]",
         else => {},
     };
     return n;
+}
+
+/// Sum of squares into `sum`, for the scalar schedules.
+fn scalarSum(comptime k: Norm, comptime first: []const u8, comptime step: []const u8, comptime base: []const u8) []const u8 {
+    if (k.binding(.sumsq, 0)) |sumsq| return fmt(
+        \\    const unsigned int partial_count = ({0s} + 7u) / 8u;
+        \\    float sum = 0.0f;
+        \\    for (unsigned int i = {1s}; i < partial_count; {2s}) sum += {3s}[{4s}i];
+        \\
+    , .{ k.p_dim, first, step, sumsq, if (k.rows == .single) "" else "row * partial_count + " });
+    return fmt(
+        \\    float sum = 0.0f;
+        \\    for (unsigned int i = {0s}; i < {1s}; {2s}) {{ const float v = {3s}; sum += v * v; }}
+        \\
+    , .{ first, k.p_dim, step, scalarNames(k, base).x });
+}
+
+fn scalarOutputs(comptime k: Norm, comptime first: []const u8, comptime step: []const u8, comptime base: []const u8) []const u8 {
+    const names = scalarNames(k, base);
+    var body: []const u8 = "";
+    for (k.outputs, 0..) |e, o| {
+        const out = k.need(.output, @intCast(o));
+        if (k.binding(.output_bf16, @intCast(o))) |half_out| {
+            body = body ++ fmt(" const float y{0d} = {1s}; {2s}[{3s}i] = y{0d}; {4s}[{3s}i] = termite_f32_to_bf16(y{0d});", .{ o, e.render(names), out, base, half_out });
+        } else body = body ++ fmt(" {s}[{s}i] = {s};", .{ out, base, e.render(names) });
+    }
+    return fmt("    for (unsigned int i = {s}; i < {s}; {s}) {{{s} }}\n", .{ first, k.p_dim, step, body });
+}
+
+pub fn render(comptime k: Norm) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        const d = Dialect.of(k.backend);
+        var s: []const u8 = (k.decl orelse "") ++ signature(k);
+        switch (k.schedule) {
+            .serial_single, .serial_rows => {
+                const base = if (k.schedule == .serial_single) "" else "base + ";
+                s = s ++ (if (k.schedule == .serial_single) "    if (gid != 0u) return;\n" else fmt("    if (gid >= {s}) return;\n", .{k.p_rows}));
+                s = s ++ fmt("    if ({s} == 0u) return;\n", .{k.p_dim});
+                if (k.schedule == .serial_rows) s = s ++ fmt("    const unsigned int base = gid * {s};\n", .{k.p_dim});
+                s = s ++ scalarSum(k, "0u", "++i", base);
+                s = s ++ fmt("    const float inv = {s}(sum / float({s}) + {s});\n", .{ d.rsqrt, k.p_dim, k.p_eps });
+                s = s ++ scalarOutputs(k, "0u", "++i", base);
+            },
+            .tree => {
+                const base = if (k.rows == .single) "" else "base + ";
+                s = s ++ d.shared;
+                s = s ++ (if (k.rows == .grid_checked) fmt("    if (row >= {s}) return;\n", .{k.p_rows}) else "");
+                s = s ++ fmt("    if ({s} == 0u) return;\n", .{k.p_dim});
+                if (k.rows != .single) s = s ++ fmt("    const unsigned int base = row * {s};\n", .{k.p_dim});
+                s = s ++ scalarSum(k, "tid", "i += tpg", base);
+                s = s ++ fmt(
+                    \\    shmem[tid] = sum;
+                    \\    {0s}
+                    \\    for (unsigned int stride = tpg >> 1; stride > 0u; stride >>= 1u) {{ if (tid < stride) shmem[tid] += shmem[tid + stride]; {0s} }}
+                    \\    const float inv = {1s}(shmem[0] / float({2s}) + {3s});
+                    \\
+                , .{ d.barrier, d.rsqrt, k.p_dim, k.p_eps });
+                if (k.binding(.inv_out, 0)) |inv_out| {
+                    s = s ++ fmt("    if (tid == 0u) {s}[0] = inv;\n", .{inv_out});
+                } else s = s ++ scalarOutputs(k, "tid", "i += tpg", base);
+            },
+            .simd4 => s = s ++ renderSimd4(k),
+        }
+        return s ++ "}\n";
+    }
 }
 
 fn float4At(comptime buf: []const u8, comptime idx: []const u8) []const u8 {
@@ -216,145 +316,96 @@ fn store4(comptime buf: []const u8, comptime value: []const u8) []const u8 {
     return fmt("{0s}[i] = {1s}.x; {0s}[i + 1u] = {1s}.y; {0s}[i + 2u] = {1s}.z; {0s}[i + 3u] = {1s}.w;", .{ buf, value });
 }
 
-/// Sum of squares into `sum`, for the scalar schedules.
-fn scalarSum(comptime k: MetalNorm, comptime first: []const u8, comptime step: []const u8, comptime base: []const u8) []const u8 {
-    if (k.has(.sumsq)) return fmt(
-        \\    const uint partial_count = (p.{0s} + 7u) / 8u;
-        \\    float sum = 0.0f;
-        \\    for (uint i = {1s}; i < partial_count; {2s}) sum += {3s}[{4s}i];
-        \\
-    , .{ k.dim, first, step, k.binding(.sumsq, 0), if (k.rows == .single) "" else "row * partial_count + " });
-    const names = scalarNames(k, base);
-    return fmt(
-        \\    float sum = 0.0f;
-        \\    for (uint i = {0s}; i < p.{1s}; {2s}) {{ const float v = {3s}; sum += v * v; }}
-        \\
-    , .{ first, k.dim, step, names.x });
-}
-
-fn scalarOutputs(comptime k: MetalNorm, comptime first: []const u8, comptime step: []const u8, comptime base: []const u8) []const u8 {
-    const names = scalarNames(k, base);
-    var body: []const u8 = "";
-    for (k.outputs, 0..) |e, o| body = body ++ fmt(" {s}[{s}i] = {s};", .{ k.binding(.output, @intCast(o)), base, e.render(names) });
-    return fmt("    for (uint i = {s}; i < p.{s}; {s}) {{{s} }}\n", .{ first, k.dim, step, body });
-}
-
-pub fn renderMetal(comptime k: MetalNorm) []const u8 {
-    comptime {
-        @setEvalBranchQuota(200_000);
-        var s: []const u8 = (k.decl orelse "") ++ metalSignature(k);
-        switch (k.schedule) {
-            .serial_single, .serial_rows => {
-                const base = if (k.schedule == .serial_single) "" else "base + ";
-                s = s ++ (if (k.schedule == .serial_single) "    if (gid != 0u) return;\n" else "    if (gid >= p.rows) return;\n");
-                s = s ++ fmt("    if (p.{s} == 0u) return;\n", .{k.dim});
-                if (k.schedule == .serial_rows) s = s ++ fmt("    const uint base = gid * p.{s};\n", .{k.dim});
-                s = s ++ scalarSum(k, "0u", "++i", base);
-                s = s ++ fmt("    const float inv = rsqrt(sum / float(p.{s}) + p.eps);\n", .{k.dim});
-                s = s ++ scalarOutputs(k, "0u", "++i", base);
-            },
-            .tree => {
-                const base = if (k.rows == .single) "" else "base + ";
-                s = s ++ (if (k.rows == .grid_checked) "    if (row >= p.rows) return;\n" else "");
-                s = s ++ fmt("    if (p.{s} == 0u) return;\n", .{k.dim});
-                if (k.rows != .single) s = s ++ fmt("    const uint base = row * p.{s};\n", .{k.dim});
-                s = s ++ scalarSum(k, "tid", "i += tpg", base);
-                s = s ++
-                    \\    shmem[tid] = sum;
-                    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    \\    for (uint stride = tpg >> 1; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }
-                    \\
-                ;
-                s = s ++ fmt("    const float inv = rsqrt(shmem[0] / float(p.{s}) + p.eps);\n", .{k.dim});
-                if (k.has(.inv_out)) {
-                    s = s ++ fmt("    if (tid == 0u) {s}[0] = inv;\n", .{k.binding(.inv_out, 0)});
-                } else s = s ++ scalarOutputs(k, "tid", "i += tpg", base);
-            },
-            .simd4 => s = s ++ renderSimd4(k),
-        }
-        return s ++ "}\n";
-    }
-}
-
-fn renderSimd4(comptime k: MetalNorm) []const u8 {
+fn renderSimd4(comptime k: Norm) []const u8 {
+    if (k.backend != .metal) @compileError(k.name ++ ": simd4 is Metal-only");
     const input = k.inputName();
     var s: []const u8 = if (k.local_shared) "    threadgroup float shmem[32];\n" else "";
     s = s ++ fmt(
-        \\    if (row >= p.rows || p.{0s} == 0u || (p.{0s} & 3u) != 0u) return;
+        \\    if (row >= {0s} || {1s} == 0u || ({1s} & 3u) != 0u) return;
         \\    if (simd_group == 0u) shmem[simd_lane] = 0.0f;
-        \\    const uint base = row * p.{0s};
-        \\    const uint vectors = p.{0s} >> 2u;
+        \\    const uint base = row * {1s};
+        \\    const uint vectors = {1s} >> 2u;
         \\    float sum = 0.0f;
-        \\    for (uint v = tid; v < vectors; v += tpg) {{ const uint i = base + (v << 2u); const float4 x = {1s}; sum += dot(x, x); }}
+        \\    for (uint v = tid; v < vectors; v += tpg) {{ const uint i = base + (v << 2u); const float4 x = {2s}; sum += dot(x, x); }}
         \\    sum = simd_sum(sum);
         \\    threadgroup_barrier(mem_flags::mem_threadgroup);
         \\    if (simd_lane == 0u) shmem[simd_group] = sum;
         \\    threadgroup_barrier(mem_flags::mem_threadgroup);
         \\    sum = simd_sum(shmem[simd_lane]);
-        \\    const float inv = rsqrt(sum / float(p.{0s}) + p.eps);
+        \\    const float inv = rsqrt(sum / float({1s}) + {3s});
         \\
-    , .{ k.dim, float4At(input, "i") });
-    var names: NExpr.Names = .{ .x = "x", .inv = "inv", .scale = "p.scale" };
-    var loads: []const u8 = "";
+    , .{ k.p_rows, k.p_dim, float4At(input, "i"), k.p_eps });
+    var names: NExpr.Names = .{ .x = "x", .scale = k.p_scale };
+    var weight_loads: []const u8 = "";
     for (k.bindings) |b| switch (b.role) {
         .weight => |w| {
             names.weights[w] = fmt("w{d}", .{w});
-            loads = loads ++ fmt(" const float4 w{d} = {s};", .{ w, float4At(b.name, "j") });
+            weight_loads = weight_loads ++ fmt(" const float4 w{d} = {s};", .{ w, float4At(b.name, "j") });
         },
-        .residual => {
-            names.residual = "r";
-            loads = loads ++ fmt(" const float4 r = {s};", .{float4At(b.name, "i")});
-        },
+        .residual => names.residual = "r",
         else => {},
     };
     const head = "    for (uint v = tid; v < vectors; v += tpg) { const uint j = v << 2u; const uint i = base + j;";
+    const residual_load = if (k.binding(.residual, 0)) |r| fmt(" const float4 r = {s};", .{float4At(r, "i")}) else "";
     if (k.staged) |first| {
         // Store the staged value, then finish from the reloaded copy.
-        const out = k.binding(.output, 0);
-        var first_names = names;
-        first_names.residual = "";
-        var first_loads: []const u8 = "";
-        for (k.bindings) |b| if (b.role == .weight) {
-            first_loads = first_loads ++ fmt(" const float4 w{d} = {s};", .{ b.role.weight, float4At(b.name, "j") });
-        };
+        const out = k.need(.output, 0);
         s = s ++ fmt("    device volatile float *rounded = {s};\n", .{out});
-        s = s ++ fmt("{s} const float4 x = {s};{s} const float4 staged = {s}; {s} }}\n", .{ head, float4At(input, "i"), first_loads, first.render(first_names), store4("rounded", "staged") });
+        s = s ++ fmt("{s} const float4 x = {s};{s} const float4 staged = {s}; {s} }}\n", .{ head, float4At(input, "i"), weight_loads, first.render(names), store4("rounded", "staged") });
         s = s ++ "    threadgroup_barrier(mem_flags::mem_device);\n";
-        s = s ++ fmt("{s} const float4 staged = {s}; const float4 r = {s}; const float4 y = {s}; {s} }}\n", .{ head, float4At("rounded", "i"), float4At(k.binding(.residual, 0), "i"), k.outputs[0].render(names), store4(out, "y") });
-        return s;
+        return s ++ fmt("{s} const float4 staged = {s};{s} const float4 y = {s}; {s} }}\n", .{ head, float4At("rounded", "i"), residual_load, k.outputs[0].render(names), store4(out, "y") });
     }
     var body: []const u8 = "";
     for (k.outputs, 0..) |e, o| {
         const y = fmt("y{d}", .{o});
         body = body ++ fmt(" float4 {s} = {s};", .{ y, e.render(names) });
         if (k.clamp_flags) body = body ++ fmt(" if ((p.flags & 1u) != 0u) {0s} = max({0s}, float4(p.lo)); if ((p.flags & 2u) != 0u) {0s} = min({0s}, float4(p.hi));", .{y});
-        body = body ++ " " ++ store4(k.binding(.output, @intCast(o)), y);
+        body = body ++ " " ++ store4(k.need(.output, @intCast(o)), y);
     }
-    return s ++ fmt("{s} const float4 x = {s};{s}{s} }}\n", .{ head, float4At(input, "i"), loads, body });
+    return s ++ fmt("{s} const float4 x = {s};{s}{s}{s} }}\n", .{ head, float4At(input, "i"), weight_loads, residual_load, body });
 }
 
-const in_w_out: []const Binding = &.{ .{ .name = "input", .role = .input }, .{ .name = "weight", .role = .{ .weight = 0 } }, .{ .name = "output", .role = .{ .output = 0 } }, .{ .name = "p", .role = .params } };
-const in_w_res_out: []const Binding = &.{ .{ .name = "input", .role = .input }, .{ .name = "weight", .role = .{ .weight = 0 } }, .{ .name = "residual", .role = .residual }, .{ .name = "output", .role = .{ .output = 0 } }, .{ .name = "p", .role = .params } };
-const in_w_res_out_sumsq: []const Binding = &.{ .{ .name = "input", .role = .input }, .{ .name = "weight", .role = .{ .weight = 0 } }, .{ .name = "residual", .role = .residual }, .{ .name = "output", .role = .{ .output = 0 } }, .{ .name = "sumsq", .role = .sumsq }, .{ .name = "p", .role = .params } };
+// ---------------------------------------------------------------- kernels
+
+fn bind(comptime name: []const u8, comptime role: Role) Binding {
+    return .{ .name = name, .role = role };
+}
+const p_struct = bind("p", .params);
+const in_w_out: []const Binding = &.{ bind("input", .input), bind("weight", .{ .weight = 0 }), bind("output", .{ .output = 0 }), p_struct };
+const in_w_res_out: []const Binding = &.{ bind("input", .input), bind("weight", .{ .weight = 0 }), bind("residual", .residual), bind("output", .{ .output = 0 }), p_struct };
+const in_w_res_out_sumsq: []const Binding = &.{ bind("input", .input), bind("weight", .{ .weight = 0 }), bind("residual", .residual), bind("output", .{ .output = 0 }), bind("sumsq", .sumsq), p_struct };
 
 const normed = x.times(inv).times(weight(0));
 const normed_add = normed.plus(residual);
 const normed_add_scale = normed_add.times(scale);
 const normed4 = x.times(inv.times(weight(0)));
 
-pub const metal_kernels = [_]MetalNorm{
-    .{ .name = "termite_apply_rms_norm_1x", .schedule = .serial_single, .params_type = "termite_metal_apply_layer_norm_params", .bindings = in_w_out, .outputs = &.{normed} },
-    .{ .name = "termite_apply_rms_norm_1x_reduce", .schedule = .tree, .params_type = "termite_metal_apply_layer_norm_params", .bindings = in_w_out, .outputs = &.{normed} },
-    .{ .name = "termite_compute_rms_inv_scale_1x", .schedule = .tree, .params_type = "termite_metal_apply_layer_norm_params", .bindings = &.{ .{ .name = "input", .role = .input }, .{ .name = "inv_scale", .role = .inv_out }, .{ .name = "p", .role = .params } } },
-    .{ .name = "termite_apply_rms_norm_rows", .schedule = .serial_rows, .params_type = "termite_metal_apply_row_norm_params", .bindings = in_w_out, .outputs = &.{normed} },
-    .{ .name = "termite_apply_rms_norm_rows_reduce", .schedule = .tree, .rows = .grid_checked, .params_type = "termite_metal_apply_row_norm_params", .bindings = in_w_out, .outputs = &.{normed} },
-    .{ .name = "termite_apply_rms_norm_rows_simd4_reduce", .schedule = .simd4, .rows = .grid_checked, .params_type = "termite_metal_apply_row_norm_params", .bindings = in_w_out, .outputs = &.{normed4} },
+const layer_params = "termite_metal_apply_layer_norm_params";
+const layer_scale_params = "termite_metal_apply_layer_norm_scale_params";
+const row_params = "termite_metal_apply_row_norm_params";
+const row_scale_params = "termite_metal_apply_row_norm_scale_params";
+
+/// CUDA kernels: one block per row, `rows`/`dim`/`eps` scalar arguments.
+fn cuda(comptime name: []const u8, comptime bindings: []const Binding, comptime outputs: []const NExpr) Norm {
+    return .{ .name = name, .backend = .cuda, .schedule = .tree, .rows = .grid_checked, .p_rows = "rows", .p_dim = "dim", .p_eps = "eps", .bindings = bindings, .outputs = outputs };
+}
+const c_params = bind("", .params);
+
+pub const kernels = [_]Norm{
+    // ---- Metal
+    .{ .name = "termite_apply_rms_norm_1x", .backend = .metal, .schedule = .serial_single, .params_type = layer_params, .bindings = in_w_out, .outputs = &.{normed} },
+    .{ .name = "termite_apply_rms_norm_1x_reduce", .backend = .metal, .schedule = .tree, .params_type = layer_params, .bindings = in_w_out, .outputs = &.{normed} },
+    .{ .name = "termite_compute_rms_inv_scale_1x", .backend = .metal, .schedule = .tree, .params_type = layer_params, .bindings = &.{ bind("input", .input), bind("inv_scale", .inv_out), p_struct } },
+    .{ .name = "termite_apply_rms_norm_rows", .backend = .metal, .schedule = .serial_rows, .params_type = row_params, .bindings = in_w_out, .outputs = &.{normed} },
+    .{ .name = "termite_apply_rms_norm_rows_reduce", .backend = .metal, .schedule = .tree, .rows = .grid_checked, .params_type = row_params, .bindings = in_w_out, .outputs = &.{normed} },
+    .{ .name = "termite_apply_rms_norm_rows_simd4_reduce", .backend = .metal, .schedule = .simd4, .rows = .grid_checked, .params_type = row_params, .bindings = in_w_out, .outputs = &.{normed4} },
     .{
         .name = "antfly_norm_clamp",
+        .backend = .metal,
         .schedule = .simd4,
         .rows = .grid_checked,
         .params_type = "antfly_norm_clamp_params",
-        .dim = "dim",
+        .p_dim = "p.dim",
         .bindings = in_w_out,
         .outputs = &.{normed4},
         .clamp_flags = true,
@@ -363,47 +414,51 @@ pub const metal_kernels = [_]MetalNorm{
     },
     .{
         .name = "termite_apply_rms_norm_rows_triple_simd4_reduce",
+        .backend = .metal,
         .schedule = .simd4,
         .rows = .grid_checked,
-        .params_type = "termite_metal_apply_row_norm_params",
-        .bindings = &.{
-            .{ .name = "input", .role = .input },
-            .{ .name = "first_weight", .role = .{ .weight = 0 } },
-            .{ .name = "second_weight", .role = .{ .weight = 1 } },
-            .{ .name = "third_weight", .role = .{ .weight = 2 } },
-            .{ .name = "first_output", .role = .{ .output = 0 } },
-            .{ .name = "second_output", .role = .{ .output = 1 } },
-            .{ .name = "third_output", .role = .{ .output = 2 } },
-            .{ .name = "p", .role = .params },
-        },
+        .params_type = row_params,
+        .bindings = &.{ bind("input", .input), bind("first_weight", .{ .weight = 0 }), bind("second_weight", .{ .weight = 1 }), bind("third_weight", .{ .weight = 2 }), bind("first_output", .{ .output = 0 }), bind("second_output", .{ .output = 1 }), bind("third_output", .{ .output = 2 }), p_struct },
         .outputs = &.{ normed4, x.times(inv.times(weight(1))), x.times(inv.times(weight(2))) },
     },
-    .{ .name = "termite_apply_rms_norm_add_1x", .schedule = .tree, .params_type = "termite_metal_apply_layer_norm_params", .bindings = in_w_res_out, .outputs = &.{normed_add} },
-    .{ .name = "termite_apply_rms_norm_add_rows_canonical", .schedule = .tree, .rows = .grid, .params_type = "termite_metal_apply_layer_norm_params", .bindings = in_w_res_out, .outputs = &.{normed_add} },
-    .{ .name = "termite_apply_rms_norm_add_1x_sumsq", .schedule = .tree, .params_type = "termite_metal_apply_layer_norm_params", .bindings = in_w_res_out_sumsq, .outputs = &.{normed_add} },
-    .{ .name = "termite_apply_rms_norm_add_rows_sumsq", .schedule = .tree, .rows = .grid, .params_type = "termite_metal_apply_layer_norm_params", .bindings = in_w_res_out_sumsq, .outputs = &.{normed_add} },
-    .{ .name = "termite_apply_rms_norm_add_scale_1x_sumsq", .schedule = .tree, .params_type = "termite_metal_apply_layer_norm_scale_params", .bindings = in_w_res_out_sumsq, .outputs = &.{normed_add_scale} },
-    .{
-        .name = "termite_apply_rms_norm_add_1x_f16_input",
-        .schedule = .tree,
-        .params_type = "termite_metal_apply_layer_norm_params",
-        .bindings = &.{ .{ .name = "input", .role = .input_half }, .{ .name = "weight", .role = .{ .weight = 0 } }, .{ .name = "residual", .role = .residual }, .{ .name = "output", .role = .{ .output = 0 } }, .{ .name = "p", .role = .params } },
-        .outputs = &.{normed_add},
-    },
-    .{ .name = "termite_apply_rms_norm_add_scale_1x", .schedule = .tree, .params_type = "termite_metal_apply_layer_norm_scale_params", .bindings = in_w_res_out, .outputs = &.{normed_add_scale} },
-    .{ .name = "termite_apply_rms_norm_add_scale_rows", .schedule = .tree, .rows = .grid_checked, .params_type = "termite_metal_apply_row_norm_scale_params", .bindings = in_w_res_out, .outputs = &.{normed_add_scale} },
+    .{ .name = "termite_apply_rms_norm_add_1x", .backend = .metal, .schedule = .tree, .params_type = layer_params, .bindings = in_w_res_out, .outputs = &.{normed_add} },
+    .{ .name = "termite_apply_rms_norm_add_rows_canonical", .backend = .metal, .schedule = .tree, .rows = .grid, .params_type = layer_params, .bindings = in_w_res_out, .outputs = &.{normed_add} },
+    .{ .name = "termite_apply_rms_norm_add_1x_sumsq", .backend = .metal, .schedule = .tree, .params_type = layer_params, .bindings = in_w_res_out_sumsq, .outputs = &.{normed_add} },
+    .{ .name = "termite_apply_rms_norm_add_rows_sumsq", .backend = .metal, .schedule = .tree, .rows = .grid, .params_type = layer_params, .bindings = in_w_res_out_sumsq, .outputs = &.{normed_add} },
+    .{ .name = "termite_apply_rms_norm_add_scale_1x_sumsq", .backend = .metal, .schedule = .tree, .params_type = layer_scale_params, .bindings = in_w_res_out_sumsq, .outputs = &.{normed_add_scale} },
+    .{ .name = "termite_apply_rms_norm_add_1x_f16_input", .backend = .metal, .schedule = .tree, .params_type = layer_params, .bindings = &.{ bind("input", .input_half), bind("weight", .{ .weight = 0 }), bind("residual", .residual), bind("output", .{ .output = 0 }), p_struct }, .outputs = &.{normed_add} },
+    .{ .name = "termite_apply_rms_norm_add_scale_1x", .backend = .metal, .schedule = .tree, .params_type = layer_scale_params, .bindings = in_w_res_out, .outputs = &.{normed_add_scale} },
+    .{ .name = "termite_apply_rms_norm_add_scale_rows", .backend = .metal, .schedule = .tree, .rows = .grid_checked, .params_type = row_scale_params, .bindings = in_w_res_out, .outputs = &.{normed_add_scale} },
     // Normalized values round through the output buffer before the residual
     // add, matching the unfused chain. `* p.scale` replaces the previous
     // `if (p.scale != 1.0f)`: multiplying by 1.0 is exact.
-    .{ .name = "termite_apply_rms_norm_add_scale_simd4", .schedule = .simd4, .rows = .grid_checked, .params_type = "termite_metal_apply_row_norm_scale_params", .bindings = in_w_res_out, .staged = normed4, .outputs = &.{(NExpr{ .ref = "staged" }).plus(residual).times(scale)} },
+    .{ .name = "termite_apply_rms_norm_add_scale_simd4", .backend = .metal, .schedule = .simd4, .rows = .grid_checked, .params_type = row_scale_params, .bindings = in_w_res_out, .staged = normed4, .outputs = &.{(NExpr{ .staged = {} }).plus(residual).times(scale)} },
+
+    // ---- CUDA (argument order is the host launch ABI in ops/cuda/kernels.zig)
+    cuda("termite_rms_norm_f32", &.{ bind("dst", .{ .output = 0 }), bind("input", .input), bind("weight", .{ .weight = 0 }), c_params }, &.{normed}),
+    cuda("termite_rms_norm_f32_bf16", &.{ bind("dst", .{ .output = 0 }), bind("dst_bf16", .{ .output_bf16 = 0 }), bind("input", .input), bind("weight", .{ .weight = 0 }), c_params }, &.{normed}),
+    cuda("termite_rms_norm_add_f32", &.{ bind("dst", .{ .output = 0 }), bind("input", .input), bind("weight", .{ .weight = 0 }), bind("residual", .residual), c_params }, &.{normed_add}),
+    cuda("termite_rms_norm_add_f32_bf16", &.{ bind("dst", .{ .output = 0 }), bind("dst_bf16", .{ .output_bf16 = 0 }), bind("input", .input), bind("weight", .{ .weight = 0 }), bind("residual", .residual), c_params }, &.{normed_add}),
+    cuda("termite_rms_norm_add_mul_scalar_f32", &.{ bind("dst", .{ .output = 0 }), bind("input", .input), bind("weight", .{ .weight = 0 }), bind("residual", .residual), bind("scalar", .scalar), c_params }, &.{normed.times(scale).plus(residual)}),
+    cuda("termite_rms_norm_add_output_scale_f32", &.{ bind("dst", .{ .output = 0 }), bind("input", .input), bind("weight", .{ .weight = 0 }), bind("residual", .residual), bind("scalar", .scalar), c_params }, &.{normed_add_scale}),
+    cuda("termite_rms_norm_bare_f32", &.{ bind("dst", .{ .output = 0 }), bind("input", .input), c_params }, &.{x.times(inv)}),
+    // Gemma 4 A4B branches three RMSNorms from the same attention residual.
+    cuda("termite_gemma4_a4b_rms_norm_triple_f32", &.{ bind("first", .{ .output = 0 }), bind("second", .{ .output = 1 }), bind("third", .{ .output = 2 }), bind("input", .input), bind("first_weight", .{ .weight = 0 }), bind("second_weight", .{ .weight = 1 }), bind("third_weight", .{ .weight = 2 }), c_params }, &.{ normed, x.times(inv).times(weight(1)), x.times(inv).times(weight(2)) }),
 };
+
+fn renderAll(comptime backend: Backend) []const u8 {
+    var out: []const u8 = "";
+    for (kernels) |k| if (k.backend == backend) {
+        out = out ++ render(k);
+    };
+    return out;
+}
 
 /// The region body for metal_kernels.m: each source line as a C string.
 pub fn metalRegion() []const u8 {
     comptime {
         @setEvalBranchQuota(10_000_000);
-        var src: []const u8 = "";
-        for (metal_kernels) |k| src = src ++ renderMetal(k);
+        const src = renderAll(.metal);
         var out: []const u8 = "";
         var start: usize = 0;
         for (src, 0..) |ch, i| {
@@ -425,112 +480,9 @@ fn escape(comptime s: []const u8) []const u8 {
     return out;
 }
 
-// ---------------------------------------------------------------- CUDA
-
-pub const CudaNorm = struct {
-    name: []const u8,
-    /// Output buffers, in argument order before `input`.
-    outputs: []const []const u8 = &.{"dst"},
-    /// Also write a bf16 copy to `dst_bf16`.
-    bf16: bool = false,
-    /// Weight arguments after `input`.
-    weights: []const []const u8 = &.{"weight"},
-    residual: bool = false,
-    /// `const float* scalar` argument, read once as `output_scale`.
-    scalar: bool = false,
-    /// Name of the 1/rms variable.
-    inv_name: []const u8 = "scale",
-    /// Index elements through `unsigned int idx = base + i`.
-    idx: bool = true,
-    /// `const`-qualified locals.
-    const_locals: bool = false,
-    /// A shared intermediate (`const float normalized = ...`) before the stores.
-    let: ?struct { name: []const u8, expr: NExpr } = null,
-    /// One per output.
-    exprs: []const NExpr,
-    comment: []const u8 = "",
-};
-
-pub fn renderCuda(comptime k: CudaNorm) []const u8 {
-    comptime {
-        @setEvalBranchQuota(200_000);
-        const c = if (k.const_locals) "const " else "";
-        var args: []const []const u8 = &.{};
-        for (k.outputs) |o| args = args ++ .{"float* " ++ o};
-        if (k.bf16) args = args ++ .{"unsigned short* dst_bf16"};
-        args = args ++ .{"const float* input"};
-        for (k.weights) |w| args = args ++ .{"const float* " ++ w};
-        if (k.residual) args = args ++ .{"const float* residual"};
-        if (k.scalar) args = args ++ .{"const float* scalar"};
-        args = args ++ .{ "unsigned int rows", "unsigned int dim", "float eps" };
-        var s: []const u8 = k.comment ++ "extern \"C\" __global__ void " ++ k.name ++ "(\n";
-        for (args, 0..) |a, i| s = s ++ "    " ++ a ++ (if (i + 1 < args.len) ",\n" else "\n");
-        s = s ++ fmt(
-            \\) {{
-            \\    {0s}unsigned int row = blockIdx.x;
-            \\    if (row >= rows) return;
-            \\    {0s}unsigned int tid = threadIdx.x;
-            \\    const unsigned int base = row * dim;
-            \\    __shared__ float partial[256];
-            \\    float sumsq = 0.0f;
-            \\    for (unsigned int i = tid; i < dim; i += blockDim.x) {{
-            \\        {0s}float x = input[base + i];
-            \\        sumsq += x * x;
-            \\    }}
-            \\    partial[tid] = sumsq;
-            \\    __syncthreads();
-            \\    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {{
-            \\        if (tid < stride) partial[tid] += partial[tid + stride];
-            \\        __syncthreads();
-            \\    }}
-            \\    {0s}float {1s} = rsqrtf(partial[0] / (float)dim + eps);
-            \\
-        , .{ c, k.inv_name });
-        if (k.scalar) s = s ++ "    float output_scale = scalar[0];\n";
-        const at = if (k.idx) "idx" else "base + i";
-        var names: NExpr.Names = .{ .x = "input[" ++ at ++ "]", .inv = k.inv_name, .residual = "residual[" ++ at ++ "]", .scale = "output_scale" };
-        for (k.weights, 0..) |w, i| names.weights[i] = w ++ "[i]";
-        s = s ++ "    for (unsigned int i = tid; i < dim; i += blockDim.x) {\n";
-        if (k.idx) s = s ++ fmt("        {s}unsigned int idx = base + i;\n", .{c});
-        if (k.let) |l| s = s ++ fmt("        {s}float {s} = {s};\n", .{ c, l.name, l.expr.render(names) });
-        for (k.outputs, k.exprs) |o, e| {
-            if (k.bf16) {
-                s = s ++ fmt("        float value = {s};\n        {s}[{s}] = value;\n        dst_bf16[{s}] = termite_f32_to_bf16(value);\n", .{ e.render(names), o, at, at });
-            } else s = s ++ fmt("        {s}[{s}] = {s};\n", .{ o, at, e.render(names) });
-        }
-        return s ++ "    }\n}\n";
-    }
-}
-
-pub const cuda_kernels = [_]CudaNorm{
-    .{ .name = "termite_rms_norm_f32", .idx = false, .exprs = &.{normed} },
-    .{ .name = "termite_rms_norm_f32_bf16", .bf16 = true, .exprs = &.{normed} },
-    .{ .name = "termite_rms_norm_add_f32", .residual = true, .inv_name = "norm_scale", .exprs = &.{normed_add} },
-    .{ .name = "termite_rms_norm_add_f32_bf16", .bf16 = true, .residual = true, .inv_name = "norm_scale", .exprs = &.{normed_add} },
-    .{ .name = "termite_rms_norm_add_mul_scalar_f32", .residual = true, .scalar = true, .inv_name = "norm_scale", .exprs = &.{normed.times(scale).plus(residual)} },
-    .{ .name = "termite_rms_norm_add_output_scale_f32", .residual = true, .scalar = true, .inv_name = "norm_scale", .exprs = &.{normed_add_scale} },
-    .{ .name = "termite_rms_norm_bare_f32", .weights = &.{}, .idx = false, .exprs = &.{x.times(inv)} },
-    .{
-        .name = "termite_gemma4_a4b_rms_norm_triple_f32",
-        .outputs = &.{ "first", "second", "third" },
-        .weights = &.{ "first_weight", "second_weight", "third_weight" },
-        .const_locals = true,
-        .let = .{ .name = "normalized", .expr = x.times(inv) },
-        .exprs = &.{ (NExpr{ .ref = "normalized" }).times(weight(0)), (NExpr{ .ref = "normalized" }).times(weight(1)), (NExpr{ .ref = "normalized" }).times(weight(2)) },
-        .comment =
-        \\// Gemma 4 A4B branches three RMSNorms from the same attention residual. Share
-        \\// the denominator reduction while preserving the ordinary RMSNorm reduction
-        \\// order, then materialize the three independently weighted outputs.
-        \\
-        ,
-    },
-};
-
 pub fn cudaRegion() []const u8 {
     comptime {
         @setEvalBranchQuota(10_000_000);
-        var out: []const u8 = "";
-        for (cuda_kernels, 0..) |k, i| out = out ++ (if (i == 0) "" else "\n") ++ renderCuda(k);
-        return out;
+        return renderAll(.cuda);
     }
 }
