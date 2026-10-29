@@ -24,12 +24,18 @@ const snappy = @import("../encoding/snappy.zig");
 const View = @import("../segment_source.zig").View;
 const Sink = @import("../segment.zig").SegmentSink;
 const Control = @import("antfly_cancellation").CancellationToken;
-const magic = "AFOV0002";
+const magic = "AFOV0003";
 const header_size = 32;
 const block_tokens = 1024;
 const page_terms = 64;
 const page_bytes = 64 * 1024;
-pub const Ref = struct { offset: u64, wire: u32, raw: u32, count: u32 };
+pub const Ref = struct {
+    offset: u64,
+    wire: u32,
+    raw: u32,
+    count: u32,
+    through_end: u32 = 0,
+};
 pub const Encoded = struct { bytes: usize, root_raw: u32, count: u32 };
 fn integer(a: A, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
     var b: [@sizeOf(T)]u8 = undefined;
@@ -45,6 +51,7 @@ fn reference(a: A, out: *std.ArrayList(u8), ref: Ref) !void {
     try integer(a, out, u32, ref.wire);
     try integer(a, out, u32, ref.raw);
     try integer(a, out, u32, ref.count);
+    try integer(a, out, u32, ref.through_end);
 }
 fn variable(a: A, out: *std.ArrayList(u8), value: u64) !void {
     var n = value;
@@ -66,7 +73,7 @@ const Parser = struct {
         return self.take(try self.int(u32));
     }
     fn ref(self: *@This()) !Ref {
-        return .{ .offset = try self.int(u64), .wire = try self.int(u32), .raw = try self.int(u32), .count = try self.int(u32) };
+        return .{ .offset = try self.int(u64), .wire = try self.int(u32), .raw = try self.int(u32), .count = try self.int(u32), .through_end = try self.int(u32) };
     }
     fn variable(self: *@This()) !u64 {
         var n: u64 = 0;
@@ -118,8 +125,10 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
     defer a.free(next);
     @memset(next, std.math.maxInt(u32));
     var ordered = true;
+    var disjoint = true;
     for (tokens, 0..) |token, i| {
         if (i != 0 and (token.start_byte < tokens[i - 1].start_byte or (token.start_byte == tokens[i - 1].start_byte and token.end_byte > tokens[i - 1].end_byte))) ordered = false;
+        if (i != 0 and token.start_byte <= tokens[i - 1].end_byte) disjoint = false;
         if (token.start_byte > token.end_byte) return error.InvalidData;
         const entry = try by_term.getOrPut(a, token.term);
         if (!entry.found_existing) {
@@ -160,12 +169,22 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
         refs.clearRetainingCapacity();
         var at = group.first;
         var remaining = group.count;
+        var prior: ?analysis.Token = null;
+        var minimum_start: u32 = std.math.maxInt(u32);
+        var minimum_gap: u32 = std.math.maxInt(u32);
+        var through_end: u32 = 0;
         while (remaining != 0) {
             const n = @min(remaining, block_tokens);
             raw.clearRetainingCapacity();
             var start: i64 = 0;
             for (0..n) |_| {
                 const token = tokens[at];
+                through_end = @max(through_end, token.end_byte);
+                if (prior) |previous_token| {
+                    minimum_start = @min(minimum_start, token.start_byte -| previous_token.start_byte);
+                    minimum_gap = @min(minimum_gap, token.start_byte -| previous_token.end_byte);
+                }
+                prior = token;
                 const delta = @as(i64, token.start_byte) - start;
                 try variable(a, &raw, @bitCast((delta << 1) ^ (delta >> 63)));
                 try variable(a, &raw, token.end_byte - token.start_byte);
@@ -173,10 +192,14 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
                 start = token.start_byte;
                 at = next[at];
             }
-            try refs.append(a, try chunk(a, sink, base, raw.items, n));
+            var ref = try chunk(a, sink, base, raw.items, n);
+            ref.through_end = through_end;
+            try refs.append(a, ref);
             remaining -= n;
         }
         try text(a, &pending, group.term);
+        try integer(a, &pending, u32, if (group.count < 2) 0 else minimum_start);
+        try integer(a, &pending, u32, if (group.count < 2) 0 else minimum_gap);
         try integer(a, &pending, u32, @intCast(refs.items.len));
         for (refs.items) |ref| try reference(a, &pending, ref);
         previous = group.term;
@@ -194,8 +217,8 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
     std.mem.writeInt(u32, header[16..20], root_ref.wire, .little);
     std.mem.writeInt(u32, header[20..24], root_ref.raw, .little);
     std.mem.writeInt(u32, header[24..28], count, .little);
-    if (groups.items.len > 0x7fffffff) return error.InvalidData;
-    std.mem.writeInt(u32, header[28..32], @as(u32, @intCast(groups.items.len)) | (if (ordered) @as(u32, 0x80000000) else 0), .little);
+    if (groups.items.len > 0x3fffffff) return error.InvalidData;
+    std.mem.writeInt(u32, header[28..32], @as(u32, @intCast(groups.items.len)) | (if (ordered) @as(u32, 0x80000000) else 0) | (if (ordered and disjoint) @as(u32, 0x40000000) else 0), .little);
     try sink.writeAt(base, &header);
     return .{ .bytes = sink.len() - base, .root_raw = root_ref.raw, .count = count };
 }
@@ -310,7 +333,7 @@ pub fn prepare(a: A, view: View, source_length: u32, root_raw: u32, count: u32, 
     defer work.free(root_bytes);
     var root: Parser = .{ .bytes = root_bytes };
     const n = try root.int(u32);
-    if (n > (root_bytes.len - root.at) / 24) return error.InvalidData;
+    if (n > (root_bytes.len - root.at) / 28) return error.InvalidData;
     const Page = struct { ceiling: []const u8, ref: Ref };
     const pages = try work.alloc(Page, n);
     defer work.free(pages);
@@ -326,7 +349,7 @@ pub fn prepare(a: A, view: View, source_length: u32, root_raw: u32, count: u32, 
         prior_end = ref.offset + ref.wire;
         term_count += ref.count;
     }
-    if (root.at != root.bytes.len or term_count != (std.mem.readInt(u32, h[28..32], .little) & 0x7fffffff) or term_count > count or (term_count == 0) != (count == 0)) return error.InvalidData;
+    if (root.at != root.bytes.len or term_count != (std.mem.readInt(u32, h[28..32], .little) & 0x3fffffff) or term_count > count or (term_count == 0) != (count == 0)) return error.InvalidData;
     const needed = try selectedPages(work, pages, selection);
     defer if (needed) |bits| work.free(bits);
     try control.check();
@@ -353,27 +376,38 @@ pub fn prepare(a: A, view: View, source_length: u32, root_raw: u32, count: u32, 
             const term = try p.string();
             if ((prior != null and std.mem.order(u8, prior.?, term) != .lt) or std.mem.order(u8, term, page.ceiling) == .gt) return error.InvalidData;
             prior = term;
+            const minimum_start = try p.int(u32);
+            const minimum_gap = try p.int(u32);
             const blocks = try p.int(u32);
-            if (blocks == 0 or blocks > (p.bytes.len - p.at) / 20) return error.InvalidData;
+            if (blocks == 0 or blocks > (p.bytes.len - p.at) / 24) return error.InvalidData;
             const matched = if (selection.matches) |check| try check(selection.ptr.?, term) else true;
             const retained = if (matched) try out.dupe(u8, term) else "";
             const refs = try out.alloc(Ref, if (matched) blocks else 0);
             var block_end: u64 = header_size;
+            var prior_through: u32 = 0;
+            var occurrences: u32 = 0;
+            const ordered = std.mem.readInt(u32, h[28..32], .little) & 0x80000000 != 0;
+            const disjoint = std.mem.readInt(u32, h[28..32], .little) & 0x40000000 != 0;
+            if (disjoint and !ordered) return error.InvalidData;
             for (0..blocks) |i| {
                 const ref = try p.ref();
                 if (ref.offset < block_end or ref.offset > page.ref.offset or ref.wire == 0 or ref.wire > page.ref.offset - ref.offset or ref.count == 0 or ref.count > block_tokens or ref.raw == 0 or ref.raw > page_bytes) return error.InvalidData;
+                if ((i + 1 < blocks and ref.count != block_tokens) or ref.through_end > source_length or ref.through_end < prior_through) return error.InvalidData;
+                prior_through = ref.through_end;
+                occurrences = std.math.add(u32, occurrences, ref.count) catch return error.InvalidData;
                 block_end = ref.offset + ref.wire;
                 if (!matched) continue;
                 total += ref.count;
                 if (total > count) return error.InvalidData;
                 refs[i] = ref;
             }
-            if (matched) try terms.append(out, .{ .text = retained, .blocks = refs });
+            if (minimum_start > source_length or minimum_gap > source_length or (occurrences == 1 and (minimum_start != 0 or minimum_gap != 0)) or (disjoint and occurrences > 1 and (minimum_start == 0 or minimum_gap == 0))) return error.InvalidData;
+            if (matched) try terms.append(out, .{ .text = retained, .blocks = refs, .count = occurrences, .minimum_start = minimum_start, .minimum_gap = minimum_gap });
         }
         if (p.at != p.bytes.len or prior == null or !std.mem.eql(u8, prior.?, page.ceiling)) return error.InvalidData;
     }
     if (selection.matches == null and selection.ranges == null and total != count) return error.InvalidData;
-    return .{ .a = a, .owner = owner, .view = view, .source_length = source_length, .terms = try terms.toOwnedSlice(out), .count = @intCast(total), .ordered = std.mem.readInt(u32, h[28..32], .little) & 0x80000000 != 0 };
+    return .{ .a = a, .owner = owner, .view = view, .source_length = source_length, .terms = try terms.toOwnedSlice(out), .count = @intCast(total), .ordered = std.mem.readInt(u32, h[28..32], .little) & 0x80000000 != 0, .disjoint = std.mem.readInt(u32, h[28..32], .little) & 0x40000000 != 0 };
 }
 pub fn select(a: A, view: View, source_length: u32, root_raw: u32, count: u32, selection: Selection, control: Control) !Vector {
     const plan = try prepare(a, view, source_length, root_raw, count, selection, control);
@@ -381,7 +415,7 @@ pub fn select(a: A, view: View, source_length: u32, root_raw: u32, count: u32, s
 }
 /// Immutable term/block navigation, independent of occurrence materialization.
 pub const Plan = struct {
-    pub const Term = struct { text: []const u8, blocks: []const Ref };
+    pub const Term = struct { text: []const u8, blocks: []const Ref, count: u32, minimum_start: u32, minimum_gap: u32 };
     a: A,
     owner: *std.heap.ArenaAllocator,
     view: View,
@@ -389,6 +423,24 @@ pub const Plan = struct {
     terms: []const Term,
     count: u32,
     ordered: bool,
+    disjoint: bool,
+    /// Spacing is a producer-attested lower bound; deleting terms only widens
+    /// gaps. For future windows, expired blocks cannot contribute. The first
+    /// overlapping span ends at least one byte into an integer window, and the
+    /// next starts after its gap; remaining starts are minimum_start apart.
+    pub fn densityUpper(self: *const Plan, width: u64, first: u32, ceiling: u32) ?u32 {
+        if (!self.disjoint) return null;
+        var total: u64 = 0;
+        for (self.terms) |term| {
+            const block = seekBlock(term.blocks, first);
+            if (block == term.blocks.len) continue;
+            const remaining = @as(u64, term.count) - block * block_tokens;
+            const bound = if (term.count == 1) @as(u64, 1) else if (width <= @as(u64, term.minimum_gap) + 1) @as(u64, 1) else 2 + (width - 2 - term.minimum_gap) / term.minimum_start;
+            total += @min(remaining, bound);
+            if (total > ceiling) return null;
+        }
+        return @intCast(total);
+    }
     pub fn deinit(self: *Plan) void {
         self.owner.deinit();
         self.a.destroy(self.owner);
@@ -434,8 +486,28 @@ pub const Plan = struct {
         return .{ .a = a, .owner = owner, .items = try items.toOwnedSlice(out) };
     }
 };
+fn seekBlock(blocks: []const Ref, first: u32) usize {
+    var low: usize = 0;
+    var high = blocks.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (blocks[mid].through_end <= first) low = mid + 1 else high = mid;
+    }
+    return low;
+}
+/// Advisory reads use the enclosing source's bounded queue and shared scheduler.
+/// Only selected terms' blocks are hinted; no intervening occurrence payloads.
+fn prefetch(view: View, refs: []const Ref) void {
+    var bytes: u64 = 0;
+    for (refs[0..@min(refs.len, 4)]) |ref| {
+        if (ref.wire > 256 * 1024 - bytes) break;
+        view.source.prefetch(view.offset + ref.offset, ref.wire);
+        bytes += ref.wire;
+    }
+}
 const Occurrences = struct {
     block: usize = 0,
+    decoded: usize = 0,
     bytes: []u8 = &.{},
     parser: Parser = .{ .bytes = &.{} },
     remaining: u32 = 0,
@@ -452,7 +524,9 @@ const Occurrences = struct {
             a.free(self.bytes);
             self.bytes = &.{};
             const ref = term.blocks[self.block];
+            prefetch(plan.view, term.blocks[self.block + 1 ..]);
             self.bytes = try read(a, plan.view, ref, plan.view.length, control);
+            self.decoded += 1;
             self.parser = .{ .bytes = self.bytes };
             self.remaining = ref.count;
             self.start = 0;
@@ -482,6 +556,12 @@ pub const Iterator = struct {
     states: []State = &.{},
     heap: []usize = &.{},
     len: usize = 0,
+    retired_reads: usize = 0,
+    pub fn blockReads(self: *const Iterator) usize {
+        var count = self.retired_reads;
+        for (self.states) |state| count += state.cursor.decoded;
+        return count;
+    }
     pub fn init(a: A, plan: *const Plan, control: Control) !Iterator {
         if (!plan.ordered) return error.InvalidData;
         var self: Iterator = .{ .a = @import("../sql/memory_budget.zig").reclaimingAllocator(a), .plan = plan, .control = control };
@@ -515,10 +595,26 @@ pub const Iterator = struct {
         }
     }
     pub fn reset(self: *Iterator) !void {
+        return self.seek(0);
+    }
+    /// Per-block prefix maxima also support overlapping ordered spans. Seeking
+    /// keeps every span that might cross the requested fragment's start.
+    pub fn seek(self: *Iterator, first: u32) !void {
         self.len = 0;
+        try self.control.check();
+        var hints: usize = 0;
+        for (self.plan.terms) |term| {
+            const block = seekBlock(term.blocks, first);
+            if (block < term.blocks.len and hints < 4) {
+                prefetch(self.plan.view, term.blocks[block .. block + 1]);
+                hints += 1;
+            }
+        }
         for (self.states, self.plan.terms, 0..) |*state, term, i| {
             try self.control.check();
+            self.retired_reads += state.cursor.decoded;
             state.cursor.deinit(self.a);
+            state.cursor.block = seekBlock(term.blocks, first);
             state.current = try state.cursor.next(self.a, self.plan, term, self.control);
             if (state.current != null) {
                 self.heap[self.len] = i;
@@ -677,4 +773,80 @@ test "highlight source offset interval planning merges large exact and prefix un
     const bits = (try selectedPages(a, &pages, .{ .ranges = many })).?;
     defer a.free(bits);
     try std.testing.expectEqualSlices(bool, &.{ false, false, true, true, true, false, false }, bits);
+}
+
+test "highlight occurrence block seeks preserve crossing spans and prefetch only selected blocks" {
+    const a = std.testing.allocator;
+    const segment = @import("../segment.zig");
+    const tokens = try a.alloc(analysis.Token, 4096);
+    defer a.free(tokens);
+    for (tokens, 0..) |*token, i| token.* = .{ .term = if (i % 2 == 0) "needle" else "other", .start_byte = @intCast(i * 7), .end_byte = @intCast(i * 7 + 6), .position = @intCast(i) };
+    var memory = segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    const encoded = try write(a, &sink, tokens);
+    const Range = struct {
+        bytes: []const u8,
+        hints: [64]struct { start: u64, len: u64 } = undefined,
+        hint_count: usize = 0,
+        fn close(_: *anyopaque) void {}
+        fn read(raw: *anyopaque, at: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(at)..][0..out.len]);
+        }
+        fn hint(raw: *anyopaque, at: u64, len: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.hint_count == self.hints.len) return;
+            self.hints[self.hint_count] = .{ .start = at, .len = len };
+            self.hint_count += 1;
+        }
+    };
+    const Match = struct {
+        fn needle(_: *anyopaque, term: []const u8) !bool {
+            return std.mem.eql(u8, term, "needle");
+        }
+    };
+    var range: Range = .{ .bytes = memory.out.items };
+    const source = try View.init(.{ .ranges = .{ .ptr = &range, .length = memory.out.items.len, .read_into = Range.read, .close = Range.close, .prefetch = Range.hint } }, 0, memory.out.items.len);
+    var plan = try prepare(a, source, 4096 * 7, encoded.root_raw, encoded.count, .{ .ptr = &range, .matches = Match.needle, .ranges = &.{.{ .lower = "needle" }} }, .none);
+    defer plan.deinit();
+    try std.testing.expect(plan.disjoint);
+    try std.testing.expectEqual(@as(usize, 1), plan.terms.len);
+    const vector = try plan.materialize(a, .none);
+    defer vector.deinit();
+    for ([_]u32{ 1, 2, 7, 17, 100, 513 }) |width| for ([_]u32{ 0, 1, 7, 7000, 14000, 28000 }) |first| {
+        var actual: u32 = 0;
+        for (vector.items) |token| if (token.start_byte < first + width and token.end_byte > first) {
+            actual += 1;
+        };
+        try std.testing.expect(plan.densityUpper(width, first, std.math.maxInt(u32)).? >= actual);
+    };
+    var iterator = try Iterator.init(a, &plan, .none);
+    defer iterator.deinit();
+    try iterator.seek(28000);
+    try std.testing.expectEqual(@as(usize, 2), iterator.blockReads());
+    while (try iterator.next()) |token| try std.testing.expect(token.start_byte >= 2048 * 7);
+    try std.testing.expect(range.hint_count != 0);
+    for (range.hints[0..range.hint_count]) |hint| {
+        const found = for (plan.terms[0].blocks) |block| {
+            if (block.offset == hint.start and block.wire == hint.len) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+    // A long earlier span must remain visible to a later fragment seek.
+    tokens[0].end_byte = 25000;
+    var overlapping = segment.MemorySegmentSink.init(a);
+    defer overlapping.deinit();
+    var output = overlapping.sink();
+    const overlap = try write(a, &output, tokens);
+    var other = try prepare(a, try View.init(.{ .contiguous = overlapping.out.items }, 0, overlapping.out.items.len), 4096 * 7, overlap.root_raw, overlap.count, .{}, .none);
+    defer other.deinit();
+    try std.testing.expect(!other.disjoint);
+    try std.testing.expect(other.densityUpper(100, 20000, 10) == null);
+    var crossing = try Iterator.init(a, &other, .none);
+    defer crossing.deinit();
+    try crossing.seek(20000);
+    const first = (try crossing.next()).?;
+    try std.testing.expectEqual(@as(u32, 0), first.start_byte);
+    try std.testing.expectEqual(@as(u32, 25000), first.end_byte);
 }

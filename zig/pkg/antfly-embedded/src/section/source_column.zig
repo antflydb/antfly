@@ -207,6 +207,12 @@ pub const Text = struct {
         }
         return .{ .view = view, .length = length, .pages = pages, .variant_count = variants, .variants = entries };
     }
+    /// ASCII pages cannot move window endpoints. Otherwise UTF-8 can extend
+    /// a snapped window by at most three bytes at either end.
+    pub fn boundaryExpansion(self: Text) u32 {
+        for (0..self.pages.len / 32) |i| if (std.mem.readInt(u32, self.pages[i * 32 + 24 ..][0..4], .little) != 0) return 6;
+        return 0;
+    }
     pub const Vector = offsets.Vector;
     pub const Selection = offsets.Selection;
     /// All-token reads remain useful to codec/compaction oracles. Serving passes

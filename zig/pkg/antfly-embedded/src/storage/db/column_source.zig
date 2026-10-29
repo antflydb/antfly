@@ -29,9 +29,16 @@ pub const Page = struct {
     selection: ?[]const usize = null,
     owner: ?rows.ColumnOwner = null,
     native_leases: std.ArrayListUnmanaged(rows.ColumnOwner) = .empty,
+    native_builders: ?[]NativeBuilder = null,
+    native_allocator: ?A = null,
+    native_finished: bool = false,
     pub fn retainedBytes(self: *const Page) usize {
         var total = @sizeOf(Page) +| self.arena.queryCapacity() +| (if (self.owner) |owner| owner.retained_bytes else 0);
         for (self.native_leases.items) |lease| total +|= lease.retained_bytes;
+        if (self.native_builders) |builders| {
+            total +|= builders.len * @sizeOf(NativeBuilder);
+            for (builders) |*builder| total +|= builder.bytes();
+        }
         return total;
     }
     pub fn retain(self: *Page) void {
@@ -43,6 +50,10 @@ pub const Page = struct {
         if (self.owner) |owner| owner.release();
         for (self.native_leases.items) |lease| lease.release();
         self.native_leases.deinit(a);
+        if (self.native_builders) |builders| {
+            for (builders) |*builder| builder.deinit(self.native_allocator.?);
+            self.native_allocator.?.free(builders);
+        }
         self.arena.deinit();
         a.destroy(self);
     }
@@ -51,34 +62,103 @@ pub const Page = struct {
         self.retain();
         return .{ .page = self, .index = if (self.selection) |selection| selection[index] else index };
     }
-    const NativeCells = struct {
-        values: []std.json.Value,
+    /// Mutable only while a page is built. Scalar buffers become the final
+    /// physical vectors; only genuinely heterogeneous values need JSON cells.
+    const NativeBuilder = struct {
+        const Values = union(enum) { none, integer: []i64, float: []f64, bool: []bool, string: [][]const u8, json: []std.json.Value };
+        values: Values = .none,
+        nulls: []u8 = &.{},
+        fn deinit(self: *@This(), a: A) void {
+            switch (self.values) {
+                .none => {},
+                inline else => |v| a.free(v),
+            }
+            a.free(self.nulls);
+        }
+        fn bytes(self: *const @This()) usize {
+            return self.nulls.len + switch (self.values) {
+                .none => @as(usize, 0),
+                inline else => |v| v.len * @sizeOf(@typeInfo(@TypeOf(v)).pointer.child),
+            };
+        }
+        fn at(self: *const @This(), cell_index: usize) std.json.Value {
+            if (self.nulls[cell_index] != 0) return .null;
+            return switch (self.values) {
+                .none => .null,
+                .json => |v| v[cell_index],
+                inline else => |v, tag| @unionInit(std.json.Value, @tagName(tag), v[cell_index]),
+            };
+        }
         fn read(raw: *const anyopaque, index: usize) !std.json.Value {
             const self: *const @This() = @ptrCast(@alignCast(raw));
-            if (index >= self.values.len) return error.RowSourceColumnLengthMismatch;
-            return self.values[index];
+            if (index >= self.nulls.len) return error.RowSourceColumnLengthMismatch;
+            return self.at(index);
+        }
+        fn set(self: *@This(), a: A, cell_index: usize, value: std.json.Value) !void {
+            if (value == .null) {
+                self.nulls[cell_index] = 1;
+                return;
+            }
+            if (self.values == .none) switch (value) {
+                inline .integer, .float, .bool, .string => |_, tag| {
+                    const T = @FieldType(std.json.Value, @tagName(tag));
+                    const buffer = try a.alloc(T, self.nulls.len);
+                    const zero: T = if (tag == .string) "" else if (tag == .bool) false else 0;
+                    @memset(buffer, zero);
+                    self.values = @unionInit(Values, @tagName(tag), buffer);
+                },
+                else => {
+                    const buffer = try a.alloc(std.json.Value, self.nulls.len);
+                    @memset(buffer, .null);
+                    self.values = .{ .json = buffer };
+                },
+            };
+            const compatible = switch (self.values) {
+                .none => unreachable,
+                .json => true,
+                inline else => |_, tag| std.meta.activeTag(value) == @field(std.meta.Tag(std.json.Value), @tagName(tag)),
+            };
+            if (!compatible) {
+                const buffer = try a.alloc(std.json.Value, self.nulls.len);
+                for (buffer, 0..) |*out, i| out.* = self.at(i);
+                switch (self.values) {
+                    .none => unreachable,
+                    inline else => |v| a.free(v),
+                }
+                self.values = .{ .json = buffer };
+            }
+            self.nulls[cell_index] = 0;
+            switch (self.values) {
+                .none => unreachable,
+                .json => |v| v[cell_index] = value,
+                inline else => |v, tag| v[cell_index] = @field(value, @tagName(tag)),
+            }
         }
     };
-    /// Build result vectors over retained native payloads. Containers decode in
-    /// this page's arena; scalar strings borrow an explicit chunk/page lease.
+    /// Build result vectors over retained native payloads. Buffers are admitted
+    /// and reclaimable independently of the page's container/payload arena.
     pub fn native(a: A, names: []const []const u8, count: usize) !*Page {
         const self = try a.create(Page);
         self.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = count };
         errdefer self.release();
+        const work = @import("../../sql/memory_budget.zig").reclaimingAllocator(a);
+        self.native_allocator = work;
+        const builders = try work.alloc(NativeBuilder, names.len);
+        @memset(builders, .{});
+        self.native_builders = builders;
         const pa = self.arena.allocator();
         const columns = try pa.alloc(rows.ColumnVector, names.len);
-        for (columns, names) |*column, name| {
-            const cells = try pa.create(NativeCells);
-            cells.values = try pa.alloc(std.json.Value, count);
-            @memset(cells.values, .null);
-            column.* = .{ .name = try pa.dupe(u8, name), .values = .{ .encoded = .{ .ptr = cells, .begin = 0, .count = count, .kind = .json, .read = NativeCells.read } } };
+        for (columns, names, builders) |*column, name, *builder| {
+            builder.nulls = try work.alloc(u8, count);
+            @memset(builder.nulls, 1);
+            column.* = .{ .name = try pa.dupe(u8, name), .values = .{ .encoded = .{ .ptr = builder, .begin = 0, .count = count, .kind = .json, .read = NativeBuilder.read } } };
         }
         self.columns = columns;
         return self;
     }
-    pub fn setNative(self: *Page, row_index: usize, column_index: usize, value: std.json.Value) void {
-        const cells: *NativeCells = @ptrCast(@alignCast(@constCast(self.columns[column_index].values.encoded.ptr)));
-        cells.values[row_index] = value;
+    pub fn setNative(self: *Page, row_index: usize, column_index: usize, value: std.json.Value) !void {
+        std.debug.assert(!self.native_finished and row_index < self.len);
+        try self.native_builders.?[column_index].set(self.native_allocator.?, row_index, value);
     }
     /// Consumes a lease even on allocation failure. No source reader, request
     /// context, or artifact pin is retained: only authenticated decoded bytes.
@@ -91,37 +171,21 @@ pub const Page = struct {
         try self.native_leases.append(self.a, lease);
     }
     pub fn finishNative(self: *Page) !void {
-        const pa = self.arena.allocator();
-        for (@constCast(self.columns)) |*column| {
-            const cells: *const NativeCells = @ptrCast(@alignCast(column.values.encoded.ptr));
-            var tag: ?std.meta.Tag(std.json.Value) = null;
-            var uniform = true;
-            const nulls = try pa.alloc(u8, self.len);
-            for (cells.values, nulls) |value, *flag| {
-                flag.* = @intFromBool(value == .null);
-                if (value == .null) continue;
-                if (tag) |prior| {
-                    if (prior != std.meta.activeTag(value)) uniform = false;
-                } else tag = std.meta.activeTag(value);
-            }
-            column.nulls = .{ .bytes = nulls };
-            if (!uniform or tag == null) continue;
-            switch (tag.?) {
-                inline .integer, .float, .bool, .string => |kind| {
-                    const T = @FieldType(std.json.Value, @tagName(kind));
-                    const values = try pa.alloc(T, self.len);
-                    for (cells.values, values) |value, *out| out.* = if (value == .null) (if (kind == .string) "" else if (kind == .bool) false else 0) else @field(value, @tagName(kind));
-                    column.values = @unionInit(rows.ColumnValues, switch (kind) {
-                        .integer => "i64",
-                        .float => "f64",
-                        .string => "bytes",
-                        .bool => "bool",
-                        else => unreachable,
-                    }, values);
-                },
+        std.debug.assert(!self.native_finished);
+        for (@constCast(self.columns), self.native_builders.?) |*column, *builder| {
+            column.nulls = .{ .bytes = builder.nulls };
+            switch (builder.values) {
+                inline .integer, .float, .bool, .string => |values, tag| column.values = @unionInit(rows.ColumnValues, switch (tag) {
+                    .integer => "i64",
+                    .float => "f64",
+                    .bool => "bool",
+                    .string => "bytes",
+                    else => unreachable,
+                }, values),
                 else => {},
             }
         }
+        self.native_finished = true;
     }
     /// Copy only selected vector slots before the provider advances. Dictionary
     /// entries are gathered once per page, preserving shared string storage.
@@ -907,4 +971,57 @@ test "external lake bounded window profiles prepared string sizing and plain tra
         }
         bytes[position] = 'x';
     };
+}
+
+test "external lake native typed result construction retains only physical scalar buffers" {
+    const a = std.testing.allocator;
+    const count = 4096;
+    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+    var budget = @import("../../sql/memory_budget.zig"){ .backing = a, .limit = 512 * 1024 };
+    {
+        const page = try Page.native(budget.allocator(), &names, count);
+        defer page.release();
+        for (0..count) |row| for (0..names.len) |column| {
+            try page.setNative(row, column, if (row % 11 == 0) .null else .{ .integer = @as(i64, @intCast(row)) + 9007199254740993 });
+        };
+        try page.finishNative();
+        for (page.columns) |column| {
+            try std.testing.expect(column.values == .i64);
+            try std.testing.expectEqual(@as(i64, 9007199254740994), column.values.i64[1]);
+            try std.testing.expect(column.nulls.isNull(0));
+        }
+        try std.testing.expect(page.retainedBytes() < count * names.len * 16);
+        std.debug.print("NATIVE_RESULT_TYPED cells={d} generic_cell_bytes={d} retained_bytes={d} peak_bytes={d}\n", .{ count * names.len, @sizeOf(std.json.Value), page.retainedBytes(), budget.peak });
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+test "external lake native typed result construction widens heterogeneous values and unwinds allocation faults" {
+    const Case = struct {
+        fn run(a: A) !void {
+            const page = try Page.native(a, &.{ "mixed", "integer", "string", "empty" }, 5);
+            defer page.release();
+            const values = [_]std.json.Value{ .{ .integer = 9007199254740993 }, .{ .float = 1.5 }, .{ .string = "borrowed" }, .null, .{ .bool = true } };
+            for (values, 0..) |value, row| {
+                try page.setNative(row, 0, value);
+                try page.setNative(row, 1, .{ .integer = -9007199254740993 });
+                try page.setNative(row, 2, .{ .string = "survives finish" });
+            }
+            try page.finishNative();
+            try std.testing.expect(page.columns[0].values == .encoded);
+            try std.testing.expect(page.columns[1].values == .i64);
+            try std.testing.expect(page.columns[2].values == .bytes);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (values, 0..) |value, row| {
+                const actual = try (Row{ .page = page, .index = row }).value(&scratch);
+                try std.testing.expectEqualDeep(value, actual.object.get("mixed").?);
+                try std.testing.expectEqual(@as(i64, -9007199254740993), actual.object.get("integer").?.integer);
+                try std.testing.expect(actual.object.get("empty").? == .null);
+            }
+        }
+    };
+    try Case.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Case.run, .{});
 }

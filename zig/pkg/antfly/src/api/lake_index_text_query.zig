@@ -3840,7 +3840,7 @@ fn requiresEncodedSource(req: types.SearchRequest) bool {
 fn projectedHighlightSource(scratch: *std.heap.ArenaAllocator, hit: *const types.SearchHit, fields: []const []const u8) !?std.json.Value {
     _ = scratch.reset(.retain_capacity);
     const from_columns = hit.source_value == null;
-    const value = hit.source_value orelse if (hit.column_source) |source| try source.value(scratch) else return null;
+    const value = hit.source_value orelse if (hit.column_source) |source| try source.valueForProjection(scratch, .{ .fields = fields, .include_all_fields = false }) else return null;
     for (fields) |field| {
         const found = local.api_json_helpers.extractJsonPathValue(value, field) orelse return null;
         if (from_columns and std.mem.indexOfScalar(u8, field, '.') == null and found == .string and found.string.len > 4096) return null;
@@ -5786,7 +5786,7 @@ test "external lake highlight projection reuses small column leases and keeps la
         defer page.release();
         const text = try page.arena.allocator().alloc(u8, size);
         @memset(text, 'x');
-        page.setNative(0, 0, .{ .string = text });
+        try page.setNative(0, 0, .{ .string = text });
         try page.finishNative();
         var hit: types.SearchHit = .{ .id = try a.dupe(u8, "row"), .column_source = page.row(0) };
         defer hit.deinit(a);
@@ -5819,4 +5819,30 @@ test "external lake scalar outputs hydrate dependencies independently of the pub
     try std.testing.expectEqualStrings("hidden", hidden[0]);
     req.field_projection_json = "{\"fields\":[{\"name\":\"one\",\"expression\":{\"literal\":1}}]}";
     try std.testing.expectEqual(@as(usize, 0), (try projectionColumns(a, table, req)).?.len);
+}
+
+test "external lake highlight projected dependencies avoid unrelated JSON decoding" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 40001);
+    defer a.free(payload);
+    payload[0] = '[';
+    for (0..20000) |i| {
+        payload[1 + i * 2] = '0';
+        payload[2 + i * 2] = if (i == 19999) ']' else ',';
+    }
+    const page = try local.storage_db_column_source.Page.copy(a, .{
+        .snapshot = .{ .table_id = "docs", .snapshot_id = "one" },
+        .row_refs = &.{.{ .relational_key = "row" }},
+        .columns = &.{.{ .name = "payload", .values = .{ .json = &.{payload} } }},
+    }, &.{0});
+    defer page.release();
+    var hit: types.SearchHit = .{ .id = try a.dupe(u8, "row"), .column_source = page.row(0) };
+    defer hit.deinit(a);
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 };
+    var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+    defer scratch.deinit();
+    const selected = try hit.column_source.?.valueForProjection(&scratch, .{ .fields = @as([]const []const u8, &.{"body"}), .include_all_fields = false });
+    try std.testing.expectEqual(@as(usize, 0), selected.object.count());
+    try std.testing.expect((try projectedHighlightSource(&scratch, &hit, &.{"body"})) == null);
+    std.debug.print("PROJECTION_DEPENDENCY_PROBE unrelated_json_bytes={d} budget={d} selected=success helper=declined_without_decoding\n", .{ payload.len, budget.limit });
 }

@@ -259,16 +259,22 @@ pub const Hydrator = struct {
         const Page = local.storage_db_column_source.Page;
         const page = try Page.native(a, fields, input.len);
         errdefer page.release();
+        var indices: std.StringHashMapUnmanaged(usize) = .empty;
+        defer indices.deinit(a);
+        for (fields, 0..) |field, i| {
+            const entry = try indices.getOrPut(a, field);
+            if (!entry.found_existing) entry.value_ptr.* = i;
+        }
         const Output = struct {
             page: *Page,
             input: Input,
+            indices: *const std.StringHashMapUnmanaged(usize),
             fn index(output: *@This(), name: []const u8) !usize {
-                for (output.page.columns, 0..) |vector, i| if (std.mem.eql(u8, name, vector.name)) return i;
-                return error.InvalidNativeLakeTextCorpus;
+                return output.indices.get(name) orelse error.InvalidNativeLakeTextCorpus;
             }
             fn accept(raw: *anyopaque, _: A, row: usize, name: []const u8, value: std.json.Value) !void {
                 const output: *@This() = @ptrCast(@alignCast(raw));
-                output.page.setNative(row, try output.index(name), value);
+                try output.page.setNative(row, try output.index(name), value);
             }
             fn retain(raw: *anyopaque, lease: local.storage_rowsource_types.ColumnOwner) !void {
                 try @as(*@This(), @ptrCast(@alignCast(raw))).page.adoptNativeLease(lease);
@@ -276,11 +282,11 @@ pub const Hydrator = struct {
             fn text(raw: *anyopaque, _: A, row: usize, name: []const u8, value: local.section_source_column.Text) !bool {
                 const output: *@This() = @ptrCast(@alignCast(raw));
                 const bytes = try value.read(output.page.arena.allocator(), 0, value.length, .{ .ptr = &output.input, .check_fn = Input.checkToken });
-                output.page.setNative(row, try output.index(name), .{ .string = bytes });
+                try output.page.setNative(row, try output.index(name), .{ .string = bytes });
                 return true;
             }
         };
-        var output: Output = .{ .page = page, .input = input };
+        var output: Output = .{ .page = page, .input = input, .indices = &indices };
         try self.visitRows(a, snapshot, input, fields, .{ .ptr = &output, .accept = Output.accept, .text = Output.text, .retain = Output.retain, .decode_allocator = page.arena.allocator() });
         try page.finishNative();
         return page;

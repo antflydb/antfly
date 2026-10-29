@@ -1947,9 +1947,9 @@ values. The benchmark controls cover both small/wide and large/dense shapes.
 
 ### Selective original-offset vectors and shared indexing analysis
 
-Stored-source recipe **v7** (`AFSC0004`, `AFST4`) keeps independently compressed
+Stored-source recipe **v8** (`AFSC0004`, `AFST4`) keeps independently compressed
 64-KiB source pages and replaces flat token vectors with relocatable term
-navigation (`AFOV0002`). A ceiling directory routes exact and prefix matchers to
+navigation (`AFOV0003`). A ceiling directory routes exact and prefix matchers to
 compressed dictionary pages of at most 64 terms. Other supported patterns inspect
 the dictionary once per distinct term. Each matching term names independently
 compressed occurrence blocks of at most 1,024 records, containing a signed source
@@ -1997,7 +1997,7 @@ query shapes, execution order and environment qualify any timing claim.
 
 ### Dense occurrence streams, Unicode metadata and equivalent bindings
 
-Recipe v7 keeps UTF-8 continuation maps beside their individual 64-KiB source
+Recipe v8 keeps UTF-8 continuation maps beside their individual 64-KiB source
 pages. A 32-byte descriptor per page names the compressed source and optional
 boundary map; ASCII pages omit the map. Snippet clipping retains two decoded
 maps, each at most 8 KiB, instead of decoding a whole-value bitmap. Sorted and
@@ -2042,9 +2042,58 @@ stream. This keeps cross-document acceleration available for ordinary builds
 and substring producers without dropping highlight offsets or retaining a
 second token owner. A warm-cache oracle covers both single and grouped bindings.
 
-No API options or result-size limits change. Native reader protocol 93 and
-compiled runtime ABI 69 fence the new source layout; older derived text
+No API options or result-size limits change. Native reader protocol 94 and
+compiled runtime ABI 70 fence the new source layout; older derived text
 publications rebuild through reconciliation. Qualification includes exact
 comparison against the full fragment selector across UTF-8 boundaries, fragment
 counts and sizes, bounded live-memory probes, analyzer aliases, allocation
 failures, cancellation and real Parquet/Iceberg restart without source objects.
+
+
+### Exact occurrence-block pruning and physical result builders
+
+Stored-source recipe v8 adds a prefix maximum source end to each occurrence
+block and minimum consecutive start spacing and end-to-start gap to each term.
+The writer separately attests strict disjointness of all emitted source spans;
+ordered overlapping spans can seek but cannot use the density certificate.
+Summaries share the enclosing section's authenticated publication identity.
+Each block reference grows from 20 to 24 wire bytes, and each dictionary term
+adds eight bytes. Compaction copies this relocatable evidence without reanalysis.
+
+For an integer window of width `W`, a repeated disjoint term contributes at most
+one occurrence when `W <= minimum_gap + 1`, otherwise at most
+`2 + floor((W - 2 - minimum_gap) / minimum_start)`. Cap each term by its remaining
+occurrence count and sum across matching terms. Omitting unmatched terms can
+only widen gaps. UTF-8 clipping permits at most six extra bytes; ASCII descriptors
+prove no expansion. A full candidate heap can stop when this upper bound cannot
+beat its worst retained candidate, including monotone source-start and end ties.
+Checks run every 256 candidates. This preserves the existing greedy fragment
+selection exactly. Missing disjointness or an inconclusive bound retains the
+complete streaming pass, including arbitrary overlapping analyzer output.
+
+After choosing fragments, binary searches over block prefix maxima skip blocks
+whose spans all end before each output interval. Prefix maxima retain an early
+long span crossing a later interval. Each term then decodes locally from the
+selected block; replay stops after the interval. Lookahead hints cover only
+selected occurrence blocks, at most four references and 256 KiB per hint batch.
+The enclosing source owns bounded asynchronous work on the shared I/O scheduler,
+including cancellation, joining and cache admission. Hints remain optional.
+Local warm benchmarks cannot qualify the cloud-latency benefit of prefetch.
+
+Native result pages allocate physical scalar buffers as values arrive, preserving
+nullable i64, f64, boolean and string vectors without an intermediate matrix of
+JSON cells. Only genuinely heterogeneous or structured values use generic
+cells. Widening copies the previous scalar representation once and frees it;
+builder buffers remain individually reclaimable under memory admission and
+become the final vectors without a finishing copy. Result leases retain borrowed
+payloads. Field-major hydration uses a single request-local field-name lookup
+instead of scanning all projected names for every cell. Projected highlighting
+materializes only its own field dependencies; unrelated lazy JSON columns stay
+encoded. Final response-size limits are unchanged.
+
+Native oracles compare streaming/pruned fragments with the full selector across
+fragment counts, widths, UTF-8 boundaries and overlapping spans, and cover exact
+large integers, nulls, heterogeneous widening, allocation failures and cleanup.
+Real Parquet/Iceberg restart tests and `bench/lake/typed_results.py` exercise
+public delivery. Keep candidate/block-work and retained-byte measurements
+separate from local Debug timing and provider qualification.
