@@ -64,6 +64,12 @@ or levels, 1 MiB per input and 16 MiB per request; model and executor limits can
 narrow these ceilings. Executor admission counts inputs separately from their
 expanded questions.
 
+GLiNER Decide-1B admits one input per wire request. Decision enrichment
+`batch_size` controls concurrent one-document requests; it does not combine
+documents into a multi-input Decide request. The default batch size is
+supported. Request sizes include the complete schema/question prompt, and
+requests exceeding a qualified bound fail instead of truncating.
+
 ## SQL, providers and bindings
 
 The shared decision provider serves `ai_decide`, `ai_choice`, `ai_score` and
