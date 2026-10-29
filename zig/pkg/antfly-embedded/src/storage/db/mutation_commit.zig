@@ -236,6 +236,121 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return batchInternalPreparedOwned(&owner, req, profile, opts, generated_memo, prepared_row_allocator);
         }
 
+        // These resources share the entire preparation/commit lifetime. Keeping
+        // their ownership in one frame makes each fallible exit invoke one
+        // cleanup, rather than expanding every collection walk at every try.
+        const PreparedBatchResources = struct {
+            alloc: Allocator,
+            effects_arena: std.heap.ArenaAllocator,
+            rows: ?[]?mapper.PreparedRelationalWrite = null,
+            effects: ?[]PreparedRowEffects = null,
+            generated: ?PrecomputedGeneratedBatch = null,
+            generated_plan: ?GeneratedBatchWritePlan = null,
+            write_plan: ?index_manager_mod.IndexManager.WritePlanSnapshotView = null,
+            document_generated: ?PrecomputedGeneratedBatch = null,
+            generated_snapshot: GeneratedWriteReadSnapshot = .{},
+
+            noinline fn deinit(resources: *@This()) void {
+                const alloc = resources.alloc;
+                // Preserve reverse acquisition order: plans and row borrows
+                // are released before their catalog lease and backing arena.
+                resources.generated_snapshot.deinit(alloc);
+                if (resources.document_generated) |*generated| generated.deinit(alloc);
+                if (resources.generated_plan) |*plan| plan.deinit();
+                if (resources.generated) |*generated| generated.deinit(alloc);
+                if (resources.effects) |effects| alloc.free(effects);
+                if (resources.rows) |rows| {
+                    for (rows) |*maybe_row| if (maybe_row.*) |*row| row.deinit(alloc);
+                    alloc.free(rows);
+                }
+                if (resources.write_plan) |*plan| plan.release();
+                resources.effects_arena.deinit();
+                resources.* = undefined;
+            }
+        };
+
+        const MutationWriteBuffers = struct {
+            alloc: Allocator,
+            use_preprepared_rows: bool,
+            store_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
+            owned_store_keys: std.ArrayListUnmanaged([]u8) = .empty,
+            owned_store_values: std.ArrayListUnmanaged([]u8) = .empty,
+            timestamp_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
+            explicit_embedding_artifact_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+            explicit_graph_artifact_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+            delete_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+            owned_delete_keys: std.ArrayListUnmanaged([]u8) = .empty,
+            graph_artifact_clears: std.ArrayListUnmanaged(GraphArtifactClear) = .empty,
+            timestamp_delete_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+            overwrite_probe_entries: std.ArrayListUnmanaged(OverwriteProbeEntry) = .empty,
+            identity_upsert_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+            identity_upsert_write_indexes: std.ArrayListUnmanaged(usize) = .empty,
+            identity_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
+            identity_visibility_deletes: std.ArrayListUnmanaged([]u8) = .empty,
+            prepared_embedding_artifact_count: usize = 0,
+            prepared_graph_artifact_count: usize = 0,
+            vector_store_field_names: [][]u8 = &.{},
+
+            noinline fn deinit(buffers: *@This()) void {
+                for (buffers.identity_visibility_deletes.items) |key| buffers.alloc.free(key);
+                buffers.identity_visibility_deletes.deinit(buffers.alloc);
+
+                for (buffers.identity_writes.items) |item| {
+                    buffers.alloc.free(@constCast(item.key));
+                    buffers.alloc.free(@constCast(item.value));
+                }
+                buffers.identity_writes.deinit(buffers.alloc);
+
+                buffers.identity_upsert_write_indexes.deinit(buffers.alloc);
+                buffers.identity_upsert_keys.deinit(buffers.alloc);
+                buffers.overwrite_probe_entries.deinit(buffers.alloc);
+
+                for (buffers.timestamp_delete_keys.items) |key| buffers.alloc.free(@constCast(key));
+                buffers.timestamp_delete_keys.deinit(buffers.alloc);
+
+                if (!buffers.use_preprepared_rows)
+                    for (buffers.graph_artifact_clears.items) |*item| item.deinit(buffers.alloc);
+                buffers.graph_artifact_clears.deinit(buffers.alloc);
+
+                for (buffers.owned_delete_keys.items) |key| buffers.alloc.free(key);
+                buffers.owned_delete_keys.deinit(buffers.alloc);
+
+                buffers.delete_keys.deinit(buffers.alloc);
+
+                for (buffers.explicit_graph_artifact_writes.items[buffers.prepared_graph_artifact_count..]) |item| {
+                    buffers.alloc.free(@constCast(item.key));
+                    buffers.alloc.free(@constCast(item.value));
+                }
+                buffers.explicit_graph_artifact_writes.deinit(buffers.alloc);
+
+                for (buffers.explicit_embedding_artifact_writes.items[buffers.prepared_embedding_artifact_count..]) |item| {
+                    buffers.alloc.free(@constCast(item.key));
+                    buffers.alloc.free(@constCast(item.value));
+                }
+                buffers.explicit_embedding_artifact_writes.deinit(buffers.alloc);
+
+                if (!buffers.use_preprepared_rows) {
+                    for (buffers.timestamp_writes.items) |item| {
+                        buffers.alloc.free(@constCast(item.key));
+                        buffers.alloc.free(@constCast(item.value));
+                    }
+                }
+                buffers.timestamp_writes.deinit(buffers.alloc);
+
+                for (buffers.vector_store_field_names) |field| buffers.alloc.free(field);
+                if (buffers.vector_store_field_names.len > 0) buffers.alloc.free(buffers.vector_store_field_names);
+
+                for (buffers.owned_store_values.items) |value| buffers.alloc.free(value);
+                buffers.owned_store_values.deinit(buffers.alloc);
+
+                for (buffers.owned_store_keys.items) |key| buffers.alloc.free(key);
+                buffers.owned_store_keys.deinit(buffers.alloc);
+
+                buffers.store_writes.deinit(buffers.alloc);
+                buffers.* = undefined;
+            }
+        };
+
         noinline fn batchInternalPreparedOwned(
             self: *S.PreparedBatchOwner,
             req: types.BatchRequest,
@@ -457,42 +572,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Row side effects outlive speculative preparation but are consumed as
             // borrowed slices by the serialized commit. A batch arena turns their
             // many small keys/payloads into bump allocations and one release.
-            var prepared_effects_arena = std.heap.ArenaAllocator.init(preparation_alloc);
-            defer prepared_effects_arena.deinit();
-            var preprepared_rows: ?[]?mapper.PreparedRelationalWrite = null;
-            var preprepared_effects: ?[]PreparedRowEffects = null;
-            var preprepared_generated: ?PrecomputedGeneratedBatch = null;
-            var preprepared_generated_plan: ?GeneratedBatchWritePlan = null;
+            var preparation = PreparedBatchResources{
+                .alloc = preparation_alloc,
+                .effects_arena = std.heap.ArenaAllocator.init(preparation_alloc),
+            };
+            defer preparation.deinit();
             var prepared_write_plan_generation: ?u64 = null;
-            var write_plan_snapshot: ?index_manager_mod.IndexManager.WritePlanSnapshotView = null;
-            defer if (write_plan_snapshot) |*plan_snapshot| plan_snapshot.release();
-            defer if (preprepared_rows) |rows| {
-                for (rows) |*maybe_row| if (maybe_row.*) |*row| row.deinit(preparation_alloc);
-                preparation_alloc.free(rows);
-            };
-            defer if (preprepared_effects) |effects| {
-                preparation_alloc.free(effects);
-            };
-            defer if (preprepared_generated) |*generated| generated.deinit(preparation_alloc);
-            defer if (preprepared_generated_plan) |*plan| plan.deinit();
             // Document-mode analogue of the relational hoist below: extraction and
             // generated-enrichment precompute (asset/chunk/embedding requests) run
             // here, before the exclusive apply lock, instead of unconditionally
-            // in-lock. `preprepared_document_generated` is reused under the lock
+            // in-lock. `preparation.document_generated` is reused under the lock
             // only if the catalog generation this precompute observed is still
             // current (`document_generated_write_plan_generation`) and this
             // batch's own write keys have not been touched by another commit
-            // since (`generated_precompute_snapshot`, validated unconditionally
+            // since (`preparation.generated_snapshot`, validated unconditionally
             // alongside `transform_snapshot` below). Either check failing forces
             // `PreparedGenerationChanged`/`PreparedReadSetChanged`, which the
             // existing bounded retry in `batchInternalWithPreparationAllocator`
             // already handles by recomputing from a fresh snapshot -- never by
             // silently reusing stale precompute.
-            var preprepared_document_generated: ?PrecomputedGeneratedBatch = null;
-            defer if (preprepared_document_generated) |*generated| generated.deinit(preparation_alloc);
             var document_generated_write_plan_generation: ?u64 = null;
-            var generated_precompute_snapshot: GeneratedWriteReadSnapshot = .{};
-            defer generated_precompute_snapshot.deinit(preparation_alloc);
             if (request_schema_view) |view| if (view.storageMode() == .relational) {
                 var stable_keys = std.StringHashMapUnmanaged(void).empty;
                 defer stable_keys.deinit(preparation_alloc);
@@ -520,13 +619,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         splitShadowRequiresMaterializedDerivedBatch(self);
                     const rows = try preparation_alloc.alloc(?mapper.PreparedRelationalWrite, effective_req.writes.len);
                     @memset(rows, null);
-                    preprepared_rows = rows;
+                    preparation.rows = rows;
                     const effects = try preparation_alloc.alloc(PreparedRowEffects, effective_req.writes.len);
                     for (effects) |*effect| effect.* = .{};
-                    preprepared_effects = effects;
+                    preparation.effects = effects;
                     const prepare_start_ns = monotonicTimeNs();
-                    write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
-                    prepared_write_plan_generation = write_plan_snapshot.?.generation();
+                    preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                    prepared_write_plan_generation = preparation.write_plan.?.generation();
                     try prepareRelationalRows(
                         prepared_row_allocator,
                         S.ownerField(self, "backend_runtime").*.io(),
@@ -535,8 +634,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         view.validator(),
                         view.tableSchema().*,
                         view.physicalLayout(),
-                        write_plan_snapshot.?.plan().*,
-                        retainPreparedTextRoots(req.sync_level, write_plan_snapshot.?.plan().has_text_consumers, splitShadowRequiresMaterializedDerivedBatch(self)),
+                        preparation.write_plan.?.plan().*,
+                        retainPreparedTextRoots(req.sync_level, preparation.write_plan.?.plan().has_text_consumers, splitShadowRequiresMaterializedDerivedBatch(self)),
                         preparation_timestamp_ns,
                         rows,
                         opts.durable_rows,
@@ -570,7 +669,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         S.ownerField(self, "core").*.index_manager.writePlanGeneration() != prepared_write_plan_generation.?)
                         return error.PreparedGenerationChanged;
                     {
-                        const effects_alloc = prepared_effects_arena.allocator();
+                        const effects_alloc = preparation.effects_arena.allocator();
                         for (effective_req.writes, rows, effects) |write, *maybe_row, *effect| {
                             if (maybe_row.*) |*row| {
                                 row.extracted.artifact_keys_owned_individually = false;
@@ -609,7 +708,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     );
                                 }
                                 for (row.extracted.graph_writes) |graph_write| {
-                                    const generation = write_plan_snapshot.?.plan().graphCoverageGeneration(graph_write.index_name) orelse return error.IndexNotFound;
+                                    const generation = preparation.write_plan.?.plan().graphCoverageGeneration(graph_write.index_name) orelse return error.IndexNotFound;
                                     const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
                                     try appendPreparedGraphEdgeArtifactWrite(effects_alloc, S.ownerField(self, "core").*.store, &effect.graph_writes, graph_write, generation, graph_entry.ttl_duration_ns, preparation_timestamp_ns);
                                 }
@@ -627,26 +726,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, rows.len);
                             defer preparation_alloc.free(extracted_rows);
                             for (rows, 0..) |maybe_row, index| extracted_rows[index] = maybe_row.?.extracted;
-                            preprepared_generated_plan = try planGeneratedEnrichmentsForRows(
+                            preparation.generated_plan = try planGeneratedEnrichmentsForRows(
                                 preparation_alloc,
                                 effective_req,
                                 extracted_rows,
-                                write_plan_snapshot.?.plan().*,
+                                preparation.write_plan.?.plan().*,
                             );
                         }
                     }
-                    if (preprepared_generated_plan != null) {
+                    if (preparation.generated_plan != null) {
                         var extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, rows.len);
                         defer preparation_alloc.free(extracted_rows);
                         for (rows, 0..) |maybe_row, index| extracted_rows[index] = maybe_row.?.extracted;
-                        preprepared_generated = try prepareGeneratedEnrichments(
+                        preparation.generated = try prepareGeneratedEnrichments(
                             self,
                             preparation_alloc,
                             effective_req,
                             extracted_rows,
                             generatedPrecomputeModeForSyncLevel(req.sync_level),
                             opts.force_generated_artifact_names,
-                            &preprepared_generated_plan.?,
+                            &preparation.generated_plan.?,
                             generated_memo,
                         );
                     }
@@ -681,12 +780,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     splitShadowRequiresMaterializedDerivedBatch(self);
                 if (requires_inline_generated and effective_req.writes.len > 0) {
                     const precompute_generated_start_ns = monotonicTimeNs();
-                    generated_precompute_snapshot = try self.captureGeneratedWriteReadSnapshot(preparation_alloc, effective_req.writes);
+                    preparation.generated_snapshot = try self.captureGeneratedWriteReadSnapshot(preparation_alloc, effective_req.writes);
                     // Every catalog-derived input this loop needs (dense/sparse
                     // direct-field vectors, graph field-edge configs) is read
                     // from an owned, refcounted WritePlanSnapshot acquired here
                     // -- the same mechanism the relational-row hoist above uses
-                    // via `write_plan_snapshot` -- instead of touching
+                    // via `preparation.write_plan` -- instead of touching
                     // `S.ownerField(self, "core").*.index_manager`'s live catalog arrays directly.
                     // The snapshot is cloned under `catalog_mutex.lockShared()`
                     // once per generation and stays valid after that lock is
@@ -697,15 +796,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // any catalog publication racing with this precompute is
                     // also caught as a generation change under the lock, never
                     // silently used.
-                    write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
-                    document_generated_write_plan_generation = write_plan_snapshot.?.generation();
+                    preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                    document_generated_write_plan_generation = preparation.write_plan.?.generation();
                     const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
                     var extracted_rows_initialized: usize = 0;
                     defer {
                         for (extracted_rows[0..extracted_rows_initialized]) |*item| item.deinit(preparation_alloc);
                         preparation_alloc.free(extracted_rows);
                     }
-                    const doc_plan = write_plan_snapshot.?.plan().*;
+                    const doc_plan = preparation.write_plan.?.plan().*;
                     const doc_plan_needs_parse = doc_plan.graph_fields.len != 0 or doc_plan.dense_fields.len != 0 or doc_plan.sparse_fields.len != 0;
                     for (effective_req.writes, 0..) |write, i| {
                         if (isMetadataKey(write.key)) {
@@ -728,7 +827,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
                         }
                     }
-                    preprepared_document_generated = try prepareGeneratedEnrichments(
+                    preparation.document_generated = try prepareGeneratedEnrichments(
                         self,
                         preparation_alloc,
                         effective_req,
@@ -820,9 +919,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // interval between the fast preflight above and lock acquisition.
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
-            if (write_plan_snapshot == null and (S.ownerField(self, "core").*.index_manager.hasGroupSources() or opts.group_source_command != null) and
+            if (preparation.write_plan == null and (S.ownerField(self, "core").*.index_manager.hasGroupSources() or opts.group_source_command != null) and
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
-                write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
             const apply_lock_wait_start_ns = monotonicTimeNs();
             try self.lockApplyForPortableRuntime();
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
@@ -1135,11 +1234,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Coalescer draining above can release/reacquire apply. An index-only
             // publication need not change the schema or managed-index generation.
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
-            if (write_plan_snapshot) |pinned| if (pinned.plan().group_sources) |group_plan| {
+            if (preparation.write_plan) |pinned| if (pinned.plan().group_sources) |group_plan| {
                 if (group_plan.entries.len > 0 and pinned.generation() != S.ownerField(self, "core").*.index_manager.writePlanGeneration()) return error.PreparedGenerationChanged;
             };
             const use_preprepared_rows = blk: {
-                const rows = preprepared_rows orelse break :blk false;
+                const rows = preparation.rows orelse break :blk false;
                 const pinned = request_schema_view orelse break :blk false;
                 if ((request_schema_binding == null and !S.ownerField(self, "core").*.isSchemaViewCurrent(pinned)) or
                     rows.len != effective_req.writes.len) break :blk false;
@@ -1150,15 +1249,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Never convert an optimistic generation race into allocation-heavy
             // work under the exclusive apply lock. batchInternal retries this
             // request from a freshly pinned immutable schema/catalog generation.
-            if (preprepared_rows != null and !use_preprepared_rows)
+            if (preparation.rows != null and !use_preprepared_rows)
                 return error.PreparedGenerationChanged;
             // Same fence for document-mode's pre-lock generated-enrichment
             // precompute: a catalog publication (new/changed enrichment, index)
             // between the pre-lock read and this lock acquisition invalidates it.
-            const use_preprepared_document_generated = preprepared_document_generated != null and
+            const use_preprepared_document_generated = preparation.document_generated != null and
                 document_generated_write_plan_generation != null and
                 S.ownerField(self, "core").*.index_manager.writePlanGeneration() == document_generated_write_plan_generation.?;
-            if (preprepared_document_generated != null and !use_preprepared_document_generated)
+            if (preparation.document_generated != null and !use_preprepared_document_generated)
                 return error.PreparedGenerationChanged;
             // Transform expansion or an epoch/index-plan race invalidates the
             // speculative rows. Pin the currently published epoch once for the
@@ -1192,7 +1291,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try self.enforceRowPolicyMutationLocked(
                     policy_schema_view,
                     effective_req,
-                    if (use_preprepared_rows) preprepared_rows else null,
+                    if (use_preprepared_rows) preparation.rows else null,
                     principal,
                 );
             }
@@ -1210,7 +1309,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // only tracks schema/enrichment catalog changes, not per-document
             // data changes. use_preprepared_document_generated already forced a
             // retry on a stale catalog; this call does the same for a stale key.
-            if (use_preprepared_document_generated) try self.validateGeneratedWriteReadSnapshot(generated_precompute_snapshot);
+            if (use_preprepared_document_generated) try self.validateGeneratedWriteReadSnapshot(preparation.generated_snapshot);
 
             if (effective_req.predicates.len > 0) {
                 const predicates_start_ns = monotonicTimeNs();
@@ -1267,11 +1366,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 try stage.deleteDocument(&index_writer, key);
             };
-            var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            var write_buffers = MutationWriteBuffers{
+                .alloc = S.ownerField(self, "alloc").*,
+                .use_preprepared_rows = use_preprepared_rows,
+            };
+            defer write_buffers.deinit();
             if (S.ownerField(self, "local_execution").*.row_policy_table_name) |table_name| {
-                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = internal_keys.graph_owning_table_key, .value = table_name });
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = internal_keys.graph_owning_table_key, .value = table_name });
             }
-            defer store_writes.deinit(S.ownerField(self, "alloc").*);
             if (req.activate_range_tracking) {
                 const ranges = @import("../range_protection.zig");
                 try ranges.validateRequest(req);
@@ -1279,94 +1381,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer probe.abort();
                 if (!try ranges.isActive(&probe)) {
                     if (try S.ownerField(self, "core").*.hasTopologySensitiveTransactions()) return error.IntentConflict;
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = ranges.activation_key, .value = ranges.activation_value });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = ranges.activation_key, .value = ranges.activation_value });
                 }
             }
-            var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
-            defer {
-                for (owned_store_keys.items) |key| S.ownerField(self, "alloc").*.free(key);
-                owned_store_keys.deinit(S.ownerField(self, "alloc").*);
-            }
-            var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
-            defer {
-                for (owned_store_values.items) |value| S.ownerField(self, "alloc").*.free(value);
-                owned_store_values.deinit(S.ownerField(self, "alloc").*);
-            }
             const vector_field_names_start_ns = monotonicTimeNs();
-            const vector_store_field_names = if (relationalColumns(self) == null)
+            write_buffers.vector_store_field_names = if (relationalColumns(self) == null)
                 try S.ownerField(self, "core").*.index_manager.vectorStoreFieldNamesAlloc(S.ownerField(self, "alloc").*)
             else
                 &.{};
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_vector_field_names_ns, vector_field_names_start_ns);
-            defer {
-                for (vector_store_field_names) |field| S.ownerField(self, "alloc").*.free(field);
-                if (vector_store_field_names.len > 0) S.ownerField(self, "alloc").*.free(vector_store_field_names);
-            }
-            var timestamp_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-            defer {
-                if (!use_preprepared_rows) {
-                    for (timestamp_writes.items) |item| {
-                        S.ownerField(self, "alloc").*.free(@constCast(item.key));
-                        S.ownerField(self, "alloc").*.free(@constCast(item.value));
-                    }
-                }
-                timestamp_writes.deinit(S.ownerField(self, "alloc").*);
-            }
-            var prepared_embedding_artifact_count: usize = 0;
-            var explicit_embedding_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-            defer {
-                for (explicit_embedding_artifact_writes.items[prepared_embedding_artifact_count..]) |item| {
-                    S.ownerField(self, "alloc").*.free(@constCast(item.key));
-                    S.ownerField(self, "alloc").*.free(@constCast(item.value));
-                }
-                explicit_embedding_artifact_writes.deinit(S.ownerField(self, "alloc").*);
-            }
-            var prepared_graph_artifact_count: usize = 0;
-            var explicit_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-            defer {
-                for (explicit_graph_artifact_writes.items[prepared_graph_artifact_count..]) |item| {
-                    S.ownerField(self, "alloc").*.free(@constCast(item.key));
-                    S.ownerField(self, "alloc").*.free(@constCast(item.value));
-                }
-                explicit_graph_artifact_writes.deinit(S.ownerField(self, "alloc").*);
-            }
-            var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer delete_keys.deinit(S.ownerField(self, "alloc").*);
-            var owned_delete_keys = std.ArrayListUnmanaged([]u8).empty;
-            defer {
-                for (owned_delete_keys.items) |key| S.ownerField(self, "alloc").*.free(key);
-                owned_delete_keys.deinit(S.ownerField(self, "alloc").*);
-            }
-            var graph_artifact_clears = std.ArrayListUnmanaged(GraphArtifactClear).empty;
-            defer {
-                if (!use_preprepared_rows)
-                    for (graph_artifact_clears.items) |*item| item.deinit(S.ownerField(self, "alloc").*);
-                graph_artifact_clears.deinit(S.ownerField(self, "alloc").*);
-            }
-            var timestamp_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer {
-                for (timestamp_delete_keys.items) |key| S.ownerField(self, "alloc").*.free(@constCast(key));
-                timestamp_delete_keys.deinit(S.ownerField(self, "alloc").*);
-            }
-            var overwrite_probe_entries = std.ArrayListUnmanaged(OverwriteProbeEntry).empty;
-            defer overwrite_probe_entries.deinit(S.ownerField(self, "alloc").*);
-            var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer identity_upsert_keys.deinit(S.ownerField(self, "alloc").*);
-            var identity_upsert_write_indexes = std.ArrayListUnmanaged(usize).empty;
-            defer identity_upsert_write_indexes.deinit(S.ownerField(self, "alloc").*);
-            var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-            defer {
-                for (identity_writes.items) |item| {
-                    S.ownerField(self, "alloc").*.free(@constCast(item.key));
-                    S.ownerField(self, "alloc").*.free(@constCast(item.value));
-                }
-                identity_writes.deinit(S.ownerField(self, "alloc").*);
-            }
-            var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
-            defer {
-                for (identity_visibility_deletes.items) |key| S.ownerField(self, "alloc").*.free(key);
-                identity_visibility_deletes.deinit(S.ownerField(self, "alloc").*);
-            }
 
             if (req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned) {
                 // Recheck under the apply fence: ownership may have changed since
@@ -1483,11 +1506,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 effective_req.merge_artifacts = filtered_cleanup_replay_writes.?;
             }
 
-            const group_plan: ?*const group_mutations.Plan = if (write_plan_snapshot) |pinned|
+            const group_plan: ?*const group_mutations.Plan = if (preparation.write_plan) |pinned|
                 if (pinned.plan().group_sources) |*plan| if (plan.entries.len > 0) plan else null else null
             else
                 null;
-            const group_alloc = prepared_effects_arena.allocator();
+            const group_alloc = preparation.effects_arena.allocator();
             const group_changes: []?[]const group_mutations.Plan.Change = if (group_plan != null) try group_alloc.alloc(?[]const group_mutations.Plan.Change, effective_req.writes.len) else &.{};
             @memset(group_changes, null);
             for (effective_req.writes, 0..) |write, i| {
@@ -1500,7 +1523,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .sparse_embeddings = &.{},
                     };
                     extracted_initialized += 1;
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = write.key,
                         .value = write.value,
                     });
@@ -1508,8 +1531,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 const relational_prepare_start_ns = monotonicTimeNs();
                 var prepared_relational: ?mapper.PreparedRelationalWrite = if (use_preprepared_rows) blk: {
-                    const prepared = preprepared_rows.?[i].?;
-                    preprepared_rows.?[i] = null;
+                    const prepared = preparation.rows.?[i].?;
+                    preparation.rows.?[i] = null;
                     break :blk prepared;
                 } else if (apply_schema_view) |view|
                     if (write.json_null_fields.len != 0)
@@ -1571,16 +1594,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_index_field_embeddings_ns, index_field_embeddings_start_ns);
                 const embedding_artifacts_start_ns = monotonicTimeNs();
                 if (use_preprepared_rows) {
-                    const effects = &preprepared_effects.?[i];
-                    try explicit_embedding_artifact_writes.appendSlice(S.ownerField(self, "alloc").*, effects.embedding_writes.items);
-                    prepared_embedding_artifact_count = explicit_embedding_artifact_writes.items.len;
+                    const effects = &preparation.effects.?[i];
+                    try write_buffers.explicit_embedding_artifact_writes.appendSlice(S.ownerField(self, "alloc").*, effects.embedding_writes.items);
+                    write_buffers.prepared_embedding_artifact_count = write_buffers.explicit_embedding_artifact_writes.items.len;
                     effects.embedding_writes.clearRetainingCapacity();
                 } else {
                     for (extracted[i].dense_embeddings) |*embedding| {
                         if (embedding.artifact_key != null) continue;
                         embedding.artifact_key = try appendEmbeddingArtifactWrite(
                             S.ownerField(self, "alloc").*,
-                            &explicit_embedding_artifact_writes,
+                            &write_buffers.explicit_embedding_artifact_writes,
                             write.key,
                             write.key,
                             embedding.index_name,
@@ -1594,7 +1617,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (embedding.artifact_key != null) continue;
                         embedding.artifact_key = try appendSparseEmbeddingArtifactWrite(
                             S.ownerField(self, "alloc").*,
-                            &explicit_embedding_artifact_writes,
+                            &write_buffers.explicit_embedding_artifact_writes,
                             write.key,
                             embedding.index_name,
                             .authored,
@@ -1606,21 +1629,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_embedding_artifacts_ns, embedding_artifacts_start_ns);
                 const graph_artifacts_start_ns = monotonicTimeNs();
                 if (use_preprepared_rows) {
-                    const effects = &preprepared_effects.?[i];
-                    try explicit_graph_artifact_writes.appendSlice(S.ownerField(self, "alloc").*, effects.graph_writes.items);
-                    prepared_graph_artifact_count = explicit_graph_artifact_writes.items.len;
+                    const effects = &preparation.effects.?[i];
+                    try write_buffers.explicit_graph_artifact_writes.appendSlice(S.ownerField(self, "alloc").*, effects.graph_writes.items);
+                    write_buffers.prepared_graph_artifact_count = write_buffers.explicit_graph_artifact_writes.items.len;
                     effects.graph_writes.clearRetainingCapacity();
-                    try graph_artifact_clears.appendSlice(S.ownerField(self, "alloc").*, effects.graph_clears.items);
+                    try write_buffers.graph_artifact_clears.appendSlice(S.ownerField(self, "alloc").*, effects.graph_clears.items);
                     effects.graph_clears.clearRetainingCapacity();
                 } else {
                     for (extracted[i].graph_writes) |graph_write| {
                         const generation = (S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
                         const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                        try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
+                        try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &write_buffers.explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
                     }
                     for (extracted[i].mentioned_graph_indexes) |index_name| {
                         const clear = try GraphArtifactClear.initAlloc(S.ownerField(self, "alloc").*, write.key, index_name);
-                        graph_artifact_clears.append(S.ownerField(self, "alloc").*, clear) catch |err| {
+                        write_buffers.graph_artifact_clears.append(S.ownerField(self, "alloc").*, clear) catch |err| {
                             var owned_clear = clear;
                             owned_clear.deinit(S.ownerField(self, "alloc").*);
                             return err;
@@ -1677,79 +1700,79 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // the established individual ownership list.
                         if (!use_preprepared_rows) {
                             errdefer S.ownerField(self, "alloc").*.free(packed_row);
-                            try owned_store_values.append(S.ownerField(self, "alloc").*, packed_row);
+                            try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, packed_row);
                         }
                         break :blk packed_row;
                     } else try strippedStoredDocumentValueAlloc(
                         S.ownerField(self, "alloc").*,
                         cleaned,
-                        vector_store_field_names,
-                        &owned_store_values,
+                        write_buffers.vector_store_field_names,
+                        &write_buffers.owned_store_values,
                     );
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
-                    const store_key = if (use_preprepared_rows) preprepared_effects.?[i].store_key.? else try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
-                    if (!use_preprepared_rows) try owned_store_keys.append(S.ownerField(self, "alloc").*, store_key);
-                    if (use_preprepared_rows) preprepared_effects.?[i].store_key = null;
-                    try overwrite_probe_entries.append(S.ownerField(self, "alloc").*, .{
+                    const store_key = if (use_preprepared_rows) preparation.effects.?[i].store_key.? else try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
+                    if (!use_preprepared_rows) try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, store_key);
+                    if (use_preprepared_rows) preparation.effects.?[i].store_key = null;
+                    try write_buffers.overwrite_probe_entries.append(S.ownerField(self, "alloc").*, .{
                         .key = store_key,
                         .value = store_value,
                         .write_index = i,
                         .semantic_hash = semantic_hash,
                     });
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = store_key,
                         .value = store_value,
                     });
-                    try identity_upsert_keys.append(S.ownerField(self, "alloc").*, write.key);
-                    try identity_upsert_write_indexes.append(S.ownerField(self, "alloc").*, i);
+                    try write_buffers.identity_upsert_keys.append(S.ownerField(self, "alloc").*, write.key);
+                    try write_buffers.identity_upsert_write_indexes.append(S.ownerField(self, "alloc").*, i);
                     if (shouldWriteTimestamp(write.key)) {
                         const timestamp_start_ns = monotonicTimeNs();
-                        const timestamp_key = if (use_preprepared_rows) preprepared_effects.?[i].timestamp_key.? else try makeTimestampKey(S.ownerField(self, "alloc").*, write.key);
-                        const timestamp_value = if (use_preprepared_rows) preprepared_effects.?[i].timestamp_value.? else blk: {
+                        const timestamp_key = if (use_preprepared_rows) preparation.effects.?[i].timestamp_key.? else try makeTimestampKey(S.ownerField(self, "alloc").*, write.key);
+                        const timestamp_value = if (use_preprepared_rows) preparation.effects.?[i].timestamp_value.? else blk: {
                             break :blk try encodeTimestampValue(S.ownerField(self, "alloc").*, resolved_write_timestamp_ns.?);
                         };
-                        try timestamp_writes.append(S.ownerField(self, "alloc").*, .{
+                        try write_buffers.timestamp_writes.append(S.ownerField(self, "alloc").*, .{
                             .key = timestamp_key,
                             .value = timestamp_value,
                         });
                         if (use_preprepared_rows) {
-                            preprepared_effects.?[i].timestamp_key = null;
-                            preprepared_effects.?[i].timestamp_value = null;
+                            preparation.effects.?[i].timestamp_key = null;
+                            preparation.effects.?[i].timestamp_value = null;
                         }
                         if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_timestamp_ns, timestamp_start_ns);
                     }
                 }
             }
             if (profile) |active_profile| {
-                active_profile.identity_upsert_keys += @intCast(identity_upsert_keys.items.len);
+                active_profile.identity_upsert_keys += @intCast(write_buffers.identity_upsert_keys.items.len);
                 active_profile.identity_delete_keys += @intCast(effective_req.deletes.len);
             }
             const identity_capacity_start_ns = monotonicTimeNs();
             if (!S.ownerField(self, "bulk_identity").*.enabled or effective_req.deletes.len != 0) {
-                try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+                try self.failIfIdentityOrdinalExhaustedForNewUpserts(write_buffers.identity_upsert_keys.items);
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
             var assume_all_new_identity_upserts = false;
-            if (S.ownerField(self, "bulk_identity").*.enabled and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
-                assume_all_new_identity_upserts = try self.rememberBulkIngestAllNewIdentityUpserts(identity_upsert_keys.items);
+            if (S.ownerField(self, "bulk_identity").*.enabled and effective_req.deletes.len == 0 and write_buffers.identity_upsert_keys.items.len > 0) {
+                assume_all_new_identity_upserts = try self.rememberBulkIngestAllNewIdentityUpserts(write_buffers.identity_upsert_keys.items);
                 if (!assume_all_new_identity_upserts) self.clearBulkIngestIdentityAllNewLocked();
             }
 
-            if (!assume_all_new_identity_upserts and overwrite_probe_entries.items.len > 0) {
+            if (!assume_all_new_identity_upserts and write_buffers.overwrite_probe_entries.items.len > 0) {
                 const overwrite_probe_start_ns = monotonicTimeNs();
                 const unchanged_derived_targets_serviceable = try self.unchangedDerivedReplayTargetsServiceable(S.ownerField(self, "alloc").*);
-                std.sort.pdq(OverwriteProbeEntry, overwrite_probe_entries.items, {}, overwriteProbeLessThan);
-                const probe_keys = overwrite_probe_keys[0..overwrite_probe_entries.items.len];
-                const probe_values = overwrite_probe_values[0..overwrite_probe_entries.items.len];
-                for (overwrite_probe_entries.items, 0..) |entry, i| {
+                std.sort.pdq(OverwriteProbeEntry, write_buffers.overwrite_probe_entries.items, {}, overwriteProbeLessThan);
+                const probe_keys = overwrite_probe_keys[0..write_buffers.overwrite_probe_entries.items.len];
+                const probe_values = overwrite_probe_values[0..write_buffers.overwrite_probe_entries.items.len];
+                for (write_buffers.overwrite_probe_entries.items, 0..) |entry, i| {
                     probe_keys[i] = entry.key;
                 }
                 const overwrite_probe_admission: backend_types.Namespace.BlockCacheAdmission = if (opts.store_batch_options.mode == .bulk_ingest or self.bulkSessionActive()) .transient else .retain;
                 var overwrite_probe_txn = try S.ownerField(self, "core").*.store.beginProbeTxnWithBlockCacheAdmission(overwrite_probe_admission);
                 defer overwrite_probe_txn.abort();
                 try overwrite_probe_txn.getManySorted(probe_keys, probe_values);
-                for (overwrite_probe_entries.items, 0..) |entry, i| {
+                for (write_buffers.overwrite_probe_entries.items, 0..) |entry, i| {
                     const existing = probe_values[i] orelse continue;
                     overwritten_flags[entry.write_index] = true;
                     const extracted_write = extracted[entry.write_index];
@@ -1776,7 +1799,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // TTL timestamp in its checksummed header, so relational rows must still
             // publish the newly prepared physical row even when derived content is
             // unchanged. The derived journal remains safely elided in both modes.
-            for (overwrite_probe_entries.items) |entry| {
+            for (write_buffers.overwrite_probe_entries.items) |entry| {
                 // Prepared retention credits bind the new physical afterimage.
                 // Keeping a semantically equal but arbitrarily larger old JSON
                 // value while updating TTL would violate that durable bound.
@@ -1787,24 +1810,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (semantic_noop_store_keys.count() != 0) {
                 var retained: usize = 0;
-                for (store_writes.items) |write| {
+                for (write_buffers.store_writes.items) |write| {
                     if (semantic_noop_store_keys.contains(write.key)) continue;
-                    store_writes.items[retained] = write;
+                    write_buffers.store_writes.items[retained] = write;
                     retained += 1;
                 }
-                store_writes.shrinkRetainingCapacity(retained);
+                write_buffers.store_writes.shrinkRetainingCapacity(retained);
             }
 
             for (effective_req.graph_writes) |graph_write| {
                 const generation = (S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
                 const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
+                try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &write_buffers.explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
             }
 
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
             var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
                 (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
-                try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
+                try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &write_buffers.store_writes, &write_buffers.owned_store_values)
             else
                 0;
 
@@ -1824,18 +1847,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer explicit_graph_write_key_set.deinit(S.ownerField(self, "alloc").*);
             try explicit_graph_write_key_set.ensureTotalCapacity(
                 S.ownerField(self, "alloc").*,
-                std.math.cast(u32, explicit_graph_artifact_writes.items.len) orelse return error.OutOfMemory,
+                std.math.cast(u32, write_buffers.explicit_graph_artifact_writes.items.len) orelse return error.OutOfMemory,
             );
-            for (explicit_graph_artifact_writes.items) |write|
+            for (write_buffers.explicit_graph_artifact_writes.items) |write|
                 explicit_graph_write_key_set.putAssumeCapacity(write.key, {});
             var graph_delete_key_set = std.StringHashMapUnmanaged(void).empty;
             defer graph_delete_key_set.deinit(S.ownerField(self, "alloc").*);
             try graph_delete_key_set.ensureTotalCapacity(
                 S.ownerField(self, "alloc").*,
-                std.math.cast(u32, owned_delete_keys.items.len) orelse return error.OutOfMemory,
+                std.math.cast(u32, write_buffers.owned_delete_keys.items.len) orelse return error.OutOfMemory,
             );
-            for (owned_delete_keys.items) |key| graph_delete_key_set.putAssumeCapacity(key, {});
-            for (graph_artifact_clears.items) |clear| {
+            for (write_buffers.owned_delete_keys.items) |key| graph_delete_key_set.putAssumeCapacity(key, {});
+            for (write_buffers.graph_artifact_clears.items) |clear| {
                 const existing = try collectGraphArtifactsForDocIndex(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, clear.doc_key, clear.index_name);
                 defer docstore_mod.DocStore.freeResults(S.ownerField(self, "alloc").*, existing);
                 for (existing) |entry| {
@@ -1857,19 +1880,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (explicit_graph_write_key_set.contains(entry.key)) continue;
                     if (graph_delete_key_set.contains(entry.key)) continue;
                     const owned_key = try S.ownerField(self, "alloc").*.dupe(u8, entry.key);
-                    try owned_delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                    try write_buffers.owned_delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
                     try graph_delete_key_set.put(S.ownerField(self, "alloc").*, owned_key, {});
-                    try delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                    try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
                     try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, entry.key);
                 }
             }
 
-            try store_writes.appendSlice(S.ownerField(self, "alloc").*, timestamp_writes.items);
+            try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, write_buffers.timestamp_writes.items);
             // Scoped restore artifacts share the normal presence, source-index,
             // target-cardinality and journal transaction; extra control writes are
             // appended too late in the pipeline for those derived invariants.
             for (opts.restore_artifacts) |artifact| {
-                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = artifact.key, .value = artifact.value });
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = artifact.key, .value = artifact.value });
             }
             for (effective_req.merge_artifacts) |row| {
                 if (internal_keys.isGraphEdgeTtlLifetimeKey(row.key) or internal_keys.isGraphEdgeTtlTombstoneKey(row.key)) {
@@ -1887,9 +1910,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (internal_keys.isGraphEdgeTtlLifetimeKey(row.key)) {
                         if (row.value.len != 8) return error.InvalidGraphEdgeTtlLifetime;
                     } else _ = try graph_edge_ttl_tombstone.Tombstone.decode(row.value);
-                    try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
+                    try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, key);
                     key_unowned = false;
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = row.value });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = row.value });
                     continue;
                 }
                 if (internal_keys.isGraphGlobalEdgeContenderKey(row.key)) {
@@ -1926,11 +1949,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const value = try graph_edge_contender.encodeAlloc(S.ownerField(self, "alloc").*, entry.config.coverage_generation, contender.source_priority, contender.edge_key, contender.state_key, rebound_payload);
                     var value_unowned = true;
                     errdefer if (value_unowned) S.ownerField(self, "alloc").*.free(value);
-                    try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
+                    try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, key);
                     key_unowned = false;
-                    try owned_store_values.append(S.ownerField(self, "alloc").*, value);
+                    try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, value);
                     value_unowned = false;
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = value });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = value });
                     // Shared reconciliation below publishes membership, lifetime,
                     // canonical payload and deadline together, including suppression.
                     continue;
@@ -1954,14 +1977,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             const bound = try enrichment_artifact_codec.bindGraphEdgeGenerationAlloc(S.ownerField(self, "alloc").*, row.value, entry.config.coverage_generation);
                             var bound_unowned = true;
                             errdefer if (bound_unowned) S.ownerField(self, "alloc").*.free(bound);
-                            try owned_store_values.append(S.ownerField(self, "alloc").*, bound);
+                            try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, bound);
                             bound_unowned = false;
                             value = bound;
                         }
                     }
                 }
-                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = row.key, .value = value });
-                try appendDirectGraphTtlDueWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.index_manager, .{ .key = row.key, .value = value }, &store_writes, &owned_store_keys, &owned_store_values);
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = row.key, .value = value });
+                try appendDirectGraphTtlDueWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.index_manager, .{ .key = row.key, .value = value }, &write_buffers.store_writes, &write_buffers.owned_store_keys, &write_buffers.owned_store_values);
                 if (internal_keys.isGraphRetirementKey(row.key)) {
                     const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(S.ownerField(self, "alloc").*, row.key);
                     defer S.ownerField(self, "alloc").*.free(artifact);
@@ -1981,37 +2004,37 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (@import("group_source_transfer.zig").isKey(effect.key)) continue;
                 const revision_key = @import("artifact_publication.zig").artifactRevisionKey(receiver_artifact_namespace, effect.key);
                 const owned_revision_key = try S.ownerField(self, "alloc").*.dupe(u8, &revision_key);
-                owned_store_keys.append(S.ownerField(self, "alloc").*, owned_revision_key) catch |err| {
+                write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, owned_revision_key) catch |err| {
                     S.ownerField(self, "alloc").*.free(owned_revision_key);
                     return err;
                 };
-                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = owned_revision_key, .value = &transferred_artifact_position_bytes });
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = owned_revision_key, .value = &transferred_artifact_position_bytes });
                 if (effect.value) |value| {
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = value });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = value });
                     // Both thin and materialized journals route these keys to
                     // configured vector consumers. Storing bytes alone would
                     // acknowledge the page without advancing its projections.
                     try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, effect.key);
                 }
             }
-            for (explicit_embedding_artifact_writes.items) |write| {
-                try store_writes.append(S.ownerField(self, "alloc").*, .{
+            for (write_buffers.explicit_embedding_artifact_writes.items) |write| {
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = write.key,
                     .value = write.value,
                 });
             }
-            for (explicit_graph_artifact_writes.items) |write| {
+            for (write_buffers.explicit_graph_artifact_writes.items) |write| {
                 const retired = try internal_keys.graphRetirementKeyAlloc(S.ownerField(self, "alloc").*, write.key);
-                owned_delete_keys.append(S.ownerField(self, "alloc").*, retired) catch |err| {
+                write_buffers.owned_delete_keys.append(S.ownerField(self, "alloc").*, retired) catch |err| {
                     S.ownerField(self, "alloc").*.free(retired);
                     return err;
                 };
-                try delete_keys.append(S.ownerField(self, "alloc").*, retired);
-                try store_writes.append(S.ownerField(self, "alloc").*, .{
+                try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, retired);
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = write.key,
                     .value = write.value,
                 });
-                try appendDirectGraphTtlDueWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.index_manager, write, &store_writes, &owned_store_keys, &owned_store_values);
+                try appendDirectGraphTtlDueWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.index_manager, write, &write_buffers.store_writes, &write_buffers.owned_store_keys, &write_buffers.owned_store_values);
                 try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
             }
             var deleted_graph_owners = std.StringHashMapUnmanaged(void).empty;
@@ -2026,7 +2049,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const owner = if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source;
                 if (!deleted_graph_owners.contains(owner)) {
                     const retired = try internal_keys.graphRetirementKeyAlloc(S.ownerField(self, "alloc").*, artifact_key);
-                    owned_store_keys.append(S.ownerField(self, "alloc").*, retired) catch |err| {
+                    write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, retired) catch |err| {
                         S.ownerField(self, "alloc").*.free(retired);
                         return err;
                     };
@@ -2036,27 +2059,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     } else graph_lifecycle_generation;
                     const stamp = if (retirement_generation != 0) cleanup_contract.retirementValue(retirement_generation) else undefined;
                     const value = try S.ownerField(self, "alloc").*.dupe(u8, if (retirement_generation != 0) &stamp else "1");
-                    owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
+                    write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
                         S.ownerField(self, "alloc").*.free(value);
                         return err;
                     };
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = retired, .value = value });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = retired, .value = value });
                 }
                 if (graph_delete_key_set.contains(artifact_key)) continue;
                 const owned_key = try S.ownerField(self, "alloc").*.dupe(u8, artifact_key);
-                try owned_delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                try write_buffers.owned_delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
                 try graph_delete_key_set.put(S.ownerField(self, "alloc").*, owned_key, {});
-                try delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
                 try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, artifact_key);
             }
             for (effective_req.deletes) |key| {
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, key);
-                try owned_delete_keys.append(S.ownerField(self, "alloc").*, store_key);
-                try delete_keys.append(S.ownerField(self, "alloc").*, store_key);
+                try write_buffers.owned_delete_keys.append(S.ownerField(self, "alloc").*, store_key);
+                try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, store_key);
                 if (shouldWriteTimestamp(key)) {
                     const timestamp_key = try makeTimestampKey(S.ownerField(self, "alloc").*, key);
-                    try timestamp_delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
-                    try delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
+                    try write_buffers.timestamp_delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
+                    try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
                 }
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_writes_ns, extract_writes_start_ns);
@@ -2084,10 +2107,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     needs_revival = markers.len != 0;
                 }
                 if (!needs_revival) continue;
-                try owned_store_keys.append(S.ownerField(self, "alloc").*, job_key);
+                try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, job_key);
                 key_owned = false;
                 const value = try cleanup_contract.encodeOwnerJobAlloc(S.ownerField(self, "alloc").*, .{ .owner = write.key, .generation = graph_lifecycle_generation });
-                owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
+                write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
                     S.ownerField(self, "alloc").*.free(value);
                     return err;
                 };
@@ -2097,7 +2120,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             // Prepend all lifecycle changes once so large owner batches remain
             // linear in their write count rather than repeatedly moving the tail.
-            try store_writes.insertSlice(S.ownerField(self, "alloc").*, 0, owner_job_writes.items);
+            try write_buffers.store_writes.insertSlice(S.ownerField(self, "alloc").*, 0, owner_job_writes.items);
 
             const delete_artifacts_start_ns = monotonicTimeNs();
             const deleted_artifact_keys = try collectEnrichmentArtifactDeletesForBatch(
@@ -2105,8 +2128,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 effective_req,
                 transferred_artifacts,
                 extracted[0..extracted_initialized],
-                &delete_keys,
-                &owned_delete_keys,
+                &write_buffers.delete_keys,
+                &write_buffers.owned_delete_keys,
             );
             defer S.ownerField(self, "alloc").*.free(deleted_artifact_keys);
             // Native transfer pages can delete relationship artifacts without a
@@ -2114,10 +2137,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // every retirement receives this commit's nonzero lifecycle stamp.
             if (graph_lifecycle_generation == 0) for (deleted_artifact_keys) |artifact| {
                 if (internal_keys.graphInlineTargetComponent(artifact) == null) continue;
-                graph_lifecycle_generation = try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
+                graph_lifecycle_generation = try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &write_buffers.store_writes, &write_buffers.owned_store_values);
                 break;
             };
-            try appendGraphEndpointRetirements(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, graph_lifecycle_generation, effective_req.deletes, S.ownerField(self, "core").*.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
+            try appendGraphEndpointRetirements(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, graph_lifecycle_generation, effective_req.deletes, S.ownerField(self, "core").*.index_manager.hasGraphIndexes(), deleted_artifact_keys, &write_buffers.store_writes, &write_buffers.owned_store_keys, &write_buffers.owned_store_values);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
             const use_thin_replay_fast_path =
@@ -2133,7 +2156,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer precomputed_generated.deinit(preparation_alloc);
             // Whether this batch's own rows needed nothing further from the
             // enrichment runtime: every generated-enrichment request for them was
-            // precomputed and folded into store_writes above, under this same
+            // precomputed and folded into write_buffers.store_writes above, under this same
             // apply-lock hold. Set after the precompute block below, before
             // precomputed_generated.generated_enrichment_refs is transferred into
             // materialized_derived_batch (which zeroes it). A sync_level
@@ -2159,12 +2182,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (!use_thin_replay_fast_path) {
                 const precompute_generated_start_ns = monotonicTimeNs();
-                if (use_preprepared_rows and preprepared_generated != null) {
-                    precomputed_generated = preprepared_generated.?;
-                    preprepared_generated = null;
+                if (use_preprepared_rows and preparation.generated != null) {
+                    precomputed_generated = preparation.generated.?;
+                    preparation.generated = null;
                 } else if (use_preprepared_document_generated) {
-                    precomputed_generated = preprepared_document_generated.?;
-                    preprepared_document_generated = null;
+                    precomputed_generated = preparation.document_generated.?;
+                    preparation.document_generated = null;
                 } else {
                     precomputed_generated = try prepareGeneratedEnrichments(
                         self,
@@ -2183,14 +2206,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
 
                 for (precomputed_generated.artifact_writes) |write| {
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = write.key,
                         .value = write.value,
                     });
                     try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
                 }
                 for (precomputed_generated.artifact_delete_keys) |key| {
-                    try delete_keys.append(S.ownerField(self, "alloc").*, key);
+                    try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, key);
                     if (internal_keys.isAssetArtifactKey(key)) {
                         try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
                     }
@@ -2199,42 +2222,42 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 enrichment_fully_precomputed = effective_req.sync_level == .enrichments and
                     precomputed_generated.generated_enrichment_refs.len == 0;
             }
-            if (effective_req.merge_artifacts.len > 0 or (if (req.merge_page) |page| page.artifact_effects.len != 0 else false) or explicit_embedding_artifact_writes.items.len > 0 or
-                explicit_graph_artifact_writes.items.len > 0 or
+            if (effective_req.merge_artifacts.len > 0 or (if (req.merge_page) |page| page.artifact_effects.len != 0 else false) or write_buffers.explicit_embedding_artifact_writes.items.len > 0 or
+                write_buffers.explicit_graph_artifact_writes.items.len > 0 or
                 precomputed_generated.artifact_writes.len > 0)
             {
-                try S.ownerField(self, "core").*.appendArtifactPresenceMarker(&store_writes);
+                try S.ownerField(self, "core").*.appendArtifactPresenceMarker(&write_buffers.store_writes);
             }
             try appendAssetArtifactSourceIndexMutations(
                 S.ownerField(self, "alloc").*,
-                &store_writes,
+                &write_buffers.store_writes,
                 deleted_artifact_keys,
-                &delete_keys,
-                &owned_store_keys,
-                &owned_store_values,
-                &owned_delete_keys,
+                &write_buffers.delete_keys,
+                &write_buffers.owned_store_keys,
+                &write_buffers.owned_store_values,
+                &write_buffers.owned_delete_keys,
             );
             try appendMixedDirectGraphContenderMutations(
                 S.ownerField(self, "alloc").*,
                 S.ownerField(self, "core").*.store,
                 S.ownerField(self, "core").*.index_manager,
-                explicit_graph_artifact_writes.items,
-                &store_writes,
-                &delete_keys,
-                &owned_store_keys,
-                &owned_store_values,
-                &owned_delete_keys,
+                write_buffers.explicit_graph_artifact_writes.items,
+                &write_buffers.store_writes,
+                &write_buffers.delete_keys,
+                &write_buffers.owned_store_keys,
+                &write_buffers.owned_store_values,
+                &write_buffers.owned_delete_keys,
             );
             if (effective_req.merge_artifacts.len != 0) try appendImportedGraphContenderMutations(
                 S.ownerField(self, "alloc").*,
                 S.ownerField(self, "core").*.store,
                 S.ownerField(self, "core").*.index_manager,
                 effective_req.merge_artifacts,
-                &store_writes,
-                &delete_keys,
-                &owned_store_keys,
-                &owned_store_values,
-                &owned_delete_keys,
+                &write_buffers.store_writes,
+                &write_buffers.delete_keys,
+                &write_buffers.owned_store_keys,
+                &write_buffers.owned_store_values,
+                &write_buffers.owned_delete_keys,
                 &changed_graph_artifact_keys,
                 &changed_graph_artifact_key_set,
             );
@@ -2242,10 +2265,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 S.ownerField(self, "alloc").*,
                 S.ownerField(self, "core").*.store,
                 S.ownerField(self, "core").*.index_manager,
-                store_writes.items,
-                delete_keys.items,
-                &delete_keys,
-                &owned_delete_keys,
+                write_buffers.store_writes.items,
+                write_buffers.delete_keys.items,
+                &write_buffers.delete_keys,
+                &write_buffers.owned_delete_keys,
             );
 
             var sync_targets: ManagedSyncTargets = .{};
@@ -2307,7 +2330,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
                 if (!std.mem.eql(u8, &namespace, &command.namespace)) return error.InvalidGroupedSourceCommand;
                 if (command.finish) |finish| {
-                    if (opts.ordered_apply_receipt == null and opts.legacy_group_plan_generation == write_plan_snapshot.?.generation() and opts.legacy_group_completed_through != null and opts.legacy_group_completed_through.? >= finish.through_sequence) group_overlay.legacy_completion = true;
+                    if (opts.ordered_apply_receipt == null and opts.legacy_group_plan_generation == preparation.write_plan.?.generation() and opts.legacy_group_completed_through != null and opts.legacy_group_completed_through.? >= finish.through_sequence) group_overlay.legacy_completion = true;
                 }
                 const route = try command.routeAlloc(group_alloc);
                 if (!S.ownerField(self, "core").*.byteRange().contains(route)) return error.KeyOutOfRange;
@@ -2384,15 +2407,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (group_overlay.effects.count() != 0) {
                 const overlay = &group_overlay;
                 var retained_deletes: usize = 0;
-                for (delete_keys.items) |deleted| {
+                for (write_buffers.delete_keys.items) |deleted| {
                     if (overlay.effects.getEntry(deleted)) |effect| if (effect.value_ptr.* != null) continue;
-                    delete_keys.items[retained_deletes] = deleted;
+                    write_buffers.delete_keys.items[retained_deletes] = deleted;
                     retained_deletes += 1;
                 }
-                delete_keys.shrinkRetainingCapacity(retained_deletes);
+                write_buffers.delete_keys.shrinkRetainingCapacity(retained_deletes);
                 var effects = overlay.effects.iterator();
                 while (effects.next()) |effect| {
-                    if (effect.value_ptr.*) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key_ptr.*, .value = value }) else try delete_keys.append(S.ownerField(self, "alloc").*, effect.key_ptr.*);
+                    if (effect.value_ptr.*) |value| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key_ptr.*, .value = value }) else try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, effect.key_ptr.*);
                 }
             }
             if (review_plan) |review| {
@@ -2400,11 +2423,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // storage uses the writer allocator, so copy only its entries.
                 var review_writes: std.ArrayList(docstore_mod.KVPair) = .empty;
                 try review.stage(group_alloc, &review_writes, sequence);
-                try store_writes.appendSlice(S.ownerField(self, "alloc").*, review_writes.items);
+                try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, review_writes.items);
             }
             if (profile) |active_profile| active_profile.source_sequence = sequence;
             const identity_metadata_start_ns = monotonicTimeNs();
-            const identity_live_before = if (identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
+            const identity_live_before = if (write_buffers.identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
                 (try doc_identity.fastStatsFromStore(S.ownerField(self, "core").*.store)).live_ordinals
             else
                 0;
@@ -2414,16 +2437,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (S.ownerField(self, "bulk_identity").*.enabled and
                 effective_req.deletes.len == 0 and
-                identity_upsert_keys.items.len > 0 and
-                (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
+                write_buffers.identity_upsert_keys.items.len > 0 and
+                (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(write_buffers.identity_upsert_write_indexes.items, overwritten_flags)))
             {
                 used_trusted_identity_path = try doc_identity.appendBatchIdentityMetadataAllNewTrustedStateWithVisibilityDeletesForNamespaceAlloc(
                     S.ownerField(self, "alloc").*,
                     S.ownerField(self, "core").*.identity_namespace,
                     sequence,
-                    &identity_writes,
-                    &identity_visibility_deletes,
-                    identity_upsert_keys.items,
+                    &write_buffers.identity_writes,
+                    &write_buffers.identity_visibility_deletes,
+                    write_buffers.identity_upsert_keys.items,
                     &S.ownerField(self, "bulk_identity").*.trusted,
                 );
                 if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
@@ -2434,17 +2457,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     S.ownerField(self, "core").*.store,
                     S.ownerField(self, "core").*.identity_namespace,
                     sequence,
-                    &identity_writes,
-                    &identity_visibility_deletes,
-                    identity_upsert_keys.items,
+                    &write_buffers.identity_writes,
+                    &write_buffers.identity_visibility_deletes,
+                    write_buffers.identity_upsert_keys.items,
                     effective_req.deletes,
                 );
             }
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.identity_metadata_ns, identity_metadata_start_ns);
-                active_profile.identity_metadata_writes += @intCast(identity_writes.items.len);
+                active_profile.identity_metadata_writes += @intCast(write_buffers.identity_writes.items.len);
             }
-            const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
+            const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(write_buffers.identity_writes.items);
             // Plan once under the apply lock: counts, page state, and the durable
             // transition must agree on whether a delayed checkpoint has authority.
             const merge_existing_raw = if (req.merge_checkpoint != null) try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store) else null;
@@ -2453,7 +2476,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (merge_existing_state) |*state| state.deinit(S.ownerField(self, "alloc").*);
             const merge_plan: ?merge_state_mod.ApplyPlan = if (req.merge_checkpoint) |checkpoint| try merge_state_mod.planCheckpointApply(S.ownerField(self, "alloc").*, if (merge_existing_state) |*state| state else null, S.ownerField(self, "core").*.byteRange(), checkpoint) else null;
             defer if (merge_plan) |plan| plan.deinit(S.ownerField(self, "alloc").*);
-            const merge_count_prepared = try @import("merge_cardinality.zig").prepare(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
+            const merge_count_prepared = try @import("merge_cardinality.zig").prepare(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, write_buffers.identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &write_buffers.identity_writes);
             if (!merge_count_prepared) if (pending_identity_visibility_summary) |summary| {
                 try range_cardinality.appendIdentityTransitionAlloc(
                     S.ownerField(self, "alloc").*,
@@ -2461,7 +2484,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     S.ownerField(self, "core").*.byteRange(),
                     identity_live_before,
                     summary.live_ordinals,
-                    &identity_writes,
+                    &write_buffers.identity_writes,
                 );
             };
             var next_table_catalog: ?table_catalog_mod.Catalog = null;
@@ -2480,7 +2503,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // Persist only the empty/non-empty transition. Exact cardinality
                 // is already transactional in the range-local counter. A split
                 // intentionally retains foreign identities in the shared namespace.
-                catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, identity_writes.items) != 0);
+                catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, write_buffers.identity_writes.items) != 0);
                 catalog.reconciled = true;
                 if (catalog.mode_initialized != previous.mode_initialized or
                     catalog.storage_mode != previous.storage_mode or
@@ -2512,8 +2535,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     next_table_catalog = catalog;
                 }
             }
-            try store_writes.appendSlice(S.ownerField(self, "alloc").*, identity_writes.items);
-            if (next_table_catalog != null) try store_writes.append(S.ownerField(self, "alloc").*, .{
+            try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, write_buffers.identity_writes.items);
+            if (next_table_catalog != null) try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                 .key = table_catalog_mod.key,
                 .value = &table_catalog_value,
             });
@@ -2522,7 +2545,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 sequence,
                 remote_child_range_dispatches.items,
                 effective_req.sync_level,
-                &store_writes,
+                &write_buffers.store_writes,
                 &owned_child_range_outbox_keys,
                 &owned_child_range_outbox_values,
             );
@@ -2566,7 +2589,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, &record);
                 const payload = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
                 errdefer S.ownerField(self, "alloc").*.free(payload);
-                if (write_plan_snapshot == null or write_plan_snapshot.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))
+                if (preparation.write_plan == null or preparation.write_plan.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))
                     try attachPreparedUpsertDocumentProjections(preparation_alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
 
                 const collect_sync_targets_start_ns = monotonicTimeNs();
@@ -2605,9 +2628,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     S.ownerField(self, "alloc").*,
                     replay_payload,
                     sequence,
-                    &store_writes,
-                    &owned_store_keys,
-                    &owned_store_values,
+                    &write_buffers.store_writes,
+                    &write_buffers.owned_store_keys,
+                    &write_buffers.owned_store_values,
                 );
             }
             var durable_replication_batch_payload: ?[]u8 = null;
@@ -2619,7 +2642,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                     const from_lsn = mirror.publisher.nextLsn();
                     const outbox = try encodeDurableReplicationOutboxAlloc(S.ownerField(self, "alloc").*, from_lsn, payload);
-                    owned_store_values.append(S.ownerField(self, "alloc").*, outbox) catch |err| {
+                    write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, outbox) catch |err| {
                         S.ownerField(self, "alloc").*.free(outbox);
                         return err;
                     };
@@ -2632,16 +2655,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     );
                     var outbox_key_owned = true;
                     errdefer if (outbox_key_owned) S.ownerField(self, "alloc").*.free(outbox_key);
-                    try owned_store_keys.append(S.ownerField(self, "alloc").*, outbox_key);
+                    try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, outbox_key);
                     outbox_key_owned = false;
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = outbox_key, .value = outbox });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = outbox_key, .value = outbox });
                     durable_replication_batch_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
                     durable_replication_batch_outbox_key = outbox_key;
                 };
                 if (append_derived_replay and !scoped_replication) if (S.ownerField(self, "local_execution").*.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
                     const from_lsn = mirror.publisher.nextLsn();
                     const outbox = try encodeDurableReplicationOutboxAlloc(S.ownerField(self, "alloc").*, from_lsn, replay_payload);
-                    owned_store_values.append(S.ownerField(self, "alloc").*, outbox) catch |err| {
+                    write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, outbox) catch |err| {
                         S.ownerField(self, "alloc").*.free(outbox);
                         return err;
                     };
@@ -2654,9 +2677,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     );
                     var outbox_key_owned = true;
                     errdefer if (outbox_key_owned) S.ownerField(self, "alloc").*.free(outbox_key);
-                    try owned_store_keys.append(S.ownerField(self, "alloc").*, outbox_key);
+                    try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, outbox_key);
                     outbox_key_owned = false;
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = outbox_key, .value = outbox });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = outbox_key, .value = outbox });
                     durable_replication_replay_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
                     durable_replication_replay_outbox_key = outbox_key;
                 };
@@ -2674,7 +2697,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var replication_applied_lsn_value_buf: [replication_applied_lsn_value_len]u8 = undefined;
             if (opts.replication_applied_lsn_marker) |lsn| {
                 if (lsn != 0) {
-                    try store_writes.append(S.ownerField(self, "alloc").*, replicationAppliedSequenceWrite(lsn, &replication_applied_lsn_value_buf));
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, replicationAppliedSequenceWrite(lsn, &replication_applied_lsn_value_buf));
                 }
             }
             var ordered_apply_receipt_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -2687,7 +2710,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // while the command receipt and participant acknowledgement still
             // must be completed. Keep those completion writes separate.
             if (ordered_apply_receipt_write) |write| {
-                if (opts.transaction_resolution == null) try store_writes.append(S.ownerField(self, "alloc").*, write);
+                if (opts.transaction_resolution == null) try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, write);
             }
             var split_range_value: ?[]u8 = null;
             defer if (split_range_value) |value| S.ownerField(self, "alloc").*.free(value);
@@ -2697,7 +2720,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (merge_range_value) |value| S.ownerField(self, "alloc").*.free(value);
             var merge_state_value = std.ArrayListUnmanaged(u8).empty;
             defer merge_state_value.deinit(S.ownerField(self, "alloc").*);
-            if (merge_page_value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("merge_page_contract.zig").key, .value = value });
+            if (merge_page_value) |value| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("merge_page_contract.zig").key, .value = value });
             var ordered_artifact_value: ?[]u8 = null;
             defer if (ordered_artifact_value) |value| S.ownerField(self, "alloc").*.free(value);
             if (req.artifact_catalog) |command| {
@@ -2707,9 +2730,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace))) return error.IdentityNamespaceMismatch;
                 if (!std.mem.eql(u8, &command.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
                 ordered_artifact_value = try @import("artifact_inventory.zig").prepareOrdered(S.ownerField(self, "alloc").*, &read, command, entry.index);
-                if (ordered_artifact_value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("artifact_inventory.zig").ordered_key, .value = value });
-                if (try @import("artifact_reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").key);
-                try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
+                if (ordered_artifact_value) |value| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("artifact_inventory.zig").ordered_key, .value = value });
+                if (try @import("artifact_reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").key);
+                try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
             }
             var split_sequence_buf: [8]u8 = undefined;
             var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
@@ -2720,7 +2743,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (persisted_range_end_owned) |value| S.ownerField(self, "alloc").*.free(value);
             if (req.split_replication) |replication| {
                 if (replication.operation == .delta) {
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = range_state_mod.split_delta_final_seq_key,
                         .value = range_state_mod.encodeSplitDeltaFinalSeq(replication.sequence, &split_sequence_buf),
                     });
@@ -2731,23 +2754,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
                     integrity_coverage_value = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage_value.? });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage_value.? });
                 }
                 if (checkpoint.kind != .source_ack) {
                     persisted_range = .{ .start = checkpoint.range_start, .end = checkpoint.range_end };
                     persisted_range_start_owned = try S.ownerField(self, "alloc").*.dupe(u8, checkpoint.range_start);
                     persisted_range_end_owned = try S.ownerField(self, "alloc").*.dupe(u8, checkpoint.range_end);
                     split_range_value = try range_state_mod.encodeRangeAlloc(S.ownerField(self, "alloc").*, persisted_range.?);
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = range_state_mod.range_key,
                         .value = split_range_value.?,
                     });
                 }
-                try store_writes.append(S.ownerField(self, "alloc").*, .{
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = range_state_mod.split_delta_final_seq_key,
                     .value = range_state_mod.encodeSplitDeltaFinalSeq(checkpoint.delta_sequence, &split_sequence_buf),
                 });
-                try store_writes.append(S.ownerField(self, "alloc").*, .{
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = range_state_mod.split_bootstrap_marker_key,
                     .value = range_state_mod.encodeSplitBootstrapMarker(.{
                         .transition_id = checkpoint.transition_id,
@@ -2778,17 +2801,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 switch (page_plan) {
                     .unchanged => {},
                     .clear => {
-                        try delete_keys.append(S.ownerField(self, "alloc").*, pages.key);
-                        try delete_keys.append(S.ownerField(self, "alloc").*, @import("merge_artifact_catalog.zig").key);
+                        try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, pages.key);
+                        try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("merge_artifact_catalog.zig").key);
                     },
                     .bind => |progress| {
                         if (!progress.receiver_namespace.eql(S.ownerField(self, "core").*.identity_namespace)) return error.DocIdentityNamespaceMismatch;
                         merge_page_value = try pages.encode(S.ownerField(self, "alloc").*, progress);
-                        try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = pages.key, .value = merge_page_value.? });
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = pages.key, .value = merge_page_value.? });
                         merge_source_catalog_value = try @import("merge_artifact_catalog.zig").encode(S.ownerField(self, "alloc").*, checkpoint, progress);
                         if (merge_source_catalog_value) |value| {
-                            try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("merge_artifact_catalog.zig").key, .value = value });
-                        } else try delete_keys.append(S.ownerField(self, "alloc").*, @import("merge_artifact_catalog.zig").key);
+                            try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("merge_artifact_catalog.zig").key, .value = value });
+                        } else try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("merge_artifact_catalog.zig").key);
                     },
                 }
                 if (page_plan != .unchanged) {
@@ -2802,51 +2825,51 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const count = try chunks.slotCount(value);
                         for (0..count) |i| {
                             const slot_key = try chunks.slotKey(S.ownerField(self, "alloc").*, @intCast(i));
-                            owned_store_keys.append(S.ownerField(self, "alloc").*, slot_key) catch |err| {
+                            write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, slot_key) catch |err| {
                                 S.ownerField(self, "alloc").*.free(slot_key);
                                 return err;
                             };
-                            try delete_keys.append(S.ownerField(self, "alloc").*, slot_key);
+                            try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, slot_key);
                         }
-                        try delete_keys.append(S.ownerField(self, "alloc").*, chunks.manifest_key);
+                        try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, chunks.manifest_key);
                     }
                 }
                 persisted_range = plan.range;
                 persisted_range_start_owned = try S.ownerField(self, "alloc").*.dupe(u8, plan.range.start);
                 persisted_range_end_owned = try S.ownerField(self, "alloc").*.dupe(u8, plan.range.end);
                 merge_range_value = try range_state_mod.encodeRangeAlloc(S.ownerField(self, "alloc").*, plan.range);
-                try store_writes.append(S.ownerField(self, "alloc").*, .{
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = range_state_mod.range_key,
                     .value = merge_range_value.?,
                 });
                 try merge_state_mod.encode(&merge_state_value, S.ownerField(self, "alloc").*, plan.state);
-                try store_writes.append(S.ownerField(self, "alloc").*, .{
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = merge_state_mod.key,
                     .value = merge_state_value.items,
                 });
-                try delete_keys.append(S.ownerField(self, "alloc").*, merge_state_mod.legacy_key);
+                try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, merge_state_mod.legacy_key);
                 const shadow = @import("online_integrity_shadow.zig");
                 if (plan.applies_checkpoint and (checkpoint.kind == .begin_copy or (checkpoint.kind == .accept and plan.state.copy_attempt.sequence == 0)) and plan.state.phase == .accepting and checkpoint.page_source != null and checkpoint.page_source.?.integrity != null) {
                     const shadow_state = try std.json.Stringify.valueAlloc(S.ownerField(self, "alloc").*, shadow.State{ .source = checkpoint.page_source.?, .context = .{ .transition_id = checkpoint.transition_id, .donor_group_id = checkpoint.donor_group_id, .receiver_group_id = checkpoint.receiver_group_id, .identity_namespace = S.ownerField(self, "core").*.identity_namespace, .copy_attempt = checkpoint.copy_attempt } }, .{});
-                    try owned_store_values.append(S.ownerField(self, "alloc").*, shadow_state);
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = shadow.key, .value = shadow_state });
+                    try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, shadow_state);
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = shadow.key, .value = shadow_state });
                     const serving_range = try range_state_mod.encodeRangeAlloc(S.ownerField(self, "alloc").*, plan.state.receiver_base_range);
-                    try owned_store_values.append(S.ownerField(self, "alloc").*, serving_range);
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = shadow.range_key, .value = serving_range });
+                    try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, serving_range);
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = shadow.range_key, .value = serving_range });
                 }
                 if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                     // Keep one bounded exact-source terminal receipt for lost
                     // checkpoint responses. A new transition replaces it; only
                     // the serving-range override controls live shadow admission.
-                    try delete_keys.append(S.ownerField(self, "alloc").*, shadow.range_key);
+                    try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, shadow.range_key);
                 }
                 if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                     const catalog = @import("relational_integrity_catalog.zig");
                     const raw_catalog = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog.key);
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
                     const coverage = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, plan.range);
-                    try owned_store_values.append(S.ownerField(self, "alloc").*, coverage);
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = coverage });
+                    try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, coverage);
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = coverage });
                 }
             }
             if (persisted_range) |range| try S.ownerField(self, "core").*.index_manager.validateRangeTransition(range);
@@ -2854,10 +2877,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 S.ownerField(self, "alloc").*,
                 S.ownerField(self, "core").*.store,
                 S.ownerField(self, "core").*.index_manager,
-                &store_writes,
-                delete_keys.items,
-                &owned_store_keys,
-                &owned_store_values,
+                &write_buffers.store_writes,
+                write_buffers.delete_keys.items,
+                &write_buffers.owned_store_keys,
+                &write_buffers.owned_store_values,
             );
             // Synchronous enrichment is the producer for every request it consumes.
             // Commit its terminal coverage decisions in the same backend batch as
@@ -2868,29 +2891,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // not by the immutable document identity. Stamp in the primary batch.
             if (S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(S.ownerField(self, "core").*.store)) {
                 const readiness = @import("artifact_producer_readiness.zig");
-                for (identity_upsert_keys.items, identity_upsert_write_indexes.items) |document, write_index| {
+                for (write_buffers.identity_upsert_keys.items, write_buffers.identity_upsert_write_indexes.items) |document, write_index| {
                     // An identical logical row creates no producer replay debt.
                     if (!derived_changed_flags[write_index]) continue;
                     const key = try readiness.localPrimaryRevisionKeyAlloc(S.ownerField(self, "alloc").*, document);
-                    owned_store_keys.append(S.ownerField(self, "alloc").*, key) catch |err| {
+                    write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, key) catch |err| {
                         S.ownerField(self, "alloc").*.free(key);
                         return err;
                     };
                     const value = try S.ownerField(self, "alloc").*.alloc(u8, 8);
-                    owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
+                    write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
                         S.ownerField(self, "alloc").*.free(value);
                         return err;
                     };
                     std.mem.writeInt(u64, value[0..8], sequence, .little);
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = value });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = value });
                 }
                 for (effective_req.deletes) |document| {
                     const key = try readiness.localPrimaryRevisionKeyAlloc(S.ownerField(self, "alloc").*, document);
-                    owned_store_keys.append(S.ownerField(self, "alloc").*, key) catch |err| {
+                    write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, key) catch |err| {
                         S.ownerField(self, "alloc").*.free(key);
                         return err;
                     };
-                    try delete_keys.append(S.ownerField(self, "alloc").*, key);
+                    try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, key);
                 }
             }
             var local_coverage_guard = if (precomputed_generated.coverage_outcomes.len != 0)
@@ -2904,11 +2927,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 S.ownerField(self, "core").*.index_manager,
                 precomputed_generated.coverage_outcomes,
                 sequence,
-                &store_writes,
-                &owned_store_keys,
-                &owned_store_values,
+                &write_buffers.store_writes,
+                &write_buffers.owned_store_keys,
+                &write_buffers.owned_store_values,
             );
-            try store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
+            try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
                 // have been checked under this same apply fence. The physical
@@ -2922,16 +2945,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (page.integrity) |effect| {
                     const address = (try @import("relational_integrity_contract.zig").parseKey(effect.key)).address;
                     if (page.phase != .cleanup_integrity and compiled.findGeneration(address.generation) == null) return error.IntegrityCatalogChanged;
-                    if (effect.value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = value }) else try delete_keys.append(S.ownerField(self, "alloc").*, effect.key);
+                    if (effect.value) |value| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = value }) else try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, effect.key);
                 }
             };
             if (req.merge_page) |page| for (page.provenance_effects) |effect| {
                 // Inert source evidence commits with the page cursor, never with
                 // donor receipt or authority records. Adoption is a separate
                 // receiver-local validation and transaction.
-                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = effect.value orelse return error.InvalidMergePage });
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = effect.value orelse return error.InvalidMergePage });
             };
-            try delete_keys.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_deletes);
+            try write_buffers.delete_keys.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_deletes);
             if (index_stage) |*stage| {
                 const effects = try stage.seal();
                 if (opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply) {
@@ -2947,10 +2970,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         try manager.checkIndexForwardWriteConflicts(forward_keys.items);
                     }
                 }
-                try store_writes.appendSlice(S.ownerField(self, "alloc").*, effects.writes);
-                try delete_keys.appendSlice(S.ownerField(self, "alloc").*, effects.deletes);
+                try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, effects.writes);
+                try write_buffers.delete_keys.appendSlice(S.ownerField(self, "alloc").*, effects.deletes);
             }
-            try delete_keys.appendSlice(S.ownerField(self, "alloc").*, identity_visibility_deletes.items);
+            try write_buffers.delete_keys.appendSlice(S.ownerField(self, "alloc").*, write_buffers.identity_visibility_deletes.items);
 
             // A synchronous hot-standby append can fail after the local transaction commit.
             // Persist the exact committed payloads in the same backend batch so an
@@ -2965,17 +2988,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // and the hot-standby wait; keep its original budgeted owner intact.
                     const key_array = transactions_mod.makeTransactionReplicationBatchOutboxKey(resolution.txn_id);
                     const key = try S.ownerField(self, "alloc").*.dupe(u8, &key_array);
-                    try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = payload });
+                    try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, key);
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = payload });
                     transaction_replication_batch_payload = payload;
                 };
                 if (append_derived_replay) if (S.ownerField(self, "local_execution").*.replication_async_effect_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
                     const payload = try S.ownerField(self, "alloc").*.dupe(u8, replay_payload);
-                    try owned_store_values.append(S.ownerField(self, "alloc").*, payload);
+                    try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, payload);
                     const key_array = transactions_mod.makeTransactionReplicationReplayOutboxKey(resolution.txn_id);
                     const key = try S.ownerField(self, "alloc").*.dupe(u8, &key_array);
-                    try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
-                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = payload });
+                    try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, key);
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = payload });
                     transaction_replication_replay_payload = payload;
                 };
             };
@@ -3002,7 +3025,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // primary commit boundary; Raft replay leases have no wall-time limit.
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             const authored_root = blk: {
-                if (S.ownerField(self, "root_incarnation").* == 0 or explicit_embedding_artifact_writes.items.len == 0) break :blk 0;
+                if (S.ownerField(self, "root_incarnation").* == 0 or write_buffers.explicit_embedding_artifact_writes.items.len == 0) break :blk 0;
                 var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer probe.abort();
                 if (try @import("artifact_publication.zig").authority(&probe) == null) break :blk 0;
@@ -3011,8 +3034,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var authored_acceptance = try @import("artifact_authored_acceptance.zig").Prepared.init(
                 S.ownerField(self, "alloc").*,
                 authored_root,
-                explicit_embedding_artifact_writes.items,
-                store_writes.items,
+                write_buffers.explicit_embedding_artifact_writes.items,
+                write_buffers.store_writes.items,
             );
             defer authored_acceptance.deinit();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -3023,8 +3046,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     resolution.commit_version,
                     .{
                         .commit_participant = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
-                        .writes = store_writes.items,
-                        .deletes = delete_keys.items,
+                        .writes = write_buffers.store_writes.items,
+                        .deletes = write_buffers.delete_keys.items,
                         .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                         .expected_intent_revision = resolution.expected_intent_revision,
                         .known_intent_keys = resolution.intent_keys,
@@ -3042,8 +3065,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
                 try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
                     S.ownerField(self, "backend_runtime").*.io(),
-                    store_writes.items,
-                    delete_keys.items,
+                    write_buffers.store_writes.items,
+                    write_buffers.delete_keys.items,
                     replay_append,
                     store_batch_options,
                     if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
@@ -3097,8 +3120,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
-                active_profile.store_write_count += @intCast(store_writes.items.len);
-                active_profile.store_delete_count += @intCast(delete_keys.items.len);
+                active_profile.store_write_count += @intCast(write_buffers.store_writes.items.len);
+                active_profile.store_delete_count += @intCast(write_buffers.delete_keys.items.len);
             }
             const is_split_progress_checkpoint = if (req.split_checkpoint) |checkpoint|
                 checkpoint.kind == .source_ack
@@ -3106,7 +3129,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 false;
             if (shouldAppendSplitDelta(self) and !is_split_progress_checkpoint) {
                 const split_delta_start_ns = monotonicTimeNs();
-                try S.ownerField(self, "core").*.appendSplitDelta(batch_timestamp_ns, store_writes.items, delete_keys.items);
+                try S.ownerField(self, "core").*.appendSplitDelta(batch_timestamp_ns, write_buffers.store_writes.items, write_buffers.delete_keys.items);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
             }
 

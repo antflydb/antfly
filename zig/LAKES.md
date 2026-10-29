@@ -965,6 +965,186 @@ Algebraic indexes:
 - Reuse adaptive recommendation logic to decide whether a materialization saves
   enough scan work to justify sidecar storage.
 
+## Native Index Execution Contracts
+
+Native text, sparse, dense, ordered and aggregate indexes serve queries over a
+snapshot-pinned publication. Every optimization below keeps exact results:
+scores and their f32 addition order, ties, cursor semantics, and the hit-count
+relation. Each one has an exact fallback when its optional proof or budget is
+unavailable. The budgets quoted here are optimization budgets, not result or
+predicate-cardinality limits. Real Parquet/Iceberg E2Es and deterministic
+work-count regressions are the qualification gate; representative archive-scale
+latency, RSS and provider-request benchmarks have not been run. The dated
+implementation and qualification log is summarized in
+[native lake performance history](../docs/design/sql/history/native-lake-performance-log.md).
+
+### Identity, ties and temporal values
+
+- Public row IDs are `lake3:` IDs: full SHA-256 snapshot and file digests
+  followed by fixed-width row-group/row coordinates (source navigation v4,
+  reader protocol 51). The public file tree is keyed by
+  SHA-256(source, empty snapshot, file), so a new snapshot changes every ID's
+  authority without rewriting unchanged file keys. `lake1:` IDs and older
+  navigation remain readable; private `lake2:` posting identities are unchanged.
+  New source bindings select identity version 2 once; existing bindings keep
+  version 1 through index lifecycle changes.
+- Equal scores tie on immutable file identity and original file rank, never on a
+  packed physical offset or a window-local ordinal. The public API's final
+  tie-breaker is ascending `_id`.
+- Datetimes are signed i128 Unix nanoseconds (doc-value wire tag 7) in SQL,
+  native sorting, cursors and date histograms (floor division before the epoch).
+  Public cursor values are normalized RFC3339. Plain RFC3339 string columns keep
+  the fallback because lexical order is not chronological order.
+
+### Predicate membership
+
+- Native sparse checkpoints persist authenticated 1024-row physical-to-native
+  ordinal blocks. Include and exclusion masks are compressed; an include
+  subtracts a completed exclusion in physical space before translation. Planning
+  holds at most 4 MiB of masks and translation scratch, 4,096 directory blocks and
+  4,096 legacy point seeks, and eagerly translates at most 64 directory windows.
+  Beyond that, scoring checks reached candidates: the first 16 competitive
+  candidates in a window use exact point checks, denser work translates one
+  1,024-ordinal window. Exhaustion discards partial masks and keeps the exact
+  candidate predicate.
+- Metadata predicates materialize upfront when the cheapest exact index selects at
+  most 4,096 candidates. Broader predicates probe the authenticated reverse row
+  index only for candidates that ranking reaches, at 64 work units per probe,
+  capped by the cheaper full-membership estimate and an 8 MiB page-read
+  allowance. Probing requires proof that the tuple bounds enforce every
+  condition. Exhausting either budget switches once to the full compressed set,
+  which later passes and hybrid consumers reuse. The admission cost includes
+  converting complete membership (per compressed block in shared coordinate
+  spaces, per row otherwise). A candidate-local answer is never cached as
+  complete membership.
+- A selective required metadata conjunct can drive serving-pack admission before
+  text ranking (`indexed_predicate_text_admission`). It streams compressed posting
+  pages into inverse source routes and deduplicates pack identities in an external
+  index with a 16 MiB resident budget and the statement spill quota. It never
+  scans Parquet to plan admission or expands broad matches into row-ID lists.
+- Residual predicates run over the narrowed physical selection, projecting only
+  their dependency columns. Typed kernels (SIMD for dense integer/float lanes,
+  memoized dictionary comparisons) keep SQL NULL, signed timestamp and exact
+  NUMERIC semantics; unsupported coercions use the scalar evaluator.
+- Embedded Parquet pruning uses row-group statistics, ColumnIndex/OffsetIndex
+  page skipping and split-block Bloom filters (BLOCK/XXHASH/UNCOMPRESSED only).
+  Decimal and timestamp bounds compare as signed scale-aware values; text-backed
+  decimals never act as numeric bounds. Pruning is advisory and never replaces
+  the residual predicate.
+- Iceberg delete files are shared as independently owned, compressed 64-bit
+  position sets routed by partition and sequence. Immutable pinned catalogs on
+  version-capable providers can publish exact delete selectors, avoiding an
+  archive-wide HEAD census; mutable sources and legacy proofs keep fresh
+  validation.
+
+### Text ranking and pagination
+
+- Publications persist a global term-frequency B-tree, per-segment summaries and
+  a term directory whose branches carry at most eight nondominated
+  (maximum frequency, minimum length) scoring envelopes. BM25 statistics (N,
+  document frequency, field lengths) always come from the complete pinned
+  publication, so admitting a subset of files or segments never changes scores.
+- Broad queries stream admission windows instead of admitting the whole corpus.
+  A window holds at most 64 segments and 32 MiB of encoded segment data;
+  `lake_indexes.text_cache.admission_window_segments` (1–64) and
+  `admission_window_bytes` (1–32 MiB) can lower that granularity. A single
+  serving segment is indivisible. Windows start at one segment and grow
+  geometrically while the winner heap is unchanged.
+- A publication-wide best-first frontier (profile label
+  `bounded_global_text_frontier`) ranks routing ranges by authenticated subtree
+  bounds before inventory admission. It holds at most 512 ranges, completes
+  overflow subtrees depth-first, uses 8 MiB of scratch and a non-replenishing
+  256 MiB term-tree read budget, and prunes only strictly lower bounds. A range
+  missing a required clause is excluded even without a cutoff. Counters are
+  exported as `antfly_lake_text_frontier_*_total`.
+- Supported shapes include term and analyzed match, nested and mixed-field
+  Boolean (must, should, minimum-should-match, must-not, boosts), exact and
+  multi-phrase positional leaves, prefix/wildcard/regexp/fuzzy patterns, text
+  components of composed and hybrid queries, pruners, rerankers, evaluation, and
+  accepted-WAL overlays. Pattern expansion examines at most 4,096 dictionary
+  entries and keeps 128 terms; compiled regex programs are cached per query
+  (16 programs, 2 MiB). Unknown bounds stay infinite and require traversal.
+- When competitive pruning skips matches, ranked totals report a `gte` lower
+  bound. Exact counts use the authoritative path; a published-only count of one
+  positive term uses the global document frequency
+  (`native_text_metadata_count`).
+- Parallel scoring uses the shared scheduler: at most four text lanes of 8 MiB
+  within a 32 MiB operator allowance, and four sparse DAAT lanes of 16 MiB within
+  64 MiB. Lanes share a monotone score cutoff; cap exhaustion reruns the exact
+  serial path.
+- Field sorts use a compatible ordered relational index as the candidate
+  producer (`ordered_lake_index_then_text_postings`) when direction, null policy,
+  collation, equality prefixes and public-ID ties match; otherwise bounded native
+  doc-value top-N. Typed first/last bounds in routing records and an endpoint
+  directory prune dominated ranges (text metadata v14/v15). The default
+  `missing_null_policy: missing_rejected` rejects missing sort values;
+  `nulls_ordered` orders them with authenticated typed-coverage witnesses.
+- Stored-source highlights (`store_source: true`) hydrate only final winners, in
+  physical segment order, under the publication reader lease.
+
+### Serving layout and publication
+
+- Native text root v11 separates canonical per-source-file maintenance state from
+  a packed serving root. Serving packs come from four bounded eight-way tiers,
+  targeting 16 MiB of input and 1 MiB of source metadata, with at most 4,096
+  sources per pack. Source spans live in authenticated pages of at most 64 spans
+  and 64 KiB. A source-to-pack ownership index and an inverse source-route tree
+  let replacements and removals touch only affected packs; small appends
+  consolidate open tails and leave closed historical packs unread.
+- Incremental publication applies signed document-frequency deltas and
+  copy-on-write B-tree updates, switching to a streaming merge when distinct
+  deltas reach max(4096, prior term count / 4). Builds checkpoint every 64
+  completed files or five seconds into paged file trees; a restart replays only
+  the unsaved tail while queries keep using the previous publication.
+- Garbage collection marks everything reachable from live publication, reader and
+  builder leases, including checkpoints. Incomplete traversals never authorize a
+  sweep.
+- Readiness warms planning navigation once per publication: at most four
+  publications concurrently, four I/O lanes of 4 MiB, 64 pages, two interior
+  levels and a two-second deadline. It never warms postings or source rows.
+  Counters: `antfly_lake_navigation_warming_{attempts,failures,pages,nanoseconds}_total`.
+- Cloud generation maps, retained-closure certificates and cloud GC are described
+  in [Cloud generations and retention evidence](REMOTE_TABLE_SERVING.md#cloud-generations-and-retention-evidence).
+
+### Accepted (recent) rows
+
+- Recent text is built once per immutable WAL cut, partitioned into
+  stable-key-prefix runs that later cuts reuse. Each build is bounded at 64 MiB;
+  the process cache holds 256 MiB. Recent rows score first to establish a
+  cutoff. Archive base statistics plus recent rows are counted exactly once, and
+  equal scores place archive rows before recent rows.
+- Recent dense/sparse indexes use at most sixteen immutable stable-prefix runs,
+  reused across cuts by content- and recipe-keyed jobs; vector requests stay
+  readiness-gated.
+- Retained cursor tokens reference small lease envelopes over shared immutable
+  state and at most sixteen reusable row groups, which expire after 24 hours.
+
+### SQL execution over lake files
+
+- The shared scheduler admits eight CPU tasks and 32 I/O tasks within a 64 MiB
+  temporary-work allowance; I/O reserves at most 32 MiB and never more than half.
+  Required work runs inline under saturation; speculative work yields.
+- Parquet reads use exact OffsetIndex page ranges, merge adjacent cold pages into
+  envelopes of up to 2 MiB, and skip encoded I/O on decoded-page hits. Rolling
+  row-group scheduling keeps at most two four-file windows; footer lookahead uses
+  a 16 MiB workspace.
+- Joins install dynamic filters. The exact build-key set stays in memory up to
+  4,096 tuples or 1 MiB and spills beyond that; it can select a compatible native
+  ordered-index probe. Inseparable partitions use bounded block replay. Join
+  partial aggregation runs only when a 128-row build sample shows at least 25
+  percent reduction. Up to eight eligible inner-join inputs are reordered by
+  bounded dynamic programming, only when strictly cheaper.
+- Aggregation uses typed physical kernels and logical row credits that file,
+  row-group and worker boundaries cannot multiply. Exact parallel reduction
+  covers COUNT, integer SUM, booleans and integer/boolean/text MIN/MAX; floating
+  extrema keep ordered reduction. Partial groups partition across reducers at
+  4,096 groups.
+- NUMERIC values stay exact through filters, index keys, joins and SUM/AVG,
+  using i128 coefficients for decimal128 and promoting wider values once.
+- Publications carry advisory planner statistics: per-file sketches (64 HLL
+  registers, heavy-key counters) for up to 64 indexed columns. They inform
+  costing only and never prune or limit rows.
+
 ## Caching And Materialization
 
 There should be three levels of caching:

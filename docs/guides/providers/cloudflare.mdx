@@ -1,0 +1,127 @@
+---
+title: Cloudflare Workers AI
+description: Workers AI embeddings, reranking, generation, reading, extraction, decisions, transcription, and speech in Antfly
+---
+
+The `cloudflare` provider calls Workers AI in your Cloudflare account. Configure
+`account_id`, the full `@cf/owner/model` or `@hf/owner/model` name, and an API
+token. An optional `gateway_id` routes requests through AI Gateway.
+
+## What It Provides
+
+| Component | Inputs | Models |
+|---|---|---|
+| Embedder | Text | BGE, Qwen embedding, and EmbeddingGemma text models |
+| Reranker | Text | `@cf/baai/bge-reranker-base` |
+| Reader | Images | Vision chat; `@cf/mistralai/mistral-small-3.1-24b-instruct` for documents |
+| Transcriber | Audio | `@cf/openai/whisper-large-v3-turbo`, with language, duration, segments, and word times when returned |
+| Speech synthesizer | Text | `@cf/deepgram/aura-2-en` and `@cf/myshell-ai/melotts`, MP3 output |
+| Generator | Text, images | Chat Completions, with streaming and tools where the model supports them |
+| Extractor | Text, images | Clairic flat records; or a generated extractor backed by a Cloudflare generator |
+| Decider | Text, images | `@cf/cloudflare/clef` and `@cf/cloudflare/clef-flash`, or a generated or embedding-similarity decider |
+
+Antfly keeps chunking itself; use a Cloudflare embedder for the chunks.
+Tool, image, and structured-output support varies by model.
+
+## Credentials
+
+`api_key`, defaulting to `CLOUDFLARE_API_TOKEN`.
+
+## Example
+
+```json
+{
+  "embedders": {
+    "cf-text": {
+      "provider": "cloudflare",
+      "account_id": "account",
+      "model": "@cf/baai/bge-base-en-v1.5",
+      "dimensions": 768,
+      "api_key": "${secret:cloudflare.api_token}"
+    }
+  },
+  "generators": {
+    "cf-chat": {
+      "provider": "cloudflare",
+      "account_id": "account",
+      "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      "api_key": "${secret:cloudflare.api_token}",
+      "max_tokens": 1024
+    }
+  },
+  "rewriters": {
+    "clean-text": {
+      "generator": "cf-chat",
+      "instructions": "Rewrite clearly while preserving meaning. Return only the rewritten text."
+    }
+  },
+  "deciders": {
+    "route-by-similarity": {
+      "decision_method": "embedding_similarity",
+      "embedder": "cf-text",
+      "embedding_options": { "dimensions": 768, "min_similarity": 0.5 }
+    },
+    "generated-choice": {
+      "decision_method": "generated",
+      "generator": {
+        "provider": "cloudflare",
+        "account_id": "account",
+        "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "api_key": "${secret:cloudflare.api_token}"
+      },
+      "probabilities": "verdict_only"
+    }
+  }
+}
+```
+
+## Behavior
+
+- **Embeddings.** Response dimensions are validated; fixed-size models are not asked to resize vectors. Text requests are batched up to 100 items.
+- **Similarity decisions.** Input and category embeddings are batched and deduplicated, example centroids are normalized, and results are cosine scores with explicit tie and threshold abstentions. `embedding_options.task_type` selects `CLUSTERING` or `CLASSIFICATION`. Token usage is a conservative byte-based estimate marked `estimated: true`.
+- **Generated extraction and decisions.** Output is validated against the typed contract. Cloudflare models use tool calls with `probabilities: "verdict_only"`, since token log-probabilities are not available.
+- **Reading.** Generated vision output is marked `interpretation`; the adapter does not invent OCR boxes or citations. A read that ends because it hit the token limit fails with `ReadOutputTruncated` rather than returning partial text.
+- **Transcription and speech.** Whisper rejects diarization. Speech synthesis returns MP3 and rejects speed or container overrides before dispatch.
+- **Clairic extraction.** The schema version (1 or 2) is validated before dispatch, and decimal precision is limited to 0–6.
+
+Not offered through Cloudflare: sparse embeddings, image embedding models,
+Markdown conversion, tabular prediction, and fixed-label classifiers in place of
+caller-defined labels.
+
+## Materialized Similarity Decisions
+
+A decision producer that uses a named embedder stores that embedder's
+configuration with the producer, so replays use the same dependency rather than
+the node's current named configuration. Changing it changes the specification
+hash and rebuilds the enrichment.
+
+```json
+{
+  "version": "v1",
+  "decider": {
+    "decision_method": "embedding_similarity",
+    "embedder": "cf-text",
+    "embedding_options": { "dimensions": 768, "min_similarity": 0.5 }
+  },
+  "embedders": {
+    "cf-text": {
+      "provider": "cloudflare",
+      "account_id": "account",
+      "model": "@cf/baai/bge-base-en-v1.5",
+      "dimensions": 768,
+      "api_key": "${secret:cloudflare.api_token}"
+    }
+  },
+  "questions": [{
+    "name": "route",
+    "type": "choice",
+    "instructions": "Choose the category that best describes the input.",
+    "choices": [{ "value": "receipt" }, { "value": "slide" }]
+  }]
+}
+```
+
+## Related
+
+- [Declarative document models](https://github.com/antflydb/antfly/blob/main/docs/design/declarative-document-models.md): whole PDF, slide, and receipt reading
+- [Provider rate limits](/docs/guides/provider-rate-limits)

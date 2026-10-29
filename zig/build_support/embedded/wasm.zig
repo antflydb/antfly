@@ -549,7 +549,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     b.step("serverless-wasm", "Build the R2-backed serverless WASM host").dependOn(&host_install.step);
 
     const antfly_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("examples/antfly_wasm.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/wasm_root.zig"),
         .strip = strip,
         .target = wasm_target,
         .optimize = optimize,

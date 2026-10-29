@@ -23,7 +23,15 @@ const requireUser = createUserContent({ auth, db, tables });
 // Mount auth routes and start listening only after schema setup succeeds.
 ```
 
-Install `@antfly/better-auth`, `@antfly/embedded`, and `better-auth@~1.7.14`. Define `authOptions` in a side-effect-free configuration module:
+The initial integration is a release candidate. Use matching published packages (Node 24+):
+
+```sh
+npm install @antfly/better-auth@0.1.0-rc.1 @antfly/embedded@0.3.0-rc.6 better-auth@~1.7.14
+```
+
+The default `@antfly/embedded` npm tag may still point to a setup placeholder; use the explicit release version. The integration requires SDK 0.2.2 or newer within 0.2, installed as a dependency. For remote apps, omit `@antfly/embedded` and install `@antfly/sdk@^0.2.2` explicitly.
+
+Define `authOptions` in a side-effect-free configuration module:
 
 ```ts
 import { authDefaults } from "@antfly/better-auth";
@@ -104,7 +112,7 @@ The embedded engine coordinates access with per-operation leases; concurrent pro
 
 Use `remoteDatabase(new AntflyClient(...))` from `@antfly/better-auth/remote` and the same adapter/schema/content helpers. No native library is imported. Set `rateLimit.storage` to `"database"`, or pass `remote: true` to `consumerAuthOptions`. Initialize schema once before starting multiple application instances.
 
-Use a server release containing the concurrent SQL connection-directory fix shipped with this integration, together with the updated SDK. SQL transactions must stay on one stable API owner endpoint. The transport retains the HTTP connection ID and active transaction session ID. Arbitrary round-robin routing is unsupported. For committed-but-pending writes, the transport reads the matching transaction receipt until visibility is confirmed. Fresh schema setup similarly checks the receipt’s table identity and schema generation before serving requests. Pending, repair-required, and uncertain writes are never replayed; unresolved outcomes fail closed.
+Use Antfly server 0.3.0-rc.6 or a later compatible release, together with SDK 0.2.2+. Earlier published SDKs lack the transaction-outcome method required by this integration. SQL transactions must stay on one stable API owner endpoint. The transport retains the HTTP connection ID and active transaction session ID. Arbitrary round-robin routing is unsupported. For committed-but-pending writes, the transport reads the matching transaction receipt until visibility is confirmed. Fresh schema setup similarly checks the receipt’s table identity and schema generation before serving requests. Pending, repair-required, and uncertain writes are never replayed; unresolved outcomes fail closed.
 
 See [the Next.js remote example](https://github.com/antflydb/antfly/tree/main/ts/examples/nextjs-auth). Next.js may use embedded Antfly only as a standalone persistent Node deployment with the same platform restrictions as Express.
 
@@ -116,10 +124,11 @@ See [the Next.js remote example](https://github.com/antflydb/antfly/tree/main/ts
 | Embedded runtime | Node 24+, macOS arm64, glibc Linux arm64/x64 |
 | Embedded deployment | One persistent process; Docker `node:24-slim`, VPS, or volume-backed host |
 | Remote recipe | Node runtime, Next.js; stable Antfly API owner |
+| Workers recipe | Dedicated native metadata owner on R2; see the Cloudflare mail example |
 | Authentication | Email/password, database sessions, verification/recovery, email change, account deletion, Google configuration |
 | Content | Owner-scoped CRUD and full-text search |
 | Plugins | Schema extension supported; additional plugin workflows require qualification |
-| Not yet | Windows, Alpine/musl, Bun, Deno, Workers/Cloudflare, browser-native/desktop auth packaging, non-TypeScript integrations |
+| Not yet | Windows, Alpine/musl, Bun, Deno, browser-native/desktop auth packaging, non-TypeScript integrations |
 
 `createTestAuth()` from `@antfly/better-auth/testing` provides an isolated temporary database and cleanup. Pass a second argument of `true` to capture consumer-flow mail. Always call `close()` in teardown. Real password hashing remains enabled.
 
@@ -130,3 +139,21 @@ Repository maintainers own the adapter alongside the TypeScript SDK. Supported-v
 ## Prior art
 
 [Convex's Better Auth integration](https://labs.convex.dev/better-auth) is prior art for keeping identities and application data in one backend while retaining Better Auth's client APIs. This integration follows the same separation: Better Auth owns authentication, and Antfly supplies persistence and narrowly scoped content access. It uses stable user identities, completes account transactions before external effects, and distinguishes extensible schema configuration from tested runtime/framework/plugin support.
+
+## Cloudflare Workers
+
+Use the separate `@antfly/better-auth/workers` entry for a Workers-native Antfly
+metadata store. It does not emulate SQL or load the embedded Node addon. The
+host must supply fenced, serializable, durable multi-key transactions; an
+eventually consistent KV binding cannot implement this contract. Provision once
+with `prepareWorkersAuth`; `createWorkersAuth` installs the structured adapter.
+Enable `nodejs_compat`, keep the auth actor private, and derive application
+mailbox/content ownership from verified sessions rather than tenant headers.
+
+The [Cloudflare mail example](https://github.com/antflydb/antfly/blob/feat/cloudflare-mail-auth/examples/cloudflare-serverless/MAIL.md)
+implements the native R2 host and tests actual workerd login, ownership and
+persisted reopen. It is a separate recipe from `remoteDatabase`, which retains
+its stable SQL API-owner requirement. Shared mailbox memberships and account
+content deletion are not yet implemented in that example; its account-deletion
+endpoint is disabled. No live email-domain qualification is implied by local
+runtime tests.

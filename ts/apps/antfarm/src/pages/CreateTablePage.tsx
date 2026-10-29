@@ -52,7 +52,7 @@ const CreateTablePage: React.FC = () => {
       <div className="relative isolate">
         <DashboardPageHeader>
           <div>
-            <DashboardPageTitle className="font-aeonik">Create New Table</DashboardPageTitle>
+            <DashboardPageTitle>Create New Table</DashboardPageTitle>
             <DashboardPageDescription>
               Define the schema for your new table.
             </DashboardPageDescription>

@@ -2,188 +2,115 @@
 
 Antfly's voice in three registers. Pick the right one with one question:
 
-> **Is this content read as a label/identifier, or as a phrase?**
-> Mono if label. Inter if phrase. Aeonik only when it's a brand moment.
+> **Is this text data, or is it interface?**
+> Mono if it's data. Inter for everything else. Aeonik only when it's a brand moment.
 
-**Chrome beats content shape.** When the element is part of the instrument chassis (a menu item, accordion trigger, button, list selector), use mono even if the text is sentence-shaped. The chassis voice wins. Inter is reserved for content that's *read* as a phrase (Card/Dialog/Sheet titles, page headings, paragraphs).
+**Data** is what the system holds or measures: IDs, table and field names, keys, values, timestamps, code, query DSL, keyboard shortcuts. **Interface** is everything you read or click to operate the product: buttons, labels, tabs, menu items, table headers, badges, sidebar items, titles, and prose. Interface text is Inter, sentence case, with no tracking.
 
-**…but what the user types is theirs.** Free-text entry (`<Input>`, `<Textarea>`, `<InputGroupTextarea>` — chat prompts, search boxes, descriptions) defaults to the body voice (Inter, `text-sm`): the user is writing a phrase, not reading an instrument. Selects stay mono — their values are system-supplied. Fields whose content is genuinely an identifier (table names, IDs, query DSL) opt back in with `font-mono`.
+The test for a screen: mono should be rare enough that it reads as a readout. If most of the visible text on a screen is mono, labels have taken over from data and nothing stands out.
 
 ## The three registers
 
 | Register | Font | What it says |
 | --- | --- | --- |
 | **Display** | Aeonik | "This is a brand moment." |
-| **Mono** | Roboto Mono / Geist Mono | "This is an instrument — a label, ID, value, or readout." |
-| **Body** | Inter | "Read this as a phrase or paragraph." |
+| **Body** | Inter | "This is the interface: read it, click it." |
+| **Mono** | Roboto Mono / Geist Mono | "This is data: an ID, a value, a name the system holds." |
 
 Plus one specialty register:
 
 | Register | Font | What it says |
 | --- | --- | --- |
-| **Pixel** | Silkscreen | "This is loud brand chrome." Used sparingly — hero kickers, AntyPixel pair-ups. |
+| **Pixel** | Silkscreen | "This is the brand mark." Paired with AntyPixel on auth, empty, and error screens. Never in running interface or page copy. |
 
 ---
 
-## Display — Aeonik
+## Display: Aeonik
 
-Reserved for **brand moments**. Used in marketing surfaces and the rare in-product hero. Aeonik signals "look here, this represents Antfly." If you use it everywhere, it stops representing anything.
+Reserved for **brand moments**. Used in marketing surfaces and the rare in-product hero. If you use it everywhere, it stops representing anything.
 
 **Use for:**
 - Hero headlines and subheads (marketing pages, landing)
 - Brand wordmarks
 - Auth-screen welcome heads
-- Empty-state hero text ("Nothing here yet")
+- Empty-state hero text
 
 **Do not use for:**
-- Page titles inside the dashboard — those are Inter
-- Card titles, dialog titles — those are Inter
+- Page titles inside the dashboard (Inter)
+- Card titles, dialog titles (Inter)
 - Section headings inside tool surfaces
 
 **Tailwind:** `font-display`
 
 ---
 
-## Mono — instrument voice
+## Body: Inter
 
-The workhorse for chrome and chassis. Mono is for content that **labels, identifies, or shows a value/state**. It reads as a tool, not as prose.
+The workhorse. Hierarchy comes from size, weight, and ink (foreground vs. muted), never from switching fonts or casing.
 
-Mono has three sub-modes — same font, different shapes for different jobs:
+### Controls and labels
 
-### Mono kicker (UPPERCASE · tracked · small)
+- Size: **13–14px** (`text-[13px]` labels and tabs, `text-sm` buttons, inputs, and menu items)
+- Weight: **500** for labels, tabs, and buttons; **400** for menu items and input values
+- Case: **sentence case**. No uppercase, no tracking.
 
-Quiet section labels and form field names. Subdued by design.
+**Use for:** `<Button>`, `<Label>`, `<TabsTrigger>`, `<AccordionTrigger>`, `<SelectTrigger>` and `<SelectItem>`, dropdown, context, and command items, sidebar menu items, `<Input>` and `<Textarea>` values.
 
-- Tracking: **0.08em** (the single label tracking)
-- Size: **11px**
-- Weight: **500** (medium)
+### Small labels
+
+Quiet structure that should recede behind content.
+
+- Size: **12px** (`text-xs`)
+- Weight: **500**
 - Color: `text-muted-foreground`
+- Case: sentence case
 
-**Use for:**
-- Form field labels (`<Label>`)
-- Table column headers
-- Card-head section labels (the kicker pattern)
-- Sidebar group headings
-- Dropdown / context menu labels
-- Tab labels (`<TabsTrigger>`)
-- Top nav items
+**Use for:** `<TableHead>`, sidebar group headings, menu group labels, `<Badge>`, `<TooltipContent>`, stat-card labels.
 
-**Tailwind shorthand:** `font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground`
-
-### Mono callout (UPPERCASE · tracked · proud)
-
-Loud kind-of-thing labels — short, important, often colored. Shorter content than a kicker, more presence.
-
-- Tracking: **0.08em** (same as kicker — one label tracking)
-- Size: **11px** (the single label size)
-- Weight: **500** (the casing and tracking carry the presence; bold is reserved for rare emphasis)
-- Color: ink by default — one signal per emphasis. Semantic/amber color is for the few
-  deliberately-colored chips (Badge primary/destructive); alert titles stay ink and let the
-  icon carry the state.
-
-**Use for:**
-- `<Badge>` (all variants)
-- `<AlertTitle>` ("ERROR", "INDEX REBUILDING")
-- Status pills, kind labels
-
-### Mono readout (sentence-case · normal)
-
-Live values, instrument data, code-like identifiers. Reads as a measurement or name.
-
-- Tracking: **0** (or 0.02em for subtle)
-- Size: **13px**
-- Weight: **400–500**
-
-**Use for:**
-- Menu items (Dropdown, Context, Select items)
-- Button text
-- Code IDs (`shard-0a1f`, `products_v2`)
-- Metric values (table numeric cells, `p99 ms`)
-- Tooltip readouts
-- Dropdown shortcuts (`⌘K`)
-- Accordion triggers (instrument-style collapsible sections)
-
-**Tailwind shorthand:** `font-mono text-[13px]`
-
----
-
-## Body — Inter
-
-For **headings users read as a phrase** and **sentences/paragraphs**. Inter is the human voice.
-
-### Body heading
-
-Restrained section titles. Not display, not chrome — readable headings.
+### Headings
 
 - Size: **16–18px**
-- Weight: **500** (medium) — *not* semibold (the design language is restrained)
+- Weight: **500** (not semibold; the design language is restrained)
 - Tracking: normal or `-0.01em`
 
-**Use for:**
-- `<CardTitle>`
-- `<DialogTitle>` / `<AlertDialogTitle>` / `<SheetTitle>`
-- Page H1 / H2
-- Section headings inside tools
+**Use for:** `<CardTitle>`, `<DialogTitle>` and `<AlertDialogTitle>` (18px), `<SheetTitle>`, section headings inside tools. `<AlertTitle>` is the same voice at `text-sm`.
+
+The page title (`<DashboardPageTitle>`) is the one heavier heading: Inter 24px, weight 600, `-0.015em` tracking. One per page.
 
 **Tailwind shorthand:** `text-base font-medium leading-tight`
 
 ### Body text
 
-Paragraphs and supporting copy.
-
 - Size: **13–15px**
-- Weight: **400** (regular)
-- Tracking: normal
+- Weight: **400**
+
+**Use for:** `<CardDescription>`, `<DialogDescription>`, `<AlertDescription>`, help text under fields, page prose.
+
+---
+
+## Mono: data voice
+
+Mono marks text that **is** data. It reads as a measurement or a name the system holds.
+
+- Size: **13px** inline, matching surrounding Inter at `text-sm`
+- Weight: **400**
+- Tracking: **0**
+- Case: whatever the data is. Never force uppercase.
+- Numbers: add `tabular-nums` in columns
 
 **Use for:**
-- `<CardDescription>` / `<DialogDescription>` / `<AlertDescription>`
-- Help text under form fields
-- Any sentence-of-explanation
-- Page-level prose
+- IDs and names: `shard-0a1f`, `products_v2`, `acme-prod`
+- Metric values in tables and charts: `p99 ms`, `1,240`
+- Code, query DSL, JSON paths
+- Keyboard shortcuts (`⌘K`, `<Kbd>`)
+- File names
+- Input fields whose content is an identifier (opt in with `font-mono`)
 
-**Tailwind shorthand:** `text-sm` or `text-[15px]`
+### Eyebrow (the one uppercase use)
 
----
+A marketing section may carry one short mono eyebrow above its heading, like `01 Analytics`. One per section at most, never inside the dashboard, never on controls.
 
-## Why DialogTitle is Inter but AlertTitle is Mono
-
-Both are "titles" — the distinction is what kind of content they hold.
-
-**`<AlertTitle>` is a kind label.** Reads as: `ERROR`. `INDEX REBUILDING`. `QUOTA EXCEEDED`. It names what kind of message you're looking at; the description tells the story. → **Mono uppercase callout.**
-
-**`<DialogTitle>` is a conversation heading.** Reads as: `Delete database?`. `Add API key`. `Confirm migration`. It's a question or task in plain language. → **Inter body heading.**
-
-If you ever want a kicker register on a dialog (e.g., "DESTRUCTIVE ACTION" above "Delete database?"), compose `<Kicker>` with `<DialogTitle>`. The two registers stack cleanly:
-
-```tsx
-<DialogHeader>
-  <Kicker>Destructive action</Kicker>
-  <DialogTitle>Delete database?</DialogTitle>
-  <DialogDescription>This cannot be undone.</DialogDescription>
-</DialogHeader>
-```
-
----
-
-## Tracking quick-reference
-
-| Where | Tracking |
-| --- | --- |
-| Buttons (mono) | **0** — no letter-spacing |
-| Mono labels — kickers, callouts, badges, alert titles (uppercase) | 0.08em |
-| Mono readouts (sentence-case) | 0 or 0.02em |
-| Inter headings | normal or -0.01em |
-| Inter body | normal |
-
-Buttons deliberately have **no tracking** — earlier prototypes felt exaggerated. Keep buttons tight.
-
----
-
-## Weight conventions
-
-- **Aeonik:** regular (400) or medium (500). Avoid bold — the size carries the moment.
-- **Mono:** regular (400) for readouts, medium (500) for labels, buttons, and callouts. Bold callouts are the exception, not the rule.
-- **Inter:** regular (400) for body, **medium (500) for headings**. Avoid semibold — restraint is part of the voice.
+**Tailwind shorthand:** `.mono-label`
 
 ---
 
@@ -194,20 +121,15 @@ Is this a brand moment (hero, marketing, wordmark)?
   └── yes → Aeonik (display)
   └── no ↓
 
-Is this part of the instrument chassis (menu, accordion, button, list, tab, badge, toolbar)?
-  └── yes → Mono
-  │     ├── short uppercase label?   → Mono kicker (tracked 0.08em)
-  │     ├── short uppercase kind?    → Mono callout (tracked 0.08em)
-  │     └── item / readout / value?  → Mono readout (no tracking)
+Is this text data (an ID, value, name, code, shortcut)?
+  └── yes → Mono, as-is casing, no tracking
   └── no ↓
 
-Is this content a label, identifier, value, or kind?
-  └── yes → Mono (same modes as above)
-  └── no ↓
-
-Is this a phrase or sentence?
-  └── short heading?  → Inter medium 16–18px
-  └── prose / body?   → Inter regular 13–15px
+Everything else is Inter, sentence case:
+  ├── control or label?  → 13–14px, weight 500
+  ├── quiet structure?   → 12px muted, weight 500
+  ├── heading?           → 16–18px, weight 500
+  └── prose?             → 13–15px, weight 400
 ```
 
 ---
@@ -217,20 +139,24 @@ Is this a phrase or sentence?
 | Component | Register | Why |
 | --- | --- | --- |
 | `<Hero>` headline | Display (Aeonik) | Brand moment |
-| `<Hero>` kicker | Pixel (Silkscreen) | Loud brand chrome |
-| `<Kicker>` | Mono kicker | Subdued section label |
-| `<Label>` | Mono kicker | Form field name |
-| `<TableHead>` | Mono kicker | Column identifier |
-| `<Badge>` | Mono callout | Kind label |
-| `<AlertTitle>` | Mono callout | Kind of message |
-| `<Button>` | Mono readout | Action label, tight |
-| `<DropdownMenuItem>` / `<SelectItem>` | Mono readout | List item, name-like |
-| `<Input>` / `<Textarea>` | Inter body | User-typed phrase (opt into mono for identifiers) |
-| `<TooltipContent>` | Mono readout | Instrument readout |
-| `<TabsTrigger>` | Mono kicker | Nav-style label, active gets amber underline |
-| `<AccordionTrigger>` | Mono readout | Instrument-style expandable, sentence-case |
-| `<CardTitle>` | Inter heading | Section name read as phrase |
-| `<DialogTitle>` / `<SheetTitle>` | Inter heading | Conversation heading |
-| `<CardDescription>` / `<AlertDescription>` | Inter body | Prose explanation |
-| `<TableCell>` (numeric/code) | Mono readout | Value / identifier |
+| `<Button>` | Inter control | Interface |
+| `<Label>` | Inter control | Interface |
+| `<TabsTrigger>` | Inter control | Interface; active tab gets the amber underline |
+| `<AccordionTrigger>` | Inter control | Interface |
+| `<DropdownMenuItem>` / `<SelectItem>` | Inter control | Interface |
+| `<Input>` / `<Textarea>` | Inter control | User-typed text (opt into mono for identifiers) |
+| `<TableHead>` | Inter small label | Recedes behind the data |
+| `<Badge>` | Inter small label | Quiet chip |
+| `<TooltipContent>` | Inter small label | Interface |
+| `<AlertTitle>` | Inter heading (`text-sm`) | Plain-language heading |
+| `<CardTitle>` / `<DialogTitle>` | Inter heading | Read as a phrase |
+| `<CardDescription>` / `<AlertDescription>` | Inter body | Prose |
+| `<TableCell>` (IDs, numbers) | Mono | Data |
 | `<TableCell>` (prose) | Inter body | Free text |
+| `<DropdownMenuShortcut>` / `<Kbd>` | Mono | Data (a key) |
+| `<CodeBlockContent>` | Mono | Data (code) |
+| `<CodeBlockTitle>` | Inter control | Interface (add `font-mono` when it is a file name) |
+| `<FieldLabel>` / `<FieldDescription>` / `<FieldError>` | Inter control / body | Interface |
+| `<ItemTitle>` | Inter control | Interface (add `font-mono` when it names a table, model, or ID) |
+| `<TraceTitle>` | Inter body | Interface |
+| `<AntyPixel>` with `<Kicker>` | Pixel | Brand mark |

@@ -56,7 +56,9 @@ env:
 
 concurrency:
   group: zig-${{ inputs.pr_number || github.ref }}
-  cancel-in-progress: true
+  # Finish an active main qualification; GitHub coalesces pending runs in this
+  # same group. PR heads and merge-queue revisions still supersede old work.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' || inputs.pr_number != '' }}
 
 jobs:
   admission:
@@ -361,6 +363,10 @@ jobs:
             rs/Cargo.toml rs/Cargo.lock \
             ':(glob)py/packages/embedded/**' \
             ':(glob)ts/packages/embedded*/**' \
+            ':(glob)ts/packages/better-auth/**' \
+            ':(glob)ts/packages/sdk/**' \
+            ':(glob)ts/examples/express-auth/**' \
+            .github/workflows/better-auth-compatibility.yml \
             ts/package.json ts/pnpm-lock.yaml ts/pnpm-workspace.yaml \
             scripts/ci/test-embedded-sdk-native.sh \
             scripts/ci/test_embedded_sdk_native.py \
@@ -638,11 +644,22 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
 
       - name: Restore ARC Zig cache dirs
         run: |
@@ -722,14 +739,16 @@ jobs:
       - name: Compile consolidated storage and graph benchmark contracts
         if: needs.changes.outputs.zig_tests == 'true'
         working-directory: zig
-        run: zig build antfly-storage-bench antfly-graph-bench -Doptimize=debug
+        run: >-
+          python3 tools/run_bounded_zig_build.py -- build --build-file ./build.zig
+          antfly-storage-bench antfly-graph-bench -Doptimize=debug -Dcpu=baseline
 
       # Keep inexpensive tooling checks beside the normal unit gate. The
       # isolated compilation/cache matrix runs in zig-full / build-cache.
       - name: Test build tooling
         working-directory: zig
         run: >-
-          python3 -m unittest
+          python3 -m unittest -v
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
           tools/test_benchmark_lake_archive.py
@@ -1993,6 +2012,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  better-auth:
+    if: >-
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    needs: [admission, e2e-base-build, e2e-full-build]
+    uses: ./.github/workflows/better-auth-compatibility.yml
+    with:
+      head_sha: ${{ inputs.head_sha || github.sha }}
+      artifact_suite: ${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}
+      versions: ${{ github.event_name == 'schedule' && '["supported","latest","beta"]' || '["supported"]' }}
+
   pgwire-driver-conformance:
     if: >-
       ${{ always() && !cancelled() && needs.admission.result == 'success' &&
@@ -2055,10 +2086,12 @@ jobs:
 
   e2e-base-plan:
     if: >-
-      ${{ !cancelled() && success() && !inputs.full_validation && needs.admission.result == 'success' &&
-      inputs.pr_number != '' && github.run_attempt == 1 && needs.changes.outputs.e2e == 'true' }}
-    name: e2e-base / plan
-    needs: [admission, changes]
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      inputs.validation_scope != 'inference-e2e' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    name: e2e / plan
+    needs: [admission, changes, e2e-base-build, e2e-full-build]
     runs-on: arc-antfly-standard-runtime
     timeout-minutes: 10
     steps:
@@ -2077,15 +2110,24 @@ jobs:
         working-directory: zig
         env:
           PYTHONPATH: ../scripts/ci
+          FULL_E2E: ${{ inputs.full_validation || inputs.pr_number == '' }}
+          ANTFLY_E2E_FULL_LAKE: ${{ (inputs.full_validation || inputs.pr_number == '') && '1' || '0' }}
           ANTFLY_E2E_DURATION_FILE: ${{ runner.temp }}/e2e-plan/durations.json
         run: |
           mkdir -p "${RUNNER_TEMP}/e2e-plan"
           if [[ ! -f "$ANTFLY_E2E_DURATION_FILE" ]]; then
             cp ../scripts/ci/antfly_e2e_durations.json "$ANTFLY_E2E_DURATION_FILE"
           fi
-          uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
+          extras=()
+          selection=()
+          if [[ "$FULL_E2E" == "true" ]]; then
+            extras+=(--extra lake --extra iceberg)
+          else
+            selection+=(-m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)")
+          fi
+          uv run --project e2e/antfly "${extras[@]}" pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
-            -m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)" e2e/antfly
+            "${selection[@]}" e2e/antfly
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
@@ -2418,7 +2460,7 @@ jobs:
       inputs.pr_number != '' &&
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base
-    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]
+    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]
     runs-on: arc-antfly-standard-runtime
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -2433,6 +2475,7 @@ jobs:
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
           NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
           PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
+          BETTER_AUTH_RESULT: ${{ needs.better-auth.result }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = "success"
@@ -2441,6 +2484,7 @@ jobs:
           test "$LOW_FD_RESULT" = "success"
           test "$NATIVE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
+          test "$BETTER_AUTH_RESULT" = "success"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -2596,6 +2640,7 @@ jobs:
     if: >-
       ${{ !cancelled() &&
       needs.admission.result == 'success' &&
+      (inputs.validation_scope == 'inference-e2e' || needs.e2e-base-plan.result == 'success') &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
       (always() &&
@@ -2609,20 +2654,21 @@ jobs:
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full / ${{ matrix.suite }}
-    needs: [admission, changes, e2e-base-build, e2e-full-build]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-base-plan]
     runs-on: ${{ !startsWith(matrix.suite, 'inference-') && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference-generation","inference-speech","inference-embedding"]' || '["inference-generation","inference-speech","inference-embedding","antfly"]') }}
+        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference-generation","inference-speech","inference-embedding"]' || '["inference-generation","inference-speech","inference-embedding","antfly-ordinary-0","antfly-ordinary-1","antfly-ordinary-2","antfly-recovery-0","antfly-recovery-1","antfly-recovery-2"]') }}
     env:
       # Full Antfly E2E has the same multi-process groups as the base shards.
       # Keep one process-owning worker per runner while lightweight tests may
       # continue on the other pytest workers.
       ANTFLY_E2E_PROCESS_SLOTS: "2"
       ANTFLY_E2E_PROCESS_WORKERS: "1"
+      ANTFLY_E2E_SUITE: ${{ matrix.suite }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2645,7 +2691,7 @@ jobs:
           # footprint fits on job-local disk; crash-test databases also use
           # runner-local disk (not tmpfs), just like the required base lanes.
           test_tmp="${RUNNER_TEMP}/antfly-e2e/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
-          if [[ "${{ matrix.suite }}" == "antfly" ]]; then
+          if [[ "$ANTFLY_E2E_SUITE" == antfly-* ]]; then
             home_cache_root="${RUNNER_TEMP}/antfly/zig"
           else
             home_cache_root="/mnt/cache/antfly/zig"
@@ -2657,6 +2703,12 @@ jobs:
             echo "TMPDIR=$test_tmp"
             echo "UV_CACHE_DIR=$uv_cache"
             echo "HF_HOME=$hf_home"
+            suite="${{ matrix.suite }}"
+            if [[ "$suite" == inference-* ]]; then
+              # Managed pulls lock and atomically publish verified model bundles.
+              # All lanes reuse these immutable artifacts; runtime caches stay local.
+              echo "ANTFLY_INFERENCE_MODELS_DIR=$home_cache_root/inference-models-full-v1"
+            fi
             echo "ANTFLY_E2E_DURATION_FILE=$duration_file"
           } >> "$GITHUB_ENV"
           mkdir -p "$test_tmp" "$uv_cache" "$hf_home" "$(dirname "$duration_file")"
@@ -2676,14 +2728,14 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust WASI target
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: ${{ steps.toolchain.outputs.rust_version }}
           targets: wasm32-wasip2
 
       - name: Build record-tools extension test fixture
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         run: cargo build --manifest-path zig/e2e/fixtures/extensions/records/Cargo.toml --release --target wasm32-wasip2
 
       - name: Download E2E executable
@@ -2698,14 +2750,14 @@ jobs:
       # Independent ingestion writers use the checkout's embedded SDK and the
       # C ABI artifact produced by the same build as the server under test.
       - name: Download ingestion native library
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-full
 
       - name: Install ingestion native library
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         run: |
           mkdir -p zig/zig-out
           tar -xzf "${RUNNER_TEMP}/libantfly-e2e-full/libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}.tar.gz" -C zig/zig-out
@@ -2721,7 +2773,7 @@ jobs:
           fi
 
       - name: Install Wasmtime C API
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         env:
           WASMTIME_VERSION: v45.0.2
         run: |
@@ -2765,7 +2817,10 @@ jobs:
           # steady request deadline on CPU-only release runners. Only tests
           # explicitly covering first-use paths opt into this hard bound.
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
-          ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
+          # Byte admission evicts under pressure. Do not force reloads just
+          # because a compound endpoint needs a small second model. The explicit
+          # eviction regression starts its own one-model server.
+          ANTFLY_INFERENCE_MAX_LOADED_MODELS: "0"
           # Keep the model process inside its existing 14GiB admission budget.
           # Shards remain serial and use the existing heavy runner envelope.
           ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
@@ -2800,17 +2855,44 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q \
             e2e/antfly/test_standalone.py::test_standalone_inference_process_envelope_composition
 
+      - name: Download shared full E2E plan
+        if: startsWith(matrix.suite, 'antfly-')
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: antfly-e2e-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/e2e-plan
+      - name: Initialize full lane timing history
+        if: startsWith(matrix.suite, 'antfly-')
+        run: |
+          mkdir -p "${RUNNER_TEMP}/e2e-reports"
+          cp "${RUNNER_TEMP}/e2e-plan/durations.json" "${RUNNER_TEMP}/e2e-reports/durations.json"
+          echo "ANTFLY_E2E_DURATION_FILE=${RUNNER_TEMP}/e2e-reports/durations.json" >> "$GITHUB_ENV"
+
       - name: Run Antfly full E2E
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         working-directory: zig
         env:
           ANTFLY_E2E_FULL_LAKE: "1"
+          PYTHONPATH: ../scripts/ci
+          ANTFLY_E2E_REPORT_DIR: ${{ runner.temp }}/e2e-reports
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
           ANTFLY_E2E_NATIVE_STACKS: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
+          suite="${{ matrix.suite }}"
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh \
+            -p zig_e2e_shard --antfly-ci-shard "${suite#antfly-}" \
+            --antfly-ci-plan "${RUNNER_TEMP}/e2e-plan/plan.json" e2e/antfly
+
+      - name: Retain full API timings and per-test results
+        if: always() && startsWith(matrix.suite, 'antfly-')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: antfly-e2e-full-timings-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-reports
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Retain full inference server logs
         if: always() && startsWith(matrix.suite, 'inference-')
@@ -2822,7 +2904,7 @@ jobs:
           retention-days: 7
 
       - name: Retain failed full E2E server logs and cluster diagnostics
-        if: failure() && matrix.suite == 'antfly'
+        if: failure() && startsWith(matrix.suite, 'antfly-')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
@@ -2861,23 +2943,46 @@ jobs:
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full
-    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-base-plan, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify full E2E suites
         env:
           BUILD_RESULT: ${{ inputs.full_validation && needs.e2e-base-build.result || needs.e2e-full-build.result }}
           TEST_RESULT: ${{ needs.e2e-full-tests.result }}
+          PLAN_RESULT: ${{ needs.e2e-base-plan.result }}
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
           NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
           PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
+          BETTER_AUTH_RESULT: ${{ needs.better-auth.result }}
           REQUIRE_LOW_FD: ${{ inputs.full_validation && inputs.pr_number != '' }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
+          test "$PLAN_RESULT" = "success"
           test "$NATIVE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
+          test "$BETTER_AUTH_RESULT" = "success"
           if [[ "$REQUIRE_LOW_FD" == "true" ]]; then
             test "$LOW_FD_RESULT" = "success"
           fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: antfly-e2e-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/e2e-plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: antfly-e2e-full-timings-*
+          path: ${{ runner.temp }}/e2e-observations
+      - name: Merge healthy lane measurements
+        run: >-
+          python3 scripts/ci/merge_e2e_durations.py
+          --baseline "${RUNNER_TEMP}/e2e-plan/durations.json"
+          --observations "${RUNNER_TEMP}/e2e-observations"
+          --output "${RUNNER_TEMP}/e2e-plan/durations.json"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/e2e-plan/durations.json
+          key: antfly-e2e-durations-v2-${{ github.run_id }}-${{ github.run_attempt }}

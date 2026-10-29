@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
+import errno
 import json
 import os
 import platform
@@ -554,12 +555,24 @@ def clone_audit_cache(
     def copy(source_file, destination_file):
         relative = Path(source_file).relative_to(source)
         if relative.parts[0] in {"o", "p"} and not relative.name.endswith(".lock"):
-            os.link(source_file, destination_file)
+            try:
+                os.link(source_file, destination_file)
+            except OSError as err:
+                if err.errno != errno.EXDEV:
+                    raise
+                # CI phase caches can live on a PVC while fixture temporary
+                # directories live on the runner filesystem. Copy immutable
+                # bytes once across that boundary instead of bootstrapping the
+                # compiler again. Same-volume worker snapshots still hard-link.
+                return shutil.copy2(source_file, destination_file)
             return str(destination_file)
         return shutil.copy2(source_file, destination_file)
 
     shutil.copytree(source, destination, copy_function=copy, symlinks=True)
-    old_root, new_root = rebase_from or source, rebase_to or destination
+    rebase_overlay_links(destination, rebase_from or source, rebase_to or destination)
+
+
+def rebase_overlay_links(destination: Path, old_root: Path, new_root: Path) -> None:
     # Relative links already retain their meaning. Absolute links into either
     # baseline cache/source overlay must not survive deletion of that baseline.
     for directory, names, files in os.walk(destination, followlinks=False):
@@ -572,6 +585,26 @@ def clone_audit_cache(
                 replacement = new_root / target.relative_to(old_root)
                 link.unlink()
                 link.symlink_to(replacement)
+
+
+def clone_audit_workspace(source: AuditWorkspace, destination: AuditWorkspace) -> None:
+    # Snapshot the warmed source overlay, rather than reconstructing it from
+    # the checkout. Preserve metadata used by compiler manifests and keep all
+    # mutable source bytes private; only immutable cache objects are hard links.
+    shutil.copytree(
+        source.root,
+        destination.root,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(".zig-cache", ".zig-global-cache", "zig-out"),
+    )
+    rebase_overlay_links(destination.root, source.root, destination.root)
+    for original, cloned in (
+        (source.local_cache, destination.local_cache),
+        (source.global_cache, destination.global_cache),
+    ):
+        clone_audit_cache(
+            original, cloned, rebase_from=source.root, rebase_to=destination.root
+        )
 
 
 def partition_cases(cases):
@@ -738,6 +771,12 @@ def main() -> None:
             print(f"{label}: compiling production artifacts", flush=True)
             arguments = [
                 "build",
+                # In Zig 0.17 an implicit current-directory build root has no
+                # cache prefix. Authored inputs then hash as absolute paths,
+                # making a relocated warm cache cold. An explicit relative
+                # build file registers a relocatable build-root prefix.
+                "--build-file",
+                "./build.zig",
                 "check-storage-compilation",
                 "-Doptimize=debug",
                 # Ownership and cache invalidation depend on Debug code and
@@ -926,19 +965,7 @@ def main() -> None:
         workers = []
         for index in range(case_workers):
             workspace = AuditWorkspace(work / f"worker-{index}", 1)
-            prepare_overlay(workspace.root)
-            clone_audit_cache(
-                baseline.local_cache,
-                workspace.local_cache,
-                rebase_from=baseline.root,
-                rebase_to=workspace.root,
-            )
-            clone_audit_cache(
-                baseline.global_cache,
-                workspace.global_cache,
-                rebase_from=baseline.root,
-                rebase_to=workspace.root,
-            )
+            clone_audit_workspace(baseline, workspace)
             # Require real compiler cache hits before accepting relocation.
             # This fails closed if a future build starts embedding root paths.
             states = build(f"worker {index} warm", workspace)

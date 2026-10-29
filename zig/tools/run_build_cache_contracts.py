@@ -82,7 +82,11 @@ def main() -> None:
         for case in cases(suite):
             print(case.id())
         return
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    # CI's Python 3.12+ reports the slowest contracts, separating expensive
+    # compilation fixtures from tests that spend time waiting. Retain local
+    # compatibility with Python 3.11.
+    timing = {"durations": 20} if sys.version_info >= (3, 12) else {}
+    result = unittest.TextTestRunner(verbosity=2, **timing).run(suite)
     if not result.wasSuccessful():
         sys.exit(1)
 
