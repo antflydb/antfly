@@ -110,71 +110,21 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
 /// Caller-owned proof/directory decoded from the SAME pinned read transaction.
 /// No lifetime or cross-request cache: this only reuses a bounded window's work.
 pub const Authority = struct { proof: ?revision.Content = null, directory: ?projection.Directory = null };
-/// Prepared under the same pinned authority as the eventual read. Bounds
-/// include fetched ranges and reconstructed JSON (escaped names and ancestors).
-/// Opaque selections and missing authority retain full-body admission.
-pub const Selection = struct {
-    chosen: [projection.maximum_fields]bool = @splat(false),
-    range_bytes: u64 = 0,
-    output_bound: u64 = 2,
-    pub fn init(directory: projection.Directory, roots: []const []const u8) Selection {
-        var self: Selection = .{};
-        for (roots) |path| if (directory.resolve(path)) |field| {
-            self.chosen[field.index] = true;
-        };
-        for (directory.fields) |field| if (self.chosen[field.index]) {
-            var parent = field.parent;
-            while (parent != projection.no_parent) : (parent = directory.fields[parent].parent) {
-                if (self.chosen[parent]) {
-                    self.chosen[field.index] = false;
-                    break;
-                }
-            }
-        };
-        var needed: [projection.maximum_fields]bool = @splat(false);
-        for (directory.fields) |field| if (self.chosen[field.index]) {
-            self.range_bytes +|= field.length;
-            var index = field.index;
-            while (!needed[index]) {
-                needed[index] = true;
-                const parent = directory.fields[index].parent;
-                if (parent == projection.no_parent) break;
-                index = parent;
-            }
-        };
-        self.output_bound +|= self.range_bytes;
-        for (directory.fields) |field| if (needed[field.index]) {
-            self.output_bound +|= @as(u64, field.name.len) *| 6 +| 6;
-        };
-        return self;
-    }
-    pub fn rangeEligible(self: Selection, proof: revision.Content) bool {
-        return self.range_bytes < proof.bytes / 2;
-    }
-    pub fn workingBytes(self: Selection) u64 {
-        return self.range_bytes +| self.output_bound;
-    }
-};
-/// Selections must be prepared from authorities at these exact row positions.
-pub fn loadPreparedSelected(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority, selections: []const ?Selection) ![]Row {
-    return loadInternal(false, a, scratch, scope, physical, ids, roots, true, null, authorities, selections);
-}
 pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]Row {
-    return loadInternal(false, a, scratch, scope, physical, ids, roots, true, null, authorities, null);
+    return loadInternal(false, a, scratch, scope, physical, ids, roots, true, null, authorities);
 }
 pub fn loadPreparedBorrowed(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]BorrowedRow {
-    return loadInternal(true, a, scratch, scope, physical, ids, roots, true, null, authorities, null);
+    return loadInternal(true, a, scratch, scope, physical, ids, roots, true, null, authorities);
 }
 pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile) ![]Row {
-    return loadInternal(false, a, scratch, scope, physical, ids, roots, authenticated, profile, null, null);
+    return loadInternal(false, a, scratch, scope, physical, ids, roots, authenticated, profile, null);
 }
-fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile, authorities: ?[]const Authority, selections: ?[]const ?Selection) ![]RowType(borrow_full) {
+fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile, authorities: ?[]const Authority) ![]RowType(borrow_full) {
     const started = ReadProfile.clock(profile);
     defer ReadProfile.add(profile, "total_ns", started);
     if (profile) |p| _ = p.calls.fetchAdd(1, .monotonic);
     if (physical.len > 64 or physical.len != ids.len or roots.len > 64) return error.InvalidBatch;
     if (authorities) |ready| if (ready.len != ids.len) return error.InvalidBatch;
-    if (selections) |ready| if (authorities == null or ready.len != ids.len) return error.InvalidBatch;
     const result = try a.alloc(RowType(borrow_full), ids.len);
     @memset(result, .{ .bytes = null, .original_bytes = 0 });
     errdefer {
@@ -249,14 +199,29 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
             };
         };
         if (directory.version == 1) repair[i] = true;
-        const selection = (if (selections) |ready| ready[i] else null) orelse Selection.init(directory, roots);
-        const chosen = selection.chosen;
+        var chosen: [projection.maximum_fields]bool = @splat(false);
+        for (roots) |path| if (directory.resolve(path)) |field| {
+            chosen[field.index] = true;
+        };
+        // Parent selections subsume descendants. Never fetch/hash overlapping
+        // values twice when predicates request both an object and its members.
+        for (directory.fields) |field| if (chosen[field.index]) {
+            var parent = field.parent;
+            while (parent != projection.no_parent) : (parent = directory.fields[parent].parent) {
+                if (chosen[parent]) {
+                    chosen[field.index] = false;
+                    break;
+                }
+            }
+        };
         var selected: std.ArrayList(projection.Field) = .empty;
+        var bytes: u64 = 0;
         for (directory.fields) |field| if (chosen[field.index]) {
             try selected.append(scratch, field);
+            bytes +|= field.length;
         };
         // Range setup should not replace a cheaper complete read.
-        if (!selection.rangeEligible(proof)) continue;
+        if (bytes >= proof.bytes / 2) continue;
         const ranges = try scratch.alloc(ranges_mod.Range, selected.items.len);
         const values = try scratch.alloc([]const u8, selected.items.len);
         for (ranges, selected.items) |*range, field| range.* = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
@@ -430,12 +395,6 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     // A historical DPD1 directory remains readable. Its coarse root forces
     // safe full reads here and requests bounded cache migration, never a guess.
     const opened = (try projection.Directory.open(temp, directory, .{ .bytes = @as(u64, body.len), .kind = internal.primary_kind, .digest = digest })).?;
-    const selection = Selection.init(opened, &.{"grep.content"});
-    try std.testing.expect(selection.rangeEligible(.{ .revision = 7, .bytes = body.len, .kind = internal.primary_kind, .digest = digest }));
-    const prepared = try loadPreparedSelected(temp, temp, &mock, &.{physical}, &.{"doc"}, &.{"grep.content"}, &.{.{ .proof = .{ .revision = 7, .bytes = body.len, .kind = internal.primary_kind, .digest = digest }, .directory = opened }}, &.{selection});
-    try std.testing.expectEqualStrings(nested[0].bytes.?, prepared[0].bytes.?);
-    try std.testing.expect(prepared[0].bytes.?.len <= selection.output_bound);
-    try std.testing.expect(selection.workingBytes() < 128);
     const grep_root = opened.find("grep").?;
     const legacy_directory = try temp.alloc(u8, 47 + 50 + "grep".len);
     @memcpy(legacy_directory[0..47], directory[0..47]);

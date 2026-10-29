@@ -81,37 +81,26 @@ pub const Batch = struct {
         if (!req.include_all_fields and operands.read_set.len == 0) return null;
         if (index < self.end) return self.rows[index - self.start];
         self.reset();
-        const full = req.include_all_fields or operands.full_read or operands.read_set.len > 64;
-        const a = self.arena.allocator();
-        const selections = try a.alloc(?logical.Selection, ids.len - index);
-        @memset(selections, null);
         var end = index;
         var bytes: usize = 0;
         while (end < ids.len) : (end += 1) {
-            const authority = authorities[end].source;
-            const proof = authority.proof orelse break;
-            var bound = proof.bytes;
-            if (!full) if (authority.directory) |directory| {
-                const selection = logical.Selection.init(directory, operands.read_set);
-                if (selection.rangeEligible(proof)) {
-                    bound = selection.workingBytes();
-                    selections[end - index] = selection;
-                }
-            };
-            const count = std.math.cast(usize, bound) orelse break;
+            const proof = authorities[end].source.proof orelse break;
+            const count = std.math.cast(usize, proof.bytes) orelse break;
             if (count > 1024 * 1024 -| bytes) break;
             bytes += count;
         }
         if (end - index < 2) return null;
         try @import("query/search_exec.zig").checkSearchRequestDeadline(req);
+        const a = self.arena.allocator();
         var scope = try txn.openReadScope(a);
         defer scope.close();
         const selected = try a.alloc(logical.Authority, end - index);
         for (authorities[index..end], selected) |authority, *out| out.* = authority.source;
+        const full = req.include_all_fields or operands.full_read or operands.read_set.len > 64;
         if (full) for (selected) |*authority| {
             authority.directory = null;
         };
-        self.rows = try logical.loadPreparedSelected(a, a, &scope, physical[index..end], ids[index..end], if (full) &.{} else operands.read_set, selected, selections[0 .. end - index]);
+        self.rows = try logical.loadPrepared(a, a, &scope, physical[index..end], ids[index..end], if (full) &.{} else operands.read_set, selected);
         self.start = index;
         self.end = end;
         return self.rows[0];
@@ -418,22 +407,4 @@ test "api query contract native scalar receipts require strict nodes and retain 
         const proof = invalid_source.read_normalized.?(invalid_source.context, "s") catch null;
         try std.testing.expect(proof == null);
     }
-}
-
-test "api query contract selected byte budgets admit narrow reads of large documents" {
-    const directory = @import("../document_projection.zig");
-    const fields = [_]directory.Field{
-        .{ .name = "body", .kind = .subtree, .offset = 1, .length = 4 * 1024 * 1024, .digest = @splat(0), .index = 0 },
-        .{ .name = "meta", .kind = .object, .offset = 5 * 1024 * 1024, .length = 64, .digest = @splat(0), .index = 1, .first_child = 2, .child_count = 1 },
-        .{ .name = "\nrevision", .kind = .leaf, .offset = 5 * 1024 * 1024 + 16, .length = 4, .digest = @splat(0), .index = 2, .parent = 1 },
-    };
-    const authority: logical.Authority = .{ .proof = .{ .revision = 1, .bytes = 6 * 1024 * 1024, .kind = @import("../internal_keys.zig").primary_kind, .digest = @splat(0) }, .directory = .{ .fields = &fields, .root_count = 2, .version = 2 } };
-    const selected = logical.Selection.init(authority.directory.?, &.{"meta.\nrevision"});
-    try std.testing.expect(selected.rangeEligible(authority.proof.?));
-    try std.testing.expect(selected.workingBytes() * 64 < 1024 * 1024);
-    try std.testing.expect(selected.output_bound >= "{\"meta\":{\"\\nrevision\":\"r1\"}}".len);
-    const overlapping = logical.Selection.init(authority.directory.?, &.{ "meta", "meta.\nrevision" });
-    try std.testing.expectEqual(@as(u64, 64), overlapping.range_bytes);
-    const opaque_selection = logical.Selection.init(authority.directory.?, &.{"body.deep.path"});
-    try std.testing.expect(!opaque_selection.rangeEligible(authority.proof.?));
 }

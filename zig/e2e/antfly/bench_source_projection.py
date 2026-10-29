@@ -107,6 +107,9 @@ def main():
         action="store_true",
         help="retain a neutral residual filter to measure sparse-ID routing independently of predicate cost",
     )
+    parser.add_argument(
+        "--id-layout", choices=("clustered", "spread"), default="clustered"
+    )
     parser.add_argument("--documents", type=int, default=8)
     parser.add_argument("--value-bytes", type=int, default=262144)
     parser.add_argument("--output", required=True, type=Path)
@@ -186,7 +189,15 @@ def main():
             out["padding"] = "p" * args.value_bytes
         return out
 
-    documents = {f"doc-{i:04}": document(i) for i in range(args.documents)}
+    prefixes = ("!", "0", "Q", "a", "z", "α", "中", "😀")
+    documents = {
+        (
+            f"doc-{i:04}"
+            if args.id_layout == "clustered"
+            else f"{prefixes[i % len(prefixes)]}-doc-{i:04}"
+        ): document(i)
+        for i in range(args.documents)
+    }
     corpus = hashlib.sha256(json.dumps(documents, sort_keys=True).encode()).hexdigest()
     samples = []
     output_hashes = {}
@@ -431,6 +442,7 @@ def main():
                     if (
                         variant == "candidate"
                         and args.mask == "exact"
+                        and args.shards == 1
                         and args.workload
                         in ("ascii", "escaped", "unicode", "numeric", "opaque")
                         and identity_rows < 2 * args.documents * args.queries_per_phase
@@ -444,6 +456,7 @@ def main():
                     if (
                         variant == "candidate"
                         and args.mask == "exact"
+                        and args.shards == 1
                         and args.workload == "small"
                     ):
                         assert sum(a for a, _ in counts) == 0, counts
@@ -456,6 +469,7 @@ def main():
                             "variant": variant,
                             "round": round_id,
                             "certificate_hits": identity_rows,
+                            "row_counter_available": bool(counts),
                             "certificate_counter_available": "certificate_rows="
                             in logs,
                             "metadata_rows": sum(a for a, _ in counts),
@@ -510,6 +524,9 @@ def main():
         "mask": args.mask,
         "shards": args.shards,
         "residual_filter": args.residual_filter,
+        "id_layout": args.id_layout,
+        "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "counter_scope": "Coordinator logs; distributed owner row counters may be unavailable. Output equality is verified independently.",
         "scope": "Native JSON tables with the recorded shard count, synthetic varied source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
         "platform": platform.platform(),
         "machine": platform.machine(),
