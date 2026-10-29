@@ -186,12 +186,9 @@ retains text spans for grounding. This example creates an index over OCR chunks:
             "type": "document_extraction",
             "config": {
               "ocr": {
-                "enabled": true,
-                "executor": "reader",
                 "mode": "always",
-                "render_dpi": 150,
-                "prompt_policy": "plain",
-                "config": {
+                "render": {"dpi": 150},
+                "reader": {
                   "provider": "apple",
                   "recognition_languages": ["en-US"]
                 }
@@ -215,9 +212,8 @@ retains text spans for grounding. This example creates an index over OCR chunks:
 
 Send that body to `POST /db/v1/tables/documents`, then write documents whose
 `document_url` points to a PDF. An inline `data:application/pdf;base64,...` URL
-can carry a local PDF. `mode: "always"` forces OCR; use `auto` to retain the
-document pipeline's text-quality fallback behavior. An Apple reader implicitly
-selects the plain prompt policy when none is specified.
+can carry a local PDF. `mode: "always"` forces OCR; use `auto` to OCR only pages
+whose native text fails the quality checks.
 
 ## Limits and verification
 

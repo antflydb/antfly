@@ -269,10 +269,14 @@ pages or make OCR output independently reprocessable. Use a
 }
 ```
 
-The built-in parser targets unencrypted, born-digital PDFs. Pages with no native
-text, such as scans and photos, are read with OCR. Use
-[LightOnOCR-3](/docs/guides/lightonocr3), which transcribes pages into Markdown
-with tables and formulas:
+This extracts the native text of born-digital PDFs, Office documents, HTML,
+email, and plain text with no model.
+
+### OCR scanned pages and images
+
+To read scanned pages and images, add an `ocr` block that names a reader.
+[LightOnOCR-3](/docs/guides/lightonocr3) transcribes pages into Markdown with
+tables and formulas:
 
 ```bash
 antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9
@@ -284,19 +288,26 @@ antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671b
   "kind": "asset",
   "field": "url",
   "content_type": "application/json",
-  "producer_json": "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"prompt_policy\":\"plain\",\"config\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}}"
+  "producer_json": "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}}"
 }
 ```
 
-LightOnOCR-3 takes no instruction prompt, so set `prompt_policy` to `plain`.
-Without an `ocr` model, extraction uses the smaller `antflydb/Florence-2-base`
-reader. Any reader provider works here, including
-[Apple Vision](/docs/guides/apple-native-ocr) on macOS.
+The `ocr` block takes:
 
-If the model is absent, the page records a failed OCR outcome instead of
-silently disappearing. Install the model and explicitly reprocess the artifact
-to retry. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to disable
-OCR. For formats outside the built-in parser, use the
+| Field | Meaning |
+|---|---|
+| `reader` | A reader provider config. Every provider except `apple` names a `model`. |
+| `generator` | Instead of `reader`, a vision-capable generator, which receives a transcription instruction. |
+| `mode` | `auto` (default) reads PDF pages without usable native text, and images. `always` reads every page. |
+| `prompt` | Overrides the prompt. Readers run their own OCR task when it is omitted. |
+| `render` | PDF rasterization: `dpi` (default 150), `resolution`, `max_pixels`, `max_dimension`. |
+| `quality` | Thresholds that decide when native PDF text is too poor to keep. |
+
+Any reader provider works, including [Apple Vision](/docs/guides/apple-native-ocr)
+on macOS. Without an `ocr` block, pages that need OCR keep their native text and
+report `extraction_status: "ocr_not_configured"`. If the configured model is not
+installed, the page records a failed OCR outcome; install the model and
+reprocess the artifact to retry. For formats outside the built-in parser, use the
 [docsaf example](https://github.com/antflydb/antfly/tree/main/examples/docsaf).
 
 `remotePDF` remains a compatibility helper for template-time extraction, but it
