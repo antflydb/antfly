@@ -1231,9 +1231,10 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
         db.run_until_idle()
         stop = threading.Event()
         started = threading.Event()
+        revisions = 0
 
         def write():
-            revisions = 0
+            nonlocal revisions
             while not stop.is_set():
                 db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": [f"v{revisions}"]}}})
                 revisions += 1
@@ -1246,6 +1247,7 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
             future = executor.submit(write)
             try:
                 assert started.wait(timeout=5)
+                writes_before_replacement = revisions
                 request = {
                     "name": "new",
                     "type": "graph",
@@ -1260,7 +1262,7 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
                     time.sleep(0.01)
             finally:
                 stop.set()
-            assert future.result(timeout=10) > 1
+            assert future.result(timeout=10) > writes_before_replacement
         db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": ["final"]}}})
         db.run_until_idle()
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "source:0000", "R", 0)] == ["final"]
