@@ -2195,3 +2195,5 @@ Declared `_type` columns retain their stored values and nulls; the index's
 default document type does not invent a source column. Explicit virtual `_id`
 references (including computed-output dependencies) request generated identity
 independently of the physical access path, matching the provider cursor contract.
+Accepted overlay rows follow the same rules and preserve declared type nulls and
+values; routing defaults never overwrite source data.

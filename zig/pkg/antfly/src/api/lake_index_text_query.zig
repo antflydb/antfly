@@ -3594,17 +3594,8 @@ const Execution = struct {
             for (keys, 0..) |key, position| {
                 if (overlay.row(key)) |row| {
                     if (T == types.ColumnSource) return error.UnsupportedSqlExecution;
-                    var image: std.json.Value = .{ .object = .empty };
+                    var image = try overlaySource(a, self.table, row, key, selected_fields);
                     defer types.deinitJsonValue(a, &image);
-                    var fields = row.object.iterator();
-                    while (fields.next()) |field| {
-                        const include = if (selected_fields) |selected| for (selected) |path| {
-                            if (std.mem.eql(u8, path, field.key_ptr.*)) break true;
-                        } else false else true;
-                        if (include) try image.object.put(a, try a.dupe(u8, field.key_ptr.*), try types.cloneJsonValue(a, field.value_ptr.*));
-                    }
-                    try image.object.put(a, try a.dupe(u8, "_id"), .{ .string = try a.dupe(u8, key) });
-                    try image.object.put(a, try a.dupe(u8, "_type"), .{ .string = try a.dupe(u8, "row") });
                     if (T == std.json.Value) result[position] = try types.cloneJsonValue(a, image) else result[position] = try std.json.Stringify.valueAlloc(a, image, .{});
                     recent += 1;
                 } else {
@@ -3892,6 +3883,36 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
     }
     return names.items;
 }
+// Source metadata follows the same contract for accepted rows and archive
+// columns: identity is virtual/explicit, and type is actual declared data.
+fn overlaySource(a: A, table: local.sql_catalog.Table, row: std.json.Value, key: []const u8, selected_fields: ?[]const []const u8) !std.json.Value {
+    var image: std.json.Value = .{ .object = .empty };
+    errdefer types.deinitJsonValue(a, &image);
+    const has_type = for (table.columns) |column| {
+        if (std.mem.eql(u8, column.name, "_type") or std.mem.eql(u8, column.path, "_type")) break true;
+    } else false;
+    var fields = row.object.iterator();
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, "_id") or (!has_type and std.mem.eql(u8, field.key_ptr.*, "_type"))) continue;
+        const include = if (selected_fields) |selected| for (selected) |path| {
+            if (std.mem.eql(u8, path, field.key_ptr.*)) break true;
+        } else false else true;
+        if (include) try cloneSourceField(a, &image, field.key_ptr.*, field.value_ptr.*);
+    }
+    if (selected_fields) |selected| for (selected) |path| if (std.mem.eql(u8, path, "_id")) {
+        try cloneSourceField(a, &image, "_id", .{ .string = key });
+        break;
+    };
+    return image;
+}
+fn cloneSourceField(a: A, target: *std.json.Value, name: []const u8, value: std.json.Value) !void {
+    const owned_name = try a.dupe(u8, name);
+    errdefer a.free(owned_name);
+    var owned_value = try types.cloneJsonValue(a, value);
+    errdefer types.deinitJsonValue(a, &owned_value);
+    try target.object.put(a, owned_name, owned_value);
+}
+
 fn appendHydrationPath(a: A, table: local.sql_catalog.Table, fields: *std.ArrayList([]const u8), path: []const u8) !void {
     if (std.mem.eql(u8, path, "_id")) {
         for (fields.items) |field| if (std.mem.eql(u8, field, path)) return;
@@ -5871,4 +5892,33 @@ test "external lake highlight projected dependencies avoid unrelated JSON decodi
     try std.testing.expectEqual(@as(usize, 0), selected.object.count());
     try std.testing.expect((try projectedHighlightSource(&scratch, &hit, &.{"body"})) == null);
     std.debug.print("PROJECTION_DEPENDENCY_PROBE unrelated_json_bytes={d} budget={d} selected=success helper=declined_without_decoding\n", .{ payload.len, budget.limit });
+}
+
+test "external lake covering and overlay source metadata preserve physical types and explicit identity under OOM" {
+    const a = std.testing.allocator;
+    const table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "id", .path = "id", .type = .integer },
+        .{ .name = "_type", .path = "_type", .type = .string },
+    } };
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":1,\"_id\":\"private\",\"_type\":null}", .{});
+    defer parsed.deinit();
+    const Scenario = struct {
+        fn run(alloc: A, declared: local.sql_catalog.Table, source: std.json.Value) !void {
+            var physical = try overlaySource(alloc, declared, source, "public", null);
+            defer types.deinitJsonValue(alloc, &physical);
+            try std.testing.expect(physical.object.get("_type").? == .null);
+            try std.testing.expect(!physical.object.contains("_id"));
+            var plain = declared;
+            plain.columns = declared.columns[0..1];
+            var wildcard = try overlaySource(alloc, plain, source, "public", null);
+            defer types.deinitJsonValue(alloc, &wildcard);
+            try std.testing.expectEqual(@as(usize, 1), wildcard.object.count());
+            var explicit = try overlaySource(alloc, plain, source, "public", &.{ "id", "_id", "_type" });
+            defer types.deinitJsonValue(alloc, &explicit);
+            try std.testing.expectEqual(@as(usize, 2), explicit.object.count());
+            try std.testing.expectEqualStrings("public", explicit.object.get("_id").?.string);
+        }
+    };
+    try Scenario.run(a, table, parsed.value);
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{ table, parsed.value });
 }
