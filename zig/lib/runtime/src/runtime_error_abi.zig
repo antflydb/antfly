@@ -61,6 +61,13 @@ test "metadata head races remain retryable across runtime callbacks" {
     try std.testing.expect(errorHasStableDetail(error.MetadataSnapshotHeadMismatch));
 }
 
+test "hierarchy cursor conflicts retain identity across runtime callbacks" {
+    const transported = statusFromError(error.HierarchyCursorStale);
+    try std.testing.expectEqual(@backingInt(Code.conflict), transported.code);
+    try std.testing.expectEqual(error.HierarchyCursorStale, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.HierarchyCursorStale));
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -939,6 +946,7 @@ pub const Detail = enum(c_int) {
     cloudflare_inference_failed,
     invalid_cloudflare_response,
     document_token_limit_exceeded,
+    hierarchy_cursor_stale,
     // Append-only Cypher details preserve graph errors across owner callbacks.
     cypher_aggregate_scope,
     cypher_aggregate_wildcard,
@@ -1938,6 +1946,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
         error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
         error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
+        error.HierarchyCursorStale => status(.conflict, .hierarchy_cursor_stale),
         error.CrcMismatch => status(.corrupt, .crc_mismatch),
         error.InvalidData => status(.corrupt, .invalid_data),
         error.MappedArtifactUnsupported => status(.unsupported, .mapped_artifact_unsupported),
@@ -2160,6 +2169,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .hierarchy_cursor_stale => "HierarchyCursorStale",
         .schema_version_changed => "SchemaVersionChanged",
         .cypher_write_request_already_used => "CypherWriteRequestAlreadyUsed",
         .invalid_cypher_parameters => "InvalidCypherParameters",
@@ -3395,7 +3405,8 @@ test "merged runtime error details preserve the common prefix under ABI two" {
     try std.testing.expectEqual(@as(c_int, 781), @backingInt(Detail.inference_endpoint_access_denied));
     try std.testing.expectEqual(@as(c_int, 782), @backingInt(Detail.document_storage_not_configured));
     try std.testing.expectEqual(@as(c_int, 825), @backingInt(Detail.document_token_limit_exceeded));
-    try std.testing.expectEqual(@as(c_int, 826), @backingInt(Detail.cypher_aggregate_scope));
+    try std.testing.expectEqual(@as(c_int, 826), @backingInt(Detail.hierarchy_cursor_stale));
+    try std.testing.expectEqual(@as(c_int, 827), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {

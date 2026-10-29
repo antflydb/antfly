@@ -60,6 +60,22 @@ pub const Row = struct {
     repair_authority: bool = false,
 };
 
+/// Full rows borrow their final read scope; reconstructed projections are owned.
+/// Consume all views before another read on that scope or before scope.close().
+/// Keeping this separate from Row prevents changing the owned-read contract.
+pub const BorrowedRow = struct {
+    bytes: ?[]const u8,
+    original_bytes: u64,
+    projected: bool = false,
+    repair_authority: bool = false,
+    pub fn deinit(self: BorrowedRow, a: A) void {
+        if (self.projected) if (self.bytes) |bytes| a.free(bytes);
+    }
+};
+fn RowType(comptime borrow_full: bool) type {
+    return if (borrow_full) BorrowedRow else Row;
+}
+
 /// Stable-order deduplicating metadata/full-body fetch. Scope owns all bytes.
 fn many(scope: anytype, keys: []const []const u8, output: []?[]const u8) !void {
     var order: [64]usize = undefined;
@@ -91,15 +107,30 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
     return loadProfiled(a, scratch, scope, physical, ids, roots, authenticated, null);
 }
 
+/// Caller-owned proof/directory decoded from the SAME pinned read transaction.
+/// No lifetime or cross-request cache: this only reuses a bounded window's work.
+pub const Authority = struct { proof: ?revision.Content = null, directory: ?projection.Directory = null };
+pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]Row {
+    return loadInternal(false, a, scratch, scope, physical, ids, roots, true, null, authorities);
+}
+pub fn loadPreparedBorrowed(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]BorrowedRow {
+    return loadInternal(true, a, scratch, scope, physical, ids, roots, true, null, authorities);
+}
 pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile) ![]Row {
+    return loadInternal(false, a, scratch, scope, physical, ids, roots, authenticated, profile, null);
+}
+fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile, authorities: ?[]const Authority) ![]RowType(borrow_full) {
     const started = ReadProfile.clock(profile);
     defer ReadProfile.add(profile, "total_ns", started);
     if (profile) |p| _ = p.calls.fetchAdd(1, .monotonic);
     if (physical.len > 64 or physical.len != ids.len or roots.len > 64) return error.InvalidBatch;
-    const result = try a.alloc(Row, ids.len);
+    if (authorities) |ready| if (ready.len != ids.len) return error.InvalidBatch;
+    const result = try a.alloc(RowType(borrow_full), ids.len);
     @memset(result, .{ .bytes = null, .original_bytes = 0 });
     errdefer {
-        for (result) |row| if (row.bytes) |bytes| a.free(bytes);
+        for (result) |row| {
+            if (!borrow_full or row.projected) if (row.bytes) |bytes| a.free(bytes);
+        }
         a.free(result);
     }
     if (ids.len == 0) return result;
@@ -108,7 +139,9 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
     var timestamps: [64]u64 = undefined;
     // Without storage authentication a directory is not authority to omit bytes.
     var phase = ReadProfile.clock(profile);
-    if (authenticated and roots.len != 0) {
+    if (authorities) |ready| {
+        for (ready, 0..) |authority, i| proofs[i] = authority.proof;
+    } else if (authenticated and roots.len != 0) {
         if (comptime @hasDecl(@typeInfo(@TypeOf(scope)).pointer.child, "loadProofWindow")) {
             try scope.loadProofWindow(scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
         } else try revision.loadWindow(scope, scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
@@ -127,7 +160,7 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
         indices[count] = i;
         count += 1;
     };
-    if (count != 0) try many(scope, keys[0..count], raw[0..count]);
+    if (count != 0 and authorities == null) try many(scope, keys[0..count], raw[0..count]);
     ReadProfile.add(profile, "directory_read_ns", phase);
     phase = ReadProfile.clock(profile);
     const Prepared = struct {
@@ -152,13 +185,18 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
             continue;
         }
         const proof = proofs[i].?;
-        const encoded_directory = encoded orelse {
+        const directory = if (authorities) |ready| ready[i].directory orelse {
             repair[i] = true;
             continue;
-        };
-        const directory = (try projection.Directory.open(scratch, encoded_directory, proof)) orelse {
-            repair[i] = !try projection.isCurrent(scratch, encoded_directory, proof);
-            continue;
+        } else directory: {
+            const encoded_directory = encoded orelse {
+                repair[i] = true;
+                continue;
+            };
+            break :directory (try projection.Directory.open(scratch, encoded_directory, proof)) orelse {
+                repair[i] = !try projection.isCurrent(scratch, encoded_directory, proof);
+                continue;
+            };
         };
         if (directory.version == 1) repair[i] = true;
         var chosen: [projection.maximum_fields]bool = @splat(false);
@@ -226,7 +264,8 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
                 index = parent;
             }
         }
-        try writer.object(&out.writer, 0, item.directory.root_count);
+        writer.object(&out.writer, 0, item.directory.root_count) catch |err|
+            return if (err == error.WriteFailed) error.OutOfMemory else err;
         result[item.index] = .{ .bytes = try out.toOwnedSlice(), .original_bytes = proofs[item.index].?.bytes, .projected = true, .repair_authority = repair[item.index] };
     }
     ReadProfile.add(profile, "reconstruct_ns", phase);
@@ -239,7 +278,7 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
     };
     if (count != 0) try many(scope, keys[0..count], raw[0..count]);
     for (indices[0..count], raw[0..count]) |i, value| {
-        result[i] = .{ .bytes = if (value) |v| try a.dupe(u8, v) else null, .original_bytes = if (value) |v| v.len else 0, .repair_authority = repair[i] or (authenticated and proofs[i] == null and (if (value) |v| v.len >= projection.minimum_bytes else false)) };
+        result[i] = .{ .bytes = if (value) |v| if (borrow_full) v else try a.dupe(u8, v) else null, .original_bytes = if (value) |v| v.len else 0, .repair_authority = repair[i] or (authenticated and proofs[i] == null and (if (value) |v| v.len >= projection.minimum_bytes else false)) };
     }
     ReadProfile.add(profile, "fallback_ns", phase);
     return result;
@@ -390,4 +429,34 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     const untrusted = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, wanted, false);
     try std.testing.expect(!untrusted[0].projected);
     try std.testing.expect(!untrusted[0].repair_authority);
+}
+
+test "logical value conditional borrowed full rows avoid payload allocation and preserve owned reads" {
+    const a = std.testing.allocator;
+    const body = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const Scope = struct {
+        body: []const u8,
+        pub fn getManySorted(self: *@This(), _: []const []const u8, values: []?[]const u8) !void {
+            for (values) |*value| value.* = self.body;
+        }
+        pub fn getRangesMany(_: *@This(), _: []const ranges_mod.Request) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var scope: Scope = .{ .body = body };
+    var tiny: [2048]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&tiny);
+    const borrowed = try loadPreparedBorrowed(fixed.allocator(), arena.allocator(), &scope, &.{"physical"}, &.{"id"}, &.{"image"}, &.{.{}});
+    defer fixed.allocator().free(borrowed);
+    defer for (borrowed) |row| row.deinit(fixed.allocator());
+    try std.testing.expect(borrowed[0].bytes.?.ptr == body.ptr);
+    try std.testing.expectEqual(body.len, borrowed[0].original_bytes);
+    try std.testing.expect(!borrowed[0].projected);
+    var owned_bytes: [2048]u8 = undefined;
+    var owned = std.heap.FixedBufferAllocator.init(&owned_bytes);
+    try std.testing.expectError(error.OutOfMemory, loadPrepared(owned.allocator(), arena.allocator(), &scope, &.{"physical"}, &.{"id"}, &.{"image"}, &.{.{}}));
 }

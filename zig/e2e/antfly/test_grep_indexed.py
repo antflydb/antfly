@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 import requests
+import re
 import test_auth as auth
 from e2e_scheduler import e2e_resource
 from helpers import start_http_server
@@ -2573,19 +2574,25 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Decisions)
     threads = [start_http_server(query), start_http_server(provider)]
     try:
-        result = run_grep(
-            tmp_path,
-            f"http://127.0.0.1:{query.server_port}",
-            table,
+        flags = [
             "--media=images",
             "--ask=Does this contain a chart?",
             "--model=fixture",
             "--endpoint",
             f"http://127.0.0.1:{provider.server_port}/decisions",
-            "--no-cache",
             "--json",
             "--decision-concurrency=8",
             "--decision-batch-wait-ms=20",
+            "--cache-dir",
+            str(tmp_path / "scores"),
+        ]
+        if change:
+            flags.append("--no-cache")
+        result = run_grep(
+            tmp_path,
+            f"http://127.0.0.1:{query.server_port}",
+            table,
+            *flags,
             page_size=16,
         )
         assert len(seen) == 2, (seen, result.stderr.decode())
@@ -2595,11 +2602,11 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
         assert point["query"] == {"bool": {"filter": {"ids": identities}}}
         assert "execution" not in point
         assert not {"order_by", "search_after", "remote_snapshot"} & point.keys()
-        assert set(point["fields"]) == {
-            "grep.revision",
-            "grep.permissions",
-            "payloads.image",
-        }
+        expected_fields = {"grep.revision", "grep.permissions"}
+        if change:
+            expected_fields.add("payloads.image")
+        assert set(point["fields"]) == expected_fields
+        assert bool(point.get("select")) == (not change)
         assert "responses" in responses[1], responses[1]
         assert not responses[1]["responses"][0].get("remote_snapshot")
         if change:
@@ -2617,8 +2624,707 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
             assert len(provider_calls) == 1
             assert len(provider_calls[0]["inputs"]) == parents
             assert json.loads(result.stdout.splitlines()[0])["type"] == "evidence"
+            warm = run_grep(
+                tmp_path,
+                f"http://127.0.0.1:{query.server_port}",
+                table,
+                *flags,
+                page_size=16,
+            )
+            assert warm.returncode == 0, warm.stderr.decode()
+            assert len(provider_calls) == 1
+            conditional = [
+                hit
+                for envelope in responses[2:]
+                for result in envelope["responses"]
+                for hit in result.get("hits", {}).get("hits", [])
+                if "_computed" in hit
+            ]
+            assert len(conditional) == parents, responses[2:]
+
+            # Descriptor writes are a bounded best-effort cache. Collisions or
+            # racing writers may require a full value; they cannot change the
+            # warm decision result or send a descriptor to the provider.
+            def computed(hit, suffix):
+                return next(
+                    value
+                    for name, value in hit["_computed"].items()
+                    if name.endswith(suffix)
+                )
+
+            assert any(computed(hit, "_changed") is False for hit in conditional), (
+                responses[2:]
+            )
+            for hit in conditional:
+                assert "image" not in hit["_source"].get("payloads", {})
+                assert (
+                    computed(hit, "_value") is None
+                    if not computed(hit, "_changed")
+                    else computed(hit, "_value")
+                )
+
     finally:
         for server, thread in zip((query, provider), threads, strict=True):
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
+
+
+def conditional_select(path, known=None):
+    return {
+        "identity": {"call": "value_identity", "args": [{"field": path}]},
+        "missing": {"call": "is_missing", "args": [{"field": path}]},
+        "changed": {
+            "is_distinct_from": [
+                {"ref": "identity"},
+                {
+                    "call": "jsonb_extract_path_text",
+                    "args": [{"param": "known"}, {"field": "_id"}],
+                },
+            ]
+        },
+        "value": {
+            "case": [{"when": {"ref": "changed"}, "then": {"field": path}}],
+            "else": {"literal": None},
+        },
+    }
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_conditional_select_binds_current_values_and_query_selection(
+    stateful_api, num_shards
+):
+    table = f"conditional_select_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    item = {
+        "body": {
+            "image": "large-image-" * 4096,
+            "null": None,
+            "integer": 9007199254740993,
+        },
+        "revision": "r1",
+        "padding": "x" * 32768,
+    }
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
+    url = stateful_api.url + f"/tables/{table}/query"
+    request = {
+        "query": {"match_all": {}},
+        "fields": ["revision"],
+        "select": conditional_select("body.image"),
+        "params": {"known": {}},
+        "limit": 10,
+    }
+    request["select"].update(
+        {
+            "null_identity": {
+                "call": "value_identity",
+                "args": [{"field": "body.null"}],
+            },
+            "absent_identity": {
+                "call": "value_identity",
+                "args": [{"field": "body.absent"}],
+            },
+            "absent": {"call": "is_missing", "args": [{"field": "body.absent"}]},
+            "integer": {"field": "body.integer"},
+        }
+    )
+
+    def query(body):
+        response = requests.post(url, json=body, timeout=60)
+        assert response.status_code == 200, response.text
+        result = response.json()["responses"][0]
+        assert result["status"] == 200, result
+        return result["hits"]["hits"]
+
+    cold = query(request)[0]
+    assert cold["_source"] == {"revision": "r1"}
+    values = cold["_computed"]
+    assert values["value"] == item["body"]["image"]
+    assert values["null_identity"].startswith("sv1-")
+    assert values["absent_identity"] is None and values["absent"] is True
+    assert values["integer"] == 9007199254740993
+    assert not any(name.startswith("__antfly_") for name in values)
+    token = values["identity"]
+    request["params"]["known"] = {"a": token}
+    warm = query(request)[0]
+    assert warm["_computed"]["value"] is None
+    assert warm["_computed"]["changed"] is False
+    assert warm["_computed"]["identity"] == token
+    # Default/all/wildcard/exclusion masks keep their existing source semantics.
+    for extra in ({"fields": ["*"]}, {"fields": ["-padding"]}, {"fields": []}):
+        selected = query({**request, **extra})[0]
+        assert selected["_computed"]["identity"] == token
+        if extra["fields"]:
+            assert selected["_source"]["body"] == item["body"]
+        else:
+            assert selected.get("_source", {}) == {}
+    all_request = {key: value for key, value in request.items() if key != "fields"}
+    assert query(all_request)[0]["_source"]["body"] == item["body"]
+    # Existing source masks remain independent; selecting body still returns it.
+    assert query({**request, "fields": ["body"]})[0]["_source"]["body"] == item["body"]
+    assert query({**request, "query": {"bool": {"filter": {"ids": ["other"]}}}}) == []
+    item["revision"] = "metadata-update"
+    item["body"]["before_image"] = "new sibling"
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
+    assert query(request)[0]["_computed"]["identity"] == token
+    item["body"]["image"] = "changed-payload"
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
+    changed = query(request)[0]["_computed"]
+    assert changed["value"] == "changed-payload" and changed["identity"] != token
+    request["params"]["known"] = {"other": changed["identity"]}
+    assert query(request)[0]["_computed"]["value"] == "changed-payload"
+
+
+@pytest.mark.parametrize("opaque", [False, True])
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_conditional_source_projection_upgrades_persisted_certificates(
+    monkeypatch, opaque, num_shards
+):
+    """An implementation-only upgrade may repair metadata, never change values."""
+    from conftest import StandaloneAntflyServer, find_free_port, resolve_binary_path
+
+    baseline = os.environ.get("ANTFLY_BASELINE_BIN")
+    current = os.environ.get("ANTFLY_BIN")
+    if not baseline or not current:
+        pytest.skip(
+            "Set ANTFLY_BASELINE_BIN and ANTFLY_BIN for persisted upgrade checks"
+        )
+    monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE", "1")
+    payload = [{"value": "value-" * 8192}] if opaque else "value-" * 8192
+    server = StandaloneAntflyServer(
+        resolve_binary_path(baseline), "127.0.0.1", find_free_port()
+    )
+    try:
+        base = server.api_url + "/tables/conditional_upgrade"
+        created = requests.post(base, json={"num_shards": num_shards}, timeout=60)
+        created.raise_for_status()
+        deadline = time.monotonic() + 30
+        while requests.get(base, timeout=5).status_code != 200:
+            assert time.monotonic() < deadline, "table did not become visible"
+            time.sleep(0.05)
+        response = requests.post(
+            base + "/batch",
+            json={
+                "inserts": {"a": {"image": payload, "revision": "r1"}},
+                "sync_level": "full_index",
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        request = {
+            "query": {"bool": {"filter": {"ids": ["a"]}}},
+            "fields": ["revision"],
+            "limit": 1,
+            "select": conditional_select("image"),
+            "params": {"known": {}},
+        }
+
+        def query():
+            response = requests.post(base + "/query", json=request, timeout=60)
+            response.raise_for_status()
+            result = response.json()["responses"][0]
+            assert result["status"] == 200, result
+            return result["hits"]["hits"][0]
+
+        server.pause()
+        log_start = server.log_path.stat().st_size
+        server.binary = resolve_binary_path(current)
+        server.resume()
+        original = query()
+        token = original["_computed"]["identity"]
+        assert original["_computed"]["value"] == payload
+        request["params"]["known"] = {"a": token}
+        warm = query()
+        assert warm["_source"] == {"revision": "r1"}
+        assert warm["_computed"]["value"] is None
+        assert warm["_computed"]["changed"] is False
+        # SVI1 opaque coverage repairs once without changing public identities.
+        deadline = time.monotonic() + 30
+        while True:
+            logs = server.log_path.read_text(errors="replace")[log_start:]
+            if any(int(n) > 0 for n in re.findall(r"certificate_rows=(\d+)", logs)):
+                break
+            assert time.monotonic() < deadline, logs
+            time.sleep(0.05)
+            assert query()["_computed"]["identity"] == token
+        # Disposable certificate epochs must not prevent an older reader from
+        # reading the same unchanged document representation.
+        server.pause()
+        server.binary = resolve_binary_path(baseline)
+        server.resume()
+        rollback = query()
+        assert rollback["_computed"]["identity"] == token
+        assert rollback["_computed"]["value"] is None
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_never_evaluates_discarded_output_rows(stateful_api, num_shards):
+    table = f"select_final_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "a": {"divisor": 0, "padding": "x" * 32768},
+            "b": {"divisor": 2, "padding": "x" * 32768},
+        },
+        sync_level="full_index",
+    )
+    request = {
+        "query": {"match_all": {}},
+        "fields": [],
+        "select": {
+            "answer": {
+                "divide": [
+                    {"literal": 8},
+                    {"cast": {"type": "integer", "expression": {"field": "divisor"}}},
+                ]
+            }
+        },
+        "order_by": [{"field": "_id", "desc": False}],
+        "offset": 1,
+        "limit": 1,
+    }
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query", json=request, timeout=60
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["responses"][0]
+    assert result["status"] == 200, result
+    assert [hit["_id"] for hit in result["hits"]["hits"]] == ["b"]
+    assert result["hits"]["hits"][0]["_computed"]["answer"] == 4
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_array_paths_and_source_mask_applied_once(stateful_api, num_shards):
+    table = "select_arrays_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    docs = {
+        "small": {"arr": [{"n": 1}, {"n": 2}], "metadata": {"_type": "image"}},
+        "large": {
+            "arr": [{"n": 3}, {"n": 4}],
+            "metadata": {"_type": "text"},
+            "padding": "x" * 32768,
+        },
+    }
+    stateful_api.batch_write(table, inserts=docs, sync_level="full_index")
+    for selected in [
+        {"constant": {"literal": 1}},
+        {
+            "n": {"field": "arr.1.n"},
+            "all": {"field": "arr.n"},
+            "kind": {"field": "metadata._type"},
+            "missing": {"call": "is_missing", "args": [{"field": "arr.1.n"}]},
+        },
+    ]:
+        response = requests.post(
+            stateful_api.url + f"/tables/{table}/query",
+            json={
+                "query": {"match_all": {}},
+                "fields": ["arr.1.n"],
+                "select": selected,
+            },
+            timeout=60,
+        )
+        assert response.status_code == 200, response.text
+        hits = response.json()["responses"][0]["hits"]["hits"]
+        assert len(hits) == 2
+        for hit in hits:
+            expected = docs[hit["_id"]]["arr"][1]["n"]
+            assert hit["_source"] == {"arr": [{"n": expected}]}, hit
+            if "n" in selected:
+                assert hit["_computed"] == {
+                    "n": expected,
+                    "all": [item["n"] for item in docs[hit["_id"]]["arr"]],
+                    "kind": docs[hit["_id"]]["metadata"]["_type"],
+                    "missing": False,
+                }, hit
+            else:
+                assert hit["_computed"] == {"constant": 1}, hit
+
+
+def test_select_alias_depth_rejected_without_losing_server(stateful_api):
+    table = "select_depth_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": 1})
+    stateful_api.batch_write(table, inserts={"a": {"n": 1}}, sync_level="full_index")
+    selected = {}
+    for i in range(64):
+        expr = {"ref": f"x{i + 1}"} if i < 63 else {"literal": 1}
+        for _ in range(40):
+            expr = {"case": [{"when": {"literal": True}, "then": expr}]}
+        selected[f"x{i}"] = expr
+    url = stateful_api.url + f"/tables/{table}/query"
+    response = requests.post(
+        url,
+        json={"query": {"match_all": {}}, "fields": [], "select": selected},
+        timeout=30,
+    )
+    assert response.status_code in (400, 422), response.text
+    healthy = requests.post(url, json={"query": {"match_all": {}}}, timeout=30)
+    assert healthy.status_code == 200, healthy.text
+
+    # A legal maximum-length chain must still run on the HTTP worker stack.
+    chain = {
+        f"x{i}": {"ref": f"x{i + 1}"} if i < 63 else {"literal": 1} for i in range(64)
+    }
+    valid = requests.post(
+        url,
+        json={"query": {"match_all": {}}, "fields": [], "select": chain},
+        timeout=30,
+    )
+    assert valid.status_code == 200, valid.text
+    assert set(
+        valid.json()["responses"][0]["hits"]["hits"][0]["_computed"].values()
+    ) == {1}
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_public_source_excludes_internal_fields(stateful_api, num_shards):
+    table = "select_private_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    private = {
+        "_resolution_work",
+        "_hierarchy_unit_revision_token",
+        "_artifact_unit_fingerprint",
+    }
+    doc = {"visible": "ok", "nested": {"_type": "user"}, "padding": "x" * 32768}
+    doc.update({name: "private" for name in private})
+    stateful_api.batch_write(table, inserts={"a": doc}, sync_level="full_index")
+    for fields in [None, ["*"], ["-padding"], ["nested._type"], ["nested.*"]]:
+        body = {"query": {"match_all": {}}, "select": {"c": {"literal": 1}}}
+        if fields is not None:
+            body["fields"] = fields
+        response = requests.post(
+            stateful_api.url + f"/tables/{table}/query", json=body, timeout=60
+        )
+        assert response.status_code == 200, response.text
+        hit = response.json()["responses"][0]["hits"]["hits"][0]
+        assert not private.intersection(hit["_source"]), hit
+        assert hit["_source"]["nested"]["_type"] == "user", hit
+        assert hit["_computed"] == {"c": 1}, hit
+
+
+def test_select_literal_and_unused_parameter_depth_admission(stateful_api):
+    table = "select_data_depth_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": 1})
+    stateful_api.batch_write(table, inserts={"a": {"n": 1}}, sync_level="full_index")
+    deep = 1
+    for _ in range(300):
+        deep = [deep]
+    url = stateful_api.url + f"/tables/{table}/query"
+    for selected, params in [
+        ({"deep": {"literal": deep}}, {}),
+        (
+            {
+                "deep": {
+                    "case": [{"when": {"literal": False}, "then": {"literal": deep}}],
+                    "else": {"literal": 1},
+                }
+            },
+            {},
+        ),
+        ({"c": {"literal": 1}}, {"unused": deep}),
+    ]:
+        response = requests.post(
+            url,
+            json={"query": {"match_all": {}}, "select": selected, "params": params},
+            timeout=30,
+        )
+        assert response.status_code in (400, 422), response.text
+        healthy = requests.post(url, json={"query": {"match_all": {}}}, timeout=30)
+        assert healthy.status_code == 200, healthy.text
+
+
+@pytest.mark.parametrize("padding", [0, 32768])
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_many_native_json_outputs(stateful_api, padding, num_shards):
+    table = "select_wide_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    values = {f"f{i}": [i, None, f"v-{i}"] for i in range(64)}
+    stateful_api.batch_write(
+        table,
+        inserts={"a": {"body": values, "padding": "x" * padding}},
+        sync_level="full_index",
+    )
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query",
+        json={
+            "query": {"match_all": {}},
+            "fields": [],
+            "select": {name: {"field": f"body.{name}"} for name in values},
+        },
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+    hit = response.json()["responses"][0]["hits"]["hits"][0]
+    assert hit["_computed"] == values, hit
+    assert hit.get("_source", {}) == {}, hit
+
+
+@pytest.mark.parametrize("padding", [0, 32768])
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_numeric_outputs_are_independent_of_materialization_order(
+    stateful_api, padding, num_shards
+):
+    from decimal import Decimal
+
+    table = "select_numeric_order_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    # Submit literal numeric spellings, without Python float coercion.
+    document = (
+        '{"n":1e-400,"nested":{"a":[1.234567890123456789,1e-400,-0.0]},"zero":-0.0,"padding":'
+        + json.dumps("x" * padding)
+        + "}"
+    )
+    inserted = requests.post(
+        stateful_api.url + f"/tables/{table}/batch",
+        data='{"inserts":{"a":' + document + '},"sync_level":"full_index"}',
+        headers={"Content-Type": "application/json"},
+        timeout=60,
+    )
+    assert inserted.status_code == 201, inserted.text
+    for field in ("n", "nested", "zero"):
+        direct = {"field": field}
+        typed = {
+            "call": "jsonb_extract_path",
+            "args": [
+                {"call": "jsonb_build_object", "args": [{"literal": "v"}, direct]},
+                {"literal": "v"},
+            ],
+        }
+        outputs = None
+        for selected in (
+            {"direct": direct, "typed": typed},
+            {"typed": typed, "direct": direct},
+        ):
+            selected["alias"] = {"ref": "direct"}
+            selected["branch"] = {
+                "case": [{"when": {"literal": True}, "then": {"field": field}}],
+                "else": {"literal": None},
+            }
+            selected["field_identity"] = {
+                "call": "value_identity",
+                "args": [{"field": field}],
+            }
+            selected["alias_identity"] = {
+                "call": "value_identity",
+                "args": [{"ref": "direct"}],
+            }
+            response = requests.post(
+                stateful_api.url + f"/tables/{table}/query",
+                json={"query": {"match_all": {}}, "fields": [], "select": selected},
+                timeout=60,
+            )
+            assert response.status_code == 200, response.text
+            hit = response.json(parse_float=Decimal)["responses"][0]["hits"]["hits"][0]
+            values = hit["_computed"]
+            assert (
+                values["direct"]
+                == values["typed"]
+                == values["alias"]
+                == values["branch"]
+            ), hit
+            assert values["field_identity"] == values["alias_identity"], hit
+            if outputs is not None:
+                assert values == outputs
+            outputs = values
+
+
+@pytest.mark.fresh_antfly_process
+@pytest.mark.parametrize("num_shards", [1, 2])
+@pytest.mark.parametrize("array_paths", [False, True])
+@pytest.mark.parametrize("large_images", [False, True])
+def test_gateway_materializes_distinct_masks_before_model_execution(
+    tmp_path, num_shards, array_paths, large_images
+):
+    import copy
+    import hashlib
+    from conftest import StandaloneAntflyServer, find_free_port
+
+    binary = os.environ.get("ANTFLY_BIN")
+    if not binary:
+        pytest.skip("Set ANTFLY_BIN for isolated gateway source checks")
+    config = tmp_path / "gateway.json"
+    config.write_text(json.dumps({"public_inference": {"enabled": True}}))
+    server = StandaloneAntflyServer(
+        binary, "127.0.0.1", find_free_port(), config_path=config
+    )
+    encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII="
+    if large_images:
+        from media_fixture import png
+
+        encoded = base64.b64encode(png(256, 100)).decode("ascii")
+    digest = hashlib.sha256(base64.b64decode(encoded)).hexdigest()
+    try:
+        table = server.api_url + "/tables/media_groups"
+        created = requests.post(table, json={"num_shards": num_shards}, timeout=30)
+        assert created.ok, created.text
+        deadline = time.monotonic() + 30
+        while requests.get(table, timeout=5).status_code != 200:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        documents = {
+            f"doc-{i}": {
+                "revision": "r1",
+                "permissions": {"public": True},
+                "images": {f"image{i}": "data:image/png;base64," + encoded},
+            }
+            for i in range(4)
+        }
+
+        if array_paths:
+            for i, document in enumerate(documents.values()):
+                document["images"] = ["unused"] * (i + 1) + [
+                    "data:image/png;base64," + encoded
+                ]
+                document["versions"] = ["unused", document.pop("revision")]
+                document["policies"] = [{"public": False}, document.pop("permissions")]
+
+        def write_document(doc_id):
+            result = requests.post(
+                table + "/batch",
+                json={
+                    "inserts": {doc_id: documents[doc_id]},
+                    "sync_level": "full_index",
+                },
+                timeout=60,
+            )
+            assert result.status_code == 201, result.text
+
+        for doc_id in documents:
+            write_document(doc_id)
+        references = [
+            {
+                "type": "input_image",
+                "source": {
+                    "table": "media_groups",
+                    "document_id": f"doc-{i}",
+                    "field": f"images.{i + 1}" if array_paths else f"images.image{i}",
+                    "revision_field": "versions.1" if array_paths else "revision",
+                    "revision": "r1",
+                    "permissions_field": "policies.1" if array_paths else "permissions",
+                    "sha256": digest,
+                    "mime_type": "image/png",
+                    "byte_length": len(base64.b64decode(encoded)),
+                    "max_pixels": 256 * 256 if large_images else 1,
+                },
+            }
+            for i in range(4)
+        ]
+        payload = {"input": [{"role": "user", "content": references}]}
+
+        def invoke(body):
+            return requests.post(server.url + "/ai/v1/decisions", json=body, timeout=30)
+
+        # No model is selected: reaching ModelRequired proves all authorized
+        # groups materialized, without invoking or downloading a provider.
+        ready = invoke(payload)
+        assert ready.status_code == 400, ready.text
+        assert ready.json()["error"]["code"] == "ModelRequired", ready.text
+        absent = copy.deepcopy(payload)
+        absent["input"][0]["content"][0]["source"]["field"] = (
+            "images.99" if array_paths else "images.absent"
+        )
+        missing = invoke(absent)
+        assert missing.status_code == 404, missing.text
+        assert missing.json()["error"]["code"] == "InferenceSourceUnavailable", (
+            missing.text
+        )
+        mismatched = copy.deepcopy(payload)
+        mismatched["input"][0]["content"][1]["source"]["sha256"] = "0" * 64
+        bad_digest = invoke(mismatched)
+        assert bad_digest.status_code == 409, bad_digest.text
+        permissions = (
+            documents["doc-3"]["policies"][1]
+            if array_paths
+            else documents["doc-3"]["permissions"]
+        )
+        permissions["public"] = False
+        write_document("doc-3")
+        denied = invoke(payload)
+        assert denied.status_code == 403, denied.text
+        permissions["public"] = True
+        write_document("doc-3")
+        if array_paths:
+            documents["doc-2"]["versions"][1] = "r2"
+        else:
+            documents["doc-2"]["revision"] = "r2"
+        write_document("doc-2")
+        stale = invoke(payload)
+        assert stale.status_code == 409, stale.text
+        if not large_images:
+            url = "data:image/png;base64," + encoded
+            documents["doc-0"]["images"] = (
+                [url] * 128 if array_paths else {f"image{i}": url for i in range(128)}
+            )
+            write_document("doc-0")
+            logical_identity = (
+                "sv1-"
+                + hashlib.sha256(
+                    b"antfly.source.value.v1\0" + json.dumps(url).encode()
+                ).hexdigest()
+            )
+            many = []
+            for i in range(128):
+                item = copy.deepcopy(references[0])
+                item["source"]["field"] = (
+                    f"images.{i}" if array_paths else f"images.image{i}"
+                )
+                item["source"]["identity"] = logical_identity
+                many.append(item)
+            split = invoke({"input": [{"role": "user", "content": many}]})
+            assert split.status_code == 400, split.text
+            assert split.json()["error"]["code"] == "ModelRequired", split.text
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_select_batches_preserve_array_positions_across_byte_and_row_windows(
+    stateful_api, num_shards
+):
+    table = "select_byte_windows_" + str(time.time_ns())
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    documents = {
+        f"doc-{i:03}": {
+            "metadata": {"revision": "r1", "ordinal": i},
+            "items": [{"n": i * 3 + j} for j in range(3)],
+            "padding": "x" * 20000,
+        }
+        for i in range(130)
+    }
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/batch",
+        json={"inserts": documents, "sync_level": "full_index"},
+        timeout=60,
+    )
+    assert response.status_code == 201, response.text
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query",
+        json={
+            "query": {"match_all": {}},
+            "limit": 130,
+            "fields": ["metadata.revision", "items.1.n"],
+            "select": {
+                "ordinal": {"field": "metadata.ordinal"},
+                "original_second": {"field": "items.1.n"},
+                "copy": {"ref": "original_second"},
+            },
+        },
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+    hits = response.json()["responses"][0]["hits"]["hits"]
+    assert {hit["_id"] for hit in hits} == set(documents)
+    for hit in hits:
+        i = documents[hit["_id"]]["metadata"]["ordinal"]
+        assert hit["_source"] == {
+            "metadata": {"revision": "r1"},
+            "items": [{"n": i * 3 + 1}],
+        }
+        assert hit["_computed"] == {
+            "ordinal": i,
+            "original_second": i * 3 + 1,
+            "copy": i * 3 + 1,
+        }

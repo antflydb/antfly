@@ -479,6 +479,46 @@ test "lite allocator v4 detached proof follows local append-only commits and ena
     try std.testing.expect((try file.check()).valid);
 }
 
+test "lite allocator v4 detached proof follows an unchecked reopened writer" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "proof-reopened-lineage.aflite");
+    defer a.free(path);
+    const value: [32768]u8 = @splat('v');
+    {
+        var seed = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        for (0..16) |_| try seed.putDocument("pool", &value);
+        _ = try seed.reclaimPages(4096);
+    }
+    var owner = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer owner.close();
+    owner.defer_allocator_verification = true;
+    const reader = try owner.captureAllocatorVerificationSnapshot(null);
+    var reader_open = true;
+    defer {
+        if (reader_open) reader.close();
+        a.destroy(reader);
+    }
+    try owner.putDocument("local", "before reopen");
+    var replacement = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer replacement.close();
+    replacement.defer_allocator_verification = true;
+    try replacement.inheritAllocatorVerification(&owner);
+    try replacement.putDocument("local", "after reopen");
+    try std.testing.expect(!replacement.free_pages_verified);
+    try std.testing.expectEqual(@as(u64, 0), (try replacement.allocatorStats()).?.reused_pages);
+    try reader.completeAllocatorVerification();
+    try replacement.inheritAllocatorVerification(reader);
+    try std.testing.expect(replacement.free_pages_verified);
+    reader.close();
+    reader_open = false;
+    for (0..8) |_| try replacement.putDocument("local", &value);
+    try std.testing.expect((try replacement.allocatorStats()).?.reused_pages > 0);
+    try std.testing.expect((try replacement.check()).valid);
+}
+
 test "lite allocator v4 detached append lineage rejects external publication and cancellation" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -497,10 +537,16 @@ test "lite allocator v4 detached append lineage rejects external publication and
         a.destroy(reader);
     }
     try file.putDocument("local", "append");
+    var replacement = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer replacement.close();
+    replacement.defer_allocator_verification = true;
+    try replacement.inheritAllocatorVerification(&file);
     cancel.request();
     try std.testing.expectError(error.MaintenanceCanceled, reader.completeAllocatorVerification());
     try file.inheritAllocatorVerification(reader);
     try std.testing.expect(!file.free_pages_verified);
+    try replacement.inheritAllocatorVerification(reader);
+    try std.testing.expect(!replacement.free_pages_verified);
     // The independently protected original proof can finish, but an adopted
     // foreign checkpoint severs its relationship to this writer's free pool.
     reader.allocator_cancel_token = null;
@@ -509,10 +555,12 @@ test "lite allocator v4 detached append lineage rejects external publication and
     defer foreign.close();
     foreign.defer_allocator_verification = true;
     try foreign.putDocument("foreign", "append");
-    try file.adoptIndexPublicationHeader(foreign.header);
-    try file.inheritAllocatorVerification(reader);
-    try std.testing.expect(!file.free_pages_verified);
-    try std.testing.expect(file.allocator_verification_base == null);
+    for ([_]*NativeFile{ &file, &replacement }) |target| {
+        try target.adoptIndexPublicationHeader(foreign.header);
+        try target.inheritAllocatorVerification(reader);
+        try std.testing.expect(!target.free_pages_verified);
+        try std.testing.expect(target.allocator_verification_base == null);
+    }
 }
 
 test "lite allocator v4 fallback reuses completed immutable leaf payload proofs" {
@@ -4422,17 +4470,27 @@ pub const NativeFile = struct {
         self.header = header;
     }
 
-    /// Reuse a completed proof for identical checkpoints or this writer's
-    /// append-only descendants of its captured base. The caller serializes
-    /// publications; foreign headers, inode changes and uncertainty reject it.
+    /// Carry pending lineage across identical runtime generations, or inherit
+    /// a completed proof for append-only descendants of its captured base.
+    /// The caller serializes publications; foreign headers, inode changes
+    /// and uncertainty reject inheritance.
     pub fn inheritAllocatorVerification(self: *NativeFile, owner: *NativeFile) !void {
-        if (!std.mem.eql(u8, self.path, owner.path) or !owner.free_pages_verified or owner.transaction_header != null or owner.durable_header != null or
+        if (!owner.free_pages_verified and (self.free_pages_verified or owner.allocator_verification_base == null)) return;
+        if (!std.mem.eql(u8, self.path, owner.path) or owner.transaction_header != null or owner.durable_header != null or
             owner.checkpoint_publication_uncertain or self.transaction_header != null or self.durable_header != null or
             self.checkpoint_publication_uncertain) return;
         const identical = std.meta.eql(self.header, owner.header);
         const descendant = if (self.allocator_verification_base) |base| std.meta.eql(base, owner.header) else false;
         if (!identical and !descendant) return;
         if ((try self.file.stat(self.runtime())).inode != (try owner.file.stat(owner.runtime())).inode) return;
+        if (!owner.free_pages_verified) {
+            // Reopening the identical generation must retain the pending
+            // append-only lineage too. This grants no reuse: only completion
+            // of the independently fenced original proof can verify it.
+            if (identical and !self.free_pages_verified and owner.allocator_verification_base != null)
+                self.allocator_verification_base = owner.allocator_verification_base;
+            return;
+        }
         self.free_pages_verified = true;
         self.allocator_verification_base = null;
     }

@@ -104,6 +104,7 @@ const help =
     \\      --max-requests N      Request budget: N or unlimited (default 1000)
     \\      --model MODEL         Decision model (or ANTFLY_GREP_MODEL)
     \\      --media text|images   Text regions or whole image/page/slide evidence
+    \\      --indexed-media-transport inline|source  Antfly gateway media references (indexed images)
     \\      --max-image-bytes N   Encoded image bytes (512K; maximum 768K)
     \\      --max-image-pixels N  Image pixel admission (16777216)
     \\      --provider NAME       antfly, openai, custom, local

@@ -22,6 +22,7 @@ const gateway = registry.gateway;
 const tasks = registry.tasks;
 const Json = std.json.Value;
 const payloads = @import("inference_payload.zig");
+pub const source_media = @import("inference_source.zig");
 const empty_registry = registry.Registry.init(std.heap.page_allocator);
 const generating = sources.generating_mod;
 
@@ -69,6 +70,7 @@ const ExecutionOptions = struct {
     attempt_limit: u8 = 8,
     operation: ?[]const u8 = null,
     attachments: ?[]const httpx.attachment_envelope.Attachment = null,
+    source_port: ?source_media.Port = null,
     authorization: ?[]const u8 = null,
     attempt_observer: ?httpx.AttemptObserver = null,
 };
@@ -369,8 +371,11 @@ pub fn execute(server: anytype, ctx: *httpx.Context, task: gateway.Task) !httpx.
 
 /// The registered handler supplies operation identity; URI spelling never selects an adapter.
 pub fn executeOperation(server: anytype, ctx: *httpx.Context, task: gateway.Task, operation: ?[]const u8) !httpx.Response {
+    return executeOperationWithSources(server, ctx, task, operation, null);
+}
+pub fn executeOperationWithSources(server: anytype, ctx: *httpx.Context, task: gateway.Task, operation: ?[]const u8, port: ?source_media.Port) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 * 1024 * 1024 };
-    return executeBounded(server, ctx, task, budget.allocator(), .{ .attempt_limit = try attemptBudget(ctx), .operation = operation }) catch |err| {
+    return executeBounded(server, ctx, task, budget.allocator(), .{ .attempt_limit = try attemptBudget(ctx), .operation = operation, .source_port = port }) catch |err| {
         if (err == error.InferenceResponseCommitted) return err;
         if (budget.exhausted) return error.InferenceRequestTooLarge;
         return err;
@@ -387,6 +392,7 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     var execution = options;
     execution.attachments = payload.attachments;
     const request = payload.value;
+    try source_media.resolve(a, request, execution.source_port);
     if (request != .object) return error.InvalidInferenceRequest;
     if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
@@ -1224,6 +1230,9 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
 }
 
 pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
+    return batchWithSources(server, ctx, null);
+}
+pub fn batchWithSources(server: anytype, ctx: *httpx.Context, port: ?source_media.Port) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 << 20 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
@@ -1253,7 +1262,7 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
     const results = try a.alloc(Result, items.array.items.len);
     var succeeded: usize = 0;
     const deadline = @import("../request_deadline.zig").platformDeadline(ctx) orelse @import("connections.zig").inferenceInvocationDeadlineNs();
-    const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx) };
+    const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx), .source_port = port };
     for (items.array.items, results, 0..) |item, *result, index| {
         result.* = .{ .custom_id = item.object.get("custom_id").?.string, .index = index };
         if (ctx.isCancellationRequested()) return error.Canceled;
