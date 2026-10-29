@@ -1000,6 +1000,108 @@ class NativePublicationQualificationTests(unittest.TestCase):
             self.assertEqual([0], receipt["server_exit_codes"])
             self.assertIn("durability_probe.py", receipt["harness_sha256"])
 
+    def test_failed_load_still_verifies_restart_and_preserves_original_failure(self):
+        for reported_passed in (False, True):
+            with self.subTest(reported_passed=reported_passed):
+                self.check_failed_load_restart(reported_passed)
+
+    def check_failed_load_restart(self, reported_passed):
+        import json
+        import pathlib
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import run_local
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            server_root = root / "server"
+            server_root.mkdir()
+            binary = root / "antfly"
+            binary.write_bytes(b"fixture binary")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"durability_restart_probe": True}))
+            output = root / "receipt.json"
+            child = Mock(returncode=None)
+            child.poll.return_value = None
+            child.send_signal.side_effect = lambda _: setattr(child, "returncode", 0)
+            child.wait.return_value = 0
+
+            def load(*args, **kwargs):
+                output.write_text(
+                    json.dumps(
+                        {
+                            "passed": reported_passed,
+                            "failures": []
+                            if reported_passed
+                            else ["descriptor recovery exceeded ceiling"],
+                        }
+                    )
+                )
+                return SimpleNamespace(returncode=1)
+
+            from contextlib import ExitStack
+
+            contexts = [
+                patch.object(
+                    run_local.sys,
+                    "argv",
+                    [
+                        "run_local.py",
+                        "--binary",
+                        str(binary),
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                    ],
+                ),
+                patch.object(
+                    run_local.tempfile, "mkdtemp", return_value=str(server_root)
+                ),
+                patch.object(run_local, "enforced_limits", return_value={}),
+                patch.object(run_local, "check_container", return_value=[]),
+                patch.object(run_local, "free_port", side_effect=[8080, 5432]),
+                patch.object(run_local, "wait_ready"),
+                patch.object(
+                    run_local.subprocess,
+                    "Popen",
+                    side_effect=[child, child],
+                ),
+                patch.object(run_local.subprocess, "run", side_effect=load),
+                patch(
+                    "durability_probe.write",
+                    return_value=(
+                        "new postimage",
+                        {"http_verified": True, "pgwire_verified": True},
+                    ),
+                ),
+                patch(
+                    "durability_probe.verify",
+                    return_value={"http_verified": True, "pgwire_verified": True},
+                ),
+            ]
+            with ExitStack() as stack:
+                for context in contexts:
+                    stack.enter_context(context)
+                self.assertTrue(run_local.main())
+            receipt = json.loads(output.read_text())
+            self.assertFalse(receipt["passed"])
+            self.assertEqual(
+                ["qualification probe exited unsuccessfully"]
+                if reported_passed
+                else ["descriptor recovery exceeded ceiling"],
+                receipt["failures"],
+            )
+            self.assertEqual(1, receipt["load_probe_exit_code"])
+            self.assertTrue(
+                receipt["durability_probe"]["before_shutdown"]["http_verified"]
+            )
+            self.assertTrue(
+                receipt["durability_probe"]["after_restart"]["pgwire_verified"]
+            )
+            self.assertEqual([0, 0], receipt["server_exit_codes"])
+
 
 if __name__ == "__main__":
     unittest.main()

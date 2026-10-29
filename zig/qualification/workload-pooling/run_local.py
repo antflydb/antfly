@@ -252,7 +252,10 @@ def main():
                 ],
                 env=probe_env,
             )
-            if result.returncode == 0 and manifest.get("durability_restart_probe"):
+            # Load/resource gates and persistence correctness are independent.
+            # Keep a failed load receipt failed while still checking a healthy
+            # server's acknowledged postimage through joined restart.
+            if manifest.get("durability_restart_probe") and child.poll() is None:
                 import durability_probe
 
                 checkpoint, durability["before_shutdown"] = durability_probe.write(
@@ -361,12 +364,16 @@ def main():
                 )
             },
             configuration=config,
+            load_probe_exit_code=result.returncode if result is not None else None,
             server_exit_code=child.returncode,
             server_exit_codes=exit_codes,
             durability_probe=durability,
             server_log=str(saved_log),
             command=command,
         )
+        if result is not None and result.returncode != 0 and receipt["passed"]:
+            receipt["failures"].append("qualification probe exited unsuccessfully")
+            receipt["passed"] = False
         if startup_problem is not None:
             receipt["failures"].append(startup_problem)
             receipt["passed"] = False

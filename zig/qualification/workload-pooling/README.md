@@ -344,13 +344,23 @@ cursor returned after rejection. Focused dispatcher tests cover those paths;
 a native file-engine mixed-load run completed every phase without unexpected
 server errors and with query, write and slow-reader progress.
 
-File-engine qualification remains open. That run still exceeded descriptor
-recovery limits for immutable-artifact leases, so the launcher did not perform
-its restart probe. The unchanged revision also reproduces the retained-cursor
-suite's normalization allocation-determinism and predecision memory-accounting
-failures. Preserve these failures and the existing resource, server-error and
-restart gates while completing the production path. A passing directory-engine
-receipt does not qualify the file engine.
+The restart probe runs independently of load/resource acceptance when the
+server remains live. A failed load receipt stays failed even when exact HTTP
+and pgwire postimages survive joined shutdown and reopen; the receipt records
+the load exit code and both server exit codes separately. Native file-engine
+mixed load now has this exact-postimage restart evidence.
+
+File-engine qualification remains open because the unchanged cold-baseline
+descriptor-recovery gate still fails. A diagnostic ownership census matched all
+21 artifact-marker descriptors to their live registry sources: 16 idle-expirable
+cache sources and five explicit readers, with no callbacks in flight. The source
+cache and live full-text segments retain storage independently of connections;
+this census does not prove process-wide descriptor bounds or qualify the failed
+gate. The unchanged revision also reproduces the retained-cursor suite's
+normalization allocation-determinism and predecision memory-accounting failures.
+Preserve these failures and the existing resource, server-error and restart
+gates while completing the production path. A passing directory-engine receipt
+does not qualify the file engine.
 
 Directory overload/restart has a passing native receipt, but repeatability is
 still open: a repeat of the same binary and semantically identical harness
