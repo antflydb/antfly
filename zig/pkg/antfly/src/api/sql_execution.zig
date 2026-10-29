@@ -1735,7 +1735,7 @@ pub const Adapter = struct {
         var keep_store = false;
         defer if (!keep_store) owner.store.deinit();
         if (self.server.source.lakeIndexLifecycleAuthority(self.context)) |authority| {
-            owner.reader_lease = self.server.lake_reader_leases.acquire(self.server.embedding_provider_runtime.io, authority, table.id, publication.generation, context) catch |err| {
+            owner.reader_lease = self.server.readerLeasePool().acquire(self.server.embedding_provider_runtime.io, authority, table.id, publication.generation, context) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory or err == error.MetadataMutationOutcomeUnknown) return err;
                 return null;

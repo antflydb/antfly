@@ -1837,7 +1837,8 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
     const authority = server.source.lakeIndexLifecycleAuthority(context) orelse return if (policy == .automatic) null else error.ExternalLakeIndexUnavailable;
     const normalized = try context.platformDeadline();
-    const read_context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    var read_context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    if (execution) |owner_execution| read_context = read_context.withExecution(owner_execution);
     var catalog_state = try local.metadata_lake_index_catalog.parse(a, definitions.catalog_json);
     defer catalog_state.deinit();
     const publication = catalog_state.value.published orelse return if (policy == .automatic) null else error.ExternalLakeIndexNotPublished;
@@ -1863,7 +1864,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     var selected: ?@import("lake_index_selection.zig").Selected = null;
     defer if (selected) |*selection| selection.deinit();
     if (pinned == null) {
-        owner.lease = server.lake_reader_leases.acquire(server.embedding_provider_runtime.io, authority, table.id, publication.generation, read_context) catch |err| {
+        owner.lease = server.readerLeasePool().acquire(server.embedding_provider_runtime.io, authority, table.id, publication.generation, read_context) catch |err| {
             try context.ensureActive();
             if (policy == .automatic and err != error.OutOfMemory and err != error.MetadataMutationOutcomeUnknown) return null;
             return err;

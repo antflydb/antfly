@@ -503,7 +503,7 @@ pub fn mutateOnService(svc: anytype, a: A, write: Write, request: @import("antfl
     if (before.revision != write.expected_revision) return error.CatalogGenerationChanged;
     try write.mutation.preflight(a, before);
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .mutate_lake_index_lifecycle = .{ .table_id = write.table_id, .expected_revision = write.expected_revision, .mutation = write.mutation } });
-    svc.waitForTransitionApplied(receipt) catch return error.MetadataMutationOutcomeUnknown;
+    svc.waitForTransitionAppliedWithContext(receipt, request) catch return error.MetadataMutationOutcomeUnknown;
     const observed = try parse(a, try store.getLakeIndexLifecycle(a, svc.metadata_group_id, write.table_id));
     if (observed.revision <= write.expected_revision or !write.mutation.observed(observed)) return error.MetadataMutationOutcomeUnknown;
 }

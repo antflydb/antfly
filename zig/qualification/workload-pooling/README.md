@@ -1318,3 +1318,56 @@ The full design remains open. Native published-index reader-lease heartbeats
 from the external snapshot pins completed here. The previously recorded initial
 work-lease/provider boundaries, preparation and cross-engine recovery gates
 (including file-engine FD recovery) remain open. Full qualification is waived.
+
+### Shared admitted native published-index reader sessions (2026-10-29)
+
+Published-index reader sessions now use the server's bounded lake renewal
+service alongside external snapshot pins. SQL, text search, readiness,
+navigation warming, published navigation and maintenance obtain their pool
+through the configured server capability. Admitted readers cannot silently
+start an independent unadmitted heartbeat. Explicit unadmitted callers retain
+the compatibility path. Session reuse amortizes durable metadata admission;
+individual handles retain their original query execution, cancellation and
+deadline independently of the shared durable session.
+
+Renewal registers one callback per live native session, with the same combined
+64-link bound, protected control execution and health capacity accounting as
+snapshot renewal. The callback supplies its own control execution to metadata
+reads and mutations, with an attempt bounded by five seconds and the cached
+lease's remaining authority. Remote metadata reads, mutation leader discovery
+and mutation delivery forward that execution to physical HTTP waits; encoding,
+signing and response parsing retain CPU. Read retry pauses also lend CPU.
+Local metadata applied waits receive the original bounded request. Existing
+metadata critical sections retain their conservative execution policy.
+
+A delayed response cannot publish a new local deadline after the old rights
+expire. Ambiguous mutations terminate renewal without replay. One refused or
+expired reader does not stop the shared service or revive when another session
+registers. The last reader detaches and joins its callback while lending caller
+CPU, then stops the service if no other native or snapshot reader remains.
+Idle cached rights can be reused while valid. A retiring-owner counter prevents
+cache replacement from freeing an owner before its last physical close returns.
+
+Four loopback HTTP cases use the production metadata client and transport with
+a local lifecycle authority: session coalescing and reuse, per-handle deadline
+and cancellation isolation, delayed expiry with unrelated query and health
+progress, ambiguous outcome without replay, and last-close physical joining.
+The listener fixture applies lifecycle mutations but does not run Raft or
+validate internal authentication grants. A separate deterministic production
+callback check verifies execution propagation through RemoteMetadataSource's
+read, topology discovery and mutation delivery. These are distinct forms of
+evidence; neither claims live cloud qualification.
+
+The full design remains open. Initial work-lease acquisition/release,
+maintenance provider and metadata holder boundaries, remaining preparation
+paths and cross-engine recovery gates (including file-engine FD recovery)
+remain outstanding. Full qualification remains waived.
+
+Evidence: `index-reader-renewal-v11-final.json` records eight successful focused
+targets, 104/104 successful build steps and unchanged inputs. The executed
+production RPC artifact passes all four included tests; its named execution
+propagation probe is also recorded in `index-reader-renewal-rpc-direct.log`.
+The affected lake admission, source-pin renewal, opening, text retirement,
+SQL startup and metadata provider checks pass. `index-reader-renewal-final.json`
+binds every committed source file to the tested inputs and exact snapshots.
+License headers and the Apache product boundary pass.

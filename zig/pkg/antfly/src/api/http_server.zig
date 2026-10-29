@@ -4676,6 +4676,11 @@ pub const ApiHttpServer = struct {
         try execution.start(self.runnableScheduler(), options, class);
     }
 
+    pub fn readerLeasePool(self: *ApiHttpServer) *@import("lake_index_reader_lease.zig").Pool {
+        self.lake_reader_leases.setService(self.snapshotRenewals());
+        return &self.lake_reader_leases;
+    }
+
     pub fn snapshotRenewalProvider(self: *ApiHttpServer) @import("../serverless/configured_object_store_support.zig").SnapshotRenewalProvider {
         return .{ .ptr = self, .get = struct {
             fn get(raw: *anyopaque) *@import("../serverless/lake_renewal_service.zig").Service {
@@ -18590,7 +18595,7 @@ pub const ApiHttpServer = struct {
             var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
             defer state.deinit();
             if (state.value.published) |published| {
-                reader_lease = try self.lake_reader_leases.acquire(self.embedding_provider_runtime.io, authority, table.table_id, published.generation, context);
+                reader_lease = try self.readerLeasePool().acquire(self.embedding_provider_runtime.io, authority, table.table_id, published.generation, context);
                 context = reader_lease.?.readContext();
             }
         }

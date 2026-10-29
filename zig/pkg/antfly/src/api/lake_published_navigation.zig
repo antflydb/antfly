@@ -208,7 +208,7 @@ pub fn openFor(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id
     defer store.deinit();
     if (!std.mem.eql(u8, &store.identity, &publication.signature.store)) return Source.openLazyCachedFor(a, schema, source_options, context, &server.lake_read_cache, execution);
     store.implementation.cloud_io = context.io;
-    const lease = reader orelse server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table_id, publication.generation, context, null) catch |err| {
+    const lease = reader orelse server.readerLeasePool().acquireRetained(server.embedding_provider_runtime.io, authority, table_id, publication.generation, active, null) catch |err| {
         try optionalAdmission(context, false, err);
         return Source.openLazyCachedFor(a, schema, source_options, context, &server.lake_read_cache, execution);
     };

@@ -63,7 +63,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     var reader_lease: ?*@import("lake_index_reader_lease.zig").Handle = null;
     defer if (reader_lease) |lease| lease.deinit();
     if (server.source.lakeIndexLifecycleAuthority(request)) |authority| {
-        reader_lease = server.lake_reader_leases.acquire(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context) catch |err| {
+        reader_lease = server.readerLeasePool().acquire(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context) catch |err| {
             try context.ensureActive();
             if (err == error.OutOfMemory or err == error.MetadataMutationOutcomeUnknown) return err;
             return &.{};

@@ -32,6 +32,7 @@ const control_only_storage_sources = storage_source_options.control_only;
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("antfly_local_sources").api_json_helpers;
+const request_http_execution = @import("../api/request_http_execution.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
@@ -27049,8 +27050,13 @@ const RemoteMetadataSource = struct {
         comptime callFn: anytype,
         ctx: anytype,
     ) !T {
-        const deadline_ns = self.awakeNs() +|
-            @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+        const ContextType = switch (@typeInfo(@TypeOf(ctx))) {
+            .pointer => |info| info.child,
+            else => @TypeOf(ctx),
+        };
+        const request: antfly.public_api.operation.RequestContext = if (@hasField(ContextType, "request")) ctx.request else .{};
+        try request.ensureExecutionActive();
+        const deadline_ns = try requestDeadlineOnClock(request, self.awakeNs(), @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms);
         var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
         var replay_proof_error: anyerror = error.NotLeader;
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
@@ -27076,7 +27082,10 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
+            try request.ensureExecutionActive();
             var metadata_client = self.metadataClient(scratch);
+            var execution_scope: request_http_execution.Scope = .{ .request = request, .inner = metadata_client.executor };
+            metadata_client.executor = execution_scope.executor();
             const status = metadata_client.fetchMutationTopologyWithBudget(self.base_uris[index], discovery_budget) catch |err| {
                 if (self.awakeNs() >= deadline_ns)
                     return replay_proof_error;
@@ -27122,7 +27131,10 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
+            try request.ensureExecutionActive();
             var metadata_client = self.metadataClient(scratch);
+            var execution_scope: request_http_execution.Scope = .{ .request = request, .inner = metadata_client.executor };
+            metadata_client.executor = execution_scope.executor();
             const result = self.deliverMetadataMutation(
                 T,
                 callFn,
@@ -28527,11 +28539,13 @@ const RemoteMetadataSource = struct {
             const first = self.metadataApiIndexForAttempt(0);
             var terminal_error: ?anyerror = null;
             for (0..self.base_uris.len) |attempt| {
-                try request.ensureActive();
+                try request.ensureExecutionActive();
                 const remaining_ns = deadline -| self.awakeNs();
                 if (remaining_ns == 0) return error.DeadlineExceeded;
                 const index = (first + attempt) % self.base_uris.len;
                 var client = self.metadataClient(alloc);
+                var execution_scope: request_http_execution.Scope = .{ .request = request, .inner = client.executor };
+                client.executor = execution_scope.executor();
                 var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(request.cancellation);
                 const attempt_ms: u32 = @intCast(@min(
                     antfly.public_api.raft_mutation_forwarding.max_remaining_ms,
@@ -28549,7 +28563,7 @@ const RemoteMetadataSource = struct {
                     }
                 };
                 errdefer read.deinit(alloc);
-                try request.ensureActive();
+                try request.ensureExecutionActive();
                 if (self.awakeNs() >= deadline) return error.DeadlineExceeded;
                 self.acceptMetadataIdentity(read.metadata_group_id, read.metadata_incarnation) catch |err| {
                     read.deinit(alloc);
@@ -28562,10 +28576,11 @@ const RemoteMetadataSource = struct {
             if (terminal_error) |err| return err;
             // Reads can safely cross an election, unlike ambiguous mutations.
             // Keep one absolute budget and a short cancellation-bounded pause.
-            try request.ensureActive();
+            try request.ensureExecutionActive();
             const remaining_ns = deadline -| self.awakeNs();
             if (remaining_ns == 0) return error.DeadlineExceeded;
-            try self.io.sleep(.fromNanoseconds(@intCast(@min(remaining_ns, 10 * std.time.ns_per_ms))), .awake);
+            var retry_scope: request_http_execution.Scope = .{ .request = request, .inner = self.httpExecutor() };
+            try retry_scope.sleep(self.io, @min(remaining_ns, 10 * std.time.ns_per_ms));
         }
     }
 
@@ -48205,6 +48220,60 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "data lake reader RPC execution reaches metadata discovery read and mutation waits" {
+            const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+            const Read = @import("../api/runnable_local_read.zig").Read;
+            const Probe = struct {
+                scheduler: *Runnable.Scheduler,
+                requests: usize = 0,
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
+                    const wait = request.execution_wait orelse return error.MissingExecutionWait;
+                    try wait.begin(wait.ptr);
+                    try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+                    try wait.end(wait.ptr);
+                    try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
+                    self.requests += 1;
+                    if (request.method == .GET) return .{
+                        .status = 200,
+                        .body = try std.json.Stringify.valueAlloc(a, antfly.metadata_api.MetadataStatus{
+                            .metadata_group_id = 1,
+                            .metadata_incarnation = @splat('1'),
+                            .metadata_raft_local_node_id = 1,
+                            .metadata_raft_leader_id = 1,
+                            .metadata_raft_role = "leader",
+                            .metrics = .{},
+                        }, .{}),
+                    };
+                    var response: antfly.common.http.HttpResponse = .{ .status = 200, .body = try a.dupe(u8, "{}") };
+                    errdefer response.deinit(a);
+                    response.headers = try a.alloc(antfly.common.http.Header, 3);
+                    response.headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "1") };
+                    response.headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+                    response.headers[2] = .{ .name = try a.dupe(u8, "x-antfly-raft-mutation-outcome"), .value = try a.dupe(u8, "committed-v1") };
+                    return response;
+                }
+            };
+            var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .control_slots = 2 });
+            defer scheduler.close();
+            var execution: Runnable.Execution = .{};
+            try execution.start(&scheduler, .{ .io = std.testing.io }, .control);
+            defer execution.finish();
+            var read: Read = .{ .execution = &execution, .allocator = std.testing.allocator };
+            var team = try read.team();
+            const request: antfly.public_api.operation.RequestContext = .{ .execution_team = &team };
+            var probe: Probe = .{ .scheduler = &scheduler };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(std.testing.allocator, &.{"http://metadata.test"}, &.{.{ .ptr = &probe, .vtable = &.{ .execute = Probe.execute } }}, std.testing.io);
+            defer source.deinit();
+            source.setting_authority_secret = "reader-rpc-fixture";
+            source.setting_authority_issuer = "reader-fixture";
+            const result = try RemoteMetadataSource.remoteGetLakeIndexLifecycle(&source, std.testing.allocator, 4, request);
+            defer std.testing.allocator.free(result);
+            try RemoteMetadataSource.remoteMutateLakeIndexLifecycle(&source, 4, 0, .{ .renew = .{ .token = @splat(1), .now_ms = 1 } }, request);
+            try std.testing.expectEqual(@as(usize, 3), probe.requests);
+        }
+
         test "data HA capture activity original admission rejects before owner access" {
             const runtime = @import("antfly_runtime_abi");
             const Authority = struct {

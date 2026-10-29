@@ -112,7 +112,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer state.deinit();
     const publication = state.value.published orelse return error.ExternalLakeIndexNotPublished;
-    const lease = try server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context, if (retained) |cut| cut.reader_token else null);
+    const lease = try server.readerLeasePool().acquireRetained(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context, if (retained) |cut| cut.reader_token else null);
     defer lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();

@@ -200,7 +200,17 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return;
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) };
-    const lease = try server.lake_reader_leases.acquire(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context);
+    var execution: local.common_request_admission.runnable_scheduler.Execution = .{};
+    defer execution.finish();
+    var bridge: ?@import("runnable_native_borrow.zig").Bridge = if (normalized.execution_team) |team|
+        try @import("runnable_native_borrow.zig").Bridge.init(&team.borrow, team.allocator)
+    else
+        null;
+    if (bridge) |*binding| {
+        try binding.bind(&execution);
+        context = context.withExecution(&execution);
+    }
+    const lease = try server.readerLeasePool().acquire(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context);
     defer lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();
