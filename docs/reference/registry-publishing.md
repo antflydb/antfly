@@ -89,13 +89,15 @@ Release order for the initial candidate:
 
 1. Publish SDK 0.2.2, which contains `getSQLTransactionOutcome` (0.2.1 does not).
 2. Complete embedded/server 0.3.0-rc.6 and its registry publication.
-3. Pass the supported Better Auth compatibility workflow, including the Linux
-   container recipe, and run the installed-package smoke test outside the workspace.
+3. Complete main Zig E2E qualification on the exact commit to be tagged. Its
+   supported Better Auth lane consumes the shared base/full server and library,
+   and includes the Linux container and installed-package smoke checks.
 4. Publish auth 0.1.0-rc.1 with npm tag `next`. Subsequent tag-driven publications
    use `ts/antfly/better-auth/v<version>` and require the tag to match the manifest.
 
-The auth release gate runs embedded and remote suites. Scheduled latest/beta
-Better Auth checks remain advisory. Stable publication and promotion of native
+The auth release gate verifies the existing same-commit Zig E2E result; it
+does not launch a native build. Daily Zig E2E runs also exercise latest/beta
+Better Auth candidates as advisory checks. Stable publication and promotion of native
 `next` packages to `latest` are separate release decisions.
 
 For the installed-package check, copy

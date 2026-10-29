@@ -703,7 +703,7 @@ const HttpExtractorState = struct {
         // schema-version-less wire request to v2 on the provider side (see
         // zig/pkg/inference's extractWithAdmission); a caller that left
         // schema_version unset everywhere -- as
-        // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+        // examples/antfly-docs-knowledge-base/index_config.go's knowledgeGraphIndexJSON and
         // GRAPH.md's shorthand extractor config both do -- has no basis to
         // reject that upgrade as a mismatch. Before this, `req.schema_version
         // orelse self.cfg.schema_version` always produced a concrete value

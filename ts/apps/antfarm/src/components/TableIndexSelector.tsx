@@ -1,5 +1,6 @@
 import {
-  Label,
+  Field,
+  FieldLabel,
   Select,
   SelectContent,
   SelectItem,
@@ -78,8 +79,8 @@ export const TableIndexSelector: React.FC<TableIndexSelectorProps> = ({
 
   return (
     <div className="grid grid-cols-2 gap-4">
-      <div className="space-y-2">
-        <Label>Table</Label>
+      <Field className="gap-2">
+        <FieldLabel>Table</FieldLabel>
         <Select value={selectedTable} onValueChange={onTableChange}>
           <SelectTrigger>
             <SelectValue placeholder="Select table..." />
@@ -92,9 +93,9 @@ export const TableIndexSelector: React.FC<TableIndexSelectorProps> = ({
             ))}
           </SelectContent>
         </Select>
-      </div>
-      <div className="space-y-2">
-        <Label>Index</Label>
+      </Field>
+      <Field className="gap-2">
+        <FieldLabel>Index</FieldLabel>
         <Select
           value={selectedIndex}
           onValueChange={onIndexChange}
@@ -113,7 +114,7 @@ export const TableIndexSelector: React.FC<TableIndexSelectorProps> = ({
             ))}
           </SelectContent>
         </Select>
-      </div>
+      </Field>
     </div>
   );
 };

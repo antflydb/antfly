@@ -2796,6 +2796,7 @@ def test_conditional_select_binds_current_values_and_query_selection(
 
 @pytest.mark.parametrize("opaque", [False, True])
 @pytest.mark.parametrize("num_shards", [1, 2])
+@e2e_resource("antfly_process")
 def test_conditional_source_projection_upgrades_persisted_certificates(
     monkeypatch, opaque, num_shards
 ):
@@ -3154,6 +3155,7 @@ def test_select_numeric_outputs_are_independent_of_materialization_order(
 @pytest.mark.parametrize("num_shards", [1, 2])
 @pytest.mark.parametrize("array_paths", [False, True])
 @pytest.mark.parametrize("large_images", [False, True])
+@e2e_resource("antfly_process")
 def test_gateway_materializes_distinct_masks_before_model_execution(
     tmp_path, num_shards, array_paths, large_images
 ):

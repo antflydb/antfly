@@ -1,0 +1,35 @@
+---
+title: Ollama
+description: Use models served by a local Ollama instance for embeddings and generation
+---
+
+The `ollama` provider calls an Ollama server through its OpenAI-compatible API.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Embedder | Text | For example `nomic-embed-text` |
+| Generator | Text, images | Images need a vision model; streaming and function tools where the model supports them |
+
+## Credentials
+
+None. The endpoint defaults to `http://127.0.0.1:11434`; set `url` for another
+host.
+
+## Example
+
+```json
+{
+  "embedders": {
+    "ollama-text": { "provider": "ollama", "model": "nomic-embed-text" }
+  },
+  "generators": {
+    "ollama-chat": { "provider": "ollama", "model": "llama3.2" }
+  }
+}
+```
+
+Ollama embeddings do not accept retrieval input types or query instructions.
+For a local model with those controls, use the
+[Antfly provider](/docs/guides/providers/antfly).

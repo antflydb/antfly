@@ -1,0 +1,32 @@
+---
+title: Pioneer
+description: Entity and structured extraction through a Pioneer inference endpoint
+---
+
+The `pioneer` provider sends extraction requests to a Pioneer `/inference`
+endpoint.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Extractor | Text | `url` is required; requests go to `{url}/inference` |
+
+## Credentials
+
+`api_key`, sent as a bearer token.
+
+## Example
+
+```json
+{
+  "extractors": {
+    "entities": {
+      "provider": "pioneer",
+      "url": "https://pioneer.example.com",
+      "model": "your-model",
+      "api_key": "${secret:pioneer.api_key}"
+    }
+  }
+}
+```

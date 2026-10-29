@@ -142,6 +142,7 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         const output = run.addOutputFileArg("libantfly.dylib");
         // Retain atom sizes and archive owners alongside the cached binary.
         // Release archives contain only the library, not this diagnostic map.
+        if (module.strip == true) run.addArg("--strip");
         run.addArg("--map");
         _ = run.addOutputFileArg("libantfly.map");
         var bundled: BundledInputs = .{ .modules = .init(b.allocator) };

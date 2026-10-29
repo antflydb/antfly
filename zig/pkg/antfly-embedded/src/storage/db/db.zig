@@ -78569,7 +78569,7 @@ test "db canonicalizes positional extractor endpoints once resolution lands" {
     // id-less mention its decimal array position as the local id, and the
     // materializer derives the same identity for `entity_index` endpoints,
     // so resolution injection canonicalizes them like id-carrying payloads
-    // (the examples/dogfood extractor shape).
+    // (the examples/antfly-docs-knowledge-base extractor shape).
     try db.addIndex(.{
         .name = "gliner_graph",
         .kind = .graph,
