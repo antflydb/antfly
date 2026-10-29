@@ -323,14 +323,18 @@ export function GeneratorSelector({
           {value.provider === "cloudflare" && (
             <>
               <Field className="gap-2">
-                <FieldLabel className="text-xs text-muted-foreground">Cloudflare account ID</FieldLabel>
+                <FieldLabel className="text-xs text-muted-foreground">
+                  Cloudflare account ID
+                </FieldLabel>
                 <Input
                   value={value.account_id}
                   onChange={(event) => onChange({ ...value, account_id: event.target.value })}
                 />
               </Field>
               <Field className="gap-2">
-                <FieldLabel className="text-xs text-muted-foreground">AI Gateway ID (optional)</FieldLabel>
+                <FieldLabel className="text-xs text-muted-foreground">
+                  AI Gateway ID (optional)
+                </FieldLabel>
                 <Input
                   value={value.gateway_id ?? ""}
                   onChange={(event) =>
