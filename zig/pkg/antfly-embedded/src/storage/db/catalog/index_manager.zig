@@ -24988,7 +24988,7 @@ pub const IndexManager = struct {
         }
 
         const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{
-            .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
+            .target_segment_bytes = activeTextMergePolicy().max_segment_size,
             .deleted_docs = deleted_docs,
             .source_map = &source_map,
         }) catch |err| {
@@ -39816,13 +39816,13 @@ test "asset registration validates document extraction OCR config" {
         .name = "document_units",
         .kind = .asset,
         .source_field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"render\":{\"dpi\":20},\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     }));
     try manager.validateEnrichmentConfig(.{
         .name = "document_units",
         .kind = .asset,
         .source_field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":150,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"render\":{\"dpi\":150},\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     });
 }
 

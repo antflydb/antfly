@@ -1,7 +1,8 @@
 "use client";
 
-import type * as React from "react";
 import { ChevronsUpDown } from "lucide-react";
+import type * as React from "react";
+import { SidebarMenuButton } from "@/components/compound/sidebar";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -9,7 +10,6 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { SidebarMenuButton } from "@/components/compound/sidebar";
 import { cn } from "@/lib/utils";
 
 function SidebarSwitcher({ children }: { children: React.ReactNode }) {

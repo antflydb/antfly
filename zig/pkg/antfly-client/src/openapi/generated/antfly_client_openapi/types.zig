@@ -1968,6 +1968,39 @@ pub const AntflyRerankerConfig = struct {
     }
 };
 
+/// Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider. Uses the Antfly inference service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
+pub const AntflySTTConfig = struct {
+    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny').
+    model: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "api_url", "api_url", true },
+        .{ "model", "model", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.endObject();
+    }
+};
+
 pub const AntflyType = enum {
     search_as_you_type,
     substring,
@@ -2326,6 +2359,47 @@ pub const AppleGeneratorConfig = struct {
         }
         if (self.temperature) |value| {
             try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// On-device SpeechAnalyzer file transcription. Requires a macOS Apple provider build and supported Speech assets. Diarization is unsupported.
+pub const AppleSTTConfig = struct {
+    /// Supported Speech locale; Apple transcription does not infer a language.
+    language_code: ?[]const u8 = null,
+    timestamps: ?bool = null,
+    /// Explicitly permit preparing and installing the selected Speech assets.
+    download_assets: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "language_code", "language_code", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "download_assets", "download_assets", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.download_assets) |value| {
+            try jw.objectField("download_assets");
             try jw.write(value);
         }
         try jw.endObject();
@@ -5595,6 +5669,70 @@ pub const CloudflareRerankerConfig = struct {
         }
         if (self.url) |value| {
             try jw.objectField("url");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
+pub const CloudflareSTTConfig = struct {
+    provider: []const u8,
+    account_id: []const u8,
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned full native endpoint override.
+    base_url: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    voice: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "base_url", "base_url", true },
+        .{ "language_code", "language_code", true },
+        .{ "voice", "voice", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
             try jw.write(value);
         }
         try jw.endObject();
@@ -11808,6 +11946,598 @@ pub const DocumentArtifactTableReprocessResponse = struct {
         try jw.write(self.shard_cursors);
         try jw.endObject();
     }
+};
+
+/// Configuration for the `document_extraction` producer. It downloads the source URL and persists derived units such as PDF pages, sections, images, and audio. Native text (PDF text layers, Office documents, HTML, email, plain text) is extracted with no model. Scanned pages and images are read only when `ocr` names a reader or generator, and audio is transcribed only when `transcription` names a transcriber. Units that need a producer that is not configured report `extraction_status` `ocr_not_configured` or `transcription_not_configured`. **Example:** ```json { "source": {"filename_field": "filename", "content_type_field": "mime_type"}, "ocr": {"reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}}, "transcription": {"transcriber": {"provider": "antfly", "model": "openai/whisper-small"}} } ```
+pub const DocumentExtractionConfig = struct {
+    source: ?DocumentExtractionSourceConfig = null,
+    /// Static filename used for content detection when the row has none.
+    filename: ?[]const u8 = null,
+    /// Static content type. Overrides the downloaded response's content type.
+    content_type: ?[]const u8 = null,
+    /// Static ETag recorded as source version metadata.
+    etag: ?[]const u8 = null,
+    /// Static checksum recorded as source version metadata.
+    checksum: ?[]const u8 = null,
+    /// Static source version. Together with the other metadata it lets extraction skip unchanged sources.
+    version: ?[]const u8 = null,
+    /// Static last-modified timestamp recorded as source version metadata.
+    last_modified: ?[]const u8 = null,
+    /// Credential reference used to download the source URL.
+    credentials: ?[]const u8 = null,
+    /// Strip HTML markup from HTML sources before storing their text.
+    html_strip_tags: ?bool = null,
+    ocr: ?DocumentExtractionOcrConfig = null,
+    transcription: ?DocumentExtractionTranscriptionConfig = null,
+    /// How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
+    route_preset: ?[]const u8 = null,
+    /// Routes evaluated in order before the preset. The first route whose match applies selects the extractor.
+    routes: ?[]const DocumentExtractionRoute = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "source", "source", true },
+        .{ "filename", "filename", true },
+        .{ "content_type", "content_type", true },
+        .{ "etag", "etag", true },
+        .{ "checksum", "checksum", true },
+        .{ "version", "version", true },
+        .{ "last_modified", "last_modified", true },
+        .{ "credentials", "credentials", true },
+        .{ "html_strip_tags", "html_strip_tags", true },
+        .{ "ocr", "ocr", true },
+        .{ "transcription", "transcription", true },
+        .{ "route_preset", "route_preset", true },
+        .{ "routes", "routes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.filename) |value| {
+            try jw.objectField("filename");
+            try jw.write(value);
+        }
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.etag) |value| {
+            try jw.objectField("etag");
+            try jw.write(value);
+        }
+        if (self.checksum) |value| {
+            try jw.objectField("checksum");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.last_modified) |value| {
+            try jw.objectField("last_modified");
+            try jw.write(value);
+        }
+        if (self.credentials) |value| {
+            try jw.objectField("credentials");
+            try jw.write(value);
+        }
+        if (self.html_strip_tags) |value| {
+            try jw.objectField("html_strip_tags");
+            try jw.write(value);
+        }
+        if (self.ocr) |value| {
+            try jw.objectField("ocr");
+            try jw.write(value);
+        }
+        if (self.transcription) |value| {
+            try jw.objectField("transcription");
+            try jw.write(value);
+        }
+        if (self.route_preset) |value| {
+            try jw.objectField("route_preset");
+            try jw.write(value);
+        }
+        if (self.routes) |value| {
+            try jw.objectField("routes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction.
+pub const DocumentExtractionOcrConfig = struct {
+    reader: ?DocumentExtractionReaderConfig = null,
+    generator: ?GeneratorConfig = null,
+    /// `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+    mode: ?[]const u8 = null,
+    /// Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
+    prompt: ?[]const u8 = null,
+    render: ?DocumentExtractionRenderConfig = null,
+    quality: ?DocumentExtractionOcrQualityConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reader", "reader", true },
+        .{ "generator", "generator", true },
+        .{ "mode", "mode", true },
+        .{ "prompt", "prompt", true },
+        .{ "render", "render", true },
+        .{ "quality", "quality", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.reader) |value| {
+            try jw.objectField("reader");
+            try jw.write(value);
+        }
+        if (self.generator) |value| {
+            try jw.objectField("generator");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.render) |value| {
+            try jw.objectField("render");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
+pub const DocumentExtractionOcrQualityConfig = struct {
+    /// Pages with fewer meaningful characters are read with OCR.
+    min_content_chars: ?i64 = null,
+    /// Minimum words before the garbled-text check applies.
+    garbled_min_words: ?i64 = null,
+    /// Words sampled by the garbled-text check.
+    garbled_sample_words: ?i64 = null,
+    /// Maximum ratio of single-character words before text counts as garbled.
+    max_single_char_word_ratio: ?f64 = null,
+    /// Minimum characters for a line to count in the corrupted-line check.
+    substantial_line_min_chars: ?i64 = null,
+    /// Maximum ratio of corrupted lines.
+    max_corrupted_line_ratio: ?f64 = null,
+    /// Font corruption score at which text is replaced by OCR.
+    font_corruption_score_threshold: ?f64 = null,
+    /// Maximum ratio of Unicode replacement characters.
+    max_replacement_char_ratio: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "min_content_chars", "min_content_chars", true },
+        .{ "garbled_min_words", "garbled_min_words", true },
+        .{ "garbled_sample_words", "garbled_sample_words", true },
+        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
+        .{ "substantial_line_min_chars", "substantial_line_min_chars", true },
+        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
+        .{ "font_corruption_score_threshold", "font_corruption_score_threshold", true },
+        .{ "max_replacement_char_ratio", "max_replacement_char_ratio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.min_content_chars) |value| {
+            try jw.objectField("min_content_chars");
+            try jw.write(value);
+        }
+        if (self.garbled_min_words) |value| {
+            try jw.objectField("garbled_min_words");
+            try jw.write(value);
+        }
+        if (self.garbled_sample_words) |value| {
+            try jw.objectField("garbled_sample_words");
+            try jw.write(value);
+        }
+        if (self.max_single_char_word_ratio) |value| {
+            try jw.objectField("max_single_char_word_ratio");
+            try jw.write(value);
+        }
+        if (self.substantial_line_min_chars) |value| {
+            try jw.objectField("substantial_line_min_chars");
+            try jw.write(value);
+        }
+        if (self.max_corrupted_line_ratio) |value| {
+            try jw.objectField("max_corrupted_line_ratio");
+            try jw.write(value);
+        }
+        if (self.font_corruption_score_threshold) |value| {
+            try jw.objectField("font_corruption_score_threshold");
+            try jw.write(value);
+        }
+        if (self.max_replacement_char_ratio) |value| {
+            try jw.objectField("max_replacement_char_ratio");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt.
+pub const DocumentExtractionReaderConfig = struct {
+    provider: []const u8,
+    /// Reader model, such as `lightonai/LightOnOCR-3-0.8B`.
+    model: ?[]const u8 = null,
+    /// Provider-level prompt. Hosted readers send their own read instruction when it is omitted.
+    prompt: ?[]const u8 = null,
+    /// Maximum output tokens per page.
+    max_tokens: ?i64 = null,
+    /// Reader endpoint URL.
+    api_url: ?[]const u8 = null,
+    /// Reader endpoint URL; takes precedence over `api_url`.
+    url: ?[]const u8 = null,
+    /// Provider API base URL.
+    base_url: ?[]const u8 = null,
+    /// API key, normally a `${secret:...}` reference.
+    api_key: ?[]const u8 = null,
+    /// Bearer token, normally a `${secret:...}` reference.
+    bearer_token: ?[]const u8 = null,
+    /// Capability token for an Antfly inference endpoint.
+    capability_token: ?[]const u8 = null,
+    /// Revision of the capability token.
+    capability_revision: ?[]const u8 = null,
+    /// Cloudflare account ID. Required for `cloudflare`.
+    account_id: ?[]const u8 = null,
+    /// Cloudflare AI Gateway ID.
+    gateway_id: ?[]const u8 = null,
+    /// Google Cloud project for `vertex`.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for `vertex`.
+    location: ?[]const u8 = null,
+    /// Path to Google Cloud credentials for `vertex`.
+    credentials_path: ?[]const u8 = null,
+    /// Apple Vision recognition languages. Defaults to `en-US`.
+    recognition_languages: ?[]const []const u8 = null,
+    /// Apple Vision recognition level.
+    recognition_level: ?[]const u8 = null,
+    /// Apple Vision language correction.
+    uses_language_correction: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "prompt", "prompt", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "api_url", "api_url", true },
+        .{ "url", "url", true },
+        .{ "base_url", "base_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "bearer_token", "bearer_token", true },
+        .{ "capability_token", "capability_token", true },
+        .{ "capability_revision", "capability_revision", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "recognition_languages", "recognition_languages", true },
+        .{ "recognition_level", "recognition_level", true },
+        .{ "uses_language_correction", "uses_language_correction", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.bearer_token) |value| {
+            try jw.objectField("bearer_token");
+            try jw.write(value);
+        }
+        if (self.capability_token) |value| {
+            try jw.objectField("capability_token");
+            try jw.write(value);
+        }
+        if (self.capability_revision) |value| {
+            try jw.objectField("capability_revision");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.recognition_languages) |value| {
+            try jw.objectField("recognition_languages");
+            try jw.write(value);
+        }
+        if (self.recognition_level) |value| {
+            try jw.objectField("recognition_level");
+            try jw.write(value);
+        }
+        if (self.uses_language_correction) |value| {
+            try jw.objectField("uses_language_correction");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// How PDF pages are rasterized for OCR.
+pub const DocumentExtractionRenderConfig = struct {
+    /// Render resolution in dots per inch.
+    dpi: ?i64 = null,
+    /// `requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size.
+    resolution: ?[]const u8 = null,
+    /// Maximum pixels per rendered page.
+    max_pixels: ?i64 = null,
+    /// Maximum width or height of a rendered page.
+    max_dimension: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "dpi", "dpi", true },
+        .{ "resolution", "resolution", true },
+        .{ "max_pixels", "max_pixels", true },
+        .{ "max_dimension", "max_dimension", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.dpi) |value| {
+            try jw.objectField("dpi");
+            try jw.write(value);
+        }
+        if (self.resolution) |value| {
+            try jw.objectField("resolution");
+            try jw.write(value);
+        }
+        if (self.max_pixels) |value| {
+            try jw.objectField("max_pixels");
+            try jw.write(value);
+        }
+        if (self.max_dimension) |value| {
+            try jw.objectField("max_dimension");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DocumentExtractionRoute = struct {
+    match: ?DocumentExtractionRouteMatch = null,
+    extractor: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "match", "match", true },
+        .{ "extractor", "extractor", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.match) |value| {
+            try jw.objectField("match");
+            try jw.write(value);
+        }
+        try jw.objectField("extractor");
+        try jw.write(self.extractor);
+        try jw.endObject();
+    }
+};
+
+/// Conditions a source must meet. Every condition given must match.
+pub const DocumentExtractionRouteMatch = struct {
+    /// Exact content type.
+    content_type: ?[]const u8 = null,
+    /// Content type prefix, such as `image/`.
+    content_type_prefix: ?[]const u8 = null,
+    /// Filename extension or list of extensions.
+    extension: ?std.json.Value = null,
+    /// Leading bytes or list of leading-byte prefixes.
+    magic_prefix: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content_type", "content_type", true },
+        .{ "content_type_prefix", "content_type_prefix", true },
+        .{ "extension", "extension", true },
+        .{ "magic_prefix", "magic_prefix", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.content_type_prefix) |value| {
+            try jw.objectField("content_type_prefix");
+            try jw.write(value);
+        }
+        if (self.extension) |value| {
+            try jw.objectField("extension");
+            try jw.write(value);
+        }
+        if (self.magic_prefix) |value| {
+            try jw.objectField("magic_prefix");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Names of row fields that carry source metadata. Each overrides the matching static field.
+pub const DocumentExtractionSourceConfig = struct {
+    /// Row field holding the source filename.
+    filename_field: ?[]const u8 = null,
+    /// Row field holding the source content type.
+    content_type_field: ?[]const u8 = null,
+    /// Row field holding the source ETag.
+    etag_field: ?[]const u8 = null,
+    /// Row field holding the source checksum.
+    checksum_field: ?[]const u8 = null,
+    /// Row field holding the source version.
+    version_field: ?[]const u8 = null,
+    /// Row field holding the source last-modified timestamp.
+    last_modified_field: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "filename_field", "filename_field", true },
+        .{ "content_type_field", "content_type_field", true },
+        .{ "etag_field", "etag_field", true },
+        .{ "checksum_field", "checksum_field", true },
+        .{ "version_field", "version_field", true },
+        .{ "last_modified_field", "last_modified_field", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.filename_field) |value| {
+            try jw.objectField("filename_field");
+            try jw.write(value);
+        }
+        if (self.content_type_field) |value| {
+            try jw.objectField("content_type_field");
+            try jw.write(value);
+        }
+        if (self.etag_field) |value| {
+            try jw.objectField("etag_field");
+            try jw.write(value);
+        }
+        if (self.checksum_field) |value| {
+            try jw.objectField("checksum_field");
+            try jw.write(value);
+        }
+        if (self.version_field) |value| {
+            try jw.objectField("version_field");
+            try jw.write(value);
+        }
+        if (self.last_modified_field) |value| {
+            try jw.objectField("last_modified_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Transcribes audio units.
+pub const DocumentExtractionTranscriptionConfig = struct {
+    transcriber: STTConfig,
 };
 
 /// Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
@@ -31330,7 +32060,7 @@ pub const InferenceReadRequest = struct {
     documents: ?[]const DocumentSource = null,
     /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
     images: ?[]const InferenceImageURL = null,
-    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
+    /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
     prompt: ?[]const u8 = null,
     /// Maximum tokens to generate
     max_tokens: ?i64 = null,
@@ -40912,6 +41642,48 @@ pub const OpenAIReasoningEffort = enum {
             .{ "max", .max },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for OpenAI STT (Whisper) provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. **Model:** whisper-1 **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB) **Docs:** https://platform.openai.com/docs/guides/speech-to-text
+pub const OpenAISTTConfig = struct {
+    /// Whisper model to use.
+    model: ?[]const u8 = null,
+    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
+    base_url: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "api_key", "api_key", true },
+        .{ "base_url", "base_url", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -51905,6 +52677,131 @@ pub const SSEToolMode = struct {
     }
 };
 
+/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
+pub const STTConfig = struct {
+    provider: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned full native endpoint override.
+    base_url: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    voice: ?[]const u8 = null,
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Enable automatic punctuation.
+    enable_automatic_punctuation: ?bool = null,
+    /// Use enhanced models for better accuracy (costs more).
+    use_enhanced: ?bool = null,
+    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    timestamps: ?bool = null,
+    /// Explicitly permit preparing and installing the selected Speech assets.
+    download_assets: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", true },
+        .{ "api_key", "api_key", true },
+        .{ "base_url", "base_url", true },
+        .{ "language_code", "language_code", true },
+        .{ "voice", "voice", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
+        .{ "use_enhanced", "use_enhanced", true },
+        .{ "api_url", "api_url", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "download_assets", "download_assets", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.enable_automatic_punctuation) |value| {
+            try jw.objectField("enable_automatic_punctuation");
+            try jw.write(value);
+        }
+        if (self.use_enhanced) |value| {
+            try jw.objectField("use_enhanced");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.download_assets) |value| {
+            try jw.objectField("download_assets");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// The STT provider to use.
 pub const STTProvider = enum {
     cloudflare,
@@ -58011,6 +58908,76 @@ pub const VertexRerankerConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Configuration for Google Cloud Speech-to-Text provider (Vertex AI). Uses Application Default Credentials (ADC) for authentication. **Features:** Streaming, speaker diarization, automatic punctuation **Docs:** https://cloud.google.com/speech-to-text/docs
+pub const VertexSTTConfig = struct {
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Default language code (e.g., 'en-US', 'es-ES').
+    language_code: ?[]const u8 = null,
+    /// Enable automatic punctuation.
+    enable_automatic_punctuation: ?bool = null,
+    /// Use enhanced models for better accuracy (costs more).
+    use_enhanced: ?bool = null,
+    /// Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation').
+    model: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "language_code", "language_code", true },
+        .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
+        .{ "use_enhanced", "use_enhanced", true },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.enable_automatic_punctuation) |value| {
+            try jw.objectField("enable_automatic_punctuation");
+            try jw.write(value);
+        }
+        if (self.use_enhanced) |value| {
+            try jw.objectField("use_enhanced");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
             try jw.write(value);
         }
         try jw.endObject();

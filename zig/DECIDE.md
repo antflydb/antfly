@@ -3,7 +3,7 @@
 Standalone inference decisions use `POST /decisions` and `/ai/v1/decisions`
 on the standalone server. The authoritative schemas live in
 [`specs/openapi/ai/decision.yaml`](../specs/openapi/ai/decision.yaml), and
-[`docs/guides/decisions.md`](../docs/guides/decisions.md) documents requests,
+[`docs/reference/decisions.md`](../docs/reference/decisions.md) documents requests,
 responses, provider configuration and examples.
 
 The public contract uses `input`, named question and answer arrays,
@@ -63,6 +63,12 @@ again for every answer. Public limits are 128 inputs, 64 questions, 2–64 choic
 or levels, 1 MiB per input and 16 MiB per request; model and executor limits can
 narrow these ceilings. Executor admission counts inputs separately from their
 expanded questions.
+
+GLiNER Decide-1B admits one input per wire request. Decision enrichment
+`batch_size` controls concurrent one-document requests; it does not combine
+documents into a multi-input Decide request. The default batch size is
+supported. Request sizes include the complete schema/question prompt, and
+requests exceeding a qualified bound fail instead of truncating.
 
 ## SQL, providers and bindings
 

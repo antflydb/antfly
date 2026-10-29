@@ -1,0 +1,40 @@
+---
+title: Anthropic
+description: Claude models as Antfly generators
+---
+
+The `anthropic` provider calls the Anthropic Messages API for generation.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Generator | Text, images | Streaming, function tools, and structured output |
+
+Images can be JPEG, PNG, GIF, or WebP, in user messages only. Other media is
+rejected before the request is sent.
+
+## Credentials
+
+`api_key`, defaulting to `ANTHROPIC_API_KEY`. The endpoint defaults to
+`https://api.anthropic.com/v1`.
+
+## Example
+
+```json
+{
+  "generators": {
+    "claude": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5-5",
+      "api_key": "${secret:anthropic.api_key}",
+      "max_tokens": 1024
+    }
+  }
+}
+```
+
+## Related
+
+- [Named inference gateway](https://github.com/antflydb/antfly/blob/main/docs/reference/inference-gateway.md#direct-anthropic-generation): direct Anthropic generation details
+- [Provider rate limits](/docs/guides/providers/rate-limits)

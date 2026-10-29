@@ -1,0 +1,4 @@
+/antfly-docs-knowledge-base
+*.aflite
+*.aflite.lock
+*.afb

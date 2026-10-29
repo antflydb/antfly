@@ -232,7 +232,7 @@ const TablesListPage: React.FC = () => {
       <div className="relative isolate">
         <DashboardPageHeader>
           <div>
-            <DashboardPageTitle className="font-aeonik">Tables</DashboardPageTitle>
+            <DashboardPageTitle>Tables</DashboardPageTitle>
             <DashboardPageDescription>
               Browse tables, inspect index coverage, and manage table lifecycle.
             </DashboardPageDescription>

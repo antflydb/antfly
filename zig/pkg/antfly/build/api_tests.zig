@@ -1990,6 +1990,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-restore-provisioning-test", "Run private hidden owner reservation and writer-cache admission").dependOn(&restore_provisioning_tests.run(b).step);
+    const enrichment_provisioning_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-enrichment-provisioning-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{ "provisioning detects", "provisioning does not require" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("antfly-api-enrichment-provisioning-test", "Run asset-producer provisioning detection for enrichment configs").dependOn(&enrichment_provisioning_tests.run(b).step);
     const hosted_batch_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-hosted-batch-tests",
         .root_module = api_table_writes_docid_test_mod,

@@ -889,7 +889,7 @@ test "capi lite AddIndexJSON registers a graph config's nested resolvers" {
     // JSON (metadata_table_provisioner.ensureResolvers); a native Lite
     // handle admits one index at a time, so registerLiteIndexResolvers
     // harvests the graph config's own "resolvers" array — the shape
-    // examples/dogfood's knowledgeGraphIndexJSON declares. Re-adding the
+    // examples/antfly-docs-knowledge-base's knowledgeGraphIndexJSON declares. Re-adding the
     // same index must be idempotent (upsertResolver observes an unchanged
     // config), matching the enrichment path's contract.
     var test_tmp = try TestDirectory.init("capi");
@@ -7919,4 +7919,52 @@ test "storage owner remote content source refreshes policy and retains in-flight
     const recovered = try remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config);
     defer alloc.free(recovered);
     try std.testing.expect(std.mem.indexOf(u8, recovered, "image/png") != null);
+}
+
+test "storage owner remote content source preserves scoped GCS connections and snapshot lifetime" {
+    const Source = struct {
+        config: *@import("antfly_local_sources").common_config.Config,
+        fn acquire(raw: *anyopaque, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = @import("antfly_local_sources").common_config.remoteContentSnapshotJsonAlloc(std.testing.allocator, &self.config.remote_content.?) catch return .out_of_memory;
+            out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+            return .ok;
+        }
+        fn release(_: *anyopaque, bytes: kernel_owner_abi.OwnedBytes) callconv(.c) void {
+            std.testing.allocator.free(bytes.slice());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var config = try @import("antfly_local_sources").common_config.Config.parseFromSlice(alloc,
+        \\{"connections":{"archive":{"kind":"external_io","capabilities":["content.fetch"],"external_io":{"protocol":"gcs","buckets":["originals"],"prefix":"objects/sha256","credentials":{"source":"bearer_token","bearer_token":"${secret:missing-gcs-reader}"}}}}}
+    );
+    defer config.deinit();
+    var source = Source{ .config = &config };
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &context));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
+    const callbacks = server_api.kernel_runtime_services.RemoteContentSource{ .version = 2, .context = &source, .acquire = Source.acquire, .release = Source.release };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks));
+    const owner = asStorageOwnerContext(context).?;
+    owner.acquire();
+    defer owner.release();
+    const facade = owner.remoteContent().?;
+    var before = try facade.acquire();
+    defer before.deinit();
+    const connection = before.config.gcs_connections.get("archive").?;
+    try std.testing.expectEqualStrings("originals", connection.buckets[0]);
+    try std.testing.expectEqualStrings("objects/sha256", connection.prefix.?);
+    try std.testing.expectEqualStrings("${secret:missing-gcs-reader}", connection.credentials.bearer_token.?);
+    const remote = @import("antfly_local_sources").template_remote;
+    const render_config = remote.RenderConfig{ .remote_content = facade, .io = std.testing.io };
+    // Scope rejection must precede resolution of the deliberately missing secret.
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/elsewhere/doc.pdf?generation=123", "archive"));
+    // An authorized locator reaches credential resolution through the owner facade.
+    try std.testing.expectError(error.SecretNotFound, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/objects/sha256/doc.pdf?generation=123", "archive"));
+    config.remote_content.?.gcs_connections.clearRetainingCapacity();
+    var after = try facade.acquire();
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after.config.gcs_connections.count());
+    try std.testing.expectEqualStrings("objects/sha256", before.config.gcs_connections.get("archive").?.prefix.?);
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/objects/sha256/doc.pdf?generation=123", "archive"));
 }
