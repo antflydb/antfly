@@ -3425,3 +3425,8 @@ surviving implementations, and validation of the active decoder paths.
 [The AY register](unified-execution-ay-outcomes.md) records fresh CUDA
 correctness/host/stream/graph measurements, their shared-GPU tail limitations,
 and a concrete plan for model-independent implementations with tuned variants.
+
+AZ continues the device-family migration with shared row/statistics programs,
+BF16 projection consumers and chronological-attention schedules. See
+[AZ outcomes](unified-execution-az-outcomes.md) for net owner accounting, original
+instruction comparisons, device/model qualification and retained timing misses.

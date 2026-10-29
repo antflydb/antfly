@@ -42,13 +42,24 @@ def main():
     headers = [
         "__device__ __forceinline__ unsigned short termite_f32_to_bf16(",
         'extern "C" __global__ void termite_f32_to_bf16(',
+        "template<bool Add>\n__device__ __forceinline__ void termite_layer_norm_impl(",
         'extern "C" __global__ void termite_layer_norm_f32(',
         'extern "C" __global__ void termite_add_bias_rows_f32(',
         'extern "C" __global__ void termite_elementwise_f32(',
+        "static __device__ __forceinline__ float termite_qwen3vl_rotate(",
         'extern "C" __global__ void termite_qwen3vl_vision_rope_f32(',
     ]
     functions = "\n\n".join(extract(reference, header) for header in headers)
-    args.output.write_text(args.prototype.read_text() + "\n\n" + functions + "\n")
+    # Keep relocation into the owned qualification directory independent of
+    # prototype-relative includes. ABI and row owners are emitted verbatim;
+    # the unfused native reference wrapper keeps its real template dependency.
+    kernel_dir = args.reference.parent.parent / "kernels"
+    abi = (kernel_dir / "kernel_abi.cuh").read_text()
+    row_program = (kernel_dir / "row_program.cuh").read_text()
+    prototype = args.prototype.read_text().replace(
+        '#include "../kernels/row_program.cuh"', row_program
+    )
+    args.output.write_text(abi + "\n" + prototype + "\n\n" + functions + "\n")
 
 
 if __name__ == "__main__":

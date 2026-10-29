@@ -396,6 +396,31 @@ pub fn build(b: *std.Build) void {
         host_ffn_check_step.dependOn(&b.addFail("Metal host FFN checks require a macOS host and target.").step);
     }
 
+    const row_families_step = b.step("test-metal-row-families", "Qualify native row, audio and rotary families against independent references");
+    if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos) {
+        const rows = b.addExecutable(.{ .name = "metal-row-families-check", .max_rss = 2 * 1024 * 1024 * 1024, .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+        }) });
+        addMacosSdkPaths(b, rows.root_module, b.graph.host);
+        rows.root_module.linkFramework("Foundation", .{});
+        rows.root_module.linkFramework("Metal", .{});
+        rows.root_module.linkFramework("MetalPerformanceShaders", .{});
+        rows.root_module.linkFramework("Accelerate", .{});
+        var flags = std.ArrayListUnmanaged([]const u8).empty;
+        flags.append(b.allocator, "-fobjc-arc") catch @panic("OOM");
+        if (b.option([]const u8, "metal-row-baseline", "Frozen shader factory header for native row qualification")) |path|
+            flags.append(b.allocator, b.fmt("-DANTFLY_METAL_ROW_BASELINE_HEADER=\"{s}\"", .{path})) catch @panic("OOM");
+        rows.root_module.addCSourceFile(.{ .file = b.path("scripts/check_metal_row_families.m"), .flags = flags.items });
+        const run_rows = b.addRunArtifact(rows);
+        run_rows.has_side_effects = true;
+        run_rows.addPassthruArgs();
+        row_families_step.dependOn(&run_rows.step);
+    } else {
+        row_families_step.dependOn(&b.addFail("Metal row family checks require a macOS host and target.").step);
+    }
+
     const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
     quant_kernel_metal_runtime_check_step.dependOn(host_ffn_check_step);
     if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos) {

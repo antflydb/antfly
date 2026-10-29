@@ -1,9 +1,13 @@
 # Model kernel families: share implementations, retain tuned specializations
 
-Audited source: `4e90c8f8f6`. This is a proposed next campaign, not an implemented
-kernel migration or a measured source reduction. AY's Glowworm qualification is
-recorded separately. The immediate priority is actual device implementation
-ownership after the large host-bridge retirements.
+Implementation status: [AZ outcomes](unified-execution-az-outcomes.md) records
+shared CUDA row/statistics and chronological-attention owners, BF16 packed
+products, Metal audio/channel rows and head statistics, plus device and model
+qualification. Unique rotary/audio/geometry policies remain specialized; existing
+CPU/vector and vision-attention sharing earns no new source-reduction credit.
+
+The following contracts were planned from `4e90c8f8f6`. AY's earlier Glowworm
+projection qualification is separate from the AZ device-family migration.
 
 The recommendation is to move model names out of kernel implementation policy.
 A model profile selects operation semantics, a proven shape range and a tuned
@@ -19,7 +23,7 @@ semantics, with a compatible fallback for other inputs. Model identity can stay
 in the model profile where it selects an arithmetic contract; it need not be
 repeated in the implementation body.
 
-## Proposed cohort order
+## Family contracts and cohort order
 
 | Cohort | Concrete source anchors | Share | Preserve as specialization policy |
 | --- | --- | --- | --- |

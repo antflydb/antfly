@@ -2207,6 +2207,7 @@ test "standalone CUDA attention includes reconstruct complete runtime templates"
         .{ flash_prefill_f16_sm89_template, "cuda_gqa_flash_prefill_f16_sm89.cuh" },
         .{ splitk_online_decode_sm89_template, "cuda_gqa_decode_splitk_online_sm89.cuh" },
         .{ attention_split_source, "cuda_gqa_split_decode_f32.cuh" },
+        .{ attention_score_prework_source, "cuda_gqa_score_prework_f32.cuh" },
     };
     inline for (templates) |entry| {
         const full = "// geometry prefix\n" ++ entry[0] ++ "// ABI wrappers\n";
@@ -2790,6 +2791,7 @@ fn renderAttentionBody(
     include_common: bool,
 ) !void {
     if (plan.lowering.reduction == .parallel_scores_then_serial) {
+        if (include_common) try out.appendSlice(allocator, attention_score_prework_source);
         return renderAttentionScorePreworkBody(allocator, out, plan);
     }
     if (include_common) try out.appendSlice(allocator, attention_split_source);
@@ -2807,8 +2809,13 @@ fn renderAttentionBody(
 }
 
 const attention_split_source = @embedFile("templates/cuda_gqa_split_decode_f32.cuh");
+const attention_score_prework_source = @embedFile("templates/cuda_gqa_score_prework_f32.cuh");
 pub fn attentionSplitCommonSource() []const u8 {
     return attention_split_source;
+}
+
+pub fn attentionScorePreworkCommonSource() []const u8 {
+    return attention_score_prework_source;
 }
 
 fn renderAttentionSerialBody(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), plan: AttentionRenderPlan) !void {
@@ -2832,368 +2839,30 @@ fn renderAttentionScorePreworkBody(
     plan: AttentionRenderPlan,
 ) !void {
     if (plan.lowering.reduction != .parallel_scores_then_serial) return error.InvalidCudaAttentionLowering;
-    const head_dim = plan.lowering.head_dim;
-    const threads = plan.launch.threads_per_block;
-    const warps = threads / 32;
-
-    try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{plan.kernel_id});
-    try out.appendSlice(allocator,
-        \\    float* scores,
-        \\    const float* q,
-        \\    const unsigned char* k,
-        \\    const unsigned int* block_table,
-        \\    unsigned int batch,
-        \\    unsigned int q_seq_len,
-        \\    unsigned int kv_seq_len,
-        \\    unsigned int num_heads,
-        \\    unsigned int num_kv_heads,
-        \\    unsigned int head_dim,
-        \\    unsigned int query_position_offset,
-        \\    unsigned int kv_position_offset,
-        \\    unsigned int sliding_window,
-        \\    unsigned int total_sequence_len,
-        \\    unsigned int key_row_bytes,
-        \\    unsigned int base_key_row_bytes,
-        \\    unsigned int block_count,
-        \\    unsigned int page_size_tokens,
-        \\    unsigned int format,
-        \\    unsigned int physical_token_capacity,
-        \\    unsigned int score_capacity,
-        \\    unsigned int chunk_size,
-        \\    unsigned int chunk_count,
-        \\    const unsigned int* decode_scalars
-        \\) {
-        \\    if (decode_scalars != 0) {
-        \\        kv_position_offset = decode_scalars[4];
-        \\        query_position_offset = decode_scalars[1];
-        \\        kv_seq_len = decode_scalars[2];
-        \\        total_sequence_len = decode_scalars[3];
-        \\    }
-        \\
-    );
-    try appendFmt(
-        allocator,
-        out,
-        "    if (batch != 1u || q_seq_len != 1u || head_dim != {d}u || blockDim.x != {d}u ||\n" ++
-            "        score_capacity == 0u || score_capacity > {d}u || chunk_size == 0u ||\n" ++
-            "        chunk_count != {d}u || key_row_bytes == 0u || base_key_row_bytes != key_row_bytes ||\n" ++
-            "        (format != 0u && format != 2u) || num_kv_heads == 0u || num_heads == 0u ||\n" ++
-            "        (num_heads % num_kv_heads) != 0u || (num_heads / num_kv_heads) > {d}u ||\n" ++
-            "        num_heads > {d}u) return;\n" ++
-            "    const unsigned int block = blockIdx.x;\n" ++
-            "    const unsigned int head = block / chunk_count;\n" ++
-            "    const unsigned int chunk = block - head * chunk_count;\n" ++
-            "    if (head >= num_heads) return;\n",
-        .{ head_dim, threads, generated_attention_score_prework_max_kv_tokens, generated_attention_score_prework_chunks, plan.lowering.query_heads_per_kv_head, generated_attention_workspace_max_query_heads },
-    );
-    try appendFmt(
-        allocator,
-        out,
-        "    __shared__ float warp_sums[{d}];\n" ++
-            "    const unsigned int lane = threadIdx.x;\n" ++
-            "    const unsigned int query_pos = query_position_offset;\n" ++
-            "    unsigned int key_start = 0u;\n" ++
-            "    unsigned int key_end = 0u;\n" ++
-            "    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {{\n" ++
-            "        const unsigned int visible = query_pos - kv_position_offset + 1u;\n" ++
-            "        key_end = visible < kv_seq_len ? visible : kv_seq_len;\n" ++
-            "        if (sliding_window != 0u) {{\n" ++
-            "            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;\n" ++
-            "            if (window_start_abs > kv_position_offset) {{\n" ++
-            "                key_start = window_start_abs - kv_position_offset;\n" ++
-            "                if (key_start > key_end) key_start = key_end;\n" ++
-            "            }}\n" ++
-            "        }}\n" ++
-            "    }}\n" ++
-            "    const unsigned int visible_count = key_end - key_start;\n" ++
-            "    if (visible_count > score_capacity) return;\n" ++
-            "    unsigned int chunk_begin = key_start + chunk * chunk_size;\n" ++
-            "    unsigned int chunk_end = chunk_begin + chunk_size;\n" ++
-            "    if (chunk_end > key_end) chunk_end = key_end;\n" ++
-            "    if (chunk_begin >= chunk_end) return;\n" ++
-            "    const unsigned int heads_per_group = num_heads / num_kv_heads;\n" ++
-            "    const unsigned int kv_head = head / heads_per_group;\n" ++
-            "    const unsigned int q_base = head * head_dim;\n" ++
-            "    const float scale_input = (float)head_dim;\n" ++
-            "    float scale;\n" ++
-            "    asm volatile (\"rsqrt.approx.f32 %0, %1;\" : \"=f\"(scale) : \"f\"(scale_input));\n" ++
-            "    for (unsigned int ki = chunk_begin; ki < chunk_end; ++ki) {{\n" ++
-            "        const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
-            "        const bool valid = physical_token != 0xffffffffu;\n" ++
-            "        const unsigned char* k_row = valid ? k + (size_t)physical_token * key_row_bytes : k;\n" ++
-            "        float partial = 0.0f;\n" ++
-            "        if (valid && lane < head_dim) {{\n" ++
-            "            const unsigned int value_index = kv_head * head_dim + lane;\n" ++
-            "            const float key_value = format == 0u\n" ++
-            "                ? termite_tq_decode_polar4_at(k_row, value_index)\n" ++
-            "                : termite_tq_f16_value(k_row, value_index);\n" ++
-            "            partial = q[q_base + lane] * key_value;\n" ++
-            "        }}\n" ++
-            "        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);\n" ++
-            "        if (lane == 0u && valid) scores[(size_t)head * score_capacity + (ki - key_start)] = dot * scale;\n" ++
-            "    }}\n" ++
-            "    (void)total_sequence_len;\n" ++
-            "}}\n",
-        .{warps},
-    );
-
-    try out.appendSlice(allocator, "\n\n");
-    try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{plan.reduction_kernel_id});
-    try out.appendSlice(allocator,
-        \\    float* dst,
-        \\    const float* scores,
-        \\    const unsigned char* v,
-        \\    const unsigned int* block_table,
-        \\    unsigned int batch,
-        \\    unsigned int q_seq_len,
-        \\    unsigned int kv_seq_len,
-        \\    unsigned int num_heads,
-        \\    unsigned int num_kv_heads,
-        \\    unsigned int head_dim,
-        \\    unsigned int query_position_offset,
-        \\    unsigned int kv_position_offset,
-        \\    unsigned int sliding_window,
-        \\    unsigned int total_sequence_len,
-        \\    unsigned int value_row_bytes,
-        \\    unsigned int block_count,
-        \\    unsigned int page_size_tokens,
-        \\    unsigned int value_format,
-        \\    unsigned int physical_token_capacity,
-        \\    unsigned int score_capacity,
-        \\    const unsigned int* decode_scalars
-        \\) {
-        \\    if (decode_scalars != 0) {
-        \\        kv_position_offset = decode_scalars[4];
-        \\        query_position_offset = decode_scalars[1];
-        \\        kv_seq_len = decode_scalars[2];
-        \\        total_sequence_len = decode_scalars[3];
-        \\    }
-        \\
-    );
-    try appendFmt(
-        allocator,
-        out,
-        "    const unsigned int head = blockIdx.x;\n" ++
-            "    if (batch != 1u || q_seq_len != 1u || head >= num_heads ||\n" ++
-            "        head_dim != {d}u || blockDim.x != {d}u || value_row_bytes == 0u ||\n" ++
-            "        (value_format != 0u && value_format != 2u) || score_capacity == 0u || score_capacity > {d}u || num_kv_heads == 0u ||\n" ++
-            "        num_heads == 0u || (num_heads % num_kv_heads) != 0u ||\n" ++
-            "        (num_heads / num_kv_heads) > {d}u || num_heads > {d}u) return;\n" ++
-            "    __shared__ float shared_max_score;\n" ++
-            "    __shared__ float shared_denom;\n" ++
-            "    __shared__ float shared_alpha[{d}];\n" ++
-            "    __shared__ float shared_beta[{d}];\n" ++
-            "    const unsigned int lane = threadIdx.x;\n" ++
-            "    const unsigned int query_pos = query_position_offset;\n" ++
-            "    unsigned int key_start = 0u;\n" ++
-            "    unsigned int key_end = 0u;\n" ++
-            "    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {{\n" ++
-            "        const unsigned int visible = query_pos - kv_position_offset + 1u;\n" ++
-            "        key_end = visible < kv_seq_len ? visible : kv_seq_len;\n" ++
-            "        if (sliding_window != 0u) {{\n" ++
-            "            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;\n" ++
-            "            if (window_start_abs > kv_position_offset) {{\n" ++
-            "                key_start = window_start_abs - kv_position_offset;\n" ++
-            "                if (key_start > key_end) key_start = key_end;\n" ++
-            "            }}\n" ++
-            "        }}\n" ++
-            "    }}\n" ++
-            "    if (key_start > key_end) key_start = key_end;\n" ++
-            "    if (key_end - key_start > score_capacity) return;\n" ++
-            "    const unsigned int heads_per_group = num_heads / num_kv_heads;\n" ++
-            "    const unsigned int kv_head = head / heads_per_group;\n" ++
-            "    if (lane == 0u) {{\n" ++
-            "        shared_max_score = -3.402823466e+38f;\n" ++
-            "        shared_denom = 0.0f;\n" ++
-            "        for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
-            "            const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
-            "            const bool valid = physical_token != 0xffffffffu;\n" ++
-            "            const unsigned int recurrence_index = ki - key_start;\n" ++
-            "            if (valid) {{\n" ++
-            "                const float score = scores[(size_t)head * score_capacity + (ki - key_start)];\n" ++
-            "                const float next_max = fmaxf(shared_max_score, score);\n" ++
-            "                shared_alpha[recurrence_index] = expf(shared_max_score - next_max);\n" ++
-            "                shared_beta[recurrence_index] = expf(score - next_max);\n" ++
-            "                shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];\n" ++
-            "                shared_max_score = next_max;\n" ++
-            "            }} else {{\n" ++
-            "                shared_alpha[recurrence_index] = 1.0f;\n" ++
-            "                shared_beta[recurrence_index] = 0.0f;\n" ++
-            "            }}\n" ++
-            "        }}\n" ++
-            "    }}\n" ++
-            "    __syncthreads();\n" ++
-            "    float acc = 0.0f;\n" ++
-            "    if (lane < head_dim) {{\n" ++
-            "        for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
-            "            const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
-            "            const bool valid = physical_token != 0xffffffffu;\n" ++
-            "            const unsigned int recurrence_index = ki - key_start;\n" ++
-            "            acc *= shared_alpha[recurrence_index];\n" ++
-            "            if (valid) {{\n" ++
-            "                const unsigned char* v_row = v + (size_t)physical_token * value_row_bytes;\n" ++
-            "                const unsigned int value_index = kv_head * head_dim + lane;\n" ++
-            "                const float value = value_format == 0u\n" ++
-            "                    ? reinterpret_cast<const float*>(v_row)[value_index]\n" ++
-            "                    : termite_tq_f16_value(v_row, value_index);\n" ++
-            "                acc += shared_beta[recurrence_index] * value;\n" ++
-            "            }}\n" ++
-            "        }}\n" ++
-            "    }}\n" ++
-            "    if (lane < head_dim) dst[head * head_dim + lane] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;\n" ++
-            "    (void)total_sequence_len;\n" ++
-            "}}\n",
-        .{
-            head_dim,
-            threads,
-            generated_attention_score_prework_max_kv_tokens,
-            plan.lowering.query_heads_per_kv_head,
-            generated_attention_workspace_max_query_heads,
-            generated_attention_score_prework_max_kv_tokens,
-            generated_attention_score_prework_max_kv_tokens,
-        },
-    );
-
-    try renderAttentionScorePreworkTiled64Consumer(allocator, out, plan);
-}
-
-/// Emits the default-off output-dimension tiled consumer. Every CTA repeats
-/// the lane-zero chronological coefficient recurrence in exactly the same
-/// operation order as the serial consumer above, then replays those
-/// coefficients for one disjoint 64-value output tile. There is no inter-CTA
-/// reduction, extra workspace, or third launch.
-fn renderAttentionScorePreworkTiled64Consumer(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    plan: AttentionRenderPlan,
-) !void {
-    const kernel_id = plan.tiled64_kernel_id orelse return error.InvalidCudaAttentionLowering;
-    const launch = plan.tiled64_launch orelse return error.InvalidCudaAttentionLowering;
-    const head_dim = plan.lowering.head_dim;
-    const max_kv_tokens = generatedAttentionScorePreworkTiled64MaxKvTokens(head_dim) orelse
+    const tiled_kernel = plan.tiled64_kernel_id orelse return error.InvalidCudaAttentionLowering;
+    const tiled_launch = plan.tiled64_launch orelse return error.InvalidCudaAttentionLowering;
+    const tiled_capacity = generatedAttentionScorePreworkTiled64MaxKvTokens(plan.lowering.head_dim) orelse
         return error.InvalidCudaAttentionLowering;
-
-    try out.appendSlice(allocator, "\n\n");
-    try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{kernel_id});
-    try out.appendSlice(allocator,
-        \\    float* dst,
-        \\    const float* scores,
-        \\    const unsigned char* v,
-        \\    const unsigned int* block_table,
-        \\    unsigned int batch,
-        \\    unsigned int q_seq_len,
-        \\    unsigned int kv_seq_len,
-        \\    unsigned int num_heads,
-        \\    unsigned int num_kv_heads,
-        \\    unsigned int head_dim,
-        \\    unsigned int query_position_offset,
-        \\    unsigned int kv_position_offset,
-        \\    unsigned int sliding_window,
-        \\    unsigned int total_sequence_len,
-        \\    unsigned int value_row_bytes,
-        \\    unsigned int block_count,
-        \\    unsigned int page_size_tokens,
-        \\    unsigned int value_format,
-        \\    unsigned int physical_token_capacity,
-        \\    unsigned int score_capacity,
-        \\    const unsigned int* decode_scalars
-        \\) {
-        \\    if (decode_scalars != 0) {
-        \\        kv_position_offset = decode_scalars[4];
-        \\        query_position_offset = decode_scalars[1];
-        \\        kv_seq_len = decode_scalars[2];
-        \\        total_sequence_len = decode_scalars[3];
-        \\    }
+    try appendFmt(allocator, out,
+        \\extern "C" __global__ void {s}(ANTFLY_GQA_SCORE_PARAMS) {{
+        \\    antfly_gqa_score_prework<{d}u, {d}u, {d}u, {d}u, {d}u, {d}u>(ANTFLY_GQA_SCORE_ARGS);
+        \\}}
+        \\extern "C" __global__ void {s}(ANTFLY_GQA_SCORE_CONSUMER_PARAMS) {{
+        \\    antfly_gqa_score_consumer<{d}u, {d}u, {d}u, {d}u, {d}u, false>(ANTFLY_GQA_SCORE_CONSUMER_ARGS);
+        \\}}
+        \\extern "C" __global__ void {s}(ANTFLY_GQA_SCORE_CONSUMER_PARAMS) {{
+        \\    antfly_gqa_score_consumer<{d}u, {d}u, {d}u, {d}u, {d}u, true>(ANTFLY_GQA_SCORE_CONSUMER_ARGS);
+        \\}}
         \\
-    );
-    try appendFmt(
-        allocator,
-        out,
-        "    const unsigned int head = blockIdx.x;\n" ++
-            "    const unsigned int output_tile = blockIdx.y;\n" ++
-            "    if (batch != 1u || q_seq_len != 1u || head >= num_heads ||\n" ++
-            "        head_dim != {d}u || blockDim.x != {d}u || output_tile >= head_dim / {d}u ||\n" ++
-            "        value_row_bytes == 0u || (value_format != 0u && value_format != 2u) ||\n" ++
-            "        score_capacity == 0u || score_capacity > {d}u || num_kv_heads == 0u ||\n" ++
-            "        num_heads == 0u || (num_heads % num_kv_heads) != 0u ||\n" ++
-            "        (num_heads / num_kv_heads) > {d}u || num_heads > {d}u) return;\n" ++
-            "    __shared__ float shared_max_score;\n" ++
-            "    __shared__ float shared_denom;\n" ++
-            "    __shared__ float shared_alpha[{d}];\n" ++
-            "    __shared__ float shared_beta[{d}];\n" ++
-            "    const unsigned int tile_lane = threadIdx.x;\n" ++
-            "    const unsigned int lane = output_tile * {d}u + tile_lane;\n" ++
-            "    const unsigned int query_pos = query_position_offset;\n" ++
-            "    unsigned int key_start = 0u;\n" ++
-            "    unsigned int key_end = 0u;\n" ++
-            "    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {{\n" ++
-            "        const unsigned int visible = query_pos - kv_position_offset + 1u;\n" ++
-            "        key_end = visible < kv_seq_len ? visible : kv_seq_len;\n" ++
-            "        if (sliding_window != 0u) {{\n" ++
-            "            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;\n" ++
-            "            if (window_start_abs > kv_position_offset) {{\n" ++
-            "                key_start = window_start_abs - kv_position_offset;\n" ++
-            "                if (key_start > key_end) key_start = key_end;\n" ++
-            "            }}\n" ++
-            "        }}\n" ++
-            "    }}\n" ++
-            "    if (key_start > key_end) key_start = key_end;\n" ++
-            "    if (key_end - key_start > score_capacity) return;\n" ++
-            "    const unsigned int heads_per_group = num_heads / num_kv_heads;\n" ++
-            "    const unsigned int kv_head = head / heads_per_group;\n" ++
-            "    if (tile_lane == 0u) {{\n" ++
-            "        shared_max_score = -3.402823466e+38f;\n" ++
-            "        shared_denom = 0.0f;\n" ++
-            "        for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
-            "            const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
-            "            const bool valid = physical_token != 0xffffffffu;\n" ++
-            "            const unsigned int recurrence_index = ki - key_start;\n" ++
-            "            if (valid) {{\n" ++
-            "                const float score = scores[(size_t)head * score_capacity + (ki - key_start)];\n" ++
-            "                const float next_max = fmaxf(shared_max_score, score);\n" ++
-            "                shared_alpha[recurrence_index] = expf(shared_max_score - next_max);\n" ++
-            "                shared_beta[recurrence_index] = expf(score - next_max);\n" ++
-            "                shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];\n" ++
-            "                shared_max_score = next_max;\n" ++
-            "            }} else {{\n" ++
-            "                shared_alpha[recurrence_index] = 1.0f;\n" ++
-            "                shared_beta[recurrence_index] = 0.0f;\n" ++
-            "            }}\n" ++
-            "        }}\n" ++
-            "    }}\n" ++
-            "    __syncthreads();\n" ++
-            "    float acc = 0.0f;\n" ++
-            "    if (lane < head_dim) {{\n" ++
-            "        for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
-            "            const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
-            "            const bool valid = physical_token != 0xffffffffu;\n" ++
-            "            const unsigned int recurrence_index = ki - key_start;\n" ++
-            "            acc *= shared_alpha[recurrence_index];\n" ++
-            "            if (valid) {{\n" ++
-            "                const unsigned char* v_row = v + (size_t)physical_token * value_row_bytes;\n" ++
-            "                const unsigned int value_index = kv_head * head_dim + lane;\n" ++
-            "                const float value = value_format == 0u\n" ++
-            "                    ? reinterpret_cast<const float*>(v_row)[value_index]\n" ++
-            "                    : termite_tq_f16_value(v_row, value_index);\n" ++
-            "                acc += shared_beta[recurrence_index] * value;\n" ++
-            "            }}\n" ++
-            "        }}\n" ++
-            "    }}\n" ++
-            "    if (lane < head_dim) dst[head * head_dim + lane] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;\n" ++
-            "    (void)total_sequence_len;\n" ++
-            "}}\n",
-        .{
-            head_dim,
-            launch.threads_per_block,
-            generated_attention_score_prework_tiled64_tile_size,
-            max_kv_tokens,
-            plan.lowering.query_heads_per_kv_head,
-            generated_attention_workspace_max_query_heads,
-            max_kv_tokens,
-            max_kv_tokens,
-            generated_attention_score_prework_tiled64_tile_size,
-        },
-    );
+    , .{
+        plan.kernel_id,                                  plan.lowering.head_dim,                        plan.launch.threads_per_block,
+        plan.lowering.query_heads_per_kv_head,           generated_attention_workspace_max_query_heads, generated_attention_score_prework_chunks,
+        generated_attention_score_prework_max_kv_tokens, plan.reduction_kernel_id,                      plan.lowering.head_dim,
+        plan.reduction_launch.threads_per_block,         plan.lowering.query_heads_per_kv_head,         generated_attention_workspace_max_query_heads,
+        generated_attention_score_prework_max_kv_tokens, tiled_kernel,                                  plan.lowering.head_dim,
+        tiled_launch.threads_per_block,                  plan.lowering.query_heads_per_kv_head,         generated_attention_workspace_max_query_heads,
+        tiled_capacity,
+    });
 }
 
 const body_q4_k_small_batch_bias_gelu = SourceFragment{
@@ -4511,17 +4180,17 @@ test "cuda renderer emits paged score prework with chronological softmax" {
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_tq_f16_value(v_row, value_index)"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 2, "(ki - key_start)"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "visible_count > score_capacity"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "chunk_count != 128u"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "chunk_count != Chunks"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (unsigned int ki = chunk_begin; ki < chunk_end; ++ki)"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (unsigned int ki = key_start; ki < key_end; ++ki)"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__shared__ float shared_alpha[4096];"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__shared__ float shared_beta[4096];"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__shared__ float shared_alpha[MaxScores];"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__shared__ float shared_beta[MaxScores];"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "acc *= shared_alpha[recurrence_index];"));
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];"));
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "acc *= shared_alpha[recurrence_index];"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "acc *= shared_alpha[recurrence_index];"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const unsigned int output_tile = blockIdx.y;"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const unsigned int lane = output_tile * 64u + tile_lane;"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const unsigned int lane = Tiled ? output_tile * 64u + tile_lane : tile_lane;"));
         try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "shared_alpha = "));
         try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "partial_max"));
         try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "partial_denom"));
@@ -4790,6 +4459,7 @@ const native_source_owners = [_]@import("kernel_source_owner.zig").NativeOwner{
     .{ .source = flash_prefill_f16_sm89_template, .include_path = "../../../graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh" },
     .{ .source = splitk_online_decode_sm89_template, .include_path = "../../../graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh" },
     .{ .source = attention_split_source, .include_path = "../../../graph/templates/cuda_gqa_split_decode_f32.cuh" },
+    .{ .source = attention_score_prework_source, .include_path = "../../../graph/templates/cuda_gqa_score_prework_f32.cuh" },
     .{ .source = q4_q8_projection_native.source, .include_path = "../../../graph/templates/cuda_q4_q8_projection.cuh" },
 };
 

@@ -74,43 +74,21 @@ extern "C" __global__ void termite_embedding_gemma2_norm_residual_bf16(
     if (row >= rows) return;
     const size_t base = (size_t)row * width;
     __shared__ float warp_sum[8], inv;
-    float sum = 0.0f;
-    for (unsigned d = threadIdx.x; d < width; d += blockDim.x) {
-        float x = __bfloat162float(branch[base + d]); sum += x * x;
-    }
-    sum = eg2_warp_sum(sum);
-    if ((threadIdx.x & 31u) == 0) warp_sum[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float x = threadIdx.x < (blockDim.x >> 5) ? warp_sum[threadIdx.x] : 0.0f;
-        x = eg2_warp_sum(x);
-        if (threadIdx.x == 0) inv = rsqrtf(x / (float)width + eps);
-    }
-    __syncthreads();
-    for (unsigned d = threadIdx.x; d < width; d += blockDim.x) {
-        const float x = __bfloat162float(branch[base + d]);
-        const __nv_bfloat16 norm = __float2bfloat16_rn(x * inv * __bfloat162float(post_weight[d]));
-        __nv_bfloat16 residual = __float2bfloat16_rn(__bfloat162float(hidden[base + d]) + __bfloat162float(norm));
-        if (scalar) residual = __float2bfloat16_rn(__bfloat162float(residual) * __bfloat162float(scalar[0]));
-        hidden[base + d] = residual;
-    }
+    antfly_row_rms(width, eps, warp_sum, inv,
+        [&](unsigned d) { return __bfloat162float(branch[base+d]); },
+        [&](unsigned d, float x, float inverse) {
+            const __nv_bfloat16 norm = __float2bfloat16_rn(x * inverse * __bfloat162float(post_weight[d]));
+            __nv_bfloat16 residual = __float2bfloat16_rn(__bfloat162float(hidden[base+d]) + __bfloat162float(norm));
+            if (scalar) residual = __float2bfloat16_rn(__bfloat162float(residual) * __bfloat162float(scalar[0]));
+            hidden[base+d] = residual;
+        });
     if (!next_weight) return;
     __syncthreads();
-    sum = 0.0f;
-    for (unsigned d = threadIdx.x; d < width; d += blockDim.x) {
-        float x = __bfloat162float(hidden[base + d]); sum += x * x;
-    }
-    sum = eg2_warp_sum(sum);
-    if ((threadIdx.x & 31u) == 0) warp_sum[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float x = threadIdx.x < (blockDim.x >> 5) ? warp_sum[threadIdx.x] : 0.0f;
-        x = eg2_warp_sum(x);
-        if (threadIdx.x == 0) inv = rsqrtf(x / (float)width + eps);
-    }
-    __syncthreads();
-    for (unsigned d = threadIdx.x; d < width; d += blockDim.x)
-        next[base + d] = __float2bfloat16_rn(__bfloat162float(hidden[base + d]) * inv * __bfloat162float(next_weight[d]));
+    antfly_row_rms(width, eps, warp_sum, inv,
+        [&](unsigned d) { return __bfloat162float(hidden[base+d]); },
+        [&](unsigned d, float x, float inverse) {
+            next[base+d] = __float2bfloat16_rn(x * inverse * __bfloat162float(next_weight[d]));
+        });
 }
 
 extern "C" __global__ void termite_embedding_gemma2_scale_rms_bf16(
@@ -121,24 +99,11 @@ extern "C" __global__ void termite_embedding_gemma2_scale_rms_bf16(
     const size_t base = (size_t)row * width;
     const size_t input_base = (size_t)row * input_stride;
     __shared__ float warp_sum[8], inv;
-    float sum = 0.0f;
-    for (unsigned d = threadIdx.x; d < width; d += blockDim.x) {
-        float x = __bfloat162float(__float2bfloat16_rn(__bfloat162float(input[input_base + d]) * scale));
-        sum += x * x;
-    }
-    sum = eg2_warp_sum(sum);
-    if ((threadIdx.x & 31u) == 0) warp_sum[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float x = threadIdx.x < (blockDim.x >> 5) ? warp_sum[threadIdx.x] : 0.0f;
-        x = eg2_warp_sum(x);
-        if (threadIdx.x == 0) inv = rsqrtf(x / (float)width + eps);
-    }
-    __syncthreads();
-    for (unsigned d = threadIdx.x; d < width; d += blockDim.x) {
-        float x = __bfloat162float(__float2bfloat16_rn(__bfloat162float(input[input_base + d]) * scale));
-        out[base + d] = __float2bfloat16_rn(x * inv * __bfloat162float(weight[d]));
-    }
+    antfly_row_rms(width, eps, warp_sum, inv,
+        [&](unsigned d) { return __bfloat162float(__float2bfloat16_rn(__bfloat162float(input[input_base+d]) * scale)); },
+        [&](unsigned d, float x, float inverse) {
+            out[base+d] = __float2bfloat16_rn(x * inverse * __bfloat162float(weight[d]));
+        });
 }
 
 extern "C" __global__ void termite_embedding_gemma2_audio_segment_conv_f32(
@@ -175,17 +140,11 @@ extern "C" __global__ void termite_embedding_gemma2_packed_heads_bf16(
     __nv_bfloat16* dst = (kind == 0u ? q : kind == 1u ? k : v) + ((size_t)row * heads + head) * dim;
     __shared__ float sums[8], inv;
     __shared__ __nv_bfloat16 normalized[512];
-    float sum = 0.0f;
-    for (unsigned d = tid; d < dim; d += blockDim.x) { float x = __bfloat162float(input[base+d]); sum += x*x; }
-    sum = eg2_warp_sum(sum);
-    if ((tid & 31u) == 0) sums[tid >> 5u] = sum;
-    __syncthreads();
-    if (tid < 32u) {
-        float x = tid < 8u ? sums[tid] : 0.0f; x = eg2_warp_sum(x);
-        if (tid == 0u) inv = rsqrtf(x / (float)dim + eps);
-    }
-    __syncthreads();
-    for (unsigned d = tid; d < dim; d += blockDim.x) normalized[d] = __float2bfloat16_rn(__bfloat162float(input[base+d]) * inv * (weight ? __bfloat162float(weight[d]) : 1.0f));
+    antfly_row_rms<8>(dim, eps, sums, inv,
+        [&](unsigned d) { return __bfloat162float(input[base+d]); },
+        [&](unsigned d, float x, float inverse) {
+            normalized[d] = __float2bfloat16_rn(x * inverse * (weight ? __bfloat162float(weight[d]) : 1.0f));
+        });
     __syncthreads();
     bool rotate = kind != 2u && (vision || !mask || mask[row] != 0);
     for (unsigned d = tid; d < dim; d += blockDim.x) {
@@ -214,10 +173,7 @@ extern "C" __global__ void termite_embedding_gemma2_packed_gelu_bf16(
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * width) return;
     size_t base = (i / width) * width * 2u + i % width;
-    float x = __bfloat162float(input[base]);
-    float g = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    g = __bfloat162float(__float2bfloat16_rn(g));
-    out[i] = __float2bfloat16_rn(g * __bfloat162float(input[base+width]));
+    out[i] = antfly_bf16_gelu_product(input+base, input+base+width);
 }
 
 // Direct geometry indexing avoids repeated gather tables and temporary sums.

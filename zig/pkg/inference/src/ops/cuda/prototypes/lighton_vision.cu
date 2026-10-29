@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include <math.h>
+#include "../kernels/row_program.cuh"
 
 __device__ __forceinline__ unsigned short lighton_bf16_rne(float value) {
     const unsigned bits = __float_as_uint(value);
@@ -24,27 +25,13 @@ extern "C" __global__ void lighton_vision_norm_bf16(
     unsigned rows, unsigned dim, float eps) {
     const unsigned row = blockIdx.x;
     if (row >= rows) return;
-    const unsigned base = row * dim, tid = threadIdx.x;
+    const unsigned base = row * dim;
     __shared__ float sums[256], squares[256];
-    float sum = 0.f, square = 0.f;
-    for (unsigned i = tid; i < dim; i += 256) {
-        const float x = input[base + i];
-        sum += x;
-        square += x * x;
-    }
-    sums[tid] = sum; squares[tid] = square;
-    __syncthreads();
-    for (unsigned stride = 128; stride; stride >>= 1) {
-        if (tid < stride) { sums[tid] += sums[tid + stride]; squares[tid] += squares[tid + stride]; }
-        __syncthreads();
-    }
-    const float mean = sums[0] / (float)dim;
-    const float variance = fmaxf(squares[0] / (float)dim - mean * mean, 0.f);
-    const float inverse = rsqrtf(variance + eps);
-    for (unsigned i = tid; i < dim; i += 256) {
-        const float value = (input[base + i] - mean) * inverse * gamma[i] + beta[i];
-        out[base + i] = lighton_bf16_rne(value);
-    }
+    antfly_row_layer_norm<256>(dim, eps, sums, squares,
+        [&](unsigned i) { return input[base + i]; },
+        [&](unsigned i, float x, float mean, float inverse) {
+            out[base + i] = lighton_bf16_rne((x - mean) * inverse * gamma[i] + beta[i]);
+        });
 }
 extern "C" __global__ void lighton_vision_bias_gelu_bf16(
     unsigned short* out, const float* input, const float* bias,

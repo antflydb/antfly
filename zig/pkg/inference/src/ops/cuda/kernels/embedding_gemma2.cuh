@@ -3,44 +3,11 @@
 #pragma once
 
 #include "embedding_gemma2_training_rope.cuh"
+#include "row_program.cuh"
 
 // EmbeddingGemma 2's encoder deliberately has its own kernels.  Decoder
 // attention is causal and applies a sqrt(head_dim) scale; neither property is
 // valid here.  Values are BF16 in memory and all reductions remain FP32.
-
-__device__ __forceinline__ float eg2_warp_sum(float x) {
-    for (int d = 16; d; d >>= 1) x += __shfl_down_sync(0xffffffffu, x, d);
-    return x;
-}
-
-__device__ __forceinline__ float eg2_warp_max(float x) {
-    for (int d = 16; d; d >>= 1) x = fmaxf(x, __shfl_down_sync(0xffffffffu, x, d));
-    return x;
-}
-
-// Exact warp-then-block statistics; planes preserve interleaving and barriers.
-// Four-lane training reductions remain separate qualified arithmetic policies.
-template<bool Maximum, unsigned Planes, typename Finish>
-__device__ __forceinline__ void antfly_warp_block_statistics(
-    float (&values)[Planes], float* const (&partials)[Planes], Finish finish, float neutral = 0.0f) {
-    #pragma unroll
-    for (unsigned p = 0; p < Planes; ++p)
-        values[p] = Maximum ? eg2_warp_max(values[p]) : eg2_warp_sum(values[p]);
-    if ((threadIdx.x & 31u) == 0) {
-        #pragma unroll
-        for (unsigned p = 0; p < Planes; ++p) partials[p][threadIdx.x >> 5] = values[p];
-    }
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        #pragma unroll
-        for (unsigned p = 0; p < Planes; ++p)
-            values[p] = threadIdx.x < (blockDim.x >> 5) ? partials[p][threadIdx.x] : neutral;
-        #pragma unroll
-        for (unsigned p = 0; p < Planes; ++p)
-            values[p] = Maximum ? eg2_warp_max(values[p]) : eg2_warp_sum(values[p]);
-        if (threadIdx.x == 0) finish(values);
-    }
-}
 
 // Pillow's RGB8 bicubic resize materializes quantized horizontal pixels.
 // The CPU supplies its exact integer coefficient plan; both passes retain
@@ -140,7 +107,7 @@ extern "C" __global__ void termite_gemma4_audio_local_attention_f32(
             float qs = q[qb + d] * q_scales[d];
             score += qs * (k[kb + d] * k_scale + rel[rb + d]);
         }
-        score = eg2_warp_sum(score);
+        score = antfly_row_warp_sum(score);
         score = __shfl_sync(0xffffffffu, score, 0);
         score = tanhf(score / logit_cap) * logit_cap;
         scores[c] = score;
@@ -185,19 +152,13 @@ extern "C" __global__ void termite_embedding_gemma2_rms_norm_bf16(
     unsigned int rows, unsigned int width, float eps) {
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
-    float sum = 0.0f;
-    for (unsigned int i = threadIdx.x; i < width; i += blockDim.x) {
-        float x = __bfloat162float(input[(size_t)row * width + i]); sum += x * x;
-    }
+    const size_t base = (size_t)row * width;
     __shared__ float warp_sum[8], inv;
-    float statistics[] = {sum}; float* const planes[] = {warp_sum};
-    antfly_warp_block_statistics<false>(statistics, planes, [&](const float* totals) { inv = rsqrtf(totals[0] / (float)width + eps); });
-    __syncthreads();
-    for (unsigned int i = threadIdx.x; i < width; i += blockDim.x) {
-        float x = __bfloat162float(input[(size_t)row * width + i]);
-        // EmbeddingGemma 2 uses direct RMS weights (no implicit +1).
-        out[(size_t)row * width + i] = __float2bfloat16_rn(x * inv * (weight ? __bfloat162float(weight[i]) : 1.0f));
-    }
+    antfly_row_rms(width, eps, warp_sum, inv,
+        [&](unsigned i) { return __bfloat162float(input[base+i]); },
+        [&](unsigned i, float x, float inverse) {
+            out[base+i] = __float2bfloat16_rn(x * inverse * (weight ? __bfloat162float(weight[i]) : 1.0f));
+        });
 }
 
 // Training-only RMSNorm matching ATen's vectorized contiguous row reduction:
@@ -432,7 +393,7 @@ extern "C" __global__ void termite_embedding_gemma2_attention_bf16(
         float dot = 0.0f;
         for (unsigned int d = lane; d < dim; d += 32u)
             dot += __bfloat162float(q[qb + d]) * __bfloat162float(k[kb + d]);
-        dot = eg2_warp_sum(dot);
+        dot = antfly_row_warp_sum(dot);
         dot = __shfl_sync(0xffffffffu, dot, 0);
         float next_max = fmaxf(max_score, dot);
         float prior_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
@@ -674,13 +635,16 @@ extern "C" __global__ void termite_embedding_gemma2_matmul_bf16(
 
 // PLE and FFN products share the same rounded GELU forward boundary.
 // The analytic VJP below retains its distinct polynomial evaluation order.
+__device__ __forceinline__ __nv_bfloat16 antfly_bf16_gelu_product(const __nv_bfloat16* gate, const __nv_bfloat16* right) {
+    float x = __bfloat162float(*gate);
+    float g = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    g = __bfloat162float(__float2bfloat16_rn(g));
+    return __float2bfloat16_rn(g * __bfloat162float(*right));
+}
 #define ANTFLY_BF16_GELU_PRODUCT(Kernel) \
 extern "C" __global__ void Kernel(__nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* right, unsigned int count) { \
     unsigned int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=count)return; \
-    float x=__bfloat162float(gate[i]); \
-    float g=0.5f*x*(1.0f+tanhf(0.7978845608028654f*(x+0.044715f*x*x*x))); \
-    g=__bfloat162float(__float2bfloat16_rn(g)); \
-    out[i]=__float2bfloat16_rn(g*__bfloat162float(right[i])); \
+    out[i]=antfly_bf16_gelu_product(gate+i,right+i); \
 }
 ANTFLY_BF16_GELU_PRODUCT(termite_embedding_gemma2_gelu_ple_bf16)
 ANTFLY_BF16_GELU_PRODUCT(termite_embedding_gemma2_gelu_mul_bf16)
@@ -892,7 +856,7 @@ extern "C" __global__ void termite_embedding_gemma2_training_softmax_f32(
     }
     // A single warp owns the row, including multiple keys per lane. The
     // saved FP32 probabilities must retain the reference reduction order.
-    local_max = eg2_warp_max(local_max);
+    local_max = antfly_row_warp_max(local_max);
     float maximum = __shfl_sync(0xffffffffu, local_max, 0), local_sum = 0.0f;
     for (unsigned int key = threadIdx.x; key < sequence; key += blockDim.x) {
         unsigned int distance = query > key ? query - key : key - query;
@@ -902,7 +866,7 @@ extern "C" __global__ void termite_embedding_gemma2_training_softmax_f32(
         probabilities[base + key] = value;
         local_sum = __fadd_rn(local_sum, value);
     }
-    local_sum = eg2_warp_sum(local_sum);
+    local_sum = antfly_row_warp_sum(local_sum);
     float sum = __shfl_sync(0xffffffffu, local_sum, 0);
     for (unsigned int key = threadIdx.x; key < sequence; key += blockDim.x)
         probabilities[base + key] = sum > 0.0f ? __fdiv_rn(probabilities[base + key], sum) : 0.0f;
@@ -919,7 +883,7 @@ extern "C" __global__ void termite_embedding_gemma2_training_softmax_vjp_f32(
     // Preserve that FP32 boundary even when a lane owns multiple keys.
     for (unsigned int key = threadIdx.x; key < sequence; key += blockDim.x)
         dot = __fadd_rn(dot, __fmul_rn(dprobabilities[base + key], probabilities[base + key]));
-    dot = eg2_warp_sum(dot);
+    dot = antfly_row_warp_sum(dot);
     float sum = __shfl_sync(0xffffffffu, dot, 0);
     for (unsigned int key = threadIdx.x; key < sequence; key += blockDim.x) {
         float probability = probabilities[base + key];
@@ -1072,7 +1036,7 @@ __device__ __forceinline__ float eg2_training_reduce_four(
         __syncthreads();
     }
     if (lane < 32) {
-        value = eg2_warp_sum(value);
+        value = antfly_row_warp_sum(value);
         if (lane == 0) partials[0] = value;
     }
     __syncthreads();

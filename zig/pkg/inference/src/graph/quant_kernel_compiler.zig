@@ -5169,6 +5169,7 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, cuda_renderer.attentionSplitCommonSource());
+    try out.appendSlice(allocator, cuda_renderer.attentionScorePreworkCommonSource());
     var emitted: usize = 0;
     var flash_common_emitted = false;
     var splitk_common_emitted = false;
@@ -13275,7 +13276,7 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     defer std.testing.allocator.free(test_filter_contents);
 
     const macos_gate = std.mem.indexOf(u8, contents, "if (target.result.os.tag == .macos) {\n        const quant_kernel_metal_artifact_check = b.addRunArtifact(quant_kernel_codegen_exe);") orelse return error.MissingMetalBuildMacosGate;
-    const non_macos_fail_closed = std.mem.indexOf(u8, contents, "} else {\n        const quant_kernel_metal_unavailable = b.addFail(metal_unavailable_message);\n        quant_kernel_metal_unavailable_step = &quant_kernel_metal_unavailable.step;\n        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);\n    }\n\n    const quant_kernel_metal_runtime_check_step") orelse return error.MissingMetalBuildNonMacosFailClosed;
+    const non_macos_fail_closed = std.mem.indexOf(u8, contents, "} else {\n        const quant_kernel_metal_unavailable = b.addFail(metal_unavailable_message);\n        quant_kernel_metal_unavailable_step = &quant_kernel_metal_unavailable.step;\n        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);\n    }") orelse return error.MissingMetalBuildNonMacosFailClosed;
     try std.testing.expect(macos_gate < non_macos_fail_closed);
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "return build_test_filters.select("));
     try std.testing.expect(std.mem.containsAtLeast(u8, test_filter_contents, 1, "else if (std.mem.startsWith(u8, arg, \"-\")) {"));
