@@ -2041,7 +2041,7 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
     unicode_body = "unicodecase " + unicode_payload + " needle"
     regular_body = "running " * 32768
     diverse_body = " ".join(f"broad{i:05d}" for i in range(8192)) + " "
-    clustered_body = "needle " + "needle quark " * 16384
+    clustered_body = "clustercase needle " + "needle quark " * 16384
     rows = pa.table(
         {
             "id": list(range(count + 6)),
@@ -2247,9 +2247,14 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                         (
                             count + 5,
                             {
-                                "disjuncts": [
-                                    {"match": "needle", "field": "body"},
-                                    {"match": "quark", "field": "body"},
+                                "conjuncts": [
+                                    {"match": "clustercase", "field": "body"},
+                                    {
+                                        "disjuncts": [
+                                            {"match": "needle", "field": "body"},
+                                            {"match": "quark", "field": "body"},
+                                        ]
+                                    },
                                 ]
                             },
                             clustered_body,
@@ -2258,7 +2263,6 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                     ):
                         request = {
                             "full_text_search": pattern,
-                            "filter_query": {"term": {"path": "/id", "value": row_id}},
                             "highlight": {
                                 "fields": ["body"],
                                 "max_fragments": 3,
