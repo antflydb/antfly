@@ -1,7 +1,9 @@
 @import "tailwindcss";
 @import "tw-animate-css";
-@import "@antfly/design-system/styles.css";
+@import "@antfly/design-system/tokens";
 @import "@antfly/design-system/theme";
+@import "@antfly/design-system/charts.css";
+@import "@antfly/design-system/base.css";
 @import "@antfly/design-system/dashboard.css";
 @import "@xyflow/react/dist/style.css";
 @import "@antfly/graph/styles.css";

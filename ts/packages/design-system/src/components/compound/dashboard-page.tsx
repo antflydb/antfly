@@ -28,7 +28,10 @@ function DashboardPageTitle({ className, ...props }: React.ComponentProps<"h1">)
   return (
     <h1
       data-slot="dashboard-page-title"
-      className={cn("font-sans text-2xl font-semibold tracking-[-0.015em] text-foreground", className)}
+      className={cn(
+        "font-sans text-2xl font-semibold tracking-[-0.015em] text-foreground",
+        className
+      )}
       {...props}
     />
   );

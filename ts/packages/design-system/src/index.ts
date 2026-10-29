@@ -19,6 +19,7 @@ export * from "./components/compound/dashboard-page";
 export * from "./components/compound/data-table";
 export * from "./components/compound/empty-state";
 export * from "./components/compound/file-upload";
+export * from "./components/compound/highlighted-code-block";
 export * from "./components/compound/layout";
 export * from "./components/compound/multi-select";
 export * from "./components/compound/page-header";

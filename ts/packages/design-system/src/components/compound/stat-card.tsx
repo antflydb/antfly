@@ -29,9 +29,7 @@ export function StatCard({
     <Card className={cn("overflow-hidden", className)} {...props}>
       <CardContent className="flex items-start justify-between gap-4">
         <div className="space-y-1">
-          <p className="font-sans text-[13px] text-muted-foreground">
-            {label}
-          </p>
+          <p className="font-sans text-[13px] text-muted-foreground">{label}</p>
           <p className="font-display text-3xl tracking-tight text-foreground">{value}</p>
           {delta ? <p className={cn("text-xs font-medium", toneClasses[tone])}>{delta}</p> : null}
         </div>

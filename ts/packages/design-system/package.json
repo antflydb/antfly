@@ -44,6 +44,10 @@
       "style": "./dist/theme.css",
       "default": "./dist/theme.css"
     },
+    "./base.css": {
+      "style": "./dist/base.css",
+      "default": "./dist/base.css"
+    },
     "./dashboard.css": {
       "style": "./dist/dashboard.css",
       "default": "./dist/dashboard.css"
@@ -89,7 +93,7 @@
     "build:components": "vite build",
     "build:fonts": "mkdir -p dist/fonts && cp -R src/fonts/aeonik dist/fonts/",
     "build:styles": "tailwindcss -i ./src/styles.css -o ./dist/index.css",
-    "build:css-assets": "mkdir -p dist/tokens/fonts && cp -R src/tokens/* dist/tokens/ && cp -R src/fonts/aeonik dist/tokens/fonts/ && cp src/theme.css dist/theme.css && cp src/charts.css dist/charts.css && cp src/dashboard.css dist/dashboard.css",
+    "build:css-assets": "mkdir -p dist/tokens/fonts && cp -R src/tokens/* dist/tokens/ && cp -R src/fonts/aeonik dist/tokens/fonts/ && cp src/theme.css dist/theme.css && cp src/base.css dist/base.css && cp src/charts.css dist/charts.css && cp src/dashboard.css dist/dashboard.css",
     "typecheck": "tsc --noEmit",
     "dev": "pnpm run build:styles --watch",
     "clean": "rm -rf dist",
