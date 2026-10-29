@@ -888,8 +888,8 @@ pub const Storage = struct {
         try control.checkpoint();
         const out = try allocator.alloc(u8, len);
         errdefer allocator.free(out);
-        if (self.vtable.read_file_range_into_with_admission) |read| {
-            try read(self.ptr, path, offset, out, control);
+        if (self.vtable.read_file_range_into_with_admission != null) {
+            try self.readFileRangeIntoWithAdmission(path, offset, out, control);
         } else try self.readFileRangeInto(allocator, path, offset, out);
         try control.checkpoint();
         return out;
@@ -1379,6 +1379,7 @@ pub const IoStorage = struct {
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
         .read_file_range_into = readFileRangeInto,
+        .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
         .read_file_range_at_most_into = readFileRangeAtMostInto,
         .file_size = fileSize,
         .read_file_trailer_alloc = readFileTrailerAlloc,
@@ -1415,6 +1416,38 @@ pub const IoStorage = struct {
 
     fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
         try readFileRangeWithIoInto(context(ptr).receiver.io(), path, offset, out);
+    }
+
+    fn readFileRangeIntoWithAdmission(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+        try control.checkpoint();
+        _ = std.math.add(u64, offset, out.len) catch return error.InvalidArgument;
+        const io = context(ptr).receiver.io();
+        // Only file open/read/close borrow the original wait boundary. The
+        // descriptor is closed before CPU reentry, including rejected returns.
+        // Retained service scopes have no lending boundary and keep their CPU.
+        if (try control.executionWait()) |boundary| {
+            try boundary.run(readControlledRange, .{ io, path, offset, out, control });
+        } else try readControlledRange(io, path, offset, out, control);
+        try control.checkpoint();
+    }
+
+    fn readControlledRange(io: std.Io, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+        try control.checkLifetime();
+        const file = if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.openFileAbsolute(io, path, .{})
+        else
+            try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        var reader = file.reader(io, &.{});
+        try reader.seekTo(offset);
+        var position: usize = 0;
+        while (position < out.len) {
+            try control.checkLifetime();
+            const end = @min(out.len, position + 64 * 1024);
+            try reader.interface.readSliceAll(out[position..end]);
+            position = end;
+        }
+        try control.checkLifetime();
     }
 
     fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
@@ -8604,4 +8637,107 @@ test "controlled physical sync control replacement fences cached inodes with adm
     try std.testing.expectEqualStrings("new", &fresh);
     try readAllAtOffset(pinned.fd, &fresh, 0);
     try std.testing.expectEqualStrings("old", &fresh);
+}
+
+test "retained physical wait borrowed IO ranges preserve original rejection and close before reentry" {
+    const Mode = enum { normal, cancel_before, cancel_read, reject_resume, missing, truncated };
+    const Probe = struct {
+        mode: Mode,
+        opened: bool = false,
+        opens: usize = 0,
+        closes: usize = 0,
+        reads: usize = 0,
+        parks: usize = 0,
+        resumes: usize = 0,
+        failure: ?anyerror = null,
+        fn source(raw: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw.?));
+        }
+        fn open(raw: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            const self = source(raw);
+            self.opens += 1;
+            if (self.mode == .missing) return error.FileNotFound;
+            self.opened = true;
+            return std.mem.zeroes(std.Io.File);
+        }
+        fn close(raw: ?*anyopaque, files: []const std.Io.File) void {
+            const self = source(raw);
+            self.closes += files.len;
+            self.opened = false;
+        }
+        fn read(raw: ?*anyopaque, _: std.Io.File, buffers: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self = source(raw);
+            self.reads += 1;
+            if (self.mode == .truncated and self.reads > 1) return 0;
+            var size: usize = 0;
+            for (buffers) |buffer| {
+                for (buffer, 0..) |*byte, index| byte.* = @intCast((offset + size + index) % 251);
+                size += buffer.len;
+            }
+            if (self.mode == .cancel_read) self.failure = error.TestBorrowedRangeOriginalRejection;
+            return size;
+        }
+        fn check(raw: *anyopaque) !void {
+            const self = source(raw);
+            if (self.failure) |cause| return cause;
+        }
+        fn park(raw: *anyopaque) !void {
+            const self = source(raw);
+            self.parks += 1;
+            try check(raw);
+        }
+        fn returnCpu(raw: *anyopaque) !void {
+            const self = source(raw);
+            self.resumes += 1;
+            try std.testing.expect(!self.opened);
+            if (self.mode == .reject_resume) return error.DeadlineExceeded;
+        }
+    };
+    const Foreign = struct {
+        var calls: usize = 0;
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            calls += 1;
+            return Storage.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+    };
+    for ([_]bool{ false, true }) |allocated| for ([_]bool{ false, true }) |lend| for (std.enums.values(Mode)) |mode| {
+        if (!lend and mode == .reject_resume) continue;
+        var probe: Probe = .{ .mode = mode, .failure = if (mode == .cancel_before) error.Canceled else null };
+        var vtable = std.Io.failing.vtable.*;
+        vtable.dirOpenFile = Probe.open;
+        vtable.fileClose = Probe.close;
+        vtable.fileReadPositional = Probe.read;
+        var backing = IoStorage.init(.{ .userdata = &probe, .vtable = &vtable });
+        var storage = backing.storage();
+        storage.boundary_dispatch = Foreign.dispatch;
+        try std.testing.expect(!storage.supportsHostPathGenerationPublication());
+        const payload: read_admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = Probe.check, .check_lifetime = Probe.check }, .execution_wait = if (lend) .{ .ptr = &probe, .begin = Probe.park, .end = Probe.returnCpu } else null };
+        var bytes: [70 * 1024]u8 = undefined;
+        Foreign.calls = 0;
+        const result: anyerror!void = if (allocated) blk: {
+            const loaded = storage.readFileRangeAllocWithAdmission(std.testing.allocator, "immutable-run", 17, bytes.len, .init(&payload));
+            if (loaded) |value| {
+                defer std.testing.allocator.free(value);
+                @memcpy(&bytes, value);
+                break :blk {};
+            } else |cause| break :blk cause;
+        } else storage.readFileRangeIntoWithAdmission("immutable-run", 17, &bytes, .init(&payload));
+        if (mode == .normal) {
+            try result;
+            for (bytes, 0..) |byte, index| try std.testing.expectEqual(@as(u8, @intCast((17 + index) % 251)), byte);
+            try std.testing.expect(probe.reads >= 2);
+        } else try std.testing.expectError(switch (mode) {
+            .cancel_before => error.Canceled,
+            .cancel_read => error.TestBorrowedRangeOriginalRejection,
+            .reject_resume => error.DeadlineExceeded,
+            .missing => error.FileNotFound,
+            .truncated => error.EndOfStream,
+            .normal => unreachable,
+        }, result);
+        try std.testing.expectEqual(@as(usize, if (mode == .cancel_before) 0 else 1), Foreign.calls);
+        try std.testing.expect(!probe.opened);
+        try std.testing.expectEqual(@as(usize, if (mode == .cancel_before or mode == .missing) 0 else 1), probe.closes);
+        try std.testing.expectEqual(@as(usize, if (lend and mode != .cancel_before) 1 else 0), probe.parks);
+        try std.testing.expectEqual(probe.parks, probe.resumes);
+    };
 }

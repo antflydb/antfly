@@ -6795,7 +6795,7 @@ pub const DB = struct {
 
     pub fn lsmMaintenanceScoreWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
         const original = lifetime orelse return self.lsmMaintenanceScore();
-        if (comptime storage_engine.enabled) return error.ExecutionWaitUnsupported;
+        if (comptime storage_engine.enabled) return storage_engine.call("lsmMaintenanceScoreWithLifetime", .{ self, lifetime });
         try self.core.apply_mutex.lockSharedControlledIo(
             self.core.apply_mutex.io orelse self.backend_runtime.filesystemIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo,
             .{ .lifetime = @import("../../common/seed_snapshot_lifetime.zig").authority(original) },
@@ -7162,12 +7162,7 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
-        if (comptime storage_engine.enabled) {
-            // This API belongs to the physical native owner. The old engine
-            // vtable cannot borrow a restriction; never silently discard one.
-            if (lifetime != null) return error.ExecutionWaitUnsupported;
-            return self.runLsmMaintenanceStep();
-        }
+        if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStepWithLifetime", .{ self, lifetime });
         try @import("../../common/seed_snapshot_lifetime.zig").checkpoint(lifetime);
         var replication_mutation = try self.acquireLsmMaintenanceReplicationMutation(lifetime);
         defer if (replication_mutation) |*lease| lease.release();
@@ -7217,12 +7212,7 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
-        if (comptime storage_engine.enabled) {
-            // This API belongs to the physical native owner. The old engine
-            // vtable cannot borrow a restriction; never silently discard one.
-            if (lifetime != null) return error.ExecutionWaitUnsupported;
-            return self.runLsmMaintenanceStepBestEffort();
-        }
+        if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStepBestEffortWithLifetime", .{ self, lifetime });
         const original = @import("../../common/seed_snapshot_lifetime.zig");
         try original.checkpoint(lifetime);
         var replication_mutation = try self.acquireLsmMaintenanceReplicationMutation(lifetime);

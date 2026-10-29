@@ -48,6 +48,9 @@ pub const PortableExportOptions = struct {
 };
 
 pub const VTable = struct {
+    runLsmMaintenanceStepBestEffortWithLifetime: *const fn (*DB, ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) Outcome(bool),
+    runLsmMaintenanceStepWithLifetime: *const fn (*DB, ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) Outcome(bool),
+    lsmMaintenanceScoreWithLifetime: *const fn (*DB, ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) Outcome(u64),
     portableExportToWriterWithOptions: *const fn (Allocator, *@import("docstore.zig").DocStore, WriterBorrow, PortableExportOptions) Outcome(void),
     openVerifiedRestoreSource: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace) Outcome(DB),
     restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, cancellation: types.CancellationToken) Outcome(void),
@@ -556,7 +559,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 29,
+    version: u32 = 30,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -628,7 +631,7 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
-extern fn antfly_storage_engine_get_descriptor_v29() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v30() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
@@ -656,11 +659,11 @@ test "logical query engine allocator normalization preserves custom quotas" {
 }
 
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v29();
+    const descriptor = antfly_storage_engine_get_descriptor_v30();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v29" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v30" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Args = std.meta.ArgsTuple(Function);
@@ -695,10 +698,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v29();
+    return antfly_storage_engine_get_descriptor_v30();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 29 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 30 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

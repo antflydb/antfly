@@ -2145,14 +2145,14 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v29", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v30", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v29", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v30", .visibility = .hidden });
     @export(&getCAllocator, .{ .name = "antfly_storage_engine_c_allocator_v1", .visibility = .hidden });
 }
 
@@ -2224,4 +2224,16 @@ fn resolutionStopWithAdmission(self: *@import("db/resolution_runtime.zig").Resol
 
 fn promotionStopWithAdmission(self: *@import("db/promotion_runtime.zig").PromotionRuntime, original: @import("../common/read_admission.zig").Port) engine.Outcome(void) {
     return .{ .value = self.stopWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
+}
+
+fn lsmMaintenanceScoreWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) engine.Outcome(u64) {
+    return .{ .value = self.lsmMaintenanceScoreWithLifetime(lifetime) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runLsmMaintenanceStepWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) engine.Outcome(bool) {
+    return .{ .value = self.runLsmMaintenanceStepWithLifetime(lifetime) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runLsmMaintenanceStepBestEffortWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) engine.Outcome(bool) {
+    return .{ .value = self.runLsmMaintenanceStepBestEffortWithLifetime(lifetime) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

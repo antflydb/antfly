@@ -1267,6 +1267,50 @@ test "opaque hidden restore prepares without mutation and reopens exact canceled
     try std.testing.expectError(error.RestoreStagingScopeChanged, client.Owner.open(options));
 }
 
+test "compiled maintenance lifetime reaches physical inspection and both step policies" {
+    const runtime = @import("antfly_runtime_abi");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 7001, .identity_range_id = 7001, .schema_json = .fromSlice("{}") });
+    defer owner.deinit();
+    var inserted = try owner.batchJson("docs", "{\"inserts\":{\"a\":{\"n\":1}},\"sync_level\":\"write\"}");
+    inserted.deinit();
+    const Check = struct {
+        calls: usize = 0,
+        cause: ?anyerror = null,
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            // Client and storage-kernel preflight consume the first two checks.
+            // Fail only after the physical engine receives the original borrow.
+            if (self.calls >= 3) if (self.cause) |cause| return runtime.error_abi.statusFromError(cause);
+            return .ok;
+        }
+    };
+    for ([_]abi.MaintenanceAction{ .inspect, .lsm_step, .lsm_step_best_effort }) |action| {
+        var check: Check = .{};
+        const lifetime: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+        _ = try owner.maintenanceWithLifetime("docs", action, &lifetime);
+        try std.testing.expect(check.calls >= 3);
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+            check = .{ .cause = cause };
+            try std.testing.expectError(cause, owner.maintenanceWithLifetime("docs", action, &lifetime));
+            try std.testing.expect(check.calls >= 3);
+            check.cause = null;
+            _ = try owner.maintenanceWithLifetime("docs", action, &lifetime);
+        }
+    }
+    var row = try owner.lookupJson("docs", "{\"key\":\"a\"}");
+    defer row.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "\"n\":1") != null);
+}
+
 test "HA seed maintenance lifetime crosses the compiled owner boundary and remains reusable" {
     const runtime = @import("antfly_runtime_abi");
     const alloc = std.testing.allocator;

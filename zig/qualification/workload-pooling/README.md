@@ -344,6 +344,21 @@ cursor returned after rejection. Focused dispatcher tests cover those paths;
 a native file-engine mixed-load run completed every phase without unexpected
 server errors and with query, write and slow-reader progress.
 
+Resident LSM inspection and both maintenance-step policies now carry the
+original lifetime restriction through the checked physical engine interface.
+The shared borrowed-I/O storage adapter supplies admission-aware range reads
+for owned recovery cursors, reuses its caller's executor, checks lifetime between
+64 KiB windows and closes the descriptor before CPU reentry. Its allocated-range
+wrapper also uses checked dispatch. This adds no host-path publication permission.
+
+Dedicated metrics-listener runs distinguish real background work from absence
+of warnings: both directory and file engines recorded flushes and completed
+compactions under mixed load, with zero maintenance worker failures. The original
+profiles then completed without maintenance or publication-recovery errors and
+verified exact HTTP/pgwire postimages through joined restart. The directory
+profile passed all gates; file descriptor recovery remains failed. These local
+runs do not qualify distributed or serverless deployment paths.
+
 The restart probe runs independently of load/resource acceptance when the
 server remains live. A failed load receipt stays failed even when exact HTTP
 and pgwire postimages survive joined shutdown and reopen; the receipt records
