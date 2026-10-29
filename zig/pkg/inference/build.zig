@@ -376,7 +376,22 @@ pub fn build(b: *std.Build) void {
         host_ffn.root_module.linkFramework("MetalPerformanceShaders", .{});
         host_ffn.root_module.linkFramework("Accelerate", .{});
         host_ffn.root_module.addCSourceFile(.{ .file = b.path("scripts/check_metal_host_ffn.m"), .flags = &.{"-fobjc-arc"} });
-        host_ffn_check_step.dependOn(&b.addRunArtifact(host_ffn).step);
+        const run_host_ffn = b.addRunArtifact(host_ffn);
+        host_ffn_check_step.dependOn(&run_host_ffn.step);
+        const ternary_attention = b.addExecutable(.{ .name = "metal-ternary-attention-check", .max_rss = 2 * 1024 * 1024 * 1024, .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+        }) });
+        addMacosSdkPaths(b, ternary_attention.root_module, b.graph.host);
+        ternary_attention.root_module.linkFramework("Foundation", .{});
+        ternary_attention.root_module.linkFramework("Metal", .{});
+        ternary_attention.root_module.linkFramework("MetalPerformanceShaders", .{});
+        ternary_attention.root_module.linkFramework("Accelerate", .{});
+        ternary_attention.root_module.addCSourceFile(.{ .file = b.path("scripts/check_metal_ternary_attention.m"), .flags = &.{"-fobjc-arc"} });
+        const run_ternary_attention = b.addRunArtifact(ternary_attention);
+        run_ternary_attention.step.dependOn(&run_host_ffn.step);
+        host_ffn_check_step.dependOn(&run_ternary_attention.step);
     } else {
         host_ffn_check_step.dependOn(&b.addFail("Metal host FFN checks require a macOS host and target.").step);
     }

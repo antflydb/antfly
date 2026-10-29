@@ -24027,16 +24027,11 @@ pub extern fn termite_metal_decode_runtime_apply_attention_gated_block_q_slot_de
     output_offset: usize,
     timing: ?*RawAttentionGatedBlockTiming,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_apply_attention_residual_tl1(
+pub extern fn termite_metal_decode_runtime_apply_attention_residual_ternary_slot(
     runtime: ?*RawMetalDecodeRuntime,
     attention_input: [*c]const f32,
     attention_pre_linear_rms_norm_slot: usize,
-    weight_raw: [*c]const u8,
-    weight_bytes: usize,
-    packed_len: u32,
-    bm: u32,
-    cfg_by: u32,
-    bmm: u32,
+    attention_linear_slot: usize,
     attention_post_linear_rms_norm_slot: usize,
     residual: [*c]const f32,
     attention_input_size: usize,
@@ -24044,27 +24039,7 @@ pub extern fn termite_metal_decode_runtime_apply_attention_residual_tl1(
     eps: f32,
     output: [*c]f32,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_apply_attention_residual_tl2(
-    runtime: ?*RawMetalDecodeRuntime,
-    attention_input: [*c]const f32,
-    attention_pre_linear_rms_norm_slot: usize,
-    weight_raw: [*c]const u8,
-    weight_bytes: usize,
-    scale_off: u32,
-    three_value_len: u32,
-    three_sign_len: u32,
-    bm: u32,
-    cfg_by: u32,
-    bmm: u32,
-    three_cols: u32,
-    two_cols: u32,
-    attention_post_linear_rms_norm_slot: usize,
-    residual: [*c]const f32,
-    attention_input_size: usize,
-    hidden_size: usize,
-    eps: f32,
-    output: [*c]f32,
-) c_int;
+
 pub extern fn termite_metal_decode_runtime_apply_attention_residual_i2_s_slot(
     runtime: ?*RawMetalDecodeRuntime,
     attention_input: [*c]const f32,
@@ -24113,7 +24088,7 @@ pub extern fn termite_metal_decode_runtime_apply_attention_residual_q8_0_slot(
     eps: f32,
     output: [*c]f32,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_apply_attention_span_residual_tl1(
+pub extern fn termite_metal_decode_runtime_apply_attention_span_residual_ternary_slot(
     runtime: ?*RawMetalDecodeRuntime,
     format: u32,
     q: [*c]const f32,
@@ -24130,12 +24105,7 @@ pub extern fn termite_metal_decode_runtime_apply_attention_span_residual_tl1(
     kv_position_offset: usize,
     sliding_window: usize,
     attention_pre_linear_rms_norm_slot: usize,
-    weight_raw: [*c]const u8,
-    weight_bytes: usize,
-    packed_len: u32,
-    bm: u32,
-    cfg_by: u32,
-    bmm: u32,
+    attention_linear_slot: usize,
     attention_post_linear_rms_norm_slot: usize,
     residual: [*c]const f32,
     attention_input_size: usize,
@@ -24194,40 +24164,7 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32_span_residual_q8_
     layer_index: usize,
     output: [*c]f32,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_apply_attention_span_residual_tl2(
-    runtime: ?*RawMetalDecodeRuntime,
-    format: u32,
-    q: [*c]const f32,
-    encoded_key: [*c]const u8,
-    v: [*c]const f32,
-    kv_tokens: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    key_row_bytes: usize,
-    v_row_stride: usize,
-    base_key_row_bytes: usize,
-    query_position: usize,
-    kv_position_offset: usize,
-    sliding_window: usize,
-    attention_pre_linear_rms_norm_slot: usize,
-    weight_raw: [*c]const u8,
-    weight_bytes: usize,
-    scale_off: u32,
-    three_value_len: u32,
-    three_sign_len: u32,
-    bm: u32,
-    cfg_by: u32,
-    bmm: u32,
-    three_cols: u32,
-    two_cols: u32,
-    attention_post_linear_rms_norm_slot: usize,
-    residual: [*c]const f32,
-    attention_input_size: usize,
-    hidden_size: usize,
-    eps: f32,
-    output: [*c]f32,
-) c_int;
+
 pub extern fn termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
     runtime: ?*RawMetalDecodeRuntime,
     input: [*c]const f32,
@@ -33564,6 +33501,24 @@ pub fn selectCompressedAttentionGatedQkv(
     return null;
 }
 
+fn ensureTernaryAttentionSlot(self: anytype, slot: usize, in_dim: usize, out_dim: usize, kind: RawQuantizedRuntimeLinearKind) !bool {
+    if (self.raw_linear_slot_runtime_prepared_kind[slot] == kind) return true;
+    if (ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim) == kind) return true;
+    // Preserve malformed-codec errors from the original raw host entry points.
+    const storage = self.raw_linear_slot_quantized_storage[slot] orelse return false;
+    const bytes = storage.preparedBytes(.row_major_blocks) orelse storage.raw_bytes;
+    switch (kind) {
+        .tl1 => {
+            _ = try quant_codec.bitnetTL1View(storage.shape, bytes);
+        },
+        .tl2 => {
+            _ = try quant_codec.bitnetTL2View(storage.shape, bytes);
+        },
+        else => unreachable,
+    }
+    return false;
+}
+
 pub fn tryRawAttentionResidualHost(
     self: anytype,
     attention_input: [*c]const f32,
@@ -33586,30 +33541,23 @@ pub fn tryRawAttentionResidualHost(
     const storage = if (kind == .quantized) self.raw_linear_slot_quantized_storage[attention_linear_slot] else null;
     const none = std.math.maxInt(usize);
     if (storage) |quantized_storage| {
-        const source_bytes = quantized_storage.preparedBytes(.row_major_blocks) orelse quantized_storage.raw_bytes;
-        const specialized_ok = switch (quantized_storage.tensor_type) {
+        const native_kind = quantizedRuntimeLinearKind(quantized_storage);
+        const specialized_ok = if (native_kind == .tl1 or native_kind == .tl2) blk: {
+            if (!try ensureTernaryAttentionSlot(self, attention_linear_slot, attention_input_size, hidden_size, native_kind)) break :blk false;
+            break :blk termite_metal_decode_runtime_apply_attention_residual_ternary_slot(
+                runtime,
+                attention_input,
+                attention_pre_linear_rms_norm_slot orelse none,
+                attention_linear_slot,
+                attention_post_linear_rms_norm_slot orelse none,
+                residual,
+                attention_input_size,
+                hidden_size,
+                eps,
+                output,
+            ) == 0;
+        } else switch (quantized_storage.tensor_type) {
             .known => |known| switch (known) {
-                .TL1 => blk: {
-                    const view = try quant_codec.bitnetTL1View(quantized_storage.shape, source_bytes);
-                    if (view.cols != attention_input_size or view.rows != hidden_size) break :blk false;
-                    break :blk termite_metal_decode_runtime_apply_attention_residual_tl1(
-                        runtime,
-                        attention_input,
-                        attention_pre_linear_rms_norm_slot orelse none,
-                        source_bytes.ptr,
-                        source_bytes.len,
-                        @intCast(view.packed_bytes.len),
-                        @intCast(view.config.bm),
-                        @intCast(view.config.by),
-                        @intCast(view.config.bmm),
-                        attention_post_linear_rms_norm_slot orelse none,
-                        residual,
-                        attention_input_size,
-                        hidden_size,
-                        eps,
-                        output,
-                    ) == 0;
-                },
                 .I2_S => blk: {
                     if (!ensureI2SRuntimeLinearSlotPrepared(self, attention_linear_slot, attention_input_size, hidden_size)) break :blk false;
                     break :blk termite_metal_decode_runtime_apply_attention_residual_i2_s_slot(
@@ -33676,33 +33624,8 @@ pub fn tryRawAttentionResidualHost(
                 },
                 else => false,
             },
-            .bitnet_tl2 => blk: {
-                const view = try quant_codec.bitnetTL2View(quantized_storage.shape, source_bytes);
-                if (view.cols != attention_input_size or view.rows != hidden_size) break :blk false;
-                const scale_off_u64 = (gguf_tensor_types.byteLen(.bitnet_tl2, &.{ @intCast(view.cols), @intCast(view.rows) }) orelse return error.UnsupportedTensorShape) - 32;
-                break :blk termite_metal_decode_runtime_apply_attention_residual_tl2(
-                    runtime,
-                    attention_input,
-                    attention_pre_linear_rms_norm_slot orelse none,
-                    source_bytes.ptr,
-                    source_bytes.len,
-                    @intCast(scale_off_u64),
-                    @intCast(view.three_values.len),
-                    @intCast(view.three_signs.len),
-                    @intCast(view.config.bm),
-                    @intCast(view.config.by),
-                    @intCast(view.config.bmm),
-                    @intCast(view.three_cols),
-                    @intCast(view.two_cols),
-                    attention_post_linear_rms_norm_slot orelse none,
-                    residual,
-                    attention_input_size,
-                    hidden_size,
-                    eps,
-                    output,
-                ) == 0;
-            },
-            .unknown => false,
+
+            .bitnet_tl2, .unknown => false,
         };
         if (specialized_ok) return true;
     }
@@ -33808,44 +33731,38 @@ pub fn tryRawCompressedAttentionResidualHost(
     if (self.raw_linear_slot_kinds[attention_linear_slot] != .quantized) return false;
     const storage = self.raw_linear_slot_quantized_storage[attention_linear_slot] orelse return false;
     const none = std.math.maxInt(usize);
-    const source_bytes = storage.preparedBytes(.row_major_blocks) orelse storage.raw_bytes;
     const format_int: u32 = CompressedKeyFormat.nativeTag(format);
+    const native_kind = quantizedRuntimeLinearKind(storage);
+    if (native_kind == .tl1 or native_kind == .tl2) {
+        if (!try ensureTernaryAttentionSlot(self, attention_linear_slot, attention_input_size, hidden_size, native_kind)) return false;
+        return termite_metal_decode_runtime_apply_attention_span_residual_ternary_slot(
+            runtime,
+            format_int,
+            q,
+            encoded_key,
+            v,
+            kv_tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            key_row_bytes,
+            v_row_stride,
+            base_key_row_bytes,
+            query_position,
+            kv_position_offset,
+            sliding_window,
+            attention_pre_linear_rms_norm_slot orelse none,
+            attention_linear_slot,
+            attention_post_linear_rms_norm_slot orelse none,
+            residual,
+            attention_input_size,
+            hidden_size,
+            eps,
+            output,
+        ) == 0;
+    }
     return switch (storage.tensor_type) {
         .known => |known| switch (known) {
-            .TL1 => blk: {
-                const view = try quant_codec.bitnetTL1View(storage.shape, source_bytes);
-                if (view.cols != attention_input_size or view.rows != hidden_size) break :blk false;
-                break :blk termite_metal_decode_runtime_apply_attention_span_residual_tl1(
-                    runtime,
-                    format_int,
-                    q,
-                    encoded_key,
-                    v,
-                    kv_tokens,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    key_row_bytes,
-                    v_row_stride,
-                    base_key_row_bytes,
-                    query_position,
-                    kv_position_offset,
-                    sliding_window,
-                    attention_pre_linear_rms_norm_slot orelse none,
-                    source_bytes.ptr,
-                    source_bytes.len,
-                    @intCast(view.packed_bytes.len),
-                    @intCast(view.config.bm),
-                    @intCast(view.config.by),
-                    @intCast(view.config.bmm),
-                    attention_post_linear_rms_norm_slot orelse none,
-                    residual,
-                    attention_input_size,
-                    hidden_size,
-                    eps,
-                    output,
-                ) == 0;
-            },
             .I2_S => blk: {
                 if (!ensureI2SRuntimeLinearSlotPrepared(self, attention_linear_slot, attention_input_size, hidden_size)) break :blk false;
                 break :blk termite_metal_decode_runtime_apply_attention_span_residual_i2_s_slot(
@@ -33907,46 +33824,8 @@ pub fn tryRawCompressedAttentionResidualHost(
             },
             else => false,
         },
-        .bitnet_tl2 => blk: {
-            const view = try quant_codec.bitnetTL2View(storage.shape, source_bytes);
-            if (view.cols != attention_input_size or view.rows != hidden_size) break :blk false;
-            const scale_off_u64 = (gguf_tensor_types.byteLen(.bitnet_tl2, &.{ @intCast(view.cols), @intCast(view.rows) }) orelse return error.UnsupportedTensorShape) - 32;
-            break :blk termite_metal_decode_runtime_apply_attention_span_residual_tl2(
-                runtime,
-                format_int,
-                q,
-                encoded_key,
-                v,
-                kv_tokens,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                key_row_bytes,
-                v_row_stride,
-                base_key_row_bytes,
-                query_position,
-                kv_position_offset,
-                sliding_window,
-                attention_pre_linear_rms_norm_slot orelse none,
-                source_bytes.ptr,
-                source_bytes.len,
-                @intCast(scale_off_u64),
-                @intCast(view.three_values.len),
-                @intCast(view.three_signs.len),
-                @intCast(view.config.bm),
-                @intCast(view.config.by),
-                @intCast(view.config.bmm),
-                @intCast(view.three_cols),
-                @intCast(view.two_cols),
-                attention_post_linear_rms_norm_slot orelse none,
-                residual,
-                attention_input_size,
-                hidden_size,
-                eps,
-                output,
-            ) == 0;
-        },
-        .unknown => false,
+
+        .bitnet_tl2, .unknown => false,
     };
 }
 
@@ -50079,3 +49958,74 @@ pub extern fn termite_metal_decode_runtime_lighton_large_vision_pack_stats(runti
 pub extern fn antfly_metal_lighton_embed_tokens(runtime: ?*RawMetalDecodeRuntime, slot: usize, rows: usize, dim: usize, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn antfly_metal_lighton_read_tokens(runtime: ?*RawMetalDecodeRuntime, output: [*]u32, rows: usize) c_int;
 pub extern fn antfly_metal_lighton_prefill_pack_streaming(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;
+
+test "metal native ternary attention prepared slots preserve the Zig C boundary" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const metal_native_provider = @import("metal_native_provider.zig");
+    for ([_]bool{ false, true }) |tl2| {
+        var provider = try metal_native_provider.MetalNativeProvider.create();
+        defer provider.deinitOwned();
+        const runtime = provider.raw_decode_runtime orelse return error.UnexpectedNull;
+        const dim = 1536;
+        const shape = [_]i64{ dim, dim };
+        const tensor_type: gguf_tensor_types.TensorType = if (tl2) .bitnet_tl2 else .{ .known = .TL1 };
+        const raw_len: usize = @intCast(gguf_tensor_types.byteLen(tensor_type, &.{ dim, dim }) orelse return error.UnexpectedNull);
+        const raw = try std.testing.allocator.alloc(u8, raw_len);
+        defer std.testing.allocator.free(raw);
+        @memset(raw, 0);
+        const scale_offset = if (tl2) blk: {
+            const view = try quant_codec.bitnetTL2View(&shape, raw);
+            @memset(raw[0..view.three_values.len], 0xdd);
+            break :blk raw_len - 32;
+        } else blk: {
+            @memset(raw[0 .. dim * dim / 4], 0x88);
+            break :blk dim * dim / 4;
+        };
+        std.mem.writeInt(u32, raw[scale_offset..][0..4], @bitCast(@as(f32, 1.0 / 128.0)), .little);
+        const storage = QuantizedStorage{ .tensor_type = tensor_type, .raw_bytes = raw, .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator };
+        const zeros: [dim]f32 = @splat(0);
+        var bias = try MetalTensor.ownedCloneFrom(&zeros, &[_]i32{dim});
+        defer bias.deinit();
+        var dummy_value = [_]f32{0};
+        const weight = MetalTensor.borrowed(&dummy_value, 1, &[_]i32{0});
+        var stats: ops.NativeQuantTimingStats = .{};
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{ .weight = weight, .bias = bias, .quantized_storage = @as(?*const QuantizedStorage, &storage), .slot = 0, .in_dim = dim, .out_dim = dim, .retain_dense_fallback = false }, &stats));
+        const input = try std.testing.allocator.alloc(f32, dim);
+        defer std.testing.allocator.free(input);
+        @memset(input, 1.0 / 64.0);
+        const residual = try std.testing.allocator.alloc(f32, dim);
+        defer std.testing.allocator.free(residual);
+        @memset(residual, 0.25);
+        var output: [dim]f32 = undefined;
+        const query = try std.testing.allocator.alloc(f32, dim);
+        defer std.testing.allocator.free(query);
+        @memset(query, 0);
+        const keys = try std.testing.allocator.alloc(u8, 3 * 256);
+        defer std.testing.allocator.free(keys);
+        @memset(keys, 0);
+        const values = try std.testing.allocator.alloc(f32, 3 * 512);
+        defer std.testing.allocator.free(values);
+        @memset(values, 1.0 / 64.0);
+        const constant_input: [dim]f32 = @splat(1.0 / 64.0);
+        const constant_residual: [dim]f32 = @splat(0.25);
+        const constant_query: [dim]f32 = @splat(0);
+        const constant_keys: [3 * 256]u8 = @splat(0);
+        const constant_values: [3 * 512]f32 = @splat(1.0 / 64.0);
+        for (0..2) |iteration| {
+            const input_ptr: [*c]const f32 = if (iteration == 0) input.ptr else &constant_input;
+            const residual_ptr: [*c]const f32 = if (iteration == 0) residual.ptr else &constant_residual;
+            const query_ptr: [*c]const f32 = if (iteration == 0) query.ptr else &constant_query;
+            const keys_ptr: [*c]const u8 = if (iteration == 0) keys.ptr else &constant_keys;
+            const values_ptr: [*c]const f32 = if (iteration == 0) values.ptr else &constant_values;
+            @memset(&output, -777);
+            try std.testing.expect(try tryRawAttentionResidualHost(&provider, input_ptr, residual_ptr, dim, dim, 0, 0, null, null, &output));
+            const expected_kind: RawQuantizedRuntimeLinearKind = if (tl2) .tl2 else .tl1;
+            try std.testing.expectEqual(expected_kind, provider.raw_linear_slot_runtime_prepared_kind[0]);
+            for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.4375), value, 1e-5);
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_attention_residual_ternary_slot(runtime, input_ptr, std.math.maxInt(usize), 0, std.math.maxInt(usize), residual_ptr, dim, dim, 0, &output));
+            @memset(&output, -777);
+            try std.testing.expect(try tryRawCompressedAttentionResidualHost(&provider, .polar4, query_ptr, query_ptr, keys_ptr, values_ptr, 3, 6, 2, 256, 256, 512, 256, 2, 0, 0, residual_ptr, dim, dim, 0, 0, null, null, 0, &output));
+            for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.4375), value, 1e-5);
+        }
+    }
+}
