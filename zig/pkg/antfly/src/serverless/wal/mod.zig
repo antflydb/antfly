@@ -24,6 +24,7 @@ pub const WalStore = store.WalStore;
 pub const FsStore = fs_store.FsStore;
 pub const RemoteStore = remote_store.RemoteStore;
 pub const IndexedObjectStore = @import("indexed_object_store.zig").IndexedObjectStore;
+pub const collector = @import("collector.zig");
 pub const ReadRange = types.ReadRange;
 
 test "serverless wal module compiles" {
@@ -37,4 +38,5 @@ test "serverless wal module compiles" {
     _ = FsStore;
     _ = RemoteStore;
     _ = IndexedObjectStore;
+    _ = collector;
 }

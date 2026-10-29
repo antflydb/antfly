@@ -39,6 +39,39 @@ pub const IndexedObjectStore = struct {
     inline_tail_enabled: bool = false,
     read_state_enabled: bool = false,
     document_index_enabled: bool = false,
+    /// Selected only by the managed-layout bootstrap on a pristine prefix.
+    /// A persisted HEAD contract remains authoritative when this hint is off.
+    managed_reads: bool = false,
+    read_clock: RootClock = .{},
+
+    pub const root_lifetime_ms: u32 = 30_000;
+    pub fn managedClockAvailable() bool {
+        const value = RootClock.read(.{});
+        return value != 0 and value != std.math.maxInt(u64);
+    }
+    pub const RootClock = struct {
+        ptr: ?*const anyopaque = null,
+        now_fn: *const fn (?*const anyopaque) u64 = now,
+        fn now(_: ?*const anyopaque) u64 {
+            const platform = @import("antfly_platform").time;
+            const os = @import("builtin").os.tag;
+            if (comptime os == .macos) {
+                // UPTIME/awake clocks omit suspension and cannot bound roots.
+                var ts: std.posix.timespec = undefined;
+                if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC_RAW, &ts)) != .SUCCESS) return std.math.maxInt(u64);
+                return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
+            }
+            if (comptime os == .linux) return platform.authorityNs();
+            if (comptime os == .freestanding or os == .wasi) {
+                if (!platform.hasHostAuthorityClock()) return std.math.maxInt(u64);
+                return platform.authorityNs();
+            }
+            return std.math.maxInt(u64);
+        }
+        pub fn read(self: @This()) u64 {
+            return self.now_fn(self.ptr);
+        }
+    };
 
     /// A bounded copy of the last record is committed by the same HEAD CAS as
     /// both trees. A one-record tail read needs no dependent page fetches.
@@ -69,6 +102,7 @@ pub const IndexedObjectStore = struct {
     pub const ReadParent = struct { latest_lsn: u64, write_epoch: u64, physical_first_lsn: u64, records: ?tree.Ref = null };
     pub const Head = struct {
         format: u32 = 2,
+        root_lifetime_ms: ?u32 = null,
         write_epoch: u64 = 1,
         physical_first_lsn: u64 = 1,
         gc_attempt: [16]u8 = @splat(0),
@@ -561,8 +595,11 @@ pub const IndexedObjectStore = struct {
     /// index and high watermark survive compaction. A later epoch barrier and
     /// reader grace period are required before deleting unreachable pages.
     pub fn compactPrefixStep(self: *@This(), namespace: []const u8, max_records: usize) !bool {
+        return self.compactPrefixStepWithCancellation(namespace, max_records, null);
+    }
+    pub fn compactPrefixStepWithCancellation(self: *@This(), namespace: []const u8, max_records: usize, cancellation: ?objectstore.CancellationToken) !bool {
         if (max_records == 0 or max_records > 256) return error.InvalidWalBatch;
-        var ctx = try Context.init(self, namespace, null);
+        var ctx = try Context.init(self, namespace, cancellation);
         defer ctx.deinit();
         for (0..self.max_attempts) |_| {
             var head = try ctx.readHead();
@@ -598,18 +635,61 @@ pub const IndexedObjectStore = struct {
     }
 
     pub const Collection = struct { records: ?tree.Ref, operations: ?tree.Ref, documents: ?tree.Ref = null, retired_before: u64, domain: [32]u8 };
+    pub const ActiveCollection = struct { id: [16]u8, roots: Collection };
+
+    /// The managed HEAD is the only active-job pointer. A collector must resume
+    /// this job rather than recreate a cached job after it has been finished.
+    pub fn collectionStatus(self: *@This(), namespace: []const u8, cancellation: ?objectstore.CancellationToken) !?ActiveCollection {
+        var ctx = try Context.init(self, namespace, cancellation);
+        defer ctx.deinit();
+        var head = try ctx.readHead();
+        defer head.deinit(self.alloc);
+        if (head.value.root_lifetime_ms == null) return error.ManagedCollectionRequired;
+        if (std.mem.allEqual(u8, &head.value.gc_attempt, 0)) return null;
+        return .{ .id = head.value.gc_attempt, .roots = .{ .records = head.value.gc_records, .operations = head.value.gc_operations, .documents = head.value.gc_documents, .retired_before = head.value.gc_retired_before, .domain = ctx.domain } };
+    }
+
+    /// Durable job completion must precede this matching-ID release. Clearing a
+    /// newer job, or resurrecting an older one, is never an idempotent retry.
+    pub fn finishCollection(self: *@This(), namespace: []const u8, id: [16]u8, retired_before: u64, cancellation: ?objectstore.CancellationToken) !bool {
+        if (std.mem.allEqual(u8, &id, 0)) return error.InvalidCollectionId;
+        var ctx = try Context.init(self, namespace, cancellation);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            if (head.value.root_lifetime_ms == null) return error.ManagedCollectionRequired;
+            if (!std.mem.eql(u8, &head.value.gc_attempt, &id) or head.value.gc_retired_before != retired_before) return false;
+            var next = head.value;
+            next.gc_attempt = @splat(0);
+            next.gc_records = null;
+            next.gc_operations = null;
+            next.gc_documents = null;
+            next.gc_retired_before = 0;
+            ctx.writeHead(next, head.revision) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return true;
+        }
+        return error.WalCommitContended;
+    }
     /// Atomically fences every writer that could publish an older upload
     /// attempt. Caller must retain these roots and honor bounded reader leases
     /// before sweeping attempts older than retired_before. Idempotent by job ID.
     pub fn beginCollection(self: *@This(), namespace: []const u8, id: [16]u8) !Collection {
+        return self.beginCollectionWithCancellation(namespace, id, null);
+    }
+    pub fn beginCollectionWithCancellation(self: *@This(), namespace: []const u8, id: [16]u8, cancellation: ?objectstore.CancellationToken) !Collection {
         if (std.mem.allEqual(u8, &id, 0)) return error.InvalidCollectionId;
-        var ctx = try Context.init(self, namespace, null);
+        var ctx = try Context.init(self, namespace, cancellation);
         defer ctx.deinit();
         for (0..self.max_attempts) |_| {
             var head = try ctx.readHead();
             defer head.deinit(self.alloc);
             var next = head.value;
             if (!std.mem.eql(u8, &next.gc_attempt, &id)) {
+                if (next.root_lifetime_ms != null and !std.mem.allEqual(u8, &next.gc_attempt, 0)) return error.CollectionBusy;
                 next.write_epoch = std.math.add(u64, next.write_epoch, 1) catch return error.WalLsnExhausted;
                 next.gc_attempt = id;
                 next.gc_records = next.records;
@@ -627,8 +707,19 @@ pub const IndexedObjectStore = struct {
     }
 
     pub fn tracePage(self: *@This(), alloc: A, namespace: []const u8, ref: tree.Ref) !tree.Page {
+        if (self.managed_reads) return error.CollectionProofRequired;
         var ctx = try Context.init(self, namespace, null);
         defer ctx.deinit();
+        return tree.readPage(alloc, ctx.store(), ref);
+    }
+    pub fn traceCollectionPage(self: *@This(), alloc: A, namespace: []const u8, id: [16]u8, retired_before: u64, ref: tree.Ref, cancellation: ?objectstore.CancellationToken) !tree.Page {
+        if (std.mem.allEqual(u8, &id, 0)) return error.InvalidCollectionId;
+        var ctx = try Context.init(self, namespace, cancellation);
+        defer ctx.deinit();
+        var head = try ctx.readHead();
+        defer head.deinit(self.alloc);
+        if (head.value.root_lifetime_ms == null) return error.ManagedCollectionRequired;
+        if (!std.mem.eql(u8, &head.value.gc_attempt, &id) or head.value.gc_retired_before != retired_before) return error.CollectionSuperseded;
         return tree.readPage(alloc, ctx.store(), ref);
     }
     pub fn pageKeyAlloc(self: *@This(), alloc: A, namespace: []const u8, ref: tree.Ref) ![]u8 {
@@ -653,6 +744,8 @@ pub const IndexedObjectStore = struct {
         root: []u8,
         domain: [32]u8,
         cancellation: ?objectstore.CancellationToken,
+        opened_ns: u64,
+        bounded_roots: bool,
         attempt: [16]u8 = @splat(0),
 
         fn init(owner: *IndexedObjectStore, namespace: []const u8, cancellation: ?objectstore.CancellationToken) !@This() {
@@ -662,7 +755,7 @@ pub const IndexedObjectStore = struct {
             const root = try std.fmt.allocPrint(owner.alloc, "{s}/wal-v1/{s}", .{ owner.prefix, std.fmt.bytesToHex(digest, .lower) });
             var domain: [32]u8 = undefined;
             Sha256.hash(root, &domain, .{});
-            return .{ .owner = owner, .root = root, .domain = domain, .cancellation = cancellation };
+            return .{ .owner = owner, .root = root, .domain = domain, .cancellation = cancellation, .opened_ns = owner.read_clock.read(), .bounded_roots = owner.managed_reads };
         }
         fn deinit(self: *@This()) void {
             self.owner.alloc.free(self.root);
@@ -676,19 +769,44 @@ pub const IndexedObjectStore = struct {
         fn check(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.cancellation) |token| try token.check();
+            if (self.rootExpired()) return error.WalSnapshotExpired;
+        }
+        fn rootExpired(self: *const @This()) bool {
+            if (!self.bounded_roots) return false;
+            const now = self.owner.read_clock.read();
+            return self.opened_ns == 0 or self.opened_ns == std.math.maxInt(u64) or now == 0 or now == std.math.maxInt(u64) or now < self.opened_ns or now - self.opened_ns >= @as(u64, root_lifetime_ms) * std.time.ns_per_ms;
+        }
+        fn transportCancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return (if (self.cancellation) |token| token.isCancelled() else false) or self.rootExpired();
+        }
+        fn transportToken(self: *@This()) objectstore.CancellationToken {
+            return .{ .ptr = self, .is_cancelled_fn = transportCancelled };
         }
         fn readHead(self: *@This()) !Snapshot {
+            try check(self);
             const a = self.owner.alloc;
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);
-            var result = self.owner.client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 4096, .cancellation = self.cancellation }) catch |err| switch (err) {
-                error.FileNotFound => return .{},
-                else => return err,
+            var result = self.owner.client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 4096, .cancellation = self.transportToken() }) catch |err| switch (err) {
+                error.FileNotFound => {
+                    try check(self);
+                    return .{ .value = .{ .root_lifetime_ms = if (self.owner.managed_reads) root_lifetime_ms else null } };
+                },
+                else => {
+                    if (err == error.Canceled) try check(self);
+                    return err;
+                },
             };
             defer result.deinit(a);
             const parsed = try std.json.parseFromSlice(Head, a, result.body, .{});
             defer parsed.deinit();
             const head = parsed.value;
+            if (head.root_lifetime_ms) |limit| {
+                if (limit != root_lifetime_ms) return error.InvalidWal;
+                self.bounded_roots = true;
+            } else if (self.owner.managed_reads) return error.WalReaderContractMissing;
+            try check(self);
             if ((head.format != 1 and head.format != 2 and head.format != 3 and head.format != 4) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
                 head.first_lsn > head.latest_lsn + 1 or (head.latest_lsn >= head.physical_first_lsn and head.records == null)) return error.InvalidWal;
             if (head.format != 4 and (head.document_index != null or head.read_parent != null or head.gc_documents != null)) return error.InvalidWal;
@@ -709,7 +827,12 @@ pub const IndexedObjectStore = struct {
                     if (ref.records != parent_.latest_lsn + 1 - parent_.physical_first_lsn) return error.InvalidWal;
                 }
             }
-            if (head.gc_documents) |ref| try ref.validate();
+            for ([_]?tree.Ref{ head.gc_records, head.gc_operations, head.gc_documents }) |ref| if (ref) |value| try value.validate();
+            if (head.root_lifetime_ms != null) {
+                if (std.mem.allEqual(u8, &head.gc_attempt, 0)) {
+                    if (head.gc_records != null or head.gc_operations != null or head.gc_documents != null or head.gc_retired_before != 0) return error.InvalidWal;
+                } else if (head.gc_retired_before < 2 or head.gc_retired_before > head.write_epoch) return error.InvalidWal;
+            }
             if (head.inline_tail) |tail| {
                 const record = codec.parseRecord(tail.bytes[0..tail.len], 0) catch return error.InvalidWal;
                 if (record.lsn != head.latest_lsn or record.next_cursor != tail.len or head.first_lsn > head.latest_lsn) return error.InvalidWal;
@@ -726,6 +849,7 @@ pub const IndexedObjectStore = struct {
             return .{ .value = head, .revision = try revision.clone(a) };
         }
         fn writeHead(self: *@This(), head: Head, revision: ?objectstore.ObjectRevision) !void {
+            try check(self);
             const a = self.owner.alloc;
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);
@@ -741,10 +865,15 @@ pub const IndexedObjectStore = struct {
             }
             defer a.free(bytes);
             if (bytes.len > 4096) return error.WalHeadTooLarge;
-            var result = try self.owner.client.compareAndPut(self.owner.bucket, key, bytes, revision, .{
+            var result = self.owner.client.compareAndPut(self.owner.bucket, key, bytes, revision, .{
                 .content_type = "application/json",
-                .cancellation = self.cancellation,
-            });
+                .cancellation = self.transportToken(),
+            }) catch |err| {
+                if (err == error.Canceled) try check(self);
+                return err;
+            };
+            // A committed HEAD remains a successful acknowledgement even if
+            // its response arrived after the root-use deadline.
             defer result.deinit(a);
         }
         fn pageKey(self: *@This(), a: A, ref: tree.Ref) ![]u8 {
@@ -753,12 +882,18 @@ pub const IndexedObjectStore = struct {
         }
         fn getPage(raw: *anyopaque, a: A, ref: tree.Ref) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
             const key = try self.pageKey(a, ref);
             defer a.free(key);
             var client = self.owner.client;
             client.allocator = a;
-            var result = try client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = ref.bytes, .cancellation = self.cancellation });
+            var result = client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = ref.bytes, .cancellation = self.transportToken() }) catch |err| {
+                if (err == error.Canceled) try check(raw);
+                return err;
+            };
             defer result.metadata.deinit(a);
+            errdefer a.free(result.body);
+            try check(raw);
             return result.body;
         }
         fn putPages(raw: *anyopaque, writes: []const tree.Write) !void {
@@ -770,7 +905,7 @@ pub const IndexedObjectStore = struct {
             defer for (requests[0..initialized]) |item| a.free(item.key);
             for (writes, requests[0..writes.len]) |write, *request| {
                 try check(raw);
-                request.* = .{ .key = try self.pageKey(a, write.ref), .body = write.bytes, .options = .{ .if_none_match = true, .cancellation = self.cancellation } };
+                request.* = .{ .key = try self.pageKey(a, write.ref), .body = write.bytes, .options = .{ .if_none_match = true, .cancellation = self.transportToken() } };
                 initialized += 1;
             }
             const results = self.owner.client.putObjects(self.owner.bucket, requests[0..writes.len]) catch |err| switch (err) {
@@ -778,19 +913,24 @@ pub const IndexedObjectStore = struct {
                     for (writes) |write| try putPage(raw, write.ref, write.bytes);
                     return;
                 },
-                else => return err,
+                else => {
+                    if (err == error.Canceled) try check(raw);
+                    return err;
+                },
             };
             defer {
                 for (results) |*result| result.deinit(a);
                 a.free(results);
             }
+            try check(raw);
         }
         fn putPage(raw: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
             const a = self.owner.alloc;
             const key = try self.pageKey(a, ref);
             defer a.free(key);
-            var result = self.owner.client.putObject(self.owner.bucket, key, bytes, .{ .if_none_match = true, .cancellation = self.cancellation }) catch |err| switch (err) {
+            var result = self.owner.client.putObject(self.owner.bucket, key, bytes, .{ .if_none_match = true, .cancellation = self.transportToken() }) catch |err| switch (err) {
                 error.PreconditionFailed => {
                     // Existing content-addressed bytes are still authenticated
                     // before accepting a successful immutable upload.
@@ -799,9 +939,13 @@ pub const IndexedObjectStore = struct {
                     if (!std.mem.eql(u8, existing, bytes)) return error.ArtifactIntegrityMismatch;
                     return;
                 },
-                else => return err,
+                else => {
+                    if (err == error.Canceled) try check(raw);
+                    return err;
+                },
             };
             defer result.deinit(a);
+            try check(raw);
         }
     };
 
@@ -869,6 +1013,128 @@ pub const IndexedObjectStore = struct {
         return self.readRangeAlloc(a, ns, .{ .start_lsn = start, .end_lsn = latest, .max_records = std.math.maxInt(usize), .max_bytes = std.math.maxInt(usize) });
     }
 };
+
+const ManagedReadFixture = struct {
+    memory: objectstore.MemoryClient,
+    faults: objectstore.ScriptedFaultClient,
+    wal: IndexedObjectStore,
+    now_ns: u64 = std.time.ns_per_s,
+
+    fn init(self: *@This(), a: A) !void {
+        self.memory = objectstore.MemoryClient.init(a);
+        errdefer self.memory.deinit();
+        self.now_ns = std.time.ns_per_s;
+        var client = self.memory.client();
+        try client.makeBucket("db");
+        self.faults = objectstore.ScriptedFaultClient.init(a, client);
+        errdefer self.faults.deinit();
+        self.wal = try IndexedObjectStore.init(a, self.faults.client(), "db", "managed");
+        self.wal.managed_reads = true;
+        self.wal.read_clock = .{ .ptr = self, .now_fn = clock };
+    }
+    fn deinit(self: *@This()) void {
+        self.wal.deinit();
+        self.faults.deinit();
+        self.memory.deinit();
+    }
+    fn clock(raw: ?*const anyopaque) u64 {
+        const self: *const @This() = @ptrCast(@alignCast(raw.?));
+        return self.now_ns;
+    }
+    fn expire(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.now_ns += 31 * std.time.ns_per_s;
+    }
+    fn rewind(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.now_ns = 1;
+    }
+    fn headPut(_: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+        return std.mem.endsWith(u8, key, "/HEAD");
+    }
+    fn pageGet(_: *anyopaque, _: []const u8, key: []const u8) bool {
+        return std.mem.indexOf(u8, key, "/pages/") != null;
+    }
+};
+
+test "serverless multiprovider managed WAL rejects late HEADs and rollback without fetching expired pages" {
+    const a = std.testing.allocator;
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(a);
+    defer fixture.deinit();
+    _ = try fixture.wal.appendIdempotent("docs", 1, "alpha", "op");
+    // A new raw reader learns the persisted policy only after its HEAD GET.
+    // Its deadline must still start before that potentially stalled response.
+    fixture.wal.managed_reads = false;
+    fixture.memory.resetOperationCount();
+    fixture.faults.next_get = .{ .complete_then_callback = .{ .ptr = &fixture, .run = ManagedReadFixture.expire } };
+    try std.testing.expectError(error.WalSnapshotExpired, fixture.wal.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 1 }));
+    try std.testing.expectEqual(@as(u64, 1), fixture.memory.operationCount());
+    fixture.memory.resetOperationCount();
+    fixture.faults.next_get = .{ .complete_then_callback = .{ .ptr = &fixture, .run = ManagedReadFixture.rewind } };
+    try std.testing.expectError(error.WalSnapshotExpired, fixture.wal.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 1 }));
+    try std.testing.expectEqual(@as(u64, 1), fixture.memory.operationCount());
+}
+
+test "serverless multiprovider managed WAL discards a late physical page response before another fetch" {
+    const a = std.testing.allocator;
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(a);
+    defer fixture.deinit();
+    const body: [2048]u8 = @splat('x');
+    const payloads: [32][]const u8 = @splat(&body);
+    _ = try fixture.wal.appendBatch("docs", 1, &payloads);
+    fixture.memory.resetOperationCount();
+    fixture.faults.get_filter = .{ .ptr = &fixture, .matches = ManagedReadFixture.pageGet };
+    fixture.faults.next_get = .{ .complete_then_callback = .{ .ptr = &fixture, .run = ManagedReadFixture.expire } };
+    try std.testing.expectError(error.WalSnapshotExpired, fixture.wal.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 32 }));
+    try std.testing.expectEqual(@as(u64, 2), fixture.memory.operationCount());
+}
+
+test "serverless multiprovider managed WAL prevents expired uploads from publishing but retains a successful HEAD acknowledgement" {
+    const a = std.testing.allocator;
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(a);
+    defer fixture.deinit();
+    fixture.faults.next_put = .{ .commit_then_callback = .{ .ptr = &fixture, .run = ManagedReadFixture.expire } };
+    try std.testing.expectError(error.WalSnapshotExpired, fixture.wal.appendIdempotent("docs", 1, "alpha", "op"));
+    try std.testing.expectEqual(@as(u64, 0), try fixture.wal.latestLsn("docs"));
+    fixture.faults.put_filter = .{ .ptr = &fixture, .matches = ManagedReadFixture.headPut };
+    fixture.faults.next_put = .{ .commit_then_callback = .{ .ptr = &fixture, .run = ManagedReadFixture.expire } };
+    try std.testing.expectEqual(@as(u64, 1), try fixture.wal.appendIdempotent("docs", 1, "alpha", "op"));
+    try std.testing.expectEqual(@as(u64, 1), try fixture.wal.appendIdempotent("docs", 1, "alpha", "op"));
+}
+
+test "serverless multiprovider managed collection resumes one HEAD job and cannot finish or resurrect a different job" {
+    const a = std.testing.allocator;
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(a);
+    defer fixture.deinit();
+    _ = try fixture.wal.appendIdempotent("docs", 1, "alpha", "op");
+    fixture.faults.put_filter = .{ .ptr = &fixture, .matches = ManagedReadFixture.headPut };
+    fixture.faults.commitNextPutThenFail(error.InjectedCollectionAckLoss);
+    try std.testing.expectError(error.InjectedCollectionAckLoss, fixture.wal.beginCollection("docs", @splat(1)));
+    const active = (try fixture.wal.collectionStatus("docs", null)).?;
+    try std.testing.expectEqual(@as(u64, 2), active.roots.retired_before);
+    const same = try fixture.wal.beginCollection("docs", @splat(1));
+    try std.testing.expect(tree.Ref.eql(same.records.?, active.roots.records.?));
+    try std.testing.expectError(error.CollectionBusy, fixture.wal.beginCollection("docs", @splat(2)));
+    try std.testing.expect(!try fixture.wal.finishCollection("docs", @splat(2), active.roots.retired_before, null));
+    fixture.faults.put_filter = .{ .ptr = &fixture, .matches = ManagedReadFixture.headPut };
+    fixture.faults.commitNextPutThenFail(error.InjectedCollectionAckLoss);
+    try std.testing.expectError(error.InjectedCollectionAckLoss, fixture.wal.finishCollection("docs", @splat(1), active.roots.retired_before, null));
+    try std.testing.expect(try fixture.wal.collectionStatus("docs", null) == null);
+    try std.testing.expect(!try fixture.wal.finishCollection("docs", @splat(1), active.roots.retired_before, null));
+    const second = try fixture.wal.beginCollection("docs", @splat(2));
+    try std.testing.expectError(error.CollectionBusy, fixture.wal.beginCollection("docs", @splat(1)));
+    try std.testing.expectError(error.CollectionSuperseded, fixture.wal.traceCollectionPage(a, "docs", @splat(1), same.retired_before, same.records.?, null));
+    try std.testing.expect(try fixture.wal.finishCollection("docs", @splat(2), second.retired_before, null));
+    const reused = try fixture.wal.beginCollection("docs", @splat(1));
+    try std.testing.expect(reused.retired_before > same.retired_before);
+    try std.testing.expect(!try fixture.wal.finishCollection("docs", @splat(1), same.retired_before, null));
+    try std.testing.expectError(error.CollectionSuperseded, fixture.wal.traceCollectionPage(a, "docs", @splat(1), same.retired_before, same.records.?, null));
+    try std.testing.expectEqual(@as(u64, 1), try fixture.wal.appendIdempotent("docs", 1, "alpha", "op"));
+}
 
 test "serverless indexed WAL serves a validated bounded last record without page reads" {
     const a = std.testing.allocator;

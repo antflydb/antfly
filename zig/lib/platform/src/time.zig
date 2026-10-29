@@ -33,6 +33,11 @@ pub fn installHostClocks(clocks: HostClocks) void {
     host_clocks = clocks;
 }
 
+/// A synthetic freestanding counter cannot authorize expiring remote roots.
+pub fn hasHostAuthorityClock() bool {
+    return !is_hostless or host_clocks != null;
+}
+
 pub fn sleepNs(ns: u64) void {
     if (comptime is_hostless) return;
 

@@ -1,9 +1,9 @@
 # Native indexed-WAL physical collection
 
-This is the remaining native reclamation design for issue #1278. It is proposed,
-not an implemented or qualified collector. Logical WAL truncation already runs
-on native object-store hosts. Physical immutable WAL pages are retained until
-the reader and durable-frontier protocol below is implemented and tested.
+This is the native reclamation protocol implemented for issue #1278. The
+collector uses the existing Antfly transactional page engine and immutable log.
+It is opt-in for new prefixes; local fault/allocation tests pass. Real-provider
+and final-artifact qualification are tracked separately below.
 
 ## Safety boundary and activation
 
@@ -17,10 +17,11 @@ assume that an old root stops being used after a Cloudflare request timeout.
 Manifest leases protect published artifacts; they do not automatically protect
 the WAL page tree captured by an unrelated native reader.
 
-Introduce an explicitly selected managed indexed layout, distinct from the
-current immutable `antfly-wal:indexed:1` marker. Initially activate it only on a
+The explicitly selected managed layout is `antfly-wal:indexed-managed:1`,
+distinct from the immutable `antfly-wal:indexed:1` marker. Initially activate it only on a
 new, empty prefix. Reject legacy and existing unmanaged indexed prefixes; an
-inventory without a marker must reject any preexisting WAL data. Coordinated
+inventory without a marker rejects both current objects and historical versions
+of preexisting WAL data, even when no current names remain. Coordinated
 upgrade/export-import is a separate protocol. Never reinterpret the existing
 marker as permission to collect its pages.
 
@@ -57,8 +58,8 @@ roots as the active-job pointer. Do not introduce an independently published
 `GC_CURRENT`: two object publications would create a takeover/stray-job race.
 
 Managed `beginCollection` must refuse a different active job. Retrying the same
-ID returns the same captured roots and retired epoch. Expose a status operation
-and a matching-ID finish CAS. Clear active roots only after durable completion;
+ID returns the same captured roots and retired epoch. Status, tracing and finish bind the job ID and retired epoch together; a reused
+ID cannot grant an older collector permission to trace or finish a newer job. Clear active roots only after durable completion;
 a different job cannot finish or mutate the current job. Reconcile a lost finish
 acknowledgement through a fresh HEAD read. Reopening first reads status and
 resumes its job; it must never recreate a cached old job after another finished.
@@ -74,11 +75,11 @@ sweep cursor and counters there. Use the existing immutable log's fencing,
 recovery and checkpoint protocol; do not invent another mutable database format.
 Each job owns its metadata forever until its HEAD pointer has been released.
 
-The earliest deletion time is recorded **after observing the committed barrier**:
-local observation time plus the full 30-second reader lifetime and a separately
-bounded clock-skew allowance (initially another 30 seconds). A timestamp sampled
-before a delayed barrier CAS does not prove a grace period. If clocks cannot meet
-the declared bound, stop collection; do not reduce grace to make tests faster.
+Deletion requires **60 seconds of local suspend-inclusive elapsed time after
+observing the committed barrier**. Restart or takeover waits the entire grace
+again. No cross-host wall timestamp authorizes deletion, so this protocol does
+not depend on a clock-skew estimate. Clock unavailability or rollback fails
+closed. The reader lifetime stays 30 seconds; tests do not shorten either limit.
 
 ## Bounded tracing and sweep
 
@@ -86,13 +87,16 @@ Seed the frontier with record, receipt and document roots. Read and authenticate
 each page with the same native tree decoder as serving. Persist a node's mark,
 pending children and advancement together in one transactional commit. A node
 can contain hundreds of child references, so retain an explicit child offset
-and commit bounded chunks, for example 60 children, within the existing
+and commit chunks of at most 60 children within the existing
 512-command ceiling. Never construct the entire reachable set in memory.
 
 Load phase and mark membership from the same captured transactional root. Never
 refresh the metadata root, retain a cached `sweep` phase, and interpret an empty
 replacement root as a complete mark set. A missing/corrupt mark page is an error.
-Durably close tracing before enabling deletion. Interrupted deletes are safe to
+Validate the authenticated metadata-tree row count against the job, seen/mark
+counts, remaining frontier and unfinished parent before enabling deletion. A
+copied completed phase over a reset mark map fails this check. Durably close
+tracing before enabling deletion. Interrupted deletes are safe to
 retry, and durable progress must never skip an unprocessed listing suffix.
 
 List only the exact namespace-owned WAL page prefix, in bounded pages. Validate
@@ -117,10 +121,12 @@ orphans without claiming that one listing catches every future upload.
 
 ## Scheduling and qualification
 
-Attach at most one bounded collector step per namespace to the native maintenance
-round after logical pruning. Preserve publication/foreground progress and the
-existing work budget. Use bounded local due hints, durable active-job status and
-idle backoff so a 25 ms runtime tick does not become 40 remote GC polls/second.
+Attach at most one offered collector step to a native maintenance round after
+publication, under the existing namespace work lease and pass cancellation.
+Logical pruning wakes the relevant namespace for a subsequent round. Preserve publication/foreground progress and the
+existing work budget. Use 64 fixed local namespace hints, durable active-job status, a global 250 ms
+step interval and five-minute idle backoff. Advance the namespace cursor only
+when offering a slot, avoiding tick/interval aliasing that starves tenants.
 Lost local hints cannot lose durable jobs. Writes may notify a scheduler without
 adding remote I/O to their acknowledgement path.
 
@@ -146,4 +152,48 @@ Required tests include all of the following:
 Run fault/allocation tests with an explicit deterministic test clock, then a
 real-provider reopen/collection/receipt test with actual grace. Rebuild and hash
 the resulting native and WASM artifacts before their full scale/ANN/live gate.
-The current qualified modules do not contain this proposed collector.
+Earlier sealed modules predate this collector and are not evidence for its
+final artifact. Their reports remain immutable; new evidence lives under
+`dist/qualification/native-gc-lab/`.
+
+## Implementation bounds and operating contract
+
+Enable native collection with `--indexed-wal true --wal-gc true` or
+`ANTFLY_SERVERLESS_INDEXED_WAL=true` and `ANTFLY_SERVERLESS_WAL_GC=true`. The
+managed format can only be selected on a pristine prefix. Disabling the collector
+leaves the persisted reader policy enforced. Coordinated legacy migration is
+not implemented.
+
+Each step has a 30-second transport/cancellation deadline and handles at most
+eight completed trace nodes, one partial branch continuation, or 16 inventory
+entries. Native metadata reads batch candidate marks against one captured root,
+limit each response to 64 KiB encoded JSON and each value to 16 KiB, and fail the
+whole read rather than truncate. The shared transactional API exposes optional
+encoded/value limits for other hosts too. Frontier commits checkpoint every
+eight commits. The job namespace includes namespace hash, retired epoch and ID.
+
+Version inventories support opaque GCS cursors and S3 key/version marker tuples.
+Reachable immutable keys retain all their versions. Historical HEAD deletion
+requires an explicit non-null version whose decoded managed epoch is retired;
+mutable `null` HEAD versions and HEAD delete markers are retained. Private job
+metadata is reclaimed only after HEAD releases its tuple. Unknown key shapes,
+foreign domains and active jobs are retained. Provider retention policies can
+prevent immediate physical-byte reclamation.
+
+Local coverage includes 193-child restart continuations, fresh restart grace,
+lost delete/finish/barrier acknowledgements, reused IDs, all allocation failures
+in initial marking and sweeping, missing authenticated mark pages, reset mark
+maps, newer-epoch writes, document/receipt roots, late orphan uploads, historical
+activation guards, opaque/tuple/null versions and four-tenant scheduler fairness.
+The real-provider opt-in test publishes 512 approximately 1 KiB documents, uses
+actual grace, writes after the barrier, collects and cleans job metadata, then
+reopens with collection disabled to verify every body and the original receipt.
+
+
+Transport cancellation polling is distinct from a fallible maintenance
+checkpoint. A transport watchdog polls shared request/shutdown flags and cached
+terminal failure; it never renews a lease or checks cancellation of its own
+separately canceled task. Explicit operation checkpoints still serialize lease
+renewals and source-pin checks and preserve their specific error. This shared
+runtime contract avoids turning a stopped HTTP watchdog into request-wide
+cancellation. Qualification preserves the initial provider failures separately.

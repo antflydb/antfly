@@ -4676,7 +4676,12 @@ pub const GraphSourceProtection = struct {
     }
 
     pub fn token(self: *GraphSourceProtection, io: std.Io) maintenance_cancellation.Token {
-        return .{ .io = io, .cooperative = .{ .ptr = self, .check_fn = check } };
+        return .{ .io = io, .cooperative = .{ .ptr = self, .check_fn = check, .is_cancelled_fn = isRequested } };
+    }
+
+    fn isRequested(ptr: *const anyopaque) bool {
+        const self: *const GraphSourceProtection = @ptrCast(@alignCast(ptr));
+        return if (self.parent) |parent| parent.isRequested() else false;
     }
 
     fn check(ptr: *const anyopaque) !void {

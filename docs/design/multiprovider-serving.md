@@ -139,10 +139,12 @@ recorded in `native-read-state.md`. No thresholds or resource caps are relaxed.
 
 General native hosts select `BootstrapConfig.indexed_wal` explicitly, then may
 enable `native_read_state` and `wal_document_index`. The standalone host exposes
-`--indexed-wal`, `--native-read-state`, and `--wal-document-index`, each taking a
+`--indexed-wal`, `--native-read-state`, `--wal-document-index`, and `--wal-gc`, each taking a
 boolean, plus `ANTFLY_SERVERLESS_INDEXED_WAL`,
 `ANTFLY_SERVERLESS_NATIVE_READ_STATE`, and
-`ANTFLY_SERVERLESS_WAL_DOCUMENT_INDEX`. All default off. The runtime's
+`ANTFLY_SERVERLESS_WAL_DOCUMENT_INDEX`, and `ANTFLY_SERVERLESS_WAL_GC`. All default off.
+The collector requires a pristine managed prefix; its persisted bounded reader
+policy remains enforced when the collector flag is disabled. The runtime's
 `openLiveSession` owns fresh published/WAL admission and supplies the shared
 cache to caller-owned sessions. Legacy HTTP diagnostic/export responses retain
 all original tail mutations and timestamps; they are not silently rewritten as
@@ -188,17 +190,12 @@ requires a locally authenticated profile; no AWS success is implied.
 The following work remains before deployment parity or the complete design can
 be called qualified:
 
-- Connect the existing durable collector frontier to generic native indexed-WAL
-  maintenance. The native pruner currently advances the logical WAL floor; that
-  alone does not reclaim obsolete immutable WAL page objects. Reuse the same
-  authenticated tracing, epoch barrier and record/receipt/document roots as the
-  hosted collector. Reader and in-progress publication protection must remain
-  effective across restart and takeover; do not introduce a latest-root-only
-  sweep. [The native collection protocol](native-indexed-wal-collection.md)
-  specifies new-prefix activation, persisted bounded root use, matching-ID
-  lifecycle, transactional child continuations, grace and provider-version
-  handling. It is proposed and not implemented. Until this is connected, retain
-  WAL pages conservatively.
+- Finish real-provider and final-artifact qualification of the implemented
+  [native collection protocol](native-indexed-wal-collection.md). The collector
+  now uses persisted bounded root use, epoch-and-ID fencing, native transactional
+  frontier/marks, bounded child continuations, restart-safe local grace and typed
+  version handling. It remains opt-in on pristine managed prefixes; earlier
+  sealed scale results predate this implementation.
 - Migrate each appropriate generic HTTP query entry point to the bounded live
   session interface with its own freshness contract. Existing diagnostic/export
   responses require mutation LSNs and timestamps and cannot use a collapsed

@@ -56,6 +56,8 @@ pub const BootstrapConfig = struct {
     indexed_wal: bool = false,
     native_read_state: bool = false,
     wal_document_index: bool = false,
+    /// Managed reader contract and physical collection, new WAL prefixes only.
+    wal_gc: bool = false,
     progress_uri: []const u8,
     catalog_uri: []const u8,
     s3_options: [5]?S3Options = .{ null, null, null, null, null },
@@ -400,6 +402,7 @@ pub const OwnedStack = struct {
     manifests: manifest_mod.ManifestStore,
     wal_impl: wal_object_store.ObjectStore,
     wal: wal_mod.WalStore,
+    wal_collector: ?*wal_mod.collector.Collector = null,
     progress_impl: progress_object_store.ObjectProgressStore,
     progress: catalog_mod.ProgressStore,
     work_lease_impl: build_mod.ObjectWorkLeaseStore,
@@ -436,6 +439,7 @@ pub const OwnedStack = struct {
         self.read_states = .{};
         self.read_state_enabled = cfg.native_read_state;
         self.point_index_enabled = cfg.wal_document_index;
+        self.wal_collector = null;
         self.query_cache = null;
         self.managed_query_embedder = null;
         self.dense_query_index_name = null;
@@ -500,7 +504,7 @@ pub const OwnedStack = struct {
         } else try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
         self.wal = self.wal_impl.walStore();
         // Establish unwind ownership before configuration can perform I/O.
-        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index }) catch |err| {
+        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index, .managed_collection = cfg.wal_gc }) catch |err| {
             self.wal.deinit();
             return err;
         };
@@ -510,6 +514,12 @@ pub const OwnedStack = struct {
         };
         self.wal = self.wal_impl.walStore();
         errdefer self.wal.deinit();
+        if (cfg.wal_gc) {
+            const collector = try alloc.create(wal_mod.collector.Collector);
+            collector.* = wal_mod.collector.Collector.init(alloc, self.wal_impl.indexed.?, io);
+            self.wal_collector = collector;
+        }
+        errdefer if (self.wal_collector) |collector| alloc.destroy(collector);
 
         var progress_target = try s3TargetAlloc(alloc, cfg.progress_uri);
         defer if (progress_target) |*target| target.deinit(alloc);
@@ -604,6 +614,7 @@ pub const OwnedStack = struct {
         }, &self.catalog, build_mod.Pruner.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal));
         var runtime_owned = true;
         errdefer if (runtime_owned) self.runtime.deinit();
+        self.runtime.wal_collector = self.wal_collector;
         const generated_lease_owner = if (cfg.work_lease_owner_id == null)
             try workLeaseOwnerIdAlloc(alloc, io)
         else
@@ -729,6 +740,7 @@ pub const OwnedStack = struct {
     pub fn deinit(self: *OwnedStack) void {
         self.read_states.deinit();
         self.runtime.deinit();
+        if (self.wal_collector) |collector| self.alloc.destroy(collector);
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_provider_runtime.deinit();
         if (self.dense_query_index_name) |index_name| self.alloc.free(index_name);
@@ -763,7 +775,7 @@ fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
 }
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
-    if ((cfg.native_read_state or cfg.wal_document_index) and !cfg.indexed_wal) return error.IndexedWalRequired;
+    if ((cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc) and !cfg.indexed_wal) return error.IndexedWalRequired;
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
@@ -1640,6 +1652,78 @@ test "serverless multiprovider public batches use bounded fresh transforms witho
     try std.testing.expectEqualStrings("{\"v\":2}", old_body);
 }
 
+test "serverless multiprovider native runtime rotates managed collection slots without tick aliasing" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    const cfg: BootstrapConfig = .{
+        .native_location = .{ .client = client, .bucket = "db", .prefix = "managed-runtime" },
+        .artifacts_uri = "file:///unused",
+        .manifests_uri = "file:///unused",
+        .wal_uri = "file:///unused",
+        .progress_uri = "file:///unused",
+        .catalog_uri = "file:///unused",
+        .indexed_wal = true,
+        .wal_gc = true,
+        .native_read_state = true,
+        .wal_document_index = true,
+        .publish_enabled = false,
+        .compaction_enabled = false,
+        .prune_enabled = false,
+        .enrichment_enabled = false,
+    };
+    {
+        var stack: OwnedStack = undefined;
+        try stack.init(a, cfg, std.testing.io);
+        defer stack.deinit();
+        var now: u64 = std.time.ns_per_s;
+        const Clock = struct {
+            fn read(raw: ?*const anyopaque) u64 {
+                return @as(*const u64, @ptrCast(@alignCast(raw.?))).*;
+            }
+        };
+        stack.wal_impl.indexed.?.read_clock = .{ .ptr = &now, .now_fn = Clock.read };
+        const tables = [_][]const u8{ "a", "b", "c", "d" };
+        for (tables) |table| {
+            try std.testing.expect(try stack.catalog.ensureTable(table, 100));
+            var result = try stack.api.ingestTableBatch(.{ .table_name = table, .timestamp_ns = 1, .mutations = &.{.{ .kind = .upsert, .doc_id = "row", .body = "alpha" }} });
+            defer result.deinit(a);
+        }
+        // 250 ms collection slots against 25 ms ticks must not repeatedly
+        // select only tenants 0 and 2. Advance the cursor on offered slots.
+        for (0..40) |_| {
+            now += 25 * std.time.ns_per_ms;
+            _ = try stack.runtime.runOnce();
+        }
+        for (tables) |table| {
+            const ns = try stack.catalog.resolveTableNamespaceAlloc(table);
+            defer a.free(ns);
+            try std.testing.expect(try stack.wal_impl.indexed.?.collectionStatus(ns, null) != null);
+        }
+        const stats = stack.runtime.metricsSnapshot();
+        try std.testing.expect(stats.wal_collection_steps >= 4);
+        try std.testing.expect(stats.wal_collection_marked_pages >= 4);
+    }
+    {
+        var disabled = cfg;
+        disabled.wal_gc = false;
+        var reopened: OwnedStack = undefined;
+        try reopened.init(a, disabled, std.testing.io);
+        defer reopened.deinit();
+        try std.testing.expect(reopened.wal_collector == null);
+        try std.testing.expect(reopened.wal_impl.indexed.?.managed_reads);
+        const ns = try reopened.catalog.resolveTableNamespaceAlloc("a");
+        defer a.free(ns);
+        const live = try reopened.openLiveSession(a, ns, .{});
+        defer live.deinit();
+        const body = (try live.lookupAlloc("row")).?;
+        defer a.free(body);
+        try std.testing.expectEqualStrings("alpha", body);
+    }
+}
+
 test "serverless multiprovider live runtime persists indexed receipts and fresh reads across reopen" {
     const enabled = std.c.getenv("ANTFLY_PROVIDER_LIVE") orelse return error.SkipZigTest;
     if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
@@ -1780,5 +1864,133 @@ test "serverless multiprovider live runtime persists indexed receipts and fresh 
         defer a.free(body);
         try std.testing.expectEqualStrings("{\"v\":2}", body);
         try std.testing.expectEqual(@as(u64, 1), try live.countDocuments());
+    }
+}
+
+test "serverless multiprovider live managed collection preserves published bodies and original receipts across reopen" {
+    const enabled = std.c.getenv("ANTFLY_PROVIDER_GC_LIVE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
+    const uri = std.mem.span(std.c.getenv("ANTFLY_QUALIFY_STORAGE_URI") orelse return error.MissingQualificationStorageUri);
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const cfg: BootstrapConfig = .{
+        .artifacts_uri = try std.fmt.allocPrint(scratch, "{s}/managed/artifacts", .{uri}),
+        .manifests_uri = try std.fmt.allocPrint(scratch, "{s}/managed/manifests", .{uri}),
+        .wal_uri = try std.fmt.allocPrint(scratch, "{s}/managed/wal", .{uri}),
+        .progress_uri = try std.fmt.allocPrint(scratch, "{s}/managed/progress", .{uri}),
+        .catalog_uri = try std.fmt.allocPrint(scratch, "{s}/managed/catalog", .{uri}),
+        .indexed_wal = true,
+        .wal_gc = true,
+        .native_read_state = true,
+        .wal_document_index = true,
+        .publish_enabled = false,
+        .compaction_enabled = false,
+        .prune_enabled = false,
+        .enrichment_enabled = false,
+    };
+    const mutations = try scratch.alloc(api_mod.DocumentMutation, 512);
+    const padding: [1000]u8 = @splat('x');
+    for (mutations, 0..) |*mutation, i| mutation.* = .{
+        .kind = .upsert,
+        .doc_id = try std.fmt.allocPrint(scratch, "doc-{d:0>4}", .{i}),
+        .body = try std.fmt.allocPrint(scratch, "{{\"value\":{d},\"padding\":\"{s}\"}}", .{ i, &padding }),
+    };
+    {
+        var stack: OwnedStack = undefined;
+        try stack.init(a, cfg, std.testing.io);
+        defer stack.deinit();
+        try std.testing.expect(try stack.catalog.ensureTable("docs", 100));
+        var seed = try stack.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "gc-seed", .timestamp_ns = 1, .mutations = mutations });
+        defer seed.deinit(a);
+        try std.testing.expectEqual(@as(u64, 512), seed.end_lsn);
+        var published = try stack.catalog.buildTable("docs");
+        defer published.deinit(a);
+        try std.testing.expect(published.published);
+        // Native pruning retires an older published generation. With only
+        // the initial generation there is no retired cut to truncate yet.
+        var advance = try stack.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "gc-published", .timestamp_ns = 2, .mutations = mutations[511..] });
+        defer advance.deinit(a);
+        try std.testing.expectEqual(@as(u64, 513), advance.end_lsn);
+        var second = try stack.catalog.buildTable("docs");
+        defer second.deinit(a);
+        try std.testing.expect(second.published);
+        const ns = try stack.catalog.resolveTableNamespaceAlloc("docs");
+        defer a.free(ns);
+        var pruned = try stack.runtime.pruner.pruneNamespace(ns, 1);
+        defer pruned.deinit(a);
+        try std.testing.expect(!pruned.gc_watermark_conflict and !pruned.work_lease_conflict);
+        try std.testing.expect(pruned.wal_records_removed > 0);
+        const indexed = stack.wal_impl.indexed.?;
+        const started = indexed.read_clock.read();
+        var newer = false;
+        var finished = false;
+        var deleted: usize = 0;
+        var marked: usize = 0;
+        for (0..1200) |_| {
+            if (indexed.read_clock.read() - started > 300 * std.time.ns_per_s) return error.CollectionQualificationTimedOut;
+            const result = try stack.wal_collector.?.step(ns, null);
+            deleted += result.deleted_objects;
+            marked += result.marked_pages;
+            if (!newer and try indexed.collectionStatus(ns, null) != null) {
+                var update = try stack.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "gc-newer", .timestamp_ns = 3, .mutations = &.{.{ .kind = .upsert, .doc_id = mutations[0].doc_id, .body = "{\"value\":-1}" }} });
+                defer update.deinit(a);
+                try std.testing.expectEqual(@as(u64, 514), update.end_lsn);
+                newer = true;
+            }
+            if (result.phase == .finished) {
+                finished = true;
+                break;
+            }
+            try std.testing.io.sleep(.fromMilliseconds(250), .awake);
+        }
+        std.debug.print("managed collection: newer={} finished={} marked={d} deleted={d} elapsed_ms={d}\n", .{ newer, finished, marked, deleted, (indexed.read_clock.read() - started) / std.time.ns_per_ms });
+        try std.testing.expect(newer);
+        try std.testing.expect(finished);
+        try std.testing.expect(deleted > 0);
+        try std.testing.expect(marked > 0);
+        try std.testing.expect(indexed.read_clock.read() - started >= @import("../wal/collector.zig").Collector.grace_ns);
+        try std.testing.expect(try indexed.collectionStatus(ns, null) == null);
+        // A completed job's private native metadata is reclaimed in bounded
+        // later slots, without starting another collection before idle backoff.
+        var idle = false;
+        for (0..1200) |_| {
+            const result = try stack.wal_collector.?.step(ns, null);
+            if (result.phase == .idle) {
+                idle = true;
+                break;
+            }
+            try std.testing.io.sleep(.fromMilliseconds(250), .awake);
+        }
+        try std.testing.expect(idle);
+        std.debug.print("managed collection: marked={d} deleted={d} elapsed_ms={d}\n", .{ marked, deleted, (indexed.read_clock.read() - started) / std.time.ns_per_ms });
+    }
+    {
+        var disabled = cfg;
+        disabled.wal_gc = false;
+        var reopened: OwnedStack = undefined;
+        try reopened.init(a, disabled, std.testing.io);
+        defer reopened.deinit();
+        try std.testing.expect(reopened.wal_collector == null and reopened.wal_impl.indexed.?.managed_reads);
+        var replay = try reopened.api.ingestTableBatch(.{ .table_name = "docs", .operation_id = "gc-seed", .timestamp_ns = 1, .mutations = mutations });
+        defer replay.deinit(a);
+        try std.testing.expectEqual(@as(u64, 512), replay.end_lsn);
+        const ns = try reopened.catalog.resolveTableNamespaceAlloc("docs");
+        defer a.free(ns);
+        const live = try reopened.openLiveSession(a, ns, .{ .io = std.testing.io });
+        defer live.deinit();
+        try std.testing.expectEqual(@as(u64, 512), try live.countDocuments());
+        // Bound each verification session too. Qualification must not depend
+        // on extending a root lifetime for a long sequence of provider GETs.
+        for (0..16) |batch| {
+            const verification = try reopened.openLiveSession(a, ns, .{ .io = std.testing.io });
+            defer verification.deinit();
+            for (mutations[batch * 32 ..][0..32], batch * 32..) |mutation, i| {
+                const body = (try verification.lookupAlloc(mutation.doc_id)).?;
+                defer a.free(body);
+                try std.testing.expectEqualStrings(if (i == 0) "{\"value\":-1}" else mutation.body.?, body);
+            }
+        }
     }
 }

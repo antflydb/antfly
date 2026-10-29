@@ -33,7 +33,7 @@ pub const ObjectStore = struct {
     bucket: []u8,
     prefix: []u8,
     mutex: std.atomic.Mutex = .unlocked,
-    const Layout = enum(u8) { legacy = 1, indexed = 2 };
+    const Layout = enum(u8) { legacy = 1, indexed = 2, managed_indexed = 3 };
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -148,6 +148,7 @@ pub const ObjectStore = struct {
         defer result.deinit(self.alloc);
         if (std.mem.eql(u8, result.body, "antfly-wal:legacy:1")) return .legacy;
         if (std.mem.eql(u8, result.body, "antfly-wal:indexed:1")) return .indexed;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed-managed:1")) return .managed_indexed;
         return error.UnsupportedWalLayout;
     }
     fn ensureLayout(self: *ObjectStore, wanted: Layout, create: bool) !void {
@@ -164,7 +165,11 @@ pub const ObjectStore = struct {
         if (!create) return;
         const key = try self.formatKey();
         defer self.alloc.free(key);
-        const value = if (wanted == .legacy) "antfly-wal:legacy:1" else "antfly-wal:indexed:1";
+        const value = switch (wanted) {
+            .legacy => "antfly-wal:legacy:1",
+            .indexed => "antfly-wal:indexed:1",
+            .managed_indexed => "antfly-wal:indexed-managed:1",
+        };
         var published = self.client.compareAndPut(self.bucket, key, value, null, .{}) catch |err| {
             // The immutable selection may have committed before an ACK was
             // lost, or another compatible opener may have selected it first.
@@ -184,33 +189,47 @@ pub const ObjectStore = struct {
 
     /// Explicit format selection. Existing legacy WALs must be migrated into a
     /// new prefix; activation may never silently hide acknowledged records.
-    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, inline_tail: bool = true }) !void {
+    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, inline_tail: bool = true, managed_collection: bool = false }) !void {
         if (self.indexed != null) return error.WalAlreadyConfigured;
         const selected = try self.readLayout();
         if (selected == .legacy) return error.LegacyWalMigrationRequired;
-        if (selected == .indexed) self.layout.store(@backingInt(Layout.indexed), .release);
+        if (options.managed_collection and selected == .indexed) return error.ManagedWalMigrationRequired;
+        const wanted: Layout = if (options.managed_collection or selected == .managed_indexed) .managed_indexed else .indexed;
+        if (wanted == .managed_indexed and !@import("indexed_object_store.zig").IndexedObjectStore.managedClockAvailable()) return error.ManagedWalClockUnavailable;
+        if (selected) |layout| self.layout.store(@backingInt(layout), .release);
         if (selected == null) {
             var cursor: ?[]u8 = null;
             defer if (cursor) |value| self.alloc.free(value);
             const listing_prefix = if (self.prefix.len == 0) try self.alloc.dupe(u8, "") else try std.fmt.allocPrint(self.alloc, "{s}/", .{self.prefix});
             defer self.alloc.free(listing_prefix);
+            // A deleted current name does not prove a pristine versioned
+            // prefix. Older unbounded readers may still hold historical roots.
+            if (wanted == .managed_indexed and try self.client.supportsObjectVersions(self.bucket, null)) {
+                var versions = try self.client.listObjectVersions(self.bucket, .{ .prefix = listing_prefix, .max_keys = 1 });
+                defer versions.deinit(self.alloc);
+                if (versions.entries.len != 0 or versions.is_truncated) return error.ManagedWalMigrationRequired;
+            }
             while (true) {
                 var page = try self.client.listObjects(self.bucket, .{ .prefix = listing_prefix, .continuation_token = cursor, .max_keys = 1000 });
                 defer page.deinit(self.alloc);
-                for (page.entries) |item| if (std.mem.endsWith(u8, item.key, "/wal.log")) return error.LegacyWalMigrationRequired;
+                for (page.entries) |item| {
+                    if (std.mem.endsWith(u8, item.key, "/wal.log")) return error.LegacyWalMigrationRequired;
+                    if (wanted == .managed_indexed) return error.ManagedWalMigrationRequired;
+                }
                 if (page.next_continuation_token == null) break;
                 const next = try self.alloc.dupe(u8, page.next_continuation_token orelse return error.InvalidObjectListing);
                 if (cursor) |value| self.alloc.free(value);
                 cursor = next;
             }
         }
-        try self.ensureLayout(.indexed, true);
+        try self.ensureLayout(wanted, true);
         const indexed = try self.alloc.create(@import("indexed_object_store.zig").IndexedObjectStore);
         errdefer self.alloc.destroy(indexed);
         indexed.* = try @import("indexed_object_store.zig").IndexedObjectStore.init(self.alloc, self.client, self.bucket, self.prefix);
         indexed.read_state_enabled = options.read_state;
         indexed.document_index_enabled = options.document_index;
         indexed.inline_tail_enabled = options.inline_tail;
+        indexed.managed_reads = wanted == .managed_indexed;
         self.indexed = indexed;
     }
     pub fn deinit(self: *ObjectStore) void {
@@ -740,6 +759,46 @@ test "serverless multiprovider WAL format selection survives lost acknowledgemen
     defer future.deinit();
     try std.testing.expectError(error.UnsupportedWalLayout, future.enableIndexed(.{}));
     try std.testing.expectError(error.UnsupportedWalLayout, future.selectLegacy());
+}
+
+test "serverless multiprovider managed WAL activates only on a new prefix and persists its contract with collection disabled" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var backing = memory.client();
+    try backing.makeBucket("db");
+    var old = try ObjectStore.initWithClient(a, backing, "db", "old");
+    defer old.deinit();
+    try old.enableIndexed(.{});
+    var upgrade = try ObjectStore.initWithClient(a, backing, "db", "old");
+    defer upgrade.deinit();
+    try std.testing.expectError(error.ManagedWalMigrationRequired, upgrade.enableIndexed(.{ .managed_collection = true }));
+    var object = try backing.putObject("db", "unmarked/wal-v1/unknown/HEAD", "unmanaged", .{});
+    object.deinit(a);
+    var unmarked = try ObjectStore.initWithClient(a, backing, "db", "unmarked");
+    defer unmarked.deinit();
+    try std.testing.expectError(error.ManagedWalMigrationRequired, unmarked.enableIndexed(.{ .managed_collection = true }));
+    try std.testing.expectError(error.FileNotFound, backing.getObject("db", "unmarked/.antfly/WAL_FORMAT", .{}));
+
+    var faults = objectstore.ScriptedFaultClient.init(a, backing);
+    defer faults.deinit();
+    faults.commitNextPutThenFail(error.InjectedManagedSelectionAckLoss);
+    var selected = try ObjectStore.initWithClient(a, faults.client(), "db", "managed");
+    defer selected.deinit();
+    try selected.enableIndexed(.{ .managed_collection = true });
+    try std.testing.expect(selected.indexed.?.managed_reads);
+    _ = try selected.append("docs", 1, "alpha");
+    var reopened = try ObjectStore.initWithClient(a, backing, "db", "managed");
+    defer reopened.deinit();
+    // Turning off collection cannot turn off an already persisted contract.
+    try reopened.enableIndexed(.{});
+    try std.testing.expect(reopened.indexed.?.managed_reads);
+    const records = try reopened.indexed.?.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 1 });
+    defer wal_types.freeRecords(a, records);
+    try std.testing.expectEqualStrings("alpha", records[0].payload);
+    var legacy = try ObjectStore.initWithClient(a, backing, "db", "managed");
+    defer legacy.deinit();
+    try std.testing.expectError(error.WalLayoutMismatch, legacy.selectLegacy());
 }
 
 test "serverless multiprovider concurrent layout selection cannot create a shadow legacy WAL" {

@@ -32,6 +32,7 @@ const CliConfig = struct {
     indexed_wal: ?bool = null,
     native_read_state: ?bool = null,
     wal_document_index: ?bool = null,
+    wal_gc: ?bool = null,
     progress_uri: ?[]const u8 = null,
     catalog_uri: ?[]const u8 = null,
     query_cache_dir: ?[]const u8 = null,
@@ -170,6 +171,7 @@ pub fn runFromIterator(
         .indexed_wal = cli.indexed_wal orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_INDEXED_WAL", false),
         .native_read_state = cli.native_read_state orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_NATIVE_READ_STATE", false),
         .wal_document_index = cli.wal_document_index orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_DOCUMENT_INDEX", false),
+        .wal_gc = cli.wal_gc orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_GC", false),
         .s3_options = configured_uris.s3_options,
         .gcs_options = configured_uris.gcs_options,
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
@@ -360,6 +362,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--wal-document-index")) {
             cfg.wal_document_index = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wal-gc")) {
+            cfg.wal_gc = try parseBoolArg(args.next() orelse return error.InvalidArguments);
             continue;
         }
         if (std.mem.eql(u8, arg, "--query-cache-dir")) {
@@ -728,6 +734,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --indexed-wal <bool> (requires an indexed or empty WAL prefix)
         \\  --native-read-state <bool>
         \\  --wal-document-index <bool>
+        \\  --wal-gc <bool> (managed indexed WAL, new prefix only)
         \\  --query-cache-dir <path>
         \\  --query-cache-max-bytes <bytes>
         \\  --manifest-write-version <18>

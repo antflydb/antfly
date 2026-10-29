@@ -41,6 +41,14 @@ pub const Request = struct {
     checkpoint_commits: u8 = 64,
     wal_commit: ?WalCommit = null,
     inline_read_set: ?InlineReadSet = null,
+    read_limits: ?ReadLimits = null,
+};
+/// Opt-in bounds checked before retaining/encoding read candidates. Exceeding
+/// a limit fails the whole read, never a silently shortened result. Existing
+/// hosts retain their existing admission when no limits are supplied.
+pub const ReadLimits = struct {
+    max_encoded_bytes: usize,
+    max_value_bytes: usize,
 };
 pub const InlineReadSet = struct {
     keys: []const []const u8,
@@ -81,6 +89,28 @@ const HotRoot = struct { format: u8 = 2, metadata_tree: ?tree.Ref = null, wal: H
 const InlineRows = struct { exact: []HotRecord = &.{}, prefix: ?[]const u8 = null, selected: ?HotRecord = null };
 const ReadRoot = struct { format: u8 = 3, metadata_tree: ?tree.Ref = null, wal: ?HotRecord = null, publication: ?HotRecord = null, read_rows: InlineRows };
 const Row = struct { key: []const u8, value: []const u8 };
+const ReadBudget = struct {
+    limits: ?ReadLimits,
+    encoded: u64,
+    fn charge(self: *@This(), row: Row) !void {
+        const limits = self.limits orelse return;
+        if (row.value.len > limits.max_value_bytes) return error.CoordinatorResultBudgetExceeded;
+        var buffer: [256]u8 = undefined;
+        var counter = std.Io.Writer.Discarding.init(&buffer);
+        try std.json.Stringify.value(row, .{}, &counter.writer);
+        self.encoded = std.math.add(u64, self.encoded, counter.fullCount() + 1) catch return error.CoordinatorResultBudgetExceeded;
+        if (self.encoded > limits.max_encoded_bytes) return error.CoordinatorResultBudgetExceeded;
+    }
+    fn encode(self: *@This(), alloc: A, value: anytype) ![]u8 {
+        if (self.limits) |limits| {
+            var buffer: [256]u8 = undefined;
+            var counter = std.Io.Writer.Discarding.init(&buffer);
+            try std.json.Stringify.value(value, .{}, &counter.writer);
+            if (counter.fullCount() > limits.max_encoded_bytes) return error.CoordinatorResultBudgetExceeded;
+        }
+        return std.json.Stringify.valueAlloc(alloc, value, .{});
+    }
+};
 const Root = struct {
     page: ?tree.Ref = null,
     hot: ?HotRoot = null,
@@ -251,7 +281,11 @@ pub const Context = struct {
     cancellation: ?objects.CancellationToken = null,
 
     pub fn execute(self: Context, req: Request) ![]u8 {
+        if (req.commands.len > 512) return error.CoordinatorBatchExceeded;
         if (req.inline_read_set) |rules| try rules.validate();
+        if (req.read_limits != null and req.action != .read and req.action != .observe_read) return error.InvalidCoordinatorReadLimits;
+        if (req.read_limits) |limits| if (limits.max_encoded_bytes == 0 or limits.max_encoded_bytes > 8 * 1024 * 1024 or limits.max_value_bytes == 0 or limits.max_value_bytes > tree.max_record_bytes) return error.InvalidCoordinatorReadLimits;
+        var read_budget = ReadBudget{ .limits = req.read_limits, .encoded = 32 + req.commands.len * 3 };
         if (req.checkpoint_commits < 8 or req.checkpoint_commits > 64 or (req.checkpoint_commits & (req.checkpoint_commits - 1)) != 0) return error.InvalidCoordinatorCheckpointCadence;
         var metadata = std.heap.ArenaAllocator.init(self.alloc);
         defer metadata.deinit();
@@ -300,6 +334,7 @@ pub const Context = struct {
             for (req.commands) |command| {
                 if (command.kind != .get) return error.CoordinatorReadRequired;
                 const value = try root.get(m, self.alloc, cache.store(), command.key);
+                if (value) |bytes| try read_budget.charge(.{ .key = command.key, .value = bytes });
                 try output.append(m, if (value) |bytes| try m.dupe(Row, &.{.{ .key = command.key, .value = bytes }}) else &.{});
             }
             var selected: ?Row = null;
@@ -309,13 +344,15 @@ pub const Context = struct {
                     if (record.value != null and std.mem.startsWith(u8, record.key, prefix)) selected = .{ .key = record.key, .value = record.value.? };
                 };
             }
-            return std.json.Stringify.valueAlloc(self.alloc, .{ .state = state, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected }, .{});
+            if (selected) |row| try read_budget.charge(row);
+            return read_budget.encode(self.alloc, .{ .state = state, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
         }
         if (req.action == .read) {
             var output = std.ArrayList([]const Row).empty;
             for (req.commands) |command| {
                 if (command.kind == .get) {
                     const value = try root.get(m, self.alloc, cache.store(), command.key);
+                    if (value) |bytes| try read_budget.charge(.{ .key = command.key, .value = bytes });
                     const rows = if (value) |bytes| try m.dupe(Row, &.{.{ .key = command.key, .value = bytes }}) else &.{};
                     try output.append(m, rows);
                 } else if (command.kind == .list) {
@@ -328,11 +365,14 @@ pub const Context = struct {
                     while (rows.items.len < command.limit) {
                         const row = (try cursor.next()) orelse break;
                         if (command.after.len != 0 and std.mem.order(u8, row.key, command.after) != .gt) continue;
+                        try read_budget.charge(.{ .key = row.key, .value = row.value });
                         try rows.append(m, .{ .key = try m.dupe(u8, row.key), .value = try m.dupe(u8, row.value) });
                     }
                     if (root.hot) |hot| for ([_]HotRecord{ hot.wal, hot.publication }) |record| {
                         if (record.value) |value| if (std.mem.startsWith(u8, record.key, command.key) and (command.after.len == 0 or std.mem.order(u8, record.key, command.after) == .gt)) {
-                            try rows.append(m, .{ .key = record.key, .value = try compactRecord(m, value, false) });
+                            const decoded = try compactRecord(m, value, false);
+                            try read_budget.charge(.{ .key = record.key, .value = decoded });
+                            try rows.append(m, .{ .key = record.key, .value = decoded });
                         };
                     };
                     std.mem.sort(Row, rows.items, {}, struct {
@@ -343,7 +383,7 @@ pub const Context = struct {
                     try output.append(m, rows.items[0..@min(rows.items.len, command.limit)]);
                 } else return error.CoordinatorReadRequired;
             }
-            return std.json.Stringify.valueAlloc(self.alloc, .{ .results = output.items }, .{});
+            return read_budget.encode(self.alloc, .{ .results = output.items });
         }
         if (req.action == .commit_wal) {
             const commit = req.wal_commit orelse return error.CoordinatorWalCommitRequired;
@@ -459,6 +499,41 @@ fn upperBound(a: A, prefix: []const u8) !?[]u8 {
         return result;
     }
     return null;
+}
+
+test "object-native read budgets account exact JSON expansion and never truncate current values" {
+    const a = std.testing.allocator;
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    const ctx = Context{ .alloc = a, .client = client, .bucket = "db", .prefix = "read-limits", .namespace = "rows", .io = std.testing.io };
+    const Header = struct { state: journal.State };
+    const initial = try ctx.execute(.{ .action = .begin, .owner = @splat(1) });
+    defer a.free(initial);
+    var start = try std.json.parseFromSlice(Header, a, initial, .{ .ignore_unknown_fields = true });
+    defer start.deinit();
+    const ascii: [512]u8 = @splat('x');
+    const control: [512]u8 = @splat(1);
+    const committed = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = start.value.state, .commands = &.{ .{ .kind = .put, .key = "ascii", .value = &ascii }, .{ .kind = .put, .key = "control", .value = &control } } });
+    defer a.free(committed);
+    var current = try std.json.parseFromSlice(Header, a, committed, .{ .ignore_unknown_fields = true });
+    defer current.deinit();
+    const limits = ReadLimits{ .max_encoded_bytes = 700, .max_value_bytes = 1024 };
+    const accepted = try ctx.execute(.{ .action = .read, .owner = @splat(1), .state = current.value.state, .commands = &.{.{ .kind = .get, .key = "ascii" }}, .read_limits = limits });
+    defer a.free(accepted);
+    var decoded = try std.json.parseFromSlice(struct { results: [][]Row }, a, accepted, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualSlices(u8, &ascii, decoded.value.results[0][0].value);
+    try std.testing.expectError(error.CoordinatorResultBudgetExceeded, ctx.execute(.{ .action = .read, .owner = @splat(1), .state = current.value.state, .commands = &.{.{ .kind = .get, .key = "control" }}, .read_limits = limits }));
+    try std.testing.expectError(error.CoordinatorResultBudgetExceeded, ctx.execute(.{ .action = .read, .owner = @splat(1), .state = current.value.state, .commands = &.{.{ .kind = .list, .key = "", .limit = 2 }}, .read_limits = limits }));
+    try std.testing.expectError(error.CoordinatorResultBudgetExceeded, ctx.execute(.{ .action = .observe_read, .owner = @splat(1), .state = current.value.state, .read_limits = .{ .max_encoded_bytes = 64, .max_value_bytes = 1024 } }));
+    try std.testing.expectError(error.CoordinatorResultBudgetExceeded, ctx.execute(.{ .action = .read, .owner = @splat(1), .state = current.value.state, .read_limits = .{ .max_encoded_bytes = 1, .max_value_bytes = 1024 } }));
+    const original = try ctx.execute(.{ .action = .read, .owner = @splat(1), .state = current.value.state, .commands = &.{.{ .kind = .get, .key = "control" }} });
+    defer a.free(original);
+    var full = try std.json.parseFromSlice(struct { results: [][]Row }, a, original, .{});
+    defer full.deinit();
+    try std.testing.expectEqualSlices(u8, &control, full.value.results[0][0].value);
 }
 
 test "object-native inline read capsules preserve ordered authority through updates and pin rotation" {
