@@ -2191,6 +2191,7 @@ buffers are released on every error path; inline payloads need no external view.
 Covering gathers publish exactly their requested source columns. Physical row
 references and authenticated identity witnesses remain outside `_source`;
 selecting a covering path cannot inject `_id` or `_type` into wildcard results.
-Declared metadata columns retain their stored values and nulls. Explicit virtual
-metadata references (including computed-output dependencies) can request generated
-identity and default type values independently of the physical access path.
+Declared `_type` columns retain their stored values and nulls; the index's
+default document type does not invent a source column. Explicit virtual `_id`
+references (including computed-output dependencies) request generated identity
+independently of the physical access path, matching the provider cursor contract.

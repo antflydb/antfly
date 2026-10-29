@@ -1020,7 +1020,7 @@ fn coveringPage(a: A, scratch: A, table: catalog.Table, block: local.sql_spill.C
                 if (cell.sql_null) break :value .null;
                 if (cell.numeric != null or cell.array != null) break :value try local.sql_runtime.encodeStorageDatum(pa, cell, try table.column(field), @import("lake_index_aggregate_artifact.zig").max_block_bytes);
                 break :value try local.api_json_helpers.cloneJsonValue(pa, cell.value);
-            } else if (std.mem.eql(u8, field, "_id")) .{ .string = try local.storage_rowsource_identity.allocId(pa, ref) } else .{ .string = "row" };
+            } else .{ .string = try local.storage_rowsource_identity.allocId(pa, ref) };
             try page.setNativeCell(row, column, wire, sql_null);
         }
     }
@@ -1033,11 +1033,8 @@ fn coveringSource(a: A, scratch: A, table: catalog.Table, root: ordered.Root, bl
     return page.row(0);
 }
 
-fn generatedCoveringField(table: catalog.Table, field: []const u8) bool {
-    if (std.mem.eql(u8, field, "_id")) return true;
-    if (!std.mem.eql(u8, field, "_type")) return false;
-    for (table.columns) |column| if (std.mem.eql(u8, column.name, field)) return false;
-    return true;
+fn generatedCoveringField(_: catalog.Table, field: []const u8) bool {
+    return std.mem.eql(u8, field, "_id");
 }
 
 /// Relative work for vectorized projected decoding/evaluation. Inventory bytes
