@@ -1098,14 +1098,6 @@
    }
   },
   {
-   "name": "termite_apply_linear_argmax_1x",
-   "family": "sampling",
-   "generated": false,
-   "source": {
-    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
-   }
-  },
-  {
    "name": "termite_apply_linear_bf16_1x",
    "family": "matvec",
    "generated": false,
