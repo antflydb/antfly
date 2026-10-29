@@ -54,7 +54,9 @@ fn canonicalAuthoredPath(b: *std.Build, path: std.Build.LazyPath) std.Build.Lazy
 fn authoredExternalPath(b: *std.Build, path: std.Build.LazyPath) std.Build.LazyPath {
     switch (path) {
         .src_path => |source| {
-            if (std.mem.startsWith(u8, source.sub_path, "../")) return canonicalAuthoredPath(b, path);
+            if (std.mem.startsWith(u8, source.sub_path, "../") or
+                std.mem.startsWith(u8, source.sub_path, "..\\"))
+                return canonicalAuthoredPath(b, path);
         },
         else => {},
     }
