@@ -1,6 +1,6 @@
 "use client";
 
-import * as AlertDialogPrimitive from "@radix-ui/react-alert-dialog";
+import { AlertDialog as AlertDialogPrimitive } from "radix-ui";
 import type * as React from "react";
 
 import { buttonVariants } from "@/components/ui/button";
@@ -76,7 +76,10 @@ function AlertDialogFooter({ className, ...props }: React.ComponentProps<"div">)
   return (
     <div
       data-slot="alert-dialog-footer"
-      className={cn("flex flex-col-reverse gap-2 border-t border-border pt-5 sm:flex-row sm:justify-end", className)}
+      className={cn(
+        "flex flex-col-reverse gap-2 border-t border-border pt-5 sm:flex-row sm:justify-end",
+        className
+      )}
       {...props}
     />
   );
@@ -89,7 +92,10 @@ function AlertDialogTitle({
   return (
     <AlertDialogPrimitive.Title
       data-slot="alert-dialog-title"
-      className={cn("font-sans text-lg leading-tight font-medium tracking-[-0.01em] text-foreground", className)}
+      className={cn(
+        "font-sans text-lg leading-tight font-medium tracking-[-0.01em] text-foreground",
+        className
+      )}
       {...props}
     />
   );

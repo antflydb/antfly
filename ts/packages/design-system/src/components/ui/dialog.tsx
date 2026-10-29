@@ -118,7 +118,10 @@ function DialogFooter({
   return (
     <div
       data-slot="dialog-footer"
-      className={cn("flex flex-col-reverse gap-2 border-t border-border pt-5 sm:flex-row sm:justify-end", className)}
+      className={cn(
+        "flex flex-col-reverse gap-2 border-t border-border pt-5 sm:flex-row sm:justify-end",
+        className
+      )}
       {...props}
     >
       {children}
@@ -135,7 +138,10 @@ function DialogTitle({ className, ...props }: React.ComponentProps<typeof Dialog
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
-      className={cn("font-sans text-lg leading-tight font-medium tracking-[-0.01em] text-foreground", className)}
+      className={cn(
+        "font-sans text-lg leading-tight font-medium tracking-[-0.01em] text-foreground",
+        className
+      )}
       {...props}
     />
   );

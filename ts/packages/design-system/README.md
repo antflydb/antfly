@@ -1,6 +1,6 @@
 # @antfly/design-system
 
-The official Antfly component library. shadcn/ui primitives (new-york style), compound components, and brand blocks, built on Tailwind v4 with the Aeonik typeface and OKLch design tokens.
+The official Antfly component library. shadcn/ui primitives (radix-vega style, on the `radix-ui` package), compound components, and brand blocks, built on Tailwind v4 with the Aeonik typeface and OKLch design tokens.
 
 ## Install
 
@@ -8,7 +8,7 @@ The official Antfly component library. shadcn/ui primitives (new-york style), co
 pnpm add @antfly/design-system
 ```
 
-Peer deps (install in your app): `react ^18 || ^19`, `react-dom ^18 || ^19`, `tailwindcss ^4`.
+Peer deps (install in your app): `react ^19`, `react-dom ^19`, `tailwindcss ^4`.
 
 ## Wire up Tailwind (Next.js / Tailwind v4)
 
@@ -21,6 +21,10 @@ Peer deps (install in your app): `react ^18 || ^19`, `react-dom ^18 || ^19`, `ta
 ```
 
 No PostCSS config needed beyond Tailwind v4 defaults. Dark mode is class-based (`<html class="dark">`).
+
+`theme` also defines the state variants the shadcn components use (`data-open:`,
+`data-checked:`, `data-disabled:`, and the rest) and the `scroll-fade-*` and
+`shimmer` utilities, so an app that imports it can use them too.
 
 If your app CSS uses `@apply`, import the raw Tailwind contract instead of the
 compiled stylesheet:
@@ -54,7 +58,8 @@ export function SignInCard() {
 
 ## Exports
 
-- `.` — all components and `cn()`
+- `.` — all components, `cn()`, and the code highlighting helpers
+  (`useHighlightedCode`, `highlightCode`)
 - `./styles.css` — tokens, fonts, Tailwind theme
 - `./tokens` — raw CSS variables only (no Tailwind directives)
 - `./theme` — Tailwind v4 theme mappings for canonical tokens
@@ -98,6 +103,43 @@ light on dark) — the everyday primary. The amber fill lives on
 `variant="brand"` (Button and Badge alike) and is reserved for special,
 infrequent actions — creating a table, not applying a filter — at most once
 per screen. The default Badge is a quiet hairline chip.
+
+## Building blocks
+
+Reach for these before hand-rolling the same thing in an app.
+
+- **Spinner** for anything loading. It carries `role="status"` and a label,
+  so screen readers announce it. Put it inside a disabled Button while an
+  action runs.
+- **Kbd** and **KbdGroup** for keyboard shortcuts. Keys are data, so they
+  render in mono.
+- **Item** for lists of things: tables, models, connections. Stack Items in
+  an `ItemGroup` as border-separated rows instead of laying records out as
+  card grids. Pass `asChild` with a link to make a whole row clickable.
+- **Field** for forms. `Field`, `FieldLabel`, `FieldDescription`, and
+  `FieldError` line up label, help text, and error the same way everywhere.
+  Set `data-invalid` on the Field and `aria-invalid` on the control when a
+  value is wrong. `FieldSet` and `FieldLegend` group related fields, and a
+  `FieldLabel` wrapping a horizontal `Field` makes a selectable choice card.
+  Field works with any form library. The `Form*` components remain for
+  existing react-hook-form screens.
+- **Empty** for empty states built from parts. `EmptyState` and
+  `AntyEmptyState` are the ready-made versions and are built on it.
+- **CodeBlock** for code, JSON, logs, and diffs, with optional line
+  numbers, highlighted lines, `added`/`removed` diff lines, wrapping, and a
+  copy button. `useHighlightedCode(code, language)` returns highlighted
+  lines and tokenizes only the new lines while a response streams.
+  `highlightCode` does the same on the server. Each language's grammar
+  loads the first time it is used.
+- **Message**, **MessageScroller**, and **Trace** for AI conversations.
+  Message lays out one turn. MessageScroller keeps the newest turn in view
+  while it streams and offers a jump-to-latest button. Trace lists an
+  agent's steps (searches, tool calls, reasoning) with a status per line
+  (`running` shimmers, `error` turns red, `pending` dims), and a step can
+  expand to show its details.
+
+Selection is shown with a check mark in foreground ink, never an amber
+dot: Select, Switcher, MultiSelect, and radio items in menus all follow this.
 
 ## Layout
 

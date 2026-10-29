@@ -102,7 +102,7 @@ Mono marks text that **is** data. It reads as a measurement or a name the system
 - IDs and names: `shard-0a1f`, `products_v2`, `acme-prod`
 - Metric values in tables and charts: `p99 ms`, `1,240`
 - Code, query DSL, JSON paths
-- Keyboard shortcuts (`⌘K`)
+- Keyboard shortcuts (`⌘K`, `<Kbd>`)
 - File names
 - Input fields whose content is an identifier (opt in with `font-mono`)
 
@@ -153,5 +153,10 @@ Everything else is Inter, sentence case:
 | `<CardDescription>` / `<AlertDescription>` | Inter body | Prose |
 | `<TableCell>` (IDs, numbers) | Mono | Data |
 | `<TableCell>` (prose) | Inter body | Free text |
-| `<DropdownMenuShortcut>` | Mono | Data (a key) |
+| `<DropdownMenuShortcut>` / `<Kbd>` | Mono | Data (a key) |
+| `<CodeBlockContent>` | Mono | Data (code) |
+| `<CodeBlockTitle>` | Inter control | Interface (add `font-mono` when it is a file name) |
+| `<FieldLabel>` / `<FieldDescription>` / `<FieldError>` | Inter control / body | Interface |
+| `<ItemTitle>` | Inter control | Interface (add `font-mono` when it names a table, model, or ID) |
+| `<TraceTitle>` | Inter body | Interface |
 | `<AntyPixel>` with `<Kicker>` | Pixel | Brand mark |
