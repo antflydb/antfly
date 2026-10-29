@@ -1,4 +1,4 @@
-ANTFLY_ROOT ?= ../../..
+ANTFLY_ROOT ?= ../../../../..
 INDEX_DIR ?= idx
 SEGMENT_MODE ?= single
 MANIFEST ?= $(INDEX_DIR)-manifest.json

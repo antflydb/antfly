@@ -519,4 +519,4 @@ encoded inputs, learned head intermediates, valid span scores and final outputs
 on native and Metal. Unsupported structures/attributes, joint decoding and
 relation endpoint constraints remain rejected. Pull metadata publishes
 `qualified_limits` for verified artifacts; refresh older pulls to record it.
-See [Lite knowledge graph usage](../../../../LITE_KNOWLEDGE_GRAPH.md).
+See [Lite knowledge-graph pipelines](../../../../LITE.md#embedded-library) and [entity resolution](../../../../RESOLUTION.md#query-keys-aliases-and-migration-lite-native).
