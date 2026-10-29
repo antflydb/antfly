@@ -8,3 +8,8 @@ Each filename is `<sample-count>-<mel-bins>-<amplitude-divisor>.f32` and contain
 quantized broadband PCM; 733-sample cases exercise the zero-padded tail, and
 16000-sample cases exercise right-edge reflection. Divisors 1 and 16 expose
 normalization errors that peak-relative normalization would hide.
+
+The first-party fixture digests are reviewed in
+`scripts/embedded_asset_licenses.json`; update those records if regeneration
+changes the reference tensors. `zig build test-whisper-frontend` from the
+inference package runs both production paths and the independent FFT checks.

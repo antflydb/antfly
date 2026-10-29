@@ -19,29 +19,35 @@ const std = @import("std");
 
 pub fn check(comptime extract: anytype) !void {
     const alloc = std.testing.allocator;
-    inline for (.{ 733, 16000 }) |count| {
+    // Literal inputs keep fixture provenance visible to the source/license
+    // boundary audit as well as to Zig's compiler cache.
+    inline for (.{
+        .{ 733, 80, 1, @embedFile("testdata/whisper/733-80-1.f32") },
+        .{ 733, 80, 16, @embedFile("testdata/whisper/733-80-16.f32") },
+        .{ 733, 128, 1, @embedFile("testdata/whisper/733-128-1.f32") },
+        .{ 733, 128, 16, @embedFile("testdata/whisper/733-128-16.f32") },
+        .{ 16000, 80, 1, @embedFile("testdata/whisper/16000-80-1.f32") },
+        .{ 16000, 80, 16, @embedFile("testdata/whisper/16000-80-16.f32") },
+        .{ 16000, 128, 1, @embedFile("testdata/whisper/16000-128-1.f32") },
+        .{ 16000, 128, 16, @embedFile("testdata/whisper/16000-128-16.f32") },
+    }) |fixture| {
+        const count = fixture[0];
+        const bins = fixture[1];
+        const amplitude: f32 = 1.0 / @as(f32, fixture[2]);
+        const bytes = fixture[3];
         const samples = try alloc.alloc(f32, count);
         defer alloc.free(samples);
-        for (samples, 0..) |*sample, i| sample.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 73) % 257)) - 128)) / 512.0;
-        inline for (.{ 80, 128 }) |bins| {
-            inline for (.{ 1, 16 }) |divisor| {
-                const amplitude: f32 = 1.0 / @as(f32, divisor);
-                const bytes = @embedFile(std.fmt.comptimePrint("testdata/whisper/{d}-{d}-{d}.f32", .{ count, bins, divisor }));
-                const input = try alloc.dupe(f32, samples);
-                defer alloc.free(input);
-                for (input) |*value| value.* *= amplitude;
-                const actual = try extract(alloc, input, bins);
-                defer alloc.free(actual);
-                try std.testing.expectEqual(@as(usize, bins * 100), actual.len);
-                var max_error: f32 = 0;
-                for (actual, 0..) |value, i| {
-                    const expected: f32 = @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
-                    max_error = @max(max_error, @abs(value - expected));
-                    try std.testing.expect(std.math.isFinite(value));
-                }
-                if (max_error > 2e-4) std.debug.print("Whisper reference count={d} bins={d} amplitude={d} max_error={d}\n", .{ count, bins, amplitude, max_error });
-                try std.testing.expect(max_error <= 2e-4);
-            }
+        for (samples, 0..) |*sample, i| sample.* = amplitude * @as(f32, @floatFromInt(@as(i32, @intCast((i * 73) % 257)) - 128)) / 512.0;
+        const actual = try extract(alloc, samples, bins);
+        defer alloc.free(actual);
+        try std.testing.expectEqual(@as(usize, bins * 100), actual.len);
+        var max_error: f32 = 0;
+        for (actual, 0..) |value, i| {
+            const expected: f32 = @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+            max_error = @max(max_error, @abs(value - expected));
+            try std.testing.expect(std.math.isFinite(value));
         }
+        if (max_error > 2e-4) std.debug.print("Whisper reference count={d} bins={d} amplitude={d} max_error={d}\n", .{ count, bins, amplitude, max_error });
+        try std.testing.expect(max_error <= 2e-4);
     }
 }
