@@ -273,3 +273,38 @@ reconcile independently, including quiet roles and recovered resource failures.
 No hour-long or physical-cold population is spent while that contract remains
 unproven. Numeric thresholds, native modules and the approved control are
 unchanged.
+
+### Final isolated probe observations
+
+Four eight-call populations were recorded separately. The first startup
+population is missing from the final snapshot. Each of the following three
+populations delivered eight fetch records, eight RPC records and all eight
+late markers: **48 terminal records and 24 late markers** in total. This is a
+fixture result, not a database qualification population.
+
+For the final population, `ScriptVersion.ID` exactly matches the independently
+recorded deployed source version for both fetch and RPC. Fetch events contain
+`RayID`, `Request` and `Response`; all eight `RayID` candidates hash to the same
+zero sentinel. They cannot identify distinct private fetch invocations. All
+RPC identity candidates are absent, and one RPC event key remains unrecognized.
+That unknown schema remains a failure, rather than an assumed identity or
+method field. Existing fixtures therefore demonstrate delivery and version
+attribution, but **do not prove unique provider invocation identity**.
+
+After the requested analytics cooldown, the scoped health query still returns
+an empty array and the job's `last_complete` remains null despite the delivered
+records. These fields cannot currently certify settlement or zero dropped
+records. The first missing population, incomplete independent accounting and
+identity/schema gaps remain explicit blockers to adopting this export as full
+gate evidence. The next design step must validate a canonical provider
+identity source (including private RPC), correlate terminal diagnostics to it,
+and establish an independent, unsampled delivery/settlement contract. Fixture
+UUIDs, row fingerprints and empty adaptive health responses must not silently
+replace those proofs.
+
+The final collector passes all **350 Node tests** and its actual-workerd private
+service-binding/DO/gzip test. The runtime's earlier 34 workerd checks remain
+unchanged. The disposable job, Workers, namespace, bucket/data and collector
+key are removed after capture; local captures, bundle revisions, failed API
+commands, schema observations and reports are retained. No existing account
+credential is deleted and no reserved database trial resources are created.
