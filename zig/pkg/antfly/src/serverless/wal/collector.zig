@@ -238,13 +238,17 @@ pub const Collector = struct {
         switch (meta.phase) {
             .mark => {
                 var progress = Result{ .phase = .marking };
-                // Amortize recovery/admission across a bounded group. A wide
-                // branch still yields at its explicit child continuation.
+                // One atomic commit amortizes native metadata path copies
+                // across eight nodes. Eight full 60-child expansions need at
+                // most 505 commands, including the job row. A wide branch
+                // still yields at its explicit child continuation.
+                var changes = std.ArrayList(kv.Command).empty;
                 for (0..8) |_| {
-                    const part = try run_ctx.mark(&meta);
+                    const part = try run_ctx.mark(&meta, &changes);
                     progress.marked_pages += part.marked_pages;
                     if (meta.phase != .mark or meta.child_offset != 0) break;
                 }
+                try run_ctx.commit(meta, changes.items);
                 return progress;
             },
             .pages, .heads => {
@@ -389,20 +393,41 @@ pub const Collector = struct {
             const active = try self.collector.wal.collectionStatus(self.namespace, self.token);
             if (active == null or !sameJob(active.?, self.active)) return error.CollectionSuperseded;
         }
-        fn mark(self: *@This(), meta: *Meta) !Result {
+        /// The durable snapshot stays fixed for the whole batch. Consult
+        /// queued mutations before reading it so newly enqueued children and
+        /// shared subtrees are observed without exposing tentative progress.
+        fn pendingRow(self: *@This(), changes: []const kv.Command, key: []const u8) !?Row {
+            for (changes) |change| if (std.mem.eql(u8, change.key, key)) return switch (change.kind) {
+                .put => .{ .key = change.key, .value = change.value orelse return error.InvalidCollectionState },
+                .delete => null,
+                else => error.InvalidCollectionState,
+            };
+            const rows = try self.read(&.{key});
+            return if (rows[0].len == 0) null else rows[0][0];
+        }
+        fn queueChange(self: *@This(), changes: *std.ArrayList(kv.Command), change: kv.Command) !void {
+            for (changes.items) |*pending| if (std.mem.eql(u8, pending.key, change.key)) {
+                pending.* = change;
+                return;
+            };
+            // Reserve one command for the canonical job row. Coalescing also
+            // removes duplicate tree mutations for children consumed in-step.
+            if (changes.items.len >= 511) return error.CoordinatorBatchExceeded;
+            try changes.append(self.arena, change);
+        }
+        fn mark(self: *@This(), meta: *Meta, changes: *std.ArrayList(kv.Command)) !Result {
             const frontier = try frontierKey(self.arena, meta.done);
-            const pending = try self.read(&.{frontier});
-            if (pending[0].len != 1 or pending[0][0].value.len > 2048) return error.CollectionStateMissing;
-            const ref = (try std.json.parseFromSlice(tree.Ref, self.arena, pending[0][0].value, .{})).value;
+            const pending = (try self.pendingRow(changes.items, frontier)) orelse return error.CollectionStateMissing;
+            if (pending.value.len > 2048) return error.CollectionStateMissing;
+            const ref = (try std.json.parseFromSlice(tree.Ref, self.arena, pending.value, .{})).value;
             try ref.validate();
             if (ref.pack != null) return error.PackedWalCollectionUnsupported;
             const encoded = try std.json.Stringify.valueAlloc(self.arena, ref, .{});
             const seen = try std.fmt.allocPrint(self.arena, "s/{s}", .{std.fmt.bytesToHex(hash(encoded), .lower)});
-            const seen_rows = try self.read(&.{seen});
-            var commands = std.ArrayList(kv.Command).empty;
+            const seen_row = try self.pendingRow(changes.items, seen);
             var newly_marked = false;
-            if (seen_rows[0].len == 1) {
-                if (!std.mem.eql(u8, seen_rows[0][0].value, "1") or meta.child_offset != 0) return error.InvalidCollectionState;
+            if (seen_row) |row| {
+                if (!std.mem.eql(u8, row.value, "1") or meta.child_offset != 0) return error.InvalidCollectionState;
             } else {
                 var page = try self.collector.wal.traceCollectionPage(self.collector.alloc, self.namespace, self.active.id, self.active.roots.retired_before, ref, self.token);
                 defer page.deinit(self.collector.alloc);
@@ -411,27 +436,25 @@ pub const Collector = struct {
                 if (meta.child_offset > children.items.len) return error.InvalidCollectionState;
                 const end = @min(children.items.len, @as(usize, meta.child_offset) + child_chunk);
                 for (children.items[meta.child_offset..end]) |child| {
-                    try commands.append(self.arena, .{ .kind = .put, .key = try frontierKey(self.arena, meta.next), .value = try std.json.Stringify.valueAlloc(self.arena, child, .{}) });
+                    try self.queueChange(changes, .{ .kind = .put, .key = try frontierKey(self.arena, meta.next), .value = try std.json.Stringify.valueAlloc(self.arena, child, .{}) });
                     meta.next = std.math.add(u64, meta.next, 1) catch return error.CollectionFrontierExhausted;
                 }
                 const key = try self.collector.wal.pageKeyAlloc(self.arena, self.namespace, ref);
                 const prefix = try pagesPrefix(self.arena, self.collector.wal.prefix, self.namespace);
                 if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidCollectionState;
-                try commands.append(self.arena, .{ .kind = .put, .key = try std.fmt.allocPrint(self.arena, "m/{s}", .{key[prefix.len..]}), .value = "1" });
+                try self.queueChange(changes, .{ .kind = .put, .key = try std.fmt.allocPrint(self.arena, "m/{s}", .{key[prefix.len..]}), .value = "1" });
                 if (end != children.items.len) {
                     meta.child_offset = @intCast(end);
-                    try self.commit(meta.*, commands.items);
                     return .{ .phase = .marking };
                 }
-                try commands.append(self.arena, .{ .kind = .put, .key = seen, .value = "1" });
+                try self.queueChange(changes, .{ .kind = .put, .key = seen, .value = "1" });
                 meta.marked += 1;
                 newly_marked = true;
             }
-            try commands.append(self.arena, .{ .kind = .delete, .key = frontier });
+            try self.queueChange(changes, .{ .kind = .delete, .key = frontier });
             meta.done += 1;
             meta.child_offset = 0;
             if (meta.done == meta.next) meta.phase = .pages;
-            try self.commit(meta.*, commands.items);
             return .{ .phase = .marking, .marked_pages = @intFromBool(newly_marked) };
         }
         fn sweep(self: *@This(), meta: *Meta) !Result {
@@ -1222,4 +1245,34 @@ test "serverless multiprovider native collection scale preserves a retained tail
     try std.testing.expect(point.indexed and point.record != null);
     try std.testing.expectEqual(@as(u64, 50_001), point.record.?.lsn);
     std.debug.print("native GC scale: rows=50000 retained=25000 cycles=2 steps={d} second_steps={d} marked={d} deleted={d} cleanup_deleted={d} peak_operations={d} before_objects={d} job_end_objects={d} after_cleanup_first={d} after_objects={d}\n", .{ steps, second_steps, marked, deleted, cleanup_deleted, peak_operations, before_objects, job_end_objects, after_cleanup_first, after_objects });
+}
+
+test "serverless multiprovider grouped frontier commit recovers all marks after a lost acknowledgement" {
+    var fixture: TestFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.seed();
+    const Filter = struct {
+        slots: usize = 0,
+        fn matches(raw: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.containsAtLeast(u8, key, 1, "/gc-jobs/") or !std.mem.endsWith(u8, key, ".json")) return false;
+            self.slots += 1;
+            // The first transaction seeds the frontier. Lose the ACK for the
+            // second, which closes both captured root pages in one commit.
+            return self.slots == 2;
+        }
+    };
+    var filter = Filter{};
+    fixture.faults.put_filter = .{ .ptr = &filter, .matches = Filter.matches };
+    fixture.faults.commitNextPutThenFail(error.InjectedMarkBatchAckLoss);
+    try std.testing.expectError(error.InjectedMarkBatchAckLoss, fixture.collector.step("docs", null));
+    try std.testing.expectEqual(@as(usize, 2), filter.slots);
+    try fixture.reopen();
+    try fixture.waitForSweep();
+    const meta = try fixture.meta();
+    try std.testing.expectEqual(@as(u64, 2), meta.marked);
+    try std.testing.expectEqual(meta.next, meta.done);
+    try fixture.finish();
+    try fixture.verify();
 }
