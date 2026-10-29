@@ -88,10 +88,10 @@ retire independently inside the cohort. Vision projection and prefill retain
 the shared runtime's execution lock. CPU readers retain serial page execution. Response execution counters report pages that actually participated
 in a multi-page decode step.
 
-`/read` currently accepts at most 1024 output tokens
-per page and rejects truncated output. Use `/generate` with a larger budget
-for dense pages; its content should contain the image and either no text or
-the exact `grounding` keyword, with thinking disabled.
+`/read` accepts up to 8192 output tokens per page and rejects truncated output.
+Use this endpoint for repeated page extraction so the reader can reuse its
+prepared execution state. The default output budget remains 256 tokens;
+request a larger budget explicitly for dense pages.
 
 ## Resolution and validation
 
@@ -121,6 +121,13 @@ Other shapes retain the existing dispatch. The CPU fallback uses vectorized
 recurrence and activations. Measure release-build latency on deployment
 hardware before setting an SLO; this does not qualify CUDA or vLLM throughput.
 
+The qualified Qwen Metal image-attention path supports up to 16,384 unmerged
+patches, matching the runtime cap of 4096 merged vision tokens. Qualified
+LightOn single-token split attention supports contexts of 192 through 16,384
+tokens, including image, prompt, and generated tokens. Longer contexts retain
+the generic fallback and need separate latency measurements. The numerical
+checks cover the 2048- and 4096-token boundaries, the 16,384-token limit,
+batched pages with different lengths, and independent CPU reference values.
 The Metal `/read` throughput profile requires
 `ANTFLY_LIGHTONOCR3_THROUGHPUT=1`,
 `ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE=1`, and
