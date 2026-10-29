@@ -15,6 +15,7 @@
 
 // Diagnostic only. Source identities and delivery completeness are not assumed.
 import{sanitizeTailEvent}from'./metrics-tail.mjs';
+import{sanitizeOtel}from'./otel-evidence.mjs';
 const encoder=new TextEncoder(),uuid=value=>typeof value==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const fail=code=>{throw Error(code);};
 async function hash(bytes){return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');}
@@ -61,9 +62,14 @@ export default {async fetch(request,env){
  if(env.RETIRE_MODE==='true'&&!['/report','/drain'].includes(path))return new Response('retired',{status:410});
  let rejectionShape;
  try{
-  if(path==='/ingest'&&request.method==='POST'){
+  if(['/ingest','/v1/traces','/v1/logs'].includes(path)&&request.method==='POST'){
    const bytes=await readBody(request),text=new TextDecoder('utf-8',{fatal:true}).decode(bytes),lines=text.trim().split('\n');
    if(bytes.length<=4096){let challenge;try{challenge=JSON.parse(text);}catch{}if(['test','tests'].includes(challenge?.content)&&Object.keys(challenge).length===1)return Response.json({validation:true,qualification:false});}
+   if(path!=='/ingest'){
+    const signal=path==='/v1/traces'?'traces':'logs';let envelopes;try{envelopes=[JSON.parse(text)];}catch{try{envelopes=lines.map(line=>JSON.parse(line));}catch{fail('TelemetryJsonInvalid');}}
+    if(envelopes.length>1000)fail('TelemetryRecordBudgetExceeded');const rows=[];for(const envelope of envelopes){rows.push(...await sanitizeOtel(envelope,env.SOURCE_WORKER,signal));if(rows.length>1000)fail('TelemetryRecordBudgetExceeded');}
+    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,signal,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');if(rows.length)await env.LOGS.put(prefix+'batches/'+signal+'-'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});return Response.json({});
+   }
    if(lines.length>1000)fail('TelemetryRecordBudgetExceeded');
    const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=JSON.parse(line);}catch{fail('TelemetryJsonInvalid');}rejectionShape={json_type:row===null?'null':Array.isArray(row)?'array':typeof row,content:row?.content==='tests'?'tests':row?.content==='test'?'test':row&&Object.hasOwn(row,'content')?'other':'absent',has_script_name:typeof row?.ScriptName==='string',keys:row&&typeof row==='object'?Object.keys(row).filter(key=>['content','test','filename','ScriptName','Event','Logs'].includes(key)):[],key_count:row&&typeof row==='object'?Object.keys(row).length:0};rows.push(await sanitizeLogpushProbe(row,env.SOURCE_WORKER));}
    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');
@@ -81,5 +87,5 @@ export default {async fetch(request,env){
   }
   if(path==='/drain'&&request.method==='POST'){const page=await env.LOGS.list({prefix,limit:1000});if(page.objects.length)await env.LOGS.delete(page.objects.map(o=>o.key));return Response.json({deleted:page.objects.length,done:page.objects.length===0});}
   return new Response('not found',{status:404});
- }catch(error){const code=/^Telemetry[A-Za-z]+$/.test(error?.message??'')?error.message:'TelemetryIngestionFailed';if(path==='/ingest'){try{await env.LOGS.put(prefix+'rejections/'+crypto.randomUUID()+'.json',JSON.stringify({schema:1,qualification:false,rejection:code,...(rejectionShape?{shape:rejectionShape}:{}),encoding:['gzip','identity'].includes(request.headers.get('Content-Encoding'))?request.headers.get('Content-Encoding'):request.headers.has('Content-Encoding')?'other':'absent'}));}catch{}}return Response.json({error:code},{status:code.includes('Exceeded')?413:code==='TelemetryIngestionFailed'?503:400});}
+ }catch(error){const code=/^Telemetry[A-Za-z]+$/.test(error?.message??'')?error.message:'TelemetryIngestionFailed';if(['/ingest','/v1/traces','/v1/logs'].includes(path)){try{await env.LOGS.put(prefix+'rejections/'+crypto.randomUUID()+'.json',JSON.stringify({schema:1,qualification:false,rejection:code,...(rejectionShape?{shape:rejectionShape}:{}),encoding:['gzip','identity'].includes(request.headers.get('Content-Encoding'))?request.headers.get('Content-Encoding'):request.headers.has('Content-Encoding')?'other':'absent'}));}catch{}}return Response.json({error:code},{status:code.includes('Exceeded')?413:code==='TelemetryIngestionFailed'?503:400});}
 }};

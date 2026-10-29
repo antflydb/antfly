@@ -23,6 +23,7 @@ test('workerd Logpush collector ingests gzip and exercises a private Worker with
   const compressed=await new Response(new Blob(['{"content": "test"}']).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();assert.equal((await call('/ingest',compressed)).status,200);
   const exercised=await(await call('/exercise','{"count":2}')).json();assert.equal(exercised.expected.length,2);assert.ok(exercised.expected.every(v=>v.id!==v.rpc));
   const row={ScriptName:source,EventTimestampMs:Date.now(),EventType:'worker_rpc',Entrypoint:'Probe',Outcome:'ok',Logs:[{message:[JSON.stringify({event:'antfly.qualification_probe',id:exercised.expected[0].rpc,kind:'rpc',phase:'complete'})]}]};assert.equal((await call('/ingest',JSON.stringify(row))).status,200);
-  const report=await(await call('/report','{}')).json();assert.equal(report.objects.length,2);assert.equal(report.qualification,false);assert.ok(!JSON.stringify(report).includes(token));
+  const attr=(key,value)=>({key,value:{stringValue:value}}),otel={resourceSpans:[{resource:{attributes:[attr('service.name',source)]},scopeSpans:[{spans:[{traceId:'a'.repeat(32),spanId:'b'.repeat(16),startTimeUnixNano:'1000000000',endTimeUnixNano:'1020000000',attributes:[attr('faas.invocation_id','private-provider-id'),attr('cloudflare.outcome','ok')]}]}]}]};assert.equal((await call('/v1/traces',JSON.stringify(otel))).status,200);assert.equal((await call('/v1/logs','{"resourceLogs":[]}')).status,200);
+  const report=await(await call('/report','{}')).json();assert.equal(report.objects.length,3);assert.equal(report.qualification,false);assert.ok(!JSON.stringify(report).includes(token));
  }finally{await mf.dispose();await rm(persist,{recursive:true,force:true});}
 });
