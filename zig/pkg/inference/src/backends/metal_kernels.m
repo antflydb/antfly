@@ -58803,7 +58803,18 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
     }
 }
 
-int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
+// Host-backed K-block FFN phases share ownership and encoding order. These
+// constants preserve each entry point's existing normalization/down schedule;
+// always-inline specialization adds no runtime format or policy dispatch.
+typedef struct {
+    uint32_t gate_format;
+    uint32_t down_format;
+    bool reduce_single_gate_norm;
+    bool descriptor_down;
+    bool track_output_borrowed;
+} termite_metal_host_gated_ffn_policy;
+
+static __attribute__((always_inline)) inline int termite_metal_apply_host_gated_ffn_slots(
     termite_metal_decode_runtime *runtime,
     const float *input,
     const float *residual,
@@ -58816,20 +58827,25 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
     size_t post_gate_rms_norm_slot,
     size_t post_down_rms_norm_slot,
     size_t down_linear_slot,
-    float *output
+    float *output,
+    termite_metal_host_gated_ffn_policy policy,
+    const char *command_label
 ) {
+// Expand at each original load site, preserving ARC and pipeline lifetimes.
+#define TERMITE_METAL_HOST_PAIR_PIPELINE(Runtime, Format) ((Format) == TERMITE_METAL_QUANT_FORMAT_Q4_K ? (Runtime)->q4_k_pair_pipeline : (Runtime)->q6_k_pair_pipeline)
+#define TERMITE_METAL_HOST_DOWN_PIPELINE(Runtime, Format) ((Format) == TERMITE_METAL_QUANT_FORMAT_Q4_K ? (Runtime)->q4_k_pipeline : (Format) == TERMITE_METAL_QUANT_FORMAT_Q5_K ? (Runtime)->q5_k_pipeline : (Runtime)->q6_k_pipeline)
+
     if (runtime == NULL || input == NULL || residual == NULL || output == NULL) return -1;
-    if (runtime->q4_k_pipeline == nil || runtime->q4_k_pair_pipeline == nil || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
+    if ((policy.gate_format == policy.down_format ? (TERMITE_METAL_HOST_DOWN_PIPELINE(runtime, policy.down_format) == nil || TERMITE_METAL_HOST_PAIR_PIPELINE(runtime, policy.gate_format) == nil) : (TERMITE_METAL_HOST_PAIR_PIPELINE(runtime, policy.gate_format) == nil || TERMITE_METAL_HOST_DOWN_PIPELINE(runtime, policy.down_format) == nil)) || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
     if (rows == 0 || hidden_size == 0 || intermediate_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX || intermediate_size > UINT32_MAX) return -3;
-    const float eps = 0.0f;
     if (hidden_size % 256u != 0 || intermediate_size % 256u != 0) return -4;
     if (gate_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || up_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || down_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -5;
     termite_metal_quant_linear_slot_view gate_view;
     termite_metal_quant_linear_slot_view up_view;
     termite_metal_quant_linear_slot_view down_view;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q4_K, gate_linear_slot, hidden_size, intermediate_size, &gate_view) != 0) return -6;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q4_K, up_linear_slot, hidden_size, intermediate_size, &up_view) != 0) return -7;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q4_K, down_linear_slot, intermediate_size, hidden_size, &down_view) != 0) return -8;
+    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, policy.gate_format, gate_linear_slot, hidden_size, intermediate_size, &gate_view) != 0) return -6;
+    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, policy.gate_format, up_linear_slot, hidden_size, intermediate_size, &up_view) != 0) return -7;
+    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, policy.down_format, down_linear_slot, intermediate_size, hidden_size, &down_view) != 0) return -8;
     if (post_gate_rms_norm_slot != SIZE_MAX) {
         if (post_gate_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -9;
         if (runtime->rms_norm_slot_prepared[post_gate_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_gate_rms_norm_slot] != intermediate_size) return -10;
@@ -58856,7 +58872,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
         BOOL output_borrowed = YES;
         id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (output_buffer == nil) {
-            output_borrowed = NO;
+            if (policy.track_output_borrowed) output_borrowed = NO;
             output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         }
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
@@ -58864,20 +58880,20 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
         termite_metal_linear_params down_params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)(intermediate_size / 256u) };
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_add_params multiply_params = { .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = eps };
-        termite_metal_apply_row_norm_params post_down_rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)hidden_size, .eps = eps };
+        termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
+        termite_metal_apply_row_norm_params post_down_rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)hidden_size, .eps = 0.0f };
         termite_metal_apply_add_params add_params = { .rows = (uint32_t)rows, .dim = (uint32_t)hidden_size };
-        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
+        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, command_label);
         if (command_buffer == nil) return -15;
 
-        id<MTLComputeCommandEncoder> pair_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        id<MTLComputeCommandEncoder> pair_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
         if (pair_encoder == nil) return -16;
         termite_metal_quant_matmul_descriptor pair_descriptor = {
             .slot = gate_linear_slot,
-            .format = TERMITE_METAL_QUANT_FORMAT_Q4_K,
+            .format = policy.gate_format,
             .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
             .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR,
-            .fallback_pipeline = runtime->q4_k_pair_pipeline,
+            .fallback_pipeline = TERMITE_METAL_HOST_PAIR_PIPELINE(runtime, policy.gate_format),
             .input_buffer = input_buffer,
             .weight_buffer = gate_view.weight_buffer,
             .weight_offset = gate_view.weight_offset,
@@ -58895,14 +58911,14 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
         if (termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, pair_encoder, &pair_descriptor) != 0) return -16;
         [pair_encoder endEncoding];
 
-        id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
         if (activation_encoder == nil) return -17;
         [activation_encoder setComputePipelineState:runtime->activation_pipeline];
         termite_metal_bind_two_buffers(activation_encoder, gate_output_buffer, 0, activated_buffer, 0, &activation_params, sizeof(activation_params));
         [activation_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1)];
         [activation_encoder endEncoding];
 
-        id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
         if (multiply_encoder == nil) return -18;
         [multiply_encoder setComputePipelineState:runtime->multiply_pipeline];
         [multiply_encoder setBuffer:activated_buffer offset:0 atIndex:0];
@@ -58914,7 +58930,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
 
         id<MTLBuffer> down_input_buffer = gated_buffer;
         if (post_gate_rms_norm_slot != SIZE_MAX) {
-            if (rows == 1) {
+            if (policy.reduce_single_gate_norm && rows == 1) {
                 if (termite_metal_encode_rms_norm_reduce(
                         runtime,
                         command_buffer,
@@ -58927,7 +58943,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
                         0.0f,
                         -19) != 0) return -19;
             } else {
-                id<MTLComputeCommandEncoder> rms_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+                id<MTLComputeCommandEncoder> rms_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
                 if (rms_encoder == nil) return -19;
                 [rms_encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
                 [rms_encoder setBuffer:gated_buffer offset:0 atIndex:0];
@@ -58940,14 +58956,35 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
             down_input_buffer = normed_gated_buffer;
         }
 
-        id<MTLComputeCommandEncoder> down_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        id<MTLComputeCommandEncoder> down_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
         if (down_encoder == nil) return -20;
-        [down_encoder setComputePipelineState:runtime->q4_k_pipeline];
-        [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
-        [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
-        [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
-        [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q4_k_pipeline, rows * hidden_size), 1, 1)];
+        if (policy.descriptor_down) {
+            termite_metal_quant_matmul_descriptor down_descriptor = {
+                .slot = down_linear_slot,
+                .format = policy.down_format,
+                .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+                .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
+                .fallback_pipeline = TERMITE_METAL_HOST_DOWN_PIPELINE(runtime, policy.down_format),
+                .input_buffer = down_input_buffer,
+                .weight_buffer = down_view.weight_buffer,
+                .weight_offset = down_view.weight_offset,
+                .output_buffer = projected_buffer,
+                .rows = rows,
+                .in_dim = intermediate_size,
+                .out_dim = hidden_size,
+                .values_per_block = down_view.values_per_block,
+                .bytes_per_block = down_view.bytes_per_block,
+                .failure_code = -20,
+            };
+            if (termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, down_encoder, &down_descriptor) != 0) return -20;
+        } else {
+            [down_encoder setComputePipelineState:TERMITE_METAL_HOST_DOWN_PIPELINE(runtime, policy.down_format)];
+            [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
+            [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
+            [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
+            [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
+            [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_DOWN_PIPELINE(runtime, policy.down_format), rows * hidden_size), 1, 1)];
+        }
         [down_encoder endEncoding];
 
         id<MTLBuffer> add_input_buffer = projected_buffer;
@@ -58977,11 +59014,40 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
-        if (!output_borrowed) {
+        if (policy.track_output_borrowed ? !output_borrowed : output_buffer.contents != (void *)output) {
             memcpy(output, [output_buffer contents], hidden_bytes);
         }
         return 0;
     }
+#undef TERMITE_METAL_HOST_PAIR_PIPELINE
+#undef TERMITE_METAL_HOST_DOWN_PIPELINE
+}
+
+int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
+    termite_metal_decode_runtime *runtime,
+    const float *input,
+    const float *residual,
+    size_t rows,
+    size_t hidden_size,
+    size_t intermediate_size,
+    uint32_t activation_kind,
+    size_t gate_linear_slot,
+    size_t up_linear_slot,
+    size_t post_gate_rms_norm_slot,
+    size_t post_down_rms_norm_slot,
+    size_t down_linear_slot,
+    float *output
+) {
+    return termite_metal_apply_host_gated_ffn_slots(
+        runtime, input, residual, rows, hidden_size, intermediate_size, activation_kind, gate_linear_slot, up_linear_slot, post_gate_rms_norm_slot, post_down_rms_norm_slot, down_linear_slot, output,
+        (termite_metal_host_gated_ffn_policy){
+            .gate_format = TERMITE_METAL_QUANT_FORMAT_Q4_K,
+            .down_format = TERMITE_METAL_QUANT_FORMAT_Q4_K,
+            .reduce_single_gate_norm = true,
+            .descriptor_down = false,
+            .track_output_borrowed = true,
+        },
+        __func__);
 }
 
 int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual(
@@ -59649,155 +59715,16 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q5_k_down_sl
     size_t down_linear_slot,
     float *output
 ) {
-    if (runtime == NULL || input == NULL || residual == NULL || output == NULL) return -1;
-    if (runtime->q4_k_pair_pipeline == nil || runtime->q5_k_pipeline == nil || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
-    if (rows == 0 || hidden_size == 0 || intermediate_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX || intermediate_size > UINT32_MAX) return -3;
-    if (hidden_size % 256u != 0 || intermediate_size % 256u != 0) return -4;
-    if (gate_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || up_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || down_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -5;
-    termite_metal_quant_linear_slot_view gate_view;
-    termite_metal_quant_linear_slot_view up_view;
-    termite_metal_quant_linear_slot_view down_view;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q4_K, gate_linear_slot, hidden_size, intermediate_size, &gate_view) != 0) return -6;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q4_K, up_linear_slot, hidden_size, intermediate_size, &up_view) != 0) return -7;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q5_K, down_linear_slot, intermediate_size, hidden_size, &down_view) != 0) return -8;
-    if (post_gate_rms_norm_slot != SIZE_MAX) {
-        if (post_gate_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -9;
-        if (runtime->rms_norm_slot_prepared[post_gate_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_gate_rms_norm_slot] != intermediate_size) return -10;
-    }
-    if (post_down_rms_norm_slot != SIZE_MAX) {
-        if (post_down_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -11;
-        if (runtime->rms_norm_slot_prepared[post_down_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_down_rms_norm_slot] != hidden_size) return -12;
-    }
-    @autoreleasepool {
-        const size_t hidden_bytes = rows * hidden_size * sizeof(float);
-        const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
-        id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
-        id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
-        id<MTLBuffer> activated_buffer = runtime->hot_intermediate_buffers[2];
-        id<MTLBuffer> gated_buffer = runtime->hot_intermediate_buffers[3];
-        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? runtime->hot_intermediate_buffers[4] : nil;
-        id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
-        id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? runtime->hot_hidden_buffers[1] : nil;
-        BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (output_buffer == nil) {
-            output_borrowed = NO;
-            output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        }
-        if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
-
-        termite_metal_linear_params down_params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)(intermediate_size / 256u) };
-        termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_add_params multiply_params = { .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
-        termite_metal_apply_row_norm_params post_down_rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)hidden_size, .eps = 0.0f };
-        termite_metal_apply_add_params add_params = { .rows = (uint32_t)rows, .dim = (uint32_t)hidden_size };
-        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
-        if (command_buffer == nil) return -15;
-
-        id<MTLComputeCommandEncoder> pair_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (pair_encoder == nil) return -16;
-        termite_metal_quant_matmul_descriptor pair_descriptor = {
-            .slot = gate_linear_slot,
-            .format = TERMITE_METAL_QUANT_FORMAT_Q4_K,
-            .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-            .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR,
-            .fallback_pipeline = runtime->q4_k_pair_pipeline,
-            .input_buffer = input_buffer,
-            .weight_buffer = gate_view.weight_buffer,
-            .weight_offset = gate_view.weight_offset,
-            .second_weight_buffer = up_view.weight_buffer,
-            .second_weight_offset = up_view.weight_offset,
-            .output_buffer = gate_output_buffer,
-            .second_output_buffer = up_output_buffer,
-            .rows = rows,
-            .in_dim = hidden_size,
-            .out_dim = intermediate_size,
-            .values_per_block = gate_view.values_per_block,
-            .bytes_per_block = gate_view.bytes_per_block,
-            .failure_code = -16,
-        };
-        if (termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, pair_encoder, &pair_descriptor) != 0) return -16;
-        [pair_encoder endEncoding];
-
-        id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (activation_encoder == nil) return -17;
-        [activation_encoder setComputePipelineState:runtime->activation_pipeline];
-        termite_metal_bind_two_buffers(activation_encoder, gate_output_buffer, 0, activated_buffer, 0, &activation_params, sizeof(activation_params));
-        [activation_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1)];
-        [activation_encoder endEncoding];
-
-        id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (multiply_encoder == nil) return -18;
-        [multiply_encoder setComputePipelineState:runtime->multiply_pipeline];
-        [multiply_encoder setBuffer:activated_buffer offset:0 atIndex:0];
-        [multiply_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
-        [multiply_encoder setBuffer:gated_buffer offset:0 atIndex:2];
-        [multiply_encoder setBytes:&multiply_params length:sizeof(multiply_params) atIndex:3];
-        [multiply_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1)];
-        [multiply_encoder endEncoding];
-
-        id<MTLBuffer> down_input_buffer = gated_buffer;
-        if (post_gate_rms_norm_slot != SIZE_MAX) {
-            id<MTLComputeCommandEncoder> rms_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-            if (rms_encoder == nil) return -19;
-            [rms_encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
-            [rms_encoder setBuffer:gated_buffer offset:0 atIndex:0];
-            [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
-            [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
-            [rms_encoder setBytes:&rms_params length:sizeof(rms_params) atIndex:3];
-            [rms_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
-            [rms_encoder endEncoding];
-            down_input_buffer = normed_gated_buffer;
-        }
-
-        id<MTLComputeCommandEncoder> down_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (down_encoder == nil) return -20;
-        [down_encoder setComputePipelineState:runtime->q5_k_pipeline];
-        [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
-        [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
-        [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
-        [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q5_k_pipeline, rows * hidden_size), 1, 1)];
-        [down_encoder endEncoding];
-
-        id<MTLBuffer> add_lhs_buffer = projected_buffer;
-        if (post_down_rms_norm_slot != SIZE_MAX) {
-            id<MTLComputeCommandEncoder> post_down_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
-            if (post_down_encoder == nil) return -21;
-            [post_down_encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
-            [post_down_encoder setBuffer:projected_buffer offset:0 atIndex:0];
-            [post_down_encoder setBuffer:runtime->rms_norm_weight_buffers[post_down_rms_norm_slot] offset:0 atIndex:1];
-            [post_down_encoder setBuffer:post_down_buffer offset:0 atIndex:2];
-            [post_down_encoder setBytes:&post_down_rms_params length:sizeof(post_down_rms_params) atIndex:3];
-            [post_down_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
-            [post_down_encoder endEncoding];
-            add_lhs_buffer = post_down_buffer;
-        }
-
-        id<MTLComputeCommandEncoder> add_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_FFN);
-        if (add_encoder == nil) return -22;
-        [add_encoder setComputePipelineState:runtime->add_pipeline];
-        [add_encoder setBuffer:add_lhs_buffer offset:0 atIndex:0];
-        [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
-        [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
-        [add_encoder setBytes:&add_params length:sizeof(add_params) atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
-        [add_encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
-        if (!output_borrowed) {
-            memcpy(output, [output_buffer contents], hidden_bytes);
-        }
-        return 0;
-    }
+    return termite_metal_apply_host_gated_ffn_slots(
+        runtime, input, residual, rows, hidden_size, intermediate_size, activation_kind, gate_linear_slot, up_linear_slot, post_gate_rms_norm_slot, post_down_rms_norm_slot, down_linear_slot, output,
+        (termite_metal_host_gated_ffn_policy){
+            .gate_format = TERMITE_METAL_QUANT_FORMAT_Q4_K,
+            .down_format = TERMITE_METAL_QUANT_FORMAT_Q5_K,
+            .reduce_single_gate_norm = false,
+            .descriptor_down = false,
+            .track_output_borrowed = true,
+        },
+        __func__);
 }
 
 int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_slots(
@@ -59815,164 +59742,16 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_sl
     size_t down_linear_slot,
     float *output
 ) {
-    if (runtime == NULL || input == NULL || residual == NULL || output == NULL) return -1;
-    if (runtime->q4_k_pair_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
-    if (rows == 0 || hidden_size == 0 || intermediate_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX || intermediate_size > UINT32_MAX) return -3;
-    const float eps = 0.0f;
-    if (hidden_size % 256u != 0 || intermediate_size % 256u != 0) return -4;
-    if (gate_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || up_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || down_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -5;
-    termite_metal_quant_linear_slot_view gate_view;
-    termite_metal_quant_linear_slot_view up_view;
-    termite_metal_quant_linear_slot_view down_view;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q4_K, gate_linear_slot, hidden_size, intermediate_size, &gate_view) != 0) return -6;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q4_K, up_linear_slot, hidden_size, intermediate_size, &up_view) != 0) return -7;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q6_K, down_linear_slot, intermediate_size, hidden_size, &down_view) != 0) return -8;
-    if (post_gate_rms_norm_slot != SIZE_MAX) {
-        if (post_gate_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -9;
-        if (runtime->rms_norm_slot_prepared[post_gate_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_gate_rms_norm_slot] != intermediate_size) return -10;
-    }
-    if (post_down_rms_norm_slot != SIZE_MAX) {
-        if (post_down_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -11;
-        if (runtime->rms_norm_slot_prepared[post_down_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_down_rms_norm_slot] != hidden_size) return -12;
-    }
-    @autoreleasepool {
-        const size_t hidden_bytes = rows * hidden_size * sizeof(float);
-        const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
-        id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
-        id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
-        id<MTLBuffer> activated_buffer = runtime->hot_intermediate_buffers[2];
-        id<MTLBuffer> gated_buffer = runtime->hot_intermediate_buffers[3];
-        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? runtime->hot_intermediate_buffers[4] : nil;
-        id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
-        id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? runtime->hot_hidden_buffers[1] : nil;
-        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
-
-        termite_metal_linear_params down_params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)(intermediate_size / 256u) };
-        termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_add_params multiply_params = { .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
-        termite_metal_apply_row_norm_params post_down_rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)hidden_size, .eps = 0.0f };
-        termite_metal_apply_add_params add_params = { .rows = (uint32_t)rows, .dim = (uint32_t)hidden_size };
-        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
-        if (command_buffer == nil) return -15;
-
-        id<MTLComputeCommandEncoder> pair_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (pair_encoder == nil) return -16;
-        termite_metal_quant_matmul_descriptor pair_descriptor = {
-            .slot = gate_linear_slot,
-            .format = TERMITE_METAL_QUANT_FORMAT_Q4_K,
-            .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-            .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR,
-            .fallback_pipeline = runtime->q4_k_pair_pipeline,
-            .input_buffer = input_buffer,
-            .weight_buffer = gate_view.weight_buffer,
-            .weight_offset = gate_view.weight_offset,
-            .second_weight_buffer = up_view.weight_buffer,
-            .second_weight_offset = up_view.weight_offset,
-            .output_buffer = gate_output_buffer,
-            .second_output_buffer = up_output_buffer,
-            .rows = rows,
-            .in_dim = hidden_size,
-            .out_dim = intermediate_size,
-            .values_per_block = gate_view.values_per_block,
-            .bytes_per_block = gate_view.bytes_per_block,
-            .failure_code = -16,
-        };
-        if (termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, pair_encoder, &pair_descriptor) != 0) return -16;
-        [pair_encoder endEncoding];
-
-        id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (activation_encoder == nil) return -17;
-        [activation_encoder setComputePipelineState:runtime->activation_pipeline];
-        termite_metal_bind_two_buffers(activation_encoder, gate_output_buffer, 0, activated_buffer, 0, &activation_params, sizeof(activation_params));
-        [activation_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1)];
-        [activation_encoder endEncoding];
-
-        id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (multiply_encoder == nil) return -18;
-        [multiply_encoder setComputePipelineState:runtime->multiply_pipeline];
-        [multiply_encoder setBuffer:activated_buffer offset:0 atIndex:0];
-        [multiply_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
-        [multiply_encoder setBuffer:gated_buffer offset:0 atIndex:2];
-        [multiply_encoder setBytes:&multiply_params length:sizeof(multiply_params) atIndex:3];
-        [multiply_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1)];
-        [multiply_encoder endEncoding];
-
-        id<MTLBuffer> down_input_buffer = gated_buffer;
-        if (post_gate_rms_norm_slot != SIZE_MAX) {
-            id<MTLComputeCommandEncoder> rms_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-            if (rms_encoder == nil) return -19;
-            [rms_encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
-            [rms_encoder setBuffer:gated_buffer offset:0 atIndex:0];
-            [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
-            [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
-            [rms_encoder setBytes:&rms_params length:sizeof(rms_params) atIndex:3];
-            [rms_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
-            [rms_encoder endEncoding];
-            down_input_buffer = normed_gated_buffer;
-        }
-
-        id<MTLComputeCommandEncoder> down_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (down_encoder == nil) return -20;
-        termite_metal_quant_matmul_descriptor down_descriptor = {
-            .slot = down_linear_slot,
-            .format = TERMITE_METAL_QUANT_FORMAT_Q6_K,
-            .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-            .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
-            .fallback_pipeline = runtime->q6_k_pipeline,
-            .input_buffer = down_input_buffer,
-            .weight_buffer = down_view.weight_buffer,
-            .weight_offset = down_view.weight_offset,
-            .output_buffer = projected_buffer,
-            .rows = rows,
-            .in_dim = intermediate_size,
-            .out_dim = hidden_size,
-            .values_per_block = down_view.values_per_block,
-            .bytes_per_block = down_view.bytes_per_block,
-            .failure_code = -20,
-        };
-        if (termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, down_encoder, &down_descriptor) != 0) return -20;
-        [down_encoder endEncoding];
-
-        id<MTLBuffer> add_lhs_buffer = projected_buffer;
-        if (post_down_rms_norm_slot != SIZE_MAX) {
-            id<MTLComputeCommandEncoder> post_down_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
-            if (post_down_encoder == nil) return -21;
-            [post_down_encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
-            [post_down_encoder setBuffer:projected_buffer offset:0 atIndex:0];
-            [post_down_encoder setBuffer:runtime->rms_norm_weight_buffers[post_down_rms_norm_slot] offset:0 atIndex:1];
-            [post_down_encoder setBuffer:post_down_buffer offset:0 atIndex:2];
-            [post_down_encoder setBytes:&post_down_rms_params length:sizeof(post_down_rms_params) atIndex:3];
-            [post_down_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
-            [post_down_encoder endEncoding];
-            add_lhs_buffer = post_down_buffer;
-        }
-
-        id<MTLComputeCommandEncoder> add_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_FFN);
-        if (add_encoder == nil) return -22;
-        [add_encoder setComputePipelineState:runtime->add_pipeline];
-        [add_encoder setBuffer:add_lhs_buffer offset:0 atIndex:0];
-        [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
-        [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
-        [add_encoder setBytes:&add_params length:sizeof(add_params) atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
-        [add_encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
-        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
-        // buffer instead of aliasing it, so results must be copied back after the wait.
-        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
-        return 0;
-    }
+    return termite_metal_apply_host_gated_ffn_slots(
+        runtime, input, residual, rows, hidden_size, intermediate_size, activation_kind, gate_linear_slot, up_linear_slot, post_gate_rms_norm_slot, post_down_rms_norm_slot, down_linear_slot, output,
+        (termite_metal_host_gated_ffn_policy){
+            .gate_format = TERMITE_METAL_QUANT_FORMAT_Q4_K,
+            .down_format = TERMITE_METAL_QUANT_FORMAT_Q6_K,
+            .reduce_single_gate_norm = false,
+            .descriptor_down = true,
+            .track_output_borrowed = false,
+        },
+        __func__);
 }
 
 int termite_metal_decode_runtime_apply_gated_ffn_residual_q6_k_slots(
@@ -59990,151 +59769,16 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q6_k_slots(
     size_t down_linear_slot,
     float *output
 ) {
-    if (runtime == NULL || input == NULL || residual == NULL || output == NULL) return -1;
-    if (runtime->q6_k_pipeline == nil || runtime->q6_k_pair_pipeline == nil || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
-    if (rows == 0 || hidden_size == 0 || intermediate_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX || intermediate_size > UINT32_MAX) return -3;
-    if (hidden_size % 256u != 0 || intermediate_size % 256u != 0) return -4;
-    if (gate_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || up_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || down_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -5;
-    termite_metal_quant_linear_slot_view gate_view;
-    termite_metal_quant_linear_slot_view up_view;
-    termite_metal_quant_linear_slot_view down_view;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q6_K, gate_linear_slot, hidden_size, intermediate_size, &gate_view) != 0) return -6;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q6_K, up_linear_slot, hidden_size, intermediate_size, &up_view) != 0) return -7;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q6_K, down_linear_slot, intermediate_size, hidden_size, &down_view) != 0) return -8;
-    if (post_gate_rms_norm_slot != SIZE_MAX) {
-        if (post_gate_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -9;
-        if (runtime->rms_norm_slot_prepared[post_gate_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_gate_rms_norm_slot] != intermediate_size) return -10;
-    }
-    if (post_down_rms_norm_slot != SIZE_MAX) {
-        if (post_down_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -11;
-        if (runtime->rms_norm_slot_prepared[post_down_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_down_rms_norm_slot] != hidden_size) return -12;
-    }
-    @autoreleasepool {
-        const size_t hidden_bytes = rows * hidden_size * sizeof(float);
-        const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
-        id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
-        id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
-        id<MTLBuffer> activated_buffer = runtime->hot_intermediate_buffers[2];
-        id<MTLBuffer> gated_buffer = runtime->hot_intermediate_buffers[3];
-        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? runtime->hot_intermediate_buffers[4] : nil;
-        id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
-        id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? runtime->hot_hidden_buffers[1] : nil;
-        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
-
-        termite_metal_linear_params down_params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)(intermediate_size / 256u) };
-        termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_add_params multiply_params = { .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
-        termite_metal_apply_row_norm_params post_down_rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)hidden_size, .eps = 0.0f };
-        termite_metal_apply_add_params add_params = { .rows = (uint32_t)rows, .dim = (uint32_t)hidden_size };
-        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
-        if (command_buffer == nil) return -15;
-
-        id<MTLComputeCommandEncoder> pair_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (pair_encoder == nil) return -16;
-        termite_metal_quant_matmul_descriptor pair_descriptor = {
-            .slot = gate_linear_slot,
-            .format = TERMITE_METAL_QUANT_FORMAT_Q6_K,
-            .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-            .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR,
-            .fallback_pipeline = runtime->q6_k_pair_pipeline,
-            .input_buffer = input_buffer,
-            .weight_buffer = gate_view.weight_buffer,
-            .weight_offset = gate_view.weight_offset,
-            .second_weight_buffer = up_view.weight_buffer,
-            .second_weight_offset = up_view.weight_offset,
-            .output_buffer = gate_output_buffer,
-            .second_output_buffer = up_output_buffer,
-            .rows = rows,
-            .in_dim = hidden_size,
-            .out_dim = intermediate_size,
-            .values_per_block = gate_view.values_per_block,
-            .bytes_per_block = gate_view.bytes_per_block,
-            .failure_code = -16,
-        };
-        if (termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, pair_encoder, &pair_descriptor) != 0) return -16;
-        [pair_encoder endEncoding];
-
-        id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (activation_encoder == nil) return -17;
-        [activation_encoder setComputePipelineState:runtime->activation_pipeline];
-        termite_metal_bind_two_buffers(activation_encoder, gate_output_buffer, 0, activated_buffer, 0, &activation_params, sizeof(activation_params));
-        [activation_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1)];
-        [activation_encoder endEncoding];
-
-        id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (multiply_encoder == nil) return -18;
-        [multiply_encoder setComputePipelineState:runtime->multiply_pipeline];
-        [multiply_encoder setBuffer:activated_buffer offset:0 atIndex:0];
-        [multiply_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
-        [multiply_encoder setBuffer:gated_buffer offset:0 atIndex:2];
-        [multiply_encoder setBytes:&multiply_params length:sizeof(multiply_params) atIndex:3];
-        [multiply_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1)];
-        [multiply_encoder endEncoding];
-
-        id<MTLBuffer> down_input_buffer = gated_buffer;
-        if (post_gate_rms_norm_slot != SIZE_MAX) {
-            id<MTLComputeCommandEncoder> rms_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-            if (rms_encoder == nil) return -19;
-            [rms_encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
-            [rms_encoder setBuffer:gated_buffer offset:0 atIndex:0];
-            [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
-            [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
-            [rms_encoder setBytes:&rms_params length:sizeof(rms_params) atIndex:3];
-            [rms_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
-            [rms_encoder endEncoding];
-            down_input_buffer = normed_gated_buffer;
-        }
-
-        id<MTLComputeCommandEncoder> down_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (down_encoder == nil) return -20;
-        [down_encoder setComputePipelineState:runtime->q6_k_pipeline];
-        [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
-        [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
-        [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
-        [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q6_k_pipeline, rows * hidden_size), 1, 1)];
-        [down_encoder endEncoding];
-
-        id<MTLBuffer> add_lhs_buffer = projected_buffer;
-        if (post_down_rms_norm_slot != SIZE_MAX) {
-            id<MTLComputeCommandEncoder> post_down_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
-            if (post_down_encoder == nil) return -21;
-            [post_down_encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
-            [post_down_encoder setBuffer:projected_buffer offset:0 atIndex:0];
-            [post_down_encoder setBuffer:runtime->rms_norm_weight_buffers[post_down_rms_norm_slot] offset:0 atIndex:1];
-            [post_down_encoder setBuffer:post_down_buffer offset:0 atIndex:2];
-            [post_down_encoder setBytes:&post_down_rms_params length:sizeof(post_down_rms_params) atIndex:3];
-            [post_down_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
-            [post_down_encoder endEncoding];
-            add_lhs_buffer = post_down_buffer;
-        }
-
-        id<MTLComputeCommandEncoder> add_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_FFN);
-        if (add_encoder == nil) return -22;
-        [add_encoder setComputePipelineState:runtime->add_pipeline];
-        [add_encoder setBuffer:add_lhs_buffer offset:0 atIndex:0];
-        [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
-        [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
-        [add_encoder setBytes:&add_params length:sizeof(add_params) atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
-        [add_encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
-        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
-        // buffer instead of aliasing it, so results must be copied back after the wait.
-        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
-        return 0;
-    }
+    return termite_metal_apply_host_gated_ffn_slots(
+        runtime, input, residual, rows, hidden_size, intermediate_size, activation_kind, gate_linear_slot, up_linear_slot, post_gate_rms_norm_slot, post_down_rms_norm_slot, down_linear_slot, output,
+        (termite_metal_host_gated_ffn_policy){
+            .gate_format = TERMITE_METAL_QUANT_FORMAT_Q6_K,
+            .down_format = TERMITE_METAL_QUANT_FORMAT_Q6_K,
+            .reduce_single_gate_norm = false,
+            .descriptor_down = false,
+            .track_output_borrowed = false,
+        },
+        __func__);
 }
 
 int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_slots(

@@ -363,7 +363,26 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);
     }
 
+    const host_ffn_check_step = b.step("test-metal-host-ffn", "Check quantized host FFN outputs, command traces and failure ownership");
+    if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos) {
+        const host_ffn = b.addExecutable(.{ .name = "metal-host-ffn-check", .max_rss = 2 * 1024 * 1024 * 1024, .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+        }) });
+        addMacosSdkPaths(b, host_ffn.root_module, b.graph.host);
+        host_ffn.root_module.linkFramework("Foundation", .{});
+        host_ffn.root_module.linkFramework("Metal", .{});
+        host_ffn.root_module.linkFramework("MetalPerformanceShaders", .{});
+        host_ffn.root_module.linkFramework("Accelerate", .{});
+        host_ffn.root_module.addCSourceFile(.{ .file = b.path("scripts/check_metal_host_ffn.m"), .flags = &.{"-fobjc-arc"} });
+        host_ffn_check_step.dependOn(&b.addRunArtifact(host_ffn).step);
+    } else {
+        host_ffn_check_step.dependOn(&b.addFail("Metal host FFN checks require a macOS host and target.").step);
+    }
+
     const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
+    quant_kernel_metal_runtime_check_step.dependOn(host_ffn_check_step);
     if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos) {
         const math_options = b.addExecutable(.{ .name = "metal-math-options-check", .root_module = b.createModule(.{
             .target = b.graph.host,
