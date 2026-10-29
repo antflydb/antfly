@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const Allocator = std.mem.Allocator;
 const manifest_types = @import("types.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
@@ -27,8 +28,12 @@ pub const ManifestStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        list_versions_for: ?*const fn (*anyopaque, Allocator, []const u8, Context) anyerror![]u64 = null,
+        get_alloc_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, CancellationToken, Context) anyerror!manifest_types.Manifest = null,
+        put_for: ?*const fn (*anyopaque, manifest_types.Manifest, Context) anyerror!void = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         put: *const fn (*anyopaque, manifest_types.Manifest) anyerror!void,
         get_alloc: *const fn (*anyopaque, Allocator, []const u8, u64) anyerror!manifest_types.Manifest,
@@ -48,14 +53,23 @@ pub const ManifestStore = struct {
     }
 
     pub fn put(self: *ManifestStore, manifest: manifest_types.Manifest) !void {
+        if (self.context) |context| if (self.vtable.put_for != null) {
+            return self.vtable.put_for.?(self.ptr, manifest, context);
+        };
         try self.vtable.put(self.ptr, manifest);
     }
 
     pub fn getAlloc(self: *ManifestStore, namespace: []const u8, version: u64) !manifest_types.Manifest {
+        if (self.context) |context| if (self.vtable.get_alloc_for != null) {
+            return self.vtable.get_alloc_for.?(self.ptr, self.allocator, namespace, version, .none, context);
+        };
         return try self.vtable.get_alloc(self.ptr, self.allocator, namespace, version);
     }
 
     pub fn getAllocWithCancellation(self: *ManifestStore, namespace: []const u8, version: u64, cancellation: CancellationToken) !manifest_types.Manifest {
+        if (self.context) |context| if (self.vtable.get_alloc_for != null) {
+            return self.vtable.get_alloc_for.?(self.ptr, self.allocator, namespace, version, cancellation, context);
+        };
         try cancellation.check();
         var result = (if (self.vtable.get_alloc_with_cancellation) |read| read(self.ptr, self.allocator, namespace, version, cancellation) else self.getAlloc(namespace, version)) catch |err| {
             try cancellation.check();
@@ -79,6 +93,9 @@ pub const ManifestStore = struct {
     }
 
     pub fn listVersionsAlloc(self: *ManifestStore, namespace: []const u8) ![]u64 {
+        if (self.context) |context| if (self.vtable.list_versions_for != null) {
+            return self.vtable.list_versions_for.?(self.ptr, self.allocator, namespace, context);
+        };
         return try self.vtable.list_versions_alloc(self.ptr, self.allocator, namespace);
     }
 

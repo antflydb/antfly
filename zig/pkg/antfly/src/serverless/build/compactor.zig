@@ -101,9 +101,21 @@ pub const Compactor = struct {
             .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(namespace),
             .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io),
         };
+        const protected = protection.token(io);
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = protected };
+        var manifests = self.manifests.*;
+        var progress = self.progress.*;
+        if (protected.execution != null) {
+            const context = bridge.readContext();
+            scoped_artifacts.write_context = context;
+            manifests.context = context;
+            progress.context = context;
+        }
         var compactor = self.*;
         compactor.artifacts = &scoped_artifacts;
-        return compactor.compactHeadPinnedUntil(namespace, publication_guard, protection.token(io)) catch |err| return builder_mod.graphPublicationError(err, false);
+        compactor.manifests = &manifests;
+        compactor.progress = &progress;
+        return compactor.compactHeadPinnedUntil(namespace, publication_guard, protected) catch |err| return builder_mod.graphPublicationError(err, false);
     }
 
     fn compactHeadPinnedUntil(

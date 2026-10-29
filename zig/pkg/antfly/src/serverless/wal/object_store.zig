@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const Provider = @import("../provider_operation.zig");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const platform_sync = @import("antfly_platform").sync;
 const objectstore = @import("objectstore");
 const wal_types = @import("types.zig");
@@ -286,6 +288,44 @@ pub const ObjectStore = struct {
         return try decodeRecordsFromAlloc(alloc, result.body, start_lsn);
     }
 
+    fn readFromAllocFor(raw: *anyopaque, alloc: std.mem.Allocator, namespace: []const u8, start_lsn: u64, context: Context) ![]wal_types.Record {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        const operation: Provider.Operation = .{ .context = context };
+        const key = try logKeyAlloc(alloc, self.prefix, namespace);
+        defer alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        var result = operation.get(&client, self.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return alloc.alloc(wal_types.Record, 0),
+            else => return err,
+        };
+        defer result.deinit(alloc);
+        const records = decodeRecordsFromAlloc(alloc, result.body, start_lsn) catch |err| {
+            try operation.check();
+            return err;
+        };
+        errdefer wal_types.freeRecords(alloc, records);
+        try operation.ready();
+        return records;
+    }
+    fn latestLsnFor(raw: *anyopaque, namespace: []const u8, context: Context) !u64 {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        const operation: Provider.Operation = .{ .context = context };
+        const key = try logKeyAlloc(self.alloc, self.prefix, namespace);
+        defer self.alloc.free(key);
+        var result = operation.get(&self.client, self.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        const lsn = lastLsn(result.body) catch |err| {
+            try operation.check();
+            return err;
+        };
+        try operation.ready();
+        return lsn;
+    }
+
     pub fn latestLsn(self: *ObjectStore, namespace: []const u8) !u64 {
         const key = try logKeyAlloc(self.alloc, self.prefix, namespace);
         defer self.alloc.free(key);
@@ -372,6 +412,8 @@ pub const ObjectStore = struct {
     }
 
     const vtable: wal_store.WalStore.VTable = .{
+        .read_from_alloc_for = readFromAllocFor,
+        .latest_lsn_for = latestLsnFor,
         .deinit = erasedDeinit,
         .append = erasedAppend,
         .append_idempotent = erasedAppendIdempotent,

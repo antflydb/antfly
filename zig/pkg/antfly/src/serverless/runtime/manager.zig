@@ -218,7 +218,7 @@ pub const ManagedRuntime = struct {
             execution.startWithSlots(scheduler, .{
                 .io = self.io,
                 .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
-                .retained_bytes = @sizeOf(Runnable.Execution),
+                .retained_bytes = @sizeOf(Runnable.Execution) + catalog_mod.CatalogService.Scope.retained_bytes,
             }, .background, 1) catch |err| {
                 try pass.check();
                 return err;
@@ -228,6 +228,10 @@ pub const ManagedRuntime = struct {
         }
         try pass.lock(&self.run_mu);
         defer self.run_mu.unlock();
+
+        var metadata_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = pass };
+        var metadata_scope: catalog_mod.CatalogService.Scope = .{};
+        const catalog = if (pass.execution != null) metadata_scope.bind(self.catalog, metadata_bridge.readContext()) else self.catalog;
 
         var stats = RuntimeRunStats{};
         if (self.cfg.publish_enabled) {
@@ -241,22 +245,22 @@ pub const ManagedRuntime = struct {
         }
         try pass.ownerCheckpoint();
 
-        const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
-        defer self.catalog.freeNamespaces(self.alloc, namespaces);
+        const namespaces = try catalog.listNamespacesAlloc(self.alloc);
+        defer catalog.freeNamespaces(self.alloc, namespaces);
 
         for (namespaces) |namespace| {
             try cancellation.check();
             try pass.ownerCheckpoint();
-            const policy = self.catalog.getPolicy(namespace.name) catch |err| switch (err) {
+            const policy = catalog.getPolicy(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
-            var status = self.catalog.buildStatus(namespace.name) catch |err| switch (err) {
+            var status = catalog.buildStatusUntil(namespace.name, pass) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
             defer status.deinit(self.alloc);
-            if (!try self.enrichNamespaceWithStatus(namespace.name, policy, status, cancellation, pass.execution, &stats)) continue;
+            if (!try self.enrichNamespaceWithStatus(namespace.name, policy, status, cancellation, pass.execution, catalog, &stats)) continue;
 
             if (self.compactor) |*compactor| {
                 try pass.ownerCheckpoint();
@@ -364,11 +368,14 @@ pub const ManagedRuntime = struct {
         try pass.lock(&self.run_mu);
         defer self.run_mu.unlock();
 
-        const policy = try self.catalog.getPolicy(namespace);
-        var status = try self.catalog.buildStatus(namespace);
+        var metadata_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = pass };
+        var metadata_scope: catalog_mod.CatalogService.Scope = .{};
+        const catalog = if (execution != null) metadata_scope.bind(self.catalog, metadata_bridge.readContext()) else self.catalog;
+        const policy = try catalog.getPolicy(namespace);
+        var status = try catalog.buildStatusUntil(namespace, pass);
         defer status.deinit(self.alloc);
         var stats = RuntimeRunStats{};
-        if (!try self.enrichNamespaceWithStatus(namespace, policy, status, cancellation, null, &stats)) {
+        if (!try self.enrichNamespaceWithStatus(namespace, policy, status, cancellation, null, catalog, &stats)) {
             return error.MaterializationUnavailable;
         }
         try cancellation.check();
@@ -407,6 +414,7 @@ pub const ManagedRuntime = struct {
         status: catalog_mod.BuildStatus,
         cancellation: CancellationToken,
         execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution,
+        catalog: *catalog_mod.CatalogService,
         stats: *RuntimeRunStats,
     ) !bool {
         try cancellation.check();
@@ -420,7 +428,7 @@ pub const ManagedRuntime = struct {
         effective_policy.rerank_terms_enabled = status.rerank_terms_enabled;
         const stage = status.enrichment_active_stage orelse audit: {
             if (!effective_policy.chunk_embeddings_enabled) return true;
-            var table = (try self.catalog.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return true;
+            var table = (try catalog.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return true;
             defer table.deinit(self.alloc);
             if (!try @import("../build/document_facts_builder.zig").hasModelSources(self.alloc, table.indexes_json)) return true;
             break :audit catalog_mod.EnrichmentStage.chunk_embeddings;
@@ -442,14 +450,18 @@ pub const ManagedRuntime = struct {
         };
         var maintenance = self.cancellationToken();
         maintenance.cooperative = cancellation;
-        maintenance.execution = execution;
+        maintenance.execution = execution orelse if (catalog.progress.context) |context| context.execution else null;
         if (held_lease) |*lease| maintenance = lease.cancellation(maintenance);
         try self.chargeWork(.enrichment_round, 1);
         try maintenance.check();
-        var cpu_phase = try maintenance.beginCpuPhase(self.runnable_slots);
+        var phase_control = maintenance;
+        // A foreground producer borrows its already funded team. Preserve it
+        // in provider calls while resizing only a background-owned execution.
+        phase_control.execution = execution;
+        var cpu_phase = try phase_control.beginCpuPhase(self.runnable_slots);
         defer cpu_phase.deinit();
 
-        const maybe_table_record = self.catalog.getTableForNamespaceAlloc(self.alloc, namespace) catch |err| switch (err) {
+        const maybe_table_record = catalog.getTableForNamespaceAlloc(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };

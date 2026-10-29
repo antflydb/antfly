@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const Allocator = std.mem.Allocator;
 const wal_types = @import("types.zig");
 const Execution = @import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution;
@@ -22,8 +23,11 @@ pub const WalStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        latest_lsn_for: ?*const fn (*anyopaque, []const u8, Context) anyerror!u64 = null,
+        read_from_alloc_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, Context) anyerror![]wal_types.Record = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         append: *const fn (*anyopaque, []const u8, u64, []const u8) anyerror!u64,
         append_with_execution: ?*const fn (*anyopaque, []const u8, u64, []const u8, *Execution) anyerror!u64 = null,
@@ -96,10 +100,16 @@ pub const WalStore = struct {
     }
 
     pub fn readFromAlloc(self: *WalStore, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
+        if (self.context) |context| if (self.vtable.read_from_alloc_for != null) {
+            return self.vtable.read_from_alloc_for.?(self.ptr, self.allocator, namespace, start_lsn, context);
+        };
         return try self.vtable.read_from_alloc(self.ptr, self.allocator, namespace, start_lsn);
     }
 
     pub fn latestLsn(self: *WalStore, namespace: []const u8) !u64 {
+        if (self.context) |context| if (self.vtable.latest_lsn_for != null) {
+            return self.vtable.latest_lsn_for.?(self.ptr, namespace, context);
+        };
         return try self.vtable.latest_lsn(self.ptr, namespace);
     }
 

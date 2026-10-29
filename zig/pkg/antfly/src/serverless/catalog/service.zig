@@ -171,6 +171,54 @@ pub const CatalogService = struct {
     store: *catalog_store.CatalogStore,
     external_source_plan_resolver: ?publication_plan.ExternalSourcePlanResolver = null,
     facts_read_leases: read_lease.Cache = .{},
+    /// Scoped provider views never become retained lease/cache owners.
+    lease_owner: ?*CatalogService = null,
+
+    pub const Scope = struct {
+        /// At most three provider views overlap: runtime, publisher, and
+        /// status/publication. Include the builder's primitive view packet.
+        pub const retained_bytes = 3 * @sizeOf(Scope) + @sizeOf(builder_mod.Builder) +
+            @sizeOf(manifest_mod.ManifestStore) + @sizeOf(progress_store_mod.ProgressStore) + @sizeOf(wal_mod.WalStore);
+        catalog: CatalogService = undefined,
+        artifacts: artifacts_mod.ArtifactStore = undefined,
+        manifests: manifest_mod.ManifestStore = undefined,
+        progress: progress_store_mod.ProgressStore = undefined,
+        wal: wal_mod.WalStore = undefined,
+        store: catalog_store.CatalogStore = undefined,
+        builder: builder_mod.Builder = undefined,
+
+        pub fn bind(scope: *Scope, original: *CatalogService, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) *CatalogService {
+            scope.artifacts = original.artifacts.*;
+            scope.manifests = original.manifests.*;
+            scope.progress = original.progress.*;
+            scope.wal = original.wal.*;
+            scope.store = original.store.*;
+            scope.artifacts.write_context = context;
+            scope.manifests.context = context;
+            scope.progress.context = context;
+            scope.wal.context = context;
+            scope.store.context = context;
+            scope.builder = original.builder.*;
+            scope.builder.artifacts = &scope.artifacts;
+            scope.builder.manifests = &scope.manifests;
+            scope.builder.progress = &scope.progress;
+            scope.builder.wal = &scope.wal;
+            // Construct a view explicitly: copying a populated lease cache or
+            // its mutex would split ownership of already retained readers.
+            scope.catalog = .{
+                .alloc = original.alloc,
+                .artifacts = &scope.artifacts,
+                .manifests = &scope.manifests,
+                .progress = &scope.progress,
+                .wal = &scope.wal,
+                .store = &scope.store,
+                .builder = &scope.builder,
+                .external_source_plan_resolver = original.external_source_plan_resolver,
+                .lease_owner = original.lease_owner orelse original,
+            };
+            return &scope.catalog;
+        }
+    };
 
     pub fn init(
         alloc: Allocator,
@@ -383,6 +431,12 @@ pub const CatalogService = struct {
     }
 
     pub fn buildStatusUntil(self: *CatalogService, namespace: []const u8, cancellation: ?maintenance_cancellation.Token) !catalog_types.BuildStatus {
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+        var scope: Scope = .{};
+        const catalog = if (cancellation != null and cancellation.?.execution != null) scope.bind(self, bridge.readContext()) else self;
+        return catalog.buildStatusForScope(namespace, cancellation);
+    }
+    fn buildStatusForScope(self: *CatalogService, namespace: []const u8, cancellation: ?maintenance_cancellation.Token) !catalog_types.BuildStatus {
         try maintenance_cancellation.check(cancellation);
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status, null);
@@ -885,10 +939,12 @@ pub const CatalogService = struct {
         var scoped = self.artifacts.*;
         scoped.upload_scope = .{ .domain = graph_page_store.PageStore.namespaceDomain(namespace), .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io) };
         if (protected.execution != null) scoped.write_context = bridge.readContext();
-        const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication, .{ .artifacts = &scoped, .cancellation = bridge.token(), .maintenance = protected });
+        var metadata_scope: Scope = .{};
+        const catalog = if (protected.execution != null) metadata_scope.bind(self, bridge.readContext()) else self;
+        const policy = catalog.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
+        var plan = try catalog.publicationPlanForNamespaceAlloc(namespace, policy, .publication, .{ .artifacts = &scoped, .cancellation = bridge.token(), .maintenance = protected });
         defer plan.deinit(self.alloc);
-        return try self.builder.publishNamespaceWithMetricAndPlanGuardedUntil(
+        return try catalog.builder.publishNamespaceWithMetricAndPlanGuardedUntil(
             namespace,
             policy.vector_distance_metric,
             plan,
@@ -2448,7 +2504,8 @@ fn enrichmentCompletionAlloc(
     // Pin before resolving the manifest; a concurrent retirement must either
     // observe this reader or reject it. Never turn an unreadable source into
     // "enrichment complete".
-    const pin = try self.facts_read_leases.acquire(self.progress, namespace, head_version);
+    const lease_owner = self.lease_owner orelse self;
+    const pin = try lease_owner.facts_read_leases.acquire(lease_owner.progress, namespace, head_version);
     const ReadCheck = struct {
         pin: read_lease.Lease,
         cancellation: ?maintenance_cancellation.Token,

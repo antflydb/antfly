@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("types.zig");
 const head_coordination = @import("../head_coordination.zig");
@@ -186,8 +187,11 @@ pub const ProgressStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        cas_head_for: ?*const fn (*anyopaque, []const u8, ?u64, u64, ?PublicationFence, Context) anyerror!bool = null,
+        get_head_for: ?*const fn (*anyopaque, []const u8, CancellationToken, Context) anyerror!u64 = null,
         work_lease_provider: ?*const fn (*anyopaque) work_lease.Provider = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         get_head: *const fn (*anyopaque, []const u8) anyerror!u64,
@@ -224,10 +228,16 @@ pub const ProgressStore = struct {
     }
 
     pub fn getHead(self: *ProgressStore, namespace: []const u8) !u64 {
+        if (self.context) |context| if (self.vtable.get_head_for != null) {
+            return self.vtable.get_head_for.?(self.ptr, namespace, .none, context);
+        };
         return try self.vtable.get_head(self.ptr, namespace);
     }
 
     pub fn getHeadWithCancellation(self: *ProgressStore, namespace: []const u8, cancellation: CancellationToken) !u64 {
+        if (self.context) |context| if (self.vtable.get_head_for != null) {
+            return self.vtable.get_head_for.?(self.ptr, namespace, cancellation, context);
+        };
         try cancellation.check();
         const result = (if (self.vtable.get_head_with_cancellation) |read| read(self.ptr, namespace, cancellation) else self.getHead(namespace)) catch |err| {
             try cancellation.check();
@@ -243,6 +253,9 @@ pub const ProgressStore = struct {
     }
 
     pub fn compareAndSwapHead(self: *ProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
+        if (self.context) |context| if (self.vtable.cas_head_for != null) {
+            return self.vtable.cas_head_for.?(self.ptr, namespace, expected, version, null, context);
+        };
         return try self.vtable.compare_and_swap_head(self.ptr, namespace, expected, version);
     }
 
@@ -256,6 +269,7 @@ pub const ProgressStore = struct {
         version: u64,
         fence: PublicationFence,
     ) !bool {
+        if (self.context) |context| if (self.vtable.cas_head_for) |publish| return publish(self.ptr, namespace, expected, version, fence, context);
         return try self.vtable.compare_and_swap_head_fenced(
             self.ptr,
             namespace,

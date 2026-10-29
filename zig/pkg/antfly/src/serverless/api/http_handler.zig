@@ -1375,7 +1375,8 @@ pub const HttpHandler = struct {
     };
 
     fn publicBatchCompletionRetainedBytes() usize {
-        return @sizeOf(PublicBatchWork) + @sizeOf(@import("../../api/runnable_local_completion.zig").Bridge) +
+        return @import("../catalog/service.zig").CatalogService.Scope.retained_bytes +
+            @sizeOf(PublicBatchWork) + @sizeOf(@import("../../api/runnable_local_completion.zig").Bridge) +
             @sizeOf(@import("../../api/runnable_write_team.zig").Completion) + @import("../../api/runnable_completion_task.zig").Task.retainedBytes();
     }
 

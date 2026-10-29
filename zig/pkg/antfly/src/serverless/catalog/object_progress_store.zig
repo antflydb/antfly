@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const Provider = @import("../provider_operation.zig");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const platform_sync = @import("antfly_platform").sync;
 const objectstore = @import("objectstore");
 const catalog_types = @import("types.zig");
@@ -174,6 +176,20 @@ pub const ObjectProgressStore = struct {
         return current.record.head_version;
     }
 
+    fn getHeadFor(raw: *anyopaque, namespace: []const u8, cancellation: CancellationToken, context: Context) !u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
+        defer self.alloc.free(key);
+        var current = (try self.tryReadHeadCurrentFor(key, false, &.{ .context = context, .cancellation = cancellation })) orelse return error.FileNotFound;
+        defer current.deinit(self.alloc);
+        if (current.record.head_version == 0) return error.FileNotFound;
+        return current.record.head_version;
+    }
+    fn casHeadFor(raw: *anyopaque, namespace: []const u8, expected: ?u64, version: u64, fence: ?progress_store.PublicationFence, context: Context) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        return self.compareAndSwapHeadOperation(namespace, expected, version, fence, &.{ .context = context });
+    }
+
     pub fn compareAndSwapHead(self: *ObjectProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
         return try self.compareAndSwapHeadMaybeFenced(namespace, expected, version, null);
     }
@@ -195,12 +211,20 @@ pub const ObjectProgressStore = struct {
         version: u64,
         fence: ?progress_store.PublicationFence,
     ) !bool {
-        const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
-        defer self.alloc.free(key);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        return self.compareAndSwapHeadOperation(namespace, expected, version, fence, &.{});
+    }
 
-        var current = try self.tryReadHeadCurrent(key);
+    /// The provider's conditional write covers the head and lease token in
+    /// one object. Contextual callers need no local mutex across CPU return;
+    /// external writers already race this same ETag and fencing check.
+    fn compareAndSwapHeadOperation(self: *ObjectProgressStore, namespace: []const u8, expected: ?u64, version: u64, fence: ?progress_store.PublicationFence, operation: *const Provider.Operation) !bool {
+        try operation.ready();
+
+        const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
+        defer self.alloc.free(key);
+        var current = try self.tryReadHeadCurrentFor(key, true, operation);
         defer if (current) |*entry| entry.deinit(self.alloc);
         const current_version: ?u64 = if (current) |entry|
             if (entry.record.head_version == 0) null else entry.record.head_version
@@ -231,14 +255,14 @@ pub const ObjectProgressStore = struct {
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
 
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = operation.put(&self.client, self.bucket, key, payload, .{
             .content_type = content_type,
             .if_none_match = current == null,
             .if_match_etag = if (current) |entry| entry.etag else null,
         }) catch |err| switch (err) {
             error.PreconditionFailed => {
                 if (fence) |required| {
-                    var winner = try self.tryReadHeadCurrent(key);
+                    var winner = try self.tryReadHeadCurrentFor(key, true, operation);
                     defer if (winner) |*entry| entry.deinit(self.alloc);
                     const entry = winner orelse return error.WorkLeaseLost;
                     if (entry.record.released or
@@ -574,7 +598,19 @@ pub const ObjectProgressStore = struct {
     }
 
     fn tryReadHeadCurrentMaybeEtagWithCancellation(self: *ObjectProgressStore, key: []const u8, require_etag: bool, cancellation: CancellationToken) !?CurrentHead {
-        var result = self.client.getObject(self.bucket, key, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } }) catch |err| switch (err) {
+        return self.tryReadHeadCurrentFor(key, require_etag, &.{ .cancellation = cancellation });
+    }
+    fn tryReadHeadCurrentFor(self: *ObjectProgressStore, key: []const u8, require_etag: bool, operation: *const Provider.Operation) !?CurrentHead {
+        var result = self.decodeHeadCurrentFor(key, require_etag, operation) catch |err| {
+            try operation.check();
+            return err;
+        };
+        errdefer if (result) |*value| value.deinit(self.alloc);
+        try operation.ready();
+        return result;
+    }
+    fn decodeHeadCurrentFor(self: *ObjectProgressStore, key: []const u8, require_etag: bool, operation: *const Provider.Operation) !?CurrentHead {
+        var result = operation.get(&self.client, self.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -584,10 +620,10 @@ pub const ObjectProgressStore = struct {
         // same body. Some adapters omit it from GET; a bare STAT would race
         // publication, so read again conditionally before trusting its ETag.
         if (require_etag and result.metadata.etag == null) {
-            var metadata = try self.client.statObjectWithOptions(self.bucket, key, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } });
+            var metadata = try operation.stat(&self.client, self.bucket, key);
             defer metadata.deinit(self.alloc);
             const etag = metadata.etag orelse return error.MissingObjectEtag;
-            var verified = try self.client.getObject(self.bucket, key, .{ .if_match_etag = etag, .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } });
+            var verified = try operation.get(&self.client, self.bucket, key, .{ .if_match_etag = etag });
             errdefer verified.deinit(self.alloc);
             if (verified.metadata.etag) |actual| {
                 if (!std.mem.eql(u8, actual, etag)) return error.PreconditionFailed;
@@ -665,6 +701,8 @@ pub const ObjectProgressStore = struct {
     }
 
     const vtable: progress_store.ProgressStore.VTable = .{
+        .get_head_for = getHeadFor,
+        .cas_head_for = casHeadFor,
         .work_lease_provider = erasedWorkLeaseProvider,
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,

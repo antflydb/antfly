@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const Provider = @import("../provider_operation.zig");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const platform_sync = @import("antfly_platform").sync;
 const object_storage = @import("antfly_local_sources").storage_object_storage;
 const catalog_types = @import("types.zig");
@@ -249,8 +251,26 @@ pub const ObjectStore = struct {
     pub fn listNamespacesAlloc(self: *ObjectStore, alloc: std.mem.Allocator) ![]catalog_types.NamespaceRecord {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        return self.listNamespacesForOperation(alloc, &.{});
+    }
 
-        const current = try self.tryReadState(alloc);
+    fn listNamespacesFor(raw: *anyopaque, alloc: std.mem.Allocator, context: Context) ![]catalog_types.NamespaceRecord {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        try guard.lock(&self.mutex);
+        defer guard.deinit();
+        const operation = guard.operation();
+        const value = self.listNamespacesForOperation(alloc, &operation) catch |err| {
+            try guard.original.check();
+            return err;
+        };
+        errdefer freeNamespaceRecords(alloc, value);
+        try guard.finish();
+        return value;
+    }
+
+    fn listNamespacesForOperation(self: *ObjectStore, alloc: std.mem.Allocator, operation: *const Provider.Operation) ![]catalog_types.NamespaceRecord {
+        const current = try self.tryReadStateFor(alloc, operation);
         defer if (current) |*value| {
             freeNamespaceRecords(alloc, value.records);
             if (value.etag) |etag| alloc.free(etag);
@@ -264,13 +284,34 @@ pub const ObjectStore = struct {
     pub fn listTablesAlloc(self: *ObjectStore, alloc: std.mem.Allocator) ![]catalog_types.TableNamespaceRecord {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        return self.listTablesForOperation(alloc, &.{});
+    }
 
-        const current_namespaces = try self.tryReadState(alloc);
+    fn listTablesFor(raw: *anyopaque, alloc: std.mem.Allocator, context: Context) ![]catalog_types.TableNamespaceRecord {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        try guard.lock(&self.mutex);
+        defer guard.deinit();
+        const operation = guard.operation();
+        const value = self.listTablesForOperation(alloc, &operation) catch |err| {
+            try guard.original.check();
+            return err;
+        };
+        errdefer {
+            for (value) |*record| record.deinit(alloc);
+            alloc.free(value);
+        }
+        try guard.finish();
+        return value;
+    }
+
+    fn listTablesForOperation(self: *ObjectStore, alloc: std.mem.Allocator, operation: *const Provider.Operation) ![]catalog_types.TableNamespaceRecord {
+        const current_namespaces = try self.tryReadStateFor(alloc, operation);
         defer if (current_namespaces) |*value| {
             freeNamespaceRecords(alloc, value.records);
             if (value.etag) |etag| alloc.free(etag);
         };
-        const current_bindings = try self.tryReadTableBindings(alloc);
+        const current_bindings = try self.tryReadTableBindingsFor(alloc, operation);
         defer if (current_bindings) |*value| {
             freeTableBindings(alloc, value.records);
             if (value.etag) |etag| alloc.free(etag);
@@ -306,13 +347,31 @@ pub const ObjectStore = struct {
     pub fn getTableAlloc(self: *ObjectStore, alloc: std.mem.Allocator, table_name: []const u8) !?catalog_types.TableNamespaceRecord {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        return self.getTableForOperation(alloc, table_name, &.{});
+    }
 
-        const current_namespaces = try self.tryReadState(alloc);
+    fn getTableFor(raw: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, context: Context) !?catalog_types.TableNamespaceRecord {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        try guard.lock(&self.mutex);
+        defer guard.deinit();
+        const operation = guard.operation();
+        var value = self.getTableForOperation(alloc, table_name, &operation) catch |err| {
+            try guard.original.check();
+            return err;
+        };
+        errdefer if (value) |*record| record.deinit(alloc);
+        try guard.finish();
+        return value;
+    }
+
+    fn getTableForOperation(self: *ObjectStore, alloc: std.mem.Allocator, table_name: []const u8, operation: *const Provider.Operation) !?catalog_types.TableNamespaceRecord {
+        const current_namespaces = try self.tryReadStateFor(alloc, operation);
         defer if (current_namespaces) |*value| {
             freeNamespaceRecords(alloc, value.records);
             if (value.etag) |etag| alloc.free(etag);
         };
-        const current_bindings = try self.tryReadTableBindings(alloc);
+        const current_bindings = try self.tryReadTableBindingsFor(alloc, operation);
         defer if (current_bindings) |*value| {
             freeTableBindings(alloc, value.records);
             if (value.etag) |etag| alloc.free(etag);
@@ -399,8 +458,25 @@ pub const ObjectStore = struct {
     pub fn getPolicy(self: *ObjectStore, namespace: []const u8) !catalog_types.NamespacePolicy {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        return self.getPolicyForOperation(namespace, &.{});
+    }
 
-        const current = try self.tryReadState(self.alloc);
+    fn getPolicyFor(raw: *anyopaque, namespace: []const u8, context: Context) !catalog_types.NamespacePolicy {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        try guard.lock(&self.mutex);
+        defer guard.deinit();
+        const operation = guard.operation();
+        const value = self.getPolicyForOperation(namespace, &operation) catch |err| {
+            try guard.original.check();
+            return err;
+        };
+        try guard.finish();
+        return value;
+    }
+
+    fn getPolicyForOperation(self: *ObjectStore, namespace: []const u8, operation: *const Provider.Operation) !catalog_types.NamespacePolicy {
+        const current = try self.tryReadStateFor(self.alloc, operation);
         defer if (current) |*value| {
             freeNamespaceRecords(self.alloc, value.records);
             if (value.etag) |etag| self.alloc.free(etag);
@@ -448,10 +524,15 @@ pub const ObjectStore = struct {
     };
 
     fn tryReadState(self: *ObjectStore, alloc: std.mem.Allocator) !?CurrentState {
+        return self.tryReadStateFor(alloc, &.{});
+    }
+    fn tryReadStateFor(self: *ObjectStore, alloc: std.mem.Allocator, operation: *const Provider.Operation) !?CurrentState {
         const key = try stateKeyAlloc(alloc, self.opened.prefix);
         defer alloc.free(key);
 
-        var result = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+        var client = self.opened.client;
+        client.allocator = alloc;
+        var result = operation.get(&client, self.opened.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -465,10 +546,15 @@ pub const ObjectStore = struct {
     }
 
     fn tryReadTableBindings(self: *ObjectStore, alloc: std.mem.Allocator) !?CurrentTableBindings {
+        return self.tryReadTableBindingsFor(alloc, &.{});
+    }
+    fn tryReadTableBindingsFor(self: *ObjectStore, alloc: std.mem.Allocator, operation: *const Provider.Operation) !?CurrentTableBindings {
         const key = try tableBindingsKeyAlloc(alloc, self.opened.prefix);
         defer alloc.free(key);
 
-        var result = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+        var client = self.opened.client;
+        client.allocator = alloc;
+        var result = operation.get(&client, self.opened.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -510,6 +596,10 @@ pub const ObjectStore = struct {
     }
 
     const vtable: catalog_store.CatalogStore.VTable = .{
+        .list_namespaces_for = listNamespacesFor,
+        .list_tables_for = listTablesFor,
+        .get_table_for = getTableFor,
+        .get_policy_for = getPolicyFor,
         .deinit = erasedDeinit,
         .ensure_namespace = erasedEnsureNamespace,
         .ensure_table = erasedEnsureTable,

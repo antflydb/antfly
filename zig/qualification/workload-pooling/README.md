@@ -481,8 +481,50 @@ orchestration. Original lifetime, clock, class and accepted-completion authority
 remain inherited; no child creates a fresh admission root or deadline.
 
 The provider integration remains part of the open maintenance milestone.
-Manifest/WAL/catalog/progress calls, retention and pruning operations, direct
-filesystem artifact adapters, and model/kernel participant waits still need
-complete physical-boundary integration. Transport forwarding alone does not
+WAL and catalog mutations, GC/enrichment progress and work-lease calls,
+retention/pruning mutations, direct filesystem artifact adapters, and model/kernel
+participant waits still need complete physical-boundary integration. Transport forwarding alone does not
 qualify remote providers. The existing file-engine resource-gate failure and
 full-qualification waiver are unchanged.
+
+
+### Maintenance metadata provider ownership
+
+Operation-local store views now carry the original execution through managed
+publication, status/planning, synchronous materialization, compaction, pruning
+and enrichment. The views share the original backend and retained lease-cache
+owners; neither mutable provider handles nor cache mutexes are copied. The
+new view packets are included in background admission and public-batch completion
+metadata before those operations can publish work or accept WAL.
+
+Manifest encoding and decoding, WAL decoding and catalog reconstruction retain
+CPU. Object-backed reads lend CPU at file open/stat/header/body reads, bounded
+filesystem iterator steps and existing S3/GCS transport waits. Opened descriptors
+remain owned through CPU return; denied return closes them through the provider's
+original executor. Provider bodies and decoded outputs remain operation-owned
+through the final lifetime check. Legacy adapters without contextual callbacks
+keep their existing CPU ownership.
+
+Catalog read sequences retain their existing mutex. Their physical waits use the
+scheduler's nonwaiting publication reserve; a disabled or busy reserve keeps CPU
+instead of queuing for ordinary CPU while holding that mutex. HEAD publication
+uses the same verified ETag and lease record in its conditional provider write;
+contextual publishers can finish without taking a legacy caller's local mutex.
+Original rejection after physical publication discards only the response and
+preserves the durable HEAD.
+
+Focused native evidence combines the actual listener's HTTP ingestion, public
+batch and published-query paths with filesystem-backed maintenance fixtures.
+The latter perform successive publications, compaction and lease-aware pruning,
+verify exact public postimages, exercise enabled/disabled catalog return capacity,
+and reject owned reads after CPU return. A separate physical HEAD-write fixture
+preserves durable publication after original-scope rejection. Enrichment checks
+retain the stable idempotent WAL identity over both memory and filesystem object
+providers, including an already funded two-CPU write owner. These fixture results
+do not qualify cloud transports or prove physical deletion while read leases
+still protect old versions.
+
+The full maintenance milestone remains open for remaining mutation/retention
+provider boundaries, immutable artifact reads and provider/model/kernel
+participation. Remote-provider behavior and the original cross-engine/resource
+gates also remain open; the full-qualification waiver still applies.

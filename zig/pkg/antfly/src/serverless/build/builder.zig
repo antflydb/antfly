@@ -388,8 +388,20 @@ pub const Builder = struct {
         const protected = protection.token(io);
         var upload_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = protected };
         if (protected.execution != null) scoped_artifacts.write_context = upload_bridge.readContext();
+        var scoped_manifests = self.manifests.*;
+        var scoped_progress = self.progress.*;
+        var scoped_wal = self.wal.*;
+        if (protected.execution != null) {
+            const context = upload_bridge.readContext();
+            scoped_manifests.context = context;
+            scoped_progress.context = context;
+            scoped_wal.context = context;
+        }
         var publisher = self.*;
         publisher.artifacts = &scoped_artifacts;
+        publisher.manifests = &scoped_manifests;
+        publisher.progress = &scoped_progress;
+        publisher.wal = &scoped_wal;
         return publisher.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protected) catch |err| return graphPublicationError(err, false);
     }
 

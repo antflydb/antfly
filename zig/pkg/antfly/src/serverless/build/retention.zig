@@ -90,9 +90,20 @@ pub const Pruner = struct {
         const operation_alloc = working_set.allocator();
         var manifests = self.manifests.*;
         manifests.allocator = operation_alloc;
+        var progress = self.progress.*;
+        var wal = self.wal.*;
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+        if (cancellation != null and cancellation.?.execution != null) {
+            const context = bridge.readContext();
+            manifests.context = context;
+            progress.context = context;
+            wal.context = context;
+        }
         var operation_pruner = self.*;
         operation_pruner.alloc = operation_alloc;
         operation_pruner.manifests = &manifests;
+        operation_pruner.progress = &progress;
+        operation_pruner.wal = &wal;
         var result = operation_pruner.pruneNamespaceAdmitted(namespace, keep_latest_versions, cancellation) catch |err| {
             if (err == error.OutOfMemory and working_set.limit_exceeded) return error.GarbageCollectionBudgetExceeded;
             return err;
@@ -115,9 +126,9 @@ pub const Pruner = struct {
         // This short, durable ownership barrier makes every older publisher
         // incapable of committing HEAD. Do not hold it across graph traversal:
         // newer publishers use higher tokens and pin their source manifests.
-        var fallback_io = std.Io.Threaded.init(self.alloc, .{});
-        defer fallback_io.deinit();
-        const io = if (cancellation) |token| token.io else fallback_io.io();
+        var fallback_io: ?std.Io.Threaded = if (cancellation == null) std.Io.Threaded.init(self.alloc, .{}) else null;
+        defer if (fallback_io) |*value| value.deinit();
+        const io = if (cancellation) |token| token.io else fallback_io.?.io();
         const provider = try self.progress.workLeaseProvider();
         var nonce: [16]u8 = undefined;
         io.random(&nonce);

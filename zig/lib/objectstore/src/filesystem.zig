@@ -267,7 +267,7 @@ pub const FilesystemClient = struct {
         if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
         const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
         defer alloc.free(object_path);
-        const file = try openFilePath(self.io, object_path);
+        const file = try openFileFor(self.io, object_path, opts.cancellation);
         defer file.close(self.io);
         return self.getOpenObject(alloc, bucket, key, file, opts);
     }
@@ -276,8 +276,9 @@ pub const FilesystemClient = struct {
     // for metadata, range resolution and body reads so unconditional GET never
     // becomes a spurious failed precondition when that path is replaced.
     fn getOpenObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, file: std.Io.File, opts: types.GetOptions) !types.GetResult {
-        const file_stat = try file.stat(self.io);
-        var header = try readObjectHeader(alloc, self.io, file, file_stat.size);
+        const control: @import("httpx").socket.WriteControl = if (opts.cancellation) |token| token.execution_wait orelse .{} else .{};
+        const file_stat = try control.withWait(std.Io.File.stat, .{ file, self.io });
+        var header = try readObjectHeaderFor(alloc, self.io, file, file_stat.size, control);
         defer header.deinit(alloc);
         var meta = try objectMetadataAlloc(alloc, bucket, key, header, file_stat.mtime.toMilliseconds());
         errdefer meta.deinit(alloc);
@@ -346,12 +347,17 @@ pub const FilesystemClient = struct {
     }
 
     fn statObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
+        return self.statObjectFor(alloc, bucket, key, null);
+    }
+
+    fn statObjectFor(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, cancellation: ?types.CancellationToken) !types.ObjectMetadata {
+        const control: @import("httpx").socket.WriteControl = if (cancellation) |token| token.execution_wait orelse .{} else .{};
         const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
         defer alloc.free(object_path);
-        const file = try openFilePath(self.io, object_path);
+        const file = try openFileFor(self.io, object_path, cancellation);
         defer file.close(self.io);
-        const file_stat = try file.stat(self.io);
-        var header = try readObjectHeader(alloc, self.io, file, file_stat.size);
+        const file_stat = try control.withWait(std.Io.File.stat, .{ file, self.io });
+        var header = try readObjectHeaderFor(alloc, self.io, file, file_stat.size, control);
         defer header.deinit(alloc);
         return objectMetadataAlloc(alloc, bucket, key, header, file_stat.mtime.toMilliseconds());
     }
@@ -376,6 +382,7 @@ pub const FilesystemClient = struct {
 
     fn listObjects(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
         if (opts.cancellation) |token| try token.check();
+        const control: @import("httpx").socket.WriteControl = if (opts.cancellation) |token| token.execution_wait orelse .{} else .{};
         if (opts.prefix.len != 0) try validateKey(std.mem.trimEnd(u8, opts.prefix, "/"));
         // Every complete path component of the prefix confines the listing.
         // Keep the final partial component as a string filter (logs/ab must
@@ -429,7 +436,7 @@ pub const FilesystemClient = struct {
         var retained = std.StringHashMapUnmanaged(void).empty;
         defer retained.deinit(alloc);
         const continuation = opts.continuation_token orelse opts.start_after;
-        while (try walker.next(self.io)) |entry| {
+        while (try control.withWait(std.Io.Dir.Walker.next, .{ &walker, self.io })) |entry| {
             if (opts.cancellation) |token| try token.check();
             if (entry.kind != .file) continue;
             const key = try std.mem.concat(alloc, u8, &.{ directory_prefix, entry.path });
@@ -473,7 +480,7 @@ pub const FilesystemClient = struct {
                 try prefixes.append(alloc, try alloc.dupe(u8, candidate.name));
                 continue;
             }
-            var meta = try self.statObject(alloc, bucket, candidate.name);
+            var meta = try self.statObjectFor(alloc, bucket, candidate.name, opts.cancellation);
             defer meta.deinit(alloc);
             try entries.append(alloc, .{
                 .key = try alloc.dupe(u8, candidate.name),
@@ -505,6 +512,7 @@ pub const FilesystemClient = struct {
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
+        .stat_object_with_options = erasedStatObjectWithOptions,
         .delete_object = erasedDeleteObject,
         .list_objects = erasedListObjects,
     };
@@ -564,6 +572,13 @@ pub const FilesystemClient = struct {
     fn erasedStatObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
         const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
         return try self.statObject(alloc, bucket, key);
+    }
+
+    fn erasedStatObjectWithOptions(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
+        if (opts.cancellation) |token| try token.check();
+        if (opts.version_id != null) return error.VersioningUnsupported;
+        return self.statObjectFor(alloc, bucket, key, opts.cancellation);
     }
 
     fn erasedDeleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
@@ -753,6 +768,25 @@ fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
         try std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
+/// The opened descriptor stays owned by this adapter until CPU return accepts
+/// it. Failed return closes it through the exact provider executor.
+const OpenedFile = struct {
+    io: std.Io,
+    file: std.Io.File,
+    fn open(io: std.Io, path: []const u8) !OpenedFile {
+        return .{ .io = io, .file = try openFilePath(io, path) };
+    }
+    fn discard(self: OpenedFile, _: anytype) void {
+        self.file.close(self.io);
+    }
+};
+fn openFileFor(io: std.Io, path: []const u8, cancellation: ?types.CancellationToken) !std.Io.File {
+    const control: @import("httpx").socket.WriteControl = if (cancellation) |token| token.execution_wait orelse .{} else .{};
+    var rejected = false;
+    const opened = try control.withOwnedWait(&rejected, OpenedFile.open, .{ io, path }, OpenedFile.discard);
+    return opened.file;
+}
+
 fn writeObjectAtomically(
     io: std.Io,
     path: []const u8,
@@ -894,9 +928,12 @@ fn encodeObjectHeader(out: *[object_header_len]u8, content_length: u64, content_
 }
 
 fn readObjectHeader(alloc: Allocator, io: std.Io, file: std.Io.File, file_size: u64) !ObjectHeader {
+    return readObjectHeaderFor(alloc, io, file, file_size, .{});
+}
+fn readObjectHeaderFor(alloc: Allocator, io: std.Io, file: std.Io.File, file_size: u64, control: @import("httpx").socket.WriteControl) !ObjectHeader {
     if (file_size < object_header_len) return error.CorruptObject;
     var fixed: [object_header_len]u8 = undefined;
-    if (try file.readPositionalAll(io, &fixed, 0) != fixed.len) return error.CorruptObject;
+    if (try control.withWait(std.Io.File.readPositionalAll, .{ file, io, &fixed, @as(u64, 0) }) != fixed.len) return error.CorruptObject;
     if (!std.mem.eql(u8, fixed[0..object_magic.len], object_magic)) return error.UnsupportedObjectFormat;
 
     const content_length = std.mem.readInt(u64, fixed[object_magic.len..][0..8], .little);
@@ -908,7 +945,7 @@ fn readObjectHeader(alloc: Allocator, io: std.Io, file: std.Io.File, file_size: 
 
     const content_type = try alloc.alloc(u8, content_type_len);
     errdefer alloc.free(content_type);
-    if (content_type.len > 0 and try file.readPositionalAll(io, content_type, object_header_len) != content_type.len)
+    if (content_type.len > 0 and try control.withWait(std.Io.File.readPositionalAll, .{ file, io, content_type, @as(u64, object_header_len) }) != content_type.len)
         return error.CorruptObject;
     var etag: [64]u8 = undefined;
     @memcpy(&etag, fixed[object_magic.len + 12 ..]);
@@ -971,7 +1008,8 @@ fn readObjectRangeAlloc(
         if (cancellation) |token| try token.check();
         const chunk_len = @min(cancellation_chunk_bytes, body.len - copied);
         const chunk = body[copied..][0..chunk_len];
-        if (try file.readPositionalAll(io, chunk, file_offset + copied) != chunk.len) return error.CorruptObject;
+        const control: @import("httpx").socket.WriteControl = if (cancellation) |token| token.execution_wait orelse .{} else .{};
+        if (try control.withWait(std.Io.File.readPositionalAll, .{ file, io, chunk, file_offset + copied }) != chunk.len) return error.CorruptObject;
         copied += chunk.len;
     }
     if (cancellation) |token| try token.check();

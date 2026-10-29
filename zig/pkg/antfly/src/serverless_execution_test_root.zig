@@ -944,3 +944,266 @@ test "serverless execution maintenance mutex wait lends CPU and preserves origin
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
 }
+
+test "serverless execution managed metadata borrows provider waits and preserves committed data after rejection" {
+    const local = @import("antfly_local_sources");
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const Catalog = @import("serverless/catalog/service.zig").CatalogService;
+    const Probe = struct {
+        execution: *Runnable.Execution,
+        scheduler: *Runnable.Scheduler,
+        waits: usize = 0,
+        lost: bool = false,
+        reject_return: bool = false,
+        fn observe(self: *@This()) !void {
+            if (self.execution.entry.?.state != .resource_blocked) return;
+            var unrelated: Runnable.Execution = .{};
+            defer unrelated.finish();
+            try unrelated.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+            self.waits += 1;
+        }
+        fn authority(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.lost) return error.WorkLeaseLost;
+            try self.observe();
+        }
+        fn original(raw: *const anyopaque) !void {
+            try authority(@constCast(raw));
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try authority(raw);
+            try self.execution.checkpoint();
+            try self.execution.park(.resource_blocked);
+            try self.observe();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_return) self.lost = true;
+            try self.execution.enter(.background);
+            try authority(raw);
+        }
+    };
+    for ([_]bool{ false, true }) |reserved_return| {
+        var directory = try local.common_test_directory.TestDirectory.init("managed-metadata");
+        defer directory.cleanup();
+        const alloc = std.testing.allocator;
+        var uris: [5][]u8 = undefined;
+        var initialized: usize = 0;
+        defer for (uris[0..initialized]) |uri| alloc.free(uri);
+        for ([_][]const u8{ "artifacts", "manifests", "wal", "progress", "catalog" }, 0..) |name, index| {
+            uris[index] = try std.fmt.allocPrint(alloc, "file://{s}/{s}", .{ directory.path(), name });
+            initialized += 1;
+        }
+        var stack: bootstrap.OwnedStack = undefined;
+        try stack.init(alloc, .{
+            .artifacts_uri = uris[0],
+            .manifests_uri = uris[1],
+            .wal_uri = uris[2],
+            .progress_uri = uris[3],
+            .catalog_uri = uris[4],
+            .query_cache_dir = null,
+            .enrichment_enabled = false,
+            .compaction_enabled = false,
+            .prune_enabled = false,
+            .graph_metric_max_parallelism = 1,
+            .process_memory_limit_bytes = 64 << 20,
+            .runnable_policy = .{ .slots = if (reserved_return) 4 else 3, .cleanup_slots = 1, .publication_slots = if (reserved_return) 1 else 0 },
+        }, std.testing.io);
+        defer stack.deinit();
+        try std.testing.expect(try stack.catalog.ensureTable("docs", 1));
+        var accepted = try stack.api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &.{.{ .kind = .upsert, .doc_id = "a", .body = "{\"body\":\"alpha\"}" }} });
+        defer accepted.deinit(stack.api.alloc);
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        const scheduler = &stack.runnable_scheduler.?;
+        try execution.start(scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) + Catalog.Scope.retained_bytes }, .background);
+        var probe: Probe = .{ .execution = &execution, .scheduler = scheduler };
+        var context = (local.serverless_query_lake_read_context.Context{ .io = std.testing.io, .authority = .{ .ptr = &probe, .check = Probe.authority } }).withExecution(&execution);
+        context.wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end };
+        var scope: Catalog.Scope = .{};
+        const catalog = scope.bind(&stack.catalog, context);
+        try std.testing.expect(catalog.lease_owner.? == &stack.catalog);
+        _ = try catalog.getPolicy("docs");
+        // Catalog read sequences preserve their mutex; a disabled return
+        // reserve keeps CPU rather than queueing while holding that mutex.
+        try std.testing.expectEqual(reserved_return, probe.waits != 0);
+        const before = probe.waits;
+        try std.testing.expectEqual(@as(u64, 1), try catalog.wal.latestLsn("docs"));
+        const records = try catalog.wal.readFromAlloc("docs", 1);
+        defer @import("serverless/wal/mod.zig").freeRecords(catalog.wal.allocator, records);
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expect(probe.waits > before);
+        const token: maintenance.Token = .{ .io = std.testing.io, .execution = &execution, .cooperative = .{ .ptr = &probe, .check_fn = Probe.original } };
+        var publication = try catalog.buildNamespaceGuardedUntil("docs", null, token);
+        defer publication.deinit(catalog.alloc);
+        try std.testing.expect(publication.published);
+        var second = try stack.api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 2, .mutations = &.{.{ .kind = .upsert, .doc_id = "b", .body = "{\"body\":\"beta\"}" }} });
+        defer second.deinit(stack.api.alloc);
+        var updated = try catalog.buildNamespaceGuardedUntil("docs", null, token);
+        defer updated.deinit(catalog.alloc);
+        try std.testing.expect(updated.published);
+        const builds = @import("serverless/build/mod.zig");
+        var compactor = builds.Compactor.init(stack.alloc, &stack.artifacts, &stack.manifests, &stack.progress);
+        var compacted = try compactor.compactHeadGuardedUntil("docs", null, token);
+        defer compacted.deinit(stack.alloc);
+        try std.testing.expect(compacted.published);
+        var pruner = builds.Pruner.init(stack.alloc, &stack.artifacts, &stack.manifests, &stack.progress, &stack.wal);
+        var pruned = try pruner.pruneNamespaceUntil("docs", 2, token);
+        defer pruned.deinit(stack.alloc);
+        try std.testing.expect(!pruned.work_lease_conflict and !pruned.gc_watermark_conflict);
+        const head = try catalog.progress.getHead("docs");
+        var manifest = try catalog.manifests.getAlloc("docs", head);
+        defer manifest.deinit(catalog.manifests.allocator);
+        try std.testing.expectEqual(@as(u64, 2), manifest.stats.document_count);
+        // The durable HEAD ETag and lease record fence this write. Keeping a
+        // legacy caller's local mutex locked cannot obstruct CPU return here.
+        try std.testing.expect(stack.progress_impl.mutex.tryLock());
+        const republished = catalog.progress.compareAndSwapHead("docs", head, head);
+        stack.progress_impl.mutex.unlock();
+        try std.testing.expect(try republished);
+        probe.reject_return = true;
+        try std.testing.expectError(error.WorkLeaseLost, catalog.wal.readFromAlloc("docs", 1));
+        try std.testing.expect(stack.wal.context == null and stack.manifests.context == null and stack.progress.context == null and stack.catalog_store.context == null);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        // The original public read path still sees the exact committed postimage.
+        var response = try stack.handler.handle(.{ .method = .get, .path = "/tables/docs/query/published" });
+        defer response.deinit(stack.handler.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var decoded = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+        defer decoded.deinit();
+        const docs = decoded.value.object.get("documents").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), docs.len);
+        try std.testing.expectEqualStrings("a", docs[0].object.get("doc_id").?.string);
+        try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", docs[0].object.get("body").?.string);
+        try std.testing.expectEqualStrings("b", docs[1].object.get("doc_id").?.string);
+        try std.testing.expectEqualStrings("{\"body\":\"beta\"}", docs[1].object.get("body").?.string);
+    }
+}
+
+test "serverless execution HEAD refusal after provider publication preserves the durable fenced result" {
+    const objectstore = @import("objectstore");
+    const progress_mod = @import("serverless/catalog/object_progress_store.zig");
+    const Fixture = struct {
+        var original_put: @FieldType(objectstore.Client.VTable, "put_object") = undefined;
+        var lost: bool = false;
+        var armed: bool = false;
+        fn put(raw: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8, bytes: []const u8, options: objectstore.PutOptions) !objectstore.PutResult {
+            const result = try original_put(raw, alloc, bucket, key, bytes, options);
+            if (armed) lost = true;
+            return result;
+        }
+        fn check(_: *anyopaque) !void {
+            if (lost) return error.WorkLeaseLost;
+        }
+    };
+    Fixture.lost = false;
+    Fixture.armed = false;
+    defer Fixture.armed = false;
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("head-publication-return");
+    defer directory.cleanup();
+    var filesystem = try objectstore.FilesystemClient.initWithIo(std.testing.allocator, directory.path(), std.testing.io);
+    defer filesystem.deinit();
+    var client = filesystem.client();
+    var vtable = client.vtable.*;
+    Fixture.original_put = vtable.put_object;
+    vtable.put_object = Fixture.put;
+    client.vtable = &vtable;
+    var backend = try progress_mod.ObjectProgressStore.initWithClient(std.testing.allocator, client, "progress", "");
+    var original = backend.progressStore();
+    defer original.deinit();
+    try std.testing.expect(try original.compareAndSwapHead("docs", null, 1));
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) }, .background);
+    var marker: u8 = 0;
+    var scoped = original;
+    scoped.context = (@import("antfly_local_sources").serverless_query_lake_read_context.Context{
+        .io = std.testing.io,
+        .authority = .{ .ptr = &marker, .check = Fixture.check },
+    }).withExecution(&execution);
+    try std.testing.expectError(error.WorkLeaseLost, scoped.compareAndSwapHeadFenced("docs", 1, 2, .{ .owner_id = "stale", .fencing_token = 1 }));
+    try std.testing.expectEqual(@as(u64, 1), try original.getHead("docs"));
+    Fixture.armed = true;
+    try std.testing.expectError(error.WorkLeaseLost, scoped.compareAndSwapHead("docs", 1, 2));
+    // Refusal discards the provider response. It cannot roll back or report
+    // nonacceptance for the atomic durable mutation that already completed.
+    try std.testing.expectEqual(@as(u64, 2), try original.getHead("docs"));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "serverless execution manifest rejection during decoding retires the owned provider result" {
+    const objectstore = @import("objectstore");
+    const manifests = @import("serverless/manifest/mod.zig");
+    const Allocations = struct {
+        live: usize = 0,
+        lost: bool = false,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
+            self.live += len;
+            // This fixture's decoded namespace is four bytes. Provider keys,
+            // bucket, checksums, content type and encoded body are longer.
+            if (len == 4) self.lost = true;
+            return bytes;
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.testing.allocator.rawFree(bytes, alignment, ret_addr);
+            self.live -= bytes.len;
+        }
+        fn authority(raw: *anyopaque) !void {
+            if (@as(*@This(), @ptrCast(@alignCast(raw))).lost) return error.WorkLeaseLost;
+        }
+    };
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("manifest-decode-return");
+    defer directory.cleanup();
+    var filesystem = try objectstore.FilesystemClient.initWithIo(std.testing.allocator, directory.path(), std.testing.io);
+    defer filesystem.deinit();
+    var backend = try @import("serverless/manifest/object_store.zig").ObjectStore.initWithClient(std.testing.allocator, filesystem.client(), "manifests", "");
+    var original = backend.manifestStore();
+    defer original.deinit();
+    try original.put(.{ .namespace = @constCast("docs"), .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 1, .stats = .{}, .artifacts = @constCast(&.{}) });
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) }, .background);
+    var allocations: Allocations = .{};
+    var scoped = original;
+    scoped.allocator = allocations.allocator();
+    scoped.context = (@import("antfly_local_sources").serverless_query_lake_read_context.Context{
+        .io = std.testing.io,
+        .authority = .{ .ptr = &allocations, .check = Allocations.authority },
+    }).withExecution(&execution);
+    const result = scoped.getAllocWithCancellation("docs", 1, .none);
+    if (result) |value| {
+        var unexpected = value;
+        unexpected.deinit(scoped.allocator);
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expectEqual(@as(anyerror, error.WorkLeaseLost), err);
+    try std.testing.expect(allocations.lost);
+    try std.testing.expectEqual(@as(usize, 0), allocations.live);
+    var healthy: manifests.Manifest = try original.getAlloc("docs", 1);
+    defer healthy.deinit(original.allocator);
+    try std.testing.expectEqualStrings("docs", healthy.namespace);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}

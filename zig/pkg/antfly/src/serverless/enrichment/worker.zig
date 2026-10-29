@@ -348,6 +348,26 @@ pub const SparseEnricher = struct {
         cfg: SparseEnricherConfig,
         cancellation: ?maintenance_cancellation.Token,
     ) !EnrichmentRunStats {
+        var manifests = self.manifests.*;
+        var progress = self.progress.*;
+        var wal = self.wal.*;
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+        if (cancellation != null and cancellation.?.execution != null) {
+            const context = bridge.readContext();
+            manifests.context = context;
+            progress.context = context;
+            wal.context = context;
+        }
+        // Provider/model handles remain borrowed from the configured worker.
+        // Per-document checkpoint/generation state already uses local worker
+        // views; this view does not destroy or reconfigure those owners.
+        var worker = self.*;
+        worker.manifests = &manifests;
+        worker.progress = &progress;
+        worker.wal = &wal;
+        return worker.runNamespaceWithConfigScoped(namespace, cfg, cancellation);
+    }
+    fn runNamespaceWithConfigScoped(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig, cancellation: ?maintenance_cancellation.Token) !EnrichmentRunStats {
         try cfg.document_limits.validate();
         if (cfg.batch_size == 0 or cfg.scan_batch_size == 0 or cfg.max_source_read_bytes == 0) return error.InvalidEnrichmentLimits;
         try maintenance_cancellation.check(cancellation);
@@ -2573,55 +2593,72 @@ test "serverless enrichment WAL fence rejects a user mutation that lands during 
 }
 
 test "serverless object enrichment writes a stable idempotent WAL identity" {
-    const alloc = std.testing.allocator;
-    var memory = objectstore.MemoryClient.init(alloc);
-    defer memory.deinit();
-    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-artifacts", "tenant");
-    var artifacts = artifact_impl.artifactStore();
-    defer artifacts.deinit();
-    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-manifests", "tenant");
-    var manifests = manifest_impl.manifestStore();
-    defer manifests.deinit();
-    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "enrichment-progress", "tenant");
-    var progress = progress_impl.progressStore();
-    defer progress.deinit();
-    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-wal", "tenant");
-    var wal = wal_impl.walStore();
-    defer wal.deinit();
+    for ([_]bool{ false, true }) |use_filesystem| {
+        const alloc = std.testing.allocator;
+        var memory = objectstore.MemoryClient.init(alloc);
+        defer memory.deinit();
+        var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("object-enrichment");
+        defer directory.cleanup();
+        var filesystem: ?objectstore.FilesystemClient = if (use_filesystem) try objectstore.FilesystemClient.initWithIo(alloc, directory.path(), std.testing.io) else null;
+        defer if (filesystem) |*value| value.deinit();
+        const client = if (filesystem) |*value| value.client() else memory.client();
+        var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, client, "enrichment-artifacts", "tenant");
+        var artifacts = artifact_impl.artifactStore();
+        defer artifacts.deinit();
+        var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, client, "enrichment-manifests", "tenant");
+        var manifests = manifest_impl.manifestStore();
+        defer manifests.deinit();
+        var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, client, "enrichment-progress", "tenant");
+        var progress = progress_impl.progressStore();
+        defer progress.deinit();
+        var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, client, "enrichment-wal", "tenant");
+        var wal = wal_impl.walStore();
+        defer wal.deinit();
 
-    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifacts, &manifests, &progress, &wal);
-    var api = @import("../api/service.zig").Service.init(alloc, &wal, &builder);
-    const batch = [_]api_types.DocumentMutation{.{
-        .kind = .upsert,
-        .doc_id = "doc-a",
-        .body = "{\"text\":\"alpha bravo\"}",
-    }};
-    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
-    defer ingest.deinit(alloc);
-    var build = try publishEnrichmentFixture(&builder);
-    defer build.deinit(alloc);
+        var builder = @import("../build/builder.zig").Builder.init(alloc, &artifacts, &manifests, &progress, &wal);
+        var api = @import("../api/service.zig").Service.init(alloc, &wal, &builder);
+        const batch = [_]api_types.DocumentMutation{.{
+            .kind = .upsert,
+            .doc_id = "doc-a",
+            .body = "{\"text\":\"alpha bravo\"}",
+        }};
+        var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
+        defer ingest.deinit(alloc);
+        var build = try publishEnrichmentFixture(&builder);
+        defer build.deinit(alloc);
 
-    var enricher = SparseEnricher.init(alloc, &artifacts, &manifests, &progress, &wal);
-    const stats = try enricher.runNamespaceWithConfig("docs", .{
-        .batch_size = 4,
-        .pipeline_version = lexical_sparse_enrichment_version,
-    });
-    try std.testing.expectEqual(@as(usize, 1), stats.wal_appends);
-    const tail = try wal.readFromAlloc("docs", 2);
-    defer wal_mod.freeRecords(alloc, tail);
-    try std.testing.expectEqual(@as(usize, 1), tail.len);
-    try std.testing.expectEqual(@as(?u64, 1), try operation_identity.sourceHeadVersion(tail[0].operation_id));
-    try std.testing.expect(std.mem.startsWith(u8, tail[0].operation_id.?, operation_identity.prefix));
-    try std.testing.expectEqual(
-        tail[0].lsn,
-        try wal.appendIdempotent(
-            "docs",
-            tail[0].timestamp_ns,
-            tail[0].payload,
-            tail[0].operation_id.?,
-        ),
-    );
-    try std.testing.expectEqual(@as(u64, 2), try wal.latestLsn("docs"));
+        var enricher = SparseEnricher.init(alloc, &artifacts, &manifests, &progress, &wal);
+        const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = if (use_filesystem) 3 else 2 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) }, if (use_filesystem) .write else .background, if (use_filesystem) 2 else 1);
+        const stats = try enricher.runNamespaceWithConfigUntil("docs", .{
+            .batch_size = 4,
+            .pipeline_version = lexical_sparse_enrichment_version,
+        }, .{ .io = std.testing.io, .execution = &execution });
+        try std.testing.expectEqual(@as(usize, 1), stats.wal_appends);
+        const tail = try wal.readFromAlloc("docs", 2);
+        defer wal_mod.freeRecords(alloc, tail);
+        try std.testing.expectEqual(@as(usize, 1), tail.len);
+        try std.testing.expectEqual(@as(?u64, 1), try operation_identity.sourceHeadVersion(tail[0].operation_id));
+        try std.testing.expect(std.mem.startsWith(u8, tail[0].operation_id.?, operation_identity.prefix));
+        try std.testing.expectEqual(
+            tail[0].lsn,
+            try wal.appendIdempotent(
+                "docs",
+                tail[0].timestamp_ns,
+                tail[0].payload,
+                tail[0].operation_id.?,
+            ),
+        );
+        try std.testing.expectEqual(@as(u64, 2), try wal.latestLsn("docs"));
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        try std.testing.expect(manifests.context == null and progress.context == null and wal.context == null);
+    }
 }
 
 test "serverless sparse enricher can append derived chunk preview mutation" {

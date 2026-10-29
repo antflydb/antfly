@@ -166,8 +166,11 @@ pub const BackgroundPublisher = struct {
     fn runOnceWithToken(self: *BackgroundPublisher, cancellation: maintenance_cancellation.Token) !PublishRunStats {
         try cancellation.lock(&self.run_mutex);
         defer self.run_mutex.unlock(self.io);
-        const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
-        defer self.catalog.freeNamespaces(self.alloc, namespaces);
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+        var scope: catalog_service.CatalogService.Scope = .{};
+        const catalog = if (cancellation.execution != null) scope.bind(self.catalog, bridge.readContext()) else self.catalog;
+        const namespaces = try catalog.listNamespacesAlloc(self.alloc);
+        defer catalog.freeNamespaces(self.alloc, namespaces);
 
         var stats = PublishRunStats{};
         self.budget_backoff.beginPass();
@@ -182,7 +185,7 @@ pub const BackgroundPublisher = struct {
                 stats.budget_rejected_namespaces += 1;
                 continue;
             }
-            var status = self.catalog.buildStatusUntil(namespace.name, cancellation) catch |err| switch (err) {
+            var status = catalog.buildStatusUntil(namespace.name, cancellation) catch |err| switch (err) {
                 error.LakeSidecarBuildBudgetExceeded => {
                     self.coalescing.suppressWake(namespace.name);
                     try self.budget_backoff.reject(self.alloc, namespace.name, std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
@@ -263,7 +266,7 @@ pub const BackgroundPublisher = struct {
                 lease.cancellation(cancellation)
             else
                 cancellation;
-            var result = self.catalog.buildNamespaceGuardedUntil(
+            var result = catalog.buildNamespaceGuardedUntil(
                 namespace.name,
                 publication_guard,
                 build_cancellation,
