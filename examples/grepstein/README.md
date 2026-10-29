@@ -166,8 +166,17 @@ separate; it needs read access to the originals bucket.
   --inference-url "$ANTFLY_INFERENCE_URL" \
   --inference-secret antfly.antfly_inference.api_key
 ./grepstein wait --url "$ANTFLY_URL"
+./grepstein qualify --state ./grepstein-corpus --url "$ANTFLY_URL" \
+  --output ./grepstein-corpus/extraction-qualification.json
 ./grepstein stats --state ./grepstein-corpus --url "$ANTFLY_URL"
 ```
+
+`wait` checks index serving milestones. `qualify` separately checks every PDF in
+the sealed publication against its native generation-pinned GCS artifact, exact
+page count and explicit OCR counters. Missing counters, stale source bindings or
+any OCR failure block qualification, even when full-text search is ready. Run it
+before semantic/graph enrichment; a successful receipt measures extraction
+coverage, not OCR transcription accuracy, source authorization or public readiness.
 
 The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
 inference. The deployed Antfly v0.3.0-rc.6 shared L4 reader pool passed synthetic
