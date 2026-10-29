@@ -31,7 +31,7 @@ export async function readCounterToken(){
 // Fixed taxonomy only: provider messages can contain arbitrary strings.
 export function counterFailureDiagnostic(value,status=200){
  const messages=(Array.isArray(value?.errors)?value.errors:[]).slice(0,16).map(e=>String(e?.message??'')).join(' ');
- const kind=status===401||status===403?'authorization':status===429||/rate.?limit|quota|too many|limit.*exceed/i.test(messages)?'rate_limit':/unknown field|cannot query|not defined|does not exist|invalid.*field/i.test(messages)?'schema':/timeout|timed out|deadline/i.test(messages)?'timeout':'provider_error';
+ const kind=status===401||status===403||/not authori[sz]ed|unauthori[sz]ed|permission denied|authentication/i.test(messages)?'authorization':status===429||/rate.?limit|quota|too many|limit.*exceed/i.test(messages)?'rate_limit':/unknown field|cannot query|not defined|does not exist|invalid.*field/i.test(messages)?'schema':/timeout|timed out|deadline/i.test(messages)?'timeout':'provider_error';
  return{kind,http_status:status,error_codes:(Array.isArray(value?.errors)?value.errors:[]).slice(0,16).map(e=>e.code).filter(Number.isSafeInteger)};
 }
 function counterQueryFailure(value,status){return Object.assign(Error('IndependentCounterQueryFailed'),{diagnostic:counterFailureDiagnostic(value,status)});}

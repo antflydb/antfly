@@ -14,7 +14,7 @@
 // limitations under the License.
 
 // Owned diagnostic lifecycle. No raw provider logs or credentials reach disk.
-import{readFile,writeFile,mkdir,readdir,appendFile,unlink}from'node:fs/promises';import{resolve,dirname,basename}from'node:path';import{fileURLToPath}from'node:url';import{spawn,execFileSync}from'node:child_process';import{createHash,randomBytes}from'node:crypto';
+import{readFile,writeFile,mkdir,readdir,appendFile,unlink}from'node:fs/promises';import{resolve,dirname,basename}from'node:path';import{fileURLToPath}from'node:url';import{spawn,execFileSync}from'node:child_process';import{createHash,randomBytes}from'node:crypto';import{readCounterToken,counterFailureDiagnostic}from'./independent-counters.mjs';
 const cwd=fileURLToPath(new URL('../',import.meta.url)),cli=resolve(cwd,'node_modules/wrangler/bin/wrangler.js'),base='antfly-1278-telemetry-';
 const json=async path=>JSON.parse(await readFile(path)),save=(path,value)=>writeFile(path,JSON.stringify(value,null,2),{mode:0o600});
 async function prepare(gatePath){
@@ -27,7 +27,7 @@ async function prepare(gatePath){
  const common={account_id:run.account,compatibility_date:'2026-10-23'};
  await save(resolve(dir,'source.json'),{...common,name:run.source,main:resolve(cwd,'qualification/logpush-probe-source.mjs'),workers_dev:false,logpush:true,observability:{enabled:true,head_sampling_rate:1},durable_objects:{bindings:[{name:'PROBES',class_name:'Probe'}]},migrations:[{tag:'v1',new_sqlite_classes:['Probe']}]});
  await save(resolve(dir,'collector.json'),{...common,name:run.collector,main:resolve(cwd,'qualification/logpush-probe-collector.mjs'),workers_dev:true,logpush:false,observability:{enabled:false},r2_buckets:[{binding:'LOGS',bucket_name:run.bucket}],services:[{binding:'FIXTURE',service:run.source}],vars:{SOURCE_WORKER:run.source,CAPTURE_ID:run.capture_id}});
- const proposal={name:id,dataset:'workers_trace_events',enabled:false,filter:JSON.stringify({where:{key:'ScriptName',operator:'eq',value:run.source}}),output_options:{field_names:['Event','EventTimestampMs','EventType','Exceptions','Logs','Outcome','ScriptName','ScriptVersion','Entrypoint','CPUTimeMs','WallTimeMs'],sample_rate:1,timestamp_format:'rfc3339'},max_upload_bytes:5000000,max_upload_records:1000};
+ const proposal={name:id,dataset:'workers_trace_events',enabled:false,filter:JSON.stringify({where:{key:'ScriptName',operator:'eq',value:run.source}}),output_options:{field_names:['Event','EventTimestampMs','EventType','Exceptions','Logs','Outcome','ScriptName','ScriptVersion','Entrypoint','CPUTimeMs','WallTimeMs'],sample_rate:1,timestamp_format:'rfc3339'},max_upload_bytes:5000000,max_upload_records:1000,max_upload_interval_seconds:30};
  await save(resolve(dir,'job-proposal.json'),proposal);await save(resolve(dir,'run.json'),run);console.log(JSON.stringify({manifest:resolve(dir,'run.json'),source:run.source,collector:run.collector,bucket:run.bucket,qualification:false}));
 }
 async function openRun(path){
@@ -36,7 +36,7 @@ async function openRun(path){
 
  if(run.job_id!=null&&(!Number.isSafeInteger(run.job_id)||run.job_id<1))throw Error('TelemetryJobIdentityInvalid');
  if(run.schema!==1||!/^[a-z0-9]+$/.test(tag??'')||run.id!==base+tag||run.source!==run.id+'-source'||run.collector!==run.id+'-collector'||run.bucket!==run.id||!/^[a-f0-9]{32}$/.test(run.account??'')||resolve(path)!==resolve(run.dir,'run.json')||basename(run.dir)!=='logpush-probe-'+tag||resolve(run.token_file)!==resolve(run.dir,'api-token')||!run.dir.startsWith(resolve(cwd,'dist/qualification')+'/'))throw Error('TelemetryScopeMismatch');
- for(const role of ['source','collector']){const c=await json(resolve(run.dir,role+'.json'));if(c.name!==run[role]||c.account_id!==run.account)throw Error('TelemetryConfigScopeMismatch');if(role==='collector'&&(c.r2_buckets?.length!==1||c.r2_buckets[0].bucket_name!==run.bucket||(c.vars?.RETIRE_MODE==='true'?c.services?.length!==0:c.services?.length!==1||c.services[0].service!==run.source)||c.logpush!==false))throw Error('TelemetryConfigScopeMismatch');}
+ for(const role of ['source','collector']){const c=await json(resolve(run.dir,role+'.json'));if(c.name!==run[role]||c.account_id!==run.account)throw Error('TelemetryConfigScopeMismatch');if(role==='collector'&&(c.r2_buckets?.length!==1||c.r2_buckets[0].bucket_name!==run.bucket||(c.vars?.RETIRE_MODE==='true'?c.services?.length!==0:c.services?.length!==1||c.services[0].service!==run.source)||c.logpush!==(run.parent_logpush_probe===true)))throw Error('TelemetryConfigScopeMismatch');}
  return run;
 }
 async function command(run,args,input,{allowExists=false,allowMissing=false}={}){
@@ -58,7 +58,7 @@ async function collector(run,path,body={}){
  const token=(await readFile(run.token_file,'utf8')).trim(),response=await fetch(new URL(path,run.origin),{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(60000)});const value=await response.json();if(!response.ok)throw Error('TelemetryCollectorStatus'+response.status);return value;
 }
 async function main(){
- const[action,path]=process.argv.slice(2);if(action==='prepare')return prepare(path);if(!['seal','revise-collector','deploy','install-token','create-job','exercise','read','cleanup'].includes(action))throw Error('TelemetryActionInvalid');
+ const[action,path]=process.argv.slice(2);if(action==='prepare')return prepare(path);if(!['seal','revise-collector','enable-parent-logpush','deploy','install-token','create-job','exercise','read','status','cleanup'].includes(action))throw Error('TelemetryActionInvalid');
  const run=await openRun(path);if(run.deleted){if(action==='cleanup')return;throw Error('TelemetryAlreadyDeleted');}const config=role=>resolve(run.dir,role+'.json');
  if(action==='seal'){
   run.bundle_hashes={};for(const role of ['source','collector']){const out=resolve(run.dir,'bundle-'+role);await mkdir(out);await command(run,['deploy','--dry-run','--config',config(role),'--outdir',out]);const hashes={};for(const name of await readdir(out))if(name.endsWith('.js'))hashes[name]=createHash('sha256').update(await readFile(resolve(out,name))).digest('hex');if(Object.keys(hashes).length!==1)throw Error('TelemetryBundleAmbiguous');run.bundle_hashes[role]=hashes;const c=await json(config(role));c.main=resolve(out,Object.keys(hashes)[0]);await save(config(role),c);}await save(path,run);return;
@@ -81,6 +81,17 @@ async function main(){
   if(!run.token_installed||run.job_id)throw Error('TelemetryJobPrecondition');const proposal=await json(resolve(run.dir,'job-proposal.json'));
   if(proposal.dataset!=='workers_trace_events'||proposal.output_options?.sample_rate!==1||proposal.filter!==JSON.stringify({where:{key:'ScriptName',operator:'eq',value:run.source}}))throw Error('TelemetryJobScopeMismatch');
   const url=new URL('/ingest',run.origin);url.search='header_Authorization='+encodeURIComponent('Bearer '+(await readFile(run.token_file,'utf8')).trim());const result=await api(run,'logpush/jobs','POST',{...proposal,enabled:true,destination_conf:url.toString()});if(!Number.isSafeInteger(result.id))throw Error('TelemetryJobIdentityMissing');run.job_id=result.id;run.job_enabled=true;await save(path,run);console.log(JSON.stringify({job_id:run.job_id,qualification:false}));return;
+ }
+ if(action==='enable-parent-logpush'){
+  if(!run.job_id||run.parent_logpush_probe)throw Error('TelemetryParentProbePrecondition');const job=await api(run,'logpush/jobs/'+run.job_id);if(job.name!==run.id||job.dataset!=='workers_trace_events'||job.filter!==JSON.stringify({where:{key:'ScriptName',operator:'eq',value:run.source}}))throw Error('TelemetryJobScopeMismatch');
+  const c=await json(config('collector'));run.parent_logpush_history={at:Date.now(),previous_version:run.versions.collector,previous_logpush:c.logpush};run.parent_logpush_probe=true;c.logpush=true;await save(config('collector'),c);await save(path,run);const output=await command(run,['deploy','--no-bundle','--config',config('collector')]),version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('TelemetryVersionMissing');run.versions.collector=version;await save(path,run);return;
+ }
+ if(action==='status'){
+  if(!run.job_id)throw Error('TelemetryJobRequired');const job=await api(run,'logpush/jobs/'+run.job_id);if(job.name!==run.id||job.dataset!=='workers_trace_events')throw Error('TelemetryJobScopeMismatch');
+  const status={at:Date.now(),qualification:false,job:{id:job.id,enabled:job.enabled,name:job.name,dataset:job.dataset,filter:job.filter,output_options:job.output_options,max_upload_interval_seconds:job.max_upload_interval_seconds,last_complete:job.last_complete,last_error:job.last_error,has_error_message:!!job.error_message}};
+  const token=await readCounterToken(),from=new Date(run.created_at).toISOString(),to=new Date().toISOString(),query=`{viewer{accounts(filter:{accountTag:"${run.account}"}){logpushHealthAdaptiveGroups(limit:100,filter:{jobId:${run.job_id},datetime_geq:"${from}",datetime_leq:"${to}"}){count avg{sampleInterval} sum{records uploads bytes bytesCompressed} dimensions{jobId status success final}}}}}`;
+  try{const response=await fetch('https://api.cloudflare.com/client/v4/graphql',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({query}),signal:AbortSignal.timeout(30000)}),value=await response.json();status.health={from,to,...(!response.ok||value.errors?.length?{failure:counterFailureDiagnostic(value,response.status)}:{rows:value.data?.viewer?.accounts?.[0]?.logpushHealthAdaptiveGroups??null})};}catch{status.health={from,to,failure:{kind:'transport'}};}
+  await save(resolve(run.dir,'status-'+status.at+'.json'),status);console.log(JSON.stringify(status));return;
  }
  if(action==='exercise'){const value=await collector(run,'/exercise',{count:8});await save(resolve(run.dir,'exercise-'+Date.now()+'.json'),value);console.log(JSON.stringify({calls:value.expected.length,qualification:false}));return;}
  if(action==='read'){const value=await collector(run,'/report');await save(resolve(run.dir,'capture-'+Date.now()+'.json'),value);const rows=value.objects.flatMap(o=>o.value.rows??[]);console.log(JSON.stringify({objects:value.objects.length,records:rows.length,event_types:rows.reduce((o,r)=>(o[r.event_type]=(o[r.event_type]??0)+1,o),{}),qualification:false}));return;}

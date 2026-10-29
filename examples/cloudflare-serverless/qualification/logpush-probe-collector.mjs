@@ -30,13 +30,13 @@ export async function sanitizeLogpushProbe(row,source){
   if(value?.event==='antfly.qualification_probe'&&uuid(value.id)&&['fetch','rpc'].includes(value.kind)&&['start','late','complete'].includes(value.phase))probes.push({id:value.id,kind:value.kind,phase:value.phase});
  }
  const exceptions=(Array.isArray(row.Exceptions)?row.Exceptions:[]).map(e=>({name:e.name??e.Name,message:e.message??e.Message}));
- const event=row.Event&&typeof row.Event==='object'?row.Event:{},request=event.request&&typeof event.request==='object'?event.request:{};
- let ray;try{ray=new Headers(request.headers??{}).get('cf-ray');}catch{}
+ const event=row.Event&&typeof row.Event==='object'?row.Event:{},request=(event.request??event.Request)&&typeof(event.request??event.Request)==='object'?(event.request??event.Request):{};
+ let ray;try{ray=new Headers(request.headers??request.Headers??{}).get('cf-ray');}catch{}
  const type=['fetch','scheduled','alarm','queue','email','worker_rpc','hibernatable_web_socket'].includes(row.EventType)?row.EventType:'unknown';
- const knownKeys=new Set(['request','response','rpcMethod','requestId','rayId','id','type','scheduledTime','cron','queue','batchSize','webSocket','rpcMethodName']);
- return{script:source,timestamp,event_type:type,entrypoint:row.Entrypoint==='Probe'?'Probe':row.Entrypoint==='default'?'default':'other',version_id:uuid(row.ScriptVersion?.id)?row.ScriptVersion.id:null,
+ const knownKeys=new Set(['Request','Response','RpcMethod','RpcMethodName','RequestId','RayId','Id','request','response','rpcMethod','requestId','rayId','id','type','scheduledTime','cron','queue','batchSize','webSocket','rpcMethodName']);
+ return{script:source,timestamp,event_type:type,entrypoint:row.Entrypoint==='Probe'?'Probe':row.Entrypoint==='default'?'default':'other',version_id:[row.ScriptVersion?.id,row.ScriptVersion?.Id,row.ScriptVersion?.ID].find(uuid)??null,version_shape:{type:row.ScriptVersion===null?'null':typeof row.ScriptVersion,known_keys:row.ScriptVersion&&typeof row.ScriptVersion==='object'?Object.keys(row.ScriptVersion).filter(key=>['id','Id','ID','tag','Tag','message','Message'].includes(key)):[],unknown_keys:row.ScriptVersion&&typeof row.ScriptVersion==='object'?Object.keys(row.ScriptVersion).filter(key=>!['id','Id','ID','tag','Tag','message','Message'].includes(key)).length:0},
   event_keys:Object.keys(event).filter(k=>knownKeys.has(k)).sort(),unknown_event_keys:Object.keys(event).filter(k=>!knownKeys.has(k)).length,
-  identity_candidates:{event_request_id_sha256:await identity(event.requestId),event_id_sha256:await identity(event.id),event_ray_id_sha256:await identity(event.rayId),request_ray_id_sha256:await identity(ray)},probes,
+  identity_candidates:{event_request_id_sha256:await identity(event.requestId??event.RequestId),event_id_sha256:await identity(event.id??event.Id),event_ray_id_sha256:await identity(event.rayId??event.RayId),request_ray_id_sha256:await identity(ray)},probes,
   event:sanitizeTailEvent({outcome:row.Outcome,cpuTime:row.CPUTimeMs,wallTime:row.WallTimeMs,scriptVersion:row.ScriptVersion,logs,exceptions,truncated:rawLogs.length>256})??{}};
 }
 async function readBody(request){
