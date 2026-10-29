@@ -1173,6 +1173,19 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const darwin_shared_storage_sdk27 = darwin_release_profile and shared_inference_core and
         @import("antfly_platform").macosSdkMatchesVersion(b, target, "27.0");
     const darwin_release_memory = darwin_shared_storage_sdk27;
+    // Independently measured on the Linux release runner, not inherited from
+    // native Apple Silicon's SDK 27 profile.
+    const darwin_cross_release_memory = optimize == .fast and inference_optimize == .fast and
+        strip and !sanitize_thread and link_libc and
+        lmdb_backend == .zig and !lmdb_evented_async_io and !with_tla and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .x86_64 and
+        b.graph.host.result.abi == .gnu and
+        target.result.os.tag == .macos and target.result.cpu.arch == .aarch64 and
+        target.result.cpu.model == baseline_cpu.model and target.result.cpu.features.eql(baseline_cpu.features) and
+        shared_inference_core and inference_enable_metal and inference_enable_system_blas and
+        !inference_enable_cuda and !inference_enable_pjrt and
+        @import("antfly_platform").macosSdkMatchesVersion(b, target, "26.1");
     const native_cpu_debug_test_profile = optimize == .debug and !strip and !sanitize_thread and link_libc and
         lmdb_backend == .zig and !lmdb_evented_async_io and !with_tla and
         inference_optimize == .fast and inference_enable_system_blas and
@@ -1244,6 +1257,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .shared_inference_core = shared_inference_core,
         .darwin_release_memory = darwin_release_memory,
         .darwin_shared_storage_sdk27 = darwin_shared_storage_sdk27,
+        .darwin_cross_release_memory = darwin_cross_release_memory,
         .sanitize_thread = sanitize_thread,
         .build_info = build_info,
 

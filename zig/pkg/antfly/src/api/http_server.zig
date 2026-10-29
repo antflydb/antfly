@@ -15705,7 +15705,12 @@ pub const ApiHttpServer = struct {
         query_req.req.cancellation = cancellation;
         if (query_req.req.graph_queries.len > 0) query_req.req.graph_query_diagnostic_sink = graph_query_diagnostic.sink();
         query_req.req.response_table_name = response_label;
-        if (query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
+        // Hierarchy traversal owns its source-revision cursor. Capturing a
+        // whole-table native cut here both bypasses its stale-revision check
+        // and rejects Lite, whose storage cannot publish a directory snapshot.
+        // Explicit retained tokens from existing callers still follow their
+        // normal validation path; ordinary sorted search continues to pin.
+        if (query_req.req.hierarchy_children == null and query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
             if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;
             const context: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
             if (try self.queryTableDefinition(resolver.arena, resolver, table_name, context)) |table| {
@@ -33362,9 +33367,10 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
             try std.testing.expect(req.hierarchy_children != null);
             try std.testing.expectEqualStrings("doc:a", req.hierarchy_children.?.parent_id);
             try std.testing.expectEqualStrings(row_filter, req.filter_query_json);
-            try std.testing.expect(req.remote_snapshot != null);
-            try std.testing.expect(req.native_query_cut != null);
-            try std.testing.expectEqual(self.calls == 0, req.native_query_cut.?.create);
+            // A page cursor is fenced by the source hierarchy revision. It
+            // must cross the HTTP/worker seam without a directory-only cut.
+            try std.testing.expect(req.remote_snapshot == null);
+            try std.testing.expect(req.native_query_cut == null);
             try std.testing.expectEqual(@as(usize, 2), req.order_by.len);
             try std.testing.expectEqualStrings("_hierarchy.position", req.order_by[0].field);
             try std.testing.expectEqualStrings("_id", req.order_by[1].field);
@@ -33413,8 +33419,8 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
             self.calls += 1;
             return .{ .json = try std.fmt.allocPrint(
                 inner_alloc,
-                "{{\"responses\":[{{\"remote_snapshot\":\"{s}\",\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_sort\":[\"{s}\",\"{s}\"],\"_source\":{s}}}]}} ,\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
-                .{ req.remote_snapshot.?, public_unit_id, position, public_unit_id, hit.stored_data.? },
+                "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_sort\":[\"{s}\",\"{s}\"],\"_source\":{s}}}]}} ,\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{ public_unit_id, position, public_unit_id, hit.stored_data.? },
             ) };
         }
     };
@@ -33445,22 +33451,17 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
     defer first.deinit(alloc);
     var first_json = try std.json.parseFromSlice(std.json.Value, alloc, first.json, .{});
     defer first_json.deinit();
+    try std.testing.expect(first_json.value.object.get("responses").?.array.items[0].object.get("remote_snapshot") == null);
     const first_hit = first_json.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
     try std.testing.expectEqualStrings(position, first_hit.get("_sort").?.array.items[0].string);
     try std.testing.expectEqualStrings(public_unit_id, first_hit.get("_sort").?.array.items[1].string);
     try std.testing.expectEqualStrings("page one", first_hit.get("_source").?.object.get("text").?.string);
 
-    var replay_request = try std.json.parseFromSlice(std.json.Value, alloc, replay_template, .{ .allocate = .alloc_always });
-    defer replay_request.deinit();
-    try replay_request.value.object.put(replay_request.arena.allocator(), "remote_snapshot", first_json.value.object.get("responses").?.array.items[0].object.get("remote_snapshot").?);
-    const replay_body = try std.json.Stringify.valueAlloc(alloc, replay_request.value, .{});
-    defer alloc.free(replay_body);
-
     var replay = try server.executePlainPublicTableQuery(
         alloc,
         reads.source(),
         "docs",
-        replay_body,
+        replay_template,
         row_filter,
         null,
         null,
@@ -33470,6 +33471,21 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
         null,
     );
     defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reads.calls);
+    // Ordinary ordered pages still require their retained snapshot token.
+    try std.testing.expectError(error.CatalogGenerationChanged, server.executePlainPublicTableQuery(
+        alloc,
+        reads.source(),
+        "docs",
+        "{\"fields\":[],\"order_by\":[{\"field\":\"_id\"}],\"search_after\":[\"doc:a\"]}",
+        row_filter,
+        null,
+        null,
+        .{ .domain = .internal, .value = "test" },
+        null,
+        null,
+        null,
+    ));
     try std.testing.expectEqual(@as(usize, 2), reads.calls);
 }
 

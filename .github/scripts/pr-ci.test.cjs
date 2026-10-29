@@ -8,6 +8,22 @@ const config = require('./pr-ci-config.json');
 const SHA = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
 
+test('main qualification completes while newer PR and merge queue revisions supersede old work', () => {
+  const workflow = fs.readFileSync(path.resolve(__dirname, '../workflows/zig-tests.yml'), 'utf8');
+  const block = workflow.match(/^concurrency:\n([\s\S]*?)(?=^jobs:)/m)[1];
+  assert.match(block, /group: zig-\$\{\{ inputs.pr_number \|\| github.ref \}\}/);
+  const expression = block.match(/cancel-in-progress: \$\{\{ (.*?) \}\}/)[1];
+  const cancel = new Function('inputs', 'github', `return (${expression});`);
+  for (const [ref, pr, expected] of [
+    ['refs/heads/main', '', false],
+    ['refs/heads/main', '1358', true],
+    ['refs/heads/fix/example', '', true],
+    ['refs/heads/gh-readonly-queue/main/pr-1', '', true],
+  ]) {
+    assert.equal(cancel({pr_number:pr}, {ref}), expected, `${ref} PR ${pr}`);
+  }
+});
+
 function fixture() {
   const repository = {full_name: 'acme/project', default_branch: 'main'};
   const pr = {number: 7, state: 'open', draft: false, labels: [],

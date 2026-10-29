@@ -45,7 +45,7 @@ pub fn antfly_db_sql_describe_json(ptr: ?*anyopaque, request: h.capi.Slice, out:
         return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_describe_json), .{ .name = "antfly_db_sql_describe_json" }), .{ ptr, request, out });
     h.capi.clearLastError();
     out.* = .{};
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);

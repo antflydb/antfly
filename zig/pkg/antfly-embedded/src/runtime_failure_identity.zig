@@ -30,6 +30,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .hierarchy_cursor_stale, .err = error.HierarchyCursorStale },
     .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
     .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
@@ -1080,6 +1081,15 @@ test "index readiness survives the local query and storage owner boundary" {
             return error.ExpectedReadinessFailure;
         };
         try std.testing.expectEqual(expected, transported);
+    }
+}
+
+test "hierarchy cursor conflicts survive local query and storage owner boundaries" {
+    for ([_]abi.FailureBoundary{ .local_query, .storage_owner }) |boundary| {
+        const failure = failureFromError(error.HierarchyCursorStale, boundary, abi.abi_version, 4);
+        try std.testing.expectEqual(abi.Status.hierarchy_cursor_stale, failure.status);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(error.HierarchyCursorStale, statusToError(failure.status));
     }
 }
 

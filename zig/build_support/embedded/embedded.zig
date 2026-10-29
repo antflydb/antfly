@@ -277,7 +277,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_inference_mod,
         "antfly-inference-core",
-        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory),
+        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -293,14 +293,14 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_enrichment_mod,
         if (options.server_integration_tests) "antfly-runtime-enrichment_compute" else "antfly-embedded-enrichment",
-        @as(u64, if (antfly_imports.darwin_release_memory) 3 else 8) * 1024 * 1024 * 1024,
+        @as(u64, if (antfly_imports.darwin_release_memory or antfly_imports.darwin_cross_release_memory) 3 else 8) * 1024 * 1024 * 1024,
     );
     const native_storage = if (antfly_imports.storage_boundary.shared_core) blk: {
         const owner_options = b.addOptions();
         owner_options.addOption(bool, "shared_storage_core", true);
         owner_options.addOption(bool, "storage_engine_owner", true);
         capi_mod.addOptions("storage_engine_options", owner_options);
-        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @as(u64, if (antfly_imports.darwin_shared_storage_sdk27) 14 else if (target.result.os.tag == .macos and !antfly_imports.darwin_release_memory) 24 else 16) * 1024 * 1024 * 1024);
+        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @import("shared_library.zig").storageCompileMaxRss(target.result.os.tag, antfly_imports.darwin_shared_storage_sdk27, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory));
         owner.link_function_sections = true;
         owner.link_data_sections = true;
         @import("source_owner.zig").registerStorageProvider(owner, b.allocator.dupe(*std.Build.Step.Compile, &.{ native_inference, native_enrichment }) catch @panic("OOM"));
@@ -588,6 +588,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "capi native memory",
+        "capi native short lived writers",
+        "capi native marker sweep",
+        "capi native unbounded writer admits reusable pool before a large request",
+        "capi native allocator proof survives close",
+        "capi native close bounds proof work",
         "capi native text queries",
         "capi native replacement wait",
         "capi graph replacement retains indexed serving edges",
