@@ -52,3 +52,16 @@ export function reconcileTailCounter(objects,roots,{source,version,counterVersio
  if(observation.gap)failures.push('TailCounterDiagnosticGap');
  return{schema:1,qualification:false,source:'independent-provider-tail-counter',dataset:'providerTailTerminalDeliveries',sampling_contract:'unfiltered-one-per-producer-invocation',worker:source,version_ids:versions,counter_version:counterVersion,timeframe:{...timeframe},count:records.length,canonical_count:canonical.length,resource_failures:observation.resource_failures,empty_witnessed:witnessed,complete:failures.length===0,failures:[...new Set(failures)]};
 }
+
+// Two independently re-listed closed-window observations are required. Native
+// pagination alone cannot establish settlement while random keys are inserted.
+export async function reconcileTailCounterSnapshots(first,second,scope){
+ const failures=[],prefix='probe-v1/'+scope?.captureId+'/',window=scope?.timeframe;
+ const valid=s=>s?.qualification===false&&s.capture_id===scope?.captureId&&uuid(s.collector_version)&&Number.isSafeInteger(s.snapshot_started_at)&&Number.isSafeInteger(s.snapshot_finished_at)&&s.snapshot_finished_at>=s.snapshot_started_at&&Array.isArray(s.objects)&&s.objects.length<=20000&&s.objects.every(o=>typeof o?.key==='string'&&o.key.startsWith(prefix)&&(o.value?.source!=='provider-tail-dispatch'||Array.isArray(o.value.records)&&o.value.records.length<=1000&&o.value.records.every(r=>r&&typeof r==='object'))&&(o.value?.rows==null||Array.isArray(o.value.rows)&&o.value.rows.length<=1000&&o.value.rows.every(r=>r&&typeof r==='object')))&&new Set(s.objects.map(o=>o.key)).size===s.objects.length;
+ if(!valid(first)||!valid(second)||!window||first.snapshot_started_at<window.to+60000||second.snapshot_started_at<first.snapshot_finished_at+30000)return{qualification:false,complete:false,failures:['TailCounterSettlementInvalid']};
+ const selected=s=>s.objects.flatMap(o=>o.value?.source==='provider-tail-dispatch'?o.value.records.filter(r=>r.timestamp>=window.from&&r.timestamp<=window.to||scope.witnesses&&[scope.witnesses.before,scope.witnesses.after].includes(r.attempt_id_sha256)).map(r=>JSON.stringify({key:o.key,producer:o.value.producer,collector_version:o.value.collector_version,record:r})):o.value?.rows?.filter(r=>r.script===scope.source&&r.start>=window.from&&r.start<=window.to).map(r=>JSON.stringify(r))??[]).sort();
+ const digest=async v=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(v)))),b=>b.toString(16).padStart(2,'0')).join('');
+ const hashes=[];for(const s of[first,second]){const roots=s.objects.flatMap(o=>o.value?.rows??[]),proof=reconcileTailCounter(s.objects,roots,{...scope,settledAt:s.snapshot_finished_at});failures.push(...proof.failures);hashes.push(await digest(selected(s)));}
+ if(hashes[0]!==hashes[1])failures.push('TailCounterWindowUnsettled');
+ return{schema:1,qualification:false,source:'independent-provider-tail-counter',complete:failures.length===0,window_sha256:hashes[1],observation_sha256:await Promise.all([first,second].map(digest)),failures:[...new Set(failures)]};
+}
