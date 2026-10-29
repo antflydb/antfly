@@ -29,6 +29,9 @@ env:
 
 jobs:
   auth-checks:
+    permissions:
+      contents: read
+      id-token: write # Read-only verified Zig dependency mirror.
     if: startsWith(github.ref, 'refs/tags/ts/antfly/better-auth/v')
     uses: ./.github/workflows/better-auth-compatibility.yml
 
