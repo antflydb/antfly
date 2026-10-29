@@ -2166,12 +2166,14 @@ can outlive the covering read wave without retaining its request or reader.
 ### Request-owned projection plans and scalar delivery
 
 Final column encoding compiles simple masks against the immutable column names
-once per request/schema, preserving include order, wildcard/duplicate semantics,
+once per request/schema when multiple hits can reuse them, preserving include
+order, wildcard/duplicate semantics,
 exclusions, internal-field removal and exact JSON sizing. The request owns at
 most four plans, including copies of names and masks; no plan holds a result-page
 lease, source payload or reader. Schema comparison uses names and order rather
 than pointer identity, so allocator reuse cannot bind a plan to the wrong page.
-Further schemas and nested masks use the existing exact projector. Preparation
+Single-hit responses, further schemas and nested masks use the existing exact
+projector, avoiding unamortized schema-plan allocation. Preparation
 resets per-hit scratch, allocates one exact field descriptor array and emits
 small JSON scalars from inline storage. Canonical float formatting and integers
 above `2^53` retain their original precision.

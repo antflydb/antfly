@@ -4285,7 +4285,8 @@ fn ColumnWireResult(comptime T: type) type {
                                         if (self.plan) |plan| {
                                             // Prepared descriptors live only until source() either
                                             // clones them into residency or writes them to the spool.
-                                            const prepared = self.column_projection.prepare(source, self.scratch.allocator(), self.scratch, options) catch |err| {
+                                            // A single hit cannot amortize a schema-plan build.
+                                            const prepared = (if (self.hits.len > 1) self.column_projection.prepare(source, self.scratch.allocator(), self.scratch, options) else source.prepare(self.scratch.allocator(), self.scratch, options)) catch |err| {
                                                 self.failure.* = err;
                                                 return error.WriteFailed;
                                             };
@@ -4295,7 +4296,7 @@ fn ColumnWireResult(comptime T: type) type {
                                                 return error.WriteFailed;
                                             };
                                             w.endWriteRaw();
-                                        } else self.column_projection.write(source, self.scratch, options, w) catch |err| {
+                                        } else (if (self.hits.len > 1) self.column_projection.write(source, self.scratch, options, w) else source.write(self.scratch, options, w)) catch |err| {
                                             if (err != error.WriteFailed) self.failure.* = err;
                                             return error.WriteFailed;
                                         };
