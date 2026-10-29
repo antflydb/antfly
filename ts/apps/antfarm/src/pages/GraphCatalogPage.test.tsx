@@ -103,7 +103,7 @@ it("keeps the original edit revision through refresh and requires explicit reloa
   );
 });
 
-it("checks owner readiness with a bounded read and clears it when the definition changes", async () => {
+it("demands relationship projections for readiness and clears it when the definition changes", async () => {
   const original = {
     graph_id: "4",
     revision: "1",
@@ -120,7 +120,7 @@ it("checks owner readiness with a bounded read and clears it when the definition
   await waitFor(() =>
     expect(mocks.client.graphs.execute).toHaveBeenCalledWith(
       "knowledge",
-      { query: "MATCH (n) RETURN n LIMIT 0" },
+      { query: "MATCH ()-[r]->() RETURN r LIMIT 0" },
       { signal: expect.any(AbortSignal) }
     )
   );

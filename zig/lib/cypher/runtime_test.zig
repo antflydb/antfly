@@ -8984,3 +8984,92 @@ test "computed finite key collections seek once and preserve domains and scope" 
         try std.testing.expectEqual(case.reads, result.stats.scanned_anchors);
     }
 }
+
+test "correlated property batches preserve duplicates encounter order and row goals" {
+    const Indexed = struct {
+        var bulk_reads: usize = 0;
+        var scalar_reads: usize = 0;
+        const duplicate: v.Node = .{ .identity = .{ .table = "docs", .key = "extra" }, .labels = &.{"Document"}, .properties = &.{ .{ .name = "id", .value = .{ .string = "a" } }, .{ .name = "rank", .value = .{ .integer = 3 } } } };
+        const nodes = [_]*const v.Node{ &Fixture.nodes[0], &duplicate, &Fixture.nodes[1] };
+        fn matches(node: *const v.Node, filters: []const b.PropertyFilter) bool {
+            for (filters) |filter| {
+                if (!std.mem.eql(u8, filter.property, "id")) continue;
+                const key = (v.Value{ .node = node }).property("id");
+                if (filter.op == .eq) {
+                    if (!key.eql(filter.value)) return false;
+                } else if (filter.op == .in) {
+                    const found = for (filter.value.list) |item| {
+                        if (key.eql(item)) break true;
+                    } else false;
+                    if (!found) return false;
+                } else return false;
+            }
+            return true;
+        }
+        fn filtered(_: *anyopaque, a: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, maximum: usize) !b.Page(*const v.Node) {
+            if (after != null) return .{ .items = &.{}, .examined = 0 };
+            if (filters[0].op == .in) bulk_reads += 1 else scalar_reads += 1;
+            var out: std.ArrayList(*const v.Node) = .empty;
+            for (nodes) |node| if (matches(node, filters)) {
+                if (out.items.len == maximum) break;
+                try out.append(a, node);
+            };
+            return .{ .items = out.items, .examined = out.items.len, .next = "empty-owner" };
+        }
+        fn scan(_: *anyopaque, a: std.mem.Allocator, _: []const u8, after: ?[]const u8, maximum: usize) !b.Page(*const v.Node) {
+            const begin = if (after) |cursor| try std.fmt.parseUnsigned(usize, cursor, 10) else 0;
+            const end = @min(nodes.len, begin + maximum);
+            return .{ .items = try a.dupe(*const v.Node, nodes[begin..end]), .unfiltered = true, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn estimate(_: *anyopaque, _: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, maximum: usize) !?usize {
+            var size: usize = 0;
+            for (nodes) |node| if (matches(node, filters)) {
+                size += 1;
+            };
+            return if (size <= maximum) size else null;
+        }
+    };
+    for ([_]struct { query: []const u8, expected: []const i64, bulk: usize, anchors: usize = 5 }{
+        .{ .query = "UNWIND ['a','b','a'] AS k MATCH(n:Document {id:k}) RETURN collect(n.rank)", .expected = &.{ 1, 3, 2, 1, 3 }, .bulk = 1 },
+        .{ .query = "UNWIND ['A','B','A'] AS k MATCH(n:Document) WHERE n.id=toLower(k) RETURN collect(n.rank)", .expected = &.{ 1, 3, 2, 1, 3 }, .bulk = 1 },
+        .{ .query = "UNWIND ['a','missing','b','a'] AS k OPTIONAL MATCH(n:Document {id:k}) RETURN collect(n.rank)", .expected = &.{ 1, 3, 2, 1, 3 }, .bulk = 1 },
+        .{ .query = "UNWIND ['a','b'] AS k MATCH(n:Document {id:k}) RETURN collect(n.rank)", .expected = &.{ 1, 3, 2 }, .bulk = 1, .anchors = 3 },
+    }) |case| {
+        Indexed.bulk_reads = 0;
+        Indexed.scalar_reads = 0;
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        callbacks.scan = Indexed.scan;
+        callbacks.scan_where = Indexed.filtered;
+        callbacks.estimate_where = Indexed.estimate;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{ .scanned_anchors = case.anchors });
+        defer result.deinit();
+        try std.testing.expectEqual(case.bulk, Indexed.bulk_reads);
+        try std.testing.expectEqual(@as(usize, 0), Indexed.scalar_reads);
+        try std.testing.expectEqual(case.expected.len, result.rows[0][0].list.len);
+        for (case.expected, result.rows[0][0].list) |expected, value| try std.testing.expectEqual(expected, value.integer);
+    }
+    Indexed.bulk_reads = 0;
+    Indexed.scalar_reads = 0;
+    var fixture: Fixture = .{};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.scan = Indexed.scan;
+    callbacks.scan_where = Indexed.filtered;
+    callbacks.estimate_where = Indexed.estimate;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND ['a','b','a'] AS k MATCH(n:Document {id:k}) RETURN n.rank LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{ .scanned_anchors = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), Indexed.bulk_reads);
+    try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+    var independent = try c.compile(std.testing.allocator, "UNWIND range(0,9) AS k MATCH(n:Document {id:'a'}) RETURN count(*)", .{}, &diagnostic);
+    defer independent.deinit();
+    var counted = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &independent, &.{}, .{});
+    defer counted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), Indexed.bulk_reads);
+    try std.testing.expectEqual(@as(i64, 20), counted.rows[0][0].integer);
+}

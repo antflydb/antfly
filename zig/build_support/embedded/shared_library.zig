@@ -378,6 +378,7 @@ pub fn nativeExecutableLink(b: *std.Build, object: *std.Build.Step.Compile, name
     const target = object.root_module.resolved_target.?.result;
     const link = b.addSystemCommand(&.{"python3"});
     link.addFileArg(b.path("tools/native_executable_link.py"));
+    link.addFileInput(b.path("tools/macho_merged_globals.py"));
     const deployment = target.os.version_range.semver.min;
     link.addArgs(&.{ "--arch", if (target.cpu.arch == .aarch64) "arm64" else "x86_64", "--deployment", b.fmt("{d}.{d}.{d}", .{ deployment.major, deployment.minor, deployment.patch }), "--sdk" });
     link.addDirectoryArg(b.named_lazy_paths.get("antfly_macos_sdk_root").?);

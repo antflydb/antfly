@@ -115,6 +115,69 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             wait_for_index=True,
         )
         assert result["rows"] == [[{"type": "integer", "value": "1999"}]], result
+        # Membership must stay on bounded indexed seeks across the old 256
+        # cutoff; physical work must depend on the domain, not table size.
+        for size in (128, 256, 257, 400):
+            membership = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": f"MATCH(n:D) WHERE n.id IN [i IN range(0,{size - 1}) | 'n'+toString(i)] RETURN sum(n.score)",
+                    "limits": {"scanned_anchors": size, "intermediate_states": 50000},
+                },
+            )
+            assert membership["rows"] == [
+                [{"type": "integer", "value": str(size * (size - 1) // 2)}]
+            ], membership
+            assert membership["stats"]["scanned_anchors"] <= size, membership
+        incompatible = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH(n:D) WHERE n.id IN range(0,399) RETURN count(*)",
+                "limits": {"scanned_anchors": 2000, "intermediate_states": 100000},
+            },
+        )
+        assert incompatible["rows"] == [[{"type": "integer", "value": "0"}]], (
+            incompatible
+        )
+        assert incompatible["stats"]["scanned_anchors"] <= 2000, incompatible
+        # A later out-of-range integer must invalidate DOUBLE seek coercion
+        # for the whole domain before any earlier window can emit candidates.
+        floating = table + "_floating"
+        call("/sql", {"statement": f"CREATE TABLE {floating} (value DOUBLE PRECISION)"})
+        call(
+            "/sql", {"statement": f"CREATE INDEX {floating}_value ON {floating}(value)"}
+        )
+        call(
+            f"/tables/{floating}/batch",
+            {
+                "inserts": {
+                    **{f"n{i}": {"value": float(i)} for i in range(20)},
+                    "rounded": {"value": 9007199254740992.0},
+                },
+                "sync_level": "full_index",
+            },
+        )
+        call(
+            f"/graphs/{floating}",
+            {"labels": [{"name": "F", "table": floating}], "relationships": []},
+        )
+        call(
+            f"/graphs/{floating}/query",
+            {
+                "query": "MATCH(n:F {value:19}) RETURN n.value",
+                "limits": {"scanned_anchors": 1},
+            },
+            wait_for_index=True,
+        )
+        precise = call(
+            f"/graphs/{floating}/query",
+            {
+                "query": "MATCH(n:F) WHERE n.value IN $values RETURN count(*)",
+                "parameters": {"values": [*range(256), 9007199254740993]},
+                "limits": {"scanned_anchors": 21, "intermediate_states": 50000},
+            },
+        )
+        assert precise["rows"] == [[{"type": "integer", "value": "20"}]], precise
         # Row-bound computed document keys must use owner point reads, with
         # the complete Cypher predicate still applied to each returned node.
         for key_predicate in (

@@ -434,6 +434,15 @@ test "external lake Cypher execution reads immutable native document and graph c
             try std.testing.expectEqualStrings("b", filtered.hashes[0].id);
             try std.testing.expectEqual(@as(usize, 0), filtered.documents.len);
         }
+        {
+            var batch_arena = std.heap.ArenaAllocator.init(a);
+            defer batch_arena.deinit();
+            const reply = try read.invokeTyped(batch_arena.allocator(), .{ .operation = .get_many, .graph_incarnation = 1, .graph_revision = 1, .identities = &.{ .{ .table = "docs", .key = "b" }, .{ .table = "docs", .key = "missing" }, .{ .table = "docs", .key = "b" } }, .read_fields = &.{"title"} });
+            try std.testing.expectEqual(@as(usize, 3), reply.values.len);
+            try std.testing.expectEqualStrings("Changed", (cypher.value.Value{ .node = reply.values[0].value.node }).property("title").string);
+            try std.testing.expect(reply.values[1].value == .null);
+            try std.testing.expectEqualStrings("Changed", (cypher.value.Value{ .node = reply.values[2].value.node }).property("title").string);
+        }
         const Channel = struct {
             fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
                 const port: *local.storage_statement_read_fence.GraphRead = @ptrCast(@alignCast(ptr));
@@ -678,4 +687,18 @@ test "external lake Cypher indexed bounds use the captured scalar catalog" {
     try std.testing.expectEqual(@as(usize, 1), page.rows.len);
     try std.testing.expectEqualStrings("b", page.rows[0].key);
     try std.testing.expectEqualStrings("{\"id\":2}", page.rows[0].json);
+    for ([_]i64{ 1, 2, 1 }) |id| {
+        try session.seekPrefix(&.{.{ .integer = id }}, null);
+        var selected = try session.reader.nextPage(a, db.backend_runtime.io(), .{ .rows = 1, .output_bytes = 4096 });
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 1), selected.rows.len);
+        try std.testing.expectEqualStrings(if (id == 1) "a" else "b", selected.rows[0].key);
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const reply = try read.invokeTyped(arena.allocator(), .{ .operation = .get_many, .graph_incarnation = 1, .graph_revision = 1, .identities = &.{ .{ .table = "docs", .key = "b" }, .{ .table = "docs", .key = "missing" }, .{ .table = "docs", .key = "a" }, .{ .table = "docs", .key = "b" } }, .read_fields = &.{"id"} });
+    try std.testing.expectEqual(@as(usize, 4), reply.values.len);
+    for ([_]?i64{ 2, null, 1, 2 }, reply.values) |expected, value| {
+        if (expected) |id| try std.testing.expectEqual(id, (@import("cypher").value.Value{ .node = value.value.node }).property("id").integer) else try std.testing.expect(value.value == .null);
+    }
 }

@@ -1626,3 +1626,72 @@ test "distributed population bounds sum only matching retained owners and reject
     owners[1].count = null;
     try std.testing.expectEqual(@as(?u64, null), try population(backend.ptr, std.testing.allocator, "docs"));
 }
+
+test "sparse membership retains per-owner windows across indexed and primary shards" {
+    const rpc = @import("rpc.zig");
+    const Fixture = struct {
+        primary: bool,
+        fn check(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn bind(_: *anyopaque, _: A, _: catalog.Graph) !void {}
+        fn filtered(ptr: *anyopaque, a: A, _: []const u8, filters: []const b.PropertyFilter, _: ?[]const u8, maximum: usize) !b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const values = filters[0].value.list;
+            try std.testing.expect(values.len <= 128);
+            const count = if (self.primary) 1 else values.len;
+            try std.testing.expect(count <= maximum);
+            const nodes = try a.alloc(*const v.Node, count);
+            for (nodes, 0..) |*out, i| {
+                const node = try a.create(v.Node);
+                node.* = .{ .identity = .{ .table = "docs", .key = if (self.primary) "primary" else try std.fmt.allocPrint(a, "indexed-{d}", .{values[i].integer}) }, .labels = &.{"D"}, .properties = try a.dupe(v.Entry, &.{.{ .name = "id", .value = if (self.primary) .{ .integer = 42 } else values[i] }}) };
+                out.* = node;
+            }
+            return .{ .items = nodes, .examined = count, .unfiltered = self.primary };
+        }
+        fn backend(self: *@This()) b.Backend {
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = check, .scan = undefined, .scan_where = filtered, .get = undefined, .expand = undefined } };
+        }
+        fn invoke(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const endpoint: *rpc.Owner = @ptrCast(@alignCast(ptr));
+            return endpoint.execute(a, body);
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+    var owners = [_]Fixture{ .{ .primary = false }, .{ .primary = true } };
+    var endpoints = [_]rpc.Owner{ .{ .backend = owners[0].backend(), .graph = graph, .table = "docs" }, .{ .backend = owners[1].backend(), .graph = graph, .table = "docs" } };
+    var clients = [_]rpc.Client{ .{ .channel = .{ .ptr = &endpoints[0], .call = Fixture.invoke }, .incarnation = 1, .revision = 1 }, .{ .channel = .{ .ptr = &endpoints[1], .call = Fixture.invoke }, .incarnation = 1, .revision = 1 } };
+    var snapshots = [_]Snapshot{ .{ .backend = clients[0].backend(), .ptr = &owners[0], .validate = Fixture.check, .close = Fixture.close }, .{ .backend = clients[1].backend(), .ptr = &owners[1], .validate = Fixture.check, .close = Fixture.close } };
+    const targets = [_]Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "docs", .table_id = 1, .group_id = 2 } };
+    var set: ReadSet = .{ .a = a, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &owners[0], .checkpoint = Fixture.check, .admit = undefined, .capture = undefined } };
+    var coordinator: rpc.Owner = .{ .backend = set.backend(), .graph = graph, .table = "" };
+    var client: rpc.Client = .{ .channel = .{ .ptr = &coordinator, .call = Fixture.invoke, .owner_local = false }, .incarnation = 1, .revision = 1 };
+    const backend = client.backend();
+    const values = try a.alloc(v.Value, 400);
+    for (values, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
+    const filters = &[_]b.PropertyFilter{.{ .property = "id", .op = .in, .value = .{ .list = values }, .domain = .integer }};
+    var after: ?[]const u8 = null;
+    var total: usize = 0;
+    var primary: usize = 0;
+    var seen: [400]bool = @splat(false);
+    while (true) {
+        const page = try backend.vtable.scan_where.?(backend.ptr, a, "docs", filters, after, 128);
+        for (page.items) |node| {
+            total += 1;
+            if (std.mem.eql(u8, node.identity.key, "primary")) {
+                primary += 1;
+            } else {
+                const id: usize = @intCast((v.Value{ .node = node }).property("id").integer);
+                try std.testing.expect(!seen[id]);
+                seen[id] = true;
+            }
+        }
+        after = page.next;
+        if (after == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 401), total);
+    try std.testing.expectEqual(@as(usize, 1), primary);
+    for (seen) |present| try std.testing.expect(present);
+}

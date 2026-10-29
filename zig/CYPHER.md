@@ -4397,3 +4397,81 @@ the 50,000-state regression ceiling. Their medians were respectively 18.579,
 18.435 and 10.769 ms. Timings are local diagnostic observations,
 not latency guarantees; the public regression tests enforce deterministic
 results, work/anchor ceilings and bounded memory independently.
+
+### Bounded sparse native seeks and correlated lookup batches
+
+Certified property membership domains retain one deduplicated statement-local
+list (up to 4,096 values). Stateless continuations select at most 128 values per
+owner request, retaining the window offset and native cursor rather than copying
+the complete domain into every request. Windows belong to physical owners;
+coordinator channels retain the full domain until every shard completes. This
+keeps mixed indexed/primary shards from truncating or duplicating each other's
+domains. Native pages consume multiple equality
+branches within their row/work demand. Supported leading-column scalar indexes
+reuse one captured typed session, schema, policy and projection plan while a
+reclaimable reader arena resets the equality prefix between branches. Composite
+suffixes, direction, continuation identity, TTL and captured scalar catalogs use
+the existing reader encoding and visibility rules. Other usable index shapes
+retain independent bounded seeks.
+
+The domain certificate describes the complete original list, including integers
+outside DOUBLE's exact range. Owners decide type compatibility before the first
+indexed window; an incompatible or unsupported list scans the primary source
+once. Its continuation stays in that fallback until completion. Unproved/mixed
+lists retain residual evaluation. An owner cannot switch a later indexed window
+to primary scanning and duplicate rows from earlier windows. Native seek work is
+charged per physical branch; no owner-side domain cache or cross-request lease
+is introduced.
+
+Native `get_many` now groups the bounded input by physical table and shares its
+read authorization, captured transaction, schema and projection plan. Relational
+batches use one authenticated typed reader and the SQL reader's sorted storage
+multi-read, with per-key TTL and row-policy checks. Reclaimable source scopes
+retain one run/index decode per chunk and release buffers before retrying a
+smaller batch; large unrequested columns cannot accumulate beside reply storage. Document batches project stored spans before parsing requested content.
+Durable query generations capture one transient local read cut per batch at
+the statement wall time; embedded Zig and C API hosts forward the same bounded
+callback, including the C API's existing authority-retry behavior. Results remain
+aligned with the input, including duplicate, missing, hidden and invalid identities. Schema, cancellation, deadline and authority checks surround
+each batch; output owns its bytes independently of temporary readers.
+
+Full consumers of `UNWIND ... MATCH` can prefetch deterministic row-bound property
+equalities in bounded windows. A strict bounded candidate estimate prevents
+speculative materialization of a corpus or large nonunique fanout. A quota-owned
+cache retains only matching candidates and replays each equality bucket in
+native encounter order for the original outer inputs. Duplicate outer bindings,
+nonunique properties, OPTIONAL null extension and sequential aggregates retain
+their ordinary semantics. The original MATCH predicate remains authoritative.
+Unsupported proofs and cache quota exhaustion decline to the ordinary operator,
+with performed work still charged. Saturated estimates decline; estimates never
+supply query rows or EOF. Empty terminal probes can finish trailing owners at
+an exact anchor ceiling without refunding any observed records. Finite row
+goals, general graph joins and
+nested continuations retain demand-driven or weighted execution.
+
+The graph catalog readiness action now probes `MATCH ()-[r]->() RETURN r LIMIT 0`.
+This requires every mapped physical relationship projection during snapshot
+capture without enumerating graph rows. A node-only probe intentionally has no
+physical relationship dependencies and cannot establish projection readiness.
+
+Qualification for bounded native batches: all 501 optimized core tests pass,
+including mixed indexed/primary owners, RPC fallback continuation, membership
+boundaries through 4,096 values, global integer precision evidence, duplicate and
+OPTIONAL correlated inputs, independent-join eligibility, finite row goals and
+empty terminal probes at an exact anchor ceiling. All four native retained-cut
+fixtures pass with no leaks across 58 build steps, including durable and pinned
+key batches, duplicates/missing identities, captured visibility and scalar-prefix
+reuse after a live catalog drop. The storage compilation harness passes all 30
+cases. The Go SDK suite, 547 TypeScript SDK tests (one skip), 304 Antfarm tests
+and four new main CI contracts pass. Main is merged through `be8c595518`; the
+Antfarm rebuild after that merge matches the bundled assets byte for byte.
+
+
+On macOS, embedded-only test composition uses the same native final-link path
+as the main composition. Relocatable Zig/LLVM objects can lose `N_ALT_ENTRY` on
+exported aliases inside merged data aggregates. The native linker restores those
+alias flags in an adjacent staged entry object, preserving base-relative private
+members while keeping code/data dead-stripping enabled. The compiler object is
+unchanged and the staged object remains beside the executable for debug maps.
+Five binary-format tests cover aliases, ordering, idempotence, ordinary objects,
+malformed input and staging; the corrected embedded gate passes 125 tests.

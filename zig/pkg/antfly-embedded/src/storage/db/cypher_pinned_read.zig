@@ -153,49 +153,106 @@ pub fn scan(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8,
 /// Document point reads retain the primary bytes and use span projection, so
 /// wide unrequested payloads never become a DOM or escape into reply storage.
 pub fn get(db: anytype, a: A, cut: *Snapshot, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
-    if (!cut.byte_range.contains(key) or @import("group_source_identity.zig").isAnchor(key)) return null;
+    const results = try getMany(db, a, cut, &.{key}, .{ .include_documents = true, .fields = opts.fields, .include_all_fields = opts.include_all_fields, .execution_deadline_ns = opts.execution_deadline_ns, .cancellation = opts.cancellation, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database });
+    defer a.free(results);
+    return results[0];
+}
+
+/// One native batch owns one schema/policy/read cut and one projection plan.
+/// Results retain input order and missing/hidden identities remain null.
+pub fn getMany(db: anytype, a: A, cut: *Snapshot, keys: []const []const u8, input: types.ScanOptions) ![]?types.LookupResult {
+    if (keys.len > 128) return error.CypherOwnerBudgetExceeded;
+    var scratch = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
     var schema = db.core.acquireSchemaView();
     defer if (schema) |*view| view.release();
     if ((if (schema) |view| view.version() else 0) != cut.schema_version) return error.SchemaVersionChanged;
+    const results = try a.alloc(?types.LookupResult, keys.len);
+    @memset(results, null);
+    errdefer {
+        for (results) |*result| if (result.*) |*value| value.deinit(a);
+        a.free(results);
+    }
+    const opts = if (input.relational_query != null) input else try db.cypherDocumentScanOptions(temporary, input);
     if (schema) |view| if (view.storageMode() == .relational) {
-        var page = try scan(db, a, cut, key, key, .{ .inclusive_from = true, .include_documents = true, .limit = 1, .fields = opts.fields, .include_all_fields = opts.include_all_fields, .execution_deadline_ns = opts.execution_deadline_ns, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database });
-        defer page.deinit(a);
-        if (page.documents.len == 0) return null;
-        return .{ .json = try a.dupe(u8, page.documents[0].json) };
+        var facade: Database(@TypeOf(db.*)) = .{ .source = db, .core = db.core, .cut = cut.* };
+        // The native read scope must release its bounded source buffers on
+        // each retry/page, independently of the caller's reply arena.
+        const backing = cypher.backend.reclaimingAllocator(a);
+        const session = try facade.openRelationalReadSession(backing, "", "", opts);
+        defer session.deinit();
+        var row_scratch = std.heap.ArenaAllocator.init(backing);
+        defer row_scratch.deinit();
+        var start: usize = 0;
+        while (start < keys.len) {
+            const end = @min(keys.len, start + 64);
+            var selected: [64][]const u8 = undefined;
+            var positions: [64]usize = undefined;
+            var count: usize = 0;
+            for (keys[start..end], start..) |key, i| {
+                try session.checkpoint();
+                if (!cut.byte_range.contains(key) or @import("group_source_identity.zig").isAnchor(key)) continue;
+                selected[count] = key;
+                positions[count] = i;
+                count += 1;
+            }
+            var next: usize = 0;
+            while (next < count) {
+                _ = row_scratch.reset(.free_all);
+                try session.checkpoint();
+                const batch = try @import("relational_rows.zig").lookupCypherBatch(&session.reader, row_scratch.allocator(), selected[next..count], 16 << 20);
+                if (batch.consumed == 0 or batch.consumed > count - next or batch.rows.len != batch.consumed) return error.InvalidResponse;
+                for (batch.rows, positions[next..][0..batch.consumed]) |row, position| {
+                    try session.checkpoint();
+                    if (row) |value| results[position] = .{ .json = try std.json.Stringify.valueAlloc(a, value.typed orelse return error.InvalidResponse, .{}), .version = value.version };
+                }
+                next += batch.consumed;
+            }
+            start = end;
+        }
+        try session.checkpoint();
+        return results;
     };
-    var authority = try db.acquireCypherReadAuthority(a, opts.row_policy_principal_proof, opts.row_policy_database);
+    var authority = try db.acquireCypherReadAuthority(temporary, opts.row_policy_principal_proof, opts.row_policy_database);
     defer authority.release();
-    const time = @import("antfly_platform").time;
-    if (opts.cancellation) |token| try token.check();
-    if (opts.execution_deadline_ns) |deadline| if (time.monotonicNs() >= deadline) return error.DeadlineExceeded;
     var read = try cut.primary.forkRead();
     defer read.abort();
-    const internal = @import("../internal_keys.zig");
-    const store_key = try internal.documentKeyAlloc(a, key);
-    defer a.free(store_key);
-    const raw = read.getLeased(store_key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    const timestamp_key = try internal.ttlKeyAlloc(a, key);
-    defer a.free(timestamp_key);
-    const timestamp = read.get(timestamp_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    const version: u64 = if (timestamp) |bytes| if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .little) else return error.InvalidData else 0;
-    const duration = if (schema) |view| view.visibilityTtlDurationNs() else 0;
-    if (duration != 0 and version != 0 and @import("../ttl.zig").isExpired(version, duration, cut.now)) return null;
     const projection = @import("document_query.zig");
-    var plan = try projection.SpanProjectionPlan.init(a, opts);
+    const lookup: types.LookupOptions = .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields };
+    var plan = try projection.SpanProjectionPlan.init(temporary, lookup);
     defer if (plan) |*value| value.deinit();
-    var result = if (plan) |*value| try projection.lookupJsonWithPlan(a, a, raw, value) else try projection.lookupJson(a, raw, opts);
-    errdefer result.deinit(a);
-    result.version = version;
+    const internal = @import("../internal_keys.zig");
+    const duration = if (schema) |view| view.visibilityTtlDurationNs() else 0;
+    for (keys, results) |key, *out| {
+        try checkBatch(&authority, opts);
+        if (!cut.byte_range.contains(key) or @import("group_source_identity.zig").isAnchor(key)) continue;
+        const store_key = try internal.documentKeyAlloc(temporary, key);
+        defer temporary.free(store_key);
+        const raw = read.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        const timestamp_key = try internal.ttlKeyAlloc(temporary, key);
+        defer temporary.free(timestamp_key);
+        const timestamp = read.get(timestamp_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const version: u64 = if (timestamp) |bytes| if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .little) else return error.InvalidData else 0;
+        if (duration != 0 and version != 0 and @import("../ttl.zig").isExpired(version, duration, cut.now)) continue;
+        var result = if (plan) |*value| try projection.lookupJsonWithPlan(temporary, a, raw, value) else try projection.lookupJsonWithOutput(temporary, a, raw, lookup);
+        result.version = version;
+        out.* = result;
+    }
+    try checkBatch(&authority, opts);
+    return results;
+}
+fn checkBatch(authority: anytype, opts: types.ScanOptions) !void {
+    const time = @import("antfly_platform").time;
     try authority.checkAt(@intCast(time.realtimeNs() / std.time.ns_per_s));
     if (opts.cancellation) |token| try token.check();
     if (opts.execution_deadline_ns) |deadline| if (time.monotonicNs() >= deadline) return error.DeadlineExceeded;
-    return result;
 }
 
 pub fn edges(db: anytype, a: A, cut: *Snapshot, name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph.EdgeDirection, cursor: ?graph.CypherEdgeScanCursor, limits: graph.EdgePageLimits) !graph.CypherEdgePage {
@@ -308,6 +365,9 @@ pub fn Database(comptime DB: type) type {
             const session = try self.source.openRelationalReadSessionAtSnapshot(a, from, to, opts, &statement);
             session.reader.now_ns = self.cut.now;
             return session;
+        }
+        pub fn getCypherDocuments(self: *@This(), a: A, keys: []const []const u8, opts: types.ScanOptions, _: u64) ![]?types.LookupResult {
+            return self.source.getCypherPinnedDocuments(a, &self.cut, keys, opts);
         }
         pub fn getDocument(self: *@This(), a: A, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
             return self.source.getCypherPinnedDocument(a, &self.cut, key, opts);

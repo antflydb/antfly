@@ -59,7 +59,10 @@ pub fn Page(comptime T: type) type {
     };
 }
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in, is_null };
-pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq };
+/// Private compiler proof: a distinct, homogeneous, non-null primitive set.
+/// Inexact integers cannot be lowered into rounded DOUBLE equality domains.
+pub const ScalarDomain = enum { string, boolean, integer, integer_inexact_double };
+pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq, domain: ?ScalarDomain = null };
 pub const PropertyOrder = struct {
     property: []const u8,
     descending: bool = false,

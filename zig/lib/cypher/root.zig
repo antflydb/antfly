@@ -54,6 +54,7 @@ test {
     _ = @import("range_pipeline.zig");
     _ = @import("mutation_test.zig");
     _ = @import("native_test.zig");
+    _ = @import("sparse_seek.zig");
     _ = @import("postimage_policy_test.zig");
     _ = @import("request.zig");
     _ = wire;

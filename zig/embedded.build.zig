@@ -31,6 +31,7 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
         // Shared providers and their callers must use the same debug/tracing
         // profile, including the independent embedded packaging composition.
         if (shared.strip) @import("build_support/embedded/shared_library.zig").stripBuildGraph(b);
+        @import("pkg/antfly/build/linked_tests.zig").finalizeNativeLinks(b);
     }
     b.modules.put(b.allocator, "antfly-inference", shared.inference_graph.inference_mod) catch @panic("OOM");
     const local_module = b.createModule(.{

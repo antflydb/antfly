@@ -118,12 +118,13 @@ export default function GraphCatalogPage() {
     setCheckingReadiness(true);
     setReadiness("");
     try {
-      // Opening the ordinary read path validates owner cuts and index
-      // incarnations. LIMIT 0 avoids scanning documents or disclosing rows.
+      // An untyped edge demands every mapped relationship projection. A
+      // node-only probe would validate primary reads while skipping those
+      // projections. LIMIT 0 retains capture checks without returning rows.
       const result = await client.graphs.execute(
         entry.name,
         {
-          query: "MATCH (n) RETURN n LIMIT 0",
+          query: "MATCH ()-[r]->() RETURN r LIMIT 0",
         },
         { signal: controller.signal }
       );

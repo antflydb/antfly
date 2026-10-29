@@ -28176,6 +28176,23 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("getCypherPinnedDocument", .{ self, alloc, cut, key, opts });
         return @import("cypher_pinned_read.zig").get(self, alloc, cut, key, opts);
     }
+    /// Durable query generations are immutable databases. Capture one local
+    /// primary/schema/policy lease for the whole key batch, at statement time.
+    pub fn getCypherDocuments(self: *DB, alloc: Allocator, keys: []const []const u8, opts: types.ScanOptions, now: u64) ![]?types.LookupResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("getCypherDocuments", .{ self, alloc, keys, opts, now });
+        if (keys.len > 128) return error.CypherOwnerBudgetExceeded;
+        if (!self.hasRetainedQueryCut() or now == 0) return error.CypherSnapshotRequired;
+        var fence = (try self.tryStatementReadFence()) orelse return error.CypherSnapshotNotReady;
+        defer fence.release();
+        var cut = try @import("cypher_pinned_read.zig").captureSelected(self, alloc, &fence, &.{}, now);
+        defer cut.deinit();
+        fence.release();
+        return @import("cypher_pinned_read.zig").getMany(self, alloc, &cut, keys, opts);
+    }
+    pub fn getCypherPinnedDocuments(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, keys: []const []const u8, opts: types.ScanOptions) ![]?types.LookupResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("getCypherPinnedDocuments", .{ self, alloc, cut, keys, opts });
+        return @import("cypher_pinned_read.zig").getMany(self, alloc, cut, keys, opts);
+    }
     pub fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !types.ScanResult {
         if (comptime storage_engine.enabled) return storage_engine.call("scanCypherPinnedSnapshot", .{ self, alloc, cut, from, to, opts });
         return @import("cypher_pinned_read.zig").scan(self, alloc, cut, from, to, opts);

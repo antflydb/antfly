@@ -171,6 +171,7 @@ pub const Reader = struct {
     source_compilations: usize = 0,
     source_cache_hits: usize = 0,
     failed_row: ?Row = null,
+    seek_arena: ?std.heap.ArenaAllocator = null,
     after: std.ArrayList(u8) = .empty,
     done: bool = false,
 
@@ -525,8 +526,41 @@ pub const Reader = struct {
         return key.items;
     }
 
+    /// Rebind one equality prefix inside the same READY generation, primary
+    /// snapshot, policy evaluator and projection plan. No catalog is reopened.
+    pub fn seekPrefix(self: *Reader, values: []const Value, after: ?[]const u8) !void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderSeekPrefix", .{ self, values, after });
+        const index = self.index orelse return error.InvalidRelationalRowsRequest;
+        if (values.len == 0 or values.len > index.tuple.keys.len) return error.InvalidRelationalIndexBound;
+        // A failed prefix reset must never leave a readable cursor pointing
+        // into the arena we are about to reclaim. A later seek can retry.
+        self.done = true;
+        if (self.seek_arena == null) self.seek_arena = std.heap.ArenaAllocator.init(self.alloc);
+        _ = self.seek_arena.?.reset(.{ .retain_with_limit = 64 << 10 });
+        const a = self.seek_arena.?.allocator();
+        var lower = try boundKey(a, index, .{ .values = values, .inclusive = true }, false);
+        var upper = try boundKey(a, index, .{ .values = values, .inclusive = true }, true);
+        if (after) |encoded| {
+            const prefix = try records.forwardPrefix(index.id());
+            const suffix = try row_cursor_codec.decode(a, encoded, self.cursor_identity orelse return error.InvalidRelationalRowsRequest);
+            const key = try std.mem.concat(a, u8, &.{ &prefix, suffix });
+            _ = records.parseForward(key, index) catch return error.InvalidRelationalRowsRequest;
+            if (self.reverse) {
+                if (std.mem.order(u8, key, upper) == .lt) upper = key;
+            } else {
+                const next = (try internal.nextPrefixAlloc(a, key)) orelse return error.InvalidRelationalRowsRequest;
+                if (std.mem.order(u8, next, lower) == .gt) lower = next;
+            }
+        }
+        self.lower = lower;
+        self.upper = upper;
+        self.after.clearRetainingCapacity();
+        self.done = false;
+    }
+
     pub fn deinit(self: *Reader) void {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderDeinit", .{self}) catch @panic("incompatible storage owner");
+        if (self.seek_arena) |*arena| arena.deinit();
         if (self.row_policy_lease) |*lease| lease.release();
         if (self.failed_row) |row| self.alloc.free(row.key);
         if (self.covering_projection) |*plan| plan.deinit();
@@ -726,6 +760,10 @@ pub const Reader = struct {
     /// Returned payloads own their bytes independently of the temporary batch.
     pub fn lookupSqlBatch(self: *Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) !Hydrated {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupSqlBatch", .{ self, alloc, documents, layout, max_bytes });
+        return self.lookupBatchFormat(alloc, documents, max_bytes, true, layout);
+    }
+
+    fn lookupBatchFormat(self: *Reader, alloc: Allocator, documents: []const []const u8, max_bytes: usize, comptime native_cells: bool, layout: ?*const @import("../../sql/catalog.zig").Row.TypedLayout) !Hydrated {
         if (self.index != null or documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidRelationalRowsRequest;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         const SourceBudget = @import("../../sql/memory_budget.zig");
@@ -788,11 +826,14 @@ pub const Reader = struct {
             // abandoned page payloads in an arena during batch downsizing.
             for (documents[0..requested], raw[0..requested], rows) |document, value, *out| {
                 if (!predicate_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
-                out.* = if (value) |v| try self.hydratePrimary(alloc, predicate_scratch.allocator(), document, v, true, null, layout) else null;
+                out.* = if (value) |v| try self.hydratePrimary(alloc, predicate_scratch.allocator(), document, v, native_cells, null, layout) else null;
                 count += 1;
                 if (out.*) |row| {
-                    bytes +|= row.key.len + row.typed_cells.?.presence.?.len;
-                    for (row.typed_cells.?.values) |cell| bytes +|= try @import("../../sql/operators.zig").datumBytes(cell);
+                    bytes +|= row.key.len;
+                    if (native_cells) {
+                        bytes +|= row.typed_cells.?.presence.?.len;
+                        for (row.typed_cells.?.values) |cell| bytes +|= try @import("../../sql/operators.zig").datumBytes(cell);
+                    } else bytes +|= try typedSize(row.typed.?, 0);
                 }
                 if (bytes >= max_bytes) break;
             }
@@ -1073,3 +1114,10 @@ pub const Reader = struct {
         return size;
     }
 };
+
+/// Owner-only storage hydration behind DB.getCypherPinnedDocuments. This is
+/// never an additional consumer Reader method or a cross-runtime callback.
+pub fn lookupCypherBatch(reader: *Reader, alloc: Allocator, documents: []const []const u8, max_bytes: usize) anyerror!Reader.Hydrated {
+    if (comptime storage_engine.enabled) @compileError("Cypher batch hydration belongs to the native storage owner");
+    return reader.lookupBatchFormat(alloc, documents, max_bytes, false, null);
+}

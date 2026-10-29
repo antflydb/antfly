@@ -109,10 +109,10 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         }
         read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
         channel.read = &read.?;
-        client = .{ .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .typed = AuthorityChannel.invokeTyped, .checkpoint = AuthorityChannel.checkpoint }, .incarnation = graph.incarnation, .revision = graph.revision };
+        client = .{ .channel = channel.rpcChannel(), .incarnation = graph.incarnation, .revision = graph.revision };
         provider = client.backend();
     }
-    var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint } };
+    var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = channel.rpcChannel() };
     errdefer if (writer.receipt) |receipt| {
         write_outcome.* = switch (receipt.status) {
             .aborted => .aborted,
@@ -143,6 +143,9 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     return encoded;
 }
 pub const AuthorityChannel = struct {
+    pub fn rpcChannel(self: *AuthorityChannel) cypher.rpc.Channel {
+        return .{ .ptr = self, .call = invoke, .typed = invokeTyped, .checkpoint = checkpoint, .owner_local = false };
+    }
     server: *server_mod.ApiHttpServer,
     identity: *?server_mod.AuthenticatedIdentity,
     context: operation.RequestContext,

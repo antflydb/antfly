@@ -2068,7 +2068,7 @@ pub const Adapter = struct {
         owner.authority = .{ .server = self.server, .identity = self.identity, .context = self.context, .name = graph.graph.name, .record_id = graph.graph.incarnation, .tables = inputs, .writes = false, .read = &owner.read, .role_revision = role_revision };
         owner.authority.catalog_guard = .{ .ptr = owner, .call = GraphStatement.validateCatalog };
         const authority = &owner.authority;
-        var client: cypher.rpc.Client = .{ .channel = .{ .ptr = authority, .call = @import("graph_execution.zig").AuthorityChannel.invoke, .typed = @import("graph_execution.zig").AuthorityChannel.invokeTyped, .checkpoint = @import("graph_execution.zig").AuthorityChannel.checkpoint }, .incarnation = graph.graph.incarnation, .revision = graph.graph.revision };
+        var client: cypher.rpc.Client = .{ .channel = authority.rpcChannel(), .incarnation = graph.graph.incarnation, .revision = graph.graph.revision };
         if (self.range_reads) |observed| {
             const body = try std.json.Stringify.valueAlloc(owned, cypher.rpc.Request{ .operation = .observe_ranges, .graph_incarnation = graph.graph.incarnation, .graph_revision = graph.graph.revision }, .{});
             const bytes = try client.channel.call(client.channel.ptr, owned, body);

@@ -662,6 +662,8 @@ pub const Program = struct {
                 .jsonb_array_length,
                 .initcap,
                 .jsonb_extract_path,
+                .value_identity,
+                .is_missing,
                 => {},
             },
         };

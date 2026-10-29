@@ -236,6 +236,7 @@ test "physical dependencies retain nested and wildcard edges and fail broad for 
         .{ .query = "MATCH(n:A)-[:R]->(m:B) RETURN m", .a_count = 1, .b_count = 0 },
         .{ .query = "MATCH(n:A)<-[:R]-(m:B) RETURN m", .a_count = 1, .b_count = 0 },
         .{ .query = "MATCH(n)-[]-(m) RETURN n", .a_count = 1, .b_count = 1 },
+        .{ .query = "MATCH ()-[r]->() RETURN r LIMIT 0", .a_count = 1, .b_count = 1 },
         .{ .query = "MATCH(n:A) RETURN EXISTS { MATCH(m:B)-[:S]->(x:A) RETURN x }", .a_count = 0, .b_count = 1 },
         .{ .query = "MATCH(n:A)-[:R]->(m:B) RETURN n UNION MATCH(n:B)-[:S]->(m:A) RETURN n", .a_count = 1, .b_count = 1 },
         .{ .query = "CALL antfly.search($table,{query:'x'}) YIELD node RETURN node", .a_count = null, .b_count = null },

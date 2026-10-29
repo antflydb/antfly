@@ -25,7 +25,7 @@ const A = std.mem.Allocator;
 // Named transport types keep the checked callback ABI stable across separately
 // compiled runtimes. Anonymous enum/struct type names contain local IDs.
 pub const Operation = enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project };
-pub const Filter = struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq };
+pub const Filter = struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq, domain: ?b.ScalarDomain = null };
 pub const OrderAfter = struct { value: std.json.Value };
 pub const Order = struct { property: []const u8, descending: bool = false, exclude_null: bool = false, after: ?OrderAfter = null };
 pub const BudgetFailure = enum { work, anchors };
@@ -97,7 +97,15 @@ pub const Reply = struct {
         return out;
     }
 };
-pub const Channel = struct { typed: ?*const fn (*anyopaque, A, Request) anyerror!Reply = null, ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
+pub const Channel = struct {
+    /// Only physical-owner channels partition sparse domains. A coordinator
+    /// must retain the full domain until each shard's continuation is done.
+    owner_local: bool = true,
+    typed: ?*const fn (*anyopaque, A, Request) anyerror!Reply = null,
+    ptr: *anyopaque,
+    call: *const fn (*anyopaque, A, []const u8) anyerror![]u8,
+    checkpoint: ?*const fn (*anyopaque) anyerror!void = null,
+};
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {
     channel: Channel,
@@ -268,15 +276,18 @@ pub const Client = struct {
         var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, filters, .{}), .{ .parse_numbers = false });
-        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .operation = .scan, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit });
+        const window = if (self.channel.owner_local) try @import("sparse_seek.zig").Window.open(temporary, filters, after) else null;
+        const selected = if (window) |part| part.filters else filters;
+        const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, selected, .{}), .{ .parse_numbers = false });
+        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .operation = .scan, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = if (window) |part| part.after else after, .limit = limit });
         const nodes = try a.alloc(*const v.Node, reply.values.len);
         for (reply.values, nodes) |input, *out| {
             const value = try input.value.clone(a);
             if (value != .node or !std.mem.eql(u8, value.node.identity.table, table)) return error.CypherInvalidBackendPage;
             out.* = value.node;
         }
-        return .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined, .unfiltered = reply.unfiltered };
+        const page: b.Page(*const v.Node) = .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined, .unfiltered = reply.unfiltered };
+        return if (window) |part| try part.finish(a, page) else page;
     }
     fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
         const self = cast(ptr);
@@ -433,7 +444,7 @@ pub const Owner = struct {
             .estimate => {
                 if (!self.permitsTable(request.table) or request.limit > 128) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
-                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op };
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain };
                 const upper = if (self.backend.vtable.estimate_where) |estimate| try estimate(self.backend.ptr, scratch, request.table, filters, request.limit) else null;
                 try self.backend.vtable.checkpoint(self.backend.ptr);
                 return .{ .work = meter.units, .estimate = upper };
@@ -441,7 +452,7 @@ pub const Owner = struct {
             .scan_ordered => {
                 if (!self.permitsTable(request.table) or request.order.len > 32) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
-                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op };
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain };
                 const order = try scratch.alloc(b.PropertyOrder, request.order.len);
                 for (request.order, order) |input, *out| out.* = .{ .property = input.property, .descending = input.descending, .exclude_null = input.exclude_null, .after = if (input.after) |key| try v.Value.fromJson(scratch, key.value) else null };
                 const page = if (self.backend.vtable.scan_ordered) |read| read(self.backend.ptr, scratch, request.table, filters, order, request.after, request.limit, request.max_examined) catch |err| return self.readFailure(meter.units, err) else null;
@@ -454,7 +465,7 @@ pub const Owner = struct {
             .scan => {
                 if (!self.permitsTable(request.table)) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
-                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op };
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain };
                 const page = if (self.backend.vtable.scan_where) |filtered| try filtered(self.backend.ptr, scratch, request.table, filters, request.after, request.limit) else try self.backend.vtable.scan(self.backend.ptr, scratch, request.table, request.after, request.limit);
                 for (page.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
                 next = page.next;
@@ -773,4 +784,47 @@ test "owner wire replies preserve terminal ordered cursor steps" {
     try trace.validate(reply.values.len);
     try std.testing.expectEqual(@as(?[]const u8, null), trace.steps[0].after);
     try std.testing.expectEqual(@as(?[]const u8, null), try trace.materialize(a, 1, @as(?b.Work, null)));
+}
+
+test "sparse RPC membership bounds packets and resumes one primary fallback" {
+    const Fixture = struct {
+        delivered: usize = 0,
+        calls: usize = 0,
+        fallback: bool = false,
+        fn call(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const request = try std.json.parseFromSliceLeaky(Request, a, body, .{});
+            self.calls += 1;
+            const filter = request.filters[0];
+            if (self.fallback and request.after != null) {
+                try std.testing.expectEqualStrings("primary-position", request.after.?);
+                try std.testing.expectEqual(@as(usize, 400), filter.value.array.items.len);
+                try std.testing.expect(filter.domain == null);
+            } else {
+                try std.testing.expect(filter.value.array.items.len <= 128);
+                try std.testing.expectEqual(b.ScalarDomain.integer, filter.domain.?);
+                self.delivered += filter.value.array.items.len;
+            }
+            return std.json.Stringify.valueAlloc(a, Reply{ .unfiltered = self.fallback, .next = if (self.fallback and self.calls == 1) "primary-position" else null }, .{});
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const values = try a.alloc(v.Value, 400);
+    for (values, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
+    const filters = &[_]b.PropertyFilter{.{ .property = "id", .op = .in, .value = .{ .list = values }, .domain = .integer }};
+    for ([_]bool{ false, true }) |fallback| {
+        var fixture: Fixture = .{ .fallback = fallback };
+        var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.call }, .incarnation = 1, .revision = 1 };
+        const backend = client.backend();
+        var after: ?[]const u8 = null;
+        while (true) {
+            const page = try backend.vtable.scan_where.?(backend.ptr, a, "docs", filters, after, 128);
+            after = page.next;
+            if (after == null) break;
+        }
+        try std.testing.expectEqual(@as(usize, if (fallback) 2 else 4), fixture.calls);
+        try std.testing.expectEqual(@as(usize, if (fallback) 128 else 400), fixture.delivered);
+    }
 }

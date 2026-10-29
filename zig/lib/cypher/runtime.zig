@@ -1887,8 +1887,8 @@ const Engine = struct {
         scalars: std.AutoHashMapUnmanaged(u64, v.Value) = .empty,
         strings: ?@import("string_work.zig").Runtime = null,
         lists: std.AutoHashMapUnmanaged(u64, @import("invariant_membership.zig").Membership) = .empty,
-        filter_domains: std.AutoHashMapUnmanaged(u64, ?v.Value) = .empty,
-        filter_owned_domains: std.AutoHashMapUnmanaged(Identity, ?v.Value) = .empty,
+        filter_domains: std.AutoHashMapUnmanaged(u64, ?FilterDomain) = .empty,
+        filter_owned_domains: std.AutoHashMapUnmanaged(Identity, ?FilterDomain) = .empty,
         producer_lists: std.AutoHashMapUnmanaged(u64, *@import("invariant_membership.zig").Producer) = .empty,
         membership_budget: ?*Budget = null,
         captured_lists: ?ProducerMemo = null,
@@ -1977,6 +1977,7 @@ const Engine = struct {
     join: ?*const Join = null,
     lookups: []Lookup = &.{},
     lookup: ?*Lookup = null,
+    correlated_lookup: ?*Lookup = null,
     distinct_sequence: usize = 0,
     distinct_input_token: ?usize = null,
     aggregate_overrides: ?AggregateOverrides = null,
@@ -6759,6 +6760,158 @@ const Engine = struct {
             }
             return true;
         }
+        fn canBatchCorrelated(fold: *@This(), engine: *Engine, row: Row, index: usize) bool {
+            if (!engine.read_only or fold.closed_domain or fold.consumer != null or fold.continuation != null or fold.group_window != null or fold.projection.limit != null or fold.distinct_goal != null or index + 1 >= fold.middle.len or fold.middle[index + 1].operation != .match) return false;
+            for (fold.middle[index + 1 ..]) |clause| if (clause.operation == .project and (clause.operation.project.value.limit != null or clause.operation.project.value.skip != null)) return false;
+            const operation = fold.middle[index + 1].operation.match;
+            if (independentExpressions(operation, fold.middle[index].operation.unwind.alias)) return false;
+            if (operation.paths.len != 1 or operation.paths[0].nodes.len != 1 or operation.paths[0].edges.len != 0) return false;
+            const pattern = operation.paths[0].nodes[0];
+            return pattern.alias != null and pattern.labels.len == 1 and lookup(row, pattern.alias.?) == null and engine.backend.vtable.scan_where != null and engine.backend.vtable.estimate_where != null;
+        }
+        fn batchedUnwindMatch(fold: *@This(), engine: *Engine, row: Row, index: usize, unwind: @FieldType(@FieldType(ast.Clause, "operation"), "unwind"), original: ListSource) anyerror!bool {
+            // Full consumers license bounded lookahead. Row goals, pattern
+            // consumers and nested continuations keep demand-driven execution.
+            if (original.length() < 2 or !fold.canBatchCorrelated(engine, row, index)) return false;
+            const operation = fold.middle[index + 1].operation.match;
+            if (operation.paths.len != 1 or operation.paths[0].nodes.len != 1 or operation.paths[0].edges.len != 0) return false;
+            const pattern = operation.paths[0].nodes[0];
+            if (pattern.alias == null or pattern.labels.len != 1 or lookup(row, pattern.alias.?) != null) return false;
+            if (engine.backend.vtable.scan_where == null or engine.backend.vtable.estimate_where == null) return false;
+            var source = original;
+            while (true) {
+                // Leave one slot for a strict bounded population proof.
+                var items: [127]v.Value = undefined;
+                var batch_size: usize = 0;
+                while (batch_size < items.len) : (batch_size += 1) items[batch_size] = source.next() orelse break;
+                if (batch_size == 0) break;
+                var batch: Lookup = .{ .alias = pattern.alias, .table = engine.graph.label(pattern.labels[0]).?.table, .budget = .{ .backing = engine.scratch_allocator, .limit = @min(8 << 20, engine.limits.memory_bytes / 8) } };
+                batch.arena = std.heap.ArenaAllocator.init(batch.budget.allocator());
+                defer if (batch.arena) |*arena| arena.deinit();
+                var examined: usize = 0;
+                const prepared = fold.prefetchCorrelated(engine, row, unwind.alias, pattern, operation.predicate, items[0..batch_size], &batch, &examined) catch |err| declined: {
+                    if (err == error.OutOfMemory and batch.budget.exhausted) break :declined false;
+                    return err;
+                };
+                // Physical rows not replayed from a successful cache, or all
+                // work from a declined cache, still consume the anchor quota.
+                const debt = if (prepared) examined - batch.rows.items.len else examined;
+                if (debt > engine.limits.scanned_anchors -| engine.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
+                engine.stats.scanned_anchors += debt;
+                if (!prepared) batch.decline();
+                const previous = engine.correlated_lookup;
+                engine.correlated_lookup = if (prepared) &batch else previous;
+                defer engine.correlated_lookup = previous;
+                var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                defer arena.deinit();
+                for (items[0..batch_size]) |item| {
+                    _ = arena.reset(.retain_capacity);
+                    const scope = EvalScope.enter(engine, arena.allocator());
+                    defer scope.leave(engine);
+                    try engine.state();
+                    if (fold.record_rows) fold.stage_counts[index + 1] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
+                    try fold.expand(engine, try engine.replace(row, unwind.alias, item), index + 1);
+                }
+            }
+            return true;
+        }
+        fn prefetchCorrelated(_: *@This(), engine: *Engine, row: Row, alias: []const u8, pattern: ast.Node, predicate: ?*const ast.Expr, items: []const v.Value, batch: *Lookup, examined: *usize) anyerror!bool {
+            const a = batch.arena.?.allocator();
+            const scope = EvalScope.enter(engine, a);
+            defer scope.leave(engine);
+            var keys: std.ArrayList(v.Value) = .empty;
+            var kind: ?std.meta.Tag(v.Value) = null;
+            var inexact_double = false;
+            for (items) |item| {
+                const input = try engine.replace(row, alias, item);
+                const filters = try engine.nodeFilters(pattern, predicate, input);
+                const selected = for (filters) |filter| {
+                    if (filter.op == .eq and (batch.property == null or std.mem.eql(u8, batch.property.?, filter.property))) break filter;
+                } else return false;
+                batch.property = selected.property;
+                const value = selected.value;
+                if (value == .null) return false; // Preserve OPTIONAL/error timing.
+                switch (value) {
+                    .integer, .string, .boolean => {},
+                    else => return false,
+                }
+                if (kind) |known| {
+                    if (known != std.meta.activeTag(value)) return false;
+                } else kind = std.meta.activeTag(value);
+                if (value == .integer and (value.integer < -9007199254740992 or value.integer > 9007199254740992)) inexact_double = true;
+                const hash = (try engine.values.info(value)).hash;
+                var candidate = batch.domain.head(hash);
+                while (candidate) |position| {
+                    const link = batch.domain.links.items[position];
+                    if (try engine.values.eql(keys.items[link.index], value)) break;
+                    candidate = link.next;
+                }
+                if (candidate != null) continue;
+                try batch.domain.insert(a, hash, keys.items.len);
+                try keys.append(a, try value.clone(a));
+            }
+            if (batch.property == null or keys.items.len == 0) return false;
+            batch.keys = keys.items;
+            const filter: backend_mod.PropertyFilter = .{ .property = batch.property.?, .op = .in, .value = .{ .list = keys.items }, .domain = switch (kind.?) {
+                .string => .string,
+                .boolean => .boolean,
+                .integer => if (inexact_double) .integer_inexact_double else .integer,
+                else => unreachable,
+            } };
+            // A strict candidate upper bound avoids materializing a large
+            // nonunique fanout or speculative unindexed corpus. No source row
+            // has been emitted, and an unsupported proof declines normally.
+            const maximum = @min(128, engine.limits.scanned_anchors -| engine.stats.scanned_anchors);
+            if (maximum == 0) return false;
+            const proof = try engine.backend.vtable.estimate_where.?(engine.backend.ptr, a, batch.table, &.{filter}, maximum + 1);
+            const upper = proof orelse return false;
+            // Estimates can saturate at their requested limit. Only a strict
+            // bound fits this cache; it never supplies query rows or EOF.
+            if (upper > maximum) return false;
+            var after: ?[]const u8 = null;
+            while (true) {
+                try engine.state();
+                const remaining = maximum - examined.*;
+                // A distributed cursor can still name trailing empty owners
+                // after consuming its exact record allowance. An empty EOF
+                // probe consumes work but no anchors. Every observed record,
+                // including one that makes the cache decline, stays charged.
+                const page_limit = @max(1, remaining);
+                var page_scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                defer page_scratch.deinit();
+                const page = try engine.backend.vtable.scan_where.?(engine.backend.ptr, page_scratch.allocator(), batch.table, &.{filter}, after, page_limit);
+                const used = page.examined orelse page.items.len;
+                if (used < page.items.len or used > page_limit) return error.CypherInvalidBackendPage;
+                examined.* += used;
+                if (examined.* > maximum) return false;
+                if (page.unfiltered) return false;
+                for (page.items) |node| {
+                    const key = (v.Value{ .node = node }).property(batch.property.?);
+                    var candidate = batch.domain.head((try engine.values.info(key)).hash);
+                    while (candidate) |position| {
+                        const link = batch.domain.links.items[position];
+                        if (try engine.values.eql(batch.keys[link.index], key)) {
+                            try batch.captureRows(engine, &.{node});
+                            break;
+                        }
+                        candidate = link.next;
+                    }
+                }
+                after = if (page.next) |next| try a.dupe(u8, next) else null;
+                if (after == null) break;
+            }
+            // Hash chains prepend. Rebuild from the end so each equality
+            // bucket retains the native encounter order for COLLECT and
+            // sequential floating SUM/AVG, including duplicate outer inputs.
+            batch.index = .{};
+            for (0..batch.rows.items.len) |offset| {
+                const i = batch.rows.items.len - offset - 1;
+                const key = (v.Value{ .node = batch.rows.items[i] }).property(batch.property.?);
+                try batch.index.insert(a, (try engine.values.info(key)).hash, i);
+            }
+            batch.complete = true;
+            return true;
+        }
         fn expand(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!void {
             if (fold.axis_trace) |trace| {
                 for (row) |entry| if ((try engine.readMetadata(entry.value)).entities) return error.CypherAxisMemoDeclined;
@@ -6839,15 +6992,19 @@ const Engine = struct {
                         }
                         if (projectedSource(unwind.expression) and !arithmeticSource(unwind.expression)) {
                             const independent = try fold.independentTail(engine, unwind.alias, index + 1, null);
-                            if (!independent and try fold.memoAxis(engine, row, index)) return;
+                            if (!independent and !fold.canBatchCorrelated(engine, row, index) and try fold.memoAxis(engine, row, index)) return;
                             var consumer: UnwindReceiver = .{ .fold = fold, .row = row, .index = index, .owner = engine.local_invariants, .locals = engine.projection_locals, .weighted = independent };
+                            consumer.batching = !independent and fold.canBatchCorrelated(engine, row, index);
+                            defer consumer.deinit();
                             var receiver: ListReceiver = .{ .ptr = &consumer, .emit = UnwindReceiver.add, .complete = UnwindReceiver.isComplete, .destination = fold.retained, .observer = .{ .name = "collect", .args = &.{}, .collect_limit = if (independent) 0 else null } };
                             _ = try engine.produceList(unwind.expression, row, null, &receiver);
                             try receiver.check();
+                            try consumer.flush(engine);
                             if (consumer.complete) |err| return err;
                             return;
                         }
                         var source = (try engine.unwindSource(unwind.expression, row)) orelse return;
+                        if (try fold.batchedUnwindMatch(engine, row, index, unwind, source)) return;
                         if (try fold.repeatedWindow(engine, row, index, unwind, source)) return;
                         if (source.values == .range) {
                             var sequence = source.values.range;
@@ -8855,8 +9012,19 @@ const Engine = struct {
         // Global reducers/order remain stage barriers. This continuation path
         // is for finite unordered demand; it never enumerates a large count
         // query that the weighted stage executor can reduce compactly.
-        if (has_match and (grouped or projection.order.len != 0 or consumer_goal == null or !weightedExpression(middle))) return null;
-        if (has_match and consumer_goal.? > self.limits.intermediate_states -| self.stats.intermediate_states) return null;
+        // A single row-local node join has no route bag to summarize. It can
+        // stream full reducers while a bounded sparse prefetch amortizes the
+        // correlated equality probes. All other graph pipelines retain the
+        // weighted-stage barrier above.
+        const correlated_batch = scalar_seed and self.read_only and middle.len == 2 and middle[0].operation == .unwind and middle[1].operation == .match and self.backend.vtable.scan_where != null and self.backend.vtable.estimate_where != null and eligible: {
+            const matching = middle[1].operation.match;
+            if (independentExpressions(matching, middle[0].operation.unwind.alias)) break :eligible false;
+            if (matching.paths.len != 1) break :eligible false;
+            const candidate = matching.paths[0];
+            break :eligible candidate.nodes.len == 1 and candidate.edges.len == 0 and candidate.selector == .all and candidate.nodes[0].labels.len == 1 and candidate.nodes[0].alias != null and self.graph.label(candidate.nodes[0].labels[0]) != null;
+        };
+        if (has_match and !correlated_batch and (grouped or projection.order.len != 0 or consumer_goal == null or !weightedExpression(middle))) return null;
+        if (has_match and !correlated_batch and consumer_goal.? > self.limits.intermediate_states -| self.stats.intermediate_states) return null;
         for (middle) |clause| {
             if (clause.operation == .match) continue;
             if (clause.operation == .subquery) {
@@ -10982,6 +11150,9 @@ const Engine = struct {
         index: value_work.Index = .{},
         table: []const u8 = "",
         property: ?[]const u8 = null,
+        alias: ?[]const u8 = null,
+        keys: []const v.Value = &.{},
+        domain: value_work.Index = .{},
         key: v.Value = .null,
         disabled: bool = false,
         complete: bool = false,
@@ -11288,8 +11459,9 @@ const Engine = struct {
     // Canonical access hints never rewrite the authoritative IN expression.
     // Cache only invocation-bound expressions; row-dependent values retain
     // their own epoch. Admission caps count distinct partitions, not duplicates.
-    fn filterMembership(self: *Engine, expression: *const ast.Expr, input: v.Value) !v.Value {
-        if (input != .list) return input;
+    const FilterDomain = struct { value: v.Value, domain: ?backend_mod.ScalarDomain = null };
+    fn filterMembership(self: *Engine, expression: *const ast.Expr, input: v.Value) !FilterDomain {
+        if (input != .list) return .{ .value = input };
         const id = expression.execution_invariant;
         // Parameters deliberately have no execution ID. Their immutable
         // allocation also licenses caching, including forwarded list aliases.
@@ -11299,15 +11471,16 @@ const Engine = struct {
         const provenance = parameter_owner orelse self.immutableOwner(input);
         const owner = if (id != null) try self.invocationState() else provenance orelse try self.invariantState();
         const identity: Invariants.Identity = .{ .address = @intFromPtr(input.list.ptr), .length = input.list.len };
-        if (id) |key| if (owner.filter_domains.get(key)) |cached| return cached orelse input;
-        if (id == null and provenance != null) if (owner.filter_owned_domains.get(identity)) |cached| return cached orelse input;
+        if (id) |key| if (owner.filter_domains.get(key)) |cached| return cached orelse FilterDomain{ .value = input };
+        if (id == null and provenance != null) if (owner.filter_owned_domains.get(identity)) |cached| return cached orelse FilterDomain{ .value = input };
         const a = if (id != null or provenance != null) owner.work.a else self.a;
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer scratch.deinit();
         var index: value_work.Index = .{};
         var values: std.ArrayList(v.Value) = .empty;
         var kind: ?std.meta.Tag(v.Value) = null;
-        const canonical: ?v.Value = normalized: {
+        var inexact_double = false;
+        const canonical: ?FilterDomain = normalized: {
             for (input.list) |value| {
                 try self.state();
                 if (value == .null) continue;
@@ -11326,17 +11499,23 @@ const Engine = struct {
                     position = link.next;
                 }
                 if (position != null) continue;
-                if (values.items.len == 256) break :normalized null;
+                if (values.items.len == 4096) break :normalized null;
+                if (value == .integer and (value.integer < -9007199254740992 or value.integer > 9007199254740992)) inexact_double = true;
                 try index.insert(scratch.allocator(), hash, values.items.len);
                 try values.append(scratch.allocator(), value);
             }
             const owned = try a.alloc(v.Value, values.items.len);
             for (values.items, owned) |value, *out| out.* = try value.clone(a);
-            break :normalized .{ .list = owned };
+            break :normalized .{ .value = .{ .list = owned }, .domain = switch (kind orelse .integer) {
+                .string => .string,
+                .boolean => .boolean,
+                .integer => if (inexact_double) .integer_inexact_double else .integer,
+                else => unreachable,
+            } };
         };
         if (id) |key| try owner.filter_domains.put(owner.work.a, key, canonical);
         if (id == null and provenance != null) try owner.filter_owned_domains.put(owner.work.a, identity, canonical);
-        return canonical orelse input;
+        return canonical orelse .{ .value = input };
     }
     fn predicateFilters(self: *Engine, expression: *const ast.Expr, alias: []const u8, row: Row, filters: *std.ArrayList(backend_mod.PropertyFilter)) !void {
         if ((self.private_parameters.len != 0 or self.allow_null_filters) and expression.value == .unary and expression.value.unary.op == .is_null) {
@@ -11353,7 +11532,8 @@ const Engine = struct {
             var property: ?[]const u8 = null;
             var items: std.ArrayList(v.Value) = .empty;
             if (try self.membershipFilter(expression, alias, row, &property, &items)) {
-                try filters.append(self.a, .{ .property = property.?, .value = .{ .list = items.items }, .op = .in });
+                const domain = try self.filterMembership(expression, .{ .list = items.items });
+                try filters.append(self.a, .{ .property = property.?, .value = domain.value, .domain = domain.domain, .op = .in });
             }
             return;
         }
@@ -11388,17 +11568,21 @@ const Engine = struct {
             const property = operands[index];
             if (property.value != .property or property.value.property.base.value != .variable or !std.mem.eql(u8, property.value.property.base.value.variable, alias)) continue;
             const value = if (op == .in) try self.seekCollection(operands[1 - index], row) else try self.seekValue(operands[1 - index], row);
-            if (value) |operand| try filters.append(self.a, .{
-                .property = property.value.property.name,
-                .value = if (op == .in) try self.filterMembership(operands[1 - index], operand) else operand,
-                .op = if (index == 0) op else switch (op) {
-                    .lt => .gt,
-                    .lte => .gte,
-                    .gt => .lt,
-                    .gte => .lte,
-                    else => op,
-                },
-            });
+            if (value) |operand| {
+                const domain = if (op == .in) try self.filterMembership(operands[1 - index], operand) else FilterDomain{ .value = operand };
+                try filters.append(self.a, .{
+                    .property = property.value.property.name,
+                    .value = domain.value,
+                    .domain = domain.domain,
+                    .op = if (index == 0) op else switch (op) {
+                        .lt => .gt,
+                        .lte => .gte,
+                        .gt => .lt,
+                        .gte => .lte,
+                        else => op,
+                    },
+                });
+            }
         }
     }
 
@@ -11748,6 +11932,20 @@ const Engine = struct {
     fn scanNodes(self: *Engine, table: []const u8, first: ast.Node, predicate: ?*const ast.Expr, row: Row, cursor: ?[]const u8, demand: usize) !backend_mod.Page(*const v.Node) {
         if (self.node_order) |order| order.replayed = false;
         const bounded_demand = @min(demand, @max(@as(usize, 1), self.limits.scanned_anchors -| self.stats.scanned_anchors));
+        if (self.correlated_lookup) |batch| if (batch.complete and std.mem.eql(u8, batch.table, table) and first.alias != null and batch.alias != null and std.mem.eql(u8, first.alias.?, batch.alias.?)) {
+            const filters = try self.nodeFilters(first, predicate, row);
+            for (filters) |filter| if (filter.op == .eq and std.mem.eql(u8, filter.property, batch.property.?)) {
+                var candidate = batch.domain.head((try self.values.info(filter.value)).hash);
+                while (candidate) |position| {
+                    const link = batch.domain.links.items[position];
+                    if (try self.values.eql(batch.keys[link.index], filter.value)) {
+                        batch.key = filter.value;
+                        return batch.cachedPage(self, cursor, bounded_demand);
+                    }
+                    candidate = link.next;
+                }
+            };
+        };
         if (self.lookup) |lookup_plan| if (lookup_plan.complete and std.mem.eql(u8, lookup_plan.table, table)) return lookup_plan.cachedPage(self, cursor, bounded_demand);
         if (self.node_order) |order| if (!order.declined and std.mem.eql(u8, order.table, table) and first.alias != null and std.mem.eql(u8, order.alias, first.alias.?)) {
             if (order.prefetched) |prefetched| {
@@ -15549,6 +15747,30 @@ const Engine = struct {
         locals: ?*const @import("expressions.zig").Local,
         complete: ?anyerror = null,
         weighted: bool,
+        batching: bool = false,
+        buffer: [127]v.Value = undefined,
+        buffered: usize = 0,
+        buffer_bytes: usize = 0,
+        buffer_arena: ?std.heap.ArenaAllocator = null,
+        fn deinit(self: *@This()) void {
+            if (self.buffer_arena) |*arena| arena.deinit();
+        }
+        fn flush(self: *@This(), engine: *Engine) !void {
+            if (self.buffered == 0) return;
+            const previous_owner = engine.local_invariants;
+            const previous_locals = engine.projection_locals;
+            engine.local_invariants = self.owner;
+            engine.projection_locals = self.locals;
+            defer engine.local_invariants = previous_owner;
+            defer engine.projection_locals = previous_locals;
+            const unwind = self.fold.middle[self.index].operation.unwind;
+            if (!try self.fold.batchedUnwindMatch(engine, self.row, self.index, unwind, .{ .values = .{ .list = self.buffer[0..self.buffered] } })) {
+                for (self.buffer[0..self.buffered]) |value| try self.addValue(engine, value, Count.one);
+            }
+            self.buffered = 0;
+            self.buffer_bytes = 0;
+            _ = self.buffer_arena.?.reset(.{ .retain_with_limit = 64 << 10 });
+        }
         fn isComplete(ptr: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.complete != null;
@@ -15563,7 +15785,22 @@ const Engine = struct {
                 _ = scratch.reset(.retain_capacity);
                 const scope = EvalScope.enter(engine, scratch.allocator());
                 defer scope.leave(engine);
-                try self.addValue(engine, value, if (self.weighted) weight else Count.one);
+                const bytes = switch (value) {
+                    .null, .integer, .number, .boolean => @sizeOf(v.Value),
+                    .string => |text| text.len +| @sizeOf(v.Value),
+                    else => std.math.maxInt(usize),
+                };
+                const capacity = @min(64 << 10, engine.limits.memory_bytes / 64);
+                if (self.batching and bytes <= capacity) {
+                    if (self.buffered == self.buffer.len or bytes > capacity -| self.buffer_bytes) try self.flush(engine);
+                    if (self.buffer_arena == null) self.buffer_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                    self.buffer[self.buffered] = try value.clone(self.buffer_arena.?.allocator());
+                    self.buffered += 1;
+                    self.buffer_bytes += bytes;
+                } else {
+                    try self.flush(engine);
+                    try self.addValue(engine, value, if (self.weighted) weight else Count.one);
+                }
             }
         }
         fn addValue(self: *@This(), engine: *Engine, value: v.Value, weight: Count) !void {

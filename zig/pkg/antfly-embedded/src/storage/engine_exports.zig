@@ -114,6 +114,12 @@ fn cypherFieldDerivedEdgeType(self: *const DB, index_name: []const u8, edge_type
 fn getCypherPinnedDocument(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, key: []const u8, opts: types.LookupOptions) engine.Outcome(?types.LookupResult) {
     return .{ .value = self.getCypherPinnedDocument(alloc, cut, key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn getCypherDocuments(self: *DB, alloc: Allocator, keys: []const []const u8, opts: types.ScanOptions, now: u64) engine.Outcome([]?types.LookupResult) {
+    return .{ .value = self.getCypherDocuments(alloc, keys, opts, now) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn getCypherPinnedDocuments(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, keys: []const []const u8, opts: types.ScanOptions) engine.Outcome([]?types.LookupResult) {
+    return .{ .value = self.getCypherPinnedDocuments(alloc, cut, keys, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn captureCypherSelectedSnapshot(self: *DB, alloc: Allocator, fence: *const DB.StatementReadFence, names: []const []const u8, now: u64, cancellation: types.CancellationToken) engine.Outcome(DB.CypherPinnedSnapshot) {
     return .{ .value = self.captureCypherSelectedSnapshot(alloc, fence, names, now, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -857,6 +863,15 @@ fn relationalReaderLookupTypedRow(self: *@import("db/relational_rows.zig").Reade
 
 fn relationalSessionDeinit(session: *@import("db/relational_read_session.zig").Session) engine.Outcome(void) {
     return .{ .value = session.deinit() };
+}
+
+fn relationalSessionSeekPrefix(session: *@import("db/relational_read_session.zig").Session, values: []const std.json.Value, after: ?[]const u8) engine.Outcome(void) {
+    session.seekPrefix(values, after) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
+fn relationalReaderSeekPrefix(reader: *@import("db/relational_rows.zig").Reader, values: []const @import("db/relational_rows.zig").Value, after: ?[]const u8) engine.Outcome(void) {
+    reader.seekPrefix(values, after) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
 }
 
 fn relationalSessionCheckpoint(session: *const @import("db/relational_read_session.zig").Session) engine.Outcome(void) {

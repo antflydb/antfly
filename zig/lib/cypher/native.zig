@@ -126,7 +126,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -312,6 +312,12 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             };
         }
         fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            if (try @import("sparse_seek.zig").Window.open(scratch.allocator(), filters, encoded)) |window| {
+                const page = (try scanWhereImpl(ptr, a, table, window.filters, window.after, limit, false)).?;
+                return window.finish(a, page);
+            }
             return (try scanWhereImpl(ptr, a, table, filters, encoded, limit, false)).?;
         }
         fn filterStrength(self: *Self, filters: []const b.PropertyFilter, name: []const u8, column_type: anytype) !u8 {
@@ -639,8 +645,22 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             var schema = acquireSchema(db) orelse return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             defer schema.release();
             const Query = @TypeOf(opts.relational_query.?);
+            for (filters) |filter| if (filter.op == .in and filter.domain != null) {
+                const column = for (schema.tableSchema().relational_columns) |column| {
+                    if (std.mem.eql(u8, column.name, filter.property)) break column;
+                } else return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
+                const compatible = switch (filter.domain.?) {
+                    .string => column.column_type == .string,
+                    .boolean => column.column_type == .boolean,
+                    .integer => column.column_type == .integer or column.column_type == .number,
+                    .integer_inexact_double => column.column_type == .integer,
+                };
+                if (!compatible) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
+                break;
+            };
             var conditions: std.ArrayList(Query.Condition) = .empty;
             var alternatives: []const v.Value = &.{};
+            var alternative_condition: ?usize = null;
             for (filters) |filter| {
                 if (conditions.items.len >= 256) break;
                 var known = false;
@@ -691,6 +711,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         return .{ .items = &.{} };
                     }
                     alternatives = unique.items;
+                    alternative_condition = conditions.items.len;
                     if (cursor.branch >= alternatives.len) return error.CypherInvalidBackendCursor;
                     operand = alternatives[cursor.branch];
                 }
@@ -724,37 +745,134 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             }
             opts.relational_query.?.auto_index = true;
             opts.relational_query.?.index = cursor.index;
-            opts.relational_query.?.after = cursor.after;
             opts.relational_query.?.schema_version = cursor.schema_version;
             opts.inclusive_from = cursor.key == null;
-            const session = db.openRelationalReadSession(temporary, cursor.key orelse "", "", opts) catch |err| switch (err) {
-                // Native schema types can be narrower than Cypher values.
-                // Unsupported operands keep the complete residual scan path.
-                error.InvalidBatchRequest, error.RelationalIndexColumnTypeMismatch, error.UnsupportedRelationalIndexColumn, error.RelationalIndexColumnNotFound => return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit),
-                else => return err,
+            var shared_session: ?*DB.RelationalReadSession = null;
+            defer if (shared_session) |session| session.deinit();
+            if (comptime @hasDecl(DB.RelationalReadSession, "seekPrefix")) if (alternative_condition) |condition| {
+                var indexes = acquireIndexes(db);
+                defer if (indexes) |*pinned| pinned.deinit();
+                if (indexes) |pinned| for (pinned.plan.boundIndexes()) |index| {
+                    if (cursor.index) |name| if (!std.mem.eql(u8, name, index.name)) continue;
+                    if (index.predicate != null or index.tuple.keys.len == 0) continue;
+                    const leading = index.tuple.keys[0];
+                    if (leading.expression != null or leading.fold_ascii or !std.mem.eql(u8, schema.tableSchema().relational_columns[leading.ordinal].name, conditions.items[condition].column)) continue;
+                    var shared_opts = opts;
+                    const rest = try temporary.alloc(Query.Condition, conditions.items.len - 1);
+                    @memcpy(rest[0..condition], conditions.items[0..condition]);
+                    @memcpy(rest[condition..], conditions.items[condition + 1 ..]);
+                    shared_opts.relational_query.?.conditions = rest;
+                    shared_opts.relational_query.?.index = index.name;
+                    shared_opts.relational_query.?.schema_version = schema.version();
+                    shared_opts.relational_query.?.auto_index = false;
+                    shared_session = db.openRelationalReadSession(temporary, "", "", shared_opts) catch |err| switch (err) {
+                        error.RelationalIndexNotReady, error.IndexNotFound => continue,
+                        else => return err,
+                    };
+                    shared_session.?.reader.now_ns = self.ttl_now_ns;
+                    break;
+                };
             };
-            defer session.deinit();
-            // An unindexed predicate must remain a paged runtime residual,
-            // rather than hiding an unbounded native scan inside one call.
-            if (session.reader.index == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
-            session.reader.now_ns = self.ttl_now_ns;
-            try session.checkpoint();
-            var page = try session.reader.nextPage(temporary, null, .{ .rows = limit, .records = limit, .output_bytes = 16 << 20 });
-            defer page.deinit();
-            if (index_only) {
-                try checkpoint(ptr);
-                return if (page.more or cursor.branch + 1 < alternatives.len) null else page.rows.len;
-            }
+            var branch = cursor.branch;
             var nodes: std.ArrayList(*const v.Node) = .empty;
-            for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) try nodes.append(a, node_value);
-            const next = if (page.more) try std.json.Stringify.valueAlloc(a, PropertyCursor{ .branch = cursor.branch, .schema_version = session.reader.active.version(), .index = session.reader.index.?.name, .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else if (cursor.branch + 1 < alternatives.len)
-                try std.json.Stringify.valueAlloc(a, PropertyCursor{ .branch = cursor.branch + 1, .schema_version = session.reader.active.version(), .index = session.reader.index.?.name }, .{})
-            else
-                null;
-            try checkpoint(ptr);
-            return .{ .items = try nodes.toOwnedSlice(a), .next = next, .examined = page.records_examined };
+            var examined: usize = 0;
+            var count: usize = 0;
+            while (true) {
+                // Reclaim each physical seek's reader/decode state while the
+                // prepared domain, schema and output page remain alive.
+                var seek_scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+                defer seek_scratch.deinit();
+                const seek_a = seek_scratch.allocator();
+                try checkpoint(ptr);
+                if (self.work) |work| try work.charge(work.ptr, 1);
+                if (alternative_condition) |condition| conditions.items[condition].value = try std.json.parseFromSliceLeaky(std.json.Value, seek_a, try std.json.Stringify.valueAlloc(seek_a, alternatives[branch], .{}), .{ .parse_numbers = false });
+                opts.relational_query.?.after = if (branch == cursor.branch) cursor.after else null;
+                const session = shared_session orelse (db.openRelationalReadSession(seek_a, cursor.key orelse "", "", opts) catch |err| switch (err) {
+                    error.InvalidBatchRequest, error.RelationalIndexColumnTypeMismatch, error.UnsupportedRelationalIndexColumn, error.RelationalIndexColumnNotFound => return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit),
+                    else => return err,
+                });
+                defer if (shared_session == null) session.deinit();
+                if (comptime @hasDecl(DB.RelationalReadSession, "seekPrefix")) if (shared_session != null) {
+                    const value = conditions.items[alternative_condition.?].value orelse return error.CypherInvalidBackendPage;
+                    try session.seekPrefix(&.{value}, if (branch == cursor.branch) cursor.after else null);
+                };
+                if (session.reader.index == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
+                session.reader.now_ns = self.ttl_now_ns;
+                try session.checkpoint();
+                var page = try session.reader.nextPage(seek_a, null, .{ .rows = limit - count, .records = limit - examined, .output_bytes = 16 << 20 });
+                defer page.deinit();
+                examined += page.records_examined;
+                count += page.rows.len;
+                if (!index_only) for (page.rows) |row| {
+                    if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) try nodes.append(a, node_value);
+                };
+                const more_branches = alternatives.len != 0 and branch + 1 < alternatives.len;
+                if (!page.more and !more_branches) {
+                    try checkpoint(ptr);
+                    if (index_only) return count;
+                    return .{ .items = try nodes.toOwnedSlice(a), .examined = examined };
+                }
+                if (page.more or examined >= limit or count >= limit) {
+                    if (index_only) return null;
+                    const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .branch = if (page.more) branch else branch + 1, .schema_version = session.reader.active.version(), .index = session.reader.index.?.name, .after = if (page.more) page.next_cursor else null }, .{});
+                    try checkpoint(ptr);
+                    return .{ .items = try nodes.toOwnedSlice(a), .examined = examined, .next = next };
+                }
+                branch += 1;
+            }
         }
 
+        fn getMany(ptr: *anyopaque, a: A, identities: []const v.Identity) ![]const ?*const v.Node {
+            if (identities.len > 128) return error.CypherOwnerBudgetExceeded;
+            const self = cast(ptr);
+            const nodes = try a.alloc(?*const v.Node, identities.len);
+            @memset(nodes, null);
+            if (comptime !@hasDecl(DB, "getCypherDocuments")) {
+                for (identities, nodes) |identity, *out| {
+                    if (self.work) |work| try work.charge(work.ptr, 1);
+                    out.* = try get(ptr, a, identity);
+                }
+                return nodes;
+            }
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            var served: [128]bool = @splat(false);
+            for (identities, 0..) |identity, i| {
+                if (self.work) |work| try work.charge(work.ptr, 1);
+                if (comptime @hasDecl(DB, "cypherDocumentKeyAllowed")) if (!DB.cypherDocumentKeyAllowed(identity.key)) {
+                    served[i] = true;
+                    continue;
+                };
+                _ = try self.selected(identity.table);
+            }
+            for (self.tables) |table| {
+                var keys: [128][]const u8 = undefined;
+                var positions: [128]usize = undefined;
+                var count: usize = 0;
+                for (identities, 0..) |identity, i| if (!served[i] and std.mem.eql(u8, identity.table, table.name)) {
+                    keys[count] = identity.key;
+                    positions[count] = i;
+                    count += 1;
+                    served[i] = true;
+                };
+                if (count == 0) continue;
+                try checkpoint(ptr);
+                const authorization = try self.readAuthorization(temporary, table.name);
+                const opts = try self.scanOptions(temporary, table.db, .{ .include_documents = true, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
+                const documents = try table.db.getCypherDocuments(temporary, keys[0..count], opts, self.ttl_now_ns);
+                defer {
+                    for (documents) |*document| if (document.*) |*value| value.deinit(temporary);
+                    temporary.free(documents);
+                }
+                if (documents.len != count) return error.CypherInvalidBackendPage;
+                for (documents, positions[0..count]) |document, position| {
+                    if (document) |value| nodes[position] = try self.node(a, table.name, identities[position].key, value.json);
+                }
+                try checkpoint(ptr);
+            }
+            return nodes;
+        }
         fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
             const self = cast(ptr);
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
