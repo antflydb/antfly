@@ -144,9 +144,6 @@ with b.managed_server(
                     source_keys = {"id", "bucket"}
                     for hit in response["hits"]["hits"]:
                         assert set(hit["_source"]) == source_keys
-                        if "_type" in source_keys:
-                            assert hit["_source"]["_type"] == "row"
-                            assert hit["_source"]["_id"] == hit["_id"]
                     samples.append(
                         {
                             "case": name,
