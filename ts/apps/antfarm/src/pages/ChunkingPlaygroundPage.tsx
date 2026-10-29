@@ -10,9 +10,10 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -316,7 +317,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
       elements.push(
         <span
           key={`chunk-${chunk.id}`}
-          className={`${CHUNK_COLORS[colorIndex]} rounded-none px-0.5 border`}
+          className={`${CHUNK_COLORS[colorIndex]} rounded-md px-0.5 border`}
           title={`Chunk ${chunk.id}`}
         >
           {inputText.slice(chunk.start_char, chunk.end_char)}
@@ -341,7 +342,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Chunking Playground</DashboardPageTitle>
+          <DashboardPageTitle>Chunking Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Experiment with different chunking models and configurations
           </DashboardPageDescription>
@@ -367,8 +368,8 @@ const ChunkingPlaygroundPage: React.FC = () => {
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-            <div className="space-y-2 col-span-2">
-              <Label htmlFor="model">Model</Label>
+            <Field className="gap-2 col-span-2">
+              <FieldLabel htmlFor="model">Model</FieldLabel>
               <Select
                 value={config.model}
                 onValueChange={(value) => {
@@ -392,13 +393,13 @@ const ChunkingPlaygroundPage: React.FC = () => {
                   )}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
             {/* Basic/Fixed model options */}
             {config.model === "fixed" && (
               <>
-                <div className="space-y-2">
-                  <Label htmlFor="target_tokens">Target Tokens</Label>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="target_tokens">Target Tokens</FieldLabel>
                   <Input
                     id="target_tokens"
                     type="number"
@@ -412,10 +413,10 @@ const ChunkingPlaygroundPage: React.FC = () => {
                       })
                     }
                   />
-                </div>
+                </Field>
 
-                <div className="space-y-2">
-                  <Label htmlFor="overlap_tokens">Overlap Tokens</Label>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="overlap_tokens">Overlap Tokens</FieldLabel>
                   <Input
                     id="overlap_tokens"
                     type="number"
@@ -429,10 +430,10 @@ const ChunkingPlaygroundPage: React.FC = () => {
                       })
                     }
                   />
-                </div>
+                </Field>
 
-                <div className="space-y-2">
-                  <Label htmlFor="separator">Separator</Label>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="separator">Separator</FieldLabel>
                   <Select
                     value={config.separator}
                     onValueChange={(value) => setConfig({ ...config, separator: value })}
@@ -447,20 +448,20 @@ const ChunkingPlaygroundPage: React.FC = () => {
                       <SelectItem value=" ">Word ( )</SelectItem>
                     </SelectContent>
                   </Select>
-                </div>
+                </Field>
               </>
             )}
 
             {/* Semantic (ONNX) model options */}
             {config.model !== "fixed" && (
               <>
-                <div className="space-y-2">
-                  <Label
+                <Field className="gap-2">
+                  <FieldLabel
                     htmlFor="target_tokens"
                     title="Target tokens per chunk. Small chunks are combined until reaching this size. Set to 0 to disable."
                   >
                     Target Tokens
-                  </Label>
+                  </FieldLabel>
                   <Input
                     id="target_tokens"
                     type="number"
@@ -474,15 +475,15 @@ const ChunkingPlaygroundPage: React.FC = () => {
                       })
                     }
                   />
-                </div>
+                </Field>
 
-                <div className="space-y-2">
-                  <Label
+                <Field className="gap-2">
+                  <FieldLabel
                     htmlFor="threshold"
                     title="Minimum confidence score (0-1) for separator detection. Higher values = fewer, stronger boundaries."
                   >
                     Threshold
-                  </Label>
+                  </FieldLabel>
                   <Input
                     id="threshold"
                     type="number"
@@ -497,12 +498,12 @@ const ChunkingPlaygroundPage: React.FC = () => {
                       }
                     }}
                   />
-                </div>
+                </Field>
               </>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="max_chunks">Max Chunks</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="max_chunks">Max Chunks</FieldLabel>
               <Input
                 id="max_chunks"
                 type="number"
@@ -516,7 +517,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
                   })
                 }
               />
-            </div>
+            </Field>
           </div>
           <FormActions>
             <AIWorkflowSubmitButton
@@ -538,7 +539,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
       </Card>
       {/* Error Display */}
       {error && (
-        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -606,7 +607,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
             ) : result ? (
               <div className="h-100 overflow-y-auto space-y-4">
                 {/* Highlighted text view */}
-                <div className="p-3 bg-muted/50 rounded-none border max-h-37.5 overflow-y-auto">
+                <div className="p-3 bg-muted/50 rounded-lg border max-h-37.5 overflow-y-auto">
                   {renderHighlightedText()}
                 </div>
 
@@ -619,7 +620,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
                     return (
                       <div
                         key={chunk.id}
-                        className={`p-3 rounded-none border ${CHUNK_COLORS[colorIndex]}`}
+                        className={`p-3 rounded-lg border ${CHUNK_COLORS[colorIndex]}`}
                       >
                         <div className="flex items-center justify-between mb-2">
                           <span
