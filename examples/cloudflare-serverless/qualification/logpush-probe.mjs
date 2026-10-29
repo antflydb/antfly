@@ -41,7 +41,7 @@ async function openRun(path){
 }
 async function command(run,args,input,{allowExists=false,allowMissing=false}={}){
  let token='';try{token=(await readFile(run.token_file,'utf8')).trim();}catch{}
- const result=await new Promise((ok,bad)=>{const child=spawn(process.execPath,[cli,...args],{cwd,env:{...process.env,WRANGLER_SEND_METRICS:'false',WRANGLER_LOG:'info'},stdio:['pipe','pipe','pipe']});let output='';child.stdout.on('data',p=>output+=p);child.stderr.on('data',p=>output+=p);child.on('error',bad);child.on('close',code=>ok({code,output}));child.stdin.end(input);});
+ const result=await new Promise((ok,bad)=>{const child=spawn(process.execPath,[cli,...args],{cwd,env:{...process.env,WRANGLER_SEND_METRICS:'false',WRANGLER_LOG:'log',WRANGLER_WRITE_LOGS:'false'},stdio:['pipe','pipe','pipe']});let output='';child.stdout.on('data',p=>output+=p);child.stderr.on('data',p=>output+=p);child.on('error',bad);child.on('close',code=>ok({code,output}));child.stdin.end(input);});
  let safe=result.output;if(token)safe=safe.replaceAll(token,'[REDACTED]');safe=safe.replace(/Bearer [A-Za-z0-9._-]+/g,'Bearer [REDACTED]');await appendFile(resolve(run.dir,'lifecycle.log'),safe);
  if(result.code!==0&&!(allowExists&&/already exists/i.test(safe))&&!(allowMissing&&/does not exist|not found|could not find/i.test(safe)))throw Error('TelemetryLifecycleCommandFailed');return safe;
 }
@@ -52,18 +52,25 @@ async function api(run,path,method='GET',body){
 }
 async function verify(run){
  if(!run.bundle_hashes)throw Error('TelemetrySealRequired');
- for(const role of ['source','collector']){const config=await json(resolve(run.dir,role+'.json')),dir=resolve(run.dir,'bundle-'+role);if(dirname(config.main)!==dir||!run.bundle_hashes[role]?.[basename(config.main)])throw Error('TelemetryBundleSelectionChanged');for(const [name,sha]of Object.entries(run.bundle_hashes[role]))if(basename(name)!==name||createHash('sha256').update(await readFile(resolve(dir,name))).digest('hex')!==sha)throw Error('TelemetryBundleChanged');}
+ for(const role of ['source','collector']){const config=await json(resolve(run.dir,role+'.json')),dir=resolve(run.dir,run.bundle_dirs?.[role]??'bundle-'+role);if(dirname(config.main)!==dir||!run.bundle_hashes[role]?.[basename(config.main)])throw Error('TelemetryBundleSelectionChanged');for(const [name,sha]of Object.entries(run.bundle_hashes[role]))if(basename(name)!==name||createHash('sha256').update(await readFile(resolve(dir,name))).digest('hex')!==sha)throw Error('TelemetryBundleChanged');}
 }
 async function collector(run,path,body={}){
  const token=(await readFile(run.token_file,'utf8')).trim(),response=await fetch(new URL(path,run.origin),{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(60000)});const value=await response.json();if(!response.ok)throw Error('TelemetryCollectorStatus'+response.status);return value;
 }
 async function main(){
- const[action,path]=process.argv.slice(2);if(action==='prepare')return prepare(path);if(!['seal','deploy','install-token','create-job','exercise','read','cleanup'].includes(action))throw Error('TelemetryActionInvalid');
+ const[action,path]=process.argv.slice(2);if(action==='prepare')return prepare(path);if(!['seal','revise-collector','deploy','install-token','create-job','exercise','read','cleanup'].includes(action))throw Error('TelemetryActionInvalid');
  const run=await openRun(path);if(run.deleted){if(action==='cleanup')return;throw Error('TelemetryAlreadyDeleted');}const config=role=>resolve(run.dir,role+'.json');
  if(action==='seal'){
   run.bundle_hashes={};for(const role of ['source','collector']){const out=resolve(run.dir,'bundle-'+role);await mkdir(out);await command(run,['deploy','--dry-run','--config',config(role),'--outdir',out]);const hashes={};for(const name of await readdir(out))if(name.endsWith('.js'))hashes[name]=createHash('sha256').update(await readFile(resolve(out,name))).digest('hex');if(Object.keys(hashes).length!==1)throw Error('TelemetryBundleAmbiguous');run.bundle_hashes[role]=hashes;const c=await json(config(role));c.main=resolve(out,Object.keys(hashes)[0]);await save(config(role),c);}await save(path,run);return;
  }
  await verify(run);
+ if(action==='revise-collector'){
+  if(execFileSync('git',['status','--porcelain'],{cwd,encoding:'utf8'}).trim())throw Error('TelemetryCleanSourceRequired');
+  const revision=execFileSync('git',['rev-parse','HEAD'],{cwd,encoding:'utf8'}).trim(),selected='bundle-collector-'+revision.slice(0,12),out=resolve(run.dir,selected),build=resolve(run.dir,'collector-build-'+revision.slice(0,12)+'.json'),c=await json(config('collector'));
+  await mkdir(out);await save(build,{...c,main:resolve(cwd,'qualification/logpush-probe-collector.mjs')});await command(run,['deploy','--dry-run','--config',build,'--outdir',out]);const hashes={};for(const name of await readdir(out))if(name.endsWith('.js'))hashes[name]=createHash('sha256').update(await readFile(resolve(out,name))).digest('hex');if(Object.keys(hashes).length!==1)throw Error('TelemetryBundleAmbiguous');
+  run.bundle_history??=[];run.bundle_history.push({at:Date.now(),source_revision:run.source_revision,bundle_hashes:structuredClone(run.bundle_hashes),bundle_dirs:structuredClone(run.bundle_dirs??{source:'bundle-source',collector:'bundle-collector'}),versions:structuredClone(run.versions)});run.bundle_dirs??={source:'bundle-source',collector:'bundle-collector'};run.bundle_dirs.collector=selected;run.bundle_hashes.collector=hashes;run.source_revision=revision;c.main=resolve(out,Object.keys(hashes)[0]);await save(config('collector'),c);await save(path,run);
+  const output=await command(run,['deploy','--no-bundle','--config',config('collector')]),version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('TelemetryVersionMissing');run.versions.collector=version;await save(path,run);return;
+ }
  if(action==='deploy'){
   await command(run,['r2','bucket','create',run.bucket,'--config',config('collector')],undefined,{allowExists:true});run.versions={};for(const role of ['source','collector']){const output=await command(run,['deploy','--no-bundle','--config',config(role)]);const version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('TelemetryVersionMissing');run.versions[role]=version;if(role==='collector'){run.origin=/https:\/\/[^\s]+\.workers\.dev/.exec(output)?.[0];if(!run.origin||!new URL(run.origin).hostname.startsWith(run.collector+'.'))throw Error('TelemetryOriginMismatch');}await save(path,run);}run.deployed=true;await save(path,run);return;
  }
@@ -80,8 +87,8 @@ async function main(){
  if(action==='cleanup'){
   run.cleanup_steps??={};const step=async(name,fn)=>{if(run.cleanup_steps[name])return;await fn();run.cleanup_steps[name]=true;await save(path,run);};
   if(run.job_id)await step('delete-job',async()=>{let job;try{job=await api(run,'logpush/jobs/'+run.job_id);}catch(error){if(error.status===404)return;throw error;}let filter;try{filter=typeof job.filter==='string'?JSON.parse(job.filter):job.filter;}catch{}if(job.name!==run.id||job.dataset!=='workers_trace_events'||filter?.where?.key!=='ScriptName'||filter.where.operator!=='eq'||filter.where.value!==run.source||Object.keys(filter).length!==1||Object.keys(filter.where).length!==3)throw Error('TelemetryCleanupJobScopeMismatch');try{await api(run,'logpush/jobs/'+run.job_id,'DELETE');}catch(error){if(error.status!==404)throw error;}});
-  await step('delete-source',()=>command(run,['delete','--force','--config',config('source')],undefined,{allowMissing:true}));
   await step('retire-collector',async()=>{const c=await json(config('collector'));c.vars.RETIRE_MODE='true';c.services=[];await save(config('collector'),c);await command(run,['deploy','--no-bundle','--config',config('collector')]);});
+  await step('delete-source',()=>command(run,['delete','--force','--config',config('source')],undefined,{allowMissing:true}));
   await step('quiescence',()=>new Promise(r=>setTimeout(r,31000)));
   await step('drain',async()=>{for(let n=0;n<1000;n++)if((await collector(run,'/drain')).done)return;throw Error('TelemetryDrainBudgetExceeded');});
   await step('delete-bucket',()=>command(run,['r2','bucket','delete',run.bucket,'--config',config('collector')],undefined,{allowMissing:true}));

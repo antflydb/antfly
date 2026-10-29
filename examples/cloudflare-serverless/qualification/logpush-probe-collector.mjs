@@ -62,7 +62,7 @@ export default {async fetch(request,env){
  try{
   if(path==='/ingest'&&request.method==='POST'){
    const bytes=await readBody(request),text=new TextDecoder('utf-8',{fatal:true}).decode(bytes),lines=text.trim().split('\n');
-   if(lines.length===1){let challenge;try{challenge=JSON.parse(text);}catch{}if(challenge?.content==='tests'&&Object.keys(challenge).length===1)return Response.json({validation:true,qualification:false});}
+   if(bytes.length<=4096){let challenge;try{challenge=JSON.parse(text);}catch{}if(challenge?.content==='tests'&&Object.keys(challenge).length===1)return Response.json({validation:true,qualification:false});}
    if(lines.length>1000)fail('TelemetryRecordBudgetExceeded');
    const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=JSON.parse(line);}catch{fail('TelemetryJsonInvalid');}rows.push(await sanitizeLogpushProbe(row,env.SOURCE_WORKER));}
    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');
@@ -80,5 +80,5 @@ export default {async fetch(request,env){
   }
   if(path==='/drain'&&request.method==='POST'){const page=await env.LOGS.list({prefix,limit:1000});if(page.objects.length)await env.LOGS.delete(page.objects.map(o=>o.key));return Response.json({deleted:page.objects.length,done:page.objects.length===0});}
   return new Response('not found',{status:404});
- }catch(error){const code=/^Telemetry[A-Za-z]+$/.test(error?.message??'')?error.message:'TelemetryIngestionFailed';return Response.json({error:code},{status:code.includes('Exceeded')?413:code==='TelemetryIngestionFailed'?503:400});}
+ }catch(error){const code=/^Telemetry[A-Za-z]+$/.test(error?.message??'')?error.message:'TelemetryIngestionFailed';if(path==='/ingest'){try{await env.LOGS.put(prefix+'rejections/'+crypto.randomUUID()+'.json',JSON.stringify({schema:1,qualification:false,rejection:code,encoding:['gzip','identity'].includes(request.headers.get('Content-Encoding'))?request.headers.get('Content-Encoding'):request.headers.has('Content-Encoding')?'other':'absent'}));}catch{}}return Response.json({error:code},{status:code.includes('Exceeded')?413:code==='TelemetryIngestionFailed'?503:400});}
 }};
