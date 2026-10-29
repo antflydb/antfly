@@ -179,10 +179,9 @@ node qualification/telemetry-capabilities.mjs \
   --out=dist/qualification/telemetry-capability-new-run
 ```
 
-Both documented endpoint probes return HTTP 403/code 10000 with the current
-credential. A private file path with Account Logs Read/Edit permissions, or
-an existing unsampled export's details, is required to inspect/prepare that
-next step. The probe never logs destination URLs, provider error text or
+At that checkpoint, both documented endpoint probes returned HTTP 403/code
+10000. That historical permission failure is preserved; the later token update
+below resolves it. The probe never logs destination URLs, provider error text or
 credentials. Missing source identities, sampled totals and unproven quiet-role
 zeroes remain qualification failures; neither sibling populations nor matching
 estimates substitute for provider completeness evidence.
@@ -223,3 +222,54 @@ RPC and gzip ingestion. The next live step is to validate the platform's actual
 terminal record/identity schema and delivery settlement, then decide whether
 it satisfies the original completeness requirements. No sampled estimate or
 application marker alone is a replacement for independent platform evidence.
+
+## Live delivery findings and readiness contract
+
+The isolated `logpush-probe-mvtussmv84e4` deploys two disposable Workers, one
+Durable Object namespace and one R2 bucket; it never deploys the six reserved
+database trials. The account credential remains local and is used only for
+Cloudflare API calls. Only a freshly generated disposable collector key is
+installed on the collector and used as the job's destination authentication.
+
+The live HTTP validation fixture is gzip `{"content":"test"}`, whereas the
+[HTTP destination documentation](https://developers.cloudflare.com/logs/logpush/logpush-job/enable-destinations/http/)
+specifies `{"content":"tests"}`. Both exact one-property fixtures are now
+accepted, including multiline JSON. Other source-less records are rejected;
+fixed rejection codes and bounded schema classifications are retained without
+raw payloads. Each collector revision preserves its preceding bundle hashes,
+configuration selection and version; old captures remain unchanged.
+
+Job `1999320` is filtered to the exact source Worker and reports sample rate 1.
+The source settings independently confirm `logpush: true`. A subsequent update
+sets the documented maximum batch interval to 30 seconds. The first startup
+population has not appeared in the captured records. Two later eight-call
+populations each delivered all eight fetches, eight `worker_rpc` terminal
+records and eight late `waitUntil` markers. One ran with caller Logpush disabled;
+the other ran with it enabled as an explicit diagnostic. The caller remains
+excluded by the verified source-only filter. This does not establish a causal
+caller-setting effect or complete delivery for all populations.
+
+The observed schema requires normalization independently of realtime tail
+JSON. The collector accepts explicit Pascal-case and ID acronym aliases,
+persists only whitelisted schema keys and hashed identity candidates, and
+records an immutable arrival timestamp on new batches. Missing platform
+identities or versions remain missing; fixture UUIDs prove fixture correlation,
+not an independent provider invocation identity. Early captures made before
+these schema observations are preserved and are not retroactively repaired.
+
+Read-only job status deliberately excludes destination URLs and provider error
+messages. Official `logpushHealthAdaptiveGroups` counters retain their sampling
+metadata and exact time bounds. The existing Wrangler credential can query
+that account dataset; the Logs-only credential cannot. An empty health result
+is inconclusive. A later analytics rate-limit response is retained, with its
+requested five-minute cooldown honored. Neither condition is interpreted as
+zero dropped events or successful settlement.
+
+Before any measured gate interval, the export must complete a separate
+readiness population and reconcile both fetch and RPC records, source versions,
+late markers and independent delivery counters. Enabling a job or waiting a
+fixed delay is insufficient. Every measurement population must then settle and
+reconcile independently, including quiet roles and recovered resource failures.
+No hour-long or physical-cold population is spent while that contract remains
+unproven. Numeric thresholds, native modules and the approved control are
+unchanged.
