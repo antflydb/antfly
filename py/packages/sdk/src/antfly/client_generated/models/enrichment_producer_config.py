@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.constrained_generator_producer_config import ConstrainedGeneratorProducerConfig
+    from ..models.document_extraction_config import DocumentExtractionConfig
     from ..models.enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
     from ..models.generated_extractor_config import GeneratedExtractorConfig
     from ..models.media_output_config import MediaOutputConfig
@@ -24,15 +25,16 @@ class EnrichmentProducerConfig:
     """
     Attributes:
         type_ (EnrichmentProducerConfigType):
-        config (ConstrainedGeneratorProducerConfig | EnrichmentProducerConfigConfigType2 | GeneratedExtractorConfig |
-            MediaOutputConfig | Unset | VectorLabelsConfig): Producer-specific configuration. Generator schemas and
-            generated extractors share constrained output admission, batching, validation retry, and immutable artifact
-            replay.
+        config (ConstrainedGeneratorProducerConfig | DocumentExtractionConfig | EnrichmentProducerConfigConfigType2 |
+            GeneratedExtractorConfig | MediaOutputConfig | Unset | VectorLabelsConfig): Producer-specific configuration.
+            Generator schemas and generated extractors share constrained output admission, batching, validation retry, and
+            immutable artifact replay.
     """
 
     type_: EnrichmentProducerConfigType
     config: (
         ConstrainedGeneratorProducerConfig
+        | DocumentExtractionConfig
         | EnrichmentProducerConfigConfigType2
         | GeneratedExtractorConfig
         | MediaOutputConfig
@@ -44,6 +46,7 @@ class EnrichmentProducerConfig:
         from ..models.constrained_generator_producer_config import ConstrainedGeneratorProducerConfig
         from ..models.enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
         from ..models.generated_extractor_config import GeneratedExtractorConfig
+        from ..models.media_output_config import MediaOutputConfig
         from ..models.vector_labels_config import VectorLabelsConfig
 
         type_ = self.type_.value
@@ -58,6 +61,8 @@ class EnrichmentProducerConfig:
         elif isinstance(self.config, EnrichmentProducerConfigConfigType2):
             config = self.config.to_dict()
         elif isinstance(self.config, VectorLabelsConfig):
+            config = self.config.to_dict()
+        elif isinstance(self.config, MediaOutputConfig):
             config = self.config.to_dict()
         else:
             config = self.config.to_dict()
@@ -77,6 +82,7 @@ class EnrichmentProducerConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.constrained_generator_producer_config import ConstrainedGeneratorProducerConfig
+        from ..models.document_extraction_config import DocumentExtractionConfig
         from ..models.enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
         from ..models.generated_extractor_config import GeneratedExtractorConfig
         from ..models.media_output_config import MediaOutputConfig
@@ -89,6 +95,7 @@ class EnrichmentProducerConfig:
             data: object,
         ) -> (
             ConstrainedGeneratorProducerConfig
+            | DocumentExtractionConfig
             | EnrichmentProducerConfigConfigType2
             | GeneratedExtractorConfig
             | MediaOutputConfig
@@ -129,11 +136,19 @@ class EnrichmentProducerConfig:
                 return config_type_3
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                config_type_4 = MediaOutputConfig.from_dict(data)
+
+                return config_type_4
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            config_type_4 = MediaOutputConfig.from_dict(data)
+            config_type_5 = DocumentExtractionConfig.from_dict(data)
 
-            return config_type_4
+            return config_type_5
 
         config = _parse_config(d.pop("config", UNSET))
 

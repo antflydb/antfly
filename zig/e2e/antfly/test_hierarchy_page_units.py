@@ -69,7 +69,6 @@ def test_page_unit_cursor_survives_reopen_and_fences_source_changes(storage_engi
                                     "content_type_field": "mime_type",
                                     "version_field": "version",
                                 },
-                                "ocr_fallback": False,
                             },
                         }
                     ),

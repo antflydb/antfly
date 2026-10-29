@@ -1988,7 +1988,7 @@ test "table contract accepts the transcriber enrichment shorthand" {
     // document plus a JSON content type, so nothing downstream sees it.
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"transcriber\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"content_type\":\"application/json\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\",\\\"config\\\":{\\\"transcription\\\":{\\\"enabled\\\":true,\\\"config\\\":{\\\"provider\\\":\\\"antfly\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\",\\\"config\\\":{\\\"transcription\\\":{\\\"transcriber\\\":{\\\"provider\\\":\\\"antfly\\\"") != null);
 
     var table_req = try parseCreateTableRequest(
         std.testing.allocator,

@@ -1,7 +1,7 @@
 # Laya validation, resident Metal, and training measurements
 
 > Historical record: validation recipes and measurements split out of the
-> [Laya guide](../../../../guides/laya.md) as of 2026-10-12.
+> [Laya guide](../../../../guides/models/laya.md) as of 2026-10-12.
 
 ## Reference validation
 

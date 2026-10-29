@@ -72,8 +72,8 @@ EmbeddingGemma 2 can answer `choice` and `multi_choice` questions on
 a description or a few examples, and the answer reports cosine similarities and
 a margin. Scores are similarities, not probabilities; set `min_similarity`,
 `min_margin`, or `similarity_thresholds` from your own evaluation. See
-[Typed Decisions](../reference/decisions.md) for the request format, batches, and
+[Typed Decisions](../../reference/decisions.md) for the request format, batches, and
 SQL use.
 
 Qualification evidence and benchmarks are in the
-[EmbeddingGemma 2 history](../design/inference/history/embeddinggemma2/README.md).
+[EmbeddingGemma 2 history](../../design/inference/history/embeddinggemma2/README.md).

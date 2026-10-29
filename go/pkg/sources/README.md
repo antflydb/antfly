@@ -208,15 +208,35 @@ exclusive key range, so reconciling one source cannot remove another source's
 records or unrelated application keys. Hosted deployments still reserve source
 tables to protect their ACL markers.
 
-The writer first queries normalized metadata, preserving `indexed_at` only when
-all canonical fields and the content digest are unchanged. Volatile enumeration
-positions are excluded. Non-destructive LinearMerge pages compare canonical
-content hashes and skip unchanged rows. Every page must pass the shared snapshot
-readiness barrier. Only a fully verified authoritative inventory can issue the
-final bounded cleanup, retaining its verified IDs without uploading their text a
-second time. Partial selections, failed reads, and repair retries never reconcile
-missing rows. Provider access/absence checks precede cleanup, and a fresh query
-proves the range contains no extra records before catalog publication.
+The writer first queries a bounded list of document identities using
+`{"query":{"doc_id":{"ids":["DOCUMENT_KEY"]}}}` and requires a successful fresh
+snapshot. It compares the complete normalized projection and content digest,
+including the outer ownership/filtering fields. Identical rows are verified
+without issuing a content merge, and keep their original `indexed_at`. Input
+text must match its normalized SHA-256 digest. Volatile enumeration positions
+are excluded. Mixed pages merge only the changed rows, with deletion disabled;
+those rows must pass the shared snapshot readiness barrier.
+
+Only a fully verified authoritative inventory can reconcile missing rows.
+After provider access/absence checks, a bounded fresh range query proves whether
+there are extra records. A clean range rechecks retained IDs in bounded fresh queries and finishes without a cleanup merge;
+otherwise the final scoped merge retains all verified IDs and a fresh query
+proves that cleanup is visible. Thus an unchanged sync sends no content or
+cleanup merges. Partial selections, failed reads and failed writes never
+reconcile missing rows. No-op results include verified rows in `Skipped`, with
+no mutation cursor or range acknowledgement.
+
+Read-only data-plane GETs and POST queries retry transient transport failures
+and HTTP 408/425/429/500/502/503/504 up to three total attempts, within a shared
+30-second budget or the caller's earlier deadline. Backoff is cancellable and
+honors a supported `Retry-After`; a cooldown longer than the remaining budget
+returns the error immediately. Batch, table creation and scoped merges are never
+blindly retried. An ambiguous or invalid merge acknowledgement closes that
+writer to further mutation or cleanup. Resume the durable source run: its
+ownership journal and pinned inventory survive, and a new writer uses fresh
+visibility proofs before deciding which rows or range still need work. A
+committed write or cleanup whose acknowledgement was lost is therefore not
+replayed just to obtain another acknowledgement.
 
 The existing `/tables/{table}/merge` endpoint accepts the versioned
 `application/vnd.antfly.scoped-merge.v1+json` envelope (`scoped_merge` with explicit

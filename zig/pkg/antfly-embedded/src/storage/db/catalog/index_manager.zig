@@ -40145,13 +40145,13 @@ test "asset registration validates document extraction OCR config" {
         .name = "document_units",
         .kind = .asset,
         .source_field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"render\":{\"dpi\":20},\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     }));
     try manager.validateEnrichmentConfig(.{
         .name = "document_units",
         .kind = .asset,
         .source_field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":150,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"render\":{\"dpi\":150},\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     });
 }
 

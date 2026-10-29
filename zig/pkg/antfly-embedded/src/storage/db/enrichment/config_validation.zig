@@ -205,7 +205,7 @@ pub fn transcriberShorthandProducerJsonAlloc(alloc: Allocator, transcriber: std.
     return try std.json.Stringify.valueAlloc(alloc, .{
         .type = "document_extraction",
         .config = .{
-            .transcription = .{ .enabled = true, .config = transcriber },
+            .transcription = .{ .transcriber = transcriber },
         },
     }, .{});
 }
@@ -219,7 +219,7 @@ test "transcriber shorthand expands to a document extraction producer" {
     const producer_json = try transcriberShorthandProducerJsonAlloc(alloc, parsed.value);
     defer alloc.free(producer_json);
     try std.testing.expectEqualStrings(
-        "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
+        "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"transcriber\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
         producer_json,
     );
     // The expansion is accepted by the same admission check as a hand-written producer.
@@ -249,7 +249,7 @@ test "public enrichment validation rejects invalid execution and producer config
         .name = "units",
         .kind = .asset,
         .field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"render\":{\"dpi\":20},\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     }));
     try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
         .name = "chunks",

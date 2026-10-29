@@ -41,7 +41,9 @@ uv run --project examples/hackernews python examples/hackernews/cloud_plan.py \
   --output /private/tmp/hn-management management
 ```
 
-The plan contains a single-mode pinned instance (1 CPU/4 GiB/20 GiB initial sample,
+The plan uses Standard because Starter forbids custom capacity. Standard has a
+monthly package floor even for a small instance; review the live credit estimate
+before creation. The plan contains a single-mode pinned instance (1 CPU/4 GiB/20 GiB initial sample,
 not archive sizing), GCS provider selectors and scoped server-owned keys. Create
 the instance through Cloud's management API after reviewing credits/capacity.
 Artifact placement uses the same nested name as Antfly's engine configuration:

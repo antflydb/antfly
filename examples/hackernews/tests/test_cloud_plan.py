@@ -59,6 +59,9 @@ def test_separate_object_tables_and_scoped_cloud_keys():
 
 def test_first_boot_uses_exact_rc6_and_rejects_stale_or_unverified_images():
     request = management_plan("antfly-showcases")["create-instance.json"]
+    assert (
+        request["tier"] == "standard"
+    )  # Starter forbids the supplied custom capacity.
     assert request["initial_runtime"] == {
         "version": "v0.3.0-rc.6",
         "image": RUNTIME["image"],

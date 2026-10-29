@@ -58,7 +58,7 @@ def management_plan(project, image=None):
             "name": "Hacker News",
             "slug": "hackernews",
             "region": "us-central1",
-            "tier": "starter",
+            "tier": "standard",
             "mode": "single",
             "version_policy": "pinned",
             "node_config": {"cpu": "1000m", "memory": "4Gi", "data_storage": "20Gi"},

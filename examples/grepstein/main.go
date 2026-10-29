@@ -22,7 +22,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: grepstein stage-originals|fetch|fetch-archive|prepare-small|prepare|publish|load|enrich|wait|graph|grep|cloud-jobs|stats|explore|datasets")
+		fmt.Fprintln(os.Stderr, "usage: grepstein stage-originals|fetch|fetch-archive|prepare-small|prepare|publish|load|enrich|wait|qualify|graph|grep|cloud-jobs|stats|explore|datasets")
 		os.Exit(2)
 	}
 	var err error
@@ -31,6 +31,8 @@ func main() {
 		err = stageOriginalsCmd(os.Args[2:])
 	case "fetch-archive":
 		err = fetchArchiveCmd(os.Args[2:])
+	case "qualify":
+		err = qualifyCmd(os.Args[2:])
 	case "wait":
 		err = waitCmd(os.Args[2:])
 	case "cloud-jobs":

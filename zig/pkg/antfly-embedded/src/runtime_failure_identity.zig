@@ -30,6 +30,12 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
+    .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
+    .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },
+    .{ .status = .gcs_connection_not_found_or_out_of_scope, .err = error.GcsConnectionNotFoundOrOutOfScope },
+    .{ .status = .ambiguous_gcs_connection, .err = error.AmbiguousGcsConnection },
+    .{ .status = .invalid_connection_credentials, .err = error.InvalidConnectionCredentials },
     .{ .status = .hierarchy_cursor_stale, .err = error.HierarchyCursorStale },
     .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
     .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
@@ -1211,4 +1217,13 @@ test "document job failures retain distinct semantic identities at the compiled 
     try std.testing.expectEqual(@as(u32, 840), @backingInt(statusFromError(error.TooManyActiveJobs)));
     try std.testing.expectError(error.InvalidDocumentCheckpoint, statusToError(.invalid_document_checkpoint));
     try std.testing.expectError(error.TooManyActiveJobs, statusToError(.too_many_active_jobs));
+}
+
+test "reader failures and scoped GCS failures retain exact storage boundary identity" {
+    inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 4);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(expected, statusToError(failure.status));
+    }
 }
