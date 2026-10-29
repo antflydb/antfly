@@ -4401,27 +4401,50 @@ results, work/anchor ceilings and bounded memory independently.
 ### Bounded sparse native seeks and correlated lookup batches
 
 Certified property membership domains retain one deduplicated statement-local
-list (up to 4,096 values). Stateless continuations select at most 128 values per
-owner request, retaining the window offset and native cursor rather than copying
-the complete domain into every request. Windows belong to physical owners;
-coordinator channels retain the full domain until every shard completes. This
-keeps mixed indexed/primary shards from truncating or duplicating each other's
-domains. Native pages consume multiple equality
-branches within their row/work demand. Supported leading-column scalar indexes
-reuse one captured typed session, schema, policy and projection plan while a
-reclaimable reader arena resets the equality prefix between branches. Composite
-suffixes, direction, continuation identity, TTL and captured scalar catalogs use
-the existing reader encoding and visibility rules. Other usable index shapes
-retain independent bounded seeks.
+list (up to 4,096 values). The first physical-owner request includes every
+predicate hint. Normally it includes the complete domains. If that would exceed
+the 1 MiB graph packet ceiling, a bounded planning handoff instead carries each
+large certified domain's length, maximum string byte length, and three cost
+samples. The client counts encoded bytes without allocating the full packet,
+including projection names; the first planning call passes with a 256 KiB scratch
+ceiling. No partitioned query rows escape that handoff. The owner compares
+usable IN prefixes and the SQL planner's ordinary
+fixed-predicate access path before emitting rows. Bounded samples examine at most
+three branches and eight records per branch, with at most four indexes per domain
+and 32 IN plans. This is bounded approximate costing, not exhaustive optimization.
+Fixed equalities may precede the varying IN component in a composite prefix;
+partial indexes must independently prove their predicate from fixed conditions.
+An unusable IN hint does not discard a selective equality or range access path.
+Large integer equality on DOUBLE remains indexed when the integer round-trips
+exactly through binary64. Its SQL bound retains binary64 semantics; an inexact
+integer remains residual without poisoning other selective conditions.
+Empty domains return without scanning, independently of the schema scalar type.
+
+A sampled string domain validates the actual fixed prefix plus a worst-case
+NUL-escaped string bound before any indexed emission. Numeric certificates retain
+the complete-domain DOUBLE compatibility proof. Unsupported hosts pin one primary
+scan rather than treating samples as the domain. This preserves the original
+paged transport envelope for large computed string domains.
+
+The continuation pins the captured index, schema and selected domain. Subsequent
+physical-owner requests send at most 128 values from that domain, retaining the
+global offset and native cursor. A chosen fixed-predicate path may omit unused IN
+hints from subsequent owner requests; the runtime retains the authoritative full
+Cypher predicate. Coordinator channels leave leaf continuations opaque until
+every shard completes. This prevents mixed indexed/primary shards and alternate
+access paths from truncating or duplicating results. Native pages consume multiple
+equality branches within row/work demand and reuse one captured typed session,
+schema, policy and projection plan. Reader arenas reclaim bounds between branches.
+Composite suffixes, direction, TTL and catalog generations retain SQL visibility.
 
 The domain certificate describes the complete original list, including integers
-outside DOUBLE's exact range. Owners decide type compatibility before the first
-indexed window; an incompatible or unsupported list scans the primary source
-once. Its continuation stays in that fallback until completion. Unproved/mixed
-lists retain residual evaluation. An owner cannot switch a later indexed window
-to primary scanning and duplicate rows from earlier windows. Native seek work is
-charged per physical branch; no owner-side domain cache or cross-request lease
-is introduced.
+outside DOUBLE's exact range. Before first emission, the owner validates every
+bound of a complete chosen domain, or its conservative global bound proof after
+a sampled handoff. Incompatible or oversized bounds decline that plan
+before any rows escape; other usable access paths remain candidates. Primary
+fallback stays primary until completion. Unproved lists retain bounded null
+removal/deduplication and residual evaluation. Native seek and costing work are
+charged; no owner-side domain cache or cross-request lease is introduced.
 
 Native `get_many` now groups the bounded input by physical table and shares its
 read authorization, captured transaction, schema and projection plan. Relational
@@ -4436,9 +4459,16 @@ aligned with the input, including duplicate, missing, hidden and invalid identit
 each batch; output owns its bytes independently of temporary readers.
 
 Full consumers of `UNWIND ... MATCH` can prefetch deterministic row-bound property
-equalities in bounded windows. A strict bounded candidate estimate prevents
-speculative materialization of a corpus or large nonunique fanout. A quota-owned
-cache retains only matching candidates and replays each equality bucket in
+equalities in bounded windows. A conditional indexed probe fetches candidates and
+proves exact EOF in one operation, capped at 128 records plus one overflow witness.
+Unindexed paths decline without a corpus scan. Each leaf has a 1 MiB probe quota;
+the coordinator has a 2 MiB aggregate quota and proves completion across trailing
+empty owners. Transport scratch uses the statement budget independently of the
+optional cache quota, so owner work is consumed before cache admission can decline. Unsupported hosts retain the estimate/fetch compatibility path.
+Incomplete or quota-declined probes are advisory work: owner work remains charged,
+but their results supply no bindings or logical anchors. Admission completes only
+after the full candidate cache and encounter-order index fit. A quota-owned cache
+retains only matching candidates and replays each equality bucket in
 native encounter order for the original outer inputs. Duplicate outer bindings,
 nonunique properties, OPTIONAL null extension and sequential aggregates retain
 their ordinary semantics. The original MATCH predicate remains authoritative.
@@ -4484,9 +4514,9 @@ binary produced the following local medians (three warmups, seven samples):
 | Correlated property equality, 400 inputs | 20.055 ms | 11.694 ms |
 | Document-key point lookup | 0.984 ms | 0.996 ms |
 
-The correlated case charges 38,014 states versus the earlier 19,206: its strict
-bounded index proof and candidate fetch perform separate reads, while bounded
-bulk requests replace individual owner probes. The earlier timing campaign was
+Before conditional probes, the correlated case charged 38,014 states versus
+the earlier 19,206: its bounded index proof and candidate fetch performed
+separate reads, while bulk requests replaced individual owner probes. The earlier timing campaign was
 noisy under concurrent compilation, so these separate-run medians are diagnostic
 observations, not controlled latency guarantees. Exact sums, work ceilings,
 128/256/257/400 membership boundaries, incompatible-domain primary fallback,
@@ -4509,6 +4539,42 @@ storage compilation contracts, 17 build-wrapper tests, 210 PR/CI contracts and
 five SDK CI contracts. The temporary source-guard diagnostics are removed from
 the implementation.
 
+Follow-up qualification for owner-selected access paths and conditional probes
+passes 504 optimized core tests, the independent callback ABI contract, and five
+native retained-cut/SQL integration tests across 58 build steps with no leaks.
+The new native fixture uses 2,000 rows and competing indexes, verifies selective
+one/two-anchor plans in both predicate orders, checks empty/null membership, proves
+probe EOF at an exact budget, preserves owner work failures, and resumes all 400
+original values after a sampled planning handoff. Wire tests keep 400 long string
+values within the existing 1 MiB packet ceiling and pin unsupported-host fallback
+to its primary cursor.
+
+Authenticated HTTP follow-up passes all reproduced failures with strict anchor
+ceilings: competing bucket-IN/id-EQ scans fall from 2,000 anchors to one; either
+ordering of selective id-IN and broad bucket-IN visits two; empty/null domains
+visit zero; an unknown IN property preserves the one-anchor id equality path.
+The 1,000-input correlated query returns the exact sum 499,500 with 1,000 anchors
+and 93,045 states versus the earlier 95,038 states. Its initial local time was
+25.125 ms versus the earlier 34.954 ms. The full authenticated property-plan and
+SQL-overlay regression, including lossless large-DOUBLE equality, passes in
+24.02 seconds.
+
+A subsequent warmed run uses three warmups and seven samples per case:
+
+| Query | Previous batched median | Owner-planned/probe median |
+| --- | ---: | ---: |
+| Property membership, 256 values | 5.900 ms | 6.156 ms |
+| Property membership, 400 values | 8.746 ms | 10.332 ms |
+| Document-key membership, 400 values | 7.070 ms | 7.335 ms |
+| Correlated property equality, 400 inputs | 11.694 ms | 9.633 ms |
+| Document-key point lookup | 0.996 ms | 0.921 ms |
+
+These are diagnostic local observations under background compilation, not a
+controlled latency comparison. Membership retains its exact anchor ceilings;
+the 256-value case charges 16,914 states (previously 16,913), and the 400-input
+correlated case charges 37,221 (previously 38,014). Full-domain bound validation
+precedes indexed emission, preserving correctness when a later key is oversized.
+
 The distributed enrichment caveat above remains open. Two combined public
 campaigns passed 19 cases but the owner-loss case ended with a durable
 `committed_repair_required` receipt; all three data owners exhausted retries on
@@ -4521,3 +4587,8 @@ producer-input generation comparison; no publication fence, retry-safety rule,
 test assertion or deadline was weakened. This is not a completely green public
 campaign, and its underlying catalog/enrichment recovery cause still requires
 diagnosis.
+
+
+The SQL staged graph view also forwards `get_many` to its transaction overlay.
+Mixed staged, deleted, missing, duplicate and untouched identities retain input
+alignment while untouched identities share one bounded owner request.

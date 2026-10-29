@@ -6767,7 +6767,7 @@ const Engine = struct {
             if (independentExpressions(operation, fold.middle[index].operation.unwind.alias)) return false;
             if (operation.paths.len != 1 or operation.paths[0].nodes.len != 1 or operation.paths[0].edges.len != 0) return false;
             const pattern = operation.paths[0].nodes[0];
-            return pattern.alias != null and pattern.labels.len == 1 and lookup(row, pattern.alias.?) == null and engine.backend.vtable.scan_where != null and engine.backend.vtable.estimate_where != null;
+            return pattern.alias != null and pattern.labels.len == 1 and lookup(row, pattern.alias.?) == null and engine.backend.vtable.scan_where != null and (engine.backend.vtable.estimate_where != null or engine.backend.vtable.probe_where != null);
         }
         fn batchedUnwindMatch(fold: *@This(), engine: *Engine, row: Row, index: usize, unwind: @FieldType(@FieldType(ast.Clause, "operation"), "unwind"), original: ListSource) anyerror!bool {
             // Full consumers license bounded lookahead. Row goals, pattern
@@ -6777,7 +6777,7 @@ const Engine = struct {
             if (operation.paths.len != 1 or operation.paths[0].nodes.len != 1 or operation.paths[0].edges.len != 0) return false;
             const pattern = operation.paths[0].nodes[0];
             if (pattern.alias == null or pattern.labels.len != 1 or lookup(row, pattern.alias.?) != null) return false;
-            if (engine.backend.vtable.scan_where == null or engine.backend.vtable.estimate_where == null) return false;
+            if (engine.backend.vtable.scan_where == null or (engine.backend.vtable.estimate_where == null and engine.backend.vtable.probe_where == null)) return false;
             var source = original;
             while (true) {
                 // Leave one slot for a strict bounded population proof.
@@ -6793,8 +6793,9 @@ const Engine = struct {
                     if (err == error.OutOfMemory and batch.budget.exhausted) break :declined false;
                     return err;
                 };
-                // Physical rows not replayed from a successful cache, or all
-                // work from a declined cache, still consume the anchor quota.
+                // Charge discarded physical rows from admitted caches and
+                // ordinary fetches. Declined advisory probes leave examined
+                // zero; their owner work has already been charged.
                 const debt = if (prepared) examined - batch.rows.items.len else examined;
                 if (debt > engine.limits.scanned_anchors -| engine.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 engine.stats.scanned_anchors += debt;
@@ -6863,42 +6864,79 @@ const Engine = struct {
             // has been emitted, and an unsupported proof declines normally.
             const maximum = @min(128, engine.limits.scanned_anchors -| engine.stats.scanned_anchors);
             if (maximum == 0) return false;
-            const proof = try engine.backend.vtable.estimate_where.?(engine.backend.ptr, a, batch.table, &.{filter}, maximum + 1);
-            const upper = proof orelse return false;
-            // Estimates can saturate at their requested limit. Only a strict
-            // bound fits this cache; it never supplies query rows or EOF.
-            if (upper > maximum) return false;
-            var after: ?[]const u8 = null;
-            while (true) {
+            var fused = false;
+            var fused_examined: usize = 0;
+            if (engine.backend.vtable.probe_where) |probe_where| {
                 try engine.state();
-                const remaining = maximum - examined.*;
-                // A distributed cursor can still name trailing empty owners
-                // after consuming its exact record allowance. An empty EOF
-                // probe consumes work but no anchors. Every observed record,
-                // including one that makes the cache decline, stays charged.
-                const page_limit = @max(1, remaining);
-                var page_scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
-                defer page_scratch.deinit();
-                const page = try engine.backend.vtable.scan_where.?(engine.backend.ptr, page_scratch.allocator(), batch.table, &.{filter}, after, page_limit);
-                const used = page.examined orelse page.items.len;
-                if (used < page.items.len or used > page_limit) return error.CypherInvalidBackendPage;
-                examined.* += used;
-                if (examined.* > maximum) return false;
-                if (page.unfiltered) return false;
-                for (page.items) |node| {
-                    const key = (v.Value{ .node = node }).property(batch.property.?);
-                    var candidate = batch.domain.head((try engine.values.info(key)).hash);
-                    while (candidate) |position| {
-                        const link = batch.domain.links.items[position];
-                        if (try engine.values.eql(batch.keys[link.index], key)) {
-                            try batch.captureRows(engine, &.{node});
-                            break;
+                // Keep transport and owner scratch outside the optional cache
+                // quota. Consume the reply's work before cache admission can
+                // decline, so a quota fallback cannot refund remote reads.
+                var probe_scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                defer probe_scratch.deinit();
+                if (try probe_where(engine.backend.ptr, probe_scratch.allocator(), batch.table, &.{filter}, maximum)) |result| {
+                    // A declined probe is advisory work, not a query binding.
+                    // Its owner meter remains charged even on quota decline.
+                    if (!result.complete) return false;
+                    const page = result.page;
+                    const used = page.examined orelse page.items.len;
+                    if (page.next != null or page.unfiltered or used < page.items.len or used > maximum) return error.CypherInvalidBackendPage;
+                    for (page.items) |node| {
+                        const key = (v.Value{ .node = node }).property(batch.property.?);
+                        var candidate = batch.domain.head((try engine.values.info(key)).hash);
+                        while (candidate) |position| {
+                            const link = batch.domain.links.items[position];
+                            if (try engine.values.eql(batch.keys[link.index], key)) {
+                                try batch.captureRows(engine, &.{node});
+                                break;
+                            }
+                            candidate = link.next;
                         }
-                        candidate = link.next;
                     }
+                    // Admission is atomic. A cache quota decline before this
+                    // point cannot manufacture an anchor debt for costing.
+                    fused_examined = used;
+                    fused = true;
                 }
-                after = if (page.next) |next| try a.dupe(u8, next) else null;
-                if (after == null) break;
+            }
+            if (!fused) {
+                const estimate = engine.backend.vtable.estimate_where orelse return false;
+                const proof = try estimate(engine.backend.ptr, a, batch.table, &.{filter}, maximum + 1);
+                const upper = proof orelse return false;
+                // Estimates can saturate at their requested limit. Only a strict
+                // bound fits this cache; it never supplies query rows or EOF.
+                if (upper > maximum) return false;
+                var after: ?[]const u8 = null;
+                while (true) {
+                    try engine.state();
+                    const remaining = maximum - examined.*;
+                    // A distributed cursor can still name trailing empty owners
+                    // after consuming its exact record allowance. An empty EOF
+                    // probe consumes work but no anchors. Every observed record,
+                    // including one that makes the cache decline, stays charged.
+                    const page_limit = @max(1, remaining);
+                    var page_scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                    defer page_scratch.deinit();
+                    const page = try engine.backend.vtable.scan_where.?(engine.backend.ptr, page_scratch.allocator(), batch.table, &.{filter}, after, page_limit);
+                    const used = page.examined orelse page.items.len;
+                    if (used < page.items.len or used > page_limit) return error.CypherInvalidBackendPage;
+                    examined.* += used;
+                    if (examined.* > maximum) return false;
+                    if (page.unfiltered) return false;
+                    for (page.items) |node| {
+                        const key = (v.Value{ .node = node }).property(batch.property.?);
+                        var candidate = batch.domain.head((try engine.values.info(key)).hash);
+                        while (candidate) |position| {
+                            const link = batch.domain.links.items[position];
+                            if (try engine.values.eql(batch.keys[link.index], key)) {
+                                try batch.captureRows(engine, &.{node});
+                                break;
+                            }
+                            candidate = link.next;
+                        }
+                    }
+                    after = if (page.next) |next| try a.dupe(u8, next) else null;
+                    if (after == null) break;
+                }
             }
             // Hash chains prepend. Rebuild from the end so each equality
             // bucket retains the native encounter order for COLLECT and
@@ -6909,6 +6947,7 @@ const Engine = struct {
                 const key = (v.Value{ .node = batch.rows.items[i] }).property(batch.property.?);
                 try batch.index.insert(a, (try engine.values.info(key)).hash, i);
             }
+            if (fused) examined.* = fused_examined;
             batch.complete = true;
             return true;
         }
@@ -9016,7 +9055,7 @@ const Engine = struct {
         // stream full reducers while a bounded sparse prefetch amortizes the
         // correlated equality probes. All other graph pipelines retain the
         // weighted-stage barrier above.
-        const correlated_batch = scalar_seed and self.read_only and middle.len == 2 and middle[0].operation == .unwind and middle[1].operation == .match and self.backend.vtable.scan_where != null and self.backend.vtable.estimate_where != null and eligible: {
+        const correlated_batch = scalar_seed and self.read_only and middle.len == 2 and middle[0].operation == .unwind and middle[1].operation == .match and self.backend.vtable.scan_where != null and (self.backend.vtable.estimate_where != null or self.backend.vtable.probe_where != null) and eligible: {
             const matching = middle[1].operation.match;
             if (independentExpressions(matching, middle[0].operation.unwind.alias)) break :eligible false;
             if (matching.paths.len != 1) break :eligible false;

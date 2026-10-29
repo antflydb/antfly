@@ -47,6 +47,7 @@ pub fn Page(comptime T: type) type {
         next: ?[]const u8 = null,
         examined: ?usize = null,
         unfiltered: bool = false,
+        seek_window: ?SeekWindow = null,
         /// Ordered keys are monotone. False requires boundary-tie refinement
         /// before a row goal may stop consumption.
         stable_ties: bool = true,
@@ -58,11 +59,25 @@ pub fn Page(comptime T: type) type {
         encounter_owners: ?[]const usize = null,
     };
 }
+/// Owner-selected access path. The first request carries the complete predicate;
+/// later requests may send only this certified domain suffix (at most 128 items).
+/// Null filter means the chosen path does not partition an IN domain: its IN
+/// hints may be omitted, while the runtime retains every authoritative predicate.
+pub const SeekWindow = struct { filter: ?usize, offset: usize = 0, primary: bool = false };
+/// A bounded indexed probe never falls back to a primary scan. Null means the
+/// capability is unsupported. Incomplete probes are costing evidence, never query
+/// bindings: their record/seek work must remain charged through Work, including
+/// quota declines. Only complete, admitted pages consume logical anchors.
+pub const Probe = struct { page: Page(*const v.Node), complete: bool };
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in, is_null };
 /// Private compiler proof: a distinct, homogeneous, non-null primitive set.
 /// Inexact integers cannot be lowered into rounded DOUBLE equality domains.
 pub const ScalarDomain = enum { string, boolean, integer, integer_inexact_double };
-pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq, domain: ?ScalarDomain = null };
+/// Private transport proof over the complete certified domain. A planning
+/// request carries first/middle/last samples and emits no partitioned rows.
+/// max_string_bytes licenses a worst-case escaped bound before first emission.
+pub const DomainPlan = struct { length: usize, max_string_bytes: usize = 0 };
+pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq, domain: ?ScalarDomain = null, plan: ?DomainPlan = null };
 pub const PropertyOrder = struct {
     property: []const u8,
     descending: bool = false,
@@ -166,6 +181,8 @@ pub const Backend = struct {
         /// Typed comparisons are candidate restrictions; the runtime always
         /// rechecks Cypher semantics after authorization and projection.
         scan_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, ?[]const u8, usize) anyerror!Page(*const v.Node) = null,
+        planned_domains: bool = false,
+        probe_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, usize) anyerror!?Probe = null,
         /// A non-null page certifies monotone Cypher order keys. stable_ties
         /// additionally certifies primary encounter order for equal keys.
         /// Consumers must refine ties or decline metadata-only coarse proofs.

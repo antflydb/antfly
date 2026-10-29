@@ -46,7 +46,7 @@ pub const View = struct {
         };
     };
     pub fn backend(self: *View) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .startup_work = startupWork, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .startup_work = startupWork, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn cast(ptr: *anyopaque) *View {
         return @ptrCast(@alignCast(ptr));
@@ -258,6 +258,10 @@ pub const View = struct {
     fn get(ptr: *anyopaque, a: A, identity: cypher.value.Identity) !?*const cypher.value.Node {
         const backend_inner = cast(ptr).inner.backend();
         return backend_inner.vtable.get(backend_inner.ptr, a, identity);
+    }
+    fn getMany(ptr: *anyopaque, a: A, identities: []const cypher.value.Identity) ![]const ?*const cypher.value.Node {
+        const inner = cast(ptr).inner.backend();
+        return inner.vtable.get_many.?(inner.ptr, a, identities);
     }
     fn expandBetween(ptr: *anyopaque, a: A, mapping: cypher.catalog.Relationship, identity: cypher.value.Identity, peer: cypher.value.Identity, direction: cypher.ast.Direction, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize, max_examined: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
         const backend_inner = cast(ptr).inner.backend();

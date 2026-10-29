@@ -9021,6 +9021,15 @@ test "correlated property batches preserve duplicates encounter order and row go
             const end = @min(nodes.len, begin + maximum);
             return .{ .items = try a.dupe(*const v.Node, nodes[begin..end]), .unfiltered = true, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
         }
+        fn probeWhere(_: *anyopaque, a: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, maximum: usize) !?b.Probe {
+            bulk_reads += 1;
+            var out: std.ArrayList(*const v.Node) = .empty;
+            for (nodes) |node| if (matches(node, filters)) {
+                try out.append(a, node);
+            };
+            if (out.items.len > maximum) return .{ .page = .{ .items = &.{} }, .complete = false };
+            return .{ .page = .{ .items = out.items, .examined = out.items.len }, .complete = true };
+        }
         fn estimate(_: *anyopaque, _: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, maximum: usize) !?usize {
             var size: usize = 0;
             for (nodes) |node| if (matches(node, filters)) {
@@ -9029,7 +9038,7 @@ test "correlated property batches preserve duplicates encounter order and row go
             return if (size <= maximum) size else null;
         }
     };
-    for ([_]struct { query: []const u8, expected: []const i64, bulk: usize, anchors: usize = 5 }{
+    inline for (.{ false, true }) |fused| for ([_]struct { query: []const u8, expected: []const i64, bulk: usize, anchors: usize = 5 }{
         .{ .query = "UNWIND ['a','b','a'] AS k MATCH(n:Document {id:k}) RETURN collect(n.rank)", .expected = &.{ 1, 3, 2, 1, 3 }, .bulk = 1 },
         .{ .query = "UNWIND ['A','B','A'] AS k MATCH(n:Document) WHERE n.id=toLower(k) RETURN collect(n.rank)", .expected = &.{ 1, 3, 2, 1, 3 }, .bulk = 1 },
         .{ .query = "UNWIND ['a','missing','b','a'] AS k OPTIONAL MATCH(n:Document {id:k}) RETURN collect(n.rank)", .expected = &.{ 1, 3, 2, 1, 3 }, .bulk = 1 },
@@ -9041,7 +9050,8 @@ test "correlated property batches preserve duplicates encounter order and row go
         var callbacks = fixture.backend().vtable.*;
         callbacks.scan = Indexed.scan;
         callbacks.scan_where = Indexed.filtered;
-        callbacks.estimate_where = Indexed.estimate;
+        callbacks.estimate_where = if (fused) null else Indexed.estimate;
+        callbacks.probe_where = if (fused) Indexed.probeWhere else null;
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
         defer compiled.deinit();
@@ -9051,7 +9061,7 @@ test "correlated property batches preserve duplicates encounter order and row go
         try std.testing.expectEqual(@as(usize, 0), Indexed.scalar_reads);
         try std.testing.expectEqual(case.expected.len, result.rows[0][0].list.len);
         for (case.expected, result.rows[0][0].list) |expected, value| try std.testing.expectEqual(expected, value.integer);
-    }
+    };
     Indexed.bulk_reads = 0;
     Indexed.scalar_reads = 0;
     var fixture: Fixture = .{};

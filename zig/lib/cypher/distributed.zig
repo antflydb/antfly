@@ -220,7 +220,7 @@ pub const ReadSet = struct {
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_read_fields) |configure| configure(snapshot.backend.ptr, fields);
@@ -743,6 +743,48 @@ pub const ReadSet = struct {
         }
         try checkpoint(ptr);
         return if (found) total else null;
+    }
+    fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
+        const self = cast(ptr);
+        if (limit == 0 or limit > 128) return null;
+        var quota: @import("budget.zig") = .{ .backing = b.reclaimingAllocator(a), .limit = 2 << 20 };
+        var collected = std.heap.ArenaAllocator.init(quota.allocator());
+        defer collected.deinit();
+        var nodes: std.ArrayList(*const v.Node) = .empty;
+        var examined: usize = 0;
+        var found = false;
+        for (self.targets, self.snapshots) |target, snapshot| {
+            if (!std.mem.eql(u8, target.table, table)) continue;
+            try checkpoint(ptr);
+            const callback = snapshot.backend.vtable.probe_where orelse return if (found) b.Probe{ .page = .{ .items = &.{}, .examined = examined }, .complete = false } else null;
+            // Consume the leaf's reply/work before copying into the aggregate
+            // quota. A quota decline cannot refund work already done remotely.
+            var page_arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer page_arena.deinit();
+            const remaining = limit - examined;
+            const result = (try callback(snapshot.backend.ptr, page_arena.allocator(), table, filters, @max(1, remaining))) orelse return if (found) b.Probe{ .page = .{ .items = &.{}, .examined = examined }, .complete = false } else null;
+            found = true;
+            const used = result.page.examined orelse result.page.items.len;
+            if (used > @max(1, remaining) + 1 or (result.complete and (result.page.next != null or result.page.unfiltered or used < result.page.items.len))) return error.CypherInvalidBackendPage;
+            examined += used;
+            if (!result.complete or examined > limit) return .{ .page = .{ .items = &.{}, .examined = @min(examined, limit + 1) }, .complete = false };
+            for (result.page.items) |node| {
+                if (!std.mem.eql(u8, node.identity.table, table) or !target.owns(node.identity)) return error.CypherInvalidBackendPage;
+                const owned = (v.Value{ .node = node }).clone(collected.allocator()) catch |err| {
+                    if (err == error.OutOfMemory and quota.exhausted) return .{ .page = .{ .items = &.{}, .examined = examined }, .complete = false };
+                    return err;
+                };
+                nodes.append(collected.allocator(), owned.node) catch |err| {
+                    if (err == error.OutOfMemory and quota.exhausted) return .{ .page = .{ .items = &.{}, .examined = examined }, .complete = false };
+                    return err;
+                };
+            }
+        }
+        if (!found) return null;
+        try checkpoint(ptr);
+        const output = try a.alloc(*const v.Node, nodes.items.len);
+        for (nodes.items, output) |node, *out| out.* = (try (v.Value{ .node = node }).clone(a)).node;
+        return .{ .page = .{ .items = output, .examined = examined }, .complete = true };
     }
     fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
         const self = cast(ptr);
@@ -1634,11 +1676,12 @@ test "sparse membership retains per-owner windows across indexed and primary sha
         fn check(_: *anyopaque) !void {}
         fn close(_: *anyopaque) void {}
         fn bind(_: *anyopaque, _: A, _: catalog.Graph) !void {}
-        fn filtered(ptr: *anyopaque, a: A, _: []const u8, filters: []const b.PropertyFilter, _: ?[]const u8, maximum: usize) !b.Page(*const v.Node) {
+        fn filtered(ptr: *anyopaque, a: A, _: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, maximum: usize) !b.Page(*const v.Node) {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const values = filters[0].value.list;
-            try std.testing.expect(values.len <= 128);
-            const count = if (self.primary) 1 else values.len;
+            const offset = if (after) |cursor| try std.fmt.parseUnsigned(usize, cursor, 10) else 0;
+            try std.testing.expect(values.len == (if (offset == 0) @as(usize, 400) else @min(128, 400 - offset)));
+            const count = if (self.primary) 1 else @min(maximum, @min(128, values.len));
             try std.testing.expect(count <= maximum);
             const nodes = try a.alloc(*const v.Node, count);
             for (nodes, 0..) |*out, i| {
@@ -1646,7 +1689,13 @@ test "sparse membership retains per-owner windows across indexed and primary sha
                 node.* = .{ .identity = .{ .table = "docs", .key = if (self.primary) "primary" else try std.fmt.allocPrint(a, "indexed-{d}", .{values[i].integer}) }, .labels = &.{"D"}, .properties = try a.dupe(v.Entry, &.{.{ .name = "id", .value = if (self.primary) .{ .integer = 42 } else values[i] }}) };
                 out.* = node;
             }
-            return .{ .items = nodes, .examined = count, .unfiltered = self.primary };
+            return .{
+                .items = nodes,
+                .examined = count,
+                .unfiltered = self.primary,
+                .next = if (!self.primary and offset + count < 400) try std.fmt.allocPrint(a, "{d}", .{offset + count}) else null,
+                .seek_window = if (!self.primary and offset + count < 400) .{ .filter = 0, .offset = offset + count } else null,
+            };
         }
         fn backend(self: *@This()) b.Backend {
             return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = check, .scan = undefined, .scan_where = filtered, .get = undefined, .expand = undefined } };
@@ -1694,4 +1743,39 @@ test "sparse membership retains per-owner windows across indexed and primary sha
     try std.testing.expectEqual(@as(usize, 401), total);
     try std.testing.expectEqual(@as(usize, 1), primary);
     for (seen) |present| try std.testing.expect(present);
+}
+
+test "distributed probes prove EOF across trailing owners and decline fanout without bindings" {
+    const Owner = struct {
+        used: usize,
+        revoked: bool = false,
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.revoked) return error.Forbidden;
+        }
+        fn probeWhere(ptr: *anyopaque, _: A, _: []const u8, _: []const b.PropertyFilter, maximum: usize) !?b.Probe {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .page = .{ .items = &.{}, .examined = @min(self.used, maximum + 1) }, .complete = self.used <= maximum };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var owners = [_]Owner{ .{ .used = 2 }, .{ .used = 0 } };
+    const targets = [_]Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "docs", .table_id = 1, .group_id = 2 } };
+    var snapshots: [2]Snapshot = undefined;
+    for (&owners, &snapshots) |*owner, *snapshot| snapshot.* = .{ .ptr = owner, .validate = Owner.checkpoint, .close = undefined, .backend = .{ .ptr = owner, .vtable = &.{ .bind = undefined, .checkpoint = Owner.checkpoint, .scan = undefined, .get = undefined, .expand = undefined, .probe_where = Owner.probeWhere } } };
+    var read: ReadSet = .{ .a = a, .targets = &targets, .snapshots = &snapshots, .independent_validations = &snapshots, .source = .{ .ptr = &owners, .checkpoint = Owner.checkpoint, .admit = undefined, .capture = undefined } };
+    const backend = read.backend();
+    const probe_where = backend.vtable.probe_where.?;
+    const exact = (try probe_where(backend.ptr, a, "docs", &.{}, 2)).?;
+    try std.testing.expect(exact.complete);
+    try std.testing.expectEqual(@as(?usize, 2), exact.page.examined);
+    owners[1].used = 1;
+    const declined = (try probe_where(backend.ptr, a, "docs", &.{}, 2)).?;
+    try std.testing.expect(!declined.complete);
+    try std.testing.expectEqual(@as(usize, 0), declined.page.items.len);
+    try std.testing.expectEqual(@as(?usize, 3), declined.page.examined);
+    owners[1].revoked = true;
+    try std.testing.expectError(error.Forbidden, probe_where(backend.ptr, a, "docs", &.{}, 2));
 }

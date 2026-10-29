@@ -247,7 +247,7 @@ pub const Read = struct {
         self.pin_arena = null;
     }
     pub fn pinnedBackend(self: *Read) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .get = pinnedGet, .get_many = pinnedGetMany, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
+        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .probe_where = pinnedProbeWhere, .get = pinnedGet, .get_many = pinnedGetMany, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
     }
     fn readCallResult(comptime Callback: type) type {
         const Function = switch (@typeInfo(Callback)) {
@@ -302,6 +302,10 @@ pub const Read = struct {
     fn pinnedEstimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, limit: usize) !?usize {
         const backend = cast(ptr).pinned_adapter.backend();
         return if (backend.vtable.estimate_where) |estimate| try cast(ptr).retryRead(estimate, .{ backend.ptr, a, table, filters, limit }) else null;
+    }
+    fn pinnedProbeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, limit: usize) !?cypher.backend.Probe {
+        const backend = cast(ptr).pinned_adapter.backend();
+        return if (backend.vtable.probe_where) |read| try cast(ptr).retryRead(read, .{ backend.ptr, a, table, filters, limit }) else null;
     }
     fn pinnedGetMany(ptr: *anyopaque, a: A, identities: []const cypher.value.Identity) ![]const ?*const cypher.value.Node {
         const backend = cast(ptr).pinned_adapter.backend();

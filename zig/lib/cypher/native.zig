@@ -126,7 +126,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .planned_domains = if (@hasDecl(DB, "RelationalReadSession")) @hasDecl(DB.RelationalReadSession, "seekPrefix") else false, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -297,7 +297,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             try checkpoint(ptr);
             return .{ .items = try nodes.toOwnedSlice(a), .next = next, .examined = found.documents.len, .unfiltered = true };
         }
-        const PropertyCursor = struct { branch: usize = 0, index: ?[]const u8 = null, after: ?[]const u8 = null, key: ?[]const u8 = null, schema_version: ?u32 = null, primary: bool = false };
+        const PropertyCursor = struct { branch: usize = 0, index: ?[]const u8 = null, after: ?[]const u8 = null, key: ?[]const u8 = null, schema_version: ?u32 = null, primary: bool = false, planned: bool = false, domain_filter: ?usize = null, domain_length: usize = 0 };
         fn propertyFallback(ptr: *anyopaque, a: A, table: []const u8, cursor: PropertyCursor, limit: usize) !b.Page(*const v.Node) {
             const page = try scan(ptr, a, table, cursor.key, limit);
             return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = if (page.next) |key| try std.json.Stringify.valueAlloc(a, PropertyCursor{ .key = key, .primary = true }, .{}) else null };
@@ -312,13 +312,27 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             };
         }
         fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
-            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
-            defer scratch.deinit();
-            if (try @import("sparse_seek.zig").Window.open(scratch.allocator(), filters, encoded)) |window| {
-                const page = (try scanWhereImpl(ptr, a, table, window.filters, window.after, limit, false)).?;
-                return window.finish(a, page);
-            }
             return (try scanWhereImpl(ptr, a, table, filters, encoded, limit, false)).?;
+        }
+        fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
+            if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
+            if (comptime !@hasDecl(DB.RelationalReadSession, "seekPrefix")) return null;
+            if (limit == 0 or limit > 128) return null;
+            const self = cast(ptr);
+            if (self.work) |work| try work.charge(work.ptr, limit + 1);
+            var quota: @import("budget.zig") = .{ .backing = b.reclaimingAllocator(a), .limit = 1 << 20 };
+            var arena = std.heap.ArenaAllocator.init(quota.allocator());
+            defer arena.deinit();
+            const page = (scanPlanned(ptr, arena.allocator(), table, filters, null, limit + 1, false, true) catch |err| {
+                if (err == error.OutOfMemory and quota.exhausted) return .{ .page = .{ .items = &.{} }, .complete = false };
+                if (err == error.RelationalRowResultTooLarge) return .{ .page = .{ .items = &.{} }, .complete = false };
+                return err;
+            }) orelse return null;
+            const complete = page.next == null and (page.examined orelse page.items.len) <= limit;
+            if (!complete) return .{ .page = .{ .items = &.{}, .examined = page.examined }, .complete = false };
+            const nodes = try a.alloc(*const v.Node, page.items.len);
+            for (page.items, nodes) |item, *out| out.* = (try (v.Value{ .node = item }).clone(a)).node;
+            return .{ .page = .{ .items = nodes, .examined = page.examined }, .complete = true };
         }
         fn filterStrength(self: *Self, filters: []const b.PropertyFilter, name: []const u8, column_type: anytype) !u8 {
             var strength: u8 = 0;
@@ -629,6 +643,18 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return if (index_only) ?usize else ?b.Page(*const v.Node);
         }
         fn scanWhereImpl(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, comptime index_only: bool) anyerror!WhereResult(index_only) {
+            try checkpoint(ptr);
+            if (filters.len == 0) return if (index_only) null else try scan(ptr, a, table, encoded, limit);
+            for (filters) |filter| if (filter.op == .in and filter.value == .list and filter.value.list.len == 0) {
+                if (index_only) return 0;
+                return .{ .items = &.{} };
+            };
+            if (comptime @hasDecl(DB, "openRelationalReadSession") and @hasDecl(DB, "cypherDocumentScanOptions")) {
+                if (comptime @hasDecl(DB.RelationalReadSession, "seekPrefix")) return scanPlanned(ptr, a, table, filters, encoded, limit, index_only, false);
+            }
+            return scanLegacy(ptr, a, table, filters, encoded, limit, index_only);
+        }
+        fn scanLegacy(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, comptime index_only: bool) anyerror!WhereResult(index_only) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return if (index_only) null else try scan(ptr, a, table, encoded, limit);
             if (filters.len == 0) return if (index_only) null else try scan(ptr, a, table, encoded, limit);
             const self = cast(ptr);
@@ -822,6 +848,374 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             }
         }
 
+        const Domain = struct { filter: usize, values: []const v.Value, certified: bool, total: usize, max_string_bytes: ?usize = null };
+        const SeekPlan = struct {
+            index: []const u8,
+            domain: ?usize = null,
+            prefix: []std.json.Value = &.{},
+            usable: bool = true,
+            complete: bool = false,
+            cost: usize = std.math.maxInt(usize),
+        };
+        fn jsonOperand(value: v.Value) std.json.Value {
+            return switch (value) {
+                .null => .null,
+                .integer => |n| .{ .integer = n },
+                .number => |n| .{ .float = n },
+                .boolean => |n| .{ .bool = n },
+                .string => |s| .{ .string = s },
+                else => unreachable,
+            };
+        }
+        fn unusableSeek(err: anyerror) bool {
+            return switch (err) {
+                error.IndexNotFound, error.RelationalIndexNotReady, error.PartialIndexPredicateNotImplied, error.InvalidBatchRequest, error.RelationalIndexColumnTypeMismatch, error.UnsupportedRelationalIndexColumn, error.RelationalIndexColumnNotFound, error.RelationalIndexKeyTooLarge, error.InvalidRelationalIndexBound => true,
+                else => false,
+            };
+        }
+        fn scanPlanned(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, comptime index_only: bool, comptime probe: bool) anyerror!WhereResult(index_only) {
+            if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
+            if (comptime !@hasDecl(DB.RelationalReadSession, "seekPrefix")) return null;
+            const planning = for (filters) |filter| {
+                if (filter.plan != null) break true;
+            } else false;
+            const self = cast(ptr);
+            try checkpoint(ptr);
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            const db = try self.selected(table);
+            var cursor = if (encoded) |bytes| try std.json.parseFromSliceLeaky(PropertyCursor, temporary, bytes, .{}) else PropertyCursor{};
+            if (cursor.primary) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
+            for (filters) |filter| if (filter.op == .in and filter.value == .list and filter.value.list.len == 0) {
+                if (index_only) return 0;
+                return .{ .items = &.{} };
+            };
+            const authority = try self.readAuthorization(temporary, table);
+            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authority.deadline_ns, .row_policy_principal_proof = authority.proof, .row_policy_database = authority.database, .include_documents = true, .limit = @intCast(limit) });
+            if (opts.relational_query == null) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
+            var schema = acquireSchema(db) orelse return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
+            defer schema.release();
+            const Query = @TypeOf(opts.relational_query.?);
+            var fixed: std.ArrayList(Query.Condition) = .empty;
+            var domains: std.ArrayList(Domain) = .empty;
+            for (filters, 0..) |filter, ordinal| {
+                const column = for (schema.tableSchema().relational_columns) |column| {
+                    if (std.mem.eql(u8, column.name, filter.property)) break column;
+                } else continue;
+                if (filter.op == .in) {
+                    if (filter.value != .list) continue;
+                    const source = filter.value.list;
+                    if (filter.plan) |proof| {
+                        if (encoded != null or filter.domain == null or proof.length <= 128 or proof.length > 4096 or source.len != 3) return error.CypherInvalidBackendCursor;
+                        for (source) |value| if (value == .string and value.string.len > proof.max_string_bytes) return error.CypherInvalidBackendCursor;
+                    }
+                    if (source.len > (if (filter.domain != null) @as(usize, 4096) else 256)) continue;
+                    if (filter.domain == .integer_inexact_double and column.column_type == .number) continue;
+                    var valid = true;
+                    for (source) |value| {
+                        if (value == .null) continue;
+                        if (!filterCompatible(column.column_type, value) or (value == .number and !std.math.isFinite(value.number)) or (column.column_type == .number and value == .integer and (value.integer < -9007199254740992 or value.integer > 9007199254740992))) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (!valid) continue; // An unusable hint does not discard other access paths.
+                    var values = source;
+                    if (filter.domain == null) {
+                        var unique: std.ArrayList(v.Value) = .empty;
+                        var seen: @import("value_work.zig").Index = .{};
+                        var work = self.valueWork(temporary);
+                        for (source) |value| {
+                            if (value == .null) continue;
+                            const hash = (try work.info(value)).hash;
+                            var at = seen.head(hash);
+                            while (at) |position| {
+                                const link = seen.links.items[position];
+                                if (try work.eql(unique.items[link.index], value)) break;
+                                at = link.next;
+                            }
+                            if (at != null) continue;
+                            try seen.insert(temporary, hash, unique.items.len);
+                            try unique.append(temporary, value);
+                        }
+                        values = unique.items;
+                    }
+                    if (values.len == 0) {
+                        if (index_only) return 0;
+                        return .{ .items = &.{} };
+                    }
+                    try domains.append(temporary, .{ .filter = ordinal, .values = values, .certified = filter.domain != null, .total = if (filter.plan) |proof| proof.length else values.len, .max_string_bytes = if (filter.plan) |proof| proof.max_string_bytes else null });
+                    continue;
+                }
+                if (fixed.items.len == 256) continue;
+                if (filter.op != .is_null and !filterCompatible(column.column_type, filter.value)) continue;
+                if (filter.value == .number and !std.math.isFinite(filter.value.number)) continue;
+                var operand = if (filter.op == .is_null) @as(std.json.Value, .null) else jsonOperand(filter.value);
+                if (column.column_type == .number and filter.value == .integer and (filter.value.integer < -9007199254740992 or filter.value.integer > 9007199254740992)) {
+                    if (filter.op != .eq) continue;
+                    const number: f64 = @floatFromInt(filter.value.integer);
+                    if (@as(i128, @intFromFloat(number)) != @as(i128, filter.value.integer)) continue;
+                    // The equality is exact in binary64. Preserve those binary
+                    // semantics rather than reinterpreting an integer token's
+                    // shortest decimal spelling during SQL bound validation.
+                    operand = .{ .float = number };
+                }
+                try fixed.append(temporary, .{ .column = filter.property, .op = switch (filter.op) {
+                    .eq => .eq,
+                    .lt => .lt,
+                    .lte => .lte,
+                    .gt => .gt,
+                    .gte => .gte,
+                    .is_null => .is_not_distinct,
+                    .in => unreachable,
+                }, .value = if (filter.op == .is_null) null else operand });
+            }
+            opts.relational_query.?.conditions = fixed.items;
+            opts.relational_query.?.schema_version = cursor.schema_version orelse schema.version();
+            if (index_only) {
+                opts.fields = &.{};
+                opts.include_all_fields = false;
+                opts.relational_query.?.fields = &.{};
+            }
+            var plans: std.ArrayList(SeekPlan) = .empty;
+            if (cursor.planned) {
+                const domain = if (cursor.domain_filter) |ordinal| for (domains.items, 0..) |domain, i| {
+                    if (domain.filter == ordinal) break @as(?usize, i);
+                } else return error.CatalogGenerationChanged else @as(?usize, null);
+                try plans.append(temporary, .{ .index = cursor.index orelse return error.CypherInvalidBackendCursor, .domain = domain });
+            } else if (domains.items.len == 0) {
+                try plans.append(temporary, .{ .index = "" }); // Ordinary SQL auto-index selection.
+            }
+            // Domains are considered independently of their syntactic order.
+            // A prefix may contain fixed equalities before its varying IN key.
+            if (!cursor.planned and domains.items.len != 0) {
+                var indexes = acquireIndexes(db);
+                defer if (indexes) |*view| view.deinit();
+                if (indexes) |view| for (domains.items, 0..) |domain, domain_id| {
+                    var kept: usize = 0;
+                    for (view.plan.boundIndexes()) |index| {
+                        if (self.work) |work| try work.charge(work.ptr, 1);
+                        var prefix: std.ArrayList(std.json.Value) = .empty;
+                        var found = false;
+                        for (index.tuple.keys) |key| {
+                            if (prefix.items.len == 32 or key.expression != null or key.fold_ascii) break;
+                            const name = schema.tableSchema().relational_columns[key.ordinal].name;
+                            const equality = for (fixed.items) |condition| {
+                                if ((condition.op == .eq or condition.op == .is_not_distinct) and std.mem.eql(u8, condition.column, name)) break @as(?std.json.Value, condition.value orelse .null);
+                            } else @as(?std.json.Value, null);
+                            if (equality) |value| {
+                                try prefix.append(temporary, value);
+                                continue;
+                            }
+                            if (std.mem.eql(u8, name, filters[domain.filter].property)) {
+                                try prefix.append(temporary, .null);
+                                found = true;
+                            }
+                            break;
+                        }
+                        if (!found) continue;
+                        if (kept == 4 or plans.items.len == 32) break;
+                        try plans.append(temporary, .{ .index = index.name, .domain = domain_id, .prefix = prefix.items });
+                        kept += 1;
+                    }
+                };
+                if (fixed.items.len != 0) {
+                    var base_opts = opts;
+                    base_opts.fields = &.{};
+                    base_opts.include_all_fields = false;
+                    base_opts.relational_query.?.fields = &.{};
+                    base_opts.relational_query.?.auto_index = true;
+                    const base = db.openRelationalReadSession(temporary, "", "", base_opts) catch |err| blk: {
+                        if (unusableSeek(err)) break :blk null;
+                        return err;
+                    };
+                    if (base) |session| {
+                        defer session.deinit();
+                        if (session.reader.index) |index| try plans.append(temporary, .{ .index = try temporary.dupe(u8, index.name) });
+                    }
+                }
+            }
+            if (plans.items.len == 0) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
+            // Recreate varying prefixes on continuation from the pinned index,
+            // rather than retaining a catalog/reader in the continuation token.
+            if (cursor.planned and plans.items[0].domain != null) {
+                var indexes = acquireIndexes(db) orelse return error.CatalogGenerationChanged;
+                defer indexes.deinit();
+                const index = for (indexes.plan.boundIndexes()) |index| {
+                    if (std.mem.eql(u8, index.name, plans.items[0].index)) break index;
+                } else return error.CatalogGenerationChanged;
+                var prefix: std.ArrayList(std.json.Value) = .empty;
+                const domain = domains.items[plans.items[0].domain.?];
+                for (index.tuple.keys) |key| {
+                    if (key.expression != null or key.fold_ascii or prefix.items.len == 32) return error.CatalogGenerationChanged;
+                    const name = schema.tableSchema().relational_columns[key.ordinal].name;
+                    if (std.mem.eql(u8, name, filters[domain.filter].property)) {
+                        try prefix.append(temporary, .null);
+                        break;
+                    }
+                    const value = for (fixed.items) |condition| {
+                        if ((condition.op == .eq or condition.op == .is_not_distinct) and std.mem.eql(u8, condition.column, name)) break condition.value orelse .null;
+                    } else return error.CatalogGenerationChanged;
+                    try prefix.append(temporary, value);
+                }
+                plans.items[0].prefix = prefix.items;
+            }
+            if (!cursor.planned and plans.items.len > 1) candidates: for (plans.items) |*plan| {
+                var sample_opts = opts;
+                sample_opts.fields = &.{};
+                sample_opts.include_all_fields = false;
+                sample_opts.relational_query.?.fields = &.{};
+                sample_opts.relational_query.?.index = plan.index;
+                sample_opts.relational_query.?.auto_index = plan.domain == null;
+                var sample_arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+                defer sample_arena.deinit();
+                const sample = db.openRelationalReadSession(sample_arena.allocator(), "", "", sample_opts) catch |err| {
+                    if (unusableSeek(err)) {
+                        plan.usable = false;
+                        continue :candidates;
+                    }
+                    return err;
+                };
+                defer sample.deinit();
+                sample.reader.now_ns = self.ttl_now_ns;
+                const branches = if (plan.domain) |d| domains.items[d].total else 1;
+                const samples = @min(branches, 3);
+                var visits: usize = 0;
+                var complete = true;
+                for (0..samples) |i| {
+                    if (self.work) |work| try work.charge(work.ptr, 8);
+                    if (plan.domain) |d| {
+                        const available = domains.items[d].values.len;
+                        const ordinal = if (samples == 1) 0 else i * (available - 1) / (samples - 1);
+                        plan.prefix[plan.prefix.len - 1] = jsonOperand(domains.items[d].values[ordinal]);
+                        sample.seekPrefix(plan.prefix, null) catch |err| {
+                            if (unusableSeek(err)) {
+                                plan.usable = false;
+                                continue :candidates;
+                            }
+                            return err;
+                        };
+                    }
+                    try sample.checkpoint();
+                    var page = try sample.reader.nextPage(sample_arena.allocator(), null, .{ .rows = 8, .records = 8, .output_bytes = 1 << 20 });
+                    defer page.deinit();
+                    try sample.checkpoint();
+                    visits += page.records_examined;
+                    complete = complete and !page.more;
+                }
+                plan.complete = complete;
+                plan.cost = branches + (visits * branches + samples - 1) / samples;
+            };
+            // Invalid/oversized domain bounds decline before the first emitted
+            // row. Other ready access paths remain candidates, including base.
+            selection: while (true) {
+                var best: ?usize = null;
+                for (plans.items, 0..) |plan, i| if (plan.usable) {
+                    if (best == null or (plan.complete and !plans.items[best.?].complete) or (plan.complete == plans.items[best.?].complete and (plan.cost < plans.items[best.?].cost or (plan.cost == plans.items[best.?].cost and std.mem.lessThan(u8, plan.index, plans.items[best.?].index))))) best = i;
+                };
+                const chosen = best orelse return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
+                const plan = &plans.items[chosen];
+                var execution_opts = opts;
+                execution_opts.relational_query.?.index = if (plan.index.len != 0) plan.index else null;
+                execution_opts.relational_query.?.auto_index = plan.domain == null;
+                execution_opts.relational_query.?.after = if (plan.domain == null) cursor.after else null;
+                const session = db.openRelationalReadSession(temporary, "", "", execution_opts) catch |err| {
+                    if (unusableSeek(err) and !cursor.planned) {
+                        plan.usable = false;
+                        continue :selection;
+                    }
+                    return err;
+                };
+                defer session.deinit();
+                if (session.reader.index == null) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
+                session.reader.now_ns = self.ttl_now_ns;
+                const domain: ?Domain = if (plan.domain) |d| domains.items[d] else null;
+                if (!cursor.planned) if (domain) |d| {
+                    for (d.values) |value| {
+                        if (self.work) |work| try work.charge(work.ptr, 1);
+                        plan.prefix[plan.prefix.len - 1] = jsonOperand(value);
+                        session.seekPrefix(plan.prefix, null) catch |err| {
+                            if (unusableSeek(err)) {
+                                plan.usable = false;
+                                continue :selection;
+                            }
+                            return err;
+                        };
+                    }
+                    if (d.max_string_bytes) |maximum| if (maximum != 0) {
+                        // NUL bytes maximize tuple escaping for any string of
+                        // this byte length, independently of index direction.
+                        // Fixed prefix components use their actual encoding.
+                        if (maximum > 1 << 20) {
+                            plan.usable = false;
+                            continue :selection;
+                        }
+                        const worst = try temporary.alloc(u8, maximum);
+                        @memset(worst, 0);
+                        plan.prefix[plan.prefix.len - 1] = .{ .string = worst };
+                        session.seekPrefix(plan.prefix, null) catch |err| {
+                            if (unusableSeek(err)) {
+                                plan.usable = false;
+                                continue :selection;
+                            }
+                            return err;
+                        };
+                    };
+                    cursor.domain_length = d.total;
+                };
+                if (planning) {
+                    if (index_only or probe) return null;
+                    try session.checkpoint();
+                    try checkpoint(ptr);
+                    const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0 }, .{});
+                    return .{ .items = &.{}, .examined = 0, .next = next, .seek_window = .{ .filter = if (domain) |d| d.filter else null } };
+                }
+                var nodes: std.ArrayList(*const v.Node) = .empty;
+                var examined: usize = 0;
+                var count: usize = 0;
+                var branch = cursor.branch;
+                const total = if (domain != null) cursor.domain_length else 1;
+                if (total == 0 or branch >= total) return error.CypherInvalidBackendCursor;
+                const offset = if (domain) |d| if (d.certified and d.values.len != total) branch else @as(usize, 0) else @as(usize, 0);
+                if (domain) |d| if (offset != 0 and d.values.len != @min(@import("sparse_seek.zig").width, total - offset)) return error.CypherInvalidBackendCursor;
+                const end = if (domain != null) @min(total, branch + @import("sparse_seek.zig").width) else 1;
+                while (true) {
+                    try session.checkpoint();
+                    if (self.work) |work| try work.charge(work.ptr, 1);
+                    if (domain) |d| {
+                        if (branch - offset >= d.values.len) return error.CypherInvalidBackendCursor;
+                        plan.prefix[plan.prefix.len - 1] = jsonOperand(d.values[branch - offset]);
+                        try session.seekPrefix(plan.prefix, if (branch == cursor.branch) cursor.after else null);
+                    }
+                    var page_arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+                    defer page_arena.deinit();
+                    var page = try session.reader.nextPage(page_arena.allocator(), null, .{ .rows = limit - count, .records = limit - examined, .output_bytes = if (probe) 1 << 20 else 16 << 20 });
+                    defer page.deinit();
+                    examined += page.records_examined;
+                    count += page.rows.len;
+                    if (!index_only) for (page.rows) |row| {
+                        if (try self.node(a, table, row.key, row.json)) |item| if (item.labels.len != 0) {
+                            try nodes.append(a, item);
+                        };
+                    };
+                    try session.checkpoint();
+                    try checkpoint(ptr);
+                    const more = branch + 1 < total;
+                    if (!page.more and !more) {
+                        if (index_only) return count;
+                        return .{ .items = nodes.items, .examined = examined };
+                    }
+                    if (page.more or examined >= limit or count >= limit or branch + 1 == end) {
+                        if (index_only) return null;
+                        const next_branch = if (page.more) branch else branch + 1;
+                        const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .branch = next_branch, .after = if (page.more) page.next_cursor else null, .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain != null) total else 0 }, .{});
+                        return .{ .items = nodes.items, .examined = examined, .next = next, .seek_window = if (domain) |d| if (d.certified) b.SeekWindow{ .filter = d.filter, .offset = next_branch } else null else b.SeekWindow{ .filter = null } };
+                    }
+                    branch += 1;
+                }
+            }
+        }
         fn getMany(ptr: *anyopaque, a: A, identities: []const v.Identity) ![]const ?*const v.Node {
             if (identities.len > 128) return error.CypherOwnerBudgetExceeded;
             const self = cast(ptr);

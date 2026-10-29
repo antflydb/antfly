@@ -115,6 +115,27 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             wait_for_index=True,
         )
         assert result["rows"] == [[{"type": "integer", "value": "1999"}]], result
+        # Plan the complete predicate before selecting an IN transport window.
+        # The broad score domain must not hide the selective id access path.
+        for predicate, expected, anchors in (
+            ("n.score IN range(0,1999) AND n.id='n1999'", 1, 1),
+            ("n.score IN range(0,1999) AND n.id IN ['n1999','n1998']", 2, 2),
+            ("n.id IN ['n1999','n1998'] AND n.score IN range(0,1999)", 2, 2),
+            ("n.absent IN [1,2] AND n.id='n1999'", 0, 1),
+            ("n.id IN []", 0, 1),
+            ("n.id IN [null]", 0, 1),
+        ):
+            planned = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": f"MATCH(n:D) WHERE {predicate} RETURN count(*)",
+                    "limits": {"scanned_anchors": anchors},
+                },
+            )
+            assert planned["rows"] == [[{"type": "integer", "value": str(expected)}]], (
+                planned
+            )
+            assert planned["stats"]["scanned_anchors"] <= anchors, planned
         # Membership must stay on bounded indexed seeks across the old 256
         # cutoff; physical work must depend on the domain, not table size.
         for size in (128, 256, 257, 400):
@@ -153,6 +174,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 "inserts": {
                     **{f"n{i}": {"value": float(i)} for i in range(20)},
                     "rounded": {"value": 9007199254740992.0},
+                    "exact_large": {"value": 9007199254740994.0},
                 },
                 "sync_level": "full_index",
             },
@@ -169,12 +191,27 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             },
             wait_for_index=True,
         )
+        for predicate, expected in (
+            ("n.value=9007199254740994", 1),
+            ("n.absent IN [1,2] AND n.value=9007199254740994", 0),
+        ):
+            exact_large = call(
+                f"/graphs/{floating}/query",
+                {
+                    "query": f"MATCH(n:F) WHERE {predicate} RETURN count(*)",
+                    "limits": {"scanned_anchors": 1},
+                },
+            )
+            assert exact_large["rows"] == [
+                [{"type": "integer", "value": str(expected)}]
+            ], exact_large
+            assert exact_large["stats"]["scanned_anchors"] == 1, exact_large
         precise = call(
             f"/graphs/{floating}/query",
             {
                 "query": "MATCH(n:F) WHERE n.value IN $values RETURN count(*)",
                 "parameters": {"values": [*range(256), 9007199254740993]},
-                "limits": {"scanned_anchors": 21, "intermediate_states": 50000},
+                "limits": {"scanned_anchors": 22, "intermediate_states": 50000},
             },
         )
         assert precise["rows"] == [[{"type": "integer", "value": "20"}]], precise

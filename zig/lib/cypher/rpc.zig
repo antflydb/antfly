@@ -24,8 +24,8 @@ const catalog = @import("catalog.zig");
 const A = std.mem.Allocator;
 // Named transport types keep the checked callback ABI stable across separately
 // compiled runtimes. Anonymous enum/struct type names contain local IDs.
-pub const Operation = enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project };
-pub const Filter = struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq, domain: ?b.ScalarDomain = null };
+pub const Operation = enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project, probe };
+pub const Filter = struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq, domain: ?b.ScalarDomain = null, plan: ?b.DomainPlan = null };
 pub const OrderAfter = struct { value: std.json.Value };
 pub const Order = struct { property: []const u8, descending: bool = false, exclude_null: bool = false, after: ?OrderAfter = null };
 pub const BudgetFailure = enum { work, anchors };
@@ -42,6 +42,7 @@ pub const Request = struct {
     filters: []const Filter = &.{},
     order: []const Order = &.{},
     after: ?[]const u8 = null,
+    primary: bool = false,
     limit: usize = 128,
     search: ?std.json.Value = null,
     prepared_search_json: []const u8 = "",
@@ -66,6 +67,9 @@ pub const Reply = struct {
     estimate: ?usize = null,
     population: ?u64 = null,
     unfiltered: bool = false,
+    seek_window: ?b.SeekWindow = null,
+    probe_complete: bool = false,
+    probe_supported: bool = false,
     work: usize = 0,
     relationships: []const wire.Value = &.{},
     values: []const wire.Value = &.{},
@@ -115,7 +119,7 @@ pub const Client = struct {
     work: ?b.Work = null,
     read_fields: ?[]const []const u8 = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         cast(ptr).read_fields = fields;
@@ -144,7 +148,7 @@ pub const Client = struct {
         if (reply.work > bounded.max_work) return error.CypherInvalidBackendPage;
         if (self.work) |work| try work.charge(work.ptr, reply.work);
         if (reply.read_failure) |failure| {
-            if ((request.operation != .scan_ordered and request.operation != .get_many) or reply.values.len != 0 or reply.next != null or reply.ordered or reply.cursors != null or reply.cursor_trace != null) return error.CypherInvalidBackendPage;
+            if ((request.operation != .scan_ordered and request.operation != .get_many and request.operation != .probe) or reply.values.len != 0 or reply.next != null or reply.ordered or reply.cursors != null or reply.cursor_trace != null) return error.CypherInvalidBackendPage;
             return switch (failure) {
                 .work => error.CypherStateBudgetExceeded,
                 .anchors => error.CypherAnchorBudgetExceeded,
@@ -276,18 +280,46 @@ pub const Client = struct {
         var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const window = if (self.channel.owner_local) try @import("sparse_seek.zig").Window.open(temporary, filters, after) else null;
-        const selected = if (window) |part| part.filters else filters;
-        const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, selected, .{}), .{ .parse_numbers = false });
-        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .operation = .scan, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = if (window) |part| part.after else after, .limit = limit });
+        const input = if (self.channel.owner_local) try @import("sparse_seek.zig").prepare(temporary, filters, after) else @import("sparse_seek.zig").Input{ .filters = filters, .after = after };
+        var selected = input.filters;
+        if (self.channel.owner_local and after == null) {
+            // Count before allocating. Include variable projection/table bytes;
+            // fixed request fields fit within the reserved header allowance.
+            var count = std.Io.Writer.Discarding.init(&.{});
+            try std.json.Stringify.value(.{ .filters = input.filters, .table = table, .read_fields = self.read_fields }, .{}, &count.writer);
+            if (count.fullCount() > (1 << 20) - 2048)
+                selected = try @import("sparse_seek.zig").planning(temporary, input.filters);
+        }
+        const filter_bytes = try std.json.Stringify.valueAlloc(temporary, selected, .{});
+        const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, filter_bytes, .{ .parse_numbers = false });
+        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .operation = .scan, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = input.after, .primary = input.primary, .limit = limit });
         const nodes = try a.alloc(*const v.Node, reply.values.len);
-        for (reply.values, nodes) |input, *out| {
-            const value = try input.value.clone(a);
+        for (reply.values, nodes) |item, *out| {
+            const value = try item.value.clone(a);
             if (value != .node or !std.mem.eql(u8, value.node.identity.table, table)) return error.CypherInvalidBackendPage;
             out.* = value.node;
         }
-        const page: b.Page(*const v.Node) = .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined, .unfiltered = reply.unfiltered };
-        return if (window) |part| try part.finish(a, page) else page;
+        const page: b.Page(*const v.Node) = .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined, .unfiltered = reply.unfiltered, .seek_window = if (self.channel.owner_local) reply.seek_window else null };
+        return if (self.channel.owner_local) try @import("sparse_seek.zig").finish(a, page) else page;
+    }
+    fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
+        const self = cast(ptr);
+        if (limit == 0 or limit > 128) return null;
+        var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const encoded = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), scratch, try std.json.Stringify.valueAlloc(scratch, filters, .{}), .{ .parse_numbers = false });
+        const reply = try self.invoke(scratch, .{ .operation = .probe, .filters = encoded, .table = table, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .limit = limit });
+        if (!reply.probe_supported) return null;
+        const used = reply.examined orelse reply.values.len;
+        if (reply.next != null or reply.unfiltered or used > limit + 1 or (!reply.probe_complete and reply.values.len != 0) or (reply.probe_complete and (used > limit or used < reply.values.len))) return error.CypherInvalidBackendPage;
+        const nodes = try a.alloc(*const v.Node, reply.values.len);
+        for (reply.values, nodes) |item, *out| {
+            const value = try item.value.clone(a);
+            if (value != .node or !std.mem.eql(u8, value.node.identity.table, table)) return error.CypherInvalidBackendPage;
+            out.* = value.node;
+        }
+        return .{ .page = .{ .items = nodes, .examined = used }, .complete = reply.probe_complete };
     }
     fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
         const self = cast(ptr);
@@ -417,6 +449,7 @@ pub const Owner = struct {
         var next: ?[]const u8 = null;
         var examined: ?usize = null;
         var unfiltered = false;
+        var seek_window: ?b.SeekWindow = null;
         var scores: std.ArrayList(f64) = .empty;
         var approximate = false;
         switch (request.operation) {
@@ -441,10 +474,22 @@ pub const Owner = struct {
                 try self.backend.vtable.checkpoint(self.backend.ptr);
                 return .{ .work = meter.units, .population = count };
             },
+            .probe => {
+                if (!self.permitsTable(request.table) or request.limit > 128) return error.Forbidden;
+                const read = self.backend.vtable.probe_where orelse return .{ .work = meter.units };
+                const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain, .plan = input.plan };
+                const result = (read(self.backend.ptr, scratch, request.table, filters, request.limit) catch |err| return self.readFailure(meter.units, err)) orelse return .{ .work = meter.units };
+                const used = result.page.examined orelse result.page.items.len;
+                if (used > request.limit + 1 or (result.complete and (result.page.next != null or result.page.unfiltered or used > request.limit or used < result.page.items.len))) return error.CypherInvalidBackendPage;
+                if (result.complete) for (result.page.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
+                try self.backend.vtable.checkpoint(self.backend.ptr);
+                return .{ .work = meter.units, .probe_supported = true, .probe_complete = result.complete, .examined = used, .values = values.items };
+            },
             .estimate => {
                 if (!self.permitsTable(request.table) or request.limit > 128) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
-                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain };
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain, .plan = input.plan };
                 const upper = if (self.backend.vtable.estimate_where) |estimate| try estimate(self.backend.ptr, scratch, request.table, filters, request.limit) else null;
                 try self.backend.vtable.checkpoint(self.backend.ptr);
                 return .{ .work = meter.units, .estimate = upper };
@@ -452,7 +497,7 @@ pub const Owner = struct {
             .scan_ordered => {
                 if (!self.permitsTable(request.table) or request.order.len > 32) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
-                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain };
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain, .plan = input.plan };
                 const order = try scratch.alloc(b.PropertyOrder, request.order.len);
                 for (request.order, order) |input, *out| out.* = .{ .property = input.property, .descending = input.descending, .exclude_null = input.exclude_null, .after = if (input.after) |key| try v.Value.fromJson(scratch, key.value) else null };
                 const page = if (self.backend.vtable.scan_ordered) |read| read(self.backend.ptr, scratch, request.table, filters, order, request.after, request.limit, request.max_examined) catch |err| return self.readFailure(meter.units, err) else null;
@@ -465,12 +510,19 @@ pub const Owner = struct {
             .scan => {
                 if (!self.permitsTable(request.table)) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
-                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain };
-                const page = if (self.backend.vtable.scan_where) |filtered| try filtered(self.backend.ptr, scratch, request.table, filters, request.after, request.limit) else try self.backend.vtable.scan(self.backend.ptr, scratch, request.table, request.after, request.limit);
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op, .domain = input.domain, .plan = input.plan };
+                const planning = for (filters) |filter| {
+                    if (filter.plan != null) break true;
+                } else false;
+                // Hosts without the planning protocol enumerate their ordinary
+                // source once; sampled hints can never become query bindings.
+                const fallback = request.primary or (planning and !self.backend.vtable.planned_domains);
+                const page = if (fallback) try self.backend.vtable.scan(self.backend.ptr, scratch, request.table, request.after, request.limit) else if (self.backend.vtable.scan_where) |filtered| try filtered(self.backend.ptr, scratch, request.table, filters, request.after, request.limit) else try self.backend.vtable.scan(self.backend.ptr, scratch, request.table, request.after, request.limit);
                 for (page.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
                 next = page.next;
                 examined = page.examined;
                 unfiltered = page.unfiltered;
+                seek_window = if (fallback) b.SeekWindow{ .filter = null, .primary = true } else page.seek_window orelse if (planning and page.unfiltered) b.SeekWindow{ .filter = null } else null;
             },
             .get => {
                 const identity = request.identity orelse return error.InvalidCypherWireValue;
@@ -530,7 +582,7 @@ pub const Owner = struct {
             },
         }
         try self.backend.vtable.checkpoint(self.backend.ptr);
-        return .{ .work = meter.units, .unfiltered = unfiltered, .values = values.items, .next = next, .examined = examined, .scores = scores.items, .approximate = approximate };
+        return .{ .work = meter.units, .seek_window = seek_window, .unfiltered = unfiltered, .values = values.items, .next = next, .examined = examined, .scores = scores.items, .approximate = approximate };
     }
 };
 
@@ -786,7 +838,7 @@ test "owner wire replies preserve terminal ordered cursor steps" {
     try std.testing.expectEqual(@as(?[]const u8, null), try trace.materialize(a, 1, @as(?b.Work, null)));
 }
 
-test "sparse RPC membership bounds packets and resumes one primary fallback" {
+test "sparse RPC plans full predicate then bounds selected domain or omits unused membership" {
     const Fixture = struct {
         delivered: usize = 0,
         calls: usize = 0,
@@ -795,17 +847,23 @@ test "sparse RPC membership bounds packets and resumes one primary fallback" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const request = try std.json.parseFromSliceLeaky(Request, a, body, .{});
             self.calls += 1;
-            const filter = request.filters[0];
-            if (self.fallback and request.after != null) {
+            if (self.calls == 1) {
+                try std.testing.expectEqual(@as(usize, 400), request.filters[0].value.array.items.len);
+                self.delivered = 128;
+            } else if (self.fallback) {
                 try std.testing.expectEqualStrings("primary-position", request.after.?);
-                try std.testing.expectEqual(@as(usize, 400), filter.value.array.items.len);
-                try std.testing.expect(filter.domain == null);
+                try std.testing.expectEqual(@as(usize, 0), request.filters.len);
             } else {
+                const filter = request.filters[0];
                 try std.testing.expect(filter.value.array.items.len <= 128);
                 try std.testing.expectEqual(b.ScalarDomain.integer, filter.domain.?);
                 self.delivered += filter.value.array.items.len;
             }
-            return std.json.Stringify.valueAlloc(a, Reply{ .unfiltered = self.fallback, .next = if (self.fallback and self.calls == 1) "primary-position" else null }, .{});
+            const more = if (self.fallback) self.calls == 1 else self.delivered < 400;
+            return std.json.Stringify.valueAlloc(a, Reply{
+                .next = if (more) "primary-position" else null,
+                .seek_window = if (more) .{ .filter = if (self.fallback) null else 0, .offset = self.delivered } else null,
+            }, .{});
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -827,4 +885,105 @@ test "sparse RPC membership bounds packets and resumes one primary fallback" {
         try std.testing.expectEqual(@as(usize, if (fallback) 2 else 4), fixture.calls);
         try std.testing.expectEqual(@as(usize, if (fallback) 128 else 400), fixture.delivered);
     }
+}
+
+test "probe RPC carries exact EOF admission and rejects malformed partial bindings" {
+    const Fixture = struct {
+        malformed: bool = false,
+        fn call(ptr: *anyopaque, a: A, bytes: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const request = try std.json.parseFromSliceLeaky(Request, a, bytes, .{});
+            try std.testing.expectEqual(Operation.probe, request.operation);
+            return std.json.Stringify.valueAlloc(a, Reply{ .probe_supported = true, .probe_complete = true, .examined = if (self.malformed) request.limit + 1 else 1 }, .{});
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = .{};
+    var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.call }, .incarnation = 1, .revision = 1 };
+    const backend = client.backend();
+    const page = (try backend.vtable.probe_where.?(backend.ptr, arena.allocator(), "docs", &.{}, 2)).?;
+    try std.testing.expect(page.complete);
+    try std.testing.expectEqual(@as(?usize, 1), page.page.examined);
+    fixture.malformed = true;
+    try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.probe_where.?(backend.ptr, arena.allocator(), "docs", &.{}, 2));
+}
+
+test "wide sparse domains plan bounded samples before sending original value windows" {
+    const Fixture = struct {
+        calls: usize = 0,
+        delivered: usize = 0,
+        fn call(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(body.len <= 1 << 20);
+            const request = try std.json.parseFromSliceLeaky(Request, a, body, .{});
+            self.calls += 1;
+            const filter = request.filters[0];
+            if (self.calls == 1) {
+                try std.testing.expectEqual(@as(usize, 400), filter.plan.?.length);
+                try std.testing.expectEqual(@as(usize, 3), filter.value.array.items.len);
+                try std.testing.expect(filter.plan.?.max_string_bytes >= 3000);
+            } else {
+                try std.testing.expect(filter.plan == null);
+                try std.testing.expect(filter.value.array.items.len <= 128);
+                self.delivered += filter.value.array.items.len;
+            }
+            return std.json.Stringify.valueAlloc(a, Reply{
+                .next = if (self.delivered < 400) "native" else null,
+                .seek_window = if (self.delivered < 400) .{ .filter = 0, .offset = self.delivered } else null,
+            }, .{});
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prefix = try a.alloc(u8, 3000);
+    @memset(prefix, 'x');
+    const values = try a.alloc(v.Value, 400);
+    for (values, 0..) |*value, i| value.* = .{ .string = try std.fmt.allocPrint(a, "{s}{d}", .{ prefix, i }) };
+    var fixture: Fixture = .{};
+    var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.call }, .incarnation = 1, .revision = 1 };
+    const backend = client.backend();
+    var after: ?[]const u8 = null;
+    while (true) {
+        var quota: @import("budget.zig") = .{ .backing = b.reclaimingAllocator(a), .limit = 256 << 10 };
+        var packet_arena = std.heap.ArenaAllocator.init(quota.allocator());
+        defer packet_arena.deinit();
+        const page = try backend.vtable.scan_where.?(backend.ptr, if (after == null) packet_arena.allocator() else a, "docs", &.{.{ .property = "id", .op = .in, .value = .{ .list = values }, .domain = .string }}, after, 128);
+        after = if (page.next) |next| try a.dupe(u8, next) else null;
+        if (after == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 5), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 400), fixture.delivered);
+}
+
+test "sampled domains pin unsupported owner fallback to its primary cursor" {
+    const Fixture = struct {
+        scans: usize = 0,
+        fn bind(_: *anyopaque, _: A, _: catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(ptr: *anyopaque, _: A, _: []const u8, after: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scans += 1;
+            if (after) |cursor| try std.testing.expectEqualStrings("primary", cursor);
+            return .{ .items = &.{}, .next = if (after == null) "primary" else null };
+        }
+        fn filtered(_: *anyopaque, _: A, _: []const u8, _: []const b.PropertyFilter, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            return error.UnexpectedFilteredResume;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+    const owner: Owner = .{ .backend = .{ .ptr = &fixture, .vtable = &.{ .bind = Fixture.bind, .checkpoint = Fixture.checkpoint, .scan = Fixture.scan, .scan_where = Fixture.filtered, .get = undefined, .expand = undefined } }, .graph = graph, .table = "docs" };
+    const first = try owner.executeTyped(a, .{ .operation = .scan, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .filters = &.{.{ .property = "id", .op = .in, .domain = .string, .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "[\"a\",\"b\",\"c\"]", .{}), .plan = .{ .length = 400, .max_string_bytes = 1 } }} });
+    try std.testing.expect(first.seek_window.?.primary);
+    const encoded = try @import("sparse_seek.zig").finish(a, .{ .items = &.{}, .next = first.next, .seek_window = first.seek_window });
+    const resumed = try @import("sparse_seek.zig").prepare(a, &.{}, encoded.next);
+    try std.testing.expect(resumed.primary);
+    const last = try owner.executeTyped(a, .{ .operation = .scan, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .after = resumed.after, .primary = resumed.primary });
+    try std.testing.expect(last.next == null);
+    try std.testing.expectEqual(@as(usize, 2), fixture.scans);
 }

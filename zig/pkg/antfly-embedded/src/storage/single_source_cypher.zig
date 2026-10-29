@@ -57,7 +57,7 @@ pub fn Host(comptime DB: type) type {
             proofs: []const tracking.Proof = &.{},
             next_entity: u64 = 0,
             pub fn pinnedBackend(self: *Statement) cypher.backend.Backend {
-                return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .get = pinnedGet, .get_many = pinnedGetMany, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
+                return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .probe_where = pinnedProbeWhere, .get = pinnedGet, .get_many = pinnedGetMany, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
             }
             fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
                 const backend = cast(ptr).adapter.backend();
@@ -86,6 +86,10 @@ pub fn Host(comptime DB: type) type {
             fn pinnedEstimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, limit: usize) !?usize {
                 const backend = cast(ptr).adapter.backend();
                 return if (backend.vtable.estimate_where) |estimate| try estimate(backend.ptr, a, table, filters, limit) else null;
+            }
+            fn pinnedProbeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, limit: usize) !?cypher.backend.Probe {
+                const backend = cast(ptr).adapter.backend();
+                return if (backend.vtable.probe_where) |read| try read(backend.ptr, a, table, filters, limit) else null;
             }
             fn pinnedGetMany(ptr: *anyopaque, a: A, identities: []const cypher.value.Identity) ![]const ?*const cypher.value.Node {
                 const backend = cast(ptr).adapter.backend();

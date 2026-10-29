@@ -13,93 +13,64 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Stateless bounded seek windows. The caller retains the immutable domain;
-//! owner requests and continuation tokens retain only one fixed-size window.
+//! Stateless owner-planned domain transport. The owner sees the complete
+//! predicate once, then certifies which IN suffix subsequent calls may send.
 const std = @import("std");
 const b = @import("backend.zig");
 const v = @import("value.zig");
 const A = std.mem.Allocator;
 pub const width = 128;
-pub const Cursor = struct { sparse_seek: struct { offset: usize = 0, after: ?[]const u8 = null, full_scan: bool = false } = .{} };
-pub const Window = struct {
-    filters: []const b.PropertyFilter,
-    after: ?[]const u8,
-    position: Cursor,
-    length: usize,
-    end: usize,
-    pub fn open(a: A, filters: []const b.PropertyFilter, after: ?[]const u8) !?Window {
-        const chosen = for (filters, 0..) |filter, i| {
-            if (filter.op != .in) continue;
-            if (filter.domain == null or filter.value != .list or filter.value.list.len <= width) return null;
-            break i;
-        } else return null;
-        const domain = filters[chosen].value.list;
-        if (domain.len > 4096) return error.CypherOwnerBudgetExceeded;
-        const position = if (after) |bytes| try std.json.parseFromSliceLeaky(Cursor, a, bytes, .{}) else Cursor{};
-        if (position.sparse_seek.offset >= domain.len) return error.CypherInvalidBackendCursor;
-        const end = @min(domain.len, position.sparse_seek.offset + width);
+pub const Cursor = struct { sparse_seek: struct { window: b.SeekWindow, after: []const u8 } };
+pub const Input = struct { filters: []const b.PropertyFilter, after: ?[]const u8, primary: bool = false };
+pub fn prepare(a: A, filters: []const b.PropertyFilter, after: ?[]const u8) !Input {
+    const bytes = after orelse return .{ .filters = filters, .after = null };
+    // Unmodified cursors from backends without this capability stay opaque.
+    if (bytes.len == 0 or bytes[0] != '{') return .{ .filters = filters, .after = after };
+    const object = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return .{ .filters = filters, .after = after };
+    if (object != .object or !object.object.contains("sparse_seek")) return .{ .filters = filters, .after = after };
+    const cursor = try std.json.parseFromSliceLeaky(Cursor, a, bytes, .{});
+    const window = cursor.sparse_seek.window;
+    if (window.filter) |index| {
+        if (index >= filters.len) return error.CypherInvalidBackendCursor;
+        const source = filters[index];
+        if (source.op != .in or source.domain == null or source.value != .list) return error.CypherInvalidBackendCursor;
+        if (source.value.list.len > 4096) return error.CypherOwnerBudgetExceeded;
+        if (window.offset >= source.value.list.len) return error.CypherInvalidBackendCursor;
         const selected = try a.dupe(b.PropertyFilter, filters);
-        if (!position.sparse_seek.full_scan) selected[chosen].value = .{ .list = domain[position.sparse_seek.offset..end] } else selected[chosen].domain = null;
-        return .{ .filters = selected, .after = position.sparse_seek.after, .position = position, .length = domain.len, .end = end };
+        selected[index].value = .{ .list = source.value.list[window.offset..@min(source.value.list.len, window.offset + width)] };
+        return .{ .filters = selected, .after = cursor.sparse_seek.after };
     }
-    pub fn finish(self: Window, a: A, page: b.Page(*const v.Node)) !b.Page(*const v.Node) {
-        var result = page;
-        var position = self.position;
-        if (page.unfiltered) {
-            // A fallback after an earlier indexed window could duplicate rows.
-            // An immutable, type-certified owner must make this decision on
-            // its first window, including integer-to-DOUBLE representability.
-            if (position.sparse_seek.offset != 0) return error.CatalogGenerationChanged;
-            position.sparse_seek.full_scan = true;
-        }
-        if (page.next) |next| {
-            position.sparse_seek.after = next;
-        } else if (!position.sparse_seek.full_scan and self.end < self.length) {
-            position.sparse_seek.offset = self.end;
-            position.sparse_seek.after = null;
-        } else {
-            result.next = null;
-            return result;
-        }
-        result.next = try std.json.Stringify.valueAlloc(a, position, .{});
-        return result;
+    var selected: std.ArrayList(b.PropertyFilter) = .empty;
+    for (filters) |filter| if (filter.op != .in) try selected.append(a, filter);
+    return .{ .filters = selected.items, .after = cursor.sparse_seek.after, .primary = window.primary };
+}
+/// Oversized initial domains retain all predicate hints and complete-domain
+/// proof without making accepted paged domains exceed the transport ceiling.
+pub fn planning(a: A, filters: []const b.PropertyFilter) ![]const b.PropertyFilter {
+    const selected = try a.dupe(b.PropertyFilter, filters);
+    for (selected) |*filter| {
+        if (filter.op != .in or filter.domain == null or filter.value != .list or filter.value.list.len <= width) continue;
+        const source = filter.value.list;
+        if (source.len > 4096) return error.CypherOwnerBudgetExceeded;
+        var maximum: usize = 0;
+        for (source) |value| if (value == .string) {
+            maximum = @max(maximum, value.string.len);
+        };
+        filter.plan = .{ .length = source.len, .max_string_bytes = maximum };
+        filter.value = .{ .list = try a.dupe(v.Value, &.{ source[0], source[source.len / 2], source[source.len - 1] }) };
     }
-};
-
-test "sparse seek windows bound transport and preserve fallback continuation" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const values = try a.alloc(v.Value, 400);
-    for (values, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
-    const filters = &[_]b.PropertyFilter{.{ .property = "id", .op = .in, .value = .{ .list = values }, .domain = .integer }};
-    var after: ?[]const u8 = null;
-    var delivered: usize = 0;
-    var packets: usize = 0;
-    while (true) {
-        const window = (try Window.open(a, filters, after)).?;
-        const selected = window.filters[0].value.list;
-        try std.testing.expect(selected.len <= width);
-        try std.testing.expectEqual(@as(i64, @intCast(delivered)), selected[0].integer);
-        delivered += selected.len;
-        packets += 1;
-        after = (try window.finish(a, .{ .items = &.{}, .examined = 0 })).next;
-        if (after == null) break;
-    }
-    try std.testing.expectEqual(@as(usize, 400), delivered);
-    try std.testing.expectEqual(@as(usize, 4), packets);
-    const initial = (try Window.open(a, filters, null)).?;
-    const fallback = try initial.finish(a, .{ .items = &.{}, .unfiltered = true, .next = "native-primary-position" });
-    const resumed = (try Window.open(a, filters, fallback.next)).?;
-    try std.testing.expectEqual(@as(usize, 400), resumed.filters[0].value.list.len);
-    try std.testing.expect(resumed.filters[0].domain == null);
-    try std.testing.expectEqualStrings("native-primary-position", resumed.after.?);
-    try std.testing.expect((try resumed.finish(a, .{ .items = &.{}, .unfiltered = true })).next == null);
-    const second = (try Window.open(a, filters, (try initial.finish(a, .{ .items = &.{} })).next)).?;
-    try std.testing.expectError(error.CatalogGenerationChanged, second.finish(a, .{ .items = &.{}, .unfiltered = true }));
+    return selected;
+}
+pub fn finish(a: A, input: b.Page(*const v.Node)) !b.Page(*const v.Node) {
+    var page = input;
+    if (page.next) |next| if (page.seek_window) |window| {
+        page.next = try std.json.Stringify.valueAlloc(a, Cursor{ .sparse_seek = .{ .window = window, .after = next } }, .{});
+    };
+    page.seek_window = null;
+    return page;
 }
 
-test "sparse seek certified boundaries and global precision proof" {
+test "owner plans the full predicate before bounded domain continuations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -107,25 +78,27 @@ test "sparse seek certified boundaries and global precision proof" {
         const values = try a.alloc(v.Value, size);
         for (values, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
         values[size - 1] = .{ .integer = 9007199254740993 };
-        const filters = &[_]b.PropertyFilter{.{ .property = "id", .op = .in, .value = .{ .list = values }, .domain = .integer_inexact_double }};
-        if (size == width) {
-            try std.testing.expect(try Window.open(a, filters, null) == null);
-            continue;
+        const filters = &[_]b.PropertyFilter{
+            .{ .property = "id", .op = .in, .value = .{ .list = values }, .domain = .integer_inexact_double },
+            .{ .property = "tenant", .value = .{ .integer = 7 } },
+        };
+        const initial = try prepare(a, filters, null);
+        try std.testing.expectEqual(size, initial.filters[0].value.list.len);
+        var offset: usize = @min(width, size);
+        while (offset < size) {
+            const page = try finish(a, .{ .items = &.{}, .next = "native", .seek_window = .{ .filter = 0, .offset = offset } });
+            const resumed = try prepare(a, filters, page.next);
+            try std.testing.expectEqual(@min(width, size - offset), resumed.filters[0].value.list.len);
+            try std.testing.expectEqual(b.ScalarDomain.integer_inexact_double, resumed.filters[0].domain.?);
+            try std.testing.expectEqualStrings("native", resumed.after.?);
+            offset += resumed.filters[0].value.list.len;
         }
-        var after: ?[]const u8 = null;
-        var delivered: usize = 0;
-        while (true) {
-            const window = (try Window.open(a, filters, after)).?;
-            try std.testing.expectEqual(b.ScalarDomain.integer_inexact_double, window.filters[0].domain.?);
-            delivered += window.filters[0].value.list.len;
-            after = (try window.finish(a, .{ .items = &.{} })).next;
-            if (after == null) break;
-        }
-        try std.testing.expectEqual(size, delivered);
-        // Unproved mixed domains never get split: an owner's residual scan
-        // must see the complete original list and its native cursor.
-        var unproved = filters.*;
-        unproved[0].domain = null;
-        try std.testing.expect(try Window.open(a, &unproved, "native-position") == null);
+        const base = try finish(a, .{ .items = &.{}, .next = "base", .seek_window = .{ .filter = null } });
+        const resumed = try prepare(a, filters, base.next);
+        try std.testing.expectEqual(@as(usize, 1), resumed.filters.len);
+        try std.testing.expectEqualStrings("tenant", resumed.filters[0].property);
+        try std.testing.expectEqualStrings("base", resumed.after.?);
     }
+    const foreign = try prepare(a, &.{}, "foreign-position");
+    try std.testing.expectEqualStrings("foreign-position", foreign.after.?);
 }

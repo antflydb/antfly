@@ -362,7 +362,7 @@ pub const Overlay = struct {
             return !self.from_base or self.dirty or self.created;
         }
     };
-    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
+    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .probe_where = probeWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
         value.project_node = projectNode;
@@ -708,6 +708,12 @@ pub const Overlay = struct {
         try checkpoint(ptr);
         if (self.active) return null;
         return if (self.base.vtable.population_upper_bound) |read| try read(self.base.ptr, a, table) else null;
+    }
+    fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) anyerror!?b.Probe {
+        const self = cast(ptr);
+        try checkpoint(ptr);
+        if (self.active) return null;
+        return if (self.base.vtable.probe_where) |read| try read(self.base.ptr, a, table, filters, limit) else null;
     }
     fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) anyerror!?usize {
         const self = cast(ptr);

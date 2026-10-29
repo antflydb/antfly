@@ -702,3 +702,104 @@ test "external lake Cypher indexed bounds use the captured scalar catalog" {
         if (expected) |id| try std.testing.expectEqual(id, (@import("cypher").value.Value{ .node = value.value.node }).property("id").integer) else try std.testing.expect(value.value == .null);
     }
 }
+
+test "external lake Cypher execution reads immutable native document and graph cuts with owner planned sparse predicates" {
+    const a = std.testing.allocator;
+    const cypher = @import("cypher");
+    const DB = local.storage_db_db.DB;
+    var directory = try local.common_test_directory.TestDirectory.init("cypher-owner-planned-seeks");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"by_id","keys":[{"column":"id"}]},{"name":"by_bucket","keys":[{"column":"bucket"}]},{"name":"by_large","keys":[{"column":"large"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"},"bucket":{"type":"integer"},"large":{"type":"number"}},"additionalProperties":false}}}}
+    );
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const writes = try temporary.alloc(local.storage_db_types.BatchWrite, 2000);
+    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(temporary, "n{d}", .{i}), .value = try std.fmt.allocPrint(temporary, "{{\"id\":\"n{d}\",\"bucket\":{d},\"large\":{d}}}", .{ i, i % 4, @as(u64, 9007199254740994) + i * 2 }) };
+    try db.batch(.{ .writes = writes });
+    for ([_][]const u8{ "by_id", "by_bucket", "by_large" }) |name| for (0..128) |_| {
+        if ((try db.relationalIndexBuildStatus(name)).state == .ready) break;
+        try db.buildRelationalIndexStep(name, .{});
+    } else return error.TestIndexNotReady;
+    const domain = local.system_catalog_domain;
+    const record: domain.Resource = .{ .kind = .graph, .id = 1, .name = "g", .source_json = "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }} };
+    const json = try std.json.Stringify.valueAlloc(temporary, record, .{});
+    var fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedFence;
+    defer fence.release();
+    var read = try DB.CypherStatementSnapshot.create(a, &db, &fence, .{ .indexes = &.{}, .schema_version = 1, .catalog_json = json, .table = "docs", .table_id = 7, .cut_id = @splat('e'), .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60_000, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() }, .none);
+    defer read.deinit();
+    fence.release();
+    const Channel = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedWireCall;
+        }
+        fn typed(ptr: *anyopaque, alloc: std.mem.Allocator, request: cypher.rpc.Request) !cypher.rpc.Reply {
+            const port: *local.storage_statement_read_fence.GraphRead = @ptrCast(@alignCast(ptr));
+            return port.invokeTyped(alloc, request);
+        }
+    };
+    var client: cypher.rpc.Client = .{ .channel = .{ .ptr = &read, .call = Channel.call, .typed = Channel.typed }, .incarnation = 1, .revision = 1 };
+    const probe_filters = &[_]cypher.rpc.Filter{.{ .property = "id", .op = .in, .domain = .string, .value = .{ .array = std.array_list.Managed(std.json.Value).init(temporary) } }};
+    var probe_filter = probe_filters[0];
+    try probe_filter.value.array.append(.{ .string = "n1999" });
+    try probe_filter.value.array.append(.{ .string = "n1998" });
+    for ([_]usize{ 1, 2 }) |maximum| {
+        const reply = try read.invokeTyped(temporary, .{ .operation = .probe, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .filters = &.{probe_filter}, .limit = maximum });
+        try std.testing.expect(reply.probe_supported);
+        try std.testing.expectEqual(maximum == 2, reply.probe_complete);
+        try std.testing.expectEqual(@as(usize, if (maximum == 2) 2 else 0), reply.values.len);
+        try std.testing.expectEqual(@as(?usize, 2), reply.examined);
+    }
+    const exhausted = try read.invokeTyped(temporary, .{ .operation = .probe, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .filters = &.{probe_filter}, .limit = 2, .max_work = 0 });
+    try std.testing.expectEqual(cypher.rpc.BudgetFailure.work, exhausted.read_failure.?);
+    // Exercise the sampled planning protocol on a real immutable SQL reader,
+    // then resume against the complete original domain through the RPC client.
+    var samples = std.array_list.Managed(std.json.Value).init(temporary);
+    for ([_][]const u8{ "n0", "n200", "n399" }) |key| try samples.append(.{ .string = key });
+    const planned = try read.invokeTyped(temporary, .{ .operation = .scan, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .filters = &.{.{ .property = "id", .op = .in, .domain = .string, .plan = .{ .length = 400, .max_string_bytes = 4 }, .value = .{ .array = samples } }} });
+    try std.testing.expectEqual(@as(usize, 0), planned.values.len);
+    try std.testing.expectEqual(@as(?usize, 0), planned.examined);
+    try std.testing.expectEqual(@as(?usize, 0), planned.seek_window.?.filter);
+    const values = try temporary.alloc(cypher.value.Value, 400);
+    for (values, 0..) |*value, i| value.* = .{ .string = try std.fmt.allocPrint(temporary, "n{d}", .{i}) };
+    var after: ?[]const u8 = try std.json.Stringify.valueAlloc(temporary, .{ .sparse_seek = .{ .window = planned.seek_window.?, .after = planned.next.? } }, .{});
+    var seen: [400]bool = @splat(false);
+    var count: usize = 0;
+    const backend = client.backend();
+    while (after != null) {
+        const page = try backend.vtable.scan_where.?(backend.ptr, temporary, "docs", &.{.{ .property = "id", .op = .in, .domain = .string, .value = .{ .list = values } }}, after, 128);
+        for (page.items) |node| {
+            const ordinal = try std.fmt.parseUnsigned(usize, node.identity.key[1..], 10);
+            try std.testing.expect(ordinal < seen.len and !seen[ordinal]);
+            seen[ordinal] = true;
+            count += 1;
+        }
+        after = page.next;
+    }
+    try std.testing.expectEqual(@as(usize, 400), count);
+    const graph: cypher.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+    for ([_]struct { query: []const u8, count: i64, anchors: usize }{
+        .{ .query = "MATCH(n:D) WHERE n.bucket IN [0,1,2,3] AND n.id='n1999' RETURN count(*)", .count = 1, .anchors = 1 },
+        .{ .query = "MATCH(n:D) WHERE n.bucket IN [0,1,2,3] AND n.id IN ['n1999','n1998'] RETURN count(*)", .count = 2, .anchors = 2 },
+        .{ .query = "MATCH(n:D) WHERE n.id IN ['n1999','n1998'] AND n.bucket IN [0,1,2,3] RETURN count(*)", .count = 2, .anchors = 2 },
+        .{ .query = "MATCH(n:D) WHERE n.large=9007199254740994 RETURN count(*)", .count = 1, .anchors = 1 },
+        .{ .query = "MATCH(n:D) WHERE n.missing IN [1,2] AND n.large=9007199254740994 RETURN count(*)", .count = 0, .anchors = 1 },
+        .{ .query = "MATCH(n:D) WHERE n.large=9007199254740993 AND n.id='n1999' RETURN count(*)", .count = 0, .anchors = 1 },
+        .{ .query = "MATCH(n:D) WHERE n.id IN [] RETURN count(*)", .count = 0, .anchors = 1 },
+        .{ .query = "MATCH(n:D) WHERE n.id IN [null] RETURN count(*)", .count = 0, .anchors = 1 },
+        .{ .query = "MATCH(n:D) WHERE n.missing IN [1,2] AND n.id='n1999' RETURN count(*)", .count = 0, .anchors = 1 },
+        .{ .query = "UNWIND ['n1999','n1998','n1999'] AS k MATCH(n:D {id:k}) RETURN count(*)", .count = 3, .anchors = 3 },
+        .{ .query = "UNWIND range(0,399) AS k WITH collect('n'+toString(k)) AS ids MATCH(n:D) WHERE n.id IN ids RETURN count(*)", .count = 400, .anchors = 400 },
+    }) |case| {
+        var diagnostic: cypher.compiler.Diagnostic = .{};
+        var compiled = try cypher.compiler.compile(a, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try cypher.runtime.execute(a, client.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = case.anchors });
+        defer result.deinit();
+        try std.testing.expectEqual(case.count, result.rows[0][0].integer);
+        try std.testing.expect(result.stats.scanned_anchors <= case.anchors);
+    }
+}
