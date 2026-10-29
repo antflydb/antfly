@@ -1,4 +1,3 @@
-import { MonoLabel } from "@antfly/design-system";
 import type { Connection } from "@antfly/sdk";
 import { ArrowRight } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -29,8 +28,8 @@ export function ConnectedProvidersSummary() {
   if (loading) {
     return (
       <div className="flex items-center gap-2">
-        <div className="h-6 w-40 animate-pulse rounded-none bg-muted" />
-        <div className="h-6 w-24 animate-pulse rounded-none bg-muted" />
+        <div className="h-6 w-40 animate-pulse rounded-md bg-muted" />
+        <div className="h-6 w-24 animate-pulse rounded-md bg-muted" />
       </div>
     );
   }
@@ -39,7 +38,7 @@ export function ConnectedProvidersSummary() {
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <MonoLabel>Connected providers</MonoLabel>
+      <span className="text-xs font-medium text-muted-foreground">Connected providers</span>
       {providers.map((connection) => {
         const count = modelCount(connection);
         return (
@@ -50,7 +49,7 @@ export function ConnectedProvidersSummary() {
             title={`${providerTypeLabel(connection.inference?.provider ?? "")}${
               connection.error ? ` — ${connection.error}` : ""
             }`}
-            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-none text-xs font-mono border bg-muted text-muted-foreground hover:text-foreground transition-colors"
+            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-mono border bg-muted text-muted-foreground hover:text-foreground transition-colors"
           >
             <span
               className={cn(

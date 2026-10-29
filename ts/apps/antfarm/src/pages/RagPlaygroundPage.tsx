@@ -11,9 +11,16 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
   DashboardPageActions,
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldLabel,
+  FieldTitle,
+  HighlightedCodeBlock,
   Input,
   Label,
   Separator,
+  Spinner,
   Switch,
   Textarea,
 } from "@antfly/design-system";
@@ -24,7 +31,6 @@ import type {
   GeneratorProvider,
   QueryHit,
 } from "@antfly/sdk";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   BookOpen,
   ChevronDown,
@@ -99,7 +105,7 @@ function ErrorDisplay({ message }: { message: string }) {
     isLong && !expanded ? `${message.slice(0, ERROR_TRUNCATE_LENGTH)}...` : message;
 
   return (
-    <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
+    <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
       {displayText}
       {isLong && (
         <button
@@ -460,7 +466,7 @@ const RagPlaygroundPage: React.FC = () => {
             showHits
             renderLoading={() => (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <ReloadIcon className="h-4 w-4 animate-spin" />
+                <Spinner className="h-4 w-4" />
                 Searching and generating answer...
               </div>
             )}
@@ -470,7 +476,7 @@ const RagPlaygroundPage: React.FC = () => {
               </div>
             )}
             renderClassification={(data) => (
-              <div className="p-3 rounded-none bg-muted/50 space-y-2">
+              <div className="p-3 rounded-lg bg-muted/50 space-y-2">
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <Sparkles className="h-4 w-4" />
                   Classification
@@ -492,7 +498,7 @@ const RagPlaygroundPage: React.FC = () => {
                   </div>
                 )}
                 {data.reasoning && (
-                  <div className="text-xs text-muted-foreground mt-2 p-2 bg-background rounded-none">
+                  <div className="text-xs text-muted-foreground mt-2 p-2 bg-background rounded-md">
                     {data.reasoning}
                   </div>
                 )}
@@ -550,16 +556,20 @@ const RagPlaygroundPage: React.FC = () => {
                 </CollapsibleTrigger>
                 <CollapsibleContent className="space-y-2 mt-2">
                   {hits.map((hit, i) => (
-                    <div key={hit._id || i} className="p-3 rounded-none border text-xs space-y-1">
+                    <div key={hit._id || i} className="p-3 rounded-lg border text-xs space-y-1">
                       <div className="flex items-center justify-between">
                         <span className="font-medium">{hit._id}</span>
                         <Badge className="text-xs">{hit._score?.toFixed(3)}</Badge>
                       </div>
                       {hit._source && (
-                        <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap">
-                          {JSON.stringify(hit._source, null, 2).slice(0, 500)}
-                          {JSON.stringify(hit._source).length > 500 && "..."}
-                        </pre>
+                        <HighlightedCodeBlock
+                          code={`${JSON.stringify(hit._source, null, 2).slice(0, 500)}${
+                            JSON.stringify(hit._source).length > 500 ? "..." : ""
+                          }`}
+                          language="json"
+                          size="sm"
+                          wrap
+                        />
                       )}
                     </div>
                   ))}
@@ -691,7 +701,7 @@ const RagPlaygroundPage: React.FC = () => {
                         >
                           {isLoading ? (
                             <>
-                              <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                              <Spinner className="h-4 w-4 mr-2" />
                               Running...
                             </>
                           ) : (
@@ -745,8 +755,10 @@ const RagPlaygroundPage: React.FC = () => {
                     </div>
 
                     {/* Query Options */}
-                    <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground">Result Limit</Label>
+                    <Field className="gap-2">
+                      <FieldLabel className="text-xs text-muted-foreground">
+                        Result Limit
+                      </FieldLabel>
                       <Input
                         type="number"
                         value={limit}
@@ -755,7 +767,7 @@ const RagPlaygroundPage: React.FC = () => {
                         max={50}
                         className="w-24"
                       />
-                    </div>
+                    </Field>
 
                     <Separator />
 
@@ -764,18 +776,18 @@ const RagPlaygroundPage: React.FC = () => {
                       <Label className="text-sm font-medium">Pipeline Steps</Label>
 
                       {/* Classification */}
-                      <div className="flex items-center justify-between p-3 rounded-none border">
-                        <div className="flex items-center gap-3">
-                          <Sparkles className="h-4 w-4 text-muted-foreground" />
-                          <div>
-                            <p className="text-sm font-medium">Classification</p>
-                            <p className="text-xs text-muted-foreground">Analyze query strategy</p>
-                          </div>
-                        </div>
+                      <Field orientation="horizontal" className="p-3 rounded-lg border">
+                        <Sparkles className="h-4 w-4 text-muted-foreground shrink-0" />
+                        <FieldContent>
+                          <FieldTitle>Classification</FieldTitle>
+                          <FieldDescription className="text-xs">
+                            Analyze query strategy
+                          </FieldDescription>
+                        </FieldContent>
                         <div className="flex items-center gap-3">
                           {steps.classification.enabled && (
-                            <div className="flex items-center gap-2">
-                              <Label className="text-xs">Reasoning</Label>
+                            <Field orientation="horizontal" className="w-auto gap-2">
+                              <FieldLabel className="text-xs">Reasoning</FieldLabel>
                               <Switch
                                 checked={steps.classification.with_reasoning}
                                 onCheckedChange={(v) =>
@@ -788,7 +800,7 @@ const RagPlaygroundPage: React.FC = () => {
                                   }))
                                 }
                               />
-                            </div>
+                            </Field>
                           )}
                           <Switch
                             checked={steps.classification.enabled}
@@ -800,23 +812,21 @@ const RagPlaygroundPage: React.FC = () => {
                             }
                           />
                         </div>
-                      </div>
+                      </Field>
 
                       {/* Follow-up */}
-                      <div className="flex items-center justify-between p-3 rounded-none border">
-                        <div className="flex items-center gap-3">
-                          <HelpCircle className="h-4 w-4 text-muted-foreground" />
-                          <div>
-                            <p className="text-sm font-medium">Follow-up Questions</p>
-                            <p className="text-xs text-muted-foreground">
-                              Generate related questions
-                            </p>
-                          </div>
-                        </div>
+                      <Field orientation="horizontal" className="p-3 rounded-lg border">
+                        <HelpCircle className="h-4 w-4 text-muted-foreground shrink-0" />
+                        <FieldContent>
+                          <FieldTitle>Follow-up Questions</FieldTitle>
+                          <FieldDescription className="text-xs">
+                            Generate related questions
+                          </FieldDescription>
+                        </FieldContent>
                         <div className="flex items-center gap-3">
                           {steps.followup.enabled && (
-                            <div className="flex items-center gap-2">
-                              <Label className="text-xs">Count</Label>
+                            <Field orientation="horizontal" className="w-auto gap-2">
+                              <FieldLabel className="text-xs">Count</FieldLabel>
                               <Input
                                 type="number"
                                 value={steps.followup.count}
@@ -833,7 +843,7 @@ const RagPlaygroundPage: React.FC = () => {
                                 min={1}
                                 max={10}
                               />
-                            </div>
+                            </Field>
                           )}
                           <Switch
                             checked={steps.followup.enabled}
@@ -845,17 +855,17 @@ const RagPlaygroundPage: React.FC = () => {
                             }
                           />
                         </div>
-                      </div>
+                      </Field>
 
                       {/* Confidence */}
-                      <div className="flex items-center justify-between p-3 rounded-none border">
-                        <div className="flex items-center gap-3">
-                          <Target className="h-4 w-4 text-muted-foreground" />
-                          <div>
-                            <p className="text-sm font-medium">Confidence Scores</p>
-                            <p className="text-xs text-muted-foreground">Rate answer confidence</p>
-                          </div>
-                        </div>
+                      <Field orientation="horizontal" className="p-3 rounded-lg border">
+                        <Target className="h-4 w-4 text-muted-foreground shrink-0" />
+                        <FieldContent>
+                          <FieldTitle>Confidence Scores</FieldTitle>
+                          <FieldDescription className="text-xs">
+                            Rate answer confidence
+                          </FieldDescription>
+                        </FieldContent>
                         <Switch
                           checked={steps.confidence.enabled}
                           onCheckedChange={(v) =>
@@ -865,12 +875,12 @@ const RagPlaygroundPage: React.FC = () => {
                             }))
                           }
                         />
-                      </div>
+                      </Field>
                     </div>
 
                     {/* System Prompt */}
-                    <div className="space-y-2">
-                      <Label>System Prompt (optional)</Label>
+                    <Field className="gap-2">
+                      <FieldLabel>System Prompt (optional)</FieldLabel>
                       <Textarea
                         placeholder="Custom instructions for the generator..."
                         value={steps.generation.system_prompt}
@@ -882,11 +892,11 @@ const RagPlaygroundPage: React.FC = () => {
                         }
                         className="min-h-[80px] resize-none text-sm"
                       />
-                    </div>
+                    </Field>
 
                     {/* Generation Context */}
-                    <div className="space-y-2">
-                      <Label>Generation Context (optional)</Label>
+                    <Field className="gap-2">
+                      <FieldLabel>Generation Context (optional)</FieldLabel>
                       <Textarea
                         placeholder="Guidance for tone, detail level, style... e.g. 'Be concise and technical. Include code examples.'"
                         value={steps.generation.generation_context}
@@ -901,7 +911,7 @@ const RagPlaygroundPage: React.FC = () => {
                         }
                         className="min-h-[60px] resize-none text-sm"
                       />
-                    </div>
+                    </Field>
                   </CardContent>
                 </CollapsibleContent>
               </Collapsible>

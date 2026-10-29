@@ -1,40 +1,40 @@
-# Native memory without a model
+# Native memory
 
-This example exercises the same evidence/temporal policy over HTTP or the direct
-embedded SDK. It imports newer deployment guidance before older guidance and
-checks that current and historical recall remain correct.
+Antfly's native memory service (`/memory/v1`) stores what an agent learns as
+typed claims with evidence: who said it, when it was true, and which later
+claim replaced it. Recall returns the current answer and, on request, the
+history behind it. The same actions run in-process on an embedded `.aflite`
+file or over HTTP against a server, and MCP clients reach them at
+`/memory/v1/mcp`.
 
-```sh
-# From the repository root, after installing the Python SDK:
-python examples/native-memory/main.py --url http://localhost:8080 --space demo
+The memory contract is documented in [zig/MEMORY.md](../../zig/MEMORY.md):
+evidence and temporal policy, identity and supersession judging, provenance,
+and recorded explanations.
 
-# Embedded: install the embedded Python SDK and build/provide libantfly first.
-python examples/native-memory/main.py --database demo.aflite --space demo
-```
+## A complete application: Codex on Antfly
 
-The HTTP SDK uses the server's configured authentication; set `ANTFLY_TOKEN` when
-needed. Embedded access is governed by ownership of the database file. No model,
-Go memory server, extension package or Wasmtime runtime is required.
+[antflydb/codex](https://github.com/antflydb/codex/tree/antfly/integration), a
+fork of OpenAI's Codex CLI, is the full worked example. On its
+`antfly/integration` branch Codex keeps all of its state in Antfly instead of
+SQLite and rollout files:
 
-For `docsaf`, map each source version/section to an immutable evidence ID and
-retain its source URL, author and event time. Submit externally produced typed
-assertions under external mode, or explicitly enable a qualified managed pipeline.
-See [MEMORY.md](../../zig/MEMORY.md) for the complete native contract and research.
+- **Knowledge across sessions.** Codex extracts decisions, rationale,
+  preferences, lessons and constraints from sessions into a knowledge graph
+  of claims and concepts, tracks which claims supersede others, and exposes
+  it to the agent as a `knowledge.search` tool. Its client for the native
+  memory service runs identity, relation and supersession judging through
+  `/memory/v1`.
+- **Decisions.** A local approval reviewer asks a typed-decision model what
+  the worst effect of a tool call would be and records each verdict and its
+  outcome, so approvals can be calibrated against precedent.
+- **Searchable history.** Session history is indexed for full-text and
+  semantic search.
+- **Embedded or server.** One setting switches between a local `.aflite` file
+  through `libantfly` and a hosted Antfly instance over HTTP and the
+  PostgreSQL wire protocol.
 
-The example also prints a recorded explanation. To import an ordinary business
-row, submit evidence with `resource_selector={"table": "business", "id": "row-id"}`
-instead of copying its text. Native admission captures and pins the authorized
-row version; add `expected_revision` to reject concurrent changes. Call
-`memory.execute(space, "explain", id=id, body={"revision": revision})` for a historical explanation.
+The design, configuration, measurements and Antfly findings are in
+[ANTFLY_INTEGRATION.md](https://github.com/antflydb/codex/blob/antfly/integration/ANTFLY_INTEGRATION.md).
 
-The Python SDK's `trace_event` and `resource_reference` helpers build versioned
-ordinary-table rows and typed provenance links. Keep `retrieved`, `used`, and
-`supported_by` separate. Writing a trace row alone does not admit a memory. See
-[the shared provenance design](../../zig/MEMORY.md#shared-native-provenance-and-recorded-explanations)
-for authorization, retention, source-change behavior, and completeness flags.
-
-MCP clients connect to `/memory/v1/mcp`. Discover typed `memory_observe`,
-`memory_recall`, `memory_explain` and the other native actions with `tools/list`.
-Arguments use `{space, body}` plus `id` for resource operations and
-`idempotency_key` for mutations. Memory tools and sessions are separate from the
-ordinary database MCP server at `/mcp/v1`.
+For a smaller starting point that builds a knowledge graph with search over a
+document corpus, see [antfly-docs-knowledge-base](../antfly-docs-knowledge-base/).

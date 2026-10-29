@@ -24,7 +24,7 @@ const QuerySection: React.FC<QuerySectionProps> = ({
     return (
       <div
         className={cn(
-          "border rounded-none p-6 space-y-4",
+          "border rounded-lg p-6 space-y-4",
           variant === "default" && "bg-card",
           variant === "muted" && "bg-muted/30",
           className

@@ -308,7 +308,7 @@ on macOS. Without an `ocr` block, pages that need OCR keep their native text and
 report `extraction_status: "ocr_not_configured"`. If the configured model is not
 installed, the page records a failed OCR outcome; install the model and
 reprocess the artifact to retry. For formats outside the built-in parser, use the
-[docsaf example](https://github.com/antflydb/antfly/tree/main/examples/docsaf).
+[docsaf CLI](https://github.com/antflydb/antfly/tree/main/go/pkg/docsaf).
 
 `remotePDF` remains a compatibility helper for template-time extraction, but it
 is deprecated. Prefer durable extraction for production workflows.
