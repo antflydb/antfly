@@ -45,7 +45,7 @@ async function fixture(persist) {
     "for(const name of['sql','kv'])Object.defineProperty(ctx.storage,name,{get(){throw Error('UnexpectedPlatformDatabaseAccess');}});";
   const auth = await modules(
     authDir,
-    `import Service,{MailAuth as Base}from'./mail-auth-worker.js';export class TestMailAuth extends Base{constructor(ctx,env){${guard}super(ctx,env);const transaction=this.store.transaction.bind(this.store);this.store.transaction=fn=>transaction(async tx=>{let userWrite=false;const wrapped={...tx,put:(key,value)=>{if(key.startsWith('better-auth/v1/row/user/'))userWrite=true;return tx.put(key,value);}};const result=await fn(wrapped);if(this.failSignup&&userWrite){this.failSignup=false;throw Error('InjectedSignupCommitFailure');}return result;});}injectSignupFailure(){this.failSignup=true;}async userCount(){return(await this.auth.$context).adapter.count({model:'user'});}}export default class extends Service{failSignup(){return this.actor().injectSignupFailure();}countUsers(){return this.actor().userCount();}async flush(){const actor=this.actor();for(const id of await actor.retryAuthMail())await actor.dispatch(id);}}`
+    `import Service,{MailAuth as Base}from'./mail-auth-worker.js';export class TestMailAuth extends Base{constructor(ctx,env){${guard}super(ctx,env);const transaction=this.store.transaction.bind(this.store);this.store.transaction=fn=>transaction(async tx=>{let userWrite=false;const wrapped={...tx,put:(key,value)=>{if(key.startsWith('better-auth/v1/row/user/'))userWrite=true;return tx.put(key,value);}};const result=await fn(wrapped);if(this.failSignup&&userWrite){this.failSignup=false;throw Error('InjectedSignupCommitFailure');}return result;});}injectSignupFailure(){this.failSignup=true;}async ageSession(headers){const session=await this.auth.api.getSession({headers:new Headers(headers)});await(await this.auth.$context).adapter.update({model:'session',where:[{field:'id',value:session.session.id}],update:{expiresAt:new Date(Date.now()+5*86400000),updatedAt:new Date(Date.now()-2*86400000)}});}async userCount(){return(await this.auth.$context).adapter.count({model:'user'});}}export default class extends Service{failSignup(){return this.actor().injectSignupFailure();}ageSession(headers){return this.actor().ageSession(headers);}countUsers(){return this.actor().userCount();}async flush(){const actor=this.actor();for(const id of await actor.retryAuthMail())await actor.dispatch(id);}}`
   );
   const app = await modules(
     appDir,
@@ -92,13 +92,13 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
   const persist = await mkdtemp(resolve(cwd, "dist/mail-workerd-"));
   let mf = await fixture(persist);
   const cookies = {};
-  const call = async (path, body, user) => {
+  const call = async (path, body, user, ip = "127.0.0.1") => {
     const worker = await mf.getWorker("mail");
     return worker.fetch("http://localhost:3000" + path, {
       method: body ? "POST" : "GET",
       headers: {
         Origin: "http://localhost:3000",
-        "CF-Connecting-IP": "127.0.0.1",
+        "CF-Connecting-IP": ip,
         ...(body ? { "Content-Type": "application/json" } : {}),
         ...(user ? { Cookie: cookies[user] } : {}),
       },
@@ -113,6 +113,11 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
   };
   try {
     assert.equal((await call("/mail/messages")).status, 401);
+    const invalidSignup = await call("/api/auth/sign-up/email", {
+      email: "invalid@example.test", name: "Invalid", password: "short",
+    }, null, "127.0.0.2");
+    assert.equal(invalidSignup.status, 400);
+    assert.equal((await invalidSignup.json()).code, "PASSWORD_TOO_SHORT");
     for (const name of ["alice", "bob"]) {
       const signup = await call("/api/auth/sign-up/email", {
         email: name + "@example.test",
@@ -140,6 +145,15 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
       assert.equal(login.status, 200, await login.text());
       cookies[name] = login.headers.get("set-cookie").split(";")[0];
     }
+    await (await mf.getWorker("auth")).ageSession([["cookie", cookies.alice]]);
+    const renewed = await call("/api/me", null, "alice");
+    assert.equal(renewed.status, 200);
+    assert.ok(
+      renewed.headers.getSetCookie().some((cookie) =>
+        cookie.startsWith(cookies.alice.split("=")[0] + "=") && /Max-Age=604800/i.test(cookie)
+      )
+    );
+    assert.equal(Object.hasOwn(await renewed.json(), "cookies"), false);
     await (await mf.getWorker("auth")).failSignup();
     const failed = await call("/api/auth/sign-up/email", {
       email: "rollback@example.test",

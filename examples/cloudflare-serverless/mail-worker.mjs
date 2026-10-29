@@ -56,43 +56,53 @@ export default {
       headers.set("X-Content-Type-Options", "nosniff");
       return new Response(asset.body, { status: asset.status, headers });
     }
+    let cookies = [];
+    const withCookies = (result) => {
+      for (const cookie of cookies) result.headers.append("Set-Cookie", cookie);
+      return result;
+    };
+    const reply = (body, status = 200) => withCookies(response(body, status));
     try {
-      const session = await env.AUTH_SERVICE.session([...request.headers]);
-      if (!session) return response({ error: "SignInRequired" }, 401);
+      const result = await env.AUTH_SERVICE.session([...request.headers]);
+      cookies = result.cookies;
+      const session = result.session;
+      if (!session) return reply({ error: "SignInRequired" }, 401);
       const { mailbox } = session,
         stub = actor(env, mailbox.id);
       if (request.method !== "GET" && request.headers.get("Origin") !== env.AUTH_ORIGIN)
-        return response({ error: "InvalidOrigin" }, 403);
-      if (url.pathname === "/api/me" && request.method === "GET") return response(session);
+        return reply({ error: "InvalidOrigin" }, 403);
+      if (url.pathname === "/api/me" && request.method === "GET") return reply(session);
       if (url.pathname === "/mail/messages" && request.method === "GET")
-        return response(
+        return reply(
           publicPage(await stub.list(mailbox.id, url.searchParams.get("cursor") ?? ""))
         );
       if (url.pathname === "/mail/search" && request.method === "GET")
-        return response(publicPage(await stub.search(mailbox.id, url.searchParams.get("q"))));
+        return reply(publicPage(await stub.search(mailbox.id, url.searchParams.get("q"))));
       const match = /^\/mail\/messages\/([a-f0-9-]{36})(?:\/attachments\/(\d{1,2}))?$/.exec(
         url.pathname
       );
       if (match && request.method === "GET") {
         if (match[2]) {
           const part = await stub.attachment(mailbox.id, match[1], Number(match[2]));
-          if (!part) return response({ error: "NotFound" }, 404);
-          return new Response(part.bytes, {
-            headers: {
-              "Content-Type": "application/octet-stream",
-              "Content-Disposition":
-                "attachment; filename=attachment; filename*=UTF-8''" +
-                encodeURIComponent(part.filename),
-              "X-Content-Type-Options": "nosniff",
-              "Cache-Control": "private, no-store",
-            },
-          });
+          if (!part) return reply({ error: "NotFound" }, 404);
+          return withCookies(
+            new Response(part.bytes, {
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition":
+                  "attachment; filename=attachment; filename*=UTF-8''" +
+                  encodeURIComponent(part.filename),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+              },
+            })
+          );
         }
         const message = await stub.message(mailbox.id, match[1]);
-        return message ? response(publicMessage(message)) : response({ error: "NotFound" }, 404);
+        return message ? reply(publicMessage(message)) : reply({ error: "NotFound" }, 404);
       }
       if (url.pathname === "/mail/outbox" && request.method === "GET")
-        return response(await stub.outboundList(mailbox.id, url.searchParams.get("cursor") ?? ""));
+        return reply(await stub.outboundList(mailbox.id, url.searchParams.get("cursor") ?? ""));
       if (url.pathname === "/mail/outbox" && request.method === "POST") {
         const body = JSON.parse(
           new TextDecoder().decode(await boundedBytes(request.body, 600 * 1024))
@@ -101,11 +111,11 @@ export default {
           !uuid(body.id) ||
           Object.keys(body).some((k) => !["id", "to", "subject", "text", "reply_to"].includes(k))
         )
-          return response({ error: "InvalidOutgoingMail" }, 400);
+          return reply({ error: "InvalidOutgoingMail" }, 400);
         const mail = { to: body.to, subject: body.subject, text: body.text, from: mailbox.address };
         if (body.reply_to) {
           const prior = await stub.message(mailbox.id, body.reply_to);
-          if (!prior) return response({ error: "NotFound" }, 404);
+          if (!prior) return reply({ error: "NotFound" }, 404);
           mail.to = prior.from;
           if (
             typeof prior.message_id === "string" &&
@@ -115,20 +125,20 @@ export default {
         }
         const queued = await stub.enqueue(mailbox.id, body.id, mail);
         await hint(env, mailbox.id, "send", body.id);
-        return response({ id: queued.id, state: queued.state }, 202);
+        return reply({ id: queued.id, state: queued.state }, 202);
       }
       const outbox = /^\/mail\/outbox\/([a-f0-9-]{36})$/.exec(url.pathname);
       if (outbox && request.method === "GET") {
         const row = await stub.outbound(mailbox.id, outbox[1]);
-        return row ? response(row) : response({ error: "NotFound" }, 404);
+        return row ? reply(row) : reply({ error: "NotFound" }, 404);
       }
-      return response({ error: "NotFound" }, 404);
+      return reply({ error: "NotFound" }, 404);
     } catch (error) {
       if (error?.message === "MailSendRateLimited")
-        return response({ error: "MailSendRateLimited" }, 429);
+        return reply({ error: "MailSendRateLimited" }, 429);
       const invalid =
         error instanceof SyntaxError || /^Invalid|Exceeded$/.test(error?.message ?? "");
-      return response(
+      return reply(
         { error: invalid ? "InvalidRequest" : "MailTemporarilyUnavailable" },
         invalid ? 400 : 503
       );

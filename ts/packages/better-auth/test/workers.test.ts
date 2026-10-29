@@ -14,6 +14,7 @@
 // limitations under the License.
 
 import { betterAuth } from "better-auth";
+import { APIError } from "better-auth/api";
 import { describe, expect, it } from "vitest";
 import {
   authDefaults,
@@ -113,6 +114,55 @@ describe("Workers structured Antfly auth adapter", () => {
     ).rejects.toThrow();
     expect(callbacks).toBe(1);
     expect(f.store.data).toEqual(before);
+  });
+  it("preserves signup validation errors without writing an account", async () => {
+    const f = await fixture();
+    const response = await f.auth.api.signUpEmail({
+      body: { name: "Alice", email: "alice@example.test", password: "short" },
+      asResponse: true,
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: "PASSWORD_TOO_SHORT" });
+    expect(
+      await f.store.transaction((tx) => new WorkersAuthRows(f.options).find(tx, "user"))
+    ).toEqual([]);
+  });
+  it("preserves application errors after rollback without replaying the callback", async () => {
+    const f = await fixture();
+    await signup(f.auth);
+    const before = structuredClone(f.store.data);
+    const db = workersAdapter(f.store)(f.options);
+    const error = new APIError("BAD_REQUEST", { message: "Rejected by application" });
+    let calls = 0;
+    await expect(
+      db.transaction(async (tx) => {
+        calls++;
+        await tx.deleteMany({ model: "account", where: [] });
+        throw error;
+      })
+    ).rejects.toBe(error);
+    expect(calls).toBe(1);
+    expect(f.store.data).toEqual(before);
+  });
+  it("reports a rollback failure as storage uncertainty instead of an application error", async () => {
+    const f = await fixture();
+    const transaction = f.store.transaction.bind(f.store);
+    f.store.transaction = async (fn) => {
+      try {
+        return await transaction(fn);
+      } catch {
+        throw Error("Injected rollback failure");
+      }
+    };
+    const db = workersAdapter(f.store)(f.options);
+    await expect(
+      db.transaction(async () => {
+        throw new APIError("BAD_REQUEST", { message: "Rejected by application" });
+      })
+    ).rejects.toMatchObject({
+      status: "INTERNAL_SERVER_ERROR",
+      body: { code: "ANTFLY_AUTH_DATABASE_ERROR" },
+    });
   });
   it("does not release queued verification email after failed commit", async () => {
     const f = await fixture(true);

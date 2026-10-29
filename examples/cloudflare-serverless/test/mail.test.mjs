@@ -171,7 +171,7 @@ test("mail HTTP authorization never accepts browser-selected ownership or bypass
     calls = [],
     env = {
       AUTH_ORIGIN: "https://mail.example.test",
-      AUTH_SERVICE: { session: async () => ({ user: { id: "alice" }, mailbox }) },
+      AUTH_SERVICE: { session: async () => ({ session: { user: { id: "alice" }, mailbox }, cookies: [] }) },
       MAILBOXES: {
         getByName(id) {
           calls.push(id);
@@ -206,7 +206,7 @@ test("mail HTTP authorization never accepts browser-selected ownership or bypass
     (
       await worker.fetch(req("/mail/messages"), {
         ...env,
-        AUTH_SERVICE: { session: async () => null },
+        AUTH_SERVICE: { session: async () => ({ session: null, cookies: [] }) },
       })
     ).status,
     401
@@ -222,4 +222,34 @@ test("per-mailbox outbound quota is atomic, bounded and preserves idempotent enq
   await assert.rejects(outbox.enqueue(crypto.randomUUID(), mail), /MailSendRateLimited/);
   now = 3600000;
   assert.equal((await outbox.enqueue(crypto.randomUUID(), mail)).state, "pending");
+});
+
+test("mail responses forward separate renewal and clearing cookies without exposing them as JSON", async () => {
+  const mailbox = { id: crypto.randomUUID(), address: "support@example.test" };
+  const cookies = [
+    "session=renewed; Path=/; HttpOnly; Expires=Fri, 30 Oct 2026 00:00:00 GMT",
+    "cache=; Path=/; Max-Age=0; HttpOnly",
+  ];
+  const env = {
+    AUTH_ORIGIN: "https://mail.example.test",
+    AUTH_SERVICE: { session: async () => ({ session: { user: { id: "alice" }, mailbox }, cookies }) },
+    MAILBOXES: { getByName: () => ({
+      list: async () => ({ messages: [] }),
+      attachment: async () => ({ bytes: new Uint8Array([1]), filename: "test.txt" }),
+    }) },
+  };
+  const request = (path) => new Request(env.AUTH_ORIGIN + path);
+  for (const path of ["/api/me", "/mail/messages", "/mail/messages/" + crypto.randomUUID() + "/attachments/0", "/mail/missing"]) {
+    const result = await worker.fetch(request(path), env);
+    assert.deepEqual(result.headers.getSetCookie(), cookies);
+    if (path === "/api/me") {
+      const body = await result.json();
+      assert.deepEqual(body, { user: { id: "alice" }, mailbox });
+      assert.equal(Object.hasOwn(body, "cookies"), false);
+    }
+  }
+  env.AUTH_SERVICE.session = async () => ({ session: null, cookies: [cookies[1]] });
+  const signedOut = await worker.fetch(request("/api/me"), env);
+  assert.equal(signedOut.status, 401);
+  assert.deepEqual(signedOut.headers.getSetCookie(), [cookies[1]]);
 });

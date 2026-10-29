@@ -115,8 +115,13 @@ export class MailAuth extends DurableObject {
   }
   async session(headerEntries) {
     await this.ensureReady();
-    const session = await this.auth.api.getSession({ headers: new Headers(headerEntries) });
-    if (!session || (!session.user.emailVerified && !this.local)) return null;
+    const { response: session, headers } = await this.auth.api.getSession({
+      headers: new Headers(headerEntries),
+      returnHeaders: true,
+    });
+    const cookies = headers.getSetCookie();
+    if (!session || (!session.user.emailVerified && !this.local))
+      return { session: null, cookies };
     const user = { id: session.user.id, name: session.user.name, email: session.user.email },
       key = "mail-membership/v1/" + (await digest(user.id)),
       domain = new URL("https://" + this.env.MAIL_DOMAIN).hostname;
@@ -131,7 +136,7 @@ export class MailAuth extends DurableObject {
       }
       return mailbox;
     });
-    return { user, mailbox };
+    return { session: { user, mailbox }, cookies };
   }
   async recipient(to) {
     await this.ensureReady();

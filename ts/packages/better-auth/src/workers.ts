@@ -36,12 +36,22 @@ export function workersAdapter(store: AuthKeyValueStore) {
   return (options: BetterAuthOptions) => {
     const rows = new WorkersAuthRows(options);
     async function run<T>(fn: (tx: AuthKeyValueSession) => Promise<T>): Promise<T> {
+      let applicationError: unknown;
       try {
         return await store.transaction(async (tx) => {
           await rows.ready(tx);
-          return fn(tx);
+          try {
+            return await fn(tx);
+          } catch (error) {
+            applicationError = error;
+            throw error;
+          }
         });
-      } catch {
+      } catch (error) {
+        // Preserve application errors only after the store confirms rollback by
+        // rethrowing the callback error. A different commit/rollback error is
+        // still an uncertain storage failure.
+        if (error === applicationError && error instanceof APIError) throw error;
         throw new APIError("INTERNAL_SERVER_ERROR", {
           code: "ANTFLY_AUTH_DATABASE_ERROR",
           message: "Authentication storage is unavailable. Do not replay an uncertain write.",
