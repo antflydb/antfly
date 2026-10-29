@@ -215,7 +215,7 @@ Cancellation, deadlines and hard resource limits still propagate as failures.
 ## Cloudflare providers
 
 Cloudflare is a general Antfly provider, shared with SQL, retrieval and
-enrichment. See [Cloudflare models](../reference/cloudflare-models.md) for coverage across model tasks. Document composites are consumers of those provider protocols.
+enrichment. See [Cloudflare Workers AI](../guides/providers/cloudflare.mdx) for coverage across model tasks. Document composites are consumers of those provider protocols.
 Workers AI hosts the models; AI Gateway is optional routing configuration.
 
 An ordinary extraction provider configuration uses:

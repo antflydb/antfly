@@ -6,7 +6,7 @@ shared terminology is in the [glossary](glossary.mdx).
 
 ## Sections
 
-- [Guides](guides/) — tutorials, examples, and integrations.
+- [Guides](guides/) — tutorials, examples, and integrations. [Inference Components and Providers](guides/inference-providers.mdx) maps each kind of inference to the providers that serve it, with one page per provider under [guides/providers](guides/providers/).
 - [Reference](reference/) — authentication, secrets, SDKs, formats, [document TTL](reference/ttl.md), [typed decisions](reference/decisions.md), [inference runtime configuration](reference/inference-runtime.md), CLI packaging, and [licensing maintenance](reference/licensing.md).
 - [Operations](operations/) — object-storage operations and development, [store-root enrollment](operations/store-root-enrollment.md), and runtime verification history.
 - [Design](design/) — current architecture and technical decisions; the [Zig roadmap](../zig/ROADMAP.md#design-documents) indexes subsystem documents kept beside their code.
