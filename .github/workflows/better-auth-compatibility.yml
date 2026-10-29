@@ -50,9 +50,12 @@ jobs:
         working-directory: zig
         run: |
           mkdir -p "$RUNNER_TEMP/auth-native-reports"
+          # This suite checks adapter, SQL, persistence and transport behavior.
+          # Use runtime safety checks and avoid optimizing the entire server
+          # before exercising the JavaScript compatibility matrix.
           python3 -u tools/run_bounded_zig_build.py --zig zig --report "$RUNNER_TEMP/auth-native-reports/build.json" -- \
             build --build-file ./build.zig libantfly antfly \
-            -Doptimize=fast -Dstrip=true -Dcpu=baseline \
+            -Doptimize=debug -Dstrip=false -Dcpu=baseline \
             -Dmetal=false -Dcuda=false -j2 --summary all
       - name: Upload native compilation diagnostics
         if: always()

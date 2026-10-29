@@ -2008,3 +2008,20 @@ For a regression owned by the physical C API implementation, use
 partition used by the ordinary C API gate, avoiding an expensive consumer
 compilation solely to discover that the selected tests belong to the owner.
 The ordinary gate continues to audit the complete consumer/owner union.
+
+Better Auth follow-up run 40908943772 removed the API retry, but still reached
+its unchanged two-hour deadline. Persisted sampling shows API emission finished
+in about 37 minutes (6,906,523,648 sampled bytes), inference in 28 minutes,
+the storage adapter in 27 minutes, and the physical storage engine was still
+actively compiling after 39 minutes. Peak sampled compiler-tree RSS was
+11,704,987,648 bytes; this was compiler work, not a hung test or another
+reservation retry. Incomplete engine measurements do not justify lowering its
+reservation.
+
+The compatibility workflow now builds unstripped Debug artifacts: its matrix
+checks adapter, SQL, persistence and transport semantics, and does not benchmark
+optimized inference. This avoids whole-server LLVM optimization and enables
+runtime safety checks. Native Debug reservations remain in effect; runner size,
+concurrency, aggregate memory admission and the two-hour deadline are unchanged.
+The retained diagnostic upload remains mandatory qualification for this change.
+Production release optimization and its independent qualification are unchanged.

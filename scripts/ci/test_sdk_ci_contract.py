@@ -44,7 +44,7 @@ class SdkCiContractTests(unittest.TestCase):
         self.assertIn("steps.toolchain.outputs.zig_nixpkgs_revision", native)
         self.assertIn("grep -q 'dynamically linked'", native)
         self.assertIn("tools/run_bounded_zig_build.py", native)
-        self.assertIn("-Dstrip=true -Dcpu=baseline", native)
+        self.assertIn("-Doptimize=debug -Dstrip=false -Dcpu=baseline", native)
         self.assertIn("-j2", native)
         self.assertNotIn("--maxrss", native)
         self.assertIn("/mnt/cache/antfly/zig/", native)
