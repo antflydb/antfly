@@ -6,9 +6,9 @@ package does not embed a database or download models.
 
 ## Release status
 
-This is a release candidate. Release the SDK foundations in `@antfly/sdk` 0.2.0
-or newer before releasing this package. Until then, use the local tarball verifier
-below. After registry publication:
+This package is a release candidate. Its SDK foundation is published as
+`@antfly/sdk` 0.2.2. Before this package is published, use the local tarball
+verifier below. After registry publication:
 
 ```sh
 npm install @antfly/langchain @antfly/sdk @langchain/core
@@ -168,7 +168,7 @@ pnpm --filter @antfly/langchain... typecheck
 pnpm --filter @antfly/langchain... test
 pnpm --filter @antfly/langchain lint
 pnpm --filter @antfly/langchain test:package
-# Validate compiled integration tarballs against published @antfly/sdk@0.2.1:
+# Validate compiled integration tarballs against published @antfly/sdk@0.2.2:
 node packages/langchain/scripts/verify-package.mjs --registry-sdk --contracts
 # Dedicated server and installed embedding/reranking models required:
 ANTFLY_LIVE=1 pnpm --filter @antfly/langchain test
@@ -266,6 +266,6 @@ metadata; ordinary read queries reuse successful validation until a query error.
 Local package checks deliberately include the development SDK tarball unless
 `--registry-sdk` is set. Before a release, run
 `node scripts/verify-release.mjs langchain` (or `langgraph-store`). That separate
-gate requires dependencies from npm and checks SDK exports/types. SDK 0.2.1 is
+gate requires dependencies from npm and checks SDK exports/types. SDK 0.2.2 is
 published. LangGraph store's registry-only gate requires LangChain to be
 published first.

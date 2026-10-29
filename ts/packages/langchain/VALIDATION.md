@@ -1,9 +1,22 @@
 # LangChain.js validation
 
-Validation on 2026-10-28 used the Python LangChain suite as the behavioral
-reference. The branch packages are `@antfly/langchain` and
-`@antfly/langgraph-store` 0.1.0. The SDK used by the independent consumers is
-the published `@antfly/sdk@0.2.1`, not the workspace SDK.
+Validation uses the Python LangChain suite as the behavioral reference. The
+branch packages are `@antfly/langchain` and `@antfly/langgraph-store` 0.1.0.
+
+On 2026-10-29, after rebasing onto main with SDK 0.2.2, the integration builds,
+type checks, and lint passed. Workspace tests passed: 532 SDK tests with one
+existing conditional skip, 62 LangChain tests, and 7 LangGraph-store tests with
+zero integration skips. An isolated consumer installed published
+`@antfly/sdk@0.2.2` alongside packed integration packages. ESM, CommonJS,
+strict `.mts`/`.cts` types, live smoke, and all 69 integration contracts passed
+using the pinned peers below. The same isolated checks passed with core 1.3.1,
+classic 1.0.57, and openai 1.8.0. The LangChain registry-only release gate also
+passed with published SDK 0.2.2. Raw evidence is under
+`.state/langchain/validation-20261029-*` and the consumer receipt records its
+exact artifact hashes.
+
+The 2026-10-28 cross-platform baseline below used published SDK 0.2.1, not the
+workspace SDK:
 
 | Environment | Checks | Result |
 | --- | --- | --- |

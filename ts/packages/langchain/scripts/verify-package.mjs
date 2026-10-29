@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const registrySDK = process.argv.includes("--registry-sdk");
 const contracts = process.argv.includes("--contracts");
-const registrySDKVersion = process.env.ANTFLY_SDK_VERSION ?? "0.2.1";
+const registrySDKVersion = process.env.ANTFLY_SDK_VERSION ?? "0.2.2";
 const packedNames = registrySDK
   ? ["langchain", "langgraph-store"]
   : ["sdk", "langchain", "langgraph-store"];

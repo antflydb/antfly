@@ -49,5 +49,6 @@ Build/test from `ts`: `pnpm --filter @antfly/langgraph-store... build`, then
 `pnpm --filter @antfly/langgraph-store test`. Set `ANTFLY_LIVE=1` and `ANTFLY_URL`
 to run the two-user runtime integration test. Tests create/drop unique tables.
 The independent package verifier is shared with `@antfly/langchain` and verifies
-all three SDK/integration tarballs. Publish SDK, LangChain, then this package via
-the `ts/antfly/langgraph-store/v*` tag workflow after registry configuration.
+all three SDK/integration tarballs by default. With `--registry-sdk`, it uses the
+published SDK. Publish LangChain before this package via the
+`ts/antfly/langgraph-store/v*` tag workflow after registry configuration.
