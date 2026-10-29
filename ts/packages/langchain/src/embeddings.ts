@@ -66,6 +66,7 @@ export class AntflyEmbeddings extends Embeddings {
           options?.signal?.throwIfAborted();
           return vectors(
             await this.options.client.embedDense(this.options.model, parts, {
+              truncate: this.options.truncate,
               dimensions: this.options.dimensions,
               task_type: "RETRIEVAL_DOCUMENT",
               error_policy: "fail_fast",

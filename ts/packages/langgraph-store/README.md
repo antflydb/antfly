@@ -33,11 +33,13 @@ indexing; a path list overrides default fields. Multiple fields produce separate
 vectors; the best cosine similarity ranks each item. Filters apply before
 pagination. Supported operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`.
 
-Like the Python reference, single-field namespaces use Antfly's native cosine
-index with server-side namespace and value filters. Once a namespace contains a
-multi-field item, a persistent marker selects exact paginated maximum-cosine
-pooling. Markers remain after updates/deletes for cross-process correctness.
-This fallback costs O(namespace records); query pages contain the values, so
+Unfiltered single-field namespaces use Antfly's native cosine index with
+server-side namespace isolation. Searches with value filters use exact paginated
+maximum-cosine pooling so equality compares whole JSON values, including arrays
+and objects, before pagination. Once a namespace contains a multi-field item, a
+persistent marker also selects exact pooling for unfiltered searches. Markers
+remain after updates/deletes for cross-process correctness.
+Exact pooling costs O(namespace records); query pages contain the values, so
 there is no lookup request per item. Namespace listing likewise reads pages.
 `create` provisions the external cosine index (`indexName`, default
 `memory_vectors`). For tables created by the earlier unindexed prototype,

@@ -143,7 +143,11 @@ it("rejects a traversal that leaves scope at an intermediate hop", async () => {
   );
   await expect(graph.queryGraph({ x: { traverse: { start: { keys: [key] } } } })).rejects.toThrow();
 });
-it("sends one multimodal item per embedding request", async () => {
+it.each([
+  true,
+  false,
+  undefined,
+])("sends one multimodal item per request with truncate=%s", async (truncate) => {
   const calls: unknown[] = [];
   vi.stubGlobal(
     "fetch",
@@ -156,6 +160,7 @@ it("sends one multimodal item per embedding request", async () => {
   const embeddings = new AntflyEmbeddings({
     client: new InferenceClient({ baseUrl: "http://antfly.test" }),
     model: "explicit-vision",
+    truncate,
   });
   expect(
     await embeddings.embedMultimodal([
@@ -170,6 +175,10 @@ it("sends one multimodal item per embedding request", async () => {
     [1, 0],
   ]);
   expect(calls).toHaveLength(2);
+  for (const call of calls) {
+    if (truncate === undefined) expect(call).not.toHaveProperty("truncate");
+    else expect(call).toHaveProperty("truncate", truncate);
+  }
 });
 it("does not accept a committed graph response without table outcomes", async () => {
   vi.stubGlobal(

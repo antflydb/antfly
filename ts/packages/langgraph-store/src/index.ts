@@ -134,47 +134,17 @@ class MemoryRecords extends AntflyJSONStore<StoredItem> {
   async nativeSearch(
     ns: string[],
     vector: number[],
-    limit: number,
-    filter: Record<string, unknown> = {}
+    limit: number
   ): Promise<(Item & { score: number })[]> {
     if (!this.vectorIndex) throw new Error("Semantic search requires index embeddings");
-    const predicates: unknown[] = [{ term: { path: "/value/indexed", value: true } }],
-      exclusions: unknown[] = [];
-    for (const [name, condition] of Object.entries(filter)) {
-      const path =
-        "/value/value/" +
-        name
-          .split(".")
-          .map((p) => p.replaceAll("~", "~0").replaceAll("/", "~1"))
-          .join("/");
-      if (
-        condition &&
-        typeof condition === "object" &&
-        !Array.isArray(condition) &&
-        Object.keys(condition).some((k) => k.startsWith("$"))
-      ) {
-        for (const [op, value] of Object.entries(condition)) {
-          if (op === "$eq") predicates.push({ term: { path, value } });
-          else if (op === "$ne") exclusions.push({ term: { path, value } });
-          else if (["$gt", "$gte", "$lt", "$lte"].includes(op))
-            predicates.push({ range: { [path]: { [op.slice(1)]: value } } });
-          else throw new TypeError(`Unsupported filter operator ${op}`);
-        }
-      } else predicates.push({ term: { path, value: condition } });
-    }
     const request: TableQueryRequest = {
       filter_prefix: this.key(prefix(ns)),
       indexes: [this.vectorIndex],
       embeddings: { [this.vectorIndex]: vector },
       limit,
-      filter_query: { conjuncts: predicates } as NonNullable<TableQueryRequest["filter_query"]>,
-      ...(exclusions.length
-        ? {
-            exclusion_query: { disjuncts: exclusions } as NonNullable<
-              TableQueryRequest["exclusion_query"]
-            >,
-          }
-        : {}),
+      filter_query: {
+        term: { path: "/value/indexed", value: true },
+      } as NonNullable<TableQueryRequest["filter_query"]>,
     };
     return queryHits(await this.client.tables.query(this.table, request)).map((hit) => {
       if (
@@ -329,13 +299,11 @@ export class AntflyStore extends BaseStore {
         ? undefined
         : this.vector(await this.options.index!.embeddings.embedQuery(op.query));
     if (!limit) return [];
-    if (query && !(await this.storage.hasMultifield(op.namespacePrefix))) {
-      const native = await this.storage.nativeSearch(
-        op.namespacePrefix,
-        query,
-        offset + limit,
-        op.filter
-      );
+    // Server term/range predicates use array-membership semantics. Evaluate
+    // value filters against stored JSON so all search paths agree before pagination.
+    const filtered = Object.keys(op.filter ?? {}).length > 0;
+    if (query && !filtered && !(await this.storage.hasMultifield(op.namespacePrefix))) {
+      const native = await this.storage.nativeSearch(op.namespacePrefix, query, offset + limit);
       // Match Python's second check for a concurrent first multifield write.
       if (!(await this.storage.hasMultifield(op.namespacePrefix)))
         return native.slice(offset, offset + limit);

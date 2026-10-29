@@ -56,11 +56,19 @@ beforeEach(() => {
             .slice(1)
             .split("/")
             .reduce((v, k) => v?.[k], obj);
+        // The server admits scalar term operands and matches any array element.
+        const term = (actual: unknown, expected: unknown): boolean => {
+          if (expected !== null && typeof expected === "object")
+            throw new Error("Term operands must be scalar");
+          return Array.isArray(actual)
+            ? actual.some((value) => term(value, expected))
+            : actual === expected;
+        };
         const match = (obj: any, q: any): boolean =>
           !q ||
           q.conjuncts?.every((c: any) => match(obj, c)) ||
           q.disjuncts?.some((c: any) => match(obj, c)) ||
-          (q.term && JSON.stringify(get(obj, q.term.path)) === JSON.stringify(q.term.value)) ||
+          (q.term && term(get(obj, q.term.path), q.term.value)) ||
           (q.range &&
             Object.entries(q.range).every(([path, ops]: any) =>
               Object.entries(ops).every(([op, x]: any) => {
@@ -132,6 +140,52 @@ it("applies filters before pagination and honors index false", async () => {
   await expect(memory.search(["a"], { filter: { n: { $unknown: 2 } } })).rejects.toThrow(
     "Unsupported"
   );
+});
+it.each<[Record<string, unknown>, string[]]>([
+  [{ tags: "a" }, ["2"]],
+  [{ tags: { $eq: ["a", "b"] } }, ["1", "3"]],
+  [{ tags: ["a", "b"] }, ["1", "3"]],
+  [{ profile: { x: 1 } }, ["1", "2"]],
+  [{ profile: { $eq: { x: 1 } } }, ["1", "2"]],
+  [{ tags: { $ne: ["a", "b"] } }, ["2"]],
+  [{ tags: { $ne: "a" } }, ["1", "3"]],
+  [{ n: { $gte: 2 } }, ["2"]],
+  [{ n: { $lt: "4" } }, ["3"]],
+  [{ "profile.x": 1 }, ["1", "2"]],
+])("preserves filtered semantic search before and after multifield writes: %j", async (filter, expected) => {
+  const memory = store();
+  await memory.put(["a"], "1", { food: "apple", tags: ["a", "b"], profile: { x: 1 }, n: [2] });
+  await memory.put(["a"], "2", { food: "pear", tags: "a", profile: { x: 1 }, n: 2 });
+  await memory.put(["a"], "3", { food: "apple", tags: ["a", "b"], profile: { x: 2 }, n: "3" });
+  await memory.put(["a"], "4", { tags: "a", profile: { x: 1 }, n: 4 }, false);
+  await memory.put(["other"], "foreign", { tags: "a", profile: { x: 1 }, n: 2 });
+  const search = async () =>
+    (await store().search(["a"], { query: "apple", filter })).map((item) => item.key).sort();
+  expect(await search()).toEqual(expected);
+  await memory.put(["a"], "multi", { parts: ["apple", "pear"] }, ["parts[*]"]);
+  await memory.delete(["a"], "multi");
+  expect(await search()).toEqual(expected);
+});
+it("filters semantic candidates before applying offset and limit across query pages", async () => {
+  const memory = new AntflyStore({
+    client: new AntflyClient({ baseUrl: "http://unused" }),
+    table: "memory",
+    pageSize: 1,
+    index: { dims: 2, embeddings: { embedDocuments, embedQuery: async () => [1, 0] } },
+  });
+  await memory.put(["a"], "1", { food: "apple", tags: ["a"] });
+  await memory.put(["a"], "2", { food: "apple", tags: "a" });
+  await memory.put(["a"], "3", { food: "pear", tags: "a" });
+  expect(
+    (await memory.search(["a"], { query: "apple", filter: { tags: "a" }, limit: 1 })).map(
+      (item) => item.key
+    )
+  ).toEqual(["2"]);
+  expect(
+    (
+      await memory.search(["a"], { query: "apple", filter: { tags: "a" }, offset: 1, limit: 1 })
+    ).map((item) => item.key)
+  ).toEqual(["3"]);
 });
 it("validates vector dimensions, namespaces and TTL", async () => {
   const memory = store();
