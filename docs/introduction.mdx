@@ -11,7 +11,7 @@ order: 1
 - Where do I start?
 </Questions>
 
-Antfly is a database with the retrieval pipeline built in. A table can carry full-text, vector, and graph indexes at the same time, and the models that chunk, embed, rerank, and extract run inside the engine. You insert documents and query them; there is no separate pipeline to assemble around the database. It runs as a single binary on a laptop, as a cluster on Kubernetes, or hosted in [Antfly Cloud](/cloud).
+Antfly is a database with the retrieval pipeline built in. A table can carry full-text, vector, and graph indexes at the same time, and the models that read, transcribe, chunk, embed, rerank, and extract run inside the engine or on a provider you connect. You insert documents and query them; there is no separate pipeline to assemble around the database. It runs as a single binary on a laptop, as a cluster on Kubernetes, or hosted in [Antfly Cloud](/cloud).
 
 ## What You Can Build
 
@@ -27,8 +27,8 @@ Each of these has a guide that ends with the finished thing running:
 ## Inside the Engine
 
 - **One engine, several indexes.** `full_text` (BM25), `embeddings` (dense RaBitQ-compressed or sparse vectors), `graph` (traversal and pathfinding), `algebraic` (aggregates and materializations), and `relational` (ordered composite keys) are index types on the same table and are fused in one query plan. The [Document Engine](/docs/guides/document-engine) page covers how mappings, search modes, filters, sorting, and pagination compose.
-- **Inference inside the engine.** Chunking, embedding, summarization, and entity extraction run as background enrichments, and cross-encoder and late-interaction reranking run as query processors, on [Antfly Inference](/docs/guides/inference), which runs quantized models locally beside the database. Ollama, OpenAI, OpenRouter, Cohere, Gemini, Vertex AI, and AWS Bedrock plug in as index embedders through the same configuration.
-- **Any shape of data.** Text, PDFs (with local OCR when needed), images, and audio, referenced by URL or inserted directly, embedded by native models or with vectors your application manages. See [Multimodal Embeddings](/docs/guides/multimodal).
+- **Enrichment built in.** OCR, transcription, chunking, embedding, summarization, and entity extraction run as background enrichments, and reranking runs as a query processor. Each can use a model running in [Antfly Inference](/docs/guides/inference) beside the database, or a provider you connect: OpenAI, Gemini, Vertex AI, AWS Bedrock, Cohere, Cloudflare, OpenRouter, Ollama, or Apple's native frameworks on macOS. The [model guide](/docs/guides/supported-models) lists the local defaults.
+- **Any shape of data.** Text, PDFs, scanned pages and photos, images, and audio, referenced by URL or inserted directly. Antfly reads, transcribes, and embeds them, or stores vectors your application manages. See [Multimodal Embeddings](/docs/guides/multimodal) and [Transcription](/docs/guides/transcription).
 - **Built for agents.** Streaming RAG, retrieval and query-builder agents, evaluation metrics, and an MCP surface, plus an [agent skill](https://github.com/antflydb/antfly-skills) that teaches a coding agent the whole API.
 - **Distributed by design.** Multi-Raft consensus, horizontal sharding with online splitting, cross-shard write transactions, and a Kubernetes [operator](/docs/operator) with autoscaling. [Architecture](/docs/architecture) explains how the pieces fit.
 - **Local-first too.** [Antfly Lite](/docs/guides/lite) embeds the engine in a single `.aflite` file for desktop and edge applications.

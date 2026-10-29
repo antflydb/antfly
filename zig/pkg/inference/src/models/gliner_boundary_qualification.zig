@@ -771,7 +771,19 @@ fn cudaBatchEntries() [2 + family_profiles.len]Entry {
     for (cudaMultilingualEntries(), 2..) |entry, i| entries[i] = cudaBatchEntry(entry);
     return entries;
 }
-const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries());
+// Metal FP32 batches use the same bounded per-item profiles as serial serving.
+// Keep reduced precision, Multi-Decide and long-document requests independent.
+pub const metal_batch_items: usize = 8;
+fn metalBatchEntries() [2 + family_profiles.len]Entry {
+    var entries: [2 + family_profiles.len]Entry = undefined;
+    entries[0] = base_production_entries[1];
+    entries[1] = transformersWrapperEntries()[1];
+    for (family_profiles, 2..) |profile, i|
+        entries[i] = .{ .identity = fastino_gliner25_multi_v1, .backend = .metal, .features = profile.features, .lengths = profile.lengths };
+    for (&entries) |*entry| entry.lengths.request_items = .{ .min = 2, .max = metal_batch_items };
+    return entries;
+}
+const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries() ++ metalBatchEntries());
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -1375,4 +1387,26 @@ test "CUDA boundary batch rows preserve per-item limits and exclude long documen
     var long = composed_window_lengths;
     long.request_items = Range.exact(2);
     try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(fastino_gliner25_base_v1, .cuda, composed_window_features, long));
+}
+
+test "Metal boundary FP32 batch rows retain per-item geometry and reject unqualified profiles" {
+    for (metalBatchEntries()) |entry| {
+        for ([_]u32{ 2, 4, 8 }) |n| {
+            var lengths = entry.lengths;
+            lengths.request_items = Range.exact(n);
+            try require(entry.identity, .metal, entry.features, lengths);
+        }
+        var lengths = entry.lengths;
+        lengths.request_items = Range.exact(9);
+        try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(entry.identity, .metal, entry.features, lengths));
+        lengths.request_items = Range.exact(2);
+        lengths.padded_sequence_tokens = Range.exact(1_000_000);
+        try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(entry.identity, .metal, entry.features, lengths));
+    }
+    var lengths = fastino_gliner25_base_v1_lengths;
+    lengths.request_items = Range.exact(2);
+    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(fastino_gliner25_base_v1_fp16_encoder, .metal, fastino_gliner25_base_v1_features, lengths));
+    var long = composed_window_lengths;
+    long.request_items = Range.exact(2);
+    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(fastino_gliner25_base_v1, .metal, composed_window_features, long));
 }

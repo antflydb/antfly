@@ -99,7 +99,7 @@ what it can and cannot interrupt). It raises `UnsupportedError` if this
 build does not link the inference runtime or the runtime cannot start.
 
 For decision question types and examples, see the
-[typed decision guide](../../../docs/guides/decisions.md).
+[typed decision guide](../../../docs/reference/decisions.md).
 
 Each call takes the request JSON and returns the response JSON of the
 matching `/ai/v1` route of the Antfly inference HTTP API: `embed()`,

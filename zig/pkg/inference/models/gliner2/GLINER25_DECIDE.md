@@ -63,8 +63,18 @@ writer. Only the encoder and head differ.
   checkpoints keep the prior unsupported-model response on
   `schema_version: 2`.
 - Metal requests on this route are admitted like the boundary route: the
-  model's executor limits are validated and device scratch is leased before
-  the model lock is taken.
+  model's executor limits are validated, then a cancellable per-model admission
+  lock admits one batch's device scratch before taking the execution lock.
+  Queued batches do not reserve duplicate device workspaces.
+- **FP32 Metal batches**: the exact qualified DeBERTa Decide artifact groups
+  up to eight inputs per physical forward, with at most 512 tokens per prepared
+  sequence. Larger requests retain the existing public limit (128 inputs before
+  process-specific limits) and execute in bounded groups. Each group shares one
+  padded encoder forward and a single final logits readback.
+  Split-task requests retain serial execution and the
+  existing eight-sequence limit per input; device scratch admission follows
+  that physical execution choice. Decide Q8 remains rejected on Metal.
+  This does not change the separate Decide-1B request contract.
 
 ```bash
 curl -s localhost:8090/ai/v1/extract -H 'content-type: application/json' -d '{

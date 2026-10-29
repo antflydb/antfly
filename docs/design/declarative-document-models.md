@@ -215,7 +215,7 @@ Cancellation, deadlines and hard resource limits still propagate as failures.
 ## Cloudflare providers
 
 Cloudflare is a general Antfly provider, shared with SQL, retrieval and
-enrichment. See [Cloudflare models](cloudflare-models.md) for coverage across model tasks. Document composites are consumers of those provider protocols.
+enrichment. See [Cloudflare models](../reference/cloudflare-models.md) for coverage across model tasks. Document composites are consumers of those provider protocols.
 Workers AI hosts the models; AI Gateway is optional routing configuration.
 
 An ordinary extraction provider configuration uses:
@@ -858,11 +858,10 @@ work. Whitespace normalization is explicit per corpus case. Costs are not inferr
 from model names or token counts.
 
 `scripts/testdata/document_models/corpus.json` provides deterministic PDF and
-slide-order smoke fixtures. Extend the same corpus format with labelled scanned
-PDFs, receipt photos, long item lists, distortions and image-heavy slides for
-quality qualification. The small smoke corpus does not establish OCR quality on
-those populations. Existing `scripts/eval_extract.py` separately evaluates
-schema-driven extraction against labelled source spans.
+slide-order fixtures. Add labelled cases (scanned PDFs, photos, handwriting,
+image-heavy slides) in the same format to compare readers on your own documents.
+`scripts/eval_extract.py` separately evaluates schema-driven extraction against
+labelled source spans.
 
 
 Cloudflare vision can also be a remote document reading binding:

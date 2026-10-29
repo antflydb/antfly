@@ -20,7 +20,7 @@ See: [Mirror a PostgreSQL Table](/docs/guides/cdc-replication) | [CDC design](ht
 
 ### Document Extraction
 
-The `document_extraction` asset producer downloads a document URL during enrichment and persists derived units such as PDF pages and chunks. PDF pages with no native text use OCR by default with the local `antflydb/Florence-2-base` model. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to opt out. This durable ingestion path is distinct from [template](#templates) helpers such as `remoteMedia`, which prepare media for inference without persisting page artifacts.
+The `document_extraction` asset producer downloads a document URL during enrichment and persists derived units such as PDF pages and chunks. PDF pages with no native text are read with OCR by default. [LightOnOCR-3](/docs/guides/lightonocr3) is the recommended reader; without an `ocr` model configured, the local `antflydb/Florence-2-base` model is used. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to opt out. This durable ingestion path is distinct from [template](#templates) helpers such as `remoteMedia`, which prepare media for inference without persisting page artifacts.
 
 ### Enrichments, Artifacts & Asset Producers
 
