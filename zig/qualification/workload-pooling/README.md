@@ -1258,3 +1258,63 @@ Evidence: lake-heartbeat-v7-final.json records the focused lake admission,
 maintenance source-pin renewal, provider-opening, real text-retirement, SQL scan
 startup and physical read-resource targets. lake-heartbeat-final.json binds their
 tested source hashes to the committed bytes.
+
+
+### Shared admitted lake snapshot heartbeats (2026-10-29)
+
+The snapshot-heartbeat admission path above is now integrated. Configured SQL,
+search, readiness, catalog/maintenance and native-index source opening share a
+lazy server-owned renewal service. The host lookup is deferred until a managed
+snapshot actually needs a pin. It does not allocate a worker for unrelated
+queries or for a source without managed snapshot protection.
+
+One control execution is reserved before task publication and remains parked
+between renewal sweeps and during physical provider waits. A fixed registry
+holds at most 64 borrowed source links; its worst-case link metadata is included
+in the service reservation. Every callback retains that reader's original root,
+request deadline, source refusal and cached Unix/suspend-inclusive lease bounds.
+The server's control execution supplies CPU, never fresh query/read authority.
+Admitted owners without a configured service fail explicitly; the existing
+unadmitted/disabled path remains explicit.
+
+Protected services, lease children and cleanup jointly leave the final control
+registry slot and at least half of control retained-byte capacity available.
+Services cannot reclassify into ordinary work. Scheduler metrics expose service
+count and retained bytes. New registration waits poll original authority while
+lending caller CPU; expiry can abandon an unregistered candidate. Reader
+retirement removes its link before joining the one in-flight callback, lends
+CPU during that join and stops/joins the worker when the registry becomes empty.
+Event completion is published under the registry mutex before a detached owner
+can be freed. Server shutdown closes admission before provider opening, joins
+the worker, then retires its executor before scheduler/Io teardown. Readiness and
+catalog routes now bind their original native/opaque execution for these waits.
+
+A service CPU denial fences its registered readers. A later registration can
+join the terminal worker and reserve a new execution, but the service epoch
+prevents old readers from reacquiring rights. A single reader's cancellation,
+expiry, transport failure or retirement remains local to that reader.
+
+Real local-provider fixtures cover 64 pins across eight retained query owners,
+quota overflow, one-reader refusal with another reader still renewing, service
+recovery without reviving old readers, initial pin acquisition and periodic
+provider I/O. Fourteen native/opaque periodic cases cover success, cancellation,
+original deadline, source expiry, transport failure, reader cleanup and server
+shutdown. An uncancelable sync barrier proves physical callback joins; a queued
+registration behind that join must expire at its original deadline. Unrelated
+query and health grants succeed while the retiring reader lends its CPU. The
+configured resolver rejects shutdown before artifact credentials/providers open.
+These are real filesystem-provider operations with injected waiting, not live
+cloud or disk-latency benchmark evidence.
+
+Evidence: `lake-service-v10-final.json` passes all ten affected targets: SQL lake
+admission, maintenance source-pin renewal, lake-store opening, text retirement,
+SQL scan startup, read resources, native/opaque owner ports, SQL write teams and
+cleanup budgets. It records 112/112 successful steps and 200/200 tests in that
+run, with unchanged source inputs. `lake-service-final.json` binds the tested
+source bytes to the committed snapshots. Licensing and Apache boundaries pass.
+
+The full design remains open. Native published-index reader-lease heartbeats
+(`lake_index_reader_lease.Pool`) still need admitted renewal; they are distinct
+from the external snapshot pins completed here. The previously recorded initial
+work-lease/provider boundaries, preparation and cross-engine recovery gates
+(including file-engine FD recovery) remain open. Full qualification is waived.

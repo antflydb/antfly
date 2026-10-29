@@ -42,9 +42,19 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     };
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    var execution: local.common_request_admission.runnable_scheduler.Execution = .{};
+    defer execution.finish();
+    var bridge: ?@import("runnable_native_borrow.zig").Bridge = if (normalized.execution_team) |team|
+        try @import("runnable_native_borrow.zig").Bridge.init(&team.borrow, team.allocator)
+    else
+        null;
+    if (bridge) |*binding| {
+        try binding.bind(&execution);
+        context = context.withExecution(&execution);
+    }
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);
     sql_table.external_indexes = .{ .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
-    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
+    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = server.snapshotRenewalProvider(), .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
     try server.prepareLakeCache();
     var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = sql_table.external_base_source }, options.lakeOptions(), context, &server.lake_read_cache);
     defer source.deinit();

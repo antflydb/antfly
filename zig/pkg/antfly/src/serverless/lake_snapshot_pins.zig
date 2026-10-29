@@ -129,7 +129,9 @@ pub const Owner = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     heartbeat: ?std.Io.Future(void) = null,
     heartbeat_interval_ns: u64 = 30 * std.time.ns_per_s,
-    fn checkSource(self: *const Owner) !void {
+    service: ?*@import("lake_renewal_service.zig").Service = null,
+    link: @import("lake_renewal_service.zig").Service.Link = .{},
+    pub fn checkSource(self: *const Owner) !void {
         if (self.stopping.load(.acquire)) return error.Canceled;
         try self.parent.checkLifetime();
         const deadline_ns = self.unix_deadline.load(.acquire);
@@ -168,11 +170,17 @@ pub const Owner = struct {
         self.authority_deadline.store(authority +| @min(duration_ns, deadline_ns -| now), .release);
     }
     pub fn start(self: *Owner) !local.serverless_lake_host.SnapshotPin {
+        try self.checkSource();
+        if (self.service == null and (self.parent.execution != null or self.parent.wait != null)) return error.SnapshotRenewalServiceRequired;
         try self.renew(self.parent);
-        self.heartbeat = self.io.concurrent(run, .{self}) catch |err| {
-            try self.checkSource();
-            return err;
-        };
+        if (self.service) |service| {
+            try service.attach(self);
+        } else {
+            self.heartbeat = self.io.concurrent(run, .{self}) catch |err| {
+                try self.checkSource();
+                return err;
+            };
+        }
         return .{ .ptr = self, .check = check, .deinit = destroy };
     }
     fn run(self: *Owner) void {
@@ -185,8 +193,11 @@ pub const Owner = struct {
         }
     }
     fn heartbeatOnce(self: *Owner) !void {
+        return self.heartbeatFor(self.backgroundContext());
+    }
+    pub fn heartbeatFor(self: *Owner, context: Context) !void {
         try self.refusal.check();
-        self.renew(self.backgroundContext()) catch |err| {
+        self.renew(context) catch |err| {
             const cause = blk: {
                 self.checkSource() catch |original| break :blk original;
                 if (err == error.LakeSnapshotRetired) break :blk err;
@@ -203,10 +214,12 @@ pub const Owner = struct {
         const self: *Owner = @ptrCast(@alignCast(raw));
         try self.refusal.check();
         try self.checkSource();
+        if (self.service) |service| try service.checkOwner(self);
     }
     pub fn destroy(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
         self.stopping.store(true, .release);
+        if (self.service) |service| service.detach(self);
         if (self.heartbeat) |*future| future.cancel(self.io);
         self.opened.deinit();
         self.a.free(self.prefix);
@@ -231,7 +244,7 @@ test "external lake snapshot retirement fences new admission and protects durabl
 
 test "external lake snapshot heartbeat preserves source bounds and passive checks through real provider waits" {
     const Runnable = local.common_request_admission.runnable_scheduler;
-    const Mode = enum { success, canceled, deadline, expired, cleanup, provider_failure };
+    const Mode = enum { success, canceled, deadline, expired, cleanup, provider_failure, shutdown };
     const Fixture = struct {
         threaded: std.Io.Threaded,
         execution: ?*Runnable.Execution = null,
@@ -244,6 +257,7 @@ test "external lake snapshot heartbeat preserves source bounds and passive check
         release: std.Io.Event = .unset,
         destroyed: std.atomic.Value(bool) = .init(false),
         fail_sync: std.atomic.Value(bool) = .init(false),
+        cleanup_progress: std.atomic.Value(bool) = .init(false),
         fn checkpoint(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             _ = self.checkpoint_calls.fetchAdd(1, .acq_rel);
@@ -252,6 +266,47 @@ test "external lake snapshot heartbeat preserves source bounds and passive check
         fn destroy(self: *@This(), owner: *Owner) void {
             Owner.destroy(owner);
             self.destroyed.store(true, .release);
+        }
+        fn shutdown(self: *@This(), service: *@import("lake_renewal_service.zig").Service) void {
+            service.deinit();
+            self.destroyed.store(true, .release);
+        }
+        fn releaseForCleanup(self: *@This(), owner: *Owner) !void {
+            const io = self.threaded.io();
+            defer self.release.set(io);
+            const until = platform.time.monotonicNs() + std.time.ns_per_s;
+            while (true) {
+                platform.sync.lockYielding(&self.scheduler.?.mutex);
+                const blocked = self.execution.?.entry.?.state == .resource_blocked;
+                self.scheduler.?.mutex.unlock();
+                if (owner.stopping.load(.acquire) and blocked) break;
+                if (platform.time.monotonicNs() >= until) return error.CleanupDidNotLendReaderCpu;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            var query: Runnable.Execution = .{};
+            defer query.finish();
+            try query.startWithSlots(self.scheduler.?, .{ .io = io, .allow_wait = false }, .query, 2);
+            var health: Runnable.Execution = .{};
+            defer health.finish();
+            try health.start(self.scheduler.?, .{ .io = io, .allow_wait = false }, .control);
+            health.finish();
+            query.finish();
+            var pending_execution: Runnable.Execution = .{};
+            defer pending_execution.finish();
+            try pending_execution.start(self.scheduler.?, .{ .io = io, .retained_bytes = 4096 }, .query);
+            var pending: Owner = .{
+                .a = std.testing.allocator,
+                .opened = owner.opened,
+                .prefix = owner.prefix,
+                .snapshot = owner.snapshot,
+                .parent = (Context{ .io = io, .deadline_ns = platform.time.monotonicNs() + 50 * std.time.ns_per_ms }).withExecution(&pending_execution),
+                .io = io,
+                .service = owner.service,
+                .unix_deadline = .init(platform.time.realtimeNs() + duration_ns),
+                .authority_deadline = .init(platform.time.authorityNs() + duration_ns),
+            };
+            try std.testing.expectError(error.DeadlineExceeded, owner.service.?.attach(&pending));
+            self.cleanup_progress.store(true, .release);
         }
         fn sync(raw: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
             const threaded: *std.Io.Threaded = @ptrCast(@alignCast(raw.?));
@@ -272,7 +327,7 @@ test "external lake snapshot heartbeat preserves source bounds and passive check
         }
     };
     const a = std.testing.allocator;
-    for (std.enums.values(Mode)) |mode| {
+    for (std.enums.values(Mode)) |mode| for ([_]bool{ false, true }) |borrowed_owner| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
@@ -292,6 +347,16 @@ test "external lake snapshot heartbeat preserves source bounds and passive check
         try execution.startWithSlots(&scheduler, .{ .io = io, .retained_bytes = 4096 }, .query, 2);
         fixture.execution = &execution;
         fixture.scheduler = &scheduler;
+        var read: @import("../api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = a };
+        const team = try read.team();
+        var bridge = try @import("../api/runnable_native_borrow.zig").Bridge.init(&team.borrow, a);
+        var borrowed: Runnable.Execution = .{};
+        defer borrowed.finish();
+        if (borrowed_owner) try bridge.bind(&borrowed);
+        const reader_execution = if (borrowed_owner) &borrowed else &execution;
+        var service: @import("lake_renewal_service.zig").Service = .{ .interval_ns = 10 * std.time.ns_per_ms };
+        service.configure(io, &scheduler);
+        defer service.deinit();
         var canceled = std.atomic.Value(bool).init(false);
         const deadline = platform.time.monotonicNs() + if (mode == .deadline) @as(u64, 400 * std.time.ns_per_ms) else 5 * std.time.ns_per_s;
         const owner = try a.create(Owner);
@@ -301,13 +366,16 @@ test "external lake snapshot heartbeat preserves source bounds and passive check
             .prefix = try a.dupe(u8, "identity"),
             .snapshot = try a.dupe(u8, "42"),
             .io = io,
-            .heartbeat_interval_ns = 10 * std.time.ns_per_ms,
-            .parent = (Context{ .io = io, .deadline_ns = deadline, .cancellation = .fromAtomic(&canceled), .additional_checkpoint = .{ .ptr = &fixture, .check = Fixture.checkpoint } }).withExecution(&execution),
+            .service = &service,
+            .parent = (Context{ .io = io, .deadline_ns = deadline, .cancellation = .fromAtomic(&canceled), .additional_checkpoint = .{ .ptr = &fixture, .check = Fixture.checkpoint } }).withExecution(reader_execution),
         };
         const pin = try owner.start();
         var pin_owned = true;
         defer if (pin_owned) pin.deinit(pin.ptr);
         const initial = owner.unix_deadline.load(.acquire);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_services);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().control_children);
+        try std.testing.expect(owner.heartbeat == null);
         try std.testing.expect(fixture.initial_loans.load(.acquire) > 0);
         fixture.checkpoint_armed.store(true, .release);
         const checkpoints = fixture.checkpoint_calls.load(.acquire);
@@ -339,17 +407,30 @@ test "external lake snapshot heartbeat preserves source bounds and passive check
         var destruction: ?std.Io.Future(void) = null;
         defer if (destruction) |*future| future.cancel(io);
         if (mode == .cleanup) {
-            destruction = try io.concurrent(Fixture.destroy, .{ &fixture, owner });
+            query.finish();
+            try execution.enter(.query);
+            var helper = try io.concurrent(Fixture.releaseForCleanup, .{ &fixture, owner });
+            defer _ = helper.cancel(io) catch {};
+            pin.deinit(pin.ptr);
+            pin_owned = false;
+            try helper.await(io);
+            try std.testing.expect(fixture.cleanup_progress.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+        }
+        if (mode == .shutdown) {
+            destruction = try io.concurrent(Fixture.shutdown, .{ &fixture, &service });
             try io.sleep(.fromMilliseconds(10), .awake);
             try std.testing.expect(!fixture.destroyed.load(.acquire));
         }
         fixture.release.set(io);
-        if (mode == .cleanup) {
+        if (mode == .shutdown) {
             destruction.?.await(io);
             destruction = null;
-            pin_owned = false;
             try std.testing.expect(fixture.destroyed.load(.acquire));
-        } else {
+            try std.testing.expectError(error.LakeSnapshotReadLeaseExpired, pin.check(pin.ptr));
+            pin.deinit(pin.ptr);
+            pin_owned = false;
+        } else if (mode != .cleanup) {
             while (true) {
                 if (mode == .success and owner.unix_deadline.load(.acquire) > initial) break;
                 owner.refusal.check() catch break;
@@ -383,14 +464,150 @@ test "external lake snapshot heartbeat preserves source bounds and passive check
                     try std.testing.expectError(error.LakeSnapshotReadLeaseExpired, pin.check(pin.ptr));
                     try std.testing.expectEqual(initial, owner.unix_deadline.load(.acquire));
                 },
-                .cleanup => unreachable,
+                .cleanup, .shutdown => unreachable,
             }
             pin.deinit(pin.ptr);
             pin_owned = false;
         }
         query.finish();
+        borrowed.finish();
         execution.finish();
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+fn fixtureOwner(a: A, client: objectstore.Client, context: Context, service: *@import("lake_renewal_service.zig").Service, snapshot: []const u8) !*Owner {
+    var opened = try local.serverless_object_store_support.OpenedObjectStore.initWithClient(a, client, "pins", "");
+    errdefer opened.deinit();
+    const prefix = try a.dupe(u8, "shared");
+    errdefer a.free(prefix);
+    const id = try a.dupe(u8, snapshot);
+    errdefer a.free(id);
+    const owner = try a.create(Owner);
+    errdefer a.destroy(owner);
+    owner.* = .{ .a = a, .opened = opened, .prefix = prefix, .snapshot = id, .parent = context, .io = context.io.?, .service = service };
+    _ = try owner.start();
+    return owner;
+}
+
+test "external lake snapshot service shares bounded execution across readers and isolates refusal" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Service = @import("lake_renewal_service.zig").Service;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var filesystem = try objectstore.FilesystemClient.initWithIo(a, root, std.testing.io);
+    defer filesystem.deinit();
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 3 });
+    defer scheduler.close();
+    var service: Service = .{ .interval_ns = 5 * std.time.ns_per_ms };
+    service.configure(std.testing.io, &scheduler);
+    defer service.deinit();
+    var executions: [8]Runnable.Execution = @splat(.{});
+    defer for (&executions) |*execution| execution.finish();
+    var flags: [Service.limit]std.atomic.Value(bool) = @splat(.init(false));
+    var owners: [Service.limit]?*Owner = @splat(null);
+    defer for (&owners) |*owner| if (owner.*) |live| Owner.destroy(live);
+    const deadline = platform.time.monotonicNs() + 10 * std.time.ns_per_s;
+    for (&owners, 0..) |*owner, index| {
+        const execution = &executions[index % executions.len];
+        if (index < executions.len) try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 4096 }, .query) else try execution.enter(.query);
+        var buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buffer, "snapshot-{d}", .{index});
+        owner.* = try fixtureOwner(a, filesystem.client(), (Context{ .io = std.testing.io, .deadline_ns = deadline, .cancellation = .fromAtomic(&flags[index]) }).withExecution(execution), &service, id);
+        try std.testing.expect(owner.*.?.heartbeat == null);
+        try execution.park(.resource_blocked);
     }
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_services);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().control_children);
+    try executions[0].enter(.query);
+    const overflow = (Context{ .io = std.testing.io, .deadline_ns = deadline }).withExecution(&executions[0]);
+    try std.testing.expectError(error.SchedulerFull, fixtureOwner(a, filesystem.client(), overflow, &service, "overflow"));
+    try executions[0].park(.resource_blocked);
+    var health: Runnable.Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = deadline }, .control);
+    health.finish();
+    const healthy = owners[owners.len - 1].?;
+    const before = healthy.unix_deadline.load(.acquire);
+    flags[0].store(true, .release);
+    while (true) {
+        const refused = if (owners[0].?.refusal.check()) |_| false else |_| true;
+        if (refused and healthy.unix_deadline.load(.acquire) > before) break;
+        if (platform.time.monotonicNs() >= deadline) return error.SharedSnapshotRenewalDidNotProgress;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.Canceled, Owner.check(owners[0].?));
+    try Owner.check(healthy);
+    for (&owners) |*owner| {
+        Owner.destroy(owner.*.?);
+        owner.* = null;
+    }
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().control_services);
+    try std.testing.expectEqual(@as(usize, 0), service.count);
+    for (&executions) |*execution| execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "external lake snapshot service recovers its execution without reviving failed readers" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Service = @import("lake_renewal_service.zig").Service;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var filesystem = try objectstore.FilesystemClient.initWithIo(a, root, std.testing.io);
+    defer filesystem.deinit();
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 50 });
+    defer scheduler.close();
+    var service: Service = .{ .interval_ns = 5 * std.time.ns_per_ms };
+    service.configure(std.testing.io, &scheduler);
+    defer service.deinit();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    const context = (Context{ .io = std.testing.io, .deadline_ns = platform.time.monotonicNs() + 5 * std.time.ns_per_s }).withExecution(&execution);
+    const old = try fixtureOwner(a, filesystem.client(), context, &service, "old");
+    var old_owned = true;
+    defer if (old_owned) Owner.destroy(old);
+    try execution.park(.resource_blocked);
+    var health: Runnable.Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io }, .control);
+    const until = platform.time.monotonicNs() + 3 * std.time.ns_per_s;
+    while (!service.failed.load(.acquire)) {
+        if (platform.time.monotonicNs() >= until) return error.ServiceDidNotObserveDeniedControl;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.LakeSnapshotReadLeaseExpired, Owner.check(old));
+    health.finish();
+    var next_execution: Runnable.Execution = .{};
+    defer next_execution.finish();
+    try next_execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    const next_context = (Context{ .io = std.testing.io, .deadline_ns = context.deadline_ns }).withExecution(&next_execution);
+    const next = try fixtureOwner(a, filesystem.client(), next_context, &service, "new");
+    var next_owned = true;
+    defer if (next_owned) Owner.destroy(next);
+    const initial = next.unix_deadline.load(.acquire);
+    try next_execution.park(.resource_blocked);
+    while (next.unix_deadline.load(.acquire) <= initial) {
+        try Owner.check(next);
+        if (platform.time.monotonicNs() >= until) return error.ServiceDidNotRecover;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.LakeSnapshotReadLeaseExpired, Owner.check(old));
+    try Owner.check(next);
+    Owner.destroy(old);
+    old_owned = false;
+    Owner.destroy(next);
+    next_owned = false;
+    execution.finish();
+    next_execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

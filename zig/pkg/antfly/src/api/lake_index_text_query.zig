@@ -116,7 +116,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();
-    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| cut.catalog_metadata else null, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = server.snapshotRenewalProvider(), .retained_catalog_metadata = if (retained) |cut| cut.catalog_metadata else null, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     defer store.deinit();
     store.implementation.cloud_io = server.embedding_provider_runtime.io;

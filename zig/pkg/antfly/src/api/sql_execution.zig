@@ -1225,7 +1225,7 @@ pub const Adapter = struct {
             const table = try resolve(self, scratch, cut.name orelse return error.CatalogGenerationChanged, .read);
             if (table.id != cut.table_id or table.schema_version != cut.schema_version or !std.mem.eql(u8, table.physical_name, entry.table_name) or (if (table.external_indexes) |indexes| indexes.object_generation else 0) != cut.object_generation) return error.SqlWriteConflict;
             const binding = (table.external_base_source orelse return error.SqlWriteConflict).binding;
-            const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
+            const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = self.server.snapshotRenewalProvider(), .snapshot_execution = self.runnable orelse self.write_execution, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
             var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load);
             defer current.deinit(scratch);
             if (!std.mem.eql(u8, current.table.metadata_location, cut.metadata_location) or !std.mem.eql(u8, current.table.metadata_json, cut.metadata_json) or try @import("../serverless/lake_ingestion.zig").watermark(scratch, binding, options, context) != cut.pending.lsn) return error.SqlWriteConflict;
@@ -1717,7 +1717,7 @@ pub const Adapter = struct {
         try self.server.prepareLakeCache();
         const normalized = try self.context.platformDeadline();
         var context: local.serverless_query_lake_read_context.Context = try self.lakeReadContext(normalized.deadline_ns);
-        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = self.server.snapshotRenewalProvider(), .snapshot_execution = self.runnable orelse self.write_execution, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
         var source = try @import("lake_published_navigation.zig").openFor(a, self.server, table.id, if (table.external_indexes) |indexes| indexes.catalog_json else "", .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, self.context, null, if (self.cpuScope()) |scope| scope.execution else null);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
@@ -1871,7 +1871,7 @@ pub const Adapter = struct {
         const expiry_deadline = time.monotonicNs() +| (cut.expires_ms - wall_now) * std.time.ns_per_ms;
         normalized.deadline_ns = @min(normalized.deadline_ns orelse expiry_deadline, expiry_deadline);
         self.context = normalized;
-        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = self.server.snapshotRenewalProvider(), .snapshot_execution = self.runnable orelse self.write_execution, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
         var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, table.external_base_source.?.binding, options, try self.lakeReadContext(normalized.deadline_ns), .load);
         defer current.deinit(a);
         const root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(a, current.table.metadata_json);
@@ -1907,7 +1907,7 @@ pub const Adapter = struct {
         if (receipt.object_generation != generation) return error.ReadReceiptGenerationMismatch;
         const binding = table.external_base_source.?.binding;
         if (binding.write_policy != .iceberg_writer) return error.UnsupportedReadVisibility;
-        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = generation };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = self.server.snapshotRenewalProvider(), .snapshot_execution = self.runnable orelse self.write_execution, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = generation };
         const normalized = try self.context.platformDeadline();
         const time = @import("antfly_platform").time;
         const wait_ms = self.read_requirements.wait_ms orelse 5000;
@@ -2042,7 +2042,7 @@ pub const Adapter = struct {
                 if (retained) |cut| if (self.read_requirements.after_write) |receipt| if (receipt.table_id == request.table.id) try self.read_requirements.requireCoverage(request.table.id, cut.object_generation, cut.pending.lsn, true);
                 const ready_metadata = if (retained == null) try self.awaitSqlReceipt(scratch.allocator(), alloc, request.table) else null;
                 const normalized = try self.context.platformDeadline();
-                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
+                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = self.server.snapshotRenewalProvider(), .snapshot_execution = self.runnable orelse self.write_execution, .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
                 source.* = try @import("lake_published_navigation.zig").openFor(alloc, self.server, request.table.id, if (request.table.external_indexes) |indexes| indexes.catalog_json else "", schema, lake_options.lakeOptions(), try self.lakeReadContext(normalized.deadline_ns), self.context, null, if (self.cpuScope()) |scope| scope.execution else null);
                 errdefer source.deinit();
                 try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, try self.lakeReadContext(normalized.deadline_ns));

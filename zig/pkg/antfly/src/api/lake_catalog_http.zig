@@ -51,8 +51,19 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     if (request.expected_table_id) |id| if (id != table.table_id) return error.TableGenerationChanged;
     var source = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return error.InvalidLakeCatalog;
     defer source.deinit(a);
-    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
-    const lake_context: catalog.types.Context = .{ .io = server.sharedApiNetworkIo(), .deadline_ns = context.deadline_ns, .cancellation = if (context.cancellation.ptr != null and context.cancellation.is_cancelled_fn != null) .{ .ptr = context.cancellation.ptr.?, .is_cancelled_fn = context.cancellation.is_cancelled_fn.? } else null };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = server.snapshotRenewalProvider(), .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+    var lake_context: catalog.types.Context = .{ .io = server.sharedApiNetworkIo(), .deadline_ns = context.deadline_ns, .cancellation = if (context.cancellation.ptr != null and context.cancellation.is_cancelled_fn != null) .{ .ptr = context.cancellation.ptr.?, .is_cancelled_fn = context.cancellation.is_cancelled_fn.? } else null };
+    const admission_context = try context.platformDeadline();
+    var execution: local.common_request_admission.runnable_scheduler.Execution = .{};
+    defer execution.finish();
+    var bridge: ?@import("runnable_native_borrow.zig").Bridge = if (admission_context.execution_team) |team|
+        try @import("runnable_native_borrow.zig").Bridge.init(&team.borrow, team.allocator)
+    else
+        null;
+    if (bridge) |*binding| {
+        try binding.bind(&execution);
+        lake_context = lake_context.withExecution(&execution);
+    }
     if (request.action == .reconcile and source.binding.catalog == null) {
         try server.prepareLakeCache();
         var serving = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .external_base_source = source }, options.lakeOptions(), .{ .io = server.sharedApiNetworkIo(), .deadline_ns = context.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(context.cancellation.ptr, context.cancellation.is_cancelled_fn) }, &server.lake_read_cache);

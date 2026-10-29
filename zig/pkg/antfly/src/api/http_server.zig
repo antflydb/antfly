@@ -4183,6 +4183,7 @@ pub const ApiHttpServer = struct {
     lake_cache_start_mutex: std.Io.Mutex = .init,
     lake_query_metrics: @import("lake_query_metrics.zig").Metrics = .{},
     lake_reader_leases: @import("lake_index_reader_lease.zig").Pool = .{},
+    lake_snapshot_renewals: @import("../serverless/lake_renewal_service.zig").Service = .{},
     lake_recent_vector_jobs: @import("lake_recent_vectors.zig").Cache = .{},
     lake_retained_groups: @import("antfly_local_sources").serverless_query_lake_decoded_cache.Cache = .{ .a = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator) },
     lake_retained_payloads: @import("lake_retained_cut.zig").Cache = .{ .max_entries = 512, .budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 } },
@@ -4673,6 +4674,19 @@ pub const ApiHttpServer = struct {
 
     pub fn startSqlRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, options: @import("antfly_local_sources").common_bounded_admission.Options, class: RunnableScheduler.Class) !void {
         try execution.start(self.runnableScheduler(), options, class);
+    }
+
+    pub fn snapshotRenewalProvider(self: *ApiHttpServer) @import("../serverless/configured_object_store_support.zig").SnapshotRenewalProvider {
+        return .{ .ptr = self, .get = struct {
+            fn get(raw: *anyopaque) *@import("../serverless/lake_renewal_service.zig").Service {
+                return @as(*ApiHttpServer, @ptrCast(@alignCast(raw))).snapshotRenewals();
+            }
+        }.get };
+    }
+
+    pub fn snapshotRenewals(self: *ApiHttpServer) *@import("../serverless/lake_renewal_service.zig").Service {
+        self.lake_snapshot_renewals.configure(self.embedding_provider_runtime.io, self.runnableScheduler());
+        return &self.lake_snapshot_renewals;
     }
 
     fn runnableScheduler(self: *ApiHttpServer) ?*RunnableScheduler.Scheduler {
@@ -5665,6 +5679,7 @@ pub const ApiHttpServer = struct {
 
     pub fn deinit(self: *ApiHttpServer) void {
         self.closeReadRetirementAdmission();
+        self.lake_snapshot_renewals.deinit();
         if (self.owned_remote_attempts.load(.acquire)) |state| {
             state.registry.closeAdmission();
             if (state.endpoint_source) |source| source.close();
@@ -18475,7 +18490,7 @@ pub const ApiHttpServer = struct {
                         return server.index_installation_closing.load(.acquire);
                     }
                 }.canceled };
-                const ingest_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.cfg.node_config, .secret_store = self.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+                const ingest_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = self.snapshotRenewalProvider(), .node_config = self.cfg.node_config, .secret_store = self.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
                 const context: local.serverless_query_lake_read_context.Context = .{ .io = self.embedding_provider_runtime.io, .cancellation = ingest_cancel };
                 // Keep the keyed reconciliation trigger alive while queued WAL
                 // transactions remain. The next pass resolves fresh authority
@@ -18557,7 +18572,7 @@ pub const ApiHttpServer = struct {
         @import("lake_retained_cut.zig").collect(&retained_artifacts, table.table_id, store.identity, platform_time.realtimeNs() / std.time.ns_per_ms, cancel) catch |err| {
             std.log.warn("native retained search cut collection deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };
-        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = config, .secret_store = self.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .snapshot_renewal_provider = self.snapshotRenewalProvider(), .node_config = config, .secret_store = self.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
         try self.prepareLakeCache();
         const source_options = options.lakeOptions();
         var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema.external_base_source }, source_options, context, &self.lake_read_cache);

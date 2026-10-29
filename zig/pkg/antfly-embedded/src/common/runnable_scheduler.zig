@@ -293,6 +293,7 @@ pub const Entry = struct {
     cleanup_active: bool = false,
     protected_cleanup_root: bool = false,
     protected_control_child: bool = false,
+    protected_control_service: bool = false,
     dormant_cleanup_root: bool = false,
     /// CPU partition only: never changes query, completion or cleanup authority.
     publication_active: bool = false,
@@ -435,6 +436,8 @@ pub const Scheduler = struct {
         child_operations: usize = 0,
         control_children: usize = 0,
         control_child_bytes: u64 = 0,
+        control_services: usize = 0,
+        control_service_bytes: u64 = 0,
         retained_bytes: u64 = 0,
         control_operations: usize = 0,
         control_retained_bytes: u64 = 0,
@@ -1132,11 +1135,20 @@ pub const Scheduler = struct {
                 budget.max_wait_ms == 0 or budget.max_wait_ms > self.config.max_wait_ms or budget.estimated_work_ns == 0)
                 return error.InvalidRunnableDemand;
         }
+        if (e.protected_control_service) {
+            if (!control or e.protected_control_child or e.protected_cleanup_root or
+                self.metrics.control_children + self.metrics.control_services + self.metrics.cleanup_operations >= control_count -| 1 or
+                e.bytes > (self.config.control_bytes / 2) -| (self.metrics.control_child_bytes + self.metrics.control_service_bytes + self.metrics.cleanup_retained_bytes))
+            {
+                self.metrics.rejected +|= 1;
+                return error.SchedulerFull;
+            }
+        }
         if (e.protected_control_child) {
             // Background lease keepers cannot consume the final control registry
             // slot or more than half its retained memory, including cleanup.
-            if (!control or self.metrics.control_children + self.metrics.cleanup_operations >= control_count -| 1 or
-                e.bytes > (self.config.control_bytes / 2) -| (self.metrics.control_child_bytes + self.metrics.cleanup_retained_bytes))
+            if (!control or self.metrics.control_children + self.metrics.control_services + self.metrics.cleanup_operations >= control_count -| 1 or
+                e.bytes > (self.config.control_bytes / 2) -| (self.metrics.control_child_bytes + self.metrics.control_service_bytes + self.metrics.cleanup_retained_bytes))
             {
                 self.metrics.rejected +|= 1;
                 return error.SchedulerFull;
@@ -1147,8 +1159,8 @@ pub const Scheduler = struct {
             // its last operation or more than half its retained byte reserve.
             const cleanup_limit = @min(@as(usize, 2), control_count -| 1);
             if (!control or self.metrics.cleanup_operations >= cleanup_limit or
-                self.metrics.cleanup_operations + self.metrics.control_children >= control_count -| 1 or
-                e.bytes > (self.config.control_bytes / 2) -| (self.metrics.cleanup_retained_bytes + self.metrics.control_child_bytes))
+                self.metrics.cleanup_operations + self.metrics.control_children + self.metrics.control_services >= control_count -| 1 or
+                e.bytes > (self.config.control_bytes / 2) -| (self.metrics.cleanup_retained_bytes + self.metrics.control_child_bytes + self.metrics.control_service_bytes))
             {
                 self.metrics.rejected +|= 1;
                 return error.ResourceTemporarilyUnavailable;
@@ -1183,6 +1195,10 @@ pub const Scheduler = struct {
         if (e.protected_control_child) {
             self.metrics.control_children += 1;
             self.metrics.control_child_bytes += e.bytes;
+        }
+        if (e.protected_control_service) {
+            self.metrics.control_services += 1;
+            self.metrics.control_service_bytes += e.bytes;
         }
         // Registry/count/bytes cover queued, running AND blocked operations.
         // Resume never needs another reservation or allocation.
@@ -1537,6 +1553,7 @@ pub const Scheduler = struct {
     pub fn reclassifyBlocked(self: *Scheduler, e: *Entry, class: Class) !void {
         self.lock();
         defer self.mutex.unlock();
+        if (e.protected_control_service and class != .control) return error.InvalidRunnableTransition;
         if (e.scheduler != self) return error.InvalidRunnableTransition;
         if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
@@ -1906,6 +1923,11 @@ pub const Scheduler = struct {
             }
             self.metrics.child_operations -= 1;
             e.parent = null;
+        }
+        if (e.protected_control_service) {
+            self.metrics.control_services -= 1;
+            self.metrics.control_service_bytes -= e.bytes;
+            e.protected_control_service = false;
         }
         if (e.reserved_control) {
             self.metrics.control_operations -= 1;
@@ -2292,6 +2314,20 @@ pub const Execution = struct {
         self.entry = .{ .options = options, .class = .write, .slots = 1, .bytes = options.retained_bytes };
         errdefer self.finish();
         try scheduler.reserveCleanupRoot(&self.entry.?, budget_ns);
+    }
+
+    /// Fund one independent server-owned control worker before publishing its
+    /// task. It starts parked; its worker obtains CPU on activation. Service,
+    /// child and cleanup reservations jointly preserve health count/bytes.
+    pub fn reserveControlService(self: *Execution, owner: *Scheduler, options: admission.Options) !void {
+        if (self.entry != null or self.borrowed != null or self.child_pending) return error.InvalidRunnableTransition;
+        if (options.retained_bytes < @sizeOf(Entry)) return error.InvalidRunnableDemand;
+        try options.check();
+        self.entry = .{ .options = options, .class = .control, .slots = 1, .bytes = options.retained_bytes, .protected_control_service = true };
+        errdefer self.finish();
+        owner.lock();
+        defer owner.mutex.unlock();
+        try owner.submitLocked(&self.entry.?, options.now(), false, true);
     }
 
     pub fn startCleanupRoot(self: *Execution, scheduler: *Scheduler, options: admission.Options) !void {
@@ -6994,4 +7030,50 @@ test "runnable scheduler guarded publication retires expired return CPU before a
     try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
     writer.finish();
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+}
+
+test "workload control services preserve health capacity jointly with children and cleanup" {
+    var scheduler = try Scheduler.init(.{ .slots = 3 });
+    defer scheduler.close();
+    const options: admission.Options = .{ .io = std.testing.io, .retained_bytes = @sizeOf(Execution) };
+    var excessive: Execution = .{};
+    defer excessive.finish();
+    var excessive_options = options;
+    excessive_options.retained_bytes = scheduler.config.control_bytes / 2 + 1;
+    try std.testing.expectError(error.SchedulerFull, excessive.reserveControlService(&scheduler, excessive_options));
+    var services: [3]Execution = @splat(.{});
+    defer for (&services) |*service| service.finish();
+    try services[0].reserveControlService(&scheduler, options);
+    try services[1].reserveControlService(&scheduler, options);
+    var query: Execution = .{};
+    defer query.finish();
+    try query.startWithSlots(&scheduler, .{ .io = std.testing.io }, .query, 2);
+    var child: Execution = .{};
+    defer child.finish();
+    try child.reserveControlChild(&query, std.testing.io, @sizeOf(Execution));
+    try std.testing.expectError(error.SchedulerFull, services[2].reserveControlService(&scheduler, options));
+    var cleanup: Execution = .{};
+    defer cleanup.finish();
+    var cleanup_options = options;
+    cleanup_options.deadline_ns = options.now() + 200 * std.time.ns_per_ms;
+    cleanup_options.allow_wait = false;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, cleanup.startCleanupRoot(&scheduler, cleanup_options));
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+    health.finish();
+    child.finish();
+    try services[2].reserveControlService(&scheduler, options);
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().control_services);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().control_children);
+    try std.testing.expectError(error.InvalidRunnableTransition, services[0].enter(.query));
+    try services[0].enter(.control);
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().runnable_slots);
+    try services[0].park(.resource_blocked);
+    for (&services) |*service| service.finish();
+    query.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().control_services);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().control_service_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }
