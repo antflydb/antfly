@@ -3413,3 +3413,9 @@ output copyback, and original-versus-candidate device and host qualification.
 [The AW register](unified-execution-aw-outcomes.md) records reuse of the shared
 ternary slot contract across attention and FFNs, three persistent projection
 weights, retired raw-weight bridges, and explicit single-row fallback admission.
+
+### AX unreachable Metal host bridges
+
+[The AX register](unified-execution-ax-outcomes.md) records retirement of nine
+superseded C/Zig entry points, whole-repository reference checks, byte-identical
+surviving implementations, and validation of the active decoder paths.
