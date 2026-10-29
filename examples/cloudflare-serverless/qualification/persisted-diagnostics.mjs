@@ -25,9 +25,13 @@ const roles = ['app', 'writer', 'reader', 'builder'];
 const digest = value => createHash('sha256').update(value).digest('hex');
 const fail = code => { throw Error(code); };
 
-export function persistedWindowQuery(run, role, timeframe, {view = 'events', offset} = {}) {
+export function persistedWindowQuery(run, role, timeframe, options = {}) {
   assertGateRun(run);
-  if (!roles.includes(role) || !['events', 'calculations'].includes(view)) fail('InvalidDiagnosticView');
+  if(!roles.includes(role))fail('InvalidDiagnosticView');
+  return diagnosticQuery(run.id+(role==='app'?'':'-'+role),timeframe,options);
+}
+function diagnosticQuery(worker,timeframe,{view='events',offset,excludeSpans=false}={}){
+  if(!['events','calculations'].includes(view)||typeof excludeSpans!=='boolean')fail('InvalidDiagnosticView');
   const {from, to} = timeframe;
   if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 0 || from >= to || to - from > 60000) fail('InvalidDiagnosticWindow');
   if (offset !== undefined && (typeof offset !== 'string' || !/^[\w-]{1,256}$/.test(offset))) fail('InvalidDiagnosticCursor');
@@ -36,7 +40,7 @@ export function persistedWindowQuery(run, role, timeframe, {view = 'events', off
     ...(view === 'calculations' ? {chartType: 'aggregate'} : {}),
     ...(offset === undefined ? {} : {offset, offsetDirection: 'next'}),
     parameters: {filterCombination: 'and',
-      filters: [{key: '$metadata.service', type: 'string', operation: 'eq', value: run.id + (role === 'app' ? '' : '-' + role)}],
+      filters: [{key: '$metadata.service', type: 'string', operation: 'eq', value: worker},...(excludeSpans?[{key:'$metadata.type',type:'string',operation:'neq',value:'span'}]:[])],
       ...(view === 'calculations' ? {calculations: [{operator: 'count', alias: 'events'}]} : {}),
     },
   };
@@ -80,6 +84,14 @@ export function sanitizePersistedEvent(row, worker, timeframe) {
 // does not establish that the platform stored every invocation (see design).
 export async function collectPersistedWindow(run, role, token, timeframe, options = {}) {
   persistedWindowQuery(run,role,timeframe);
+  return collectWindows(run,role,token,timeframe,{...options,queryFactory:(window,args)=>persistedWindowQuery(run,role,window,{...args,excludeSpans:options.excludeSpans??false})});
+}
+export async function collectTelemetryProbeWindow(probe,token,timeframe,options={}){
+  if(probe.schema!==1||probe.mode!=='otel'||!/^antfly-1278-telemetry-[a-z0-9]+$/.test(probe.id??'')||probe.source!==probe.id+'-source'||!/^[a-f0-9]{32}$/.test(probe.account??''))fail('DiagnosticProbeScopeMismatch');
+  diagnosticQuery(probe.source,timeframe,{excludeSpans:true});
+  return collectWindows({id:probe.source,account:probe.account},'app',token,timeframe,{...options,queryFactory:(window,args)=>diagnosticQuery(probe.source,window,{...args,excludeSpans:true})});
+}
+async function collectWindows(run,role,token,timeframe,options){
   const clock=options.clock??Date.now,started=clock(),budget={queries:0,bytes:0,deadline:started+120000};
   const pieces=[];
   async function collect(window){
@@ -101,8 +113,8 @@ export async function collectPersistedWindow(run, role, token, timeframe, option
   const observed=coverage.report().streams.find(s=>s.run===run.id&&s.role===role);
   return{...pieces[0],timeframe:{...timeframe},collected_started_at:started,collected_finished_at:clock(),events:rows.length,invocations:invocations.length,invocation_errors:invocations.filter(r=>r.event.outcome!=='ok').length,resource_failures:observed.resource_failures,gap:observed.gap,queries:budget.queries,transferred_bytes:budget.bytes,query_slices:pieces.map(p=>({timeframe:p.timeframe,events:p.events,rows_sha256:p.rows_sha256})),rows_sha256:digest(JSON.stringify(rows)),rows};
 }
-async function collectPersistedSlice(run, role, token, timeframe, {fetch: request = fetch, signal, clock = Date.now}, budget) {
-  persistedWindowQuery(run, role, timeframe);
+async function collectPersistedSlice(run, role, token, timeframe, {fetch: request = fetch, signal, clock = Date.now,queryFactory}, budget) {
+  queryFactory(timeframe,{});
   if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{20,256}$/.test(token)) fail('InvalidObservabilityToken');
   const worker = run.id + (role === 'app' ? '' : '-' + role);
   const collected_started_at=clock();let queries = 0, transferred = 0;
@@ -113,7 +125,7 @@ async function collectPersistedSlice(run, role, token, timeframe, {fetch: reques
     try {
       response = await request('https://api.cloudflare.com/client/v4/accounts/' + run.account + '/workers/observability/telemetry/query', {
         method: 'POST', headers: {Authorization: 'Bearer ' + token, 'Content-Type': 'application/json'},
-        body: JSON.stringify(persistedWindowQuery(run, role, timeframe, {view, offset})),
+        body: JSON.stringify(queryFactory(timeframe,{view,offset})),
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(Math.min(30000,remaining))]) : AbortSignal.timeout(Math.min(30000,remaining)),
       });
     } catch { fail('DiagnosticQueryTransportFailed'); }

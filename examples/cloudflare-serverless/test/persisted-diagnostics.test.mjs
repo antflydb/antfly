@@ -16,7 +16,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {resolve} from 'node:path';
-import {collectPersistedWindow, persistedWindowQuery, sanitizePersistedEvent} from '../qualification/persisted-diagnostics.mjs';
+import {collectTelemetryProbeWindow, collectPersistedWindow, persistedWindowQuery, sanitizePersistedEvent} from '../qualification/persisted-diagnostics.mjs';
 
 const id='antfly-1278-g-test-1-c',dir=resolve('dist',id),run={id,dir,worker:id,bucket:id,account:'a'.repeat(32),queues:[id,id+'-dead'],token_file:resolve(dir,'api-token'),services:['app','writer','reader','builder'].map(role=>({role,name:id+(role==='app'?'':'-'+role)}))};
 const token='test-disposable-token-12345',time={from:1000,to:2000};
@@ -91,3 +91,5 @@ test('query sampling splits exact disjoint windows but never accepts ingestion s
  const result=await collectPersistedWindow(run,'app',token,whole,{fetch});assert.equal(result.events,2);assert.equal(result.query_slices.length,2);assert.equal(result.query_slices[0].timeframe.to+1,result.query_slices[1].timeframe.from);assert.equal(result.queries,7);assert.equal(result.reconciled,true);assert.deepEqual(result.timeframe,whole);
  let calls=0;await assert.rejects(collectPersistedWindow(run,'app',token,whole,{fetch:async()=>{calls++;return Response.json({success:true,result:{run:{status:'COMPLETED'},statistics:{abr_level:1},calculations:[{alias:'events',aggregates:[{count:2,value:2,sampleInterval:1.01}]}]}});}}),/IngestionSampled/);assert.equal(calls,1);
 });
+
+test('tracing-enabled log windows exclude span records through the same exact bounded collector',async()=>{const api=fixture([row('one')]);await collectPersistedWindow(run,'app',token,time,{...api,excludeSpans:true});for(const query of api.requests)assert.deepEqual(query.parameters.filters[1],{key:'$metadata.type',type:'string',operation:'neq',value:'span'});const probe={schema:1,mode:'otel',id:'antfly-1278-telemetry-fixture',source:'antfly-1278-telemetry-fixture-source',account:'a'.repeat(32)},r=row('one');r.$metadata.service=probe.source;r.$workers.scriptName=probe.source;const p=fixture([r]);assert.equal((await collectTelemetryProbeWindow(probe,token,time,p)).invocations,1);await assert.rejects(collectTelemetryProbeWindow({...probe,source:'production'},token,time,p),/ProbeScope/);});
