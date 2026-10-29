@@ -282,7 +282,7 @@ class ZigValidationScopeTests(unittest.TestCase):
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
         self.assertIn(
-            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
+            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]",
             aggregate,
         )
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
@@ -310,12 +310,25 @@ class ZigValidationScopeTests(unittest.TestCase):
                         "REQUIRE_LOW_FD": required,
                         "NATIVE_SDK_RESULT": native,
                         "PGWIRE_DRIVER_RESULT": "success",
+                        "BETTER_AUTH_RESULT": "success",
                     },
                     check=False,
                     capture_output=True,
                 )
                 self.assertEqual(result.returncode == 0, success, result.stderr)
 
+        self.assertTrue(selected("better-auth"))
+        self.assertTrue(selected("better-auth", full=True))
+        self.assertTrue(selected("better-auth", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "better-auth",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
         self.assertTrue(selected("embedded-sdk-native"))
         self.assertTrue(selected("embedded-sdk-native", full=True))
         self.assertTrue(selected("embedded-sdk-native", pr="", event="push"))
@@ -347,7 +360,13 @@ class ZigValidationScopeTests(unittest.TestCase):
             command = textwrap.dedent(blocks[job].split("run: |\n", 1)[1])
             if job == "e2e-base":
                 command = command.split("\n- uses:", 1)[0]
-            for driver in ("success", "failure", "skipped"):
+            for driver, auth in (
+                ("success", "success"),
+                ("failure", "success"),
+                ("skipped", "success"),
+                ("success", "failure"),
+                ("success", "skipped"),
+            ):
                 with self.subTest(job=job, driver=driver):
                     result = subprocess.run(
                         ["bash", "-c", command],
@@ -360,12 +379,15 @@ class ZigValidationScopeTests(unittest.TestCase):
                             "REQUIRE_LOW_FD": "true",
                             "NATIVE_SDK_RESULT": "success",
                             "PGWIRE_DRIVER_RESULT": driver,
+                            "BETTER_AUTH_RESULT": auth,
                         },
                         check=False,
                         capture_output=True,
                     )
                     self.assertEqual(
-                        result.returncode == 0, driver == "success", result.stderr
+                        result.returncode == 0,
+                        driver == auth == "success",
+                        result.stderr,
                     )
 
     def test_base_native_wasm_and_model_qualification_have_independent_owners(self):

@@ -362,6 +362,10 @@ jobs:
             rs/Cargo.toml rs/Cargo.lock \
             ':(glob)py/packages/embedded/**' \
             ':(glob)ts/packages/embedded*/**' \
+            ':(glob)ts/packages/better-auth/**' \
+            ':(glob)ts/packages/sdk/**' \
+            ':(glob)ts/examples/express-auth/**' \
+            .github/workflows/better-auth-compatibility.yml \
             ts/package.json ts/pnpm-lock.yaml ts/pnpm-workspace.yaml \
             scripts/ci/test-embedded-sdk-native.sh \
             scripts/ci/test_embedded_sdk_native.py \
@@ -1996,6 +2000,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  better-auth:
+    if: >-
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    needs: [admission, e2e-base-build, e2e-full-build]
+    uses: ./.github/workflows/better-auth-compatibility.yml
+    with:
+      head_sha: ${{ inputs.head_sha || github.sha }}
+      artifact_suite: ${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}
+      versions: ${{ github.event_name == 'schedule' && '["supported","latest","beta"]' || '["supported"]' }}
+
   pgwire-driver-conformance:
     if: >-
       ${{ always() && !cancelled() && needs.admission.result == 'success' &&
@@ -2421,7 +2437,7 @@ jobs:
       inputs.pr_number != '' &&
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base
-    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]
+    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]
     runs-on: arc-antfly-standard-runtime
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -2436,6 +2452,7 @@ jobs:
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
           NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
           PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
+          BETTER_AUTH_RESULT: ${{ needs.better-auth.result }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = "success"
@@ -2444,6 +2461,7 @@ jobs:
           test "$LOW_FD_RESULT" = "success"
           test "$NATIVE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
+          test "$BETTER_AUTH_RESULT" = "success"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -2873,7 +2891,7 @@ jobs:
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full
-    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify full E2E suites
@@ -2883,6 +2901,7 @@ jobs:
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
           NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
           PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
+          BETTER_AUTH_RESULT: ${{ needs.better-auth.result }}
           REQUIRE_LOW_FD: ${{ inputs.full_validation && inputs.pr_number != '' }}
         run: |
           set -euo pipefail
@@ -2890,6 +2909,7 @@ jobs:
           test "$TEST_RESULT" = "success"
           test "$NATIVE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
+          test "$BETTER_AUTH_RESULT" = "success"
           if [[ "$REQUIRE_LOW_FD" == "true" ]]; then
             test "$LOW_FD_RESULT" = "success"
           fi

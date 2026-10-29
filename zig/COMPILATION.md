@@ -2018,10 +2018,15 @@ actively compiling after 39 minutes. Peak sampled compiler-tree RSS was
 reservation retry. Incomplete engine measurements do not justify lowering its
 reservation.
 
-The compatibility workflow now builds unstripped Debug artifacts: its matrix
-checks adapter, SQL, persistence and transport semantics, and does not benchmark
-optimized inference. This avoids whole-server LLVM optimization and enables
-runtime safety checks. Native Debug reservations remain in effect; runner size,
-concurrency, aggregate memory admission and the two-hour deadline are unchanged.
-The retained diagnostic upload remains mandatory qualification for this change.
-Production release optimization and its independent qualification are unchanged.
+Better Auth does not own a native build. Its reusable compatibility workflow
+consumes the server and installed C ABI library from the same run's successful
+`e2e-base-build` or `e2e-full-build`. The caller checks out the same candidate
+SHA and both E2E aggregate gates require supported-version auth success. Daily
+Zig qualification also exercises latest/beta candidates without weakening the
+supported-version gate. Embedded, remote, installed-package and persistent
+container checks are retained. SDK/auth-only changes select E2E coverage.
+
+Npm publication requires a successful main Zig qualification for the exact
+peeled tag commit, including full E2E and supported Better Auth jobs from its
+latest attempt. It does not start a compiler or reuse results from another
+commit. Release optimization and its independent qualification are unchanged.

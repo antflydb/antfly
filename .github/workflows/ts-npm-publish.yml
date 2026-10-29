@@ -33,9 +33,20 @@ jobs:
   auth-checks:
     permissions:
       contents: read
-      id-token: write # Read-only verified Zig dependency mirror.
+      actions: read
     if: startsWith(github.ref, 'refs/tags/ts/antfly/better-auth/v')
-    uses: ./.github/workflows/better-auth-compatibility.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Require same-commit Zig E2E and Better Auth qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/verify_auth_e2e.py
+          --repository "$GITHUB_REPOSITORY"
+          --commit "$(git rev-parse HEAD)"
 
   publish:
     needs: auth-checks
