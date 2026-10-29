@@ -622,44 +622,222 @@ test {
     _ = extraction;
 }
 
-/// Qualified adapter/model metadata. Unknown aliases and task variants (audio,
-/// search, transcription, etc.) do not inherit a family's chat capabilities.
+/// Qualified adapter/model metadata. Model names are matched by family
+/// grammar (family, optional point version, size tier, then a dated snapshot
+/// or preview suffix), so new snapshots of a qualified family are admitted
+/// while task variants (audio, transcription, image, search, realtime, TTS,
+/// embedding) and unknown aliases are not.
 /// https://developers.openai.com/api/docs/guides/structured-outputs
 /// https://ai.google.dev/gemini-api/docs/models
+/// https://docs.anthropic.com/en/docs/build-with-claude/tool-use
 pub fn hostedCapabilities(cfg: anytype) Capabilities {
     const name = if (std.mem.lastIndexOfScalar(u8, cfg.model, '/')) |slash| cfg.model[slash + 1 ..] else cfg.model;
     switch (cfg.provider) {
         .openai => {
             if (std.mem.eql(u8, name, "gpt-4o-2024-05-13")) return .{ .tool_call = true, .images = true, .token_logprobs = true };
-            for ([_][]const u8{ "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "o3", "o3-mini", "o4-mini" }) |model| {
-                if (std.mem.eql(u8, name, model) or datedSnapshot(name, model)) return .{ .tool_call = true, .images = !std.mem.eql(u8, model, "o3-mini"), .json_schema = true, .token_logprobs = std.mem.startsWith(u8, model, "gpt-4") };
-            }
+            if (openAiFamily(name)) |family| return .{
+                .tool_call = true,
+                .json_schema = true,
+                .images = !std.mem.startsWith(u8, name, "o3-mini"),
+                .token_logprobs = std.mem.startsWith(u8, family, "gpt-4"),
+            };
         },
         .cloudflare => {
             for ([_][]const u8{ "llama-3.3-70b-instruct-fp8-fast", "qwen3-30b-a3b-fp8", "mistral-small-3.1-24b-instruct" }) |model| if (std.mem.eql(u8, name, model)) return .{ .tool_call = true, .images = std.mem.startsWith(u8, model, "mistral-small") };
         },
-        .gemini, .vertex => {
-            for ([_][]const u8{ "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-pro-preview", "gemini-3-flash-preview" }) |model| if (std.mem.eql(u8, name, model)) return .{ .tool_call = true, .images = true };
-        },
+        .gemini, .vertex => if (geminiModel(name)) return .{ .tool_call = true, .images = true },
+        .anthropic => if (claudeModel(name)) return .{ .tool_call = true, .images = true },
+        .bedrock => if (bedrockClaudeModel(name)) return .{ .tool_call = true, .images = true },
         else => {},
     }
     return .{};
 }
-fn datedSnapshot(name: []const u8, model: []const u8) bool {
-    if (name.len != model.len + 11 or !std.mem.startsWith(u8, name, model) or name[model.len] != '-') return false;
-    const date = name[model.len + 1 ..];
-    for (date, 0..) |byte, i| if (i == 4 or i == 7) {
+
+fn allDigits(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+/// gpt-4o, gpt-4.1, gpt-5 (and point releases such as gpt-5.1), o3 and o4,
+/// with an optional mini or nano tier and an optional dated snapshot.
+fn openAiFamily(name: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4" }) |family| {
+        if (!std.mem.startsWith(u8, name, family)) continue;
+        var rest = name[family.len..];
+        if (std.mem.eql(u8, family, "gpt-5") and rest.len > 1 and rest[0] == '.') {
+            const end = std.mem.indexOfScalar(u8, rest, '-') orelse rest.len;
+            if (!allDigits(rest[1..end])) continue;
+            rest = rest[end..];
+        }
+        for ([_][]const u8{ "-mini", "-nano" }) |tier| if (std.mem.startsWith(u8, rest, tier)) {
+            rest = rest[tier.len..];
+            break;
+        };
+        if (rest.len == 0 or isDateSuffix(rest)) return family;
+    }
+    return null;
+}
+
+/// `-YYYY-MM-DD`
+fn isDateSuffix(rest: []const u8) bool {
+    if (rest.len != 11 or rest[0] != '-') return false;
+    for (rest[1..], 0..) |byte, i| if (i == 4 or i == 7) {
         if (byte != '-') return false;
     } else if (!std.ascii.isDigit(byte)) return false;
     return true;
 }
+
+/// gemini-2.0, gemini-2.5 and gemini-3.x in flash, flash-lite or pro, with an
+/// optional -NNN, -latest or -preview[-...] suffix.
+fn geminiModel(name: []const u8) bool {
+    const prefix = "gemini-";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    var rest = name[prefix.len..];
+    const version_end = std.mem.indexOfScalar(u8, rest, '-') orelse return false;
+    const version = rest[0..version_end];
+    const supported = std.mem.eql(u8, version, "2.0") or std.mem.eql(u8, version, "2.5") or std.mem.eql(u8, version, "3") or
+        (std.mem.startsWith(u8, version, "3.") and allDigits(version[2..]));
+    if (!supported) return false;
+    rest = rest[version_end..];
+    const tier = for ([_][]const u8{ "-flash-lite", "-flash", "-pro" }) |candidate| {
+        if (std.mem.startsWith(u8, rest, candidate)) break candidate;
+    } else return false;
+    rest = rest[tier.len..];
+    if (rest.len == 0 or std.mem.eql(u8, rest, "-latest")) return true;
+    if (rest[0] == '-' and allDigits(rest[1..])) return true;
+    if (!std.mem.startsWith(u8, rest, "-preview")) return false;
+    rest = rest["-preview".len..];
+    while (rest.len > 0) {
+        if (rest[0] != '-') return false;
+        const end = std.mem.indexOfScalarPos(u8, rest, 1, '-') orelse rest.len;
+        if (!allDigits(rest[1..end])) return false;
+        rest = rest[end..];
+    }
+    return true;
+}
+
+/// Claude 3 and later, as `claude-<tier>-<major>[-<minor>][-<date>]` or the
+/// older `claude-<major>[-<minor>]-<tier>[-<date>]`.
+fn claudeModel(name: []const u8) bool {
+    const prefix = "claude-";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    var parts = std.mem.splitScalar(u8, name[prefix.len..], '-');
+    var tier_seen = false;
+    var numbers: usize = 0;
+    var dated = false;
+    var first_number: ?[]const u8 = null;
+    while (parts.next()) |part| {
+        if (dated) return false;
+        if (isClaudeTier(part)) {
+            if (tier_seen) return false;
+            tier_seen = true;
+        } else if (allDigits(part)) {
+            if (part.len == 8) {
+                dated = true;
+            } else {
+                if (part.len > 2) return false;
+                numbers += 1;
+                if (numbers > 2) return false;
+                if (first_number == null) first_number = part;
+            }
+        } else return false;
+    }
+    const major = std.fmt.parseUnsigned(u32, first_number orelse return false, 10) catch return false;
+    return tier_seen and major >= 3;
+}
+
+fn isClaudeTier(part: []const u8) bool {
+    for ([_][]const u8{ "opus", "sonnet", "haiku", "fable" }) |tier| if (std.mem.eql(u8, part, tier)) return true;
+    return false;
+}
+
+/// `[region.]anthropic.<claude>[-vN[:N]]`
+fn bedrockClaudeModel(name: []const u8) bool {
+    var rest = name;
+    for ([_][]const u8{ "us.", "eu.", "apac.", "jp.", "au.", "global." }) |region| if (std.mem.startsWith(u8, rest, region)) {
+        rest = rest[region.len..];
+        break;
+    };
+    if (!std.mem.startsWith(u8, rest, "anthropic.")) return false;
+    rest = rest["anthropic.".len..];
+    if (std.mem.lastIndexOf(u8, rest, "-v")) |version| {
+        const suffix = rest[version + 2 ..];
+        const colon = std.mem.indexOfScalar(u8, suffix, ':');
+        const major = suffix[0 .. colon orelse suffix.len];
+        if (allDigits(major) and (colon == null or allDigits(suffix[colon.? + 1 ..]))) rest = rest[0..version];
+    }
+    return claudeModel(rest);
+}
+
 test "constrained hosted metadata rejects unqualified task variants and unknown aliases" {
-    const Provider = enum { openai, gemini, vertex, antfly, cloudflare };
+    const Provider = enum { openai, gemini, vertex, antfly, cloudflare, anthropic, bedrock };
     const Config = struct { provider: Provider = .openai, model: []const u8 };
     try std.testing.expect((hostedCapabilities(Config{ .model = "gpt-4.1-2025-04-14" })).token_logprobs);
     for ([_][]const u8{ "gpt-4o-audio-preview", "gpt-4o-mini-transcribe", "gpt-4.1-custom-alias", "o3-deep-research" }) |name| try std.testing.expectError(error.UnsupportedConstrainedOutput, hostedCapabilities(Config{ .model = name }).select(.auto, null));
     try std.testing.expectError(error.UnsupportedConstrainedOutput, hostedCapabilities(Config{ .provider = .gemini, .model = "gemini-2.5-flash-image" }).select(.auto, null));
     try std.testing.expectError(error.UnsupportedConstrainedOutput, hostedCapabilities(Config{ .model = "gpt-4o-2024-05-13" }).select(.json_schema, null));
+}
+
+test "constrained hosted metadata admits qualified families by name grammar" {
+    const Provider = enum { openai, gemini, vertex, antfly, cloudflare, anthropic, bedrock };
+    const Config = struct { provider: Provider, model: []const u8 };
+    const admitted = [_]Config{
+        .{ .provider = .openai, .model = "gpt-4o" },
+        .{ .provider = .openai, .model = "gpt-4o-mini-2024-07-18" },
+        .{ .provider = .openai, .model = "gpt-4.1-nano" },
+        .{ .provider = .openai, .model = "gpt-5" },
+        .{ .provider = .openai, .model = "gpt-5.1" },
+        .{ .provider = .openai, .model = "gpt-5.2-mini" },
+        .{ .provider = .openai, .model = "gpt-5-mini-2025-08-07" },
+        .{ .provider = .openai, .model = "o3" },
+        .{ .provider = .openai, .model = "o3-mini" },
+        .{ .provider = .openai, .model = "o4-mini" },
+        .{ .provider = .gemini, .model = "gemini-2.0-flash-001" },
+        .{ .provider = .gemini, .model = "gemini-2.5-flash-lite" },
+        .{ .provider = .vertex, .model = "publishers/google/models/gemini-2.5-pro" },
+        .{ .provider = .gemini, .model = "gemini-2.5-flash-preview-09-2025" },
+        .{ .provider = .gemini, .model = "gemini-3-pro-preview" },
+        .{ .provider = .gemini, .model = "gemini-3.1-flash" },
+        .{ .provider = .anthropic, .model = "claude-opus-5-5" },
+        .{ .provider = .anthropic, .model = "claude-sonnet-5-5" },
+        .{ .provider = .anthropic, .model = "claude-haiku-4-5-20251001" },
+        .{ .provider = .anthropic, .model = "claude-fable-5-1" },
+        .{ .provider = .anthropic, .model = "claude-3-5-sonnet-20241022" },
+        .{ .provider = .bedrock, .model = "anthropic.claude-sonnet-4-5-20250929-v1:0" },
+        .{ .provider = .bedrock, .model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0" },
+    };
+    for (admitted) |cfg| {
+        const caps = hostedCapabilities(cfg);
+        errdefer std.debug.print("expected {s} {s} to be admitted\n", .{ @tagName(cfg.provider), cfg.model });
+        try std.testing.expectEqual(Output.tool_call, try caps.select(.auto, null));
+        try std.testing.expect(caps.images or std.mem.eql(u8, cfg.model, "o3-mini"));
+    }
+    try std.testing.expect(hostedCapabilities(Config{ .provider = .openai, .model = "gpt-4o-mini" }).token_logprobs);
+    try std.testing.expect(!hostedCapabilities(Config{ .provider = .openai, .model = "gpt-5" }).token_logprobs);
+    try std.testing.expect(!hostedCapabilities(Config{ .provider = .anthropic, .model = "claude-opus-5-5" }).json_schema);
+    const rejected = [_]Config{
+        .{ .provider = .openai, .model = "gpt-5-codex" },
+        .{ .provider = .openai, .model = "gpt-5-chat-latest" },
+        .{ .provider = .openai, .model = "o3-pro" },
+        .{ .provider = .openai, .model = "gpt-4o-realtime-preview" },
+        .{ .provider = .openai, .model = "gpt-4o-mini-tts" },
+        .{ .provider = .openai, .model = "gpt-4o-search-preview" },
+        .{ .provider = .openai, .model = "text-embedding-3-large" },
+        .{ .provider = .gemini, .model = "gemini-2.5-flash-preview-tts" },
+        .{ .provider = .gemini, .model = "gemini-2.5-flash-native-audio-preview-09-2025" },
+        .{ .provider = .gemini, .model = "gemini-1.5-pro" },
+        .{ .provider = .gemini, .model = "gemini-embedding-001" },
+        .{ .provider = .anthropic, .model = "claude-2.1" },
+        .{ .provider = .anthropic, .model = "claude-instant-1" },
+        .{ .provider = .anthropic, .model = "claude-sonnet" },
+        .{ .provider = .bedrock, .model = "amazon.nova-pro-v1:0" },
+        .{ .provider = .bedrock, .model = "meta.llama3-70b-instruct-v1:0" },
+    };
+    for (rejected) |cfg| {
+        errdefer std.debug.print("expected {s} {s} to be rejected\n", .{ @tagName(cfg.provider), cfg.model });
+        try std.testing.expectError(error.UnsupportedConstrainedOutput, hostedCapabilities(cfg).select(.auto, null));
+    }
 }
 
 /// Provider dialect admission precedes I/O. OpenAI strict objects require all
