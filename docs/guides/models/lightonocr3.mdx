@@ -59,17 +59,15 @@ the exact `grounding` keyword, with thinking disabled.
 
 ## Read documents during ingestion
 
-To OCR scanned PDF pages as they are indexed, name the model in a
-`document_extraction` enrichment. `prompt_policy` must be `plain`, because the
-model takes no instruction prompt:
+To OCR scanned PDF pages and images as they are indexed, name the model as the
+`ocr.reader` of a `document_extraction` enrichment:
 
 ```json
 {
   "type": "document_extraction",
   "config": {
     "ocr": {
-      "prompt_policy": "plain",
-      "config": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}
+      "reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}
     }
   }
 }

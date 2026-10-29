@@ -454,18 +454,18 @@ func TestVertexOCRProfilePinsModelAndCompatibleLocation(t *testing.T) {
 	var producer struct {
 		Config struct {
 			OCR struct {
-				Config struct {
+				Reader struct {
 					Model     string `json:"model"`
 					Location  string `json:"location"`
 					MaxTokens int    `json:"max_tokens"`
-				} `json:"config"`
+				} `json:"reader"`
 			} `json:"ocr"`
 		} `json:"config"`
 	}
 	if err := json.Unmarshal([]byte(units["producer_json"].(string)), &producer); err != nil {
 		t.Fatal(err)
 	}
-	reader := producer.Config.OCR.Config
+	reader := producer.Config.OCR.Reader
 	if reader.Model != "gemini-3.8-flash" || reader.Location != "global" || reader.MaxTokens != 32768 {
 		t.Fatalf("OCR profile must persist its model, location and output budget: %+v", reader)
 	}

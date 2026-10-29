@@ -109,12 +109,9 @@ grounding. This table indexes OCR chunks:
             "type": "document_extraction",
             "config": {
               "ocr": {
-                "enabled": true,
-                "executor": "reader",
                 "mode": "always",
-                "render_dpi": 150,
-                "prompt_policy": "plain",
-                "config": {
+                "render": {"dpi": 150},
+                "reader": {
                   "provider": "apple",
                   "recognition_languages": ["en-US"]
                 }
@@ -139,7 +136,7 @@ grounding. This table indexes OCR chunks:
 Send that body to `POST /db/v1/tables/documents`, then write documents whose
 `document_url` points to a PDF, either a URL or an inline
 `data:application/pdf;base64,...` value. `mode: "always"` OCRs every page; `auto`
-OCRs only pages without native text.
+OCRs only pages whose native text is missing or fails the quality checks.
 
 ## Transcribe Recordings
 

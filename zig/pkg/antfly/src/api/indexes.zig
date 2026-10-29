@@ -8308,7 +8308,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 2), configs.len);
             try std.testing.expectEqualStrings("application/json", configs[0].content_type);
             try std.testing.expectEqualStrings(
-                "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
+                "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"transcriber\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
                 configs[0].producer_json,
             );
             try validateArtifactEnrichmentConfigs(std.testing.allocator, configs);
