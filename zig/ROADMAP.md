@@ -308,9 +308,6 @@ file's own title and a one-line description taken from its first paragraph.
 - [RESOLUTION.md](RESOLUTION.md) — Entity Resolution Design (Resolver,
   Promoter, Fusion): turning per-document extraction artifacts into canonical
   entities and an entity graph.
-- [LITE_KNOWLEDGE_GRAPH.md](LITE_KNOWLEDGE_GRAPH.md) — Embedded Lite knowledge
-  graphs: promoting resolved entity documents into named tables through an
-  atomic cross-table commit in a writable Lite database.
 - [AUTOSCHEMA.md](AUTOSCHEMA.md) — AutoSchema Knowledge Graphs: proposal for
   schema-free knowledge-graph construction in the autograph pipeline, with
   entity/event triple extraction and emergent `is_a` schema induction.
@@ -342,9 +339,6 @@ file's own title and a one-line description taken from its first paragraph.
 - [REMOTE_TABLE_SERVING.md](REMOTE_TABLE_SERVING.md) — Remote table indexes,
   caching, and materialized execution: the serving contract for snapshot-bound
   indexes, materializations, and a bounded local cache over Parquet/Iceberg.
-- [NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md) —
-  Native lake performance follow-up: native sparse predicate intersection and
-  related lake execution contracts; representative archive benchmarks pending.
 - [EXTRACT.md](EXTRACT.md) — Extraction API: the one public extraction
   endpoint Antfly exposes.
 - [FUNCTIONS.md](FUNCTIONS.md) — Functions in the query DSL and SQL: typed
