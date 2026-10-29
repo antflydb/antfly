@@ -174,11 +174,79 @@ pub const Operation = struct {
         if (std.fs.path.dirname(path)) |parent| try self.control().withWait(@import("antfly_runtime_fs").fs_paths.syncDirPortable, .{ receiver_io, parent });
         try self.ready();
     }
+    fn discardTemporary(file: std.Io.File, args: anytype) void {
+        file.close(args[1]);
+        cleanupTemporary(args[1], args[2]);
+    }
+    fn cleanupTemporary(io: std.Io, path: []const u8) void {
+        const previous = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(previous);
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    }
+    pub fn writeFile(self: *const Operation, a: std.mem.Allocator, path: []const u8, bytes: []const u8, suffix: ?[]const u8) !void {
+        try self.ready();
+        const io = try self.receiver();
+        const wait = self.control();
+        var nonce: [16]u8 = undefined;
+        io.random(&nonce);
+        const temporary = if (suffix) |value| try std.fmt.allocPrint(a, "{s}.{s}", .{ path, value }) else try std.fmt.allocPrint(a, "{s}.tmp-{s}", .{ path, std.fmt.bytesToHex(&nonce, .lower) });
+        defer a.free(temporary);
+        if (suffix != null) wait.withWait(std.Io.Dir.deleteFile, .{ std.Io.Dir.cwd(), io, temporary }) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        var rejected = false;
+        const file = try wait.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, temporary, std.Io.Dir.CreateFileOptions{ .exclusive = true } }, discardTemporary);
+        defer cleanupTemporary(io, temporary);
+        {
+            defer file.close(io);
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                try self.ready();
+                const chunk_end = offset + @min(bytes.len - offset, 1024 * 1024);
+                try wait.withWait(std.Io.File.writeStreamingAll, .{ file, io, bytes[offset..chunk_end] });
+                offset = chunk_end;
+            }
+            try wait.withWait(std.Io.File.sync, .{ file, io });
+        }
+        try self.ready();
+        try wait.withWait(std.Io.Dir.rename, .{ std.Io.Dir.cwd(), temporary, std.Io.Dir.cwd(), path, io });
+        try wait.withWait(@import("antfly_runtime_fs").fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(path) orelse "." });
+        try self.ready();
+    }
+    /// Acquire shared metadata state only after CPU reentry; a parked waiter
+    /// owns no mutex that another admitted operation can need.
+    pub fn lockIo(self: *const Operation, mutex: *std.Io.Mutex) !void {
+        try self.ready();
+        while (!mutex.tryLock()) try self.sleep(1);
+        errdefer mutex.unlock(self.context.io.?);
+        try self.check();
+    }
     pub fn sleep(self: *const Operation, milliseconds: u64) !void {
         const io = self.context.io orelse return error.BackendRuntimeIoUnavailable;
         const wait: @import("httpx").socket.WriteControl = self.token().execution_wait orelse .{};
         try wait.withWait(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(@intCast(milliseconds)), std.Io.Clock.awake });
         try self.ready();
+    }
+};
+
+/// Legacy callers own a fallback receiver; contextual callers always retain
+/// their supplied receiver and authority. Initialize in its final stack slot.
+pub const Native = struct {
+    fallback: ?std.Io.Threaded = null,
+    operation: Operation,
+    pub fn init(self: *Native, context: Context, cancellation: Cancellation) !void {
+        self.* = .{ .operation = .{ .context = context, .cancellation = cancellation } };
+        if (context.io == null) {
+            if (context.execution != null) return error.BackendRuntimeIoUnavailable;
+            self.fallback = .init(std.heap.page_allocator, .{});
+            self.operation.context.io = self.fallback.?.io();
+        }
+        errdefer self.deinit();
+        try self.operation.ready();
+    }
+    pub fn deinit(self: *Native) void {
+        if (self.fallback) |*value| value.deinit();
     }
 };
 
@@ -188,6 +256,7 @@ pub const Operation = struct {
 pub const Guard = struct {
     original: Operation,
     mutex: ?*std.atomic.Mutex = null,
+    io_mutex: ?*std.Io.Mutex = null,
     reservation: bool = false,
     parked: bool = false,
 
@@ -197,6 +266,10 @@ pub const Guard = struct {
         self.mutex = mutex;
         errdefer self.deinit();
         try self.original.check();
+    }
+    pub fn lockIo(self: *Guard, mutex: *std.Io.Mutex) !void {
+        try self.original.lockIo(mutex);
+        self.io_mutex = mutex;
     }
     pub fn operation(self: *Guard) Operation {
         var context = self.original.context;
@@ -230,6 +303,8 @@ pub const Guard = struct {
     pub fn finish(self: *Guard) !void {
         if (self.mutex) |mutex| mutex.unlock();
         self.mutex = null;
+        if (self.io_mutex) |mutex| mutex.unlock(self.original.context.io.?);
+        self.io_mutex = null;
         if (self.reservation) {
             self.reservation = false;
             try self.original.context.execution.?.finishPublication();
@@ -239,6 +314,8 @@ pub const Guard = struct {
     pub fn deinit(self: *Guard) void {
         if (self.mutex) |mutex| mutex.unlock();
         self.mutex = null;
+        if (self.io_mutex) |mutex| mutex.unlock(self.original.context.io.?);
+        self.io_mutex = null;
         if (self.reservation) {
             self.reservation = false;
             self.original.context.execution.?.finishPublication() catch {};

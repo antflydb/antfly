@@ -1773,6 +1773,7 @@ fn validateBuildReuse(a: A, store: stores.ArtifactStore, root: Root, ref: local.
 }
 fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_id: []const u8, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) anyerror!void {
     var retained_backend = backend;
+    retained_backend.write_context = context;
     const certified = retained_backend.retainedClosure(root_id, cancellation) catch false;
     try context.ensureActive();
     try cancellation.check();
@@ -1944,6 +1945,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
         }
     };
     var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation, .domain = root.domain, .maintenance_only = root.serving != null };
+    validator.store.write_context = context;
     defer validator.drain(true);
     defer validator.witnesses.deinit(a);
     try validator.retainArtifact(root_id);

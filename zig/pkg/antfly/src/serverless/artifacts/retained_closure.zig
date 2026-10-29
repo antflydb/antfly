@@ -23,11 +23,13 @@ const api = @import("store.zig");
 const Fs = @import("fs_store.zig").FsStore;
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const Provider = @import("../provider_operation.zig");
+const Context = api.ReadContext;
 const Certificate = struct { version: u8 = 1, root: []const u8, witnesses: []const api.RetentionWitness };
 const Pending = struct { arena: std.heap.ArenaAllocator, root: []const u8, witnesses: []const api.RetentionWitness, fresh: api.UploadScope, epoch: ?[16]u8 };
 pending: std.ArrayList(Pending) = .empty,
-// Parallel native families share this queue. Hold one blocking mutex through
-// inheritance and sealing so roots, arenas and the sealing batch move together.
+// Queue ownership moves under a short CPU-only mutex. Sealing owns its
+// detached arenas through all provider I/O and physical retirement.
 mutex: std.Io.Mutex = .init,
 const Self = @This();
 
@@ -36,19 +38,54 @@ pub fn deinit(self: *Self, a: A) void {
     self.pending.deinit(a);
 }
 pub fn witness(fs: *Fs, scope: api.UploadScope, token: Token) !?api.RetentionWitness {
+    return witnessFor(fs, scope, token, .{});
+}
+fn readEpoch(fs: *Fs, scope: api.UploadScope, token: Token) !?[16]u8 {
+    return readEpochFor(fs, scope, token, .{});
+}
+pub fn invalidate(fs: *Fs, scope: api.UploadScope, token: Token) !void {
+    return invalidateFor(fs, scope, token, .{});
+}
+fn load(fs: *Fs, a: A, id: []const u8, token: Token) !Certificate {
+    return loadFor(fs, a, id, token, .{});
+}
+fn valid(fs: *Fs, witnesses: []const api.RetentionWitness, token: Token) !bool {
+    return validFor(fs, witnesses, token, .{});
+}
+pub fn forgetNamespace(fs: *Fs, scope: api.UploadScope) !void {
+    return forgetNamespaceFor(fs, scope, .{});
+}
+pub fn forget(fs: *Fs, id: []const u8) !void {
+    return forgetFor(fs, id, .{});
+}
+pub fn retained(fs: *Fs, id: []const u8, token: Token) !bool {
+    return retainedFor(fs, id, token, .{});
+}
+pub fn remember(fs: *Fs, id: []const u8, witnesses: []const api.RetentionWitness, token: Token) !void {
+    return rememberFor(fs, id, witnesses, token, .{});
+}
+pub fn inherit(self: *Self, fs: *Fs, id: []const u8, previous: ?[]const u8, fresh: api.UploadScope, token: Token) !void {
+    return inheritFor(self, fs, id, previous, fresh, token, .{});
+}
+pub fn seal(self: *Self, fs: *Fs, token: Token) !void {
+    return sealFor(self, fs, token, .{});
+}
+pub fn witnessFor(fs: *Fs, scope: api.UploadScope, token: Token, context: Context) !?api.RetentionWitness {
     try token.check();
     try scope.validate();
     const path = try std.fs.path.join(fs.alloc, &.{ fs.root_dir, "graph", &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
     defer fs.alloc.free(path);
-    var threaded = std.Io.Threaded.init(fs.alloc, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    var native: Provider.Native = undefined;
+    try native.init(context, token);
+    defer native.deinit();
+    const op = &native.operation;
+    const io = try op.receiver();
+    const dir = op.openDirAt(std.Io.Dir.cwd(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return null,
         else => return err,
     };
     defer dir.close(io);
-    const stat = try dir.stat(io);
+    const stat = try op.control().withWait(std.Io.Dir.stat, .{ dir, io });
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("native-artifact-filesystem-retention-v1");
     hash.update(fs.root_dir);
@@ -61,7 +98,7 @@ pub fn witness(fs: *Fs, scope: api.UploadScope, token: Token) !?api.RetentionWit
     // mutation, independent of filesystem timestamp granularity.
     const epoch_path = try epochPath(fs, fs.alloc, scope);
     defer fs.alloc.free(epoch_path);
-    const epoch: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, epoch_path, fs.alloc, .limited(17)) catch |err| switch (err) {
+    const epoch: ?[]u8 = op.readFile(fs.alloc, epoch_path, 17) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
@@ -79,13 +116,14 @@ pub fn witness(fs: *Fs, scope: api.UploadScope, token: Token) !?api.RetentionWit
 fn epochPath(fs: *Fs, a: A, scope: api.UploadScope) ![]u8 {
     return std.fs.path.join(a, &.{ fs.inventory_root, ".retention-epochs-v1", &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
 }
-fn readEpoch(fs: *Fs, scope: api.UploadScope, token: Token) !?[16]u8 {
+fn readEpochFor(fs: *Fs, scope: api.UploadScope, token: Token, context: Context) !?[16]u8 {
     try token.check();
     const path = try epochPath(fs, fs.alloc, scope);
     defer fs.alloc.free(path);
-    var threaded = std.Io.Threaded.init(fs.alloc, .{});
-    defer threaded.deinit();
-    const bytes = std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, fs.alloc, .limited(17)) catch |err| switch (err) {
+    var native: Provider.Native = undefined;
+    try native.init(context, token);
+    defer native.deinit();
+    const bytes = native.operation.readFile(fs.alloc, path, 17) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -96,18 +134,20 @@ fn readEpoch(fs: *Fs, scope: api.UploadScope, token: Token) !?[16]u8 {
 /// Restoration tooling must call this before changing immutable payloads in
 /// place. Ordinary uploads replace directory entries; their inode stamps also
 /// invalidate proofs. GC/delete call this before each destructive mutation.
-pub fn invalidate(fs: *Fs, scope: api.UploadScope, token: Token) !void {
+pub fn invalidateFor(fs: *Fs, scope: api.UploadScope, token: Token, context: Context) !void {
     try scope.validate();
     try token.check();
     const path = try epochPath(fs, fs.alloc, scope);
     defer fs.alloc.free(path);
-    var threaded = std.Io.Threaded.init(fs.alloc, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    try fs.durable_dirs.ensure(fs.alloc, io, std.fs.path.dirname(path).?);
+    var native: Provider.Native = undefined;
+    try native.init(context, token);
+    defer native.deinit();
+    const op = &native.operation;
+    const io = try op.receiver();
+    try fs.durable_dirs.ensureWithControl(fs.alloc, io, std.fs.path.dirname(path).?, op.control());
     var epoch: [16]u8 = undefined;
     io.random(&epoch);
-    try @import("fs_store.zig").writeFileAtomicallyWithCancellation(path, &epoch, token);
+    try op.writeFile(fs.alloc, path, &epoch, null);
 }
 
 fn pathAlloc(fs: *Fs, a: A, id: []const u8) ![]u8 {
@@ -116,12 +156,13 @@ fn pathAlloc(fs: *Fs, a: A, id: []const u8) ![]u8 {
     std.crypto.hash.sha2.Sha256.hash(id, &digest, .{});
     return std.fs.path.join(a, &.{ fs.inventory_root, ".retained-closures-v1", &std.fmt.bytesToHex(&digest, .lower) });
 }
-fn load(fs: *Fs, a: A, id: []const u8, token: Token) !Certificate {
+fn loadFor(fs: *Fs, a: A, id: []const u8, token: Token, context: Context) !Certificate {
     try token.check();
     const path = try pathAlloc(fs, a, id);
-    var threaded = std.Io.Threaded.init(a, .{});
-    defer threaded.deinit();
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .limited(1024 * 1024));
+    var native: Provider.Native = undefined;
+    try native.init(context, token);
+    defer native.deinit();
+    const bytes = try native.operation.readFile(a, path, 1024 * 1024);
     if (bytes.len < 41 or !std.mem.eql(u8, bytes[0..9], "AFRETAIN1")) return error.InvalidRetentionCertificate;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes[41..], &digest, .{});
@@ -138,49 +179,54 @@ fn load(fs: *Fs, a: A, id: []const u8, token: Token) !Certificate {
     if (!includes_root) return error.InvalidRetentionCertificate;
     return cert;
 }
-fn valid(fs: *Fs, witnesses: []const api.RetentionWitness, token: Token) !bool {
+fn validFor(fs: *Fs, witnesses: []const api.RetentionWitness, token: Token, context: Context) !bool {
     for (witnesses) |entry| {
-        const current = (try witness(fs, entry.scope, token)) orelse return false;
+        const current = (try witnessFor(fs, entry.scope, token, context)) orelse return false;
         if (!std.mem.eql(u8, &current.stamp, &entry.stamp)) return false;
     }
     return true;
 }
-pub fn forgetNamespace(fs: *Fs, scope: api.UploadScope) !void {
+pub fn forgetNamespaceFor(fs: *Fs, scope: api.UploadScope, context: Context) !void {
     const path = try epochPath(fs, fs.alloc, scope);
     defer fs.alloc.free(path);
-    var threaded = std.Io.Threaded.init(fs.alloc, .{});
-    defer threaded.deinit();
-    std.Io.Dir.cwd().deleteFile(threaded.io(), path) catch |err| switch (err) {
+    var native: Provider.Native = undefined;
+    try native.init(context, .none);
+    defer native.deinit();
+    native.operation.removeFile(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 }
-pub fn forget(fs: *Fs, id: []const u8) !void {
+pub fn forgetFor(fs: *Fs, id: []const u8, context: Context) !void {
     const path = try pathAlloc(fs, fs.alloc, id);
     defer fs.alloc.free(path);
-    var threaded = std.Io.Threaded.init(fs.alloc, .{});
-    defer threaded.deinit();
-    std.Io.Dir.cwd().deleteFile(threaded.io(), path) catch |err| switch (err) {
+    var native: Provider.Native = undefined;
+    try native.init(context, .none);
+    defer native.deinit();
+    native.operation.removeFile(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 }
-pub fn retained(fs: *Fs, id: []const u8, token: Token) !bool {
+pub fn retainedFor(fs: *Fs, id: []const u8, token: Token, context: Context) !bool {
     var arena = std.heap.ArenaAllocator.init(fs.alloc);
     defer arena.deinit();
-    const cert = load(fs, arena.allocator(), id, token) catch {
+    const cert = loadFor(fs, arena.allocator(), id, token, context) catch {
         try token.check();
+        try context.checkLifetime();
         return false;
     };
-    return valid(fs, cert.witnesses, token);
+    return validFor(fs, cert.witnesses, token, context);
 }
-pub fn remember(fs: *Fs, id: []const u8, witnesses: []const api.RetentionWitness, token: Token) !void {
-    if (witnesses.len == 0 or witnesses.len > 4096 or !try valid(fs, witnesses, token)) return;
+pub fn rememberFor(fs: *Fs, id: []const u8, witnesses: []const api.RetentionWitness, token: Token, context: Context) !void {
+    if (witnesses.len == 0 or witnesses.len > 4096 or !try validFor(fs, witnesses, token, context)) return;
     const path = try pathAlloc(fs, fs.alloc, id);
     defer fs.alloc.free(path);
-    var threaded = std.Io.Threaded.init(fs.alloc, .{});
-    defer threaded.deinit();
-    try fs.durable_dirs.ensure(fs.alloc, threaded.io(), std.fs.path.dirname(path).?);
+    var native: Provider.Native = undefined;
+    try native.init(context, token);
+    defer native.deinit();
+    const op = &native.operation;
+    try fs.durable_dirs.ensureWithControl(fs.alloc, try op.receiver(), std.fs.path.dirname(path).?, op.control());
     const bytes = try std.json.Stringify.valueAlloc(fs.alloc, Certificate{ .root = id, .witnesses = witnesses }, .{});
     defer fs.alloc.free(bytes);
     if (bytes.len > 1024 * 1024 - 41) return;
@@ -189,72 +235,80 @@ pub fn remember(fs: *Fs, id: []const u8, witnesses: []const api.RetentionWitness
     @memcpy(framed[0..9], "AFRETAIN1");
     std.crypto.hash.sha2.Sha256.hash(bytes, framed[9..41], .{});
     @memcpy(framed[41..], bytes);
-    try @import("fs_store.zig").writeFileAtomicallyWithCancellation(path, framed, token);
+    try op.writeFile(fs.alloc, path, framed, null);
 }
-pub fn inherit(self: *Self, fs: *Fs, id: []const u8, previous: ?[]const u8, fresh: api.UploadScope, token: Token) !void {
-    try token.check();
-    var threaded = std.Io.Threaded.init(fs.alloc, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    try self.mutex.lock(io);
-    defer self.mutex.unlock(io);
-    try token.check();
-    if (!std.meta.eql((try api.uploadScopeFromArtifactId(id)) orelse return error.InvalidRetentionCertificate, fresh)) return error.InvalidRetentionCertificate;
-    // Same-attempt descendants inherit an unsealed proof by construction.
-    // Replace the advisory ancestor entry so per-file checkpoints cannot fill
-    // the bounded directory and prevent certifying the final serving root.
-    if (previous) |old| for (self.pending.items) |*pending| {
-        if (std.mem.eql(u8, pending.root, old) and std.meta.eql(pending.fresh, fresh)) {
+fn extendPending(self: *Self, id: []const u8, previous: ?[]const u8, fresh: api.UploadScope) !bool {
+    if (previous) |previous_id| for (self.pending.items) |*pending| {
+        if (std.mem.eql(u8, pending.root, previous_id) and std.meta.eql(pending.fresh, fresh)) {
             if (pending.root.len == id.len) @memcpy(@constCast(pending.root), id) else pending.root = try pending.arena.allocator().dupe(u8, id);
-            return;
+            return true;
         }
     };
-    if (self.pending.items.len == 64) return;
+    return self.pending.items.len == 64;
+}
+pub fn inheritFor(self: *Self, fs: *Fs, id: []const u8, previous: ?[]const u8, fresh: api.UploadScope, token: Token, context: Context) !void {
+    var native: Provider.Native = undefined;
+    try native.init(context, token);
+    defer native.deinit();
+    const op = &native.operation;
+    const io = try op.receiver();
+    if (!std.meta.eql((try api.uploadScopeFromArtifactId(id)) orelse return error.InvalidRetentionCertificate, fresh)) return error.InvalidRetentionCertificate;
+    {
+        try op.lockIo(&self.mutex);
+        defer self.mutex.unlock(io);
+        if (try self.extendPending(id, previous, fresh)) return;
+    }
     var arena = std.heap.ArenaAllocator.init(fs.alloc);
     var keep = false;
     defer if (!keep) arena.deinit();
     const a = arena.allocator();
     var witnesses: []const api.RetentionWitness = &.{};
-    if (previous) |old| {
-        const cert = load(fs, a, old, token) catch {
-            try token.check();
+    if (previous) |previous_id| {
+        const cert = loadFor(fs, a, previous_id, token, op.context) catch {
+            try op.check();
             return;
         };
-        if (!try valid(fs, cert.witnesses, token)) return;
+        if (!try validFor(fs, cert.witnesses, token, op.context)) return;
         witnesses = cert.witnesses;
         for (witnesses) |entry| {
-            if (!std.mem.eql(u8, &entry.scope.domain, &fresh.domain)) return;
-            // A namespace already covered by the base cannot be resealed.
-            if (std.meta.eql(entry.scope, fresh)) return;
+            if (!std.mem.eql(u8, &entry.scope.domain, &fresh.domain) or std.meta.eql(entry.scope, fresh)) return;
         }
     }
     if (witnesses.len == 4096) return;
     const owned = try a.dupe(u8, id);
-    try self.pending.append(fs.alloc, .{ .arena = arena, .root = owned, .witnesses = witnesses, .fresh = fresh, .epoch = try readEpoch(fs, fresh, token) });
+    const epoch = try readEpochFor(fs, fresh, token, op.context);
+    try op.lockIo(&self.mutex);
+    defer self.mutex.unlock(io);
+    if (try self.extendPending(id, previous, fresh)) return;
+    try self.pending.append(fs.alloc, .{ .arena = arena, .root = owned, .witnesses = witnesses, .fresh = fresh, .epoch = epoch });
     keep = true;
 }
-pub fn seal(self: *Self, fs: *Fs, token: Token) !void {
-    try token.check();
-    var threaded = std.Io.Threaded.init(fs.alloc, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    try self.mutex.lock(io);
-    defer self.mutex.unlock(io);
-    try token.check();
+pub fn sealFor(self: *Self, fs: *Fs, token: Token, context: Context) !void {
+    var native: Provider.Native = undefined;
+    try native.init(context, token);
+    defer native.deinit();
+    const op = &native.operation;
+    const io = try op.receiver();
+    try op.lockIo(&self.mutex);
+    var pending_batch = self.pending;
+    self.pending = .empty;
+    self.mutex.unlock(io);
     defer {
-        for (self.pending.items) |*pending| pending.arena.deinit();
-        self.pending.clearRetainingCapacity();
+        for (pending_batch.items) |*pending| pending.arena.deinit();
+        pending_batch.deinit(fs.alloc);
     }
-    for (self.pending.items) |*pending| {
-        if (!std.meta.eql(pending.epoch, try readEpoch(fs, pending.fresh, token))) continue;
-        const fresh = (try witness(fs, pending.fresh, token)) orelse continue;
-        if (!std.meta.eql(pending.epoch, try readEpoch(fs, pending.fresh, token))) continue;
+    for (pending_batch.items) |*pending| {
+        try op.ready();
+        if (!std.meta.eql(pending.epoch, try readEpochFor(fs, pending.fresh, token, op.context))) continue;
+        const fresh = (try witnessFor(fs, pending.fresh, token, op.context)) orelse continue;
+        if (!std.meta.eql(pending.epoch, try readEpochFor(fs, pending.fresh, token, op.context))) continue;
         const a = pending.arena.allocator();
         const witnesses = try a.alloc(api.RetentionWitness, pending.witnesses.len + 1);
         @memcpy(witnesses[0..pending.witnesses.len], pending.witnesses);
         witnesses[pending.witnesses.len] = fresh;
-        try remember(fs, pending.root, witnesses, token);
+        try rememberFor(fs, pending.root, witnesses, token, op.context);
     }
+    try op.ready();
 }
 
 test "external lake retained closure certificates survive reopen inherit deltas and invalidate lost artifacts" {

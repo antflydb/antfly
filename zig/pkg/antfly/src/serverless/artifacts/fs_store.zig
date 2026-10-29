@@ -102,6 +102,32 @@ pub const FsStore = struct {
         // Path and checksum preparation precede the durable inventory provider.
         try @import("antfly_local_sources").sql_execution_wait.run(wait, registerPreparedUpload, .{ self, io, path, scope, checksum, cancellation });
     }
+    pub fn registerScopedUploadFor(self: *FsStore, scope: artifact_store.UploadScope, checksum: []const u8, cancellation: CancellationToken, context: ReadContext) !void {
+        try scope.validate();
+        try artifact_store.validateSha256Checksum(checksum);
+        var native: Provider.Native = undefined;
+        try native.init(context, cancellation);
+        defer native.deinit();
+        var guard: Provider.Guard = .{ .original = native.operation };
+        defer guard.deinit();
+        const op = guard.operation();
+        const io = try op.receiver();
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+        defer self.alloc.free(path);
+        if (context.execution == null) {
+            // Preserve explicit wait-only adapters through the legacy provider
+            // frame. Native admitted callers use physical boundaries below.
+            try @import("antfly_local_sources").sql_execution_wait.run(context.wait, registerPreparedUpload, .{ self, io, path, scope, checksum, cancellation });
+            try native.operation.ready();
+            return;
+        }
+        try self.durable_dirs.ensureWithControl(self.alloc, io, path, op.control());
+        const attempt = try op.openDirAt(std.Io.Dir.cwd(), path, .{ .iterate = true, .follow_symlinks = false });
+        defer attempt.close(io);
+        const journal = try self.uploadJournalControlled(io, attempt, scope, checksum, cancellation, &op);
+        journal.close(io);
+        try guard.finish();
+    }
     fn registerPreparedUpload(self: *FsStore, io: std.Io, path: []const u8, scope: artifact_store.UploadScope, checksum: []const u8, cancellation: CancellationToken) !void {
         try self.durable_dirs.ensure(self.alloc, io, path);
         const attempt = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
@@ -140,59 +166,88 @@ pub const FsStore = struct {
     }
 
     fn putInScope(self: *FsStore, alloc: Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
-        try cancellation.check();
-        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
+        return self.putInScopeFor(alloc, scope, contents, cancellation, .{});
+    }
+    fn putInScopeFor(self: *FsStore, alloc: Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken, context: ReadContext) !artifact_store.ArtifactMetadata {
+        var native: Provider.Native = undefined;
+        try native.init(context, cancellation);
+        defer native.deinit();
+        const checksum = try sha256StringFor(alloc, contents, &native.operation);
         errdefer alloc.free(checksum);
         const artifact_id = if (scope) |value| scoped: {
             const id = try value.artifactId(checksum);
             break :scoped try alloc.dupe(u8, &id);
         } else try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
-
-        var write_io = threadedIo();
-        defer write_io.deinit();
+        var guard: Provider.Guard = .{ .original = native.operation };
+        defer guard.deinit();
         const content_mutex = &content_mutexes[std.hash.Wyhash.hash(0, artifact_id) % content_mutexes.len];
-        try content_mutex.lock(write_io.io());
-        defer content_mutex.unlock(write_io.io());
+        try guard.lockIo(content_mutex);
+        const op = guard.operation();
+        const io = try op.receiver();
+        const wait = op.control();
         const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
-
-        const existing_valid = if (fileExists(path)) blk: {
-            verifyPathContent(path, @intCast(contents.len), checksum, cancellation) catch |err| switch (err) {
-                error.ArtifactIntegrityMismatch, error.FileNotFound => break :blk false,
+        const existing_valid = valid: {
+            self.verifyPathFor(path, @intCast(contents.len), checksum, cancellation, &op) catch |err| switch (err) {
+                error.ArtifactIntegrityMismatch, error.FileNotFound => break :valid false,
                 else => return err,
             };
-            break :blk true;
-        } else false;
+            break :valid true;
+        };
         if (!existing_valid) {
-            var directory_io = threadedIo();
-            defer directory_io.deinit();
-            try self.durable_dirs.ensure(self.alloc, directory_io.io(), std.fs.path.dirname(path) orelse ".");
-            if (scope != null) {
-                const attempt = try std.Io.Dir.cwd().openDir(directory_io.io(), std.fs.path.dirname(path).?, .{ .iterate = true, .follow_symlinks = false });
-                defer attempt.close(directory_io.io());
-                var journal = try self.uploadJournal(directory_io.io(), attempt, scope.?, checksum, cancellation);
-                journal.close(directory_io.io());
-            }
+            try self.durable_dirs.ensureWithControl(self.alloc, io, std.fs.path.dirname(path) orelse ".", wait);
             if (scope) |value| {
-                // The journal is durable before staging. A per-content lock
-                // permits one deterministic staging name, discoverable by the
-                // ordinary bounded journal sweep even after a process crash.
+                const attempt = try op.openDirAt(std.Io.Dir.cwd(), std.fs.path.dirname(path).?, .{ .iterate = true, .follow_symlinks = false });
+                defer attempt.close(io);
+                const journal = try self.uploadJournalControlled(io, attempt, value, checksum, cancellation, &op);
+                journal.close(io);
                 const lock_path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&value.domain, .lower), &std.fmt.bytesToHex(&value.attempt, .lower), checksum });
                 defer self.alloc.free(lock_path);
-                const lock = try std.Io.Dir.cwd().createFile(directory_io.io(), lock_path, .{ .truncate = false });
-                defer lock.close(directory_io.io());
-                try lock.lock(directory_io.io(), .exclusive);
-                defer lock.unlock(directory_io.io());
-                try writeFileAtomicallyAt(path, contents, cancellation, "pending-v2");
-            } else try writeFileAtomicallyWithCancellation(path, contents, cancellation);
+                var rejected = false;
+                const lock = try wait.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, lock_path, std.Io.Dir.CreateFileOptions{ .truncate = false } }, closeControlledFile);
+                defer lock.close(io);
+                while (!try wait.withWait(std.Io.File.tryLock, .{ lock, io, std.Io.File.Lock.exclusive })) try op.sleep(1);
+                defer lock.unlock(io);
+                try op.writeFile(self.alloc, path, contents, "pending-v2");
+            } else try op.writeFile(self.alloc, path, contents, null);
         }
-
-        return .{
-            .artifact_id = artifact_id,
-            .byte_len = @intCast(contents.len),
-            .checksum = checksum,
-        };
+        try guard.finish();
+        return .{ .artifact_id = artifact_id, .byte_len = @intCast(contents.len), .checksum = checksum };
+    }
+    fn closeControlledFile(file: std.Io.File, args: anytype) void {
+        file.close(args[1]);
+    }
+    fn verifyPathFor(_: *FsStore, path: []const u8, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken, op: *const Provider.Operation) !void {
+        const io = try op.receiver();
+        const wait = op.control();
+        var rejected = false;
+        const file = try wait.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, closeControlledFile);
+        defer file.close(io);
+        return verifyFileFor(file, io, expected_byte_len, expected_checksum, cancellation, op);
+    }
+    fn verifyFileFor(file: std.Io.File, io: std.Io, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken, op: *const Provider.Operation) !void {
+        const wait = op.control();
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var scratch: [64 * 1024]u8 = undefined;
+        var total: u64 = 0;
+        while (true) {
+            try cancellation.check();
+            try op.ready();
+            const n = wait.withWait(std.Io.File.readStreaming, .{ file, io, &.{&scratch} }) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+            total = std.math.add(u64, total, n) catch return error.ArtifactIntegrityMismatch;
+            if (total > expected_byte_len) return error.ArtifactIntegrityMismatch;
+            hash.update(scratch[0..n]);
+        }
+        if (total != expected_byte_len) return error.ArtifactIntegrityMismatch;
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        if (!std.mem.eql(u8, &std.fmt.bytesToHex(&digest, .lower), expected_checksum)) return error.ArtifactIntegrityMismatch;
+        try op.ready();
     }
 
     pub fn getAlloc(self: *FsStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
@@ -396,52 +451,69 @@ pub const FsStore = struct {
     /// Existing flat attempts are backfilled once, without holding their IDs
     /// in memory. Journals are advisory discovery data, never read authority.
     fn uploadJournal(self: *FsStore, io: std.Io, payloads: std.Io.Dir, scope: artifact_store.UploadScope, checksum: ?[]const u8, cancellation: CancellationToken) !std.Io.File {
+        const operation: Provider.Operation = .{ .context = .{ .io = io }, .cancellation = cancellation };
+        return self.uploadJournalFor(io, payloads, scope, checksum, cancellation, operation);
+    }
+    fn uploadJournalFor(self: *FsStore, io: std.Io, payloads: std.Io.Dir, scope: artifact_store.UploadScope, checksum: ?[]const u8, cancellation: CancellationToken, original: Provider.Operation) !std.Io.File {
+        var guard: Provider.Guard = .{ .original = original };
+        defer guard.deinit();
+        const op = guard.operation();
+        const file = try self.uploadJournalControlled(io, payloads, scope, checksum, cancellation, &op);
+        errdefer file.close(io);
+        try guard.finish();
+        return file;
+    }
+    fn uploadJournalControlled(self: *FsStore, io: std.Io, payloads: std.Io.Dir, scope: artifact_store.UploadScope, checksum: ?[]const u8, cancellation: CancellationToken, op: *const Provider.Operation) !std.Io.File {
+        const wait = op.control();
+        try op.ready();
         const path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
         defer self.alloc.free(path);
         const journal_mutex = &journal_mutexes[std.hash.Wyhash.hash(0, path) % journal_mutexes.len];
-        try journal_mutex.lock(io);
+        try op.lockIo(journal_mutex);
         defer journal_mutex.unlock(io);
-        try self.durable_dirs.ensure(self.alloc, io, path);
-        const attempt = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
+        try self.durable_dirs.ensureWithControl(self.alloc, io, path, wait);
+        const attempt = try op.openDirAt(std.Io.Dir.cwd(), path, .{ .iterate = true, .follow_symlinks = false });
+        var rejected = false;
         defer attempt.close(io);
-        const lock = try attempt.createFile(io, ".uploads-lock", .{ .truncate = false });
+        const lock = try wait.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ attempt, io, ".uploads-lock", std.Io.Dir.CreateFileOptions{ .truncate = false } }, closeControlledFile);
         defer lock.close(io);
-        try lock.lock(io, .exclusive);
+        while (!try wait.withWait(std.Io.File.tryLock, .{ lock, io, std.Io.File.Lock.exclusive })) try op.sleep(1);
         defer lock.unlock(io);
         try cancellation.check();
-        var journal = attempt.openFile(io, ".uploads-v1", .{ .mode = .read_write, .allow_directory = false }) catch |err| switch (err) {
+        var journal = wait.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ attempt, io, ".uploads-v1", std.Io.Dir.OpenFileOptions{ .mode = .read_write, .allow_directory = false } }, closeControlledFile) catch |err| switch (err) {
             error.FileNotFound => build: {
                 if (@import("builtin").is_test) _ = self.journal_backfills.fetchAdd(1, .monotonic);
-                const pending = try attempt.createFile(io, ".uploads-building", .{});
+                const pending = try wait.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ attempt, io, ".uploads-building", std.Io.Dir.CreateFileOptions{} }, closeControlledFile);
                 defer pending.close(io);
-                try pending.writePositionalAll(io, journal_header, 0);
+                try wait.withWait(std.Io.File.writePositionalAll, .{ pending, io, journal_header, @as(u64, 0) });
                 var offset: u64 = journal_header.len;
                 var entries = payloads.iterate();
-                while (try entries.next(io)) |entry| {
+                while (try wait.withWait(std.Io.Dir.Iterator.next, .{ &entries, io })) |entry| {
                     try cancellation.check();
+                    try op.ready();
                     if (entry.kind != .file or entry.name.len != 64) continue;
                     artifact_store.validateSha256Checksum(entry.name) catch continue;
-                    try pending.writePositionalAll(io, entry.name, offset);
+                    try wait.withWait(std.Io.File.writePositionalAll, .{ pending, io, entry.name, offset });
                     offset += 64;
                 }
-                try pending.sync(io);
-                try attempt.rename(".uploads-building", attempt, ".uploads-v1", io);
-                try fs_paths.syncDirectoryHandlePortable(io, attempt);
-                break :build try attempt.openFile(io, ".uploads-v1", .{ .mode = .read_write, .allow_directory = false });
+                try wait.withWait(std.Io.File.sync, .{ pending, io });
+                try wait.withWait(std.Io.Dir.rename, .{ attempt, ".uploads-building", attempt, ".uploads-v1", io });
+                try wait.withWait(fs_paths.syncDirectoryHandlePortable, .{ io, attempt });
+                break :build try wait.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ attempt, io, ".uploads-v1", std.Io.Dir.OpenFileOptions{ .mode = .read_write, .allow_directory = false } }, closeControlledFile);
             },
             else => return err,
         };
         errdefer journal.close(io);
         var header: [journal_header.len]u8 = undefined;
-        if (try journal.readPositionalAll(io, &header, 0) != header.len or !std.mem.eql(u8, &header, journal_header)) return error.InvalidArtifactUploadInventory;
-        const length = try journal.length(io);
+        if (try wait.withWait(std.Io.File.readPositionalAll, .{ journal, io, &header, @as(u64, 0) }) != header.len or !std.mem.eql(u8, &header, journal_header)) return error.InvalidArtifactUploadInventory;
+        const length = try wait.withWait(std.Io.File.length, .{ journal, io });
         if (length < journal_header.len) return error.InvalidArtifactUploadInventory;
         const complete = journal_header.len + (length - journal_header.len) / 64 * 64;
-        if (length != complete) try journal.setLength(io, complete);
+        if (length != complete) try wait.withWait(std.Io.File.setLength, .{ journal, io, complete });
         if (checksum) |value| {
             try artifact_store.validateSha256Checksum(value);
-            try journal.writePositionalAll(io, value, complete);
-            try journal.sync(io);
+            try wait.withWait(std.Io.File.writePositionalAll, .{ journal, io, value, complete });
+            try wait.withWait(std.Io.File.sync, .{ journal, io });
         }
         return journal;
     }
@@ -499,10 +571,7 @@ pub const FsStore = struct {
             defer attempt.close(io);
             var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
             _ = try std.fmt.hexToBytes(&scope.attempt, &name);
-            // Journal backfill mixes directory discovery and metadata parsing
-            // under shared locks. Keep its CPU grant until those holder
-            // boundaries are converted; never park this entire compound call.
-            const journal = try self.uploadJournal(io, attempt, scope, null, cancellation);
+            const journal = if (operation) |op| try self.uploadJournalFor(io, attempt, scope, null, cancellation, op.*) else try self.uploadJournal(io, attempt, scope, null, cancellation);
             defer journal.close(io);
             var offset: u64 = if (after_attempt != null and std.mem.eql(u8, &name, after_attempt.?)) after_offset else journal_header.len;
             const end = try control.withWait(std.Io.File.length, .{ journal, io });
@@ -711,7 +780,7 @@ pub const FsStore = struct {
             // cannot publish here; a later orphan retries through registration
             // and is backfilled if it races this advisory metadata cleanup.
             try control.withWait(std.Io.Dir.deleteTree, .{ inventory, io, entry.name });
-            try @import("retained_closure.zig").forgetNamespace(self, scope);
+            if (operation) |op| try @import("retained_closure.zig").forgetNamespaceFor(self, scope, op.context) else try @import("retained_closure.zig").forgetNamespace(self, scope);
             try control.withWait(fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(payload).? });
             try control.withWait(fs_paths.syncDirectoryHandlePortable, .{ io, inventory });
         }
@@ -739,11 +808,11 @@ pub const FsStore = struct {
         const self: *FsStore = @ptrCast(@alignCast(raw));
         const op: Provider.Operation = .{ .context = context, .cancellation = token };
         try op.ready();
-        if (try artifact_store.uploadScopeFromArtifactId(id)) |scope| try @import("retained_closure.zig").invalidate(self, scope, token);
+        if (try artifact_store.uploadScopeFromArtifactId(id)) |scope| try @import("retained_closure.zig").invalidateFor(self, scope, token, context);
         const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, id);
         defer self.alloc.free(path);
         try op.removeFile(path);
-        try @import("retained_closure.zig").forget(self, id);
+        try @import("retained_closure.zig").forgetFor(self, id, context);
         self.forgetVerifiedFile(id);
         try op.ready();
     }
@@ -763,16 +832,71 @@ pub const FsStore = struct {
         try cleanupRetiredScopedTemporariesOperation(raw, domain, floor, cutoff, token, &op);
         try op.ready();
     }
+    fn verifyContentFor(raw: *anyopaque, _: Allocator, id: []const u8, byte_len: u64, checksum: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        var native: Provider.Native = undefined;
+        try native.init(context, token);
+        defer native.deinit();
+        const op = &native.operation;
+        const io = try op.receiver();
+        const wait = op.control();
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, id);
+        defer self.alloc.free(path);
+        var rejected = false;
+        const file = try wait.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, closeControlledFile);
+        defer file.close(io);
+        const before = try wait.withWait(std.Io.File.stat, .{ file, io });
+        if (before.size != byte_len) return error.ArtifactIntegrityMismatch;
+        const identity = VerifiedFile.fromStat(before);
+        if (!self.isVerifiedFile(id, identity)) {
+            try verifyFileFor(file, io, byte_len, checksum, token, op);
+            const after = try wait.withWait(std.Io.File.stat, .{ file, io });
+            if (!identity.matchesStat(after)) return error.ArtifactIntegrityMismatch;
+            try self.rememberVerifiedFile(id, identity);
+        }
+        try op.ready();
+    }
+    fn putFor(raw: *anyopaque, a: Allocator, scope: ?artifact_store.UploadScope, bytes: []const u8, token: CancellationToken, context: ReadContext) !artifact_store.ArtifactMetadata {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return self.putInScopeFor(a, scope, bytes, token, context);
+    }
+    fn retentionWitnessFor(raw: *anyopaque, scope: artifact_store.UploadScope, token: CancellationToken, context: ReadContext) !?artifact_store.RetentionWitness {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return @import("retained_closure.zig").witnessFor(self, scope, token, context);
+    }
+    fn retainedClosureFor(raw: *anyopaque, id: []const u8, token: CancellationToken, context: ReadContext) !bool {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return @import("retained_closure.zig").retainedFor(self, id, token, context);
+    }
+    fn rememberClosureFor(raw: *anyopaque, id: []const u8, witnesses: []const artifact_store.RetentionWitness, token: CancellationToken, context: ReadContext) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return @import("retained_closure.zig").rememberFor(self, id, witnesses, token, context);
+    }
+    fn inheritClosureFor(raw: *anyopaque, id: []const u8, previous: ?[]const u8, scope: artifact_store.UploadScope, token: CancellationToken, context: ReadContext) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return @import("retained_closure.zig").inheritFor(&self.retention, self, id, previous, scope, token, context);
+    }
+    fn sealClosuresFor(raw: *anyopaque, token: CancellationToken, context: ReadContext) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return @import("retained_closure.zig").sealFor(&self.retention, self, token, context);
+    }
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .verify_content_for = verifyContentFor,
+        .put_for = putFor,
         .delete_for = deleteFor,
         .visit_scoped_uploads_for = visitFor,
         .reclaim_retired_scoped_inventory_for = reclaimFor,
         .cleanup_retired_scoped_temporaries_for = cleanupFor,
         .retention_witness = retentionWitness,
+        .retention_witness_for = retentionWitnessFor,
         .retained_closure = retainedClosure,
+        .retained_closure_for = retainedClosureFor,
         .remember_closure = rememberClosure,
+        .remember_closure_for = rememberClosureFor,
         .inherit_closure = inheritClosure,
+        .inherit_closure_for = inheritClosureFor,
         .seal_closures = sealClosures,
+        .seal_closures_for = sealClosuresFor,
         .deinit = erasedDeinit,
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
@@ -1061,6 +1185,20 @@ fn writeFileAtomicallyAt(path: []const u8, contents: []const u8, cancellation: C
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
 }
 
+fn sha256StringFor(a: Allocator, bytes: []const u8, op: *const Provider.Operation) ![]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        try op.ready();
+        const chunk_end = offset + @min(bytes.len - offset, 1024 * 1024);
+        hash.update(bytes[offset..chunk_end]);
+        offset = chunk_end;
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    try op.ready();
+    return a.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+}
 fn sha256StringAlloc(alloc: Allocator, contents: []const u8) ![]u8 {
     return sha256StringWithCancellationAlloc(alloc, contents, .none);
 }

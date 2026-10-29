@@ -279,11 +279,19 @@ pub const ArtifactStore = struct {
     /// Borrowed by this operation only; shared provider handles stay unmodified.
     write_context: ?ReadContext = null,
     pub fn beginIo(self: *const ArtifactStore, count: usize) !IoGuard {
+        if (self.write_context) |context| if (context.execution != null) return .{ .phase = null };
         if (self.io_phase) |phase| try phase.begin(phase.ptr, count);
         return .{ .phase = self.io_phase };
     }
 
     pub const VTable = struct {
+        verify_content_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, CancellationToken, ReadContext) anyerror!void = null,
+        retention_witness_for: ?*const fn (*anyopaque, UploadScope, CancellationToken, ReadContext) anyerror!?RetentionWitness = null,
+        retained_closure_for: ?*const fn (*anyopaque, []const u8, CancellationToken, ReadContext) anyerror!bool = null,
+        remember_closure_for: ?*const fn (*anyopaque, []const u8, []const RetentionWitness, CancellationToken, ReadContext) anyerror!void = null,
+        inherit_closure_for: ?*const fn (*anyopaque, []const u8, ?[]const u8, UploadScope, CancellationToken, ReadContext) anyerror!void = null,
+        seal_closures_for: ?*const fn (*anyopaque, CancellationToken, ReadContext) anyerror!void = null,
+
         delete_for: ?*const fn (*anyopaque, []const u8, CancellationToken, ReadContext) anyerror!void = null,
         visit_scoped_uploads_for: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken, ReadContext) anyerror!void = null,
         reclaim_retired_scoped_inventory_for: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken, ReadContext) anyerror!void = null,
@@ -326,6 +334,13 @@ pub const ArtifactStore = struct {
     pub fn retentionWitness(self: *ArtifactStore, scope: UploadScope, cancellation: CancellationToken) !?RetentionWitness {
         try scope.validate();
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.retention_witness_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            const value = try call(self.ptr, scope, cancellation, context);
+            try op.ready();
+            return value;
+        };
         const call = self.vtable.retention_witness orelse return null;
         var phase = try self.beginIo(1);
         defer phase.abort();
@@ -335,6 +350,13 @@ pub const ArtifactStore = struct {
     }
     pub fn retainedClosure(self: *ArtifactStore, id: []const u8, cancellation: CancellationToken) !bool {
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.retained_closure_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            const value = try call(self.ptr, id, cancellation, context);
+            try op.ready();
+            return value;
+        };
         const call = self.vtable.retained_closure orelse return false;
         var phase = try self.beginIo(1);
         defer phase.abort();
@@ -344,6 +366,13 @@ pub const ArtifactStore = struct {
     }
     pub fn rememberClosure(self: *ArtifactStore, id: []const u8, witnesses: []const RetentionWitness, cancellation: CancellationToken) !void {
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.remember_closure_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            try call(self.ptr, id, witnesses, cancellation, context);
+            try op.ready();
+            return;
+        };
         if (self.vtable.remember_closure) |call| {
             var phase = try self.beginIo(1);
             defer phase.abort();
@@ -353,6 +382,13 @@ pub const ArtifactStore = struct {
     }
     pub fn inheritClosure(self: *ArtifactStore, id: []const u8, previous: ?[]const u8, cancellation: CancellationToken) !void {
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.inherit_closure_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            try call(self.ptr, id, previous, self.upload_scope orelse return error.InvalidArtifactUploadScope, cancellation, context);
+            try op.ready();
+            return;
+        };
         if (self.vtable.inherit_closure) |call| {
             var phase = try self.beginIo(1);
             defer phase.abort();
@@ -362,6 +398,13 @@ pub const ArtifactStore = struct {
     }
     pub fn sealClosures(self: *ArtifactStore, cancellation: CancellationToken) !void {
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.seal_closures_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            try call(self.ptr, cancellation, context);
+            try op.ready();
+            return;
+        };
         if (self.vtable.seal_closures) |call| {
             var phase = try self.beginIo(1);
             defer phase.abort();
@@ -907,6 +950,14 @@ pub const ArtifactStore = struct {
     ) !void {
         try cancellation.check();
         validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch return error.ArtifactIntegrityMismatch;
+
+        if (self.write_context) |context| if (self.vtable.verify_content_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            try call(self.ptr, result_alloc, artifact_id, expected_byte_len, expected_checksum, cancellation, context);
+            try op.ready();
+            return;
+        };
 
         // A backend verifier owns the complete identity, length, and content
         // check. Calling stat here as well would duplicate provider HEADs on

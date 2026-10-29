@@ -3038,3 +3038,160 @@ test "serverless execution retention joins canceled WAL I/O and resumes native a
         try std.testing.expect(artifacts.write_context == null and manifests.context == null and progress.context == null and wal.context == null);
     };
 }
+
+test "serverless execution artifact uploads verification and sealing join original cancellation" {
+    const local = @import("antfly_local_sources");
+    const api = @import("serverless/artifacts/store.zig");
+    const Fs = @import("serverless/artifacts/fs_store.zig").FsStore;
+    const Object = @import("serverless/artifacts/object_store.zig").ObjectStore;
+    const objectstore = @import("objectstore");
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const Stage = enum { upload, verify, seal };
+    const Mode = enum { success, canceled, deadline };
+    const Fixture = struct {
+        threaded: std.Io.Threaded,
+        reading: bool,
+        armed: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.Io.Event = .unset,
+        fn gate(self: *@This(), reading: bool) void {
+            if (self.reading != reading or !self.armed.swap(false, .acq_rel)) return;
+            self.entered.store(true, .release);
+            self.release.waitUncancelable(self.threaded.io());
+        }
+        fn from(raw: ?*anyopaque) *@This() {
+            return @fieldParentPtr("threaded", @as(*std.Io.Threaded, @ptrCast(@alignCast(raw.?))));
+        }
+        fn sync(raw: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const self = from(raw);
+            self.gate(false);
+            return self.threaded.io().vtable.fileSync(raw, file);
+        }
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self = from(raw);
+            self.gate(true);
+            return self.threaded.io().vtable.fileReadPositional(raw, file, data, offset);
+        }
+        fn operate(raw: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            const self = from(raw);
+            if (operation == .file_read_streaming) self.gate(true);
+            return self.threaded.io().vtable.operate(raw, operation);
+        }
+    };
+    const Job = struct {
+        store: *api.ArtifactStore,
+        root: api.ArtifactMetadata,
+        stage: Stage,
+        result: ?api.ArtifactMetadata = null,
+        cause: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.execute() catch |err| {
+                self.cause = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
+            switch (self.stage) {
+                .upload => self.result = try self.store.put("new immutable payload"),
+                .verify => try self.store.verifyContentWithCancellationUsingAllocator(std.testing.allocator, self.root.artifact_id, self.root.byte_len, self.root.checksum, .none),
+                .seal => try self.store.sealClosures(.none),
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |objects| for (std.enums.values(Stage)) |stage| for (std.enums.values(Mode)) |mode| {
+        var directory = try local.common_test_directory.TestDirectory.init("artifact-holder");
+        defer directory.cleanup();
+        var fixture: Fixture = .{ .threaded = .init(a, .{}), .reading = stage == .verify };
+        defer fixture.threaded.deinit();
+        var io = fixture.threaded.io();
+        var io_vtable = io.vtable.*;
+        io_vtable.fileSync = Fixture.sync;
+        io_vtable.fileReadPositional = Fixture.read;
+        io_vtable.operate = Fixture.operate;
+        io.vtable = &io_vtable;
+        var native = try Fs.init(a, directory.path());
+        defer native.deinit();
+        var filesystem = try objectstore.FilesystemClient.initWithIo(a, directory.path(), io);
+        defer filesystem.deinit();
+        var object = try Object.initWithClientOptions(a, filesystem.client(), "objects", "", .{ .ensure_bucket = true, .filesystem = &filesystem });
+        defer object.deinit();
+        var backend = if (objects) object.artifactStore() else native.artifactStore();
+        backend.upload_scope = .{ .domain = @splat(7), .attempt = @splat(3) };
+        var root = try backend.put("existing root");
+        defer root.deinit(a);
+        if (stage == .seal) try backend.inheritClosure(root.artifact_id, null, .none);
+        var recovery = @import("api/lake_index_artifact_recovery.zig").Reads.init(backend);
+        var store = recovery.store();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .publication_slots = 1, .read_isolation = false });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = io }, .background);
+        defer execution.finish();
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var bridge: maintenance.GraphBridge = .{ .maintenance = .{ .io = io, .execution = &execution, .requested = &canceled, .deadline_ns = if (mode == .deadline) @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s else null } };
+        store.write_context = bridge.readContext();
+        var job: Job = .{ .store = &store, .root = root, .stage = stage };
+        defer if (job.result) |*result| result.deinit(a);
+        fixture.armed.store(true, .release);
+        var task = try io.concurrent(Job.run, .{&job});
+        defer {
+            fixture.release.set(io);
+            task.cancel(io);
+        }
+        const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (!fixture.entered.load(.acquire)) {
+            if (job.done.load(.acquire)) return job.cause orelse error.ArtifactDidNotEnterProvider;
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.ArtifactDidNotEnterProvider;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        const inventory = if (objects) &object.local_inventory.? else &native;
+        try std.testing.expect(inventory.durable_dirs.mutex.tryLock());
+        inventory.durable_dirs.mutex.unlock(io);
+        if (stage == .seal) {
+            try std.testing.expect(inventory.retention.mutex.tryLock());
+            inventory.retention.mutex.unlock(io);
+            try std.testing.expectEqual(@as(usize, 0), inventory.retention.pending.items.len);
+        }
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        query.finish();
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        if (mode != .success) {
+            if (mode == .canceled) canceled.store(true, .release) else {
+                while (@import("antfly_platform").time.monotonicNs() < bridge.maintenance.?.deadline_ns.?) try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try io.sleep(.fromMilliseconds(3), .awake);
+            try std.testing.expect(!job.done.load(.acquire));
+        }
+        fixture.release.set(io);
+        task.await(io);
+        if (mode != .success) {
+            try std.testing.expectEqual(if (mode == .canceled) error.Canceled else error.DeadlineExceeded, job.cause.?);
+            try std.testing.expect(job.result == null);
+            execution.finish();
+            try execution.start(&scheduler, .{ .io = io }, .background);
+            canceled.store(false, .release);
+            bridge = .{ .maintenance = .{ .io = io, .execution = &execution, .requested = &canceled } };
+            store.write_context = bridge.readContext();
+            if (stage == .seal) try store.inheritClosure(root.artifact_id, null, .none);
+            try job.execute();
+        } else if (job.cause) |err| return err;
+        if (stage == .upload) {
+            const bytes = try backend.getAlloc(job.result.?.artifact_id);
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings("new immutable payload", bytes);
+        } else if (stage == .seal) try std.testing.expect(try store.retainedClosure(root.artifact_id, .none));
+        try std.testing.expect(recovery.cause() == null);
+        try std.testing.expect(backend.write_context == null and object.upload_context.execution == null);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}

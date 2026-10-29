@@ -760,6 +760,7 @@ fn deriveFiles(a: A, root: *Root) !void {
 /// not the total index size. Lease renewal and cancellation bound execution.
 pub fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
     var store = backend;
+    store.write_context = context;
     const certified = root.retained_id.len != 0 and (store.retainedClosure(root.retained_id, cancellation) catch false);
     try context.ensureActive();
     try cancellation.check();
@@ -848,6 +849,7 @@ fn validateReuseWithCache(a: A, backend: stores.ArtifactStore, root: Root, conte
         }
     };
     var validator: Validator = .{ .a = a, .store = backend, .domain = root.domain, .context = context, .cancellation = cancellation, .cache_entries = cache_entries };
+    validator.store.write_context = context;
     defer validator.covers.deinit(a);
     defer validator.witnesses.deinit(a);
     if (root.retained_id.len != 0) try validator.retainArtifact(root.retained_id);
@@ -2290,21 +2292,37 @@ test "external lake ordered durable run checkpoints compact resume and certify f
         try std.testing.expectEqual(@as(u64, ordinal / count), entry.ref.external.row_ordinal);
         try std.testing.expect(entry.cover != null);
     }
-    // The certificate survives backend reopening, then fails closed after an
-    // old covering block is lost. A warm audit performs only its active check.
+    // A reopened certificate validates metadata without touching tree or cover
+    // payloads. Additional lifetime checks must not masquerade as a cold audit.
     var reopened = try Fs.init(a, directory.path());
     defer reopened.deinit();
     var fresh = reopened.artifactStore();
-    const Deadline = struct {
-        remaining: usize = 1,
-        fn check(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.remaining == 0) return error.DeadlineExceeded;
-            self.remaining -= 1;
+    const Payloads = struct {
+        var calls: usize = 0;
+        fn range(_: *anyopaque, _: A, _: []const u8, _: u64, _: usize) ![]u8 {
+            calls += 1;
+            return error.UnexpectedPayloadRead;
+        }
+        fn rangeCanceled(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, _: Cancellation) ![]u8 {
+            return range(raw, alloc, id, offset, len);
+        }
+        fn verified(raw: *anyopaque, alloc: A, id: []const u8, _: u64, _: []const u8, offset: u64, len: usize, token: Cancellation) ![]u8 {
+            return rangeCanceled(raw, alloc, id, offset, len, token);
+        }
+        fn budgeted(raw: *anyopaque, alloc: A, id: []const u8, bytes: u64, checksum: []const u8, offset: u64, len: usize, token: Cancellation, _: *u64) ![]u8 {
+            return verified(raw, alloc, id, bytes, checksum, offset, len, token);
         }
     };
-    var deadline: Deadline = .{};
-    try validateReuse(a, fresh, root, .{ .checkpoint = .{ .ptr = &deadline, .check = Deadline.check } }, .none);
+    var vtable = fresh.vtable.*;
+    vtable.get_range_alloc = Payloads.range;
+    vtable.get_range_alloc_with_cancellation = Payloads.rangeCanceled;
+    vtable.get_verified_range_alloc_with_cancellation = Payloads.verified;
+    vtable.get_verified_range_alloc_with_budget = Payloads.budgeted;
+    var certified = fresh;
+    certified.vtable = &vtable;
+    Payloads.calls = 0;
+    try validateReuse(a, certified, root, .{}, .none);
+    try std.testing.expectEqual(@as(usize, 0), Payloads.calls);
     try fresh.delete(entries[0].cover.?.block.artifact_id);
     try std.testing.expect(!try fresh.retainedClosure(final_ref.artifact_id, .none));
     try std.testing.expectError(error.FileNotFound, validateReuse(a, fresh, root, .{}, .none));

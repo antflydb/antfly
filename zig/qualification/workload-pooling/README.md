@@ -1491,3 +1491,67 @@ The combined run passes 70/70 build steps and 47/47 lifecycle tests; local
 dependency tests also pass. `retention-admission-final.json` binds the committed
 files to those tested inputs and retained source snapshots. Formatting, license
 headers and the Apache product boundary pass.
+
+### Artifact uploads and retained-closure holders (2026-10-29)
+
+Native artifact uploads now implement the contextual provider callback. Hashing
+and content verification keep admitted CPU, with checkpoints between bounded
+chunks; physical opens, reads, writes, synchronization and kernel-lock readiness
+use the original operation's receiver and lifetime. Existing content and journal
+serialization uses protected CPU return while holding its locks. Rejected
+creates close their file before reporting the original refusal. Journal record
+parsing and backfill enumeration run after CPU reentry. Object-backed local
+inventories use this same registration path instead of parking the compound
+journal operation. Explicit legacy wait-only adapters remain separate.
+
+The durable-directory proof cache now locks only around cache state. Cache
+misses prove ancestor durability outside the mutex, then publish their owned
+path under a short lock; duplicate proofs are harmless. Provider waits therefore
+cannot retain this shared mutex. Failed proofs never populate the cache.
+
+Native and remote retained-closure queues have short CPU-only critical sections.
+Inheritance loads and validates prior certificates before appending under the
+queue mutex; it rechecks same-attempt descendants and capacity after reentry.
+Sealing detaches a batch and owns its arenas through all provider I/O, including
+cancellation and physical retirement. Concurrent inheritance can proceed without
+waiting for a stalled sealing provider. Native epoch invalidation, certificate
+framing and hashing, witness validation and conditional remote publication keep
+their previous proof semantics. Remote queues now serialize their shared state
+as native queues already did.
+
+The artifact API forwards explicit metadata and verification context, including
+through the derived-artifact recovery decorator. Synchronous native text and
+ordered reuse audits bind their own operation context; asynchronous readers
+continue to own their independent execution. Object verification lends CPU
+inside physical provider calls rather than around provider parsing and hashing.
+Native verification pins an open file through hashing and identity checks.
+
+Physical filesystem fixtures cover upload, verification and sealing with native
+stores and a filesystem object client through the public artifact API and
+recovery decorator. They check available directory/closure mutexes, unrelated
+query and health progress, joined cancellation/deadline refusal, and retry with
+a fresh owner. A reopened ordered certificate must avoid payload reads rather
+than satisfy a particular checkpoint count.
+
+The full design remains open. Cloud-generation map holders and remaining
+immutable-artifact/read preparation boundaries still need their complete
+production audit, along with serial graph checkpoints, vendor/framework and
+registry preparation, mapped-page-fault scope, and the unresolved file-engine
+FD recovery gate. Live-cloud and installed-native behavior are not qualified by
+these deterministic local fixtures. Full qualification remains waived.
+
+Evidence: `artifact-holder-v5.json` records 80/80 successful steps, 52/52
+lifecycle tests, 69/69 artifact integrity/reuse tests, passing background and
+SQL-lake admission checks, and unchanged native inputs. The physical gate case
+covers 18 native/object operation and success/cancellation/deadline combinations.
+`artifact-holder-directory-direct.json` runs the directory-cache source as its
+actual test root and records 1/1 passing tests. The earlier top-level filtered
+object-store build selected zero tests and is excluded from verification
+evidence. The canceled retry fixture creates a fresh bridge as well as a fresh
+execution; it never clears refusal on the old owner's capability. Formatting,
+license headers and the Apache product boundary pass.
+
+`artifact-holder-admission-final.json` binds the committed files to both tested
+input manifests and retained source snapshots. The native upload/verification
+and retained-closure holder milestone is integrated; the remaining full-design
+work above is still open.

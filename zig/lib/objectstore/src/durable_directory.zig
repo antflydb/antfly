@@ -20,6 +20,7 @@
 //! immediate rename directories. Owners must invalidate after directory removal.
 const std = @import("std");
 const builtin = @import("builtin");
+const Control = @import("httpx").socket.WriteControl;
 
 pub const Cache = struct {
     mutex: std.Io.Mutex = .init,
@@ -32,45 +33,67 @@ pub const Cache = struct {
     }
 
     pub fn ensure(self: *Cache, alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
+        return self.ensureWithControl(alloc, io, path, .{});
+    }
+
+    /// Cache state never spans provider waits. Duplicate proofs are harmless;
+    /// each miss proves ancestor durability before publishing its cache entry.
+    pub fn ensureWithControl(self: *Cache, alloc: std.mem.Allocator, io: std.Io, path: []const u8, control: Control) !void {
+        try lock(&self.mutex, io, control);
         for (self.entries) |entry| if (entry) |known| {
-            if (std.mem.eql(u8, known, path)) return;
+            if (std.mem.eql(u8, known, path)) {
+                self.mutex.unlock(io);
+                return;
+            }
         };
-        try createPath(io, path);
+        self.mutex.unlock(io);
+        try createPathControlled(io, path, control);
         var current = if (path.len == 0) "." else path;
         while (true) {
-            try sync(io, current);
+            try control.withWait(sync, .{ io, current });
             const parent = std.fs.path.dirname(current) orelse {
-                if (!std.mem.eql(u8, current, ".")) try sync(io, ".");
+                if (!std.mem.eql(u8, current, ".")) try control.withWait(sync, .{ io, "." });
                 break;
             };
             if (std.mem.eql(u8, parent, current)) break;
             current = parent;
         }
         const owned = try alloc.dupe(u8, path);
+        errdefer alloc.free(owned);
+        try lock(&self.mutex, io, control);
+        defer self.mutex.unlock(io);
+        for (self.entries) |entry| if (entry) |known| if (std.mem.eql(u8, known, path)) {
+            alloc.free(owned);
+            return;
+        };
         if (self.entries[self.next]) |old| alloc.free(old);
         self.entries[self.next] = owned;
         self.next = (self.next + 1) % self.entries.len;
     }
 };
 
-fn createPath(io: std.Io, path: []const u8) anyerror!void {
+fn lock(mutex: *std.Io.Mutex, io: std.Io, control: Control) !void {
+    while (!mutex.tryLock()) try control.withWait(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake });
+}
+fn closeDir(dir: std.Io.Dir, args: anytype) void {
+    dir.close(args[1]);
+}
+fn createPathControlled(io: std.Io, path: []const u8, control: Control) anyerror!void {
     if (path.len == 0 or std.mem.eql(u8, path, ".")) return;
-    if (std.Io.Dir.cwd().openDir(io, path, .{})) |opened| {
-        var dir = opened;
-        dir.close(io);
+    var rejected = false;
+    if (control.withOwnedWait(&rejected, std.Io.Dir.openDir, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenOptions{} }, closeDir)) |opened| {
+        opened.close(io);
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
     if (std.fs.path.dirname(path)) |parent| {
-        if (!std.mem.eql(u8, parent, path)) try createPath(io, parent);
+        if (!std.mem.eql(u8, parent, path)) try createPathControlled(io, parent, control);
     }
-    std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |err| switch (err) {
+    control.withWait(std.Io.Dir.createDir, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.Permissions.default_dir }) catch |err| switch (err) {
         error.PathAlreadyExists => {
-            var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+            const dir = try control.withOwnedWait(&rejected, std.Io.Dir.openDir, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenOptions{} }, closeDir);
             dir.close(io);
         },
         else => return err,

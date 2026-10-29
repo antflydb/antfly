@@ -30,6 +30,13 @@ pub const Reads = struct {
     }
     pub fn init(backend: stores.ArtifactStore) Reads {
         const vtable: stores.ArtifactStore.VTable = .{
+            .retention_witness_for = if (backend.vtable.retention_witness_for != null) retention_witness_for else null,
+            .retained_closure_for = if (backend.vtable.retained_closure_for != null) retained_closure_for else null,
+            .remember_closure_for = if (backend.vtable.remember_closure_for != null) remember_closure_for else null,
+            .inherit_closure_for = if (backend.vtable.inherit_closure_for != null) inherit_closure_for else null,
+            .seal_closures_for = if (backend.vtable.seal_closures_for != null) seal_closures_for else null,
+            .put_for = if (backend.vtable.put_for != null) put_for else null,
+            .verify_content_for = if (backend.vtable.verify_content_for != null) verify_content_for else null,
             .object_store = if (backend.vtable.object_store != null) object_store else null,
             .retention_witness = if (backend.vtable.retention_witness != null) retention_witness else null,
             .retained_closure = if (backend.vtable.retained_closure != null) retained_closure else null,
@@ -64,6 +71,34 @@ pub const Reads = struct {
         handle.ptr = self;
         handle.vtable = &self.vtable;
         return handle;
+    }
+    fn retention_witness_for(raw: *anyopaque, scope: stores.UploadScope, token: Cancellation, context: stores.ReadContext) !?stores.RetentionWitness {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.retention_witness_for.?(self.backend.ptr, scope, token, context);
+    }
+    fn retained_closure_for(raw: *anyopaque, id: []const u8, token: Cancellation, context: stores.ReadContext) !bool {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.retained_closure_for.?(self.backend.ptr, id, token, context);
+    }
+    fn remember_closure_for(raw: *anyopaque, id: []const u8, witnesses: []const stores.RetentionWitness, token: Cancellation, context: stores.ReadContext) !void {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.remember_closure_for.?(self.backend.ptr, id, witnesses, token, context);
+    }
+    fn inherit_closure_for(raw: *anyopaque, id: []const u8, previous: ?[]const u8, scope: stores.UploadScope, token: Cancellation, context: stores.ReadContext) !void {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.inherit_closure_for.?(self.backend.ptr, id, previous, scope, token, context);
+    }
+    fn seal_closures_for(raw: *anyopaque, token: Cancellation, context: stores.ReadContext) !void {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.seal_closures_for.?(self.backend.ptr, token, context);
+    }
+    fn put_for(raw: *anyopaque, a: A, scope: ?stores.UploadScope, bytes: []const u8, token: Cancellation, context: stores.ReadContext) !stores.ArtifactMetadata {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.put_for.?(self.backend.ptr, a, scope, bytes, token, context);
+    }
+    fn verify_content_for(raw: *anyopaque, a: A, id: []const u8, byte_len: u64, checksum: []const u8, token: Cancellation, context: stores.ReadContext) !void {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.verify_content_for.?(self.backend.ptr, a, id, byte_len, checksum, token, context) catch |err| return self.failure(err);
     }
     fn object_store(raw: *anyopaque) *@import("../serverless/artifacts/object_store.zig").ObjectStore {
         const self: *Reads = @ptrCast(@alignCast(raw));
