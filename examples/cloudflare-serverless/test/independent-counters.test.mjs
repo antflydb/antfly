@@ -71,3 +71,13 @@ test('counter failures retain only fixed actionable categories without provider 
  assert.equal(counterFailureDiagnostic({errors:{}},403).kind,'authorization');
  const result=await collectIndependentCounters(run,'private-disposable-token',timeframe,{fetch:async()=>Response.json({errors:[{message:'unknown field private-secret'}]})});assert.equal(result.failures[0].diagnostic.kind,'schema');assert.ok(!JSON.stringify(result).includes('private-secret'));
 });
+
+
+test('telemetry capability preflight is read-only, scoped and never retains destination credentials',async()=>{
+ const{telemetryJobTemplate,inspectTelemetryCapabilities}=await import('../qualification/telemetry-capabilities.mjs'),template=telemetryJobTemplate([run]),secret='private-token-and-destination-secret';
+ assert.equal(template.enabled,false);assert.equal(template.output_options.sample_rate,1);assert.equal(template.destination_conf,undefined);
+ const result=await inspectTelemetryCapabilities([run],secret,{fetch:async(url,options)=>{assert.equal(options.headers.Authorization,'Bearer '+secret);assert.equal(options.method,undefined);return Response.json({success:true,result:url.endsWith('/fields')?Object.fromEntries(template.output_options.field_names.map(k=>[k,'type'])):[{...template,id:1,enabled:true,destination_conf:'r2://private-bucket?secret-access-key='+secret}]});}});
+ assert.equal(result.configuration_inspectable,true);assert.equal(result.existing_jobs[0].exact_scope,true);assert.equal(result.delivery_contract_qualified,false);assert.ok(!JSON.stringify(result).includes(secret));assert.ok(!JSON.stringify(result).includes('private-bucket'));
+ const denied=await inspectTelemetryCapabilities([run],secret,{fetch:async()=>Response.json({success:false,errors:[{code:10000,message:secret}]},{status:403})});assert.equal(denied.configuration_inspectable,false);assert.deepEqual(denied.results[0].error_codes,[10000]);assert.ok(!JSON.stringify(denied).includes(secret));
+ await assert.rejects(inspectTelemetryCapabilities([{...run,id:'production'}],secret),/Scope/);
+});

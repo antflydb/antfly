@@ -120,7 +120,7 @@ stack or consumed corpus is reused as fresh evidence.
 
 ## Local validation checkpoint
 
-All 343 Node tests and 34 full actual-workerd checks pass. The final workerd
+All 344 Node tests and 34 full actual-workerd checks pass. The final workerd
 suite includes native SQL/KV guards, Queue-only Cron, physical cancellation
 retention, caller-context handoff, lost maintenance acknowledgements,
 publication checkpoints, both collectors, migration and eviction. A focused
@@ -143,3 +143,51 @@ The native modules are unchanged from the previously sealed 32/16/8-MiB
 family. No Zig/native-provider implementation changed in this follow-up;
 previous native/ANN/scale evidence is retained by artifact identity rather
 than being relabeled as newly executed tests.
+
+
+The bursty 20-ms-delay repeat also passes: four 512-document tenants, 32 reads
+(p95 450.95 ms), 16 writes (p95 855.78 ms) and preparation in 92.73 seconds.
+The fixture explicitly waits, within a 30-second terminal bound, for all
+reported app/writer/builder physical I/O to reach zero before inventory and
+teardown; that wait is 116 ms. The earlier bursty run ended its measurement
+with one idle-checkpoint operation active and is retained separately. Its
+correctness result is not a complete terminal-I/O measurement. These local
+experiments remain small sequential diagnostics, not a gate pass.
+
+## Reviewable next trials and capability probe
+
+Three fresh local-only pairs are prepared under
+`dist/qualification/gate-mvtt65830d61/`, with candidate runtime `9b81fa0021`
+and unchanged approved control source `c44896ac8c`. All six sets of four
+Worker bundles verify, including the original control's native module hashes.
+They retain the selected profile, capacities and numeric gate thresholds.
+No cloud resource was created and no token was uploaded. The generated local
+API-token files remain private in the unsealed proposal directory for later
+authorized deployment; they are excluded from evidence archives.
+
+`qualification/telemetry-capabilities.mjs` is a read-only preflight for the
+exact disposable scope. It checks the documented Workers Trace Events fields
+and existing export jobs, retains only fixed/numeric diagnostics, and creates
+a **disabled** job template with no destination credentials. It never treats
+configuration availability as delivery qualification. It accepts an explicit
+private token file or the existing Wrangler credential:
+
+```sh
+node qualification/telemetry-capabilities.mjs \
+  dist/qualification/gate-mvtt65830d61/gate.json \
+  --token-file=/private/path/to/account-logs-token \
+  --out=dist/qualification/telemetry-capability-new-run
+```
+
+Both documented endpoint probes return HTTP 403/code 10000 with the current
+credential. A private file path with Account Logs Read/Edit permissions, or
+an existing unsampled export's details, is required to inspect/prepare that
+next step. The probe never logs destination URLs, provider error text or
+credentials. Missing source identities, sampled totals and unproven quiet-role
+zeroes remain qualification failures; neither sibling populations nor matching
+estimates substitute for provider completeness evidence.
+
+Current evidence is under
+`examples/cloudflare-serverless/dist/qualification/runtime-recovery-1793292255/`.
+All earlier sealed reports remain unchanged. The hour-long and cold cloud
+populations have not been run on this runtime; the PR remains draft.
