@@ -19,6 +19,7 @@ export class Probe extends DurableObject {
  run(id){marker(id,'rpc','complete');return{id};}
 }
 export default {async fetch(request,env,ctx){
+ if(!env.API_TOKEN||request.headers.get('Authorization')!=='Bearer '+env.API_TOKEN)return new Response('unauthorized',{status:401});
  const id=new URL(request.url).searchParams.get('nonce');
  if(request.method!=='POST'||!isUuid(id))return new Response('invalid probe',{status:400});
  const rpc=crypto.randomUUID();marker(id,'fetch','start');

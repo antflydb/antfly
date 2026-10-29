@@ -78,7 +78,7 @@ export default {async fetch(request,env){
   }
   if(path==='/exercise'&&request.method==='POST'){
    const input=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await readBody(request))),count=input.count??8;if(!Number.isInteger(count)||count<1||count>32)fail('TelemetryProbeBudgetInvalid');
-   const expected=[];for(let i=0;i<count;i++){const id=crypto.randomUUID(),response=await env.FIXTURE.fetch('https://probe.invalid/?nonce='+id,{method:'POST'});if(!response.ok)fail('TelemetryProbeFailed');const value=await response.json();if(value.id!==id||!uuid(value.rpc))fail('TelemetryProbeIdentityInvalid');expected.push(value);}
+   const expected=[];for(let i=0;i<count;i++){const id=crypto.randomUUID(),response=await env.FIXTURE.fetch('https://probe.invalid/?nonce='+id,{method:'POST',headers:{Authorization:'Bearer '+env.API_TOKEN}});if(!response.ok)fail('TelemetryProbeFailed');const value=await response.json();if(value.id!==id||!uuid(value.rpc))fail('TelemetryProbeIdentityInvalid');expected.push(value);}
    const id=crypto.randomUUID();await env.LOGS.put(prefix+'plans/'+id+'.json',JSON.stringify({id,expected}),{onlyIf:{etagDoesNotMatch:'*'}});return Response.json({qualification:false,id,expected});
   }
   if(path==='/report'&&request.method==='POST'){

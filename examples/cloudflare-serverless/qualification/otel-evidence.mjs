@@ -15,6 +15,7 @@
 
 // OTLP/JSON boundary. Preserve provider identities, never arbitrary attributes,
 // headers, URLs, exception messages, or log bodies. Unknown data cannot qualify.
+import {resourceFailureCode} from '../performance.mjs';
 import {sanitizeTailEvent} from './metrics-tail.mjs';
 const enc = new TextEncoder();
 const reject = code => { throw Error(code); };
@@ -75,14 +76,16 @@ export async function sanitizeOtel(envelope, source, signal) {
 }
 // This reports readiness only. Gate adoption additionally requires independent
 // platform accounting, immutable evidence and a validated settlement contract.
-export function reconcileOtel(rows, expected) {
+export function reconcileOtel(rows, expected, {version} = {}) {
  const failures=[],terminals=rows.filter(r=>r.terminal),ids=new Map();
- for(const row of terminals){if(!row.invocation_id_sha256||!row.trace_id_sha256||!row.span_id_sha256)failures.push('ProviderIdentityMissing');else {const prior=ids.get(row.invocation_id_sha256);if(prior&&JSON.stringify(prior)!==JSON.stringify(row))failures.push('ProviderIdentityConflict');ids.set(row.invocation_id_sha256,row);}if(!row.version_id)failures.push('ProviderVersionMissing');if(row.handler==='unknown'||!row.outcome||row.start==null||row.end==null||row.end<row.start||row.dropped||row.warning)failures.push('TerminalMetadataIncomplete');if(row.outcome&&row.outcome!=='ok')failures.push('InvocationFailed');}
+ for(const row of terminals){if(!row.invocation_id_sha256||!row.trace_id_sha256||!row.span_id_sha256)failures.push('ProviderIdentityMissing');else {const prior=ids.get(row.invocation_id_sha256);if(prior&&JSON.stringify(prior)!==JSON.stringify(row))failures.push('ProviderIdentityConflict');ids.set(row.invocation_id_sha256,row);}if(!row.version_id)failures.push('ProviderVersionMissing');if(row.handler==='unknown'||!row.outcome||row.start==null||row.end==null||row.end<row.start||row.dropped||row.warning||!Number.isFinite(row.event?.cpuTime)||row.event.cpuTime<0||!Number.isFinite(row.event?.wallTime)||row.event.wallTime<0)failures.push('TerminalMetadataIncomplete');if(row.outcome&&row.outcome!=='ok')failures.push('InvocationFailed');}
+ for(const row of rows){if(resourceFailureCode(JSON.stringify(row.event)))failures.push('ResourceFailureObserved');if(row.dropped||row.warning)failures.push('TelemetryDroppedOrWarning');}
  const unique=[...ids.values()];
+ if(version&&unique.some(row=>row.version_id!==version))failures.push('ProviderVersionMismatch');
  for(const pair of expected)for(const[kind,id,phase]of[['fetch',pair.id,'late'],['rpc',pair.rpc,'complete']]){
   const logs=rows.filter(r=>r.signal==='logs'&&r.probes.some(p=>p.id===id&&p.kind===kind&&p.phase===phase));
   if(!logs.length)failures.push('FixtureLogMissing');
-  const matches=unique.filter(t=>logs.some(l=>l.invocation_id_sha256===t.invocation_id_sha256&&l.trace_id_sha256===t.trace_id_sha256));if(matches.length!==1)failures.push('FixtureTerminalMismatch');
+  const matches=unique.filter(t=>logs.some(l=>l.trace_id_sha256===t.trace_id_sha256&&(l.invocation_id_sha256!=null&&l.invocation_id_sha256===t.invocation_id_sha256||l.span_id_sha256!=null&&l.span_id_sha256===t.span_id_sha256)));if(matches.length!==1)failures.push('FixtureTerminalMismatch');else {if(kind==='fetch'?matches[0].handler!=='fetch':!['rpc','jsrpc','worker_rpc'].includes(matches[0].handler))failures.push('FixtureHandlerMismatch');if(logs.some(l=>l.start==null||l.start<matches[0].start||l.start>matches[0].end))failures.push('LateLogOutsideTerminalLifetime');}
  }
  if(unique.length!==expected.length*2)failures.push('TerminalCountMismatch');
  return{qualification:false,ready:failures.length===0,failures:[...new Set(failures)],terminals:unique.length,expected:expected.length*2};
