@@ -59,7 +59,7 @@ export default {async fetch(request,env){
  const path=new URL(request.url).pathname;
  if(!uuid(env.CAPTURE_ID)||!/^antfly-1278-telemetry-[a-z0-9]+-source$/.test(env.SOURCE_WORKER??''))return Response.json({error:'TelemetryScopeInvalid'},{status:500});
  const prefix='probe-v1/'+env.CAPTURE_ID+'/';
- if(env.RETIRE_MODE==='true'&&!['/report','/drain'].includes(path))return new Response('retired',{status:410});
+ if(env.RETIRE_MODE==='true'&&!['/report','/page','/drain'].includes(path))return new Response('retired',{status:410});
  let rejectionShape;
  try{
   if(['/ingest','/v1/traces','/v1/logs'].includes(path)&&request.method==='POST'){
@@ -81,6 +81,16 @@ export default {async fetch(request,env){
    const input=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await readBody(request))),count=input.count??8;if(!Number.isInteger(count)||count<1||count>32)fail('TelemetryProbeBudgetInvalid');
    const expected=[];for(let i=0;i<count;i++){const id=crypto.randomUUID(),response=await env.FIXTURE.fetch('https://probe.invalid/?nonce='+id,{method:'POST',headers:{Authorization:'Bearer '+env.API_TOKEN}});if(!response.ok)fail('TelemetryProbeFailed');const value=await response.json();if(value.id!==id||!uuid(value.rpc))fail('TelemetryProbeIdentityInvalid');expected.push(value);}
    const id=crypto.randomUUID();await env.LOGS.put(prefix+'plans/'+id+'.json',JSON.stringify({id,expected}),{onlyIf:{etagDoesNotMatch:'*'}});return Response.json({qualification:false,id,expected});
+  }
+  if(path==='/page'&&request.method==='POST'){
+   const input=JSON.parse(new TextDecoder().decode(await readBody(request)));
+   if(Object.keys(input).some(k=>k!=='cursor')||input.cursor!=null&&(typeof input.cursor!=='string'||input.cursor.length>4096))fail('TelemetryCursorInvalid');
+   // Re-list with a smaller native limit to preserve R2's actual continuation
+   // cursor. A cursor over concurrently written keys is NOT a closed snapshot.
+   let limit=32,page;for(;;){page=await env.LOGS.list({prefix,limit,...(input.cursor?{cursor:input.cursor}:{})});if(page.objects.reduce((n,o)=>n+o.size,0)<=4*1024*1024)break;if(limit===1)fail('TelemetryReportBudgetExceeded');limit=Math.max(1,Math.floor(limit/2));}
+   if(page.truncated&&(typeof page.cursor!=='string'||!page.cursor||page.cursor===input.cursor))fail('TelemetryCursorInvalid');
+   const objects=[];for(const item of page.objects){const object=await env.LOGS.get(item.key);if(!object)fail('TelemetryReportObjectMissing');objects.push({key:item.key,value:await object.json()});}
+   return Response.json({qualification:false,capture_id:env.CAPTURE_ID,collector_version:env.WORKER_VERSION?.id??null,objects,cursor:page.truncated?page.cursor:null});
   }
   if(path==='/report'&&request.method==='POST'){
    const page=await env.LOGS.list({prefix,limit:1000});if(page.truncated)fail('TelemetryReportBudgetExceeded');const objects=[];let total=0;
