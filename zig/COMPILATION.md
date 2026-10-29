@@ -1970,3 +1970,34 @@ With explicit approval, the complete-library gate is now 88 MiB, leaving
 unwind data, exported features and optimization modes are unchanged. Archive
 failures now report actual bytes/MiB as well as the limit. The production cross
 Darwin gate remains required; this native measurement does not replace it.
+
+### API cache relocation and Better Auth qualification
+
+The stripped Debug ownership audit must preserve canonical identities for
+immutable authored inputs outside the Zig build root as well as C inputs.
+Anonymous schema imports such as `../openapi.yaml` otherwise hash the overlay's
+absolute path and rebuild the API archive and four consumers after cloning.
+The bounded native regression includes an external schema and proves relocated
+cache hits, schema invalidation in both checkouts, private source mutation, and
+survival after deleting the original workspace.
+
+Better Auth run 40820082669 measured the Nix/glibc x86_64 baseline CPU stripped
+ReleaseFast API archive at 6,698,409,984 bytes against a 5 GiB reservation. Its
+retry consumed the remainder of the two-hour job. The exact Zig 0.17.0 native
+Linux GNU profile now reserves 8 GiB (at least 25% headroom); other profiles keep
+their claims. API and storage compilation still fit together in the existing
+20 GiB aggregate budget. An always-uploaded build report retains progress,
+compiler identities, CPU time and sampled memory even when the job is canceled.
+
+Full inference E2E lanes select collected tests by primary model affinity, so
+compound speech/generation tests share the generator lane. Ordinary servers
+retain models subject to the existing process/host byte budgets; only the
+explicit eviction regression uses a separate server with a one-model cap.
+The lanes share the locked, atomically published model download directory.
+
+Focused failure qualification can use `zig build storage-batch-contract-test`
+for collector allocation-failure and bounded embedding regressions, or
+`zig build capi-contract-test -Dtest-filter="..."` for public C API contracts.
+They reuse the normal test bodies and dependencies; the full storage and C API
+entrypoints retain their existing coverage. These targets avoid compiling HTTP
+discovery anchors and unrelated resolver replay suites for a focused regression.
