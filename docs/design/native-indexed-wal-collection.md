@@ -320,3 +320,11 @@ marker and HEAD. It verifies layout two, latest LSNs 2 then 3, and the persisted
 is removed. The earlier plain-text-inspector failures remain separate failed
 reports. This is a Darwin file-backend lifecycle smoke, not a cloud latency,
 background maintenance-loop or keyed HTTP ingestion qualification.
+
+
+The final 50,000-record execution repeats after the lifecycle fix: 32 focused
+tests pass with two live-provider skips and no failures/leaks. It reproduces
+884/398 steps, 1,965 marked pages, 6,224 WAL deletions, 7,397 private cleanup
+objects, peak 99 operations, and final object counts 1,973 then 1,966. Its
+executed test binary is preserved alongside the complete native command and
+release binary. The 334-case Node repeat also passes after the inspector fix.

@@ -496,3 +496,9 @@ proposal into an unsealed runtime directory before any authorized lifecycle
 changes. AWS's fresh default-profile check still returns `NoCredentials`.
 Recovered platform `SQLITE_NOMEM`, the live Cloudflare gate and matched
 colocated provider performance remain open.
+
+
+The final native 50,000-record repeat passes 32 focused cases with two
+live-provider skips and no failures/leaks, reproducing all batched collection
+counters and exact retained-record/receipt checks. Its executed binary is
+preserved. All 334 Node cases pass again after the envelope-inspector fix.
