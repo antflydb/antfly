@@ -18,9 +18,11 @@ assume that an old root stops being used after a Cloudflare request timeout.
 Manifest leases protect published artifacts; they do not automatically protect
 the WAL page tree captured by an unrelated native reader.
 
-The explicitly selected managed layout is `antfly-wal:indexed-managed:1`,
-distinct from the immutable `antfly-wal:indexed:1` marker. Initially activate it only on a
-new, empty prefix. Reject legacy and existing unmanaged indexed prefixes; an
+Managed selection uses `antfly-wal:indexed-managed:1` for nonempty logical
+prefixes and `antfly-wal:indexed-managed:2` for new empty logical roots. These
+are distinct from the unmanaged `antfly-wal:indexed:1` / `:2` markers. Activate
+managed selection only at a pristine location; the version-two relative root
+layout is described below. Reject legacy and existing unmanaged indexed prefixes; an
 inventory without a marker rejects both current objects and historical versions
 of preexisting WAL data, even when no current names remain. Coordinated
 upgrade/export-import is a separate protocol. Never reinterpret the existing
