@@ -1,7 +1,5 @@
 name: LangChain.js integration
 on:
-  pull_request:
-    paths: ['ts/packages/langchain/**', 'ts/packages/langgraph-store/**', 'ts/packages/sdk/**', 'ts/pnpm-lock.yaml', 'ts/pnpm-workspace.yaml', '.github/workflows/langchain-js.yml']
   push:
     branches: [main]
     paths: ['ts/packages/langchain/**', 'ts/packages/langgraph-store/**', 'ts/packages/sdk/**', 'ts/pnpm-lock.yaml', 'ts/pnpm-workspace.yaml', '.github/workflows/langchain-js.yml']
