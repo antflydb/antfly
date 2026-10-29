@@ -1694,7 +1694,6 @@ pub const ExtractionProvider = enum {
     antfly,
     pioneer,
     cloudflare,
-    openai,
     mock,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1702,7 +1701,6 @@ pub const ExtractionProvider = enum {
             .antfly => "antfly",
             .pioneer => "pioneer",
             .cloudflare => "cloudflare",
-            .openai => "openai",
             .mock => "mock",
         };
         try jw.write(s);
@@ -1717,7 +1715,6 @@ pub const ExtractionProvider = enum {
             .{ "antfly", .antfly },
             .{ "pioneer", .pioneer },
             .{ "cloudflare", .cloudflare },
-            .{ "openai", .openai },
             .{ "mock", .mock },
         });
         return map.get(s) orelse error.UnexpectedToken;

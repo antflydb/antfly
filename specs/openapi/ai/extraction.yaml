@@ -12,7 +12,6 @@ components:
       - antfly
       - pioneer
       - cloudflare
-      - openai
       - mock
     ExtractionConfig:
       type: object
