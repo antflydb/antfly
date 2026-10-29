@@ -20,7 +20,7 @@ from uuid import uuid4
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from cloud_plan import management_plan, native_plan
+from cloud_plan import RUNTIME, management_plan, native_plan
 
 
 def test_separate_object_tables_and_scoped_cloud_keys():
@@ -37,9 +37,7 @@ def test_separate_object_tables_and_scoped_cloud_keys():
     base = tables["archive-table.json"]["schema"]["base_source"]
     assert base["format"] == "parquet" and "write_policy" not in base
     assert base["credentials"]["ref"] == "cloud-gcs-cred_" + archive.replace("-", "")
-    plan = management_plan(
-        "antfly-showcases", "ghcr.io/antflydb/antfly@sha256:" + "a" * 64
-    )
+    plan = management_plan("antfly-showcases", RUNTIME["image"])
     assert plan["create-instance.json"]["version_policy"] == "pinned"
     assert "native_artifacts" not in plan["create-instance.json"]
     assert plan["create-instance.json"]["storage"]["artifacts"] == {
@@ -57,3 +55,52 @@ def test_separate_object_tables_and_scoped_cloud_keys():
         management_plan("antfly-showcases", "ghcr.io/antflydb/antfly:latest")
     with pytest.raises(ValueError):
         native_plan("antfly-showcases", "invalid", current)
+
+
+def test_first_boot_uses_exact_rc6_and_rejects_stale_or_unverified_images():
+    request = management_plan("antfly-showcases")["create-instance.json"]
+    assert (
+        request["tier"] == "standard"
+    )  # Starter forbids the supplied custom capacity.
+    assert request["initial_runtime"] == {
+        "version": "v0.3.0-rc.6",
+        "image": RUNTIME["image"],
+        "image_digest": RUNTIME["image"].split("@")[1],
+    }
+    digest = request["initial_runtime"]["image_digest"]
+    mirror = (
+        "us-central1-docker.pkg.dev/antfly-image-artifacts/containers/antfly@" + digest
+    )
+    assert (
+        management_plan("antfly-showcases", mirror)["create-instance.json"][
+            "initial_runtime"
+        ]["image"]
+        == mirror
+    )
+    for image in (
+        "ghcr.io/antflydb/antfly@sha256:" + "a" * 64,
+        "ghcr.io/antflydb/antfly:v0.3.0-rc.5@" + digest,
+    ):
+        with pytest.raises(ValueError, match="RC.6"):
+            management_plan("antfly-showcases", image)
+
+
+def test_sample_archive_isolated_from_future_full_export():
+    archive, current = str(uuid4()), str(uuid4())
+    files = native_plan(
+        "antfly-showcases", archive, current, "archive/qualification-20261029"
+    )
+    assert (
+        files["archive-table.json"]["schema"]["base_source"]["uri"]
+        == "gs://antfly-showcases-hn-archive/archive/qualification-20261029"
+    )
+    for prefix in (
+        "",
+        "/archive/sample",
+        "archive/../other",
+        "archive//sample",
+        "archive/sample?token=bad",
+        "other/sample",
+    ):
+        with pytest.raises(ValueError, match="Archive prefix"):
+            native_plan("antfly-showcases", archive, current, prefix)
