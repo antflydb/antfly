@@ -31,12 +31,54 @@ const audited_tests = [_][]const u8{
     "data-runtime-tests",
 };
 
+// Zig 0.17 keys relative C inputs by their working directory even with a
+// relocatable --build-root. The audit overlays share immutable authored C
+// providers, so retain those providers' canonical identities across workers.
+// Mutable Zig sources and generated paths keep their private workspace roots.
+fn authoredCPath(b: *std.Build, path: std.Build.LazyPath) std.Build.LazyPath {
+    const relative = switch (path) {
+        .src_path => |source| source.owner.root.joinString(b.allocator, source.sub_path) catch @panic("OOM"),
+        .dependency => |source| source.dependency.builder.root.joinString(b.allocator, source.sub_path) catch @panic("OOM"),
+        else => return path,
+    };
+    b.dependOnFileMetadata(path);
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, relative, b.allocator) catch |err|
+        std.debug.panic("cannot identify authored audit C input {s}: {t}", .{ relative, err });
+    return b.graph.cwdRelativePath(canonical);
+}
+
+fn retainAuthoredCIdentities(b: *std.Build, modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    var iterator = modules.keyIterator();
+    while (iterator.next()) |entry| {
+        const module = entry.*;
+        var objects: std.ArrayList(std.Build.Module.LinkObject) = .empty;
+        for (module.link_objects.items) |object| switch (object) {
+            .c_source_file => |source| {
+                source.file = authoredCPath(b, source.file);
+                objects.append(b.allocator, object) catch @panic("OOM");
+            },
+            .c_source_files => |sources| for (sources.files) |file| {
+                const source = b.allocator.create(std.Build.Module.CSourceFile) catch @panic("OOM");
+                source.* = .{
+                    .file = authoredCPath(b, sources.root.path(b, file)),
+                    .flags = sources.flags,
+                    .language = sources.language,
+                };
+                objects.append(b.allocator, .{ .c_source_file = source }) catch @panic("OOM");
+            },
+            else => objects.append(b.allocator, object) catch @panic("OOM"),
+        };
+        module.link_objects = objects;
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const measured_memory = b.option(bool, "native-linux-ownership-memory", "Use the qualified Nix glibc stripped Debug audit envelope") orelse false;
     _ = project.create(b) orelse return;
     var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     for (b.top_level_steps.values()) |top| profiles.collectSteps(&top.step, &steps, &modules);
+    retainAuthoredCIdentities(b, &modules);
     const check = b.step("check-storage-compilation", "Compile real runtime archives and their owner tests");
     var found: [audited_tests.len]bool = @splat(false);
     var iterator = steps.keyIterator();

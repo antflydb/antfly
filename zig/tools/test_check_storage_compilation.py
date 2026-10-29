@@ -778,6 +778,17 @@ class StorageCompilationDiscovery(unittest.TestCase):
             "pub export fn wWinMainCRTStartup() void {}\n"
             "pub export fn fixtureValue() u32 { return 1; }\n"
         )
+        shared_c = cls.root / "shared-c"
+        shared_c.mkdir()
+        (shared_c / "native.h").write_text("#define FIXTURE_VALUE 9\n")
+        (shared_c / "native.c").write_text(
+            '#include "native.h"\nint fixture_native(void) { return FIXTURE_VALUE; }\n'
+        )
+        (shared_c / "native_batch.c").write_text(
+            "int fixture_native_batch(void) { return 3; }\n"
+        )
+        for name in ("native.c", "native_batch.c"):
+            (cls.root / name).symlink_to(shared_c / name)
         (cls.root / "project_build.zig").write_text(r"""
 const std = @import("std");
 pub fn create(b: *std.Build) ?void {
@@ -788,6 +799,12 @@ pub fn create(b: *std.Build) ?void {
     // and generated-source cache inputs without compiling startup, compiler-rt
     // or UBSan once per synthetic consumer in every isolated cold cache.
     const root = files.addCopyFile(b.path("consumer.zig"), "main.zig");
+    const native = b.addLibrary(.{
+        .name = "fixture-native", .linkage = .static, .use_llvm = true,
+        .root_module = b.createModule(.{ .target = target, .optimize = .debug, .strip = true }),
+    });
+    native.root_module.addCSourceFile(.{ .file = b.path("native.c") });
+    native.root_module.addCSourceFiles(.{ .root = b.path("."), .files = &.{"native_batch.c"} });
     inline for (.{
         "storage-owner-tests", "storage-owner-source-tests", "storage-owner-enrichment-tests",
         "api-table-read-tests", "api-table-write-tests", "api-table-write-lifecycle-tests", "data-runtime-tests",
@@ -796,6 +813,8 @@ pub fn create(b: *std.Build) ?void {
             const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
                 .root_source_file = root, .target = target, .optimize = .debug, .strip = true,
             }) });
+            exe.use_llvm = true;
+            exe.root_module.linkLibrary(native);
             exe.entry = .disabled;
             exe.bundle_compiler_rt = false;
             exe.bundle_ubsan_rt = false;
@@ -844,6 +863,9 @@ pub fn create(b: *std.Build) ?void {
                 self.root,
                 baseline,
                 ignore=shutil.ignore_patterns(".zig-cache", ".zig-global-cache"),
+                # Immutable authored providers retain the real checkout's
+                # identity; the mutation input below remains a private copy.
+                symlinks=True,
             )
 
             # This regression owns a cold local target cache, not a second

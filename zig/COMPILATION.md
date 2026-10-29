@@ -1916,3 +1916,34 @@ accounts for source codegen instead of allowing it to overlap large owners for
 free. No forced single-job mode, larger runner or dropped benchmark contract
 is introduced. These consumer claims are conservative pending isolated peak
 measurements; they are not new measured reductions.
+
+### Relocated ownership caches and mutation cleanup (2026-10-28)
+
+The native Nix/glibc Zig 0.17 fixture reproduced a cold compiler-tool bootstrap
+of 146.45 seconds, exceeding the regression's 120-second limit before its
+relocation assertion. Snapshotting the phase's global compiler-tool cache into
+an independently owned fixture cache reduced the LLVM relocation lifecycle to
+2.65 seconds. Local target caches remain cold and private; the regression still
+checks source invalidation, baseline independence and operation after baseline
+removal. Timeouts terminate the complete compiler process group before cleanup.
+
+Adding authored C inputs reproduced a separate relocation miss with identical
+compiler arguments. Canonical paths for the unchanged C providers restored real
+compiler cache hits; a debug-compilation-directory flag did not. The audit now
+retains those shared authored identities, including batched C sources, while
+mutable Zig inputs and generated paths keep their private roots. Discovery and
+relocation tests with both C source forms pass on native Linux (4 tests, 5.95s)
+and Darwin (4 tests, 20.65s). The complete production audit remains the CI gate.
+
+A stripped baseline-CPU native Darwin storage profile found the mutation commit
+function occupying 2,218,824 bytes. Two typed ownership frames now centralize
+batch preparation and write-buffer cleanup, preserving reverse release order,
+allocator identities and borrowed/owned distinctions. Their non-inlined cleanup
+runs once per batch exit; row processing remains in the original loops. The
+function falls to 1,091,820 bytes, and the archive's text falls from 45,137,104 to
+44,012,264 bytes. Its unoptimized IR falls from about 756k lines/98k blocks to
+413k lines/57k blocks. The optimized archive compiled successfully in 745s with
+IR dumps; the baseline build reported 17 minutes. These runs shared a busy Mac
+and are not a controlled throughput or isolated compiler-time comparison.
+The row-preparation regression passes 12/12 with zero leaks. These measurements
+do not establish that the complete Darwin library meets its 80 MiB gate.
