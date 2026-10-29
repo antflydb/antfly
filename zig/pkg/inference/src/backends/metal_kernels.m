@@ -502,12 +502,6 @@ typedef enum {
     TERMITE_METAL_TAIL_STEP_COUNT
 } termite_metal_tail_step;
 
-static const uint16_t TERMITE_METAL_TAIL_STEP_KINDS[TERMITE_METAL_TAIL_STEP_COUNT] = {
-    TERMITE_METAL_PLAN_OP_DECODE_TAIL_FINAL_NORM,
-    TERMITE_METAL_PLAN_OP_DECODE_TAIL_LM_HEAD,
-    TERMITE_METAL_PLAN_OP_DECODE_TAIL_ARGMAX,
-};
-
 #define TERMITE_METAL_QUANT_FORMAT_UNSUPPORTED 0u
 #define TERMITE_METAL_QUANT_FORMAT_Q1_0 1u
 #define TERMITE_METAL_QUANT_FORMAT_I2_S 2u
@@ -1111,6 +1105,214 @@ typedef struct {
     uint16_t next;
     bool write;
 } termite_metal_core_access_interval;
+
+// Every named compute pipeline the decode runtime owns: the runtime struct
+// declares one field per entry and destroy releases each one, so a pipeline
+// added here cannot be left unreleased.
+#define TERMITE_METAL_RUNTIME_PIPELINES(X) \
+    X(video_position_pipeline) X(embed_absolute_position_pipeline) X(embedding_lookup_pipeline) \
+    X(embedding_lookup_bf16_pipeline) X(embedding_lookup_f16_pipeline) X(q4_0_get_rows_pipeline) \
+    X(q4_0_set_rows_pipeline) X(q4_0_cpy_q_to_f32_pipeline) X(q4_0_cpy_f32_to_q_pipeline) X(q4_1_get_rows_pipeline) \
+    X(q4_1_set_rows_pipeline) X(q4_1_cpy_q_to_f32_pipeline) X(q4_1_cpy_f32_to_q_pipeline) X(q5_0_get_rows_pipeline) \
+    X(q5_0_set_rows_pipeline) X(q5_0_cpy_q_to_f32_pipeline) X(q5_0_cpy_f32_to_q_pipeline) X(q5_1_get_rows_pipeline) \
+    X(q5_1_set_rows_pipeline) X(q5_1_cpy_q_to_f32_pipeline) X(q5_1_cpy_f32_to_q_pipeline) X(q4_k_get_rows_pipeline) \
+    X(q4_k_set_rows_pipeline) X(q4_k_cpy_q_to_f32_pipeline) X(q4_k_cpy_f32_to_q_pipeline) X(q5_k_get_rows_pipeline) \
+    X(q5_k_set_rows_pipeline) X(q5_k_cpy_q_to_f32_pipeline) X(q5_k_cpy_f32_to_q_pipeline) X(q6_k_get_rows_pipeline) \
+    X(q6_k_set_rows_pipeline) X(q6_k_cpy_q_to_f32_pipeline) X(q6_k_cpy_f32_to_q_pipeline) X(q8_0_get_rows_pipeline) \
+    X(q8_0_set_rows_pipeline) X(q8_0_cpy_q_to_f32_pipeline) X(q8_0_cpy_f32_to_q_pipeline) X(q8_1_get_rows_pipeline) \
+    X(q8_1_set_rows_pipeline) X(q8_1_cpy_q_to_f32_pipeline) X(q8_1_cpy_f32_to_q_pipeline) X(rope_pipeline) \
+    X(mrope_pipeline) X(qwen35_conv_pipeline) X(qwen35_prefill_conv_vec4_pipeline) X(qwen35_history_pipeline) \
+    X(qwen35_prepare_pipeline) X(qwen35_recurrent_pipeline) X(qwen35_recurrent_columns4_pipeline) \
+    X(qwen35_recurrent_decode_pipeline) X(qwen35_fused_decode_pipeline) X(lightonocr3_copy_pipeline) \
+    X(lightonocr3_recurrent_parallel_pipeline) X(lightonocr3_prefill_prepare_pipeline) \
+    X(lightonocr3_prefill_norm_pipeline) X(lightonocr3_prefill_attention_mpp_pipeline) \
+    X(lightonocr3_prefill_attention_mpp32_pipeline) X(lightonocr3_prefill_attention_direct_pipeline) \
+    X(qwen35_prepare_parallel_pipeline) X(qwen35_norm_parallel_pipeline) X(qwen35_norm_pipeline) \
+    X(vision_norm_rope_pipeline) X(embedding_head_prepare_pipeline) X(rotary_table_pipeline) X(packed_gelu_pipeline) \
+    X(rope_pair_pipeline) X(head_rms_rope_pipeline) X(head_rms_rope_hd128_sg_pipeline) X(attention_f32_pipeline) \
+    X(attention_f32_decode_1x_hd64_pipeline) X(attention_f32_decode_1x_hd64_split_stage_pipeline) \
+    X(attention_f32_decode_1x_hd64_split_reduce_pipeline) X(attention_f32_prefill_pipeline) \
+    X(attention_f32_dense_sg_pipeline) X(attention_f32_dense_sg_q16_pipeline) \
+    X(attention_f32_dense_sg_q16_f16kv_pipeline) X(attention_f32_dense_sg_q16_f16kv_hd128_pipeline) \
+    X(attention_f32_dense_sg_q16_f16kv_gqa2_pipeline) X(attention_paged_pipeline) X(selection_score_norm_pipeline) \
+    X(selection_score_reduce_pipeline) X(attention_paged_prefill_sg_pipeline) X(attention_paged_1x_pipeline) \
+    X(attention_1x_generated_pipeline) X(attention_flash_generated_pipeline) \
+    X(attention_flash_hd512_generated_pipeline) X(attention_decode_gqa_split_stage_pipeline) \
+    X(attention_decode_gqa_split_reduce_pipeline) X(lightonocr3_gqa_batch_stage_pipeline) \
+    X(lightonocr3_gqa_batch_reduce_pipeline) X(lightonocr3_gqa_split_stage_pipeline) \
+    X(lightonocr3_gqa_split_reduce_pipeline) X(compressed_attention_store_local_pipeline) \
+    X(compressed_attention_store_component_pipeline) X(compressed_attention_update_component_pipeline) \
+    X(compressed_attention_select_compressed_pipeline) X(compressed_attention_hybrid_attention_pipeline) \
+    X(paged_f32_kv_seed_pipeline) X(paged_f16_kv_seed_pipeline) X(paged_f32_v_seed_pipeline) X(copy_bytes_pipeline) \
+    X(slice_last_dim_f32_2d_pipeline) X(gather_axis0_f32_2d_pipeline) X(gather_axis0_add_bias_f32_2d_pipeline) \
+    X(concat_lastdim_f32_2d_pipeline) X(deberta_embeddings_f32_pipeline) X(gliner_word_embeddings_f32_pipeline) \
+    X(gliner_boundary_f32_pipeline) X(gliner_boundary_ffn_bias_gelu_exact_pipeline) \
+    X(gliner_boundary_ffn_bias_add_layer_norm_pipeline) X(gliner_gru_combine_f32_pipeline) \
+    X(argmax_axis_f32_pipeline) X(convert_dtype_f32_pipeline) X(cumulative_sum_f32_pipeline) \
+    X(cumulative_sum_i64_pipeline) X(cumulative_sum_i8_pipeline) X(cumulative_sum_i16_pipeline) \
+    X(cumulative_sum_u8_pipeline) X(integer_binary_pipeline) X(select_typed_pipeline) X(slice_typed_pipeline) \
+    X(gather_typed_pipeline) X(cast_typed_pipeline) X(cumulative_sum_i32_pipeline) X(sdpa_f32_pipeline) \
+    X(sdpa_f32_bert_prefill_s256_hd64_q8_pipeline) X(sdpa_f32_vision_hd64_q8_pipeline) \
+    X(sdpa_f32_vision_hd64_q32_pipeline) X(sdpa_f32_vision_hd64_flash_q16_pipeline) \
+    X(sdpa_f32_vision_hd64_flash_q32_pipeline) X(sdpa_f32_vision_hd64_flash_q32_full_pipeline) \
+    X(sdpa_f32_nomic_q8_pipeline) X(sdpa_f32_tg_pipeline) X(sdpa_f32_grouped_short256_pipeline) \
+    X(sdpa_f32_grouped_short512_pipeline) X(sdpa_f32_grouped_matrix64_pipeline) \
+    X(sdpa_f32_grouped_matrix32_pipeline) X(sdpa_f32_segments_pipeline) X(sdpa_f32_segments_tiled_pipeline) \
+    X(sdpa_f32_segments_wide_pipeline) X(sdpa_f32_segments_blocks_pipeline) X(sdpa_f32_grouped_blocks_pipeline) \
+    X(sdpa_f32_grouped_blocks256_pipeline) X(sdpa_f32_grouped_blocks256x16_pipeline) \
+    X(sdpa_f32_grouped_pack_pipeline) X(sdpa_f32_grouped_softmax_pipeline) X(sdpa_f32_grouped_unpack_pipeline) \
+    X(masked_mean_rows_pipeline) X(masked_mean_batch_pipeline) X(compose_rows_pipeline) \
+    X(normalize_embedding_pipeline) X(modernbert_training_attention_forward_pipeline) \
+    X(modernbert_training_attention_dq_pipeline) X(modernbert_training_attention_dkdv_pipeline) \
+    X(modernbert_training_attention_flash_forward_pipeline) X(modernbert_training_attention_flash_dq_pipeline) \
+    X(modernbert_training_attention_flash_dkdv_pipeline) X(sdpa_f32_florence_window_hd32_pipeline) \
+    X(sdpa_f32_florence_window_parallel_pipeline) X(florence_window_pack_f32_pipeline) \
+    X(florence_window_unpack_f32_pipeline) X(florence_channel_scores_f32_pipeline) \
+    X(florence_channel_scores_parallel_pipeline) X(florence_channel_softmax_f32_pipeline) \
+    X(florence_channel_apply_f32_pipeline) X(disentangled_relative_attention_f32_pipeline) \
+    X(disentangled_relative_attention_f32_tg_pipeline) X(disentangled_relative_attention_f32_flash4_pipeline) \
+    X(deberta_attention_pack_f32_pipeline) X(deberta_relative_score_accumulate_f32_pipeline) \
+    X(disentangled_relative_attention_bwd_scores_f32_pipeline) \
+    X(disentangled_relative_attention_bwd_dv_f32_pipeline) X(disentangled_relative_attention_bwd_dq_dk_f32_pipeline) \
+    X(disentangled_relative_attention_bwd_dqr_dkr_f32_pipeline) X(deberta_relative_score_gemm_f32_pipeline) \
+    X(deberta_relative_score_softmax_pv_f32_pipeline) X(transpose_f32_pipeline) \
+    X(transpose_last2_tiled_f32_pipeline) X(dot_general_2d_f32_pipeline) X(dot_general_2d_f32_reduce_pipeline) \
+    X(dot_general_2d_f32_small_m_tile_pipeline) X(dot_general_2d_f32_small_m_rows4_cols4_pipeline) \
+    X(dot_general_2d_f32_small_m_rows4_cols8_pipeline) X(dot_general_2d_f32_small_m_rows4_cols16_pipeline) \
+    X(dot_general_rank1_outer_f32_pipeline) X(dot_general_rank1_reduce_f32_pipeline) \
+    X(dot_general_batched_f32_pipeline) X(lora_after_a_f32_pipeline) X(lora_finish_f32_pipeline) \
+    X(lora_rank1_linear_f32_pipeline) X(lora_grad_b_f32_pipeline) X(lora_grad_b_transposed_f32_pipeline) \
+    X(lora_grad_after_a_f32_pipeline) X(lora_grad_a_f32_pipeline) X(lora_rank1_grad_b_after_a_f32_pipeline) \
+    X(scatter_add_axis0_f32_pipeline) X(conv1d_f32_pipeline) X(conv1d_im2col_f32_pipeline) \
+    X(layer_norm_add_sum_rows_pipeline) X(conv2d_f32_pipeline) X(layer_norm_pipeline) X(layer_norm_rows_pipeline) \
+    X(layer_norm_add_pipeline) X(layer_norm_add_rows_pipeline) X(bias_activation_pipeline) \
+    X(bias_add_layer_norm_pipeline) X(bias_add_layer_norm_rows_pipeline) X(layer_norm_bwd_dx_pipeline) \
+    X(layer_norm_bwd_dgdb_pipeline) X(layer_norm_bwd_dgdb_partial_pipeline) X(layer_norm_bwd_dgdb_reduce_pipeline) \
+    X(dense_qkv_split_pipeline) X(dense_pair_split_pipeline) X(dense_qkv_split_bias_pipeline) \
+    X(dense_pair_split_bias_pipeline) X(dense_qkv_direct_pipeline) X(dense_pair_direct_pipeline) \
+    X(rms_norm_pipeline) X(rms_norm_reduce_pipeline) X(rms_inv_scale_pipeline) X(rms_norm_rows_pipeline) \
+    X(rms_norm_rows_reduce_pipeline) X(rms_norm_rows_simd4_reduce_pipeline) X(lightonocr3_norm_cached1024_pipeline) \
+    X(lightonocr3_norm_cached2560_pipeline) X(lightonocr3_gemv_pipeline) X(lightonocr3_gemv_rows2_pipeline) \
+    X(lightonocr3_gate_up_gemv_pipeline) X(lightonocr3_pack_bf16_pipeline) X(lightonocr3_batch2_pipeline) \
+    X(lightonocr3_batch4_pipeline) X(lightonocr3_batch8_pipeline) X(lightonocr3_batch16_pipeline) \
+    X(lightonocr3_mpp_f32_pipeline) X(f16_encoder_mpp_pipeline) X(lightonocr3_mpp_small_tile_pipeline) \
+    X(lightonocr3_mpp_four_row_pipeline) X(lightonocr3_gate_up_split16_pipeline) \
+    X(lightonocr3_gate_up_split_reduce_pipeline) X(lightonocr3_gate_up_small16_pipeline) \
+    X(lightonocr3_gate_up_wide16_pipeline) X(lightonocr3_gate_up_wide32_pipeline) \
+    X(lightonocr3_gate_up_wide64_pipeline) X(lightonocr3_gate_up_small32_pipeline) \
+    X(lightonocr3_four_row_segment_pipeline) X(lightonocr3_down_split32_pipeline) \
+    X(lightonocr3_down_split64_pipeline) X(lightonocr3_down_split_reduce_pipeline) \
+    X(lightonocr3_mpp_f32_n32_pipeline) X(lightonocr3_mpp_bf16_pipeline) X(lightonocr3_mpp_bf16_n32_pipeline) \
+    X(rms_norm_rows_triple_simd4_reduce_pipeline) X(parallel_ffn_post_residual_simd4_pipeline) \
+    X(rms_norm_add_pipeline) X(rms_norm_add_sumsq_pipeline) X(rms_norm_add_rows_sumsq_pipeline) \
+    X(rms_norm_add_rows_canonical_pipeline) X(rms_norm_add_scale_sumsq_pipeline) X(rms_norm_add_f16_input_pipeline) \
+    X(rms_norm_add_scale_pipeline) X(rms_norm_add_scale_rows_pipeline) X(rms_norm_add_scale_simd4_pipeline) \
+    X(rms_norm_generated_pipeline) X(linear_pipeline) X(linear_reduce_pipeline) X(linear_bf16_pipeline) \
+    X(linear_bf16_reduce_pipeline) X(linear_f16_pipeline) X(linear_f16_reduce_pipeline) \
+    X(linear_f16_multi_row_pipeline) X(linear_f16_multi_row_reduce_pipeline) X(linear_bf16_multi_row_pipeline) \
+    X(linear_bf16_multi_row_reduce_pipeline) X(linear_bf16_multi_row_shared_reduce_pipeline) \
+    X(linear_bf16_multi_row_tiled32_m16_pipeline) X(linear_bf16_mm_pipeline) X(linear_bf16_mm_vec4_pipeline) \
+    X(bf16_gate_up_mm_pipeline) X(bf16_gate_up_mm_vec4_pipeline) X(linear_pair_reduce_pipeline) \
+    X(linear_multi_row_pipeline) X(linear_multi_row_reduce_pipeline) X(linear_multi_row_tiled_f32_pipeline) \
+    X(linear_multi_row_tiled_activation_f32_pipeline) X(linear_multi_row_tiled32_f32_pipeline) \
+    X(linear_multi_row_tiled32_activation_f32_pipeline) X(linear_multi_row_tiled32_m16_f32_pipeline) \
+    X(linear_multi_row_tiled32_m16_activation_f32_pipeline) X(linear_bias_pipeline) X(argmax_logits_pipeline) \
+    X(argmax_logits_partials_pipeline) X(argmax_logits_suppress_partials_pipeline) X(argmax_logits_reduce_pipeline) \
+    X(lighton_batch_argmax_partials_pipeline) X(lighton_batch_argmax_reduce_pipeline) X(layer_norm_add_sum_pipeline) \
+    X(whisper_logits_partials_pipeline) X(whisper_logits_reduce_pipeline) X(lm_head_top8_suppress_partials_pipeline) \
+    X(lm_head_top8_reduce_pipeline) X(lm_head_q6_k_rescore_top8_pipeline) X(argmax_logits_reduce_tg_pipeline) \
+    X(sample_gumbel_partials_pipeline) X(sample_logits_pipeline) X(sample_topk_partials_pipeline) \
+    X(sample_topk_reduce_pipeline) X(sample_nucleus_max_partials_pipeline) X(sample_nucleus_max_reduce_pipeline) \
+    X(sample_nucleus_probs_partials_pipeline) X(sample_nucleus_sum_reduce_pipeline) \
+    X(sample_nucleus_radix_histogram_pipeline) X(sample_nucleus_radix_histogram_serial_pipeline) \
+    X(sample_nucleus_radix_select_pipeline) X(sample_nucleus_gumbel_partials_pipeline) X(activation_pipeline) \
+    X(gelu_backward_pipeline) X(ffn_gelu_backward_rank1_branches_pipeline) \
+    X(ffn_gelu_backward_rank1_first_branch_pipeline) X(ffn_gelu_backward_rank1_output_pipeline) \
+    X(ffn_gelu_backward_rank1_first_output_pipeline) X(activation_multiply_pipeline) \
+    X(activation_multiply_f16_output_pipeline) X(softmax_pipeline) X(moe_route_select_pipeline) \
+    X(moe_route_select_tg_pipeline) X(moe_route_select_tg_register_pipeline) \
+    X(moe_route_select_tg_register_v2_pipeline) X(moe_route_select_tg_map_pipeline) X(moe_route_map_slots_pipeline) \
+    X(moe_slot_q4_0_gate_up_pipeline) X(moe_slot_q4_0_down_pipeline) X(moe_slot_reduce_pipeline) \
+    X(mapped_page_touch_pipeline) X(mapped_selected_expert_page_touch_pipeline) X(masked_bce_loss_pipeline) \
+    X(masked_bce_backward_pipeline) X(reduce_last_dim_pipeline) X(nomic_pool_normalize_pipeline) \
+    X(reduce_axis_f32_pipeline) X(multiply_reduce_last_dim_pipeline) X(broadcast_last_dim_pipeline) \
+    X(broadcast_f32_pipeline) X(multiply_pipeline) X(scale_pipeline) X(norm_residual_pipeline) \
+    X(gemma4_audio_clamp_silu_pipeline) X(spatial_pool_prepare_pipeline) X(audio_frontend_pipeline) \
+    X(audio_clipped_linear_pipeline) X(audio_attention_parallel_pipeline) X(audio_norm_clamp_pipeline) \
+    X(audio_logmel_pipeline) X(audio_conv_matrix_pipeline) X(audio_conv_tiled_pipeline) X(audio_fft512_pipeline) \
+    X(gemma4_audio_clamp_pipeline) X(gemma4_audio_glu_pipeline) X(gemma4_audio_dwconv_pipeline) \
+    X(gemma4_audio_flatten_pipeline) X(gemma4_audio_channel_norm_pipeline) X(gemma4_audio_attention_pipeline) \
+    X(gemma4_audio_attention_tg_pipeline) X(add_pipeline) X(add_scale_pipeline) X(scaled_add_scale_pipeline) \
+    X(multiply_add_pipeline) X(multiply_add2_pipeline) X(training_accumulate_pipeline) X(training_adamw_pipeline) \
+    X(training_accumulate_into_pipeline) X(training_adamw_into_pipeline) X(training_sumsq_pipeline) \
+    X(subtract_pipeline) X(divide_pipeline) X(less_than_pipeline) X(where_select_pipeline) X(i2_s_quantize_pipeline) \
+    X(q1_0_pipeline) X(i8_s_pipeline) X(q2_k_pipeline) X(antfly_q2_k_small_batch_pipeline) \
+    X(antfly_q2_k_small_batch_bias_pipeline) X(antfly_q2_k_small_batch_bias_gelu_pipeline) X(q3_k_pipeline) \
+    X(antfly_q3_k_small_batch_pipeline) X(antfly_q3_k_small_batch_bias_pipeline) \
+    X(antfly_q3_k_small_batch_bias_gelu_pipeline) X(q4_k_pipeline) X(antfly_q4_k_small_batch_bias_gelu_pipeline) \
+    X(q4_k_reduce_pipeline) X(q4_k_pair_pipeline) X(q4_k_pair_reduce_pipeline) \
+    X(q4_k_pair_activation_reduce_pipeline) X(q4_k_pair_activation_reduce_f16_output_pipeline) \
+    X(q4_k_activation_rhs_reduce_pipeline) X(q4_0_activation_rhs_reduce_pipeline) \
+    X(q4_0_activation_rhs_reduce_f16_output_pipeline) X(q4_0_pipeline) X(q4_0_id_pipeline) \
+    X(q4_0_id_a4b_gate_up_pipeline) X(q4_0_id_a4b_down_pipeline) X(q4_0_pair_id_pipeline) \
+    X(q4_0_pair_activation_id_pipeline) X(moe_merged_gate_up_activation_pipeline) X(moe_scatter_add_pipeline) \
+    X(antfly_q4_0_small_batch_pipeline) X(q4_0_pair_pipeline) X(q4_0_pair_reduce_pipeline) \
+    X(q4_0_pair_activation_reduce_pipeline) X(q4_0_pair_activation_mmv_nr4_nsg2_pipeline) \
+    X(q4_0_pair_activation_mmv_nr8_nsg2_pipeline) X(q4_0_pair_activation_mmv_nr4_nsg4_pipeline) \
+    X(q4_0_pair_activation_mmv_nr8_nsg4_pipeline) X(q4_0_pair_activation_mmv_nr4_nsg2_nq8_pipeline) \
+    X(q4_0_pair_activation_mm_m32_n64_aligned_pipeline) X(q4_0_pair_activation_mm_m32_n64_tail_pipeline) \
+    X(q4_0_pair_activation_mm_m32_n32_aligned_pipeline) X(q4_0_pair_activation_mm_m32_n32_tail_pipeline) \
+    X(q4_0_pair_activation_small_batch_r2_pipeline) X(q4_0_pair_activation_small_batch_r3_pipeline) \
+    X(q4_0_pair_activation_small_batch_r4_pipeline) X(q4_0_pair_activation_small_batch_pipeline) \
+    X(q4_0_pair_activation_reduce_f16_output_pipeline) X(q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline) \
+    X(q4_0_reduce_pipeline) X(q4_0_reduce_nr4_nsg4_pipeline) X(q4_0_reduce_nr4_nsg4_nq8_pipeline) \
+    X(q4_0_reduce_nr8_nsg4_pipeline) X(q4_0_mm_sg_pipeline) X(q4_0_mm_sg_unrolled_pipeline) \
+    X(q4_0_mm_sg_aligned_pipeline) X(q4_0_mm_sg_aligned_tail_pipeline) X(q4_0_small_batch_r2_pipeline) \
+    X(q4_0_small_batch_r4_pipeline) X(q4_0_small_batch_r8_pipeline) X(q4_0_small_batch_r2_specialized_pipeline) \
+    X(q4_0_small_batch_r3_specialized_pipeline) X(q4_0_small_batch_r2_wide_pipeline) \
+    X(q4_0_small_batch_r4_wide_pipeline) X(q4_0_small_batch_r8_wide_pipeline) X(q4_0_reduce_small_pipeline) \
+    X(q4_0_reduce_sumsq_pipeline) X(q4_0_reduce_f16_input_pipeline) X(q4_0_reduce_f16_input_small_pipeline) \
+    X(q4_0_reduce_f16_input_sumsq_pipeline) X(q4_0_reduce_f16_output_pipeline) \
+    X(q4_0_reduce_f16_input_f16_output_pipeline) X(q4_1_pipeline) X(antfly_q4_1_small_batch_pipeline) \
+    X(q4_1_reduce_pipeline) X(q5_0_pipeline) X(antfly_q5_0_small_batch_pipeline) X(q5_0_reduce_pipeline) \
+    X(q5_1_pipeline) X(antfly_q5_1_small_batch_pipeline) X(q5_1_reduce_pipeline) X(q8_0_pipeline) \
+    X(q8_0_pair_pipeline) X(q8_0_mmv_pipeline) X(q8_0_mmv_f16_input_pipeline) X(q8_0_rms_scale_mmv_pipeline) \
+    X(q8_0_small_batch_r2_pipeline) X(q8_0_small_batch_r3_pipeline) X(q8_0_small_batch_r4_pipeline) \
+    X(q8_0_small_batch_pipeline) X(antfly_q8_0_small_batch_pipeline) X(antfly_q8_0_small_batch_bias_pipeline) \
+    X(antfly_q8_0_small_batch_bias_gelu_pipeline) X(antfly_q8_0_small_batch_relu_pipeline) X(q8_0_mm_pipeline) \
+    X(q8_0_mm_f16_input_pipeline) X(q8_0_mm_sg_pipeline) X(q8_0_mm_sg_v2_pipeline) X(q8_0_mm_sg_v2_tail_pipeline) \
+    X(q8_0_mm_sg_v2_f16_input_pipeline) X(q8_0_mm_sg_v2_f16_input_tail_pipeline) X(q8_0_mm_sg_m64_pipeline) \
+    X(q8_0_mm_sg_m64_tail_pipeline) X(q8_0_mm_sg_m64_f16_input_pipeline) X(q8_0_mm_sg_m64_f16_input_tail_pipeline) \
+    X(q8_0_pair_mmv_pipeline) X(q8_0_pair_small_batch_r2_pipeline) X(q8_0_pair_small_batch_r3_pipeline) \
+    X(q8_0_pair_small_batch_r4_pipeline) X(q8_0_pair_small_batch_pipeline) X(q8_0_qkv_mmv_pipeline) \
+    X(q8_0_kv_pair_mm_sg_pipeline) X(q8_0_kv_pair_mm_sg_tail_pipeline) X(q8_0_pair_activation_reduce_pipeline) \
+    X(q8_0_pair_activation_mmv_pipeline) X(q8_0_pair_activation_rms_scale_mmv_pipeline) \
+    X(q8_0_pair_activation_rms_scale_mmv_f16_output_pipeline) X(q8_0_pair_activation_small_batch_r2_pipeline) \
+    X(q8_0_pair_activation_small_batch_r3_pipeline) X(q8_0_pair_activation_small_batch_r4_pipeline) \
+    X(q8_0_pair_activation_small_batch_pipeline) X(q8_0_pair_activation_mm_pipeline) \
+    X(q8_0_pair_activation_mm_f16_output_pipeline) X(q8_0_pair_activation_mm_sg_v2_pipeline) \
+    X(q8_0_pair_activation_mm_sg_v2_f16_output_pipeline) X(q8_0_activation_multiply_reduce_pipeline) \
+    X(q8_0_activation_multiply_mmv_pipeline) X(q8_1_pipeline) X(antfly_q8_1_small_batch_pipeline) \
+    X(q8_1_reduce_pipeline) X(q5_k_pipeline) X(antfly_q4_k_small_batch_pipeline) X(florence_q4_k_mm_matrix_pipeline) \
+    X(florence_q4_k_mm_matrix_f16_input_pipeline) X(florence_q4_k_mm_nr4_pipeline) \
+    X(antfly_q4_k_small_batch_bias_pipeline) X(antfly_q5_k_small_batch_pipeline) \
+    X(antfly_q5_k_small_batch_bias_pipeline) X(antfly_q5_k_small_batch_bias_gelu_pipeline) X(q5_k_reduce_pipeline) \
+    X(q4_k_reduce_v2_pipeline) X(q6_k_pipeline) X(antfly_q6_k_small_batch_pipeline) \
+    X(q6_k_high_row_mm_matrix_pipeline) X(antfly_q6_k_small_batch_bias_pipeline) \
+    X(antfly_q6_k_small_batch_bias_gelu_pipeline) X(q6_k_reduce_pipeline) X(q6_k_reduce_nsg4_pipeline) \
+    X(q6_k_reduce_nsg8_pipeline) X(q6_k_reduce_nbodd_pipeline) X(q6_k_reduce_nbodd_nr1_pipeline) \
+    X(q6_k_reduce_nbodd_nr4_nsg1_pipeline) X(q6_k_reduce_nbodd_nr4_nsg2_pipeline) \
+    X(q6_k_reduce_nbodd_nr6_nsg1_pipeline) X(q6_k_reduce_nbodd_nr8_nsg1_pipeline) X(q6_k_r2_reduce_pipeline) \
+    X(q6_k_reduce_f16_input_pipeline) X(q6_k_pair_pipeline) X(q8_k_pipeline) X(antfly_q8_k_small_batch_pipeline) \
+    X(q8_k_reduce_pipeline) X(iq4_nl_pipeline) X(iq4_nl_reduce_pipeline) X(iq4_xs_pipeline) \
+    X(iq4_xs_reduce_pipeline) X(mxfp4_pipeline) X(mxfp4_reduce_pipeline) X(nvfp4_pipeline) X(nvfp4_reduce_pipeline) \
+    X(iq2_xs_pipeline) X(iq2_xs_reduce_pipeline) X(i2_s_pipeline) X(i2_s_pair_pipeline) X(i2_s_linear_i8_pipeline) \
+    X(i2_s_pair_i8_pipeline) X(tl1_pipeline) X(tl2_pipeline) X(encode_polar4_key_pipeline) \
+    X(encode_turbo3_key_pipeline) X(encode_f16_convert_pipeline) X(encode_int8_per_head_pipeline) \
+    X(polar4_attention_span_pipeline) X(turbo3_attention_span_pipeline) X(audio_pad_pipeline)
+#define TERMITE_METAL_DECLARE_PIPELINE(name) id<MTLComputePipelineState> name;
+#define TERMITE_METAL_RELEASE_PIPELINE(name) runtime->name = nil;
+
 typedef struct termite_metal_decode_runtime {
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
@@ -1125,68 +1327,11 @@ typedef struct termite_metal_decode_runtime {
     // The legacy precise slot may contain a fast fallback. Strict consumers
     // must require provenance of an actual safe compilation, not its name.
     BOOL precise_library_safe;
-    id<MTLComputePipelineState> video_position_pipeline;
-    id<MTLComputePipelineState> embed_absolute_position_pipeline;
-    id<MTLComputePipelineState> embedding_lookup_pipeline;
-    id<MTLComputePipelineState> embedding_lookup_bf16_pipeline;
-    id<MTLComputePipelineState> embedding_lookup_f16_pipeline;
-    id<MTLComputePipelineState> q4_0_get_rows_pipeline;
-    id<MTLComputePipelineState> q4_0_set_rows_pipeline;
-    id<MTLComputePipelineState> q4_0_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q4_0_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> q4_1_get_rows_pipeline;
-    id<MTLComputePipelineState> q4_1_set_rows_pipeline;
-    id<MTLComputePipelineState> q4_1_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q4_1_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> q5_0_get_rows_pipeline;
-    id<MTLComputePipelineState> q5_0_set_rows_pipeline;
-    id<MTLComputePipelineState> q5_0_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q5_0_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> q5_1_get_rows_pipeline;
-    id<MTLComputePipelineState> q5_1_set_rows_pipeline;
-    id<MTLComputePipelineState> q5_1_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q5_1_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> q4_k_get_rows_pipeline;
-    id<MTLComputePipelineState> q4_k_set_rows_pipeline;
-    id<MTLComputePipelineState> q4_k_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q4_k_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> q5_k_get_rows_pipeline;
-    id<MTLComputePipelineState> q5_k_set_rows_pipeline;
-    id<MTLComputePipelineState> q5_k_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q5_k_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> q6_k_get_rows_pipeline;
-    id<MTLComputePipelineState> q6_k_set_rows_pipeline;
-    id<MTLComputePipelineState> q6_k_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q6_k_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> q8_0_get_rows_pipeline;
-    id<MTLComputePipelineState> q8_0_set_rows_pipeline;
-    id<MTLComputePipelineState> q8_0_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q8_0_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> q8_1_get_rows_pipeline;
-    id<MTLComputePipelineState> q8_1_set_rows_pipeline;
-    id<MTLComputePipelineState> q8_1_cpy_q_to_f32_pipeline;
-    id<MTLComputePipelineState> q8_1_cpy_f32_to_q_pipeline;
-    id<MTLComputePipelineState> rope_pipeline;
-    id<MTLComputePipelineState> mrope_pipeline;
-    id<MTLComputePipelineState> qwen35_conv_pipeline;
-    id<MTLComputePipelineState> qwen35_prefill_conv_vec4_pipeline;
-    id<MTLComputePipelineState> qwen35_history_pipeline;
-    id<MTLComputePipelineState> qwen35_prepare_pipeline;
-    id<MTLComputePipelineState> qwen35_recurrent_pipeline;
-    id<MTLComputePipelineState> qwen35_recurrent_columns4_pipeline;
-    id<MTLComputePipelineState> qwen35_recurrent_decode_pipeline;
-    id<MTLComputePipelineState> qwen35_fused_decode_pipeline;
-    id<MTLComputePipelineState> lightonocr3_copy_pipeline;
+    TERMITE_METAL_RUNTIME_PIPELINES(TERMITE_METAL_DECLARE_PIPELINE)
     uint64_t lightonocr3_copy_dispatches;
-    id<MTLComputePipelineState> lightonocr3_recurrent_parallel_pipeline;
-    id<MTLComputePipelineState> lightonocr3_prefill_prepare_pipeline;
-    id<MTLComputePipelineState> lightonocr3_prefill_norm_pipeline;
     uint64_t lightonocr3_prefill_norm_dispatches;
     uint64_t lightonocr3_short_prefill_norm_dispatches;
     uint64_t lightonocr3_short_direct_attention_dispatches;
-    id<MTLComputePipelineState> lightonocr3_prefill_attention_mpp_pipeline;
-    id<MTLComputePipelineState> lightonocr3_prefill_attention_mpp32_pipeline;
-    id<MTLComputePipelineState> lightonocr3_prefill_attention_direct_pipeline;
     uint64_t lightonocr3_prefill_attention_direct_dispatches;
     uint64_t lightonocr3_prefill_attention_mpp_dispatches;
     BOOL lightonocr3_recurrent_initialization_attempted;
@@ -1200,9 +1345,6 @@ typedef struct termite_metal_decode_runtime {
     uint64_t lightonocr3_wide_mpp_head_calls;
     uint64_t lightonocr3_standalone_wide_head_calls;
     uint64_t argmax_on_frame_calls;
-    id<MTLComputePipelineState> qwen35_prepare_parallel_pipeline;
-    id<MTLComputePipelineState> qwen35_norm_parallel_pipeline;
-    id<MTLComputePipelineState> qwen35_norm_pipeline;
     bool qwen35_core_batch_active;
     size_t qwen35_core_batch_expected;
     size_t qwen35_core_batch_count;
@@ -1214,53 +1356,22 @@ typedef struct termite_metal_decode_runtime {
     termite_metal_core_access_interval qwen35_core_batch_intervals[64 * 15];
     size_t qwen35_core_batch_interval_count;
 
-    id<MTLComputePipelineState> vision_norm_rope_pipeline;
-    id<MTLComputePipelineState> embedding_head_prepare_pipeline;
-    id<MTLComputePipelineState> rotary_table_pipeline;
-    id<MTLComputePipelineState> packed_gelu_pipeline;
-    id<MTLComputePipelineState> rope_pair_pipeline;
-    id<MTLComputePipelineState> head_rms_rope_pipeline;
-    id<MTLComputePipelineState> head_rms_rope_hd128_sg_pipeline;
-    id<MTLComputePipelineState> attention_f32_pipeline;
-    id<MTLComputePipelineState> attention_f32_decode_1x_hd64_pipeline;
-    id<MTLComputePipelineState> attention_f32_decode_1x_hd64_split_stage_pipeline;
-    id<MTLComputePipelineState> attention_f32_decode_1x_hd64_split_reduce_pipeline;
     id<MTLBuffer> attention_split_partials_buffer;
     size_t attention_split_partials_capacity;
     uint8_t attention_1x_split_enabled;
-    id<MTLComputePipelineState> attention_f32_prefill_pipeline;
-    id<MTLComputePipelineState> attention_f32_dense_sg_pipeline;
-    id<MTLComputePipelineState> attention_f32_dense_sg_q16_pipeline;
-    id<MTLComputePipelineState> attention_f32_dense_sg_q16_f16kv_pipeline;
-    id<MTLComputePipelineState> attention_f32_dense_sg_q16_f16kv_hd128_pipeline;
-    id<MTLComputePipelineState> attention_f32_dense_sg_q16_f16kv_gqa2_pipeline;
-    id<MTLComputePipelineState> attention_paged_pipeline;
-    id<MTLComputePipelineState> selection_score_norm_pipeline;
-    id<MTLComputePipelineState> selection_score_reduce_pipeline;
-    id<MTLComputePipelineState> attention_paged_prefill_sg_pipeline;
-    id<MTLComputePipelineState> attention_paged_1x_pipeline;
     // Generated (descriptor-rendered) decode-1x paged attention candidate. Opt-in
     // via TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED; nil (unused) until the
     // model-token gate promotes it. When built, it transparently replaces
     // attention_paged_1x_pipeline in the decode-1x dispatch (identical buffers /
     // grid / threadgroup memory), so enabling it A/B-tests the generated body.
-    id<MTLComputePipelineState> attention_1x_generated_pipeline;
     // Generated (descriptor-rendered) flash-prefill paged attention. The proven
     // Gemma4 E4B local-attention shape is on by default; A4B's exact HD256 local
     // shape is admitted through the high-memory umbrella with its own rollback.
     // TERMITE_METAL_DISABLE_FLASH_PREFILL_GENERATED remains the global switch.
-    id<MTLComputePipelineState> attention_flash_generated_pipeline;
     // Low-memory generated flash-prefill route for Gemma4's 512-d global heads.
     // Capability-gated at dispatch and independently kill-switchable.
-    id<MTLComputePipelineState> attention_flash_hd512_generated_pipeline;
     // Split-K f16 paged GQA candidate. Stage 1 shares each KV head across
     // Gemma4's four query heads; stage 2 stably merges up to 32 context splits.
-    id<MTLComputePipelineState> attention_decode_gqa_split_stage_pipeline;
-    id<MTLComputePipelineState> attention_decode_gqa_split_reduce_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gqa_batch_stage_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gqa_batch_reduce_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gqa_split_stage_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gqa_split_reduce_pipeline;
     id<MTLBuffer> attention_decode_gqa_split_scratch_buffer;
     id<MTLBuffer> attention_decode_gqa_split_scratch_buffer_alt;
     size_t attention_decode_gqa_split_scratch_capacity;
@@ -1275,151 +1386,18 @@ typedef struct termite_metal_decode_runtime {
     uint8_t decode_gqa_split_frame_scratch_reported;
     uint8_t a4b_flash_prefill_hd256_reported;
     uint8_t e2b_flash_prefill_hd256_reported;
-    id<MTLComputePipelineState> compressed_attention_store_local_pipeline;
-    id<MTLComputePipelineState> compressed_attention_store_component_pipeline;
-    id<MTLComputePipelineState> compressed_attention_update_component_pipeline;
-    id<MTLComputePipelineState> compressed_attention_select_compressed_pipeline;
-    id<MTLComputePipelineState> compressed_attention_hybrid_attention_pipeline;
-    id<MTLComputePipelineState> paged_f32_kv_seed_pipeline;
-    id<MTLComputePipelineState> paged_f16_kv_seed_pipeline;
-    id<MTLComputePipelineState> paged_f32_v_seed_pipeline;
-    id<MTLComputePipelineState> copy_bytes_pipeline;
-    id<MTLComputePipelineState> slice_last_dim_f32_2d_pipeline;
-    id<MTLComputePipelineState> gather_axis0_f32_2d_pipeline;
-    id<MTLComputePipelineState> gather_axis0_add_bias_f32_2d_pipeline;
-    id<MTLComputePipelineState> concat_lastdim_f32_2d_pipeline;
-    id<MTLComputePipelineState> deberta_embeddings_f32_pipeline;
-    id<MTLComputePipelineState> gliner_word_embeddings_f32_pipeline;
-    id<MTLComputePipelineState> gliner_boundary_f32_pipeline;
-    id<MTLComputePipelineState> gliner_boundary_ffn_bias_gelu_exact_pipeline;
-    id<MTLComputePipelineState> gliner_boundary_ffn_bias_add_layer_norm_pipeline;
-    id<MTLComputePipelineState> gliner_gru_combine_f32_pipeline;
-    id<MTLComputePipelineState> argmax_axis_f32_pipeline;
-    id<MTLComputePipelineState> convert_dtype_f32_pipeline;
-    id<MTLComputePipelineState> cumulative_sum_f32_pipeline;
-    id<MTLComputePipelineState> cumulative_sum_i64_pipeline;
-    id<MTLComputePipelineState> cumulative_sum_i8_pipeline;
-    id<MTLComputePipelineState> cumulative_sum_i16_pipeline;
-    id<MTLComputePipelineState> cumulative_sum_u8_pipeline;
-    id<MTLComputePipelineState> integer_binary_pipeline;
-    id<MTLComputePipelineState> select_typed_pipeline;
-    id<MTLComputePipelineState> slice_typed_pipeline;
-    id<MTLComputePipelineState> gather_typed_pipeline;
-    id<MTLComputePipelineState> cast_typed_pipeline;
-    id<MTLComputePipelineState> cumulative_sum_i32_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_bert_prefill_s256_hd64_q8_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_vision_hd64_q8_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_vision_hd64_q32_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_vision_hd64_flash_q16_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_vision_hd64_flash_q32_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_vision_hd64_flash_q32_full_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_nomic_q8_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_tg_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_short256_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_short512_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_matrix64_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_matrix32_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_segments_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_segments_tiled_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_segments_wide_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_segments_blocks_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_blocks_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_blocks256_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_blocks256x16_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_pack_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_softmax_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_grouped_unpack_pipeline;
-    id<MTLComputePipelineState> masked_mean_rows_pipeline;
-    id<MTLComputePipelineState> masked_mean_batch_pipeline;
-    id<MTLComputePipelineState> compose_rows_pipeline;
-    id<MTLComputePipelineState> normalize_embedding_pipeline;
 
-    id<MTLComputePipelineState> modernbert_training_attention_forward_pipeline;
-    id<MTLComputePipelineState> modernbert_training_attention_dq_pipeline;
-    id<MTLComputePipelineState> modernbert_training_attention_dkdv_pipeline;
-    id<MTLComputePipelineState> modernbert_training_attention_flash_forward_pipeline;
-    id<MTLComputePipelineState> modernbert_training_attention_flash_dq_pipeline;
-    id<MTLComputePipelineState> modernbert_training_attention_flash_dkdv_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_florence_window_hd32_pipeline;
-    id<MTLComputePipelineState> sdpa_f32_florence_window_parallel_pipeline;
-    id<MTLComputePipelineState> florence_window_pack_f32_pipeline;
-    id<MTLComputePipelineState> florence_window_unpack_f32_pipeline;
-    id<MTLComputePipelineState> florence_channel_scores_f32_pipeline;
-    id<MTLComputePipelineState> florence_channel_scores_parallel_pipeline;
-    id<MTLComputePipelineState> florence_channel_softmax_f32_pipeline;
-    id<MTLComputePipelineState> florence_channel_apply_f32_pipeline;
-    id<MTLComputePipelineState> disentangled_relative_attention_f32_pipeline;
     // Separate safe-math-only training contract. Never populated from the
     // legacy precise library, whose availability path permits a fast fallback.
     id<MTLComputePipelineState> deberta_training_attention_v1_pipelines[8];
     BOOL deberta_training_attention_v1_attempted;
-    id<MTLComputePipelineState> disentangled_relative_attention_f32_tg_pipeline;
-    id<MTLComputePipelineState> disentangled_relative_attention_f32_flash4_pipeline;
-    id<MTLComputePipelineState> deberta_attention_pack_f32_pipeline;
-    id<MTLComputePipelineState> deberta_relative_score_accumulate_f32_pipeline;
-    id<MTLComputePipelineState> disentangled_relative_attention_bwd_scores_f32_pipeline;
-    id<MTLComputePipelineState> disentangled_relative_attention_bwd_dv_f32_pipeline;
-    id<MTLComputePipelineState> disentangled_relative_attention_bwd_dq_dk_f32_pipeline;
-    id<MTLComputePipelineState> disentangled_relative_attention_bwd_dqr_dkr_f32_pipeline;
-    id<MTLComputePipelineState> deberta_relative_score_gemm_f32_pipeline;
-    id<MTLComputePipelineState> deberta_relative_score_softmax_pv_f32_pipeline;
-    id<MTLComputePipelineState> transpose_f32_pipeline;
-    id<MTLComputePipelineState> transpose_last2_tiled_f32_pipeline;
-    id<MTLComputePipelineState> dot_general_2d_f32_pipeline;
-    id<MTLComputePipelineState> dot_general_2d_f32_reduce_pipeline;
-    id<MTLComputePipelineState> dot_general_2d_f32_small_m_tile_pipeline;
-    id<MTLComputePipelineState> dot_general_2d_f32_small_m_rows4_cols4_pipeline;
-    id<MTLComputePipelineState> dot_general_2d_f32_small_m_rows4_cols8_pipeline;
-    id<MTLComputePipelineState> dot_general_2d_f32_small_m_rows4_cols16_pipeline;
-    id<MTLComputePipelineState> dot_general_rank1_outer_f32_pipeline;
-    id<MTLComputePipelineState> dot_general_rank1_reduce_f32_pipeline;
-    id<MTLComputePipelineState> dot_general_batched_f32_pipeline;
-    id<MTLComputePipelineState> lora_after_a_f32_pipeline;
-    id<MTLComputePipelineState> lora_finish_f32_pipeline;
-    id<MTLComputePipelineState> lora_rank1_linear_f32_pipeline;
-    id<MTLComputePipelineState> lora_grad_b_f32_pipeline;
-    id<MTLComputePipelineState> lora_grad_b_transposed_f32_pipeline;
-    id<MTLComputePipelineState> lora_grad_after_a_f32_pipeline;
-    id<MTLComputePipelineState> lora_grad_a_f32_pipeline;
-    id<MTLComputePipelineState> lora_rank1_grad_b_after_a_f32_pipeline;
-    id<MTLComputePipelineState> scatter_add_axis0_f32_pipeline;
-    id<MTLComputePipelineState> conv1d_f32_pipeline;
-    id<MTLComputePipelineState> conv1d_im2col_f32_pipeline;
-    id<MTLComputePipelineState> layer_norm_add_sum_rows_pipeline;
-    id<MTLComputePipelineState> conv2d_f32_pipeline;
-    id<MTLComputePipelineState> layer_norm_pipeline;
-    id<MTLComputePipelineState> layer_norm_rows_pipeline;
-    id<MTLComputePipelineState> layer_norm_add_pipeline;
-    id<MTLComputePipelineState> layer_norm_add_rows_pipeline;
-    id<MTLComputePipelineState> bias_activation_pipeline;
-    id<MTLComputePipelineState> bias_add_layer_norm_pipeline;
-    id<MTLComputePipelineState> bias_add_layer_norm_rows_pipeline;
-    id<MTLComputePipelineState> layer_norm_bwd_dx_pipeline;
-    id<MTLComputePipelineState> layer_norm_bwd_dgdb_pipeline;
-    id<MTLComputePipelineState> layer_norm_bwd_dgdb_partial_pipeline;
-    id<MTLComputePipelineState> layer_norm_bwd_dgdb_reduce_pipeline;
-    id<MTLComputePipelineState> dense_qkv_split_pipeline;
-    id<MTLComputePipelineState> dense_pair_split_pipeline;
-    id<MTLComputePipelineState> dense_qkv_split_bias_pipeline;
-    id<MTLComputePipelineState> dense_pair_split_bias_pipeline;
-    id<MTLComputePipelineState> dense_qkv_direct_pipeline;
-    id<MTLComputePipelineState> dense_pair_direct_pipeline;
-    id<MTLComputePipelineState> rms_norm_pipeline;
-    id<MTLComputePipelineState> rms_norm_reduce_pipeline;
-    id<MTLComputePipelineState> rms_inv_scale_pipeline;
-    id<MTLComputePipelineState> rms_norm_rows_pipeline;
     // Threadgroup-per-row reduce variant of rms_norm_rows for small row counts
     // (rows 2-8, hidden >= 1024): the thread-per-row kernel dispatches `rows`
     // total threads, which is pure serial latency on the planned frame
     // encoders at MTP-verify shapes.
-    id<MTLComputePipelineState> rms_norm_rows_reduce_pipeline;
     // A4B decode specialization: vectorized loads/stores plus SIMD-group
     // reduction avoids the eight threadgroup-wide barriers in the generic
     // reduce kernel. Kept behind TERMITE_METAL_ENABLE_A4B_PARALLEL_RMS_NORM.
-    id<MTLComputePipelineState> rms_norm_rows_simd4_reduce_pipeline;
-    id<MTLComputePipelineState> lightonocr3_norm_cached1024_pipeline;
-    id<MTLComputePipelineState> lightonocr3_norm_cached2560_pipeline;
     // Model-scoped encoder policy, configured only under the provider lease.
     BOOL embeddinggemma2_rms_norm_enabled;
     BOOL qwen35_ocr_vector_loads_enabled;
@@ -1434,21 +1412,7 @@ typedef struct termite_metal_decode_runtime {
     bool lighton_frame_barriers_disabled;
     uint64_t lighton_frame_policy_snapshots;
     BOOL lightonocr3_mpp_initialization_attempted;
-    id<MTLComputePipelineState> lightonocr3_gemv_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gemv_rows2_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gate_up_gemv_pipeline;
-    id<MTLComputePipelineState> lightonocr3_pack_bf16_pipeline;
-    id<MTLComputePipelineState> lightonocr3_batch2_pipeline;
-    id<MTLComputePipelineState> lightonocr3_batch4_pipeline;
-    id<MTLComputePipelineState> lightonocr3_batch8_pipeline;
-    id<MTLComputePipelineState> lightonocr3_batch16_pipeline;
     id<MTLComputePipelineState> lightonocr3_tiled_pipelines[17];
-    id<MTLComputePipelineState> lightonocr3_mpp_f32_pipeline;
-    id<MTLComputePipelineState> f16_encoder_mpp_pipeline;
-    id<MTLComputePipelineState> lightonocr3_mpp_small_tile_pipeline;
-    id<MTLComputePipelineState> lightonocr3_mpp_four_row_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gate_up_split16_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gate_up_split_reduce_pipeline;
     id<MTLComputePipelineState> lightonocr3_local_gate_vectors[2];
     id<MTLComputePipelineState> lightonocr3_local_projection_vectors[3];
     id<MTLComputePipelineState> lightonocr3_local_down_vectors[2];
@@ -1462,234 +1426,26 @@ typedef struct termite_metal_decode_runtime {
     __weak id<MTLCommandBuffer> lightonocr3_vision_pack_owners[2];
     uint64_t lightonocr3_vision_mpp_dispatches;
     id<MTLComputePipelineState> lightonocr3_local_down_tg8, lightonocr3_local_down_tg16;
-    id<MTLComputePipelineState> lightonocr3_gate_up_small16_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gate_up_wide16_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gate_up_wide32_pipeline;
-    id<MTLComputePipelineState> lightonocr3_gate_up_wide64_pipeline;
     uint64_t lightonocr3_wide_gate_up_calls;
     uint64_t lightonocr3_full64_gate_up_calls;
     uint64_t lighton_batch_argmax_calls;
     uint64_t lighton_batch_argmax_rows;
     id<MTLComputePipelineState> lightonocr3_wide_mpp_pipelines[3];
-    id<MTLComputePipelineState> lightonocr3_gate_up_small32_pipeline;
-    id<MTLComputePipelineState> lightonocr3_four_row_segment_pipeline;
-    id<MTLComputePipelineState> lightonocr3_down_split32_pipeline;
-    id<MTLComputePipelineState> lightonocr3_down_split64_pipeline;
-    id<MTLComputePipelineState> lightonocr3_down_split_reduce_pipeline;
-    id<MTLComputePipelineState> lightonocr3_mpp_f32_n32_pipeline;
-    id<MTLComputePipelineState> lightonocr3_mpp_bf16_pipeline;
     id<MTLComputePipelineState> lighton_prefill_ffn_pipelines[2];
     bool lighton_prefill_ffn_initialization_attempted;
     uint64_t lighton_prefill_ffn_calls;
-    id<MTLComputePipelineState> lightonocr3_mpp_bf16_n32_pipeline;
     // Gemma 4 shared/routed/router branches normalize the same activation.
     // This specialization shares their SIMD4 denominator reduction.
-    id<MTLComputePipelineState> rms_norm_rows_triple_simd4_reduce_pipeline;
     // Gemma 4 A4B parallel-FFN epilogue: two branch post norms, their sum,
     // the combined post norm, and the attention residual in one dispatch.
-    id<MTLComputePipelineState> parallel_ffn_post_residual_simd4_pipeline;
-    id<MTLComputePipelineState> rms_norm_add_pipeline;
-    id<MTLComputePipelineState> rms_norm_add_sumsq_pipeline;
-    id<MTLComputePipelineState> rms_norm_add_rows_sumsq_pipeline;
-    id<MTLComputePipelineState> rms_norm_add_rows_canonical_pipeline;
-    id<MTLComputePipelineState> rms_norm_add_scale_sumsq_pipeline;
-    id<MTLComputePipelineState> rms_norm_add_f16_input_pipeline;
-    id<MTLComputePipelineState> rms_norm_add_scale_pipeline;
-    id<MTLComputePipelineState> rms_norm_add_scale_rows_pipeline;
     // A4B fused post-norm + residual specialization. This mirrors the SIMD4
     // reduction used by rms_norm_rows_simd4_reduce and accepts an optional
     // output scale through the existing scale params.
-    id<MTLComputePipelineState> rms_norm_add_scale_simd4_pipeline;
     // Generated (descriptor-rendered) RMSNorm microkernel candidate. Opt-in via
     // TERMITE_METAL_ENABLE_RMS_NORM_GENERATED; nil (unused) until promoted. The
     // hand-written termite_apply_rms_norm_rows above stays the production path.
-    id<MTLComputePipelineState> rms_norm_generated_pipeline;
-    id<MTLComputePipelineState> linear_pipeline;
-    id<MTLComputePipelineState> linear_reduce_pipeline;
-    id<MTLComputePipelineState> linear_bf16_pipeline;
-    id<MTLComputePipelineState> linear_bf16_reduce_pipeline;
-    id<MTLComputePipelineState> linear_f16_pipeline;
-    id<MTLComputePipelineState> linear_f16_reduce_pipeline;
-    id<MTLComputePipelineState> linear_f16_multi_row_pipeline;
-    id<MTLComputePipelineState> linear_f16_multi_row_reduce_pipeline;
-    id<MTLComputePipelineState> linear_bf16_multi_row_pipeline;
-    id<MTLComputePipelineState> linear_bf16_multi_row_reduce_pipeline;
-    id<MTLComputePipelineState> linear_bf16_multi_row_shared_reduce_pipeline;
-    id<MTLComputePipelineState> linear_bf16_multi_row_tiled32_m16_pipeline;
-    id<MTLComputePipelineState> linear_bf16_mm_pipeline;
-    id<MTLComputePipelineState> linear_bf16_mm_vec4_pipeline;
-    id<MTLComputePipelineState> bf16_gate_up_mm_pipeline;
-    id<MTLComputePipelineState> bf16_gate_up_mm_vec4_pipeline;
-    id<MTLComputePipelineState> linear_pair_reduce_pipeline;
-    id<MTLComputePipelineState> linear_multi_row_pipeline;
-    id<MTLComputePipelineState> linear_multi_row_reduce_pipeline;
-    id<MTLComputePipelineState> linear_multi_row_tiled_f32_pipeline;
-    id<MTLComputePipelineState> linear_multi_row_tiled_activation_f32_pipeline;
-    id<MTLComputePipelineState> linear_multi_row_tiled32_f32_pipeline;
-    id<MTLComputePipelineState> linear_multi_row_tiled32_activation_f32_pipeline;
-    id<MTLComputePipelineState> linear_multi_row_tiled32_m16_f32_pipeline;
-    id<MTLComputePipelineState> linear_multi_row_tiled32_m16_activation_f32_pipeline;
-    id<MTLComputePipelineState> linear_bias_pipeline;
-    id<MTLComputePipelineState> argmax_logits_pipeline;
-    id<MTLComputePipelineState> argmax_logits_partials_pipeline;
-    id<MTLComputePipelineState> argmax_logits_suppress_partials_pipeline;
-    id<MTLComputePipelineState> argmax_logits_reduce_pipeline;
-    id<MTLComputePipelineState> lighton_batch_argmax_partials_pipeline;
-    id<MTLComputePipelineState> lighton_batch_argmax_reduce_pipeline;
-    id<MTLComputePipelineState> layer_norm_add_sum_pipeline;
-    id<MTLComputePipelineState> whisper_logits_partials_pipeline;
-    id<MTLComputePipelineState> whisper_logits_reduce_pipeline;
-    id<MTLComputePipelineState> lm_head_top8_suppress_partials_pipeline;
-    id<MTLComputePipelineState> lm_head_top8_reduce_pipeline;
-    id<MTLComputePipelineState> lm_head_q6_k_rescore_top8_pipeline;
-    id<MTLComputePipelineState> argmax_logits_reduce_tg_pipeline;
-    id<MTLComputePipelineState> sample_gumbel_partials_pipeline;
-    id<MTLComputePipelineState> sample_logits_pipeline;
-    id<MTLComputePipelineState> sample_topk_partials_pipeline;
-    id<MTLComputePipelineState> sample_topk_reduce_pipeline;
-    id<MTLComputePipelineState> sample_nucleus_max_partials_pipeline;
-    id<MTLComputePipelineState> sample_nucleus_max_reduce_pipeline;
-    id<MTLComputePipelineState> sample_nucleus_probs_partials_pipeline;
-    id<MTLComputePipelineState> sample_nucleus_sum_reduce_pipeline;
-    id<MTLComputePipelineState> sample_nucleus_radix_histogram_pipeline;
-    id<MTLComputePipelineState> sample_nucleus_radix_histogram_serial_pipeline;
-    id<MTLComputePipelineState> sample_nucleus_radix_select_pipeline;
-    id<MTLComputePipelineState> sample_nucleus_gumbel_partials_pipeline;
-    id<MTLComputePipelineState> activation_pipeline;
-    id<MTLComputePipelineState> gelu_backward_pipeline;
-    id<MTLComputePipelineState> ffn_gelu_backward_rank1_branches_pipeline;
-    id<MTLComputePipelineState> ffn_gelu_backward_rank1_first_branch_pipeline;
-    id<MTLComputePipelineState> ffn_gelu_backward_rank1_output_pipeline;
-    id<MTLComputePipelineState> ffn_gelu_backward_rank1_first_output_pipeline;
-    id<MTLComputePipelineState> activation_multiply_pipeline;
-    id<MTLComputePipelineState> activation_multiply_f16_output_pipeline;
-    id<MTLComputePipelineState> softmax_pipeline;
-    id<MTLComputePipelineState> moe_route_select_pipeline;
-    id<MTLComputePipelineState> moe_route_select_tg_pipeline;
-    id<MTLComputePipelineState> moe_route_select_tg_register_pipeline;
-    id<MTLComputePipelineState> moe_route_select_tg_register_v2_pipeline;
-    id<MTLComputePipelineState> moe_route_select_tg_map_pipeline;
-    id<MTLComputePipelineState> moe_route_map_slots_pipeline;
-    id<MTLComputePipelineState> moe_slot_q4_0_gate_up_pipeline;
-    id<MTLComputePipelineState> moe_slot_q4_0_down_pipeline;
-    id<MTLComputePipelineState> moe_slot_reduce_pipeline;
-    id<MTLComputePipelineState> mapped_page_touch_pipeline;
-    id<MTLComputePipelineState> mapped_selected_expert_page_touch_pipeline;
-    id<MTLComputePipelineState> masked_bce_loss_pipeline;
-    id<MTLComputePipelineState> masked_bce_backward_pipeline;
-    id<MTLComputePipelineState> reduce_last_dim_pipeline;
-    id<MTLComputePipelineState> nomic_pool_normalize_pipeline;
-    id<MTLComputePipelineState> reduce_axis_f32_pipeline;
-    id<MTLComputePipelineState> multiply_reduce_last_dim_pipeline;
-    id<MTLComputePipelineState> broadcast_last_dim_pipeline;
-    id<MTLComputePipelineState> broadcast_f32_pipeline;
-    id<MTLComputePipelineState> multiply_pipeline;
-    id<MTLComputePipelineState> scale_pipeline;
-    id<MTLComputePipelineState> norm_residual_pipeline;
-    id<MTLComputePipelineState> gemma4_audio_clamp_silu_pipeline;
-    id<MTLComputePipelineState> spatial_pool_prepare_pipeline;
-    id<MTLComputePipelineState> audio_frontend_pipeline;
-    id<MTLComputePipelineState> audio_clipped_linear_pipeline;
-    id<MTLComputePipelineState> audio_attention_parallel_pipeline;
-    id<MTLComputePipelineState> audio_norm_clamp_pipeline;
-    id<MTLComputePipelineState> audio_logmel_pipeline;
-    id<MTLComputePipelineState> audio_conv_matrix_pipeline;
-    id<MTLComputePipelineState> audio_conv_tiled_pipeline;
-    id<MTLComputePipelineState> audio_fft512_pipeline;
-    id<MTLComputePipelineState> gemma4_audio_clamp_pipeline;
-    id<MTLComputePipelineState> gemma4_audio_glu_pipeline;
-    id<MTLComputePipelineState> gemma4_audio_dwconv_pipeline;
-    id<MTLComputePipelineState> gemma4_audio_flatten_pipeline;
-    id<MTLComputePipelineState> gemma4_audio_channel_norm_pipeline;
-    id<MTLComputePipelineState> gemma4_audio_attention_pipeline;
-    id<MTLComputePipelineState> gemma4_audio_attention_tg_pipeline;
-    id<MTLComputePipelineState> add_pipeline;
-    id<MTLComputePipelineState> add_scale_pipeline;
-    id<MTLComputePipelineState> scaled_add_scale_pipeline;
-    id<MTLComputePipelineState> multiply_add_pipeline;
-    id<MTLComputePipelineState> multiply_add2_pipeline;
-    id<MTLComputePipelineState> training_accumulate_pipeline;
-    id<MTLComputePipelineState> training_adamw_pipeline;
-    id<MTLComputePipelineState> training_accumulate_into_pipeline;
-    id<MTLComputePipelineState> training_adamw_into_pipeline;
-    id<MTLComputePipelineState> training_sumsq_pipeline;
-    id<MTLComputePipelineState> subtract_pipeline;
-    id<MTLComputePipelineState> divide_pipeline;
-    id<MTLComputePipelineState> less_than_pipeline;
-    id<MTLComputePipelineState> where_select_pipeline;
-    id<MTLComputePipelineState> i2_s_quantize_pipeline;
-    id<MTLComputePipelineState> q1_0_pipeline;
-    id<MTLComputePipelineState> i8_s_pipeline;
-    id<MTLComputePipelineState> q2_k_pipeline;
-    id<MTLComputePipelineState> antfly_q2_k_small_batch_pipeline;
-    id<MTLComputePipelineState> antfly_q2_k_small_batch_bias_pipeline;
-    id<MTLComputePipelineState> antfly_q2_k_small_batch_bias_gelu_pipeline;
-    id<MTLComputePipelineState> q3_k_pipeline;
-    id<MTLComputePipelineState> antfly_q3_k_small_batch_pipeline;
-    id<MTLComputePipelineState> antfly_q3_k_small_batch_bias_pipeline;
-    id<MTLComputePipelineState> antfly_q3_k_small_batch_bias_gelu_pipeline;
-    id<MTLComputePipelineState> q4_k_pipeline;
-    id<MTLComputePipelineState> antfly_q4_k_small_batch_bias_gelu_pipeline;
-    id<MTLComputePipelineState> q4_k_reduce_pipeline;
-    id<MTLComputePipelineState> q4_k_pair_pipeline;
-    id<MTLComputePipelineState> q4_k_pair_reduce_pipeline;
-    id<MTLComputePipelineState> q4_k_pair_activation_reduce_pipeline;
-    id<MTLComputePipelineState> q4_k_pair_activation_reduce_f16_output_pipeline;
-    id<MTLComputePipelineState> q4_k_activation_rhs_reduce_pipeline;
-    id<MTLComputePipelineState> q4_0_activation_rhs_reduce_pipeline;
-    id<MTLComputePipelineState> q4_0_activation_rhs_reduce_f16_output_pipeline;
-    id<MTLComputePipelineState> q4_0_pipeline;
-    id<MTLComputePipelineState> q4_0_id_pipeline;
-    id<MTLComputePipelineState> q4_0_id_a4b_gate_up_pipeline;
-    id<MTLComputePipelineState> q4_0_id_a4b_down_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_id_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_id_pipeline;
-    id<MTLComputePipelineState> moe_merged_gate_up_activation_pipeline;
-    id<MTLComputePipelineState> moe_scatter_add_pipeline;
-    id<MTLComputePipelineState> antfly_q4_0_small_batch_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_reduce_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_reduce_pipeline;
     id<MTLComputePipelineState> q4_0_shared_linear_pipelines[4][2];
     id<MTLComputePipelineState> q4_0_shared_pair_pipelines[4][2];
-    id<MTLComputePipelineState> q4_0_pair_activation_mmv_nr4_nsg2_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_mmv_nr8_nsg2_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_mmv_nr4_nsg4_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_mmv_nr8_nsg4_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_mmv_nr4_nsg2_nq8_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_mm_m32_n64_aligned_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_mm_m32_n64_tail_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_mm_m32_n32_aligned_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_mm_m32_n32_tail_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_small_batch_r2_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_small_batch_r3_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_small_batch_r4_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_small_batch_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_reduce_f16_output_pipeline;
-    id<MTLComputePipelineState> q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_nr4_nsg4_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_nr4_nsg4_nq8_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_nr8_nsg4_pipeline;
-    id<MTLComputePipelineState> q4_0_mm_sg_pipeline;
-    id<MTLComputePipelineState> q4_0_mm_sg_unrolled_pipeline;
-    id<MTLComputePipelineState> q4_0_mm_sg_aligned_pipeline;
-    id<MTLComputePipelineState> q4_0_mm_sg_aligned_tail_pipeline;
-    id<MTLComputePipelineState> q4_0_small_batch_r2_pipeline;
-    id<MTLComputePipelineState> q4_0_small_batch_r4_pipeline;
-    id<MTLComputePipelineState> q4_0_small_batch_r8_pipeline;
-    id<MTLComputePipelineState> q4_0_small_batch_r2_specialized_pipeline;
-    id<MTLComputePipelineState> q4_0_small_batch_r3_specialized_pipeline;
-    id<MTLComputePipelineState> q4_0_small_batch_r2_wide_pipeline;
-    id<MTLComputePipelineState> q4_0_small_batch_r4_wide_pipeline;
-    id<MTLComputePipelineState> q4_0_small_batch_r8_wide_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_small_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_sumsq_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_f16_input_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_f16_input_small_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_f16_input_sumsq_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_f16_output_pipeline;
-    id<MTLComputePipelineState> q4_0_reduce_f16_input_f16_output_pipeline;
     uint16_t apple_gpu_family;
     uint8_t q4_0_mmv_variant_override;
     uint8_t q4_0_mmv_workload_variant_overrides[TERMITE_METAL_Q4_0_MMV_WORKLOAD_COUNT];
@@ -1740,117 +1496,6 @@ typedef struct termite_metal_decode_runtime {
     BOOL a4b_lm_head_nr4_nsg2_reported;
     BOOL a4b_lm_head_nr6_nsg1_reported;
     BOOL a4b_lm_head_nr8_nsg1_reported;
-    id<MTLComputePipelineState> q4_1_pipeline;
-    id<MTLComputePipelineState> antfly_q4_1_small_batch_pipeline;
-    id<MTLComputePipelineState> q4_1_reduce_pipeline;
-    id<MTLComputePipelineState> q5_0_pipeline;
-    id<MTLComputePipelineState> antfly_q5_0_small_batch_pipeline;
-    id<MTLComputePipelineState> q5_0_reduce_pipeline;
-    id<MTLComputePipelineState> q5_1_pipeline;
-    id<MTLComputePipelineState> antfly_q5_1_small_batch_pipeline;
-    id<MTLComputePipelineState> q5_1_reduce_pipeline;
-    id<MTLComputePipelineState> q8_0_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_pipeline;
-    id<MTLComputePipelineState> q8_0_mmv_pipeline;
-    id<MTLComputePipelineState> q8_0_mmv_f16_input_pipeline;
-    id<MTLComputePipelineState> q8_0_rms_scale_mmv_pipeline;
-    id<MTLComputePipelineState> q8_0_small_batch_r2_pipeline;
-    id<MTLComputePipelineState> q8_0_small_batch_r3_pipeline;
-    id<MTLComputePipelineState> q8_0_small_batch_r4_pipeline;
-    id<MTLComputePipelineState> q8_0_small_batch_pipeline;
-    id<MTLComputePipelineState> antfly_q8_0_small_batch_pipeline;
-    id<MTLComputePipelineState> antfly_q8_0_small_batch_bias_pipeline;
-    id<MTLComputePipelineState> antfly_q8_0_small_batch_bias_gelu_pipeline;
-    id<MTLComputePipelineState> antfly_q8_0_small_batch_relu_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_f16_input_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_v2_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_v2_tail_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_v2_f16_input_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_v2_f16_input_tail_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_m64_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_m64_tail_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_m64_f16_input_pipeline;
-    id<MTLComputePipelineState> q8_0_mm_sg_m64_f16_input_tail_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_mmv_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_small_batch_r2_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_small_batch_r3_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_small_batch_r4_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_small_batch_pipeline;
-    id<MTLComputePipelineState> q8_0_qkv_mmv_pipeline;
-    id<MTLComputePipelineState> q8_0_kv_pair_mm_sg_pipeline;
-    id<MTLComputePipelineState> q8_0_kv_pair_mm_sg_tail_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_reduce_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_mmv_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_rms_scale_mmv_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_rms_scale_mmv_f16_output_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_small_batch_r2_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_small_batch_r3_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_small_batch_r4_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_small_batch_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_mm_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_mm_f16_output_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_mm_sg_v2_pipeline;
-    id<MTLComputePipelineState> q8_0_pair_activation_mm_sg_v2_f16_output_pipeline;
-    id<MTLComputePipelineState> q8_0_activation_multiply_reduce_pipeline;
-    id<MTLComputePipelineState> q8_0_activation_multiply_mmv_pipeline;
-    id<MTLComputePipelineState> q8_1_pipeline;
-    id<MTLComputePipelineState> antfly_q8_1_small_batch_pipeline;
-    id<MTLComputePipelineState> q8_1_reduce_pipeline;
-    id<MTLComputePipelineState> q5_k_pipeline;
-    id<MTLComputePipelineState> antfly_q4_k_small_batch_pipeline;
-    id<MTLComputePipelineState> florence_q4_k_mm_matrix_pipeline;
-    id<MTLComputePipelineState> florence_q4_k_mm_matrix_f16_input_pipeline;
-    id<MTLComputePipelineState> florence_q4_k_mm_nr4_pipeline;
-    id<MTLComputePipelineState> antfly_q4_k_small_batch_bias_pipeline;
-    id<MTLComputePipelineState> antfly_q5_k_small_batch_pipeline;
-    id<MTLComputePipelineState> antfly_q5_k_small_batch_bias_pipeline;
-    id<MTLComputePipelineState> antfly_q5_k_small_batch_bias_gelu_pipeline;
-    id<MTLComputePipelineState> q5_k_reduce_pipeline;
-    id<MTLComputePipelineState> q4_k_reduce_v2_pipeline;
-    id<MTLComputePipelineState> q6_k_pipeline;
-    id<MTLComputePipelineState> antfly_q6_k_small_batch_pipeline;
-    id<MTLComputePipelineState> q6_k_high_row_mm_matrix_pipeline;
-    id<MTLComputePipelineState> antfly_q6_k_small_batch_bias_pipeline;
-    id<MTLComputePipelineState> antfly_q6_k_small_batch_bias_gelu_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_nsg4_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_nsg8_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_nbodd_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_nbodd_nr1_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_nbodd_nr4_nsg1_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_nbodd_nr4_nsg2_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_nbodd_nr6_nsg1_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_nbodd_nr8_nsg1_pipeline;
-    id<MTLComputePipelineState> q6_k_r2_reduce_pipeline;
-    id<MTLComputePipelineState> q6_k_reduce_f16_input_pipeline;
-    id<MTLComputePipelineState> q6_k_pair_pipeline;
-    id<MTLComputePipelineState> q8_k_pipeline;
-    id<MTLComputePipelineState> antfly_q8_k_small_batch_pipeline;
-    id<MTLComputePipelineState> q8_k_reduce_pipeline;
-    id<MTLComputePipelineState> iq4_nl_pipeline;
-    id<MTLComputePipelineState> iq4_nl_reduce_pipeline;
-    id<MTLComputePipelineState> iq4_xs_pipeline;
-    id<MTLComputePipelineState> iq4_xs_reduce_pipeline;
-    id<MTLComputePipelineState> mxfp4_pipeline;
-    id<MTLComputePipelineState> mxfp4_reduce_pipeline;
-    id<MTLComputePipelineState> nvfp4_pipeline;
-    id<MTLComputePipelineState> nvfp4_reduce_pipeline;
-    id<MTLComputePipelineState> iq2_xs_pipeline;
-    id<MTLComputePipelineState> iq2_xs_reduce_pipeline;
-    id<MTLComputePipelineState> i2_s_pipeline;
-    id<MTLComputePipelineState> i2_s_pair_pipeline;
-    id<MTLComputePipelineState> i2_s_linear_i8_pipeline;
-    id<MTLComputePipelineState> i2_s_pair_i8_pipeline;
-    id<MTLComputePipelineState> tl1_pipeline;
-    id<MTLComputePipelineState> tl2_pipeline;
-    id<MTLComputePipelineState> encode_polar4_key_pipeline;
-    id<MTLComputePipelineState> encode_turbo3_key_pipeline;
-    id<MTLComputePipelineState> encode_f16_convert_pipeline;
-    id<MTLComputePipelineState> encode_int8_per_head_pipeline;
-    id<MTLComputePipelineState> polar4_attention_span_pipeline;
-    id<MTLComputePipelineState> turbo3_attention_span_pipeline;
     id<MTLBuffer> token_embedding_table_buffer;
     id<MTLBuffer> position_embedding_table_buffer;
     id<MTLBuffer> generic_embedding_table_buffer;
@@ -2180,7 +1825,6 @@ typedef struct termite_metal_decode_runtime {
     // to the live working set instead of the sum of all intermediates.
     // Model-admitted execution storage. A fence owns each retired generation;
     // pending generations cannot be borrowed or evicted by another frame.
-    id<MTLComputePipelineState> audio_pad_pipeline;
     id<MTLBuffer> audio_reuse_buffers[128];
     id<MTLCommandBuffer> audio_reuse_fences[128];
     size_t audio_reuse_bytes;
@@ -3199,15 +2843,6 @@ static void termite_metal_ocr_residency_shutdown(termite_metal_decode_runtime *r
 static void termite_metal_maybe_trace_dense_linear_dispatch(const char *site, size_t slot, size_t rows, size_t in_dim, size_t out_dim, const char *variant, bool active_frame, bool planned_encoder, bool packed_weight, bool activation_fused, bool mps);
 static int termite_metal_encode_q8_0_linear(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, int failure_code);
 static int termite_metal_encode_q8_0_linear_family(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, termite_metal_q8_0_linear_family_kind q8_family, int failure_code);
-static int termite_metal_encode_q8_0_linear_raw(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, int failure_code);
-static int termite_metal_encode_q8_0_pair_activation_multiply_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> gate_weight_buffer, id<MTLBuffer> up_weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint32_t activation_kind, int failure_code);
-static int termite_metal_encode_q8_0_pair_activation_multiply_on_encoder_planned(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> gate_weight_buffer, id<MTLBuffer> up_weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint32_t activation_kind, uint8_t planned_dispatch, int failure_code);
-static int termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, size_t norm_slot, id<MTLBuffer> inv_scale_buffer, size_t inv_scale_offset, id<MTLBuffer> gate_weight_buffer, id<MTLBuffer> up_weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t in_dim, size_t out_dim, uint32_t activation_kind, int failure_code);
-static int termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder_planned(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, size_t norm_slot, id<MTLBuffer> inv_scale_buffer, size_t inv_scale_offset, id<MTLBuffer> gate_weight_buffer, id<MTLBuffer> up_weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t in_dim, size_t out_dim, uint32_t activation_kind, uint8_t planned_dispatch, int failure_code);
-static int termite_metal_encode_q8_0_activation_multiply(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> rhs_buffer, size_t rhs_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint32_t activation_kind, int failure_code);
-static int termite_metal_encode_q8_0_activation_multiply_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> rhs_buffer, size_t rhs_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint32_t activation_kind, int failure_code);
-static int termite_metal_encode_q8_0_activation_multiply_on_encoder_planned(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> rhs_buffer, size_t rhs_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint32_t activation_kind, uint8_t planned_dispatch, int failure_code);
-static int termite_metal_encode_q8_0_linear_raw_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, int failure_code);
 static int termite_metal_encode_q8_0_linear_raw_on_encoder_planned(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint8_t planned_dispatch, int failure_code);
 static int termite_metal_encode_q8_0_linear_raw_on_encoder_planned_family(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t in_dim, size_t out_dim, uint8_t planned_dispatch, termite_metal_q8_0_linear_family_kind q8_family, int failure_code);
 static int termite_metal_encode_argmax_logits_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> logits_buffer, size_t logits_offset, size_t out_dim, int failure_code);
@@ -3227,7 +2862,6 @@ static int termite_metal_encode_rms_norm_rows(termite_metal_decode_runtime *runt
 static bool termite_metal_a4b_simd4_rms_norm_rows_preferred(termite_metal_decode_runtime *runtime, size_t rows, size_t hidden_size);
 static int termite_metal_encode_rms_norm_generated(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> weight_buffer, size_t weight_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t rows, size_t hidden_size, float eps, int failure_code);
 static int termite_metal_encode_add_for(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> lhs_buffer, size_t lhs_offset, id<MTLBuffer> rhs_buffer, size_t rhs_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t elems, size_t source, int failure_code);
-static int termite_metal_encode_add(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, id<MTLBuffer> lhs_buffer, size_t lhs_offset, id<MTLBuffer> rhs_buffer, size_t rhs_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t elems, int failure_code);
 static int termite_metal_decode_runtime_ensure_active_layer_projection_buffer(termite_metal_decode_runtime *runtime, size_t index, size_t bytes);
 static void termite_metal_decode_runtime_clear_frame_resources(CFMutableArrayRef *resources);
 static int termite_metal_decode_runtime_retain_frame_resource(termite_metal_decode_runtime *runtime, id resource);
@@ -3844,19 +3478,6 @@ static void termite_metal_q4_0_mmv_parse_workload_override(
     }
 }
 
-static const char *termite_metal_decode_gqa_split_variant_name(
-    termite_metal_decode_gqa_split_variant variant
-) {
-    switch (variant) {
-        case TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_AUTO: return "auto";
-        case TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_S8: return "s8-k32-r256";
-        case TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_S16: return "s16-k32-r256";
-        case TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_S24: return "s24-k32-r256";
-        case TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_S32: return "s32-k32-r256";
-    }
-    return "unknown";
-}
-
 static termite_metal_decode_gqa_split_variant termite_metal_decode_gqa_split_variant_parse(
     const char *value,
     bool *valid
@@ -3922,14 +3543,6 @@ static uint16_t termite_metal_device_apple_gpu_family(id<MTLDevice> device) {
         if ([device supportsFamily:(MTLGPUFamily)(1000 + family)]) apple_gpu_family = family;
     }
     return apple_gpu_family;
-}
-
-static bool termite_metal_env_bool_enabled(const char *value) {
-    return value != NULL &&
-        (strcmp(value, "1") == 0 ||
-         strcasecmp(value, "true") == 0 ||
-         strcasecmp(value, "yes") == 0 ||
-         strcasecmp(value, "on") == 0);
 }
 
 static bool termite_metal_q4_0_linear_rms_add_f16_project_enabled(void) {
@@ -19089,12 +18702,6 @@ static uint8_t termite_metal_planned_layer_cursor_quant_dispatch(
     return cursor != NULL ? cursor->last_quant_dispatch : TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN;
 }
 
-static uint8_t termite_metal_planned_layer_cursor_operator(
-    const termite_metal_planned_layer_cursor *cursor
-) {
-    return cursor != NULL ? cursor->last_operator : TERMITE_METAL_OPERATOR_UNKNOWN;
-}
-
 static uint8_t termite_metal_planned_layer_cursor_input_dtype(
     const termite_metal_planned_layer_cursor *cursor
 ) {
@@ -25225,105 +24832,6 @@ static int termite_metal_encode_q8_0_linear_raw_on_encoder_planned_family(
     return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
 }
 
-static int termite_metal_encode_q8_0_linear_raw_on_encoder(
-    termite_metal_decode_runtime *runtime,
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    id<MTLBuffer> weight_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t rows,
-    size_t in_dim,
-    size_t out_dim,
-    int failure_code
-) {
-    return termite_metal_encode_q8_0_linear_raw_on_encoder_planned(
-        runtime,
-        encoder,
-        input_buffer,
-        input_offset,
-        weight_buffer,
-        output_buffer,
-        output_offset,
-        rows,
-        in_dim,
-        out_dim,
-        TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN,
-        failure_code
-    );
-}
-
-static int termite_metal_encode_q8_0_linear_raw(
-    termite_metal_decode_runtime *runtime,
-    id<MTLCommandBuffer> command_buffer,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    id<MTLBuffer> weight_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t rows,
-    size_t in_dim,
-    size_t out_dim,
-    int failure_code
-) {
-    id<MTLComputeCommandEncoder> encoder = runtime != NULL ? runtime->active_planned_compute_encoder : nil;
-    const BOOL planned_encoder = (encoder != nil);
-    if (!planned_encoder) {
-        encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_QUANT_LINEAR);
-        if (encoder == nil) return failure_code;
-    }
-    const int rc = termite_metal_encode_q8_0_linear_raw_on_encoder(runtime, encoder, input_buffer, input_offset, weight_buffer, output_buffer, output_offset, rows, in_dim, out_dim, failure_code);
-    if (!planned_encoder) [encoder endEncoding];
-    return rc;
-}
-
-static int termite_metal_encode_q8_0_linear_rms_scale_1x(
-    termite_metal_decode_runtime *runtime,
-    id<MTLCommandBuffer> command_buffer,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    size_t norm_slot,
-    id<MTLBuffer> inv_scale_buffer,
-    size_t inv_scale_offset,
-    id<MTLBuffer> weight_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t in_dim,
-    size_t out_dim,
-    int failure_code
-) {
-    if (runtime == NULL || command_buffer == nil || input_buffer == nil || inv_scale_buffer == nil || weight_buffer == nil || output_buffer == nil) return failure_code;
-    if (runtime->q8_0_rms_scale_mmv_pipeline == nil) return failure_code;
-    if (norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return failure_code;
-    if (runtime->rms_norm_slot_prepared[norm_slot] == 0 || runtime->rms_norm_hidden_sizes[norm_slot] != in_dim) return failure_code;
-    if (in_dim == 0 || out_dim == 0 || in_dim % 32u != 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return failure_code;
-    termite_metal_linear_params params = {
-        .rows = 1,
-        .in_dim = (uint32_t)in_dim,
-        .out_dim = (uint32_t)out_dim,
-        .row_blocks = (uint32_t)(in_dim / 32u),
-    };
-    termite_metal_record_q8_0_linear_dispatch(
-        runtime,
-        TERMITE_METAL_Q8_0_LINEAR_DISPATCH_MMV,
-        1,
-        TERMITE_METAL_Q8_0_LINEAR_FAMILY_RMS_SCALE);
-    id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_QUANT_LINEAR);
-    if (encoder == nil) return failure_code;
-    [encoder setComputePipelineState:runtime->q8_0_rms_scale_mmv_pipeline];
-    [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-    [encoder setBuffer:weight_buffer offset:0 atIndex:1];
-    [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
-    [encoder setBytes:&params length:sizeof(params) atIndex:3];
-    [encoder setBuffer:runtime->rms_norm_weight_buffers[norm_slot] offset:0 atIndex:4];
-    [encoder setBuffer:inv_scale_buffer offset:inv_scale_offset atIndex:5];
-    [encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    [encoder endEncoding];
-    return 0;
-}
-
 static int termite_metal_encode_q8_0_pair_linear(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -25357,54 +24865,6 @@ static int termite_metal_encode_q8_0_pair_linear(
         .rows = rows,
         .in_dim = in_dim,
         .out_dim = out_dim,
-        .values_per_block = 32u,
-        .bytes_per_block = 34u,
-        .failure_code = failure_code,
-    };
-    return termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
-}
-
-static int termite_metal_encode_q8_0_qkv_linear(
-    termite_metal_decode_runtime *runtime,
-    id<MTLCommandBuffer> command_buffer,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    id<MTLBuffer> q_weight_buffer,
-    id<MTLBuffer> k_weight_buffer,
-    id<MTLBuffer> v_weight_buffer,
-    id<MTLBuffer> q_output_buffer,
-    size_t q_output_offset,
-    id<MTLBuffer> k_output_buffer,
-    size_t k_output_offset,
-    id<MTLBuffer> v_output_buffer,
-    size_t v_output_offset,
-    size_t rows,
-    size_t in_dim,
-    size_t q_out_dim,
-    size_t kv_out_dim,
-    int failure_code
-) {
-    termite_metal_quant_matmul_descriptor descriptor = {
-        .slot = SIZE_MAX,
-        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_QKV,
-        .fallback_pipeline = runtime != NULL ? runtime->q8_0_qkv_mmv_pipeline : nil,
-        .input_buffer = input_buffer,
-        .input_offset = input_offset,
-        .weight_buffer = q_weight_buffer,
-        .second_weight_buffer = k_weight_buffer,
-        .third_weight_buffer = v_weight_buffer,
-        .output_buffer = q_output_buffer,
-        .output_offset = q_output_offset,
-        .second_output_buffer = k_output_buffer,
-        .second_output_offset = k_output_offset,
-        .third_output_buffer = v_output_buffer,
-        .third_output_offset = v_output_offset,
-        .rows = rows,
-        .in_dim = in_dim,
-        .out_dim = q_out_dim,
-        .second_out_dim = kv_out_dim,
         .values_per_block = 32u,
         .bytes_per_block = 34u,
         .failure_code = failure_code,
@@ -25448,291 +24908,6 @@ static int termite_metal_encode_q8_0_pair_activation_multiply(
         .failure_code = failure_code,
     };
     return termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
-}
-
-static int termite_metal_encode_q8_0_pair_activation_multiply_on_encoder(
-    termite_metal_decode_runtime *runtime,
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    id<MTLBuffer> gate_weight_buffer,
-    id<MTLBuffer> up_weight_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t rows,
-    size_t in_dim,
-    size_t out_dim,
-    uint32_t activation_kind,
-    int failure_code
-) {
-    return termite_metal_encode_q8_0_pair_activation_multiply_on_encoder_planned(
-        runtime,
-        encoder,
-        input_buffer,
-        input_offset,
-        gate_weight_buffer,
-        up_weight_buffer,
-        output_buffer,
-        output_offset,
-        rows,
-        in_dim,
-        out_dim,
-        activation_kind,
-        TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN,
-        failure_code
-    );
-}
-
-static int termite_metal_encode_q8_0_pair_activation_multiply_on_encoder_planned(
-    termite_metal_decode_runtime *runtime,
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    id<MTLBuffer> gate_weight_buffer,
-    id<MTLBuffer> up_weight_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t rows,
-    size_t in_dim,
-    size_t out_dim,
-    uint32_t activation_kind,
-    uint8_t planned_dispatch,
-    int failure_code
-) {
-    termite_metal_quant_matmul_descriptor descriptor = {
-        .slot = SIZE_MAX,
-        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR_ACTIVATION_MUL,
-        .fallback_pipeline = runtime != NULL ? runtime->q8_0_pair_activation_reduce_pipeline : nil,
-        .input_buffer = input_buffer,
-        .input_offset = input_offset,
-        .weight_buffer = gate_weight_buffer,
-        .second_weight_buffer = up_weight_buffer,
-        .output_buffer = output_buffer,
-        .output_offset = output_offset,
-        .rows = rows,
-        .in_dim = in_dim,
-        .out_dim = out_dim,
-        .values_per_block = 32u,
-        .bytes_per_block = 34u,
-        .activation_kind = activation_kind,
-        .use_planned_dispatch = true,
-        .planned_dispatch = planned_dispatch,
-        .failure_code = failure_code,
-    };
-    return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
-}
-
-static int termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x(
-    termite_metal_decode_runtime *runtime,
-    id<MTLCommandBuffer> command_buffer,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    size_t norm_slot,
-    id<MTLBuffer> inv_scale_buffer,
-    size_t inv_scale_offset,
-    id<MTLBuffer> gate_weight_buffer,
-    id<MTLBuffer> up_weight_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t in_dim,
-    size_t out_dim,
-    uint32_t activation_kind,
-    int failure_code
-) {
-    if (runtime == NULL || command_buffer == nil || input_buffer == nil || inv_scale_buffer == nil || gate_weight_buffer == nil || up_weight_buffer == nil || output_buffer == nil) return failure_code;
-    id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_QUANT_PAIR_ACT);
-    if (encoder == nil) return failure_code;
-    const int rc = termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder(runtime, encoder, input_buffer, input_offset, norm_slot, inv_scale_buffer, inv_scale_offset, gate_weight_buffer, up_weight_buffer, output_buffer, output_offset, in_dim, out_dim, activation_kind, failure_code);
-    [encoder endEncoding];
-    return rc;
-}
-
-static int termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder(
-    termite_metal_decode_runtime *runtime,
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    size_t norm_slot,
-    id<MTLBuffer> inv_scale_buffer,
-    size_t inv_scale_offset,
-    id<MTLBuffer> gate_weight_buffer,
-    id<MTLBuffer> up_weight_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t in_dim,
-    size_t out_dim,
-    uint32_t activation_kind,
-    int failure_code
-) {
-    return termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder_planned(
-        runtime,
-        encoder,
-        input_buffer,
-        input_offset,
-        norm_slot,
-        inv_scale_buffer,
-        inv_scale_offset,
-        gate_weight_buffer,
-        up_weight_buffer,
-        output_buffer,
-        output_offset,
-        in_dim,
-        out_dim,
-        activation_kind,
-        TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN,
-        failure_code
-    );
-}
-
-static int termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder_planned(
-    termite_metal_decode_runtime *runtime,
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    size_t norm_slot,
-    id<MTLBuffer> inv_scale_buffer,
-    size_t inv_scale_offset,
-    id<MTLBuffer> gate_weight_buffer,
-    id<MTLBuffer> up_weight_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t in_dim,
-    size_t out_dim,
-    uint32_t activation_kind,
-    uint8_t planned_dispatch,
-    int failure_code
-) {
-    termite_metal_quant_matmul_descriptor descriptor = {
-        .slot = SIZE_MAX,
-        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR_ACTIVATION_RMS_SCALE_1X,
-        .fallback_pipeline = runtime != NULL ? runtime->q8_0_pair_activation_rms_scale_mmv_pipeline : nil,
-        .input_buffer = input_buffer,
-        .input_offset = input_offset,
-        .weight_buffer = gate_weight_buffer,
-        .second_weight_buffer = up_weight_buffer,
-        .output_buffer = output_buffer,
-        .output_offset = output_offset,
-        .inv_scale_buffer = inv_scale_buffer,
-        .inv_scale_offset = inv_scale_offset,
-        .norm_slot = norm_slot,
-        .rows = 1,
-        .in_dim = in_dim,
-        .out_dim = out_dim,
-        .values_per_block = 32u,
-        .bytes_per_block = 34u,
-        .activation_kind = activation_kind,
-        .use_planned_dispatch = true,
-        .planned_dispatch = planned_dispatch,
-        .failure_code = failure_code,
-    };
-    return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
-}
-
-static int termite_metal_encode_q8_0_activation_multiply(
-    termite_metal_decode_runtime *runtime,
-    id<MTLCommandBuffer> command_buffer,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    id<MTLBuffer> weight_buffer,
-    id<MTLBuffer> rhs_buffer,
-    size_t rhs_offset,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t rows,
-    size_t in_dim,
-    size_t out_dim,
-    uint32_t activation_kind,
-    int failure_code
-) {
-    if (runtime == NULL || command_buffer == nil || input_buffer == nil || weight_buffer == nil || rhs_buffer == nil || output_buffer == nil) return failure_code;
-    BOOL encoder_owned = YES;
-    id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_QUANT_PAIR_ACT, &encoder_owned);
-    if (encoder == nil) return failure_code;
-    const int rc = termite_metal_encode_q8_0_activation_multiply_on_encoder(runtime, encoder, input_buffer, input_offset, weight_buffer, rhs_buffer, rhs_offset, output_buffer, output_offset, rows, in_dim, out_dim, activation_kind, failure_code);
-    termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
-    return rc;
-}
-
-static int termite_metal_encode_q8_0_activation_multiply_on_encoder(
-    termite_metal_decode_runtime *runtime,
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    id<MTLBuffer> weight_buffer,
-    id<MTLBuffer> rhs_buffer,
-    size_t rhs_offset,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t rows,
-    size_t in_dim,
-    size_t out_dim,
-    uint32_t activation_kind,
-    int failure_code
-) {
-    return termite_metal_encode_q8_0_activation_multiply_on_encoder_planned(
-        runtime,
-        encoder,
-        input_buffer,
-        input_offset,
-        weight_buffer,
-        rhs_buffer,
-        rhs_offset,
-        output_buffer,
-        output_offset,
-        rows,
-        in_dim,
-        out_dim,
-        activation_kind,
-        TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN,
-        failure_code
-    );
-}
-
-static int termite_metal_encode_q8_0_activation_multiply_on_encoder_planned(
-    termite_metal_decode_runtime *runtime,
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> input_buffer,
-    size_t input_offset,
-    id<MTLBuffer> weight_buffer,
-    id<MTLBuffer> rhs_buffer,
-    size_t rhs_offset,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t rows,
-    size_t in_dim,
-    size_t out_dim,
-    uint32_t activation_kind,
-    uint8_t planned_dispatch,
-    int failure_code
-) {
-    termite_metal_quant_matmul_descriptor descriptor = {
-        .slot = SIZE_MAX,
-        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_ACTIVATION_RHS_MUL,
-        .fallback_pipeline = runtime != NULL ? runtime->q8_0_activation_multiply_reduce_pipeline : nil,
-        .input_buffer = input_buffer,
-        .input_offset = input_offset,
-        .weight_buffer = weight_buffer,
-        .rhs_buffer = rhs_buffer,
-        .rhs_offset = rhs_offset,
-        .output_buffer = output_buffer,
-        .output_offset = output_offset,
-        .rows = rows,
-        .in_dim = in_dim,
-        .out_dim = out_dim,
-        .values_per_block = 32u,
-        .bytes_per_block = 34u,
-        .activation_kind = activation_kind,
-        .use_planned_dispatch = true,
-        .planned_dispatch = planned_dispatch,
-        .failure_code = failure_code,
-    };
-    return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
 }
 
 
@@ -30561,21 +29736,6 @@ static int termite_metal_encode_rms_norm_generated(
     return 0;
 }
 
-static int termite_metal_encode_add(
-    termite_metal_decode_runtime *runtime,
-    id<MTLCommandBuffer> command_buffer,
-    id<MTLBuffer> lhs_buffer,
-    size_t lhs_offset,
-    id<MTLBuffer> rhs_buffer,
-    size_t rhs_offset,
-    id<MTLBuffer> output_buffer,
-    size_t output_offset,
-    size_t elems,
-    int failure_code
-) {
-    return termite_metal_encode_add_for(runtime, command_buffer, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, elems, TERMITE_METAL_COMPUTE_SOURCE_OTHER, failure_code);
-}
-
 static int termite_metal_encode_add_for(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -32325,81 +31485,9 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
                 runtime->reuse_pool_peak_len);
         }
     }
-    runtime->embed_absolute_position_pipeline = nil;
-    runtime->embedding_lookup_pipeline = nil;
-    runtime->embedding_lookup_bf16_pipeline = nil;
-    runtime->embedding_lookup_f16_pipeline = nil;
-    runtime->q4_0_get_rows_pipeline = nil;
-    runtime->q4_0_set_rows_pipeline = nil;
-    runtime->q4_0_cpy_q_to_f32_pipeline = nil;
-    runtime->q4_0_cpy_f32_to_q_pipeline = nil;
-    runtime->q4_1_get_rows_pipeline = nil;
-    runtime->q4_1_set_rows_pipeline = nil;
-    runtime->q4_1_cpy_q_to_f32_pipeline = nil;
-    runtime->q4_1_cpy_f32_to_q_pipeline = nil;
-    runtime->q5_0_get_rows_pipeline = nil;
-    runtime->q5_0_set_rows_pipeline = nil;
-    runtime->q5_0_cpy_q_to_f32_pipeline = nil;
-    runtime->q5_0_cpy_f32_to_q_pipeline = nil;
-    runtime->q5_1_get_rows_pipeline = nil;
-    runtime->q5_1_set_rows_pipeline = nil;
-    runtime->q5_1_cpy_q_to_f32_pipeline = nil;
-    runtime->q5_1_cpy_f32_to_q_pipeline = nil;
-    runtime->q4_k_get_rows_pipeline = nil;
-    runtime->q4_k_set_rows_pipeline = nil;
-    runtime->q4_k_cpy_q_to_f32_pipeline = nil;
-    runtime->q4_k_cpy_f32_to_q_pipeline = nil;
-    runtime->q5_k_get_rows_pipeline = nil;
-    runtime->q5_k_set_rows_pipeline = nil;
-    runtime->q5_k_cpy_q_to_f32_pipeline = nil;
-    runtime->q5_k_cpy_f32_to_q_pipeline = nil;
-    runtime->q6_k_get_rows_pipeline = nil;
-    runtime->q6_k_set_rows_pipeline = nil;
-    runtime->q6_k_cpy_q_to_f32_pipeline = nil;
-    runtime->q6_k_cpy_f32_to_q_pipeline = nil;
-    runtime->q8_0_get_rows_pipeline = nil;
-    runtime->q8_0_set_rows_pipeline = nil;
-    runtime->q8_0_cpy_q_to_f32_pipeline = nil;
-    runtime->q8_0_cpy_f32_to_q_pipeline = nil;
-    runtime->q8_1_get_rows_pipeline = nil;
-    runtime->q8_1_set_rows_pipeline = nil;
-    runtime->q8_1_cpy_q_to_f32_pipeline = nil;
-    runtime->q8_1_cpy_f32_to_q_pipeline = nil;
-    runtime->rope_pipeline = nil;
-    runtime->mrope_pipeline = nil;
-    runtime->qwen35_conv_pipeline = nil;
-    runtime->qwen35_prefill_conv_vec4_pipeline = nil;
-    runtime->qwen35_history_pipeline = nil;
-    runtime->qwen35_prepare_pipeline = nil;
-    runtime->qwen35_recurrent_pipeline = nil;
-    runtime->qwen35_recurrent_columns4_pipeline = nil;
-    runtime->qwen35_recurrent_decode_pipeline = nil;
-    runtime->qwen35_fused_decode_pipeline = nil;
-    runtime->lightonocr3_copy_pipeline = nil;
-    runtime->lightonocr3_recurrent_parallel_pipeline = nil;
-    runtime->lightonocr3_prefill_prepare_pipeline = nil;
-    runtime->lightonocr3_prefill_norm_pipeline = nil;
-    runtime->lightonocr3_prefill_attention_mpp_pipeline = nil;
-    runtime->lightonocr3_prefill_attention_mpp32_pipeline = nil;
-    runtime->lightonocr3_prefill_attention_direct_pipeline = nil;
-    runtime->qwen35_prepare_parallel_pipeline = nil;
-    runtime->qwen35_norm_parallel_pipeline = nil;
-    runtime->lightonocr3_gemv_pipeline = nil;
-    runtime->lightonocr3_gemv_rows2_pipeline = nil;
-    runtime->lightonocr3_gate_up_gemv_pipeline = nil;
-    runtime->lightonocr3_pack_bf16_pipeline = nil;
-    runtime->lightonocr3_batch2_pipeline = nil;
-    runtime->lightonocr3_batch4_pipeline = nil;
-    runtime->lightonocr3_batch8_pipeline = nil;
-    runtime->lightonocr3_batch16_pipeline = nil;
+    TERMITE_METAL_RUNTIME_PIPELINES(TERMITE_METAL_RELEASE_PIPELINE)
     for (size_t rows = 0; rows < 17; rows++) runtime->lightonocr3_tiled_pipelines[rows] = nil;
 
-    runtime->lightonocr3_mpp_f32_pipeline = nil;
-    runtime->f16_encoder_mpp_pipeline = nil;
-    runtime->lightonocr3_mpp_small_tile_pipeline = nil;
-    runtime->lightonocr3_mpp_four_row_pipeline = nil;
-    runtime->lightonocr3_gate_up_split16_pipeline = nil;
-    runtime->lightonocr3_gate_up_split_reduce_pipeline = nil;
     for(size_t i=0;i<2;i++) {runtime->lightonocr3_local_gate_vectors[i]=nil;runtime->lightonocr3_local_down_vectors[i]=nil;}
     for(size_t i=0;i<3;i++)runtime->lightonocr3_local_projection_vectors[i]=nil;
     runtime->lightonocr3_local_down_vector4=nil;
@@ -32411,58 +31499,15 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->lightonocr3_prefill_gate8_16=nil;runtime->lightonocr3_prefill_gate16_32=nil;
     runtime->lightonocr3_local_gate_tg16=nil;runtime->lightonocr3_local_gate_tg32=nil;
     runtime->lightonocr3_local_down_tg8=nil;runtime->lightonocr3_local_down_tg16=nil;
-    runtime->lightonocr3_gate_up_small16_pipeline = nil;
-    runtime->lightonocr3_gate_up_wide16_pipeline = nil;
-    runtime->lightonocr3_gate_up_wide32_pipeline = nil;
-    runtime->lightonocr3_gate_up_wide64_pipeline = nil;
     for (size_t i = 0; i < 3; i++) runtime->lightonocr3_wide_mpp_pipelines[i] = nil;
-    runtime->lightonocr3_gate_up_small32_pipeline = nil;
-    runtime->lightonocr3_four_row_segment_pipeline = nil;
-    runtime->lightonocr3_down_split32_pipeline = nil;
-    runtime->lightonocr3_down_split64_pipeline = nil;
-    runtime->lightonocr3_down_split_reduce_pipeline = nil;
-    runtime->lightonocr3_mpp_f32_n32_pipeline = nil;
-    runtime->lightonocr3_mpp_bf16_pipeline = nil;
     runtime->lighton_prefill_ffn_pipelines[0] = nil;
     runtime->lighton_prefill_ffn_pipelines[1] = nil;
-    runtime->lightonocr3_mpp_bf16_n32_pipeline = nil;
-    runtime->qwen35_norm_pipeline = nil;
 
-    runtime->packed_gelu_pipeline = nil;
-    runtime->embedding_head_prepare_pipeline = nil;
-    runtime->video_position_pipeline = nil;
-    runtime->rotary_table_pipeline = nil;
-    runtime->vision_norm_rope_pipeline = nil;
-    runtime->rope_pair_pipeline = nil;
-    runtime->head_rms_rope_pipeline = nil;
-    runtime->head_rms_rope_hd128_sg_pipeline = nil;
-    runtime->attention_f32_pipeline = nil;
-    runtime->attention_f32_decode_1x_hd64_pipeline = nil;
-    runtime->attention_f32_decode_1x_hd64_split_stage_pipeline = nil;
-    runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline = nil;
     runtime->attention_split_partials_buffer = nil;
     runtime->attention_split_partials_capacity = 0;
-    runtime->attention_f32_prefill_pipeline = nil;
-    runtime->attention_f32_dense_sg_pipeline = nil;
-    runtime->attention_f32_dense_sg_q16_pipeline = nil;
-    runtime->attention_f32_dense_sg_q16_f16kv_pipeline = nil;
-    runtime->attention_f32_dense_sg_q16_f16kv_hd128_pipeline = nil;
-    runtime->attention_f32_dense_sg_q16_f16kv_gqa2_pipeline = nil;
     runtime->dense_sg_f16_k_buffer = nil;
     runtime->dense_sg_f16_v_buffer = nil;
     runtime->dense_sg_f16_kv_capacity = 0;
-    runtime->attention_paged_pipeline = nil;
-    runtime->attention_paged_prefill_sg_pipeline = nil;
-    runtime->attention_paged_1x_pipeline = nil;
-    runtime->attention_1x_generated_pipeline = nil;
-    runtime->attention_flash_generated_pipeline = nil;
-    runtime->attention_flash_hd512_generated_pipeline = nil;
-    runtime->attention_decode_gqa_split_stage_pipeline = nil;
-    runtime->attention_decode_gqa_split_reduce_pipeline = nil;
-    runtime->lightonocr3_gqa_batch_stage_pipeline = nil;
-    runtime->lightonocr3_gqa_batch_reduce_pipeline = nil;
-    runtime->lightonocr3_gqa_split_stage_pipeline = nil;
-    runtime->lightonocr3_gqa_split_reduce_pipeline = nil;
     runtime->attention_decode_gqa_split_scratch_buffer = nil;
     termite_metal_lighton_attention_batch_abort(runtime);
     runtime->lighton_attention_batch_scratch[0] = nil;
@@ -32471,444 +31516,12 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_decode_gqa_split_scratch_capacity = 0;
     runtime->active_frame_decode_gqa_split_scratch_valid = 0u;
     runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u;
-    runtime->paged_f32_kv_seed_pipeline = nil;
-    runtime->paged_f16_kv_seed_pipeline = nil;
-    runtime->paged_f32_v_seed_pipeline = nil;
-    runtime->copy_bytes_pipeline = nil;
-    runtime->slice_last_dim_f32_2d_pipeline = nil;
-    runtime->gather_axis0_f32_2d_pipeline = nil;
-    runtime->gather_axis0_add_bias_f32_2d_pipeline = nil;
-    runtime->concat_lastdim_f32_2d_pipeline = nil;
-    runtime->deberta_embeddings_f32_pipeline = nil;
-    runtime->gliner_word_embeddings_f32_pipeline = nil;
-    runtime->gliner_boundary_f32_pipeline = nil;
-    runtime->gliner_boundary_ffn_bias_gelu_exact_pipeline = nil;
-    runtime->gliner_boundary_ffn_bias_add_layer_norm_pipeline = nil;
-    runtime->gliner_gru_combine_f32_pipeline = nil;
-    runtime->argmax_axis_f32_pipeline = nil;
-    runtime->convert_dtype_f32_pipeline = nil;
-    runtime->cumulative_sum_f32_pipeline = nil;
-    runtime->integer_binary_pipeline = nil;
-    runtime->select_typed_pipeline = nil;
-    runtime->slice_typed_pipeline = nil;
-    runtime->gather_typed_pipeline = nil;
-    runtime->cast_typed_pipeline = nil;
-    runtime->cumulative_sum_i32_pipeline = nil;
-    runtime->cumulative_sum_u8_pipeline = nil;
-    runtime->cumulative_sum_i16_pipeline = nil;
-    runtime->cumulative_sum_i8_pipeline = nil;
-    runtime->cumulative_sum_i64_pipeline = nil;
-    runtime->sdpa_f32_pipeline = nil;
-    runtime->sdpa_f32_bert_prefill_s256_hd64_q8_pipeline = nil;
-    runtime->sdpa_f32_vision_hd64_q8_pipeline = nil;
-    runtime->sdpa_f32_vision_hd64_q32_pipeline = nil;
-    runtime->sdpa_f32_vision_hd64_flash_q16_pipeline = nil;
-    runtime->sdpa_f32_vision_hd64_flash_q32_pipeline = nil;
-    runtime->sdpa_f32_vision_hd64_flash_q32_full_pipeline = nil;
-    runtime->sdpa_f32_nomic_q8_pipeline = nil;
-    runtime->sdpa_f32_tg_pipeline = nil;
-    runtime->sdpa_f32_grouped_short256_pipeline = nil;
-    runtime->sdpa_f32_grouped_short512_pipeline = nil;
-    runtime->sdpa_f32_grouped_matrix64_pipeline = nil;
-    runtime->sdpa_f32_grouped_matrix32_pipeline = nil;
-    runtime->sdpa_f32_segments_pipeline = nil;
-    runtime->sdpa_f32_segments_tiled_pipeline = nil;
-    runtime->sdpa_f32_segments_wide_pipeline = nil;
-    runtime->sdpa_f32_segments_blocks_pipeline = nil;
-    runtime->masked_mean_rows_pipeline = nil;
-    runtime->masked_mean_batch_pipeline = nil;
-    runtime->compose_rows_pipeline = nil;
-    runtime->normalize_embedding_pipeline = nil;
-    runtime->sdpa_f32_grouped_unpack_pipeline = nil;
-    runtime->sdpa_f32_grouped_softmax_pipeline = nil;
-    runtime->sdpa_f32_grouped_pack_pipeline = nil;
-    runtime->sdpa_f32_grouped_blocks256_pipeline = nil;
-    runtime->sdpa_f32_grouped_blocks256x16_pipeline = nil;
-    runtime->sdpa_f32_grouped_blocks_pipeline = nil;
-    runtime->modernbert_training_attention_forward_pipeline = nil;
-    runtime->modernbert_training_attention_dq_pipeline = nil;
-    runtime->modernbert_training_attention_dkdv_pipeline = nil;
-    runtime->modernbert_training_attention_flash_forward_pipeline = nil;
-    runtime->modernbert_training_attention_flash_dq_pipeline = nil;
-    runtime->modernbert_training_attention_flash_dkdv_pipeline = nil;
-    runtime->sdpa_f32_florence_window_hd32_pipeline = nil;
-    runtime->sdpa_f32_florence_window_parallel_pipeline = nil;
-    runtime->florence_window_pack_f32_pipeline = nil;
-    runtime->florence_window_unpack_f32_pipeline = nil;
-    runtime->florence_channel_scores_f32_pipeline = nil;
-    runtime->florence_channel_scores_parallel_pipeline = nil;
-    runtime->florence_channel_softmax_f32_pipeline = nil;
-    runtime->florence_channel_apply_f32_pipeline = nil;
-    runtime->disentangled_relative_attention_f32_pipeline = nil;
     for (size_t i = 0; i < 8; ++i) runtime->deberta_training_attention_v1_pipelines[i] = nil;
-    runtime->disentangled_relative_attention_f32_tg_pipeline = nil;
-    runtime->disentangled_relative_attention_f32_flash4_pipeline = nil;
-    runtime->deberta_attention_pack_f32_pipeline = nil;
-    runtime->deberta_relative_score_accumulate_f32_pipeline = nil;
-    runtime->disentangled_relative_attention_bwd_scores_f32_pipeline = nil;
-    runtime->disentangled_relative_attention_bwd_dv_f32_pipeline = nil;
-    runtime->disentangled_relative_attention_bwd_dq_dk_f32_pipeline = nil;
-    runtime->disentangled_relative_attention_bwd_dqr_dkr_f32_pipeline = nil;
-    runtime->deberta_relative_score_gemm_f32_pipeline = nil;
-    runtime->deberta_relative_score_softmax_pv_f32_pipeline = nil;
-    runtime->transpose_f32_pipeline = nil;
-    runtime->transpose_last2_tiled_f32_pipeline = nil;
-    runtime->dot_general_2d_f32_pipeline = nil;
-    runtime->dot_general_2d_f32_reduce_pipeline = nil;
-    runtime->dot_general_2d_f32_small_m_tile_pipeline = nil;
-    runtime->dot_general_2d_f32_small_m_rows4_cols4_pipeline = nil;
-    runtime->dot_general_2d_f32_small_m_rows4_cols8_pipeline = nil;
-    runtime->dot_general_2d_f32_small_m_rows4_cols16_pipeline = nil;
-    runtime->dot_general_rank1_outer_f32_pipeline = nil;
-    runtime->dot_general_rank1_reduce_f32_pipeline = nil;
-    runtime->dot_general_batched_f32_pipeline = nil;
-    runtime->lora_after_a_f32_pipeline = nil;
-    runtime->lora_finish_f32_pipeline = nil;
-    runtime->lora_rank1_linear_f32_pipeline = nil;
-    runtime->lora_grad_b_f32_pipeline = nil;
-    runtime->lora_grad_b_transposed_f32_pipeline = nil;
-    runtime->lora_grad_after_a_f32_pipeline = nil;
-    runtime->lora_grad_a_f32_pipeline = nil;
-    runtime->lora_rank1_grad_b_after_a_f32_pipeline = nil;
-    runtime->scatter_add_axis0_f32_pipeline = nil;
-    runtime->conv1d_f32_pipeline = nil;
-    runtime->conv1d_im2col_f32_pipeline = nil;
-    runtime->layer_norm_add_sum_rows_pipeline = nil;
-    runtime->conv2d_f32_pipeline = nil;
-    runtime->layer_norm_pipeline = nil;
-    runtime->layer_norm_rows_pipeline = nil;
-    runtime->layer_norm_add_pipeline = nil;
-    runtime->layer_norm_add_rows_pipeline = nil;
-    runtime->bias_activation_pipeline = nil;
-    runtime->bias_add_layer_norm_pipeline = nil;
-    runtime->bias_add_layer_norm_rows_pipeline = nil;
-    runtime->dense_qkv_split_pipeline = nil;
-    runtime->dense_pair_split_pipeline = nil;
-    runtime->dense_qkv_split_bias_pipeline = nil;
-    runtime->dense_pair_split_bias_pipeline = nil;
-    runtime->dense_qkv_direct_pipeline = nil;
-    runtime->dense_pair_direct_pipeline = nil;
-    runtime->rms_norm_pipeline = nil;
-    runtime->rms_norm_reduce_pipeline = nil;
-    runtime->rms_inv_scale_pipeline = nil;
-    runtime->rms_norm_rows_pipeline = nil;
-    runtime->rms_norm_rows_reduce_pipeline = nil;
-    runtime->lightonocr3_norm_cached1024_pipeline = nil;
-    runtime->lightonocr3_norm_cached2560_pipeline = nil;
-    runtime->rms_norm_rows_simd4_reduce_pipeline = nil;
-    runtime->rms_norm_rows_triple_simd4_reduce_pipeline = nil;
-    runtime->parallel_ffn_post_residual_simd4_pipeline = nil;
-    runtime->rms_norm_generated_pipeline = nil;
-    runtime->rms_norm_add_pipeline = nil;
-    runtime->rms_norm_add_sumsq_pipeline = nil;
-    runtime->rms_norm_add_rows_sumsq_pipeline = nil;
-    runtime->rms_norm_add_rows_canonical_pipeline = nil;
-    runtime->rms_norm_add_scale_sumsq_pipeline = nil;
-    runtime->rms_norm_add_f16_input_pipeline = nil;
-    runtime->rms_norm_add_scale_pipeline = nil;
-    runtime->rms_norm_add_scale_rows_pipeline = nil;
-    runtime->rms_norm_add_scale_simd4_pipeline = nil;
-    runtime->linear_pipeline = nil;
-    runtime->linear_reduce_pipeline = nil;
-    runtime->linear_bf16_pipeline = nil;
-    runtime->linear_bf16_reduce_pipeline = nil;
-    runtime->linear_f16_pipeline = nil;
-    runtime->linear_f16_reduce_pipeline = nil;
-    runtime->linear_f16_multi_row_pipeline = nil;
-    runtime->linear_f16_multi_row_reduce_pipeline = nil;
-    runtime->linear_bf16_multi_row_pipeline = nil;
-    runtime->linear_bf16_multi_row_reduce_pipeline = nil;
-    runtime->linear_bf16_multi_row_shared_reduce_pipeline = nil;
-    runtime->linear_bf16_multi_row_tiled32_m16_pipeline = nil;
-    runtime->linear_bf16_mm_pipeline = nil;
-    runtime->linear_bf16_mm_vec4_pipeline = nil;
-    runtime->bf16_gate_up_mm_pipeline = nil;
-    runtime->bf16_gate_up_mm_vec4_pipeline = nil;
-    runtime->linear_pair_reduce_pipeline = nil;
-    runtime->linear_multi_row_pipeline = nil;
-    runtime->linear_multi_row_reduce_pipeline = nil;
-    runtime->linear_multi_row_tiled_f32_pipeline = nil;
-    runtime->linear_multi_row_tiled_activation_f32_pipeline = nil;
-    runtime->linear_multi_row_tiled32_f32_pipeline = nil;
-    runtime->linear_multi_row_tiled32_activation_f32_pipeline = nil;
-    runtime->linear_multi_row_tiled32_m16_f32_pipeline = nil;
-    runtime->linear_multi_row_tiled32_m16_activation_f32_pipeline = nil;
-    runtime->argmax_logits_pipeline = nil;
-    runtime->argmax_logits_partials_pipeline = nil;
-    runtime->argmax_logits_suppress_partials_pipeline = nil;
-    runtime->argmax_logits_reduce_pipeline = nil;
-    runtime->lighton_batch_argmax_partials_pipeline = nil;
-    runtime->lighton_batch_argmax_reduce_pipeline = nil;
-    runtime->layer_norm_add_sum_pipeline = nil;
-    runtime->whisper_logits_partials_pipeline = nil;
-    runtime->whisper_logits_reduce_pipeline = nil;
-    runtime->lm_head_top8_suppress_partials_pipeline = nil;
-    runtime->lm_head_top8_reduce_pipeline = nil;
-    runtime->lm_head_q6_k_rescore_top8_pipeline = nil;
-    runtime->argmax_logits_reduce_tg_pipeline = nil;
-    runtime->sample_logits_pipeline = nil;
-    runtime->sample_gumbel_partials_pipeline = nil;
-    runtime->sample_topk_partials_pipeline = nil;
-    runtime->sample_topk_reduce_pipeline = nil;
-    runtime->sample_nucleus_max_partials_pipeline = nil;
-    runtime->sample_nucleus_max_reduce_pipeline = nil;
-    runtime->sample_nucleus_probs_partials_pipeline = nil;
-    runtime->sample_nucleus_sum_reduce_pipeline = nil;
-    runtime->sample_nucleus_radix_histogram_pipeline = nil;
-    runtime->sample_nucleus_radix_histogram_serial_pipeline = nil;
-    runtime->sample_nucleus_radix_select_pipeline = nil;
-    runtime->sample_nucleus_gumbel_partials_pipeline = nil;
-    runtime->activation_pipeline = nil;
-    runtime->gelu_backward_pipeline = nil;
-    runtime->ffn_gelu_backward_rank1_output_pipeline = nil;
-    runtime->ffn_gelu_backward_rank1_first_output_pipeline = nil;
-    runtime->activation_multiply_pipeline = nil;
-    runtime->activation_multiply_f16_output_pipeline = nil;
-    runtime->softmax_pipeline = nil;
-    runtime->moe_route_select_pipeline = nil;
-    runtime->moe_route_select_tg_pipeline = nil;
-    runtime->moe_route_select_tg_register_pipeline = nil;
-    runtime->moe_route_select_tg_register_v2_pipeline = nil;
-    runtime->moe_route_select_tg_map_pipeline = nil;
-    runtime->moe_route_map_slots_pipeline = nil;
-    runtime->moe_slot_q4_0_gate_up_pipeline = nil;
-    runtime->moe_slot_q4_0_down_pipeline = nil;
-    runtime->moe_slot_reduce_pipeline = nil;
-    runtime->mapped_page_touch_pipeline = nil;
-    runtime->mapped_selected_expert_page_touch_pipeline = nil;
-    runtime->masked_bce_loss_pipeline = nil;
-    runtime->masked_bce_backward_pipeline = nil;
-    runtime->reduce_last_dim_pipeline = nil;
-    runtime->nomic_pool_normalize_pipeline = nil;
-    runtime->reduce_axis_f32_pipeline = nil;
-    runtime->multiply_reduce_last_dim_pipeline = nil;
-    runtime->broadcast_last_dim_pipeline = nil;
-    runtime->broadcast_f32_pipeline = nil;
-    runtime->multiply_pipeline = nil;
-    runtime->scale_pipeline = nil;
-    runtime->norm_residual_pipeline = nil;
-    runtime->gemma4_audio_clamp_silu_pipeline = nil;
-    runtime->spatial_pool_prepare_pipeline = nil;
-    runtime->audio_frontend_pipeline = nil;
-    runtime->audio_clipped_linear_pipeline = nil;
-    runtime->audio_attention_parallel_pipeline = nil;
-    runtime->audio_norm_clamp_pipeline = nil;
-    runtime->audio_logmel_pipeline = nil;
-    runtime->audio_conv_matrix_pipeline = nil;
-    runtime->audio_conv_tiled_pipeline = nil;
-    runtime->audio_fft512_pipeline = nil;
-    runtime->gemma4_audio_clamp_pipeline = nil;
-    runtime->gemma4_audio_glu_pipeline = nil;
-    runtime->gemma4_audio_dwconv_pipeline = nil;
-    runtime->gemma4_audio_flatten_pipeline = nil;
-    runtime->gemma4_audio_channel_norm_pipeline = nil;
-    runtime->gemma4_audio_attention_pipeline = nil;
-    runtime->gemma4_audio_attention_tg_pipeline = nil;
-    runtime->add_pipeline = nil;
-    runtime->add_scale_pipeline = nil;
-    runtime->scaled_add_scale_pipeline = nil;
-    runtime->multiply_add_pipeline = nil;
-    runtime->multiply_add2_pipeline = nil;
-    runtime->training_accumulate_pipeline = nil;
-    runtime->training_adamw_pipeline = nil;
-    runtime->training_accumulate_into_pipeline = nil;
-    runtime->training_adamw_into_pipeline = nil;
-    runtime->training_sumsq_pipeline = nil;
-    runtime->layer_norm_bwd_dx_pipeline = nil;
-    runtime->layer_norm_bwd_dgdb_pipeline = nil;
-    runtime->layer_norm_bwd_dgdb_partial_pipeline = nil;
-    runtime->layer_norm_bwd_dgdb_reduce_pipeline = nil;
-    runtime->subtract_pipeline = nil;
-    runtime->divide_pipeline = nil;
-    runtime->less_than_pipeline = nil;
-    runtime->where_select_pipeline = nil;
     runtime->optional_dummy_buffer = nil;
-    runtime->i2_s_quantize_pipeline = nil;
-    runtime->q1_0_pipeline = nil;
-    runtime->i8_s_pipeline = nil;
-    runtime->q2_k_pipeline = nil;
-    runtime->antfly_q2_k_small_batch_pipeline = nil;
-    runtime->antfly_q2_k_small_batch_bias_pipeline = nil;
-    runtime->antfly_q2_k_small_batch_bias_gelu_pipeline = nil;
-    runtime->q3_k_pipeline = nil;
-    runtime->antfly_q3_k_small_batch_pipeline = nil;
-    runtime->antfly_q3_k_small_batch_bias_pipeline = nil;
-    runtime->antfly_q3_k_small_batch_bias_gelu_pipeline = nil;
-    runtime->q4_k_pipeline = nil;
-    runtime->antfly_q4_k_small_batch_pipeline = nil;
-    runtime->florence_q4_k_mm_matrix_pipeline = nil;
-    runtime->florence_q4_k_mm_matrix_f16_input_pipeline = nil;
-    runtime->florence_q4_k_mm_nr4_pipeline = nil;
-    runtime->antfly_q4_k_small_batch_bias_pipeline = nil;
-    runtime->antfly_q4_k_small_batch_bias_gelu_pipeline = nil;
-    runtime->q4_k_reduce_pipeline = nil;
-    runtime->q4_k_reduce_v2_pipeline = nil;
-    runtime->q4_k_pair_pipeline = nil;
-    runtime->q4_k_pair_reduce_pipeline = nil;
-    runtime->q4_k_pair_activation_reduce_pipeline = nil;
-    runtime->q4_k_pair_activation_reduce_f16_output_pipeline = nil;
-    runtime->q4_k_activation_rhs_reduce_pipeline = nil;
-    runtime->q4_0_activation_rhs_reduce_pipeline = nil;
-    runtime->q4_0_activation_rhs_reduce_f16_output_pipeline = nil;
-    runtime->q4_0_pipeline = nil;
-    runtime->q4_0_id_pipeline = nil;
-    runtime->q4_0_id_a4b_gate_up_pipeline = nil;
-    runtime->q4_0_id_a4b_down_pipeline = nil;
-    runtime->q4_0_pair_id_pipeline = nil;
-    runtime->q4_0_pair_activation_id_pipeline = nil;
-    runtime->moe_merged_gate_up_activation_pipeline = nil;
-    runtime->moe_scatter_add_pipeline = nil;
-    runtime->antfly_q4_0_small_batch_pipeline = nil;
-    runtime->q4_0_pair_pipeline = nil;
-    runtime->q4_0_pair_reduce_pipeline = nil;
-    runtime->q4_0_pair_activation_reduce_pipeline = nil;
     for (size_t v = 0; v < 4; ++v) for (size_t r = 0; r < 2; ++r) {
         runtime->q4_0_shared_linear_pipelines[v][r] = nil;
         runtime->q4_0_shared_pair_pipelines[v][r] = nil;
     }
-    runtime->q4_0_pair_activation_mmv_nr4_nsg2_pipeline = nil;
-    runtime->q4_0_pair_activation_mmv_nr8_nsg2_pipeline = nil;
-    runtime->q4_0_pair_activation_mmv_nr4_nsg4_pipeline = nil;
-    runtime->q4_0_pair_activation_mmv_nr8_nsg4_pipeline = nil;
-    runtime->q4_0_pair_activation_mmv_nr4_nsg2_nq8_pipeline = nil;
-    runtime->q4_0_pair_activation_mm_m32_n64_aligned_pipeline = nil;
-    runtime->q4_0_pair_activation_mm_m32_n64_tail_pipeline = nil;
-    runtime->q4_0_pair_activation_mm_m32_n32_aligned_pipeline = nil;
-    runtime->q4_0_pair_activation_mm_m32_n32_tail_pipeline = nil;
-    runtime->q4_0_pair_activation_small_batch_r2_pipeline = nil;
-    runtime->q4_0_pair_activation_small_batch_r3_pipeline = nil;
-    runtime->q4_0_pair_activation_small_batch_r4_pipeline = nil;
-    runtime->q4_0_pair_activation_small_batch_pipeline = nil;
-    runtime->q4_0_pair_activation_reduce_f16_output_pipeline = nil;
-    runtime->q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline = nil;
-    runtime->q4_0_reduce_pipeline = nil;
-    runtime->q4_0_reduce_nr4_nsg4_pipeline = nil;
-    runtime->q4_0_reduce_nr4_nsg4_nq8_pipeline = nil;
-    runtime->q4_0_reduce_nr8_nsg4_pipeline = nil;
-    runtime->q4_0_mm_sg_pipeline = nil;
-    runtime->q4_0_mm_sg_unrolled_pipeline = nil;
-    runtime->q4_0_mm_sg_aligned_pipeline = nil;
-    runtime->q4_0_mm_sg_aligned_tail_pipeline = nil;
-    runtime->q4_0_small_batch_r2_pipeline = nil;
-    runtime->q4_0_small_batch_r4_pipeline = nil;
-    runtime->q4_0_small_batch_r8_pipeline = nil;
-    runtime->q4_0_small_batch_r2_specialized_pipeline = nil;
-    runtime->q4_0_small_batch_r3_specialized_pipeline = nil;
-    runtime->q4_0_small_batch_r2_wide_pipeline = nil;
-    runtime->q4_0_small_batch_r4_wide_pipeline = nil;
-    runtime->q4_0_small_batch_r8_wide_pipeline = nil;
-    runtime->q4_0_reduce_small_pipeline = nil;
-    runtime->q4_0_reduce_sumsq_pipeline = nil;
-    runtime->q4_0_reduce_f16_input_pipeline = nil;
-    runtime->q4_0_reduce_f16_input_small_pipeline = nil;
-    runtime->q4_0_reduce_f16_input_sumsq_pipeline = nil;
-    runtime->q4_0_reduce_f16_output_pipeline = nil;
-    runtime->q4_0_reduce_f16_input_f16_output_pipeline = nil;
-    runtime->q4_1_pipeline = nil;
-    runtime->antfly_q4_1_small_batch_pipeline = nil;
-    runtime->q4_1_reduce_pipeline = nil;
-    runtime->q5_0_pipeline = nil;
-    runtime->antfly_q5_0_small_batch_pipeline = nil;
-    runtime->q5_0_reduce_pipeline = nil;
-    runtime->q5_1_pipeline = nil;
-    runtime->antfly_q5_1_small_batch_pipeline = nil;
-    runtime->q5_1_reduce_pipeline = nil;
-    runtime->q8_0_pipeline = nil;
-    runtime->q8_0_pair_pipeline = nil;
-    runtime->q8_0_mmv_pipeline = nil;
-    runtime->q8_0_mmv_f16_input_pipeline = nil;
-    runtime->q8_0_rms_scale_mmv_pipeline = nil;
-    runtime->q8_0_small_batch_r2_pipeline = nil;
-    runtime->q8_0_small_batch_r3_pipeline = nil;
-    runtime->q8_0_small_batch_r4_pipeline = nil;
-    runtime->q8_0_small_batch_pipeline = nil;
-    runtime->antfly_q8_0_small_batch_pipeline = nil;
-    runtime->antfly_q8_0_small_batch_bias_pipeline = nil;
-    runtime->antfly_q8_0_small_batch_bias_gelu_pipeline = nil;
-    runtime->antfly_q8_0_small_batch_relu_pipeline = nil;
-    runtime->q8_0_mm_pipeline = nil;
-    runtime->q8_0_mm_f16_input_pipeline = nil;
-    runtime->q8_0_mm_sg_pipeline = nil;
-    runtime->q8_0_mm_sg_v2_pipeline = nil;
-    runtime->q8_0_mm_sg_v2_tail_pipeline = nil;
-    runtime->q8_0_mm_sg_v2_f16_input_pipeline = nil;
-    runtime->q8_0_mm_sg_v2_f16_input_tail_pipeline = nil;
-    runtime->q8_0_mm_sg_m64_pipeline = nil;
-    runtime->q8_0_mm_sg_m64_tail_pipeline = nil;
-    runtime->q8_0_mm_sg_m64_f16_input_pipeline = nil;
-    runtime->q8_0_mm_sg_m64_f16_input_tail_pipeline = nil;
-    runtime->q8_0_pair_mmv_pipeline = nil;
-    runtime->q8_0_pair_small_batch_r2_pipeline = nil;
-    runtime->q8_0_pair_small_batch_r3_pipeline = nil;
-    runtime->q8_0_pair_small_batch_r4_pipeline = nil;
-    runtime->q8_0_pair_small_batch_pipeline = nil;
-    runtime->q8_0_qkv_mmv_pipeline = nil;
-    runtime->q8_0_kv_pair_mm_sg_pipeline = nil;
-    runtime->q8_0_kv_pair_mm_sg_tail_pipeline = nil;
-    runtime->q8_0_pair_activation_reduce_pipeline = nil;
-    runtime->q8_0_pair_activation_mmv_pipeline = nil;
-    runtime->q8_0_pair_activation_rms_scale_mmv_pipeline = nil;
-    runtime->q8_0_pair_activation_rms_scale_mmv_f16_output_pipeline = nil;
-    runtime->q8_0_pair_activation_small_batch_r2_pipeline = nil;
-    runtime->q8_0_pair_activation_small_batch_r3_pipeline = nil;
-    runtime->q8_0_pair_activation_small_batch_r4_pipeline = nil;
-    runtime->q8_0_pair_activation_small_batch_pipeline = nil;
-    runtime->q8_0_pair_activation_mm_pipeline = nil;
-    runtime->q8_0_pair_activation_mm_f16_output_pipeline = nil;
-    runtime->q8_0_pair_activation_mm_sg_v2_pipeline = nil;
-    runtime->q8_0_pair_activation_mm_sg_v2_f16_output_pipeline = nil;
-    runtime->q8_0_activation_multiply_reduce_pipeline = nil;
-    runtime->q8_0_activation_multiply_mmv_pipeline = nil;
-    runtime->q8_1_pipeline = nil;
-    runtime->antfly_q8_1_small_batch_pipeline = nil;
-    runtime->q8_1_reduce_pipeline = nil;
-    runtime->q5_k_pipeline = nil;
-    runtime->antfly_q5_k_small_batch_pipeline = nil;
-    runtime->antfly_q5_k_small_batch_bias_pipeline = nil;
-    runtime->antfly_q5_k_small_batch_bias_gelu_pipeline = nil;
-    runtime->q5_k_reduce_pipeline = nil;
-    runtime->q6_k_pipeline = nil;
-    runtime->antfly_q6_k_small_batch_pipeline = nil;
-    runtime->q6_k_high_row_mm_matrix_pipeline = nil;
-    runtime->antfly_q6_k_small_batch_bias_pipeline = nil;
-    runtime->antfly_q6_k_small_batch_bias_gelu_pipeline = nil;
-    runtime->q6_k_reduce_pipeline = nil;
-    runtime->q6_k_reduce_nsg4_pipeline = nil;
-    runtime->q6_k_reduce_nsg8_pipeline = nil;
-    runtime->q6_k_reduce_nbodd_pipeline = nil;
-    runtime->q6_k_reduce_nbodd_nr1_pipeline = nil;
-    runtime->q6_k_reduce_nbodd_nr4_nsg1_pipeline = nil;
-    runtime->q6_k_reduce_nbodd_nr4_nsg2_pipeline = nil;
-    runtime->q6_k_reduce_nbodd_nr6_nsg1_pipeline = nil;
-    runtime->q6_k_reduce_nbodd_nr8_nsg1_pipeline = nil;
-    runtime->q6_k_r2_reduce_pipeline = nil;
-    runtime->q6_k_reduce_f16_input_pipeline = nil;
-    runtime->q6_k_pair_pipeline = nil;
-    runtime->q8_k_pipeline = nil;
-    runtime->antfly_q8_k_small_batch_pipeline = nil;
-    runtime->q8_k_reduce_pipeline = nil;
-    runtime->iq4_nl_pipeline = nil;
-    runtime->iq4_nl_reduce_pipeline = nil;
-    runtime->iq4_xs_pipeline = nil;
-    runtime->iq4_xs_reduce_pipeline = nil;
-    runtime->mxfp4_pipeline = nil;
-    runtime->mxfp4_reduce_pipeline = nil;
-    runtime->nvfp4_pipeline = nil;
-    runtime->nvfp4_reduce_pipeline = nil;
-    runtime->iq2_xs_pipeline = nil;
-    runtime->iq2_xs_reduce_pipeline = nil;
-    runtime->i2_s_pipeline = nil;
-    runtime->i2_s_pair_pipeline = nil;
-    runtime->i2_s_linear_i8_pipeline = nil;
-    runtime->i2_s_pair_i8_pipeline = nil;
-    runtime->tl1_pipeline = nil;
-    runtime->tl2_pipeline = nil;
-    runtime->encode_polar4_key_pipeline = nil;
-    runtime->encode_turbo3_key_pipeline = nil;
-    runtime->encode_f16_convert_pipeline = nil;
-    runtime->encode_int8_per_head_pipeline = nil;
-    runtime->polar4_attention_span_pipeline = nil;
-    runtime->turbo3_attention_span_pipeline = nil;
     runtime->token_embedding_table_buffer = nil;
     runtime->position_embedding_table_buffer = nil;
     runtime->generic_embedding_table_buffer = nil;
@@ -33149,15 +31762,6 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     memset(runtime->last_frame_blit_source_counts, 0, sizeof(runtime->last_frame_blit_source_counts));
     // The runtime is calloc/free storage: ARC does not destroy its strong
     // fields automatically. Retire these optional and shared-library PSOs too.
-    runtime->compressed_attention_store_local_pipeline = nil;
-    runtime->compressed_attention_store_component_pipeline = nil;
-    runtime->compressed_attention_update_component_pipeline = nil;
-    runtime->compressed_attention_select_compressed_pipeline = nil;
-    runtime->compressed_attention_hybrid_attention_pipeline = nil;
-    runtime->linear_bias_pipeline = nil;
-    runtime->ffn_gelu_backward_rank1_branches_pipeline = nil;
-    runtime->ffn_gelu_backward_rank1_first_branch_pipeline = nil;
-    runtime->audio_pad_pipeline = nil;
     runtime->precise_library = nil;
     runtime->library = nil;
     runtime->queue = nil;
@@ -49573,63 +48177,6 @@ int termite_metal_decode_runtime_apply_rms_norm_linear(
     }
 }
 
-static int termite_metal_decode_runtime_sample_from_logits(
-    termite_metal_decode_runtime *runtime,
-    const float *logits,
-    size_t out_dim,
-    float temperature,
-    size_t top_k,
-    float top_p,
-    float min_p,
-    float repetition_penalty,
-    float frequency_penalty,
-    float presence_penalty,
-    const uint32_t *penalty_token_ids,
-    const uint32_t *penalty_counts,
-    size_t penalty_count,
-    uint32_t seed,
-    uint32_t *output_token_id
-) {
-    if (runtime == NULL || logits == NULL || output_token_id == NULL) return -1;
-    if (runtime->sample_logits_pipeline == nil) return -2;
-    if (out_dim == 0 || out_dim > UINT32_MAX) return -3;
-    @autoreleasepool {
-        const size_t logits_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> logits_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)logits length:logits_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (logits_buffer == nil) logits_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:logits length:logits_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (logits_buffer == nil) return -4;
-        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
-        if (command_buffer == nil) return -6;
-        int rc = termite_metal_decode_runtime_encode_sample_from_logits_buffer(
-            runtime,
-            command_buffer,
-            logits_buffer,
-            out_dim,
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            repetition_penalty,
-            frequency_penalty,
-            presence_penalty,
-            penalty_token_ids,
-            penalty_counts,
-            penalty_count,
-            seed,
-            0.0f
-        );
-        if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
-        uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
-        if (result == NULL) return -9;
-        if (result[0] >= out_dim) return -21;
-        output_token_id[0] = result[0];
-        return 0;
-    }
-}
-
 // Sample from the logits already resident in runtime->sample_logits_buffer
 // (written by the fused norm+lm-head+argmax decode tail). Avoids re-running
 // the LM head for temperature sampling after a planned decode frame.
@@ -61658,7 +60205,6 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_add_params multiply_params = { .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
-        termite_metal_apply_row_norm_params post_down_rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)hidden_size, .eps = 0.0f };
         termite_metal_apply_add_params add_params = { .rows = (uint32_t)rows, .dim = (uint32_t)hidden_size };
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -13;
@@ -62757,7 +61303,6 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_sl
     if (runtime == NULL || input == NULL || residual == NULL || output == NULL) return -1;
     if (runtime->q4_k_pair_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
     if (rows == 0 || hidden_size == 0 || intermediate_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX || intermediate_size > UINT32_MAX) return -3;
-    const float eps = 0.0f;
     if (hidden_size % 256u != 0 || intermediate_size % 256u != 0) return -4;
     if (gate_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || up_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || down_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -5;
     termite_metal_quant_linear_slot_view gate_view;
@@ -62793,7 +61338,6 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_sl
         if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
 
-        termite_metal_linear_params down_params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)(intermediate_size / 256u) };
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_add_params multiply_params = { .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
@@ -63340,7 +61884,6 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -14;
 
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_add_params multiply_params = { .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = eps };
         termite_metal_apply_row_norm_params post_down_rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)hidden_size, .eps = eps };
         termite_metal_apply_add_params add_params = { .rows = (uint32_t)rows, .dim = (uint32_t)hidden_size };
@@ -64877,7 +63420,6 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0(
         if (input_buffer == nil || residual_buffer == nil || gate_weight_buffer == nil || up_weight_buffer == nil || down_weight_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
 
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
-        termite_metal_apply_add_params multiply_params = { .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_row_norm_params rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
         termite_metal_apply_row_norm_params post_down_rms_params = { .rows = (uint32_t)rows, .hidden_size = (uint32_t)hidden_size, .eps = 0.0f };
         termite_metal_apply_add_params add_params = { .rows = (uint32_t)rows, .dim = (uint32_t)hidden_size };
@@ -66089,37 +64631,6 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
     size_t position_offset
 );
 
-static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_key(
-    termite_metal_decode_runtime *runtime,
-    id<MTLCommandBuffer> command_buffer,
-    uint32_t format,
-    const float *k,
-    const float *v,
-    size_t kv_tokens,
-    size_t num_kv_heads,
-    size_t head_dim,
-    size_t key_row_bytes,
-    size_t base_key_row_bytes,
-    size_t v_row_stride,
-    size_t position_offset
-) {
-    return termite_metal_decode_runtime_encode_replace_attention_span_from_f32_key_slot(
-        runtime,
-        command_buffer,
-        0,
-        format,
-        k,
-        v,
-        kv_tokens,
-        num_kv_heads,
-        head_dim,
-        key_row_bytes,
-        base_key_row_bytes,
-        v_row_stride,
-        position_offset
-    );
-}
-
 static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_key_slot(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -66290,7 +64801,6 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         // continue to work unchanged).
         id<MTLComputePipelineState> pipeline = runtime->encode_int8_per_head_pipeline;
         if (pipeline == nil) return -8;
-        const size_t values_per_row = num_kv_heads * head_dim;
         // Threadgroup size = next power of 2 >= head_dim, capped at 256.
         size_t tg_size = 1u;
         while (tg_size < head_dim && tg_size < 256u) tg_size <<= 1u;
@@ -67428,42 +65938,6 @@ static int termite_metal_decode_runtime_encode_attention_span_slot(
     [encoder setBuffer:params_buffer offset:0 atIndex:4];
     [encoder dispatchThreads:MTLSizeMake(num_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, num_heads), 1, 1)];
     [encoder endEncoding];
-    return 0;
-}
-
-static int termite_metal_apply_optional_norm(
-    termite_metal_decode_runtime *runtime,
-    size_t layer_norm_slot,
-    size_t rms_norm_slot,
-    const float *input,
-    size_t hidden_size,
-    float eps,
-    float *output
-) {
-    if (layer_norm_slot != SIZE_MAX) {
-        return termite_metal_decode_runtime_apply_layer_norm(
-            runtime,
-            layer_norm_slot,
-            input,
-            1,
-            hidden_size,
-            eps,
-            output
-        );
-    }
-    if (rms_norm_slot != SIZE_MAX) {
-        return termite_metal_decode_runtime_apply_rms_norm(
-            runtime,
-            rms_norm_slot,
-            input,
-            hidden_size,
-            eps,
-            output
-        );
-    }
-    if (input != output) {
-        memcpy(output, input, hidden_size * sizeof(float));
-    }
     return 0;
 }
 
@@ -73380,59 +71854,6 @@ static int termite_metal_dispatch_generated_quant_relu(termite_metal_provider *p
             return 0;
         }
         return -8;
-    }
-}
-
-static int termite_metal_dispatch_pair(termite_metal_provider *provider, id<MTLComputePipelineState> pipeline, const float *input, size_t rows, size_t in_dim, size_t row_blocks, const uint8_t *weight_a_raw, size_t weight_a_bytes, const uint8_t *weight_b_raw, size_t weight_b_bytes, size_t out_dim, float *output_a, float *output_b) {
-    if (provider == NULL || pipeline == nil || input == NULL || weight_a_raw == NULL || weight_b_raw == NULL || output_a == NULL || output_b == NULL) return -1;
-    @autoreleasepool {
-        const size_t input_bytes = rows * in_dim * sizeof(float);
-        const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> weight_a_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_a_raw length:weight_a_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (weight_a_buffer == nil) weight_a_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_a_raw length:weight_a_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> weight_b_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_b_raw length:weight_b_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (weight_b_buffer == nil) weight_b_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_b_raw length:weight_b_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> output_a_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output_a length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (output_a_buffer == nil) output_a_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output_a length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> output_b_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output_b length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (output_b_buffer == nil) output_b_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output_b length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (input_buffer == nil || weight_a_buffer == nil || weight_b_buffer == nil || output_a_buffer == nil || output_b_buffer == nil) return -3;
-        termite_metal_linear_params params = {
-            .rows = (uint32_t)rows,
-            .in_dim = (uint32_t)in_dim,
-            .out_dim = (uint32_t)out_dim,
-            .row_blocks = (uint32_t)row_blocks,
-        };
-        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (params_buffer == nil) return -4;
-        id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
-        if (command_buffer == nil) return -5;
-        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (encoder == nil) return -6;
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [encoder setBuffer:weight_a_buffer offset:0 atIndex:1];
-        [encoder setBuffer:weight_b_buffer offset:0 atIndex:2];
-        [encoder setBuffer:output_a_buffer offset:0 atIndex:3];
-        [encoder setBuffer:output_b_buffer offset:0 atIndex:4];
-        [encoder setBuffer:params_buffer offset:0 atIndex:5];
-        MTLSize grid_size = MTLSizeMake(out_dim, rows, 1);
-        NSUInteger thread_width = pipeline.maxTotalThreadsPerThreadgroup;
-        if (thread_width == 0) thread_width = 32;
-        if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
-        MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -7;
-        // newBufferWithBytes (the non-page-aligned fallback) snapshots the
-        // caller's buffer instead of aliasing it, so results must be copied back.
-        if (output_a_buffer.contents != (void *)output_a) memcpy(output_a, output_a_buffer.contents, output_bytes);
-        if (output_b_buffer.contents != (void *)output_b) memcpy(output_b, output_b_buffer.contents, output_bytes);
-        return 0;
     }
 }
 
