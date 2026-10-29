@@ -47,7 +47,7 @@ const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
     @import("../template.zig");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test)
+const template_remote = if (builtin.os.tag == .freestanding)
     @import("../storage/db/template_remote_stub.zig")
 else
     @import("../template_remote.zig");
@@ -1565,7 +1565,8 @@ pub const ManagedEmbedder = struct {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         var request_entry = configured_entry.requestOverlay(alloc);
         defer request_entry.auth_header_cache.deinit(alloc);
-        request_entry.cancellation = cancellation;
+        var combined = CombinedCancellation.init(configured_entry.cancellation, cancellation);
+        request_entry.cancellation = combined.token();
         const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, &request_entry);
         defer alloc.free(rendered);
         try ensureEntryDeadline(&request_entry);
@@ -5383,21 +5384,87 @@ fn renderQueryTemplate(
     return try template_mod.renderDocumentWithHelpers(alloc, embedding_template, query_json, &extra_helpers);
 }
 
+// Template helpers convert ordinary fetch errors into inline directives. A
+// rejected execution transition must instead stop rendering; keep its exact
+// cause in the owning worker and expose Canceled to the renderer. Watchdogs
+// inspect lifetime only, never the owning worker's mutable failure field.
+const QueryTemplateWait = struct {
+    http: request_context.HttpWait,
+
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        self.http.context.check() catch return true;
+        return false;
+    }
+    fn begin(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        const control = self.http.control();
+        control.wait_begin_fn.?(control.ptr) catch |err| {
+            self.http.failure = self.http.failure orelse err;
+            return error.Canceled;
+        };
+    }
+    fn end(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        const control = self.http.control();
+        control.wait_end_fn.?(control.ptr) catch |err| {
+            self.http.failure = self.http.failure orelse err;
+            return error.Canceled;
+        };
+    }
+    fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+        try from(raw).http.control().check();
+    }
+    fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
+        const control = from(raw).http.control();
+        return control.remaining_ms_fn.?(control.ptr);
+    }
+    fn token(self: *@This()) scraping.CancellationToken {
+        return .{
+            .ptr = self,
+            .is_cancelled_fn = canceled,
+            .execution_wait = .{
+                .ptr = self,
+                .check_fn = check,
+                .remaining_ms_fn = remaining,
+                .wait_begin_fn = if (self.http.context.runnable != null) begin else null,
+                .wait_end_fn = if (self.http.context.runnable != null) end else null,
+            },
+        };
+    }
+};
+
 fn renderQueryTemplateWithEntry(
     alloc: std.mem.Allocator,
     embedding_template: []const u8,
     text: []const u8,
     entry: *const ManagedEmbeddingEntry,
 ) ![]const u8 {
-    try ensureEntryDeadline(entry);
-    if (comptime builtin.is_test) {
-        return try renderQueryTemplate(alloc, embedding_template, text);
-    }
+    try embeddingHttpContext(entry, .retrieval_query).check();
 
-    const config = queryTemplateRenderConfig(entry);
+    // Keep transport callbacks invocation-local. The configured entry may be
+    // reused by concurrent queries and must never retain this stack borrow.
+    var wait: QueryTemplateWait = .{ .http = .{ .context = embeddingHttpContext(entry, .retrieval_query) } };
+    var config = queryTemplateRenderConfig(entry);
+    if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+        if (config.io != null) {
+            config.cancellation = wait.token();
+        } else if (entry.runnable != null) {
+            return error.MissingEmbeddingHttpIo;
+        }
+    }
     const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
     defer alloc.free(query_json);
-    return try template_remote.renderJsonToTextWithConfig(alloc, embedding_template, query_json, config);
+    const rendered = template_remote.renderJsonToTextWithConfig(alloc, embedding_template, query_json, config) catch |err| {
+        try wait.http.ready();
+        return err;
+    };
+    errdefer alloc.free(rendered);
+    try wait.http.ready();
+    return rendered;
 }
 
 fn queryTemplateRenderConfig(entry: *const ManagedEmbeddingEntry) template_remote.RenderConfig {

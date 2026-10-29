@@ -1814,3 +1814,106 @@ test "serverless execution credential file admission preserves cache ownership a
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
 }
+
+test "serverless execution query template downloads lend capacity before provider dispatch" {
+    const sources = @import("antfly_local_sources");
+    const managed_mod = sources.inference_managed_embedder;
+    const App = struct {
+        received: std.atomic.Value(bool) = .init(false),
+        embeddings: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: sources.common_http_http_common.HttpRequest) !sources.common_http_http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (req.method == .GET) {
+                self.received.store(true, .release);
+                try self.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            } else _ = self.embeddings.fetchAdd(1, .monotonic);
+            return .{ .status = 200, .content_type = try alloc.dupe(u8, "text/plain"), .body = try alloc.dupe(u8, if (req.method == .GET) "downloaded template text" else "{\"data\":[{\"embedding\":[0.25,0.75]}]}") };
+        }
+    };
+    const Job = struct {
+        managed: *managed_mod.ManagedEmbedder,
+        url: []const u8,
+        revoked: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.revoked.load(.acquire)) return error.TemplateSourceRevoked;
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            const result = self.managed.embedQueryWithTemplateAndCancellation(std.testing.allocator, "model", self.url, "{{remoteText url=this}}", .{ .ptr = self, .check_fn = check }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer std.testing.allocator.free(result);
+            std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, result) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |reject| {
+        var app: App = .{};
+        var listener = sources.common_http_std_http_listener.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+        defer listener.deinit();
+        try listener.start();
+        const url = try listener.baseUri(alloc);
+        defer alloc.free(url);
+        const indexes = try std.fmt.allocPrint(alloc, "{{\"model\":{{\"type\":\"embeddings\",\"field\":\"text\",\"dimension\":2,\"embedder\":{{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"{s}\"}}}}}}", .{url});
+        defer alloc.free(indexes);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = io, .retained_bytes = 4096 }, .background, 2);
+        var read: @import("api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = alloc };
+        var remote_content: @import("antfly_scraping").RemoteContentConfig = .{ .security = .{ .block_private_ips = false } };
+        var managed = try managed_mod.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes, .{ .io = io, .remote_content = &remote_content, .runnable = (try read.team()).borrow });
+        defer managed.deinit();
+        var job: Job = .{ .managed = &managed, .url = url };
+        var future = try io.concurrent(Job.run, .{&job});
+        defer future.cancel(io);
+        defer app.release.set(io);
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+        while (!app.received.load(.acquire) or scheduler.stats().runnable_slots != 0) {
+            if (job.done.load(.acquire)) return job.failure orelse error.TemplateDidNotLendCapacity;
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TemplateDidNotLendCapacity;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(u64, 4096), scheduler.stats().retained_bytes);
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        app.release.set(io);
+        if (reject) {
+            while (scheduler.stats().queued == 0) {
+                if (job.done.load(.acquire)) return job.failure orelse error.TemplateDidNotQueueForReentry;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TemplateDidNotQueueForReentry;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            job.revoked.store(true, .release);
+            while (!job.done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TemplateDidNotRejectReentry;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        } else query.finish();
+        future.await(io);
+        if (reject) try std.testing.expectEqual(error.TemplateSourceRevoked, job.failure.?) else if (job.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, if (reject) 0 else 1), app.embeddings.load(.acquire));
+        try std.testing.expect(managed.entries[0].http_control == null);
+        try std.testing.expect(managed.entries[0].cancellation == null);
+        query.finish();
+        try std.testing.expectEqual(@as(usize, if (reject) 0 else 2), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 4096), scheduler.stats().retained_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}

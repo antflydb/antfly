@@ -83,7 +83,10 @@ pub const DownloadContext = struct {
 
     fn check(self: @This()) !void {
         try self.io.checkCancel();
-        if (self.cancellation) |token| try token.check();
+        if (self.cancellation) |token| {
+            try token.check();
+            if (token.execution_wait) |control| try control.check();
+        }
     }
 };
 
@@ -472,6 +475,7 @@ fn downloadHttpOutcomeAlloc(
             .follow_redirects = false,
             .timeout_ms = try ceiling.remainingTimeoutMs(),
             .max_response_size = maxDownloadSize(security),
+            .socket_control = if (context.cancellation) |token| token.execution_wait else null,
             .cancellation = if (context.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -482,6 +486,7 @@ fn downloadHttpOutcomeAlloc(
             else => return err,
         };
         defer response.deinit();
+        try ceiling.check();
 
         if (response.ok()) {
             const mime = trimMimeParameters(response.contentType() orelse "application/octet-stream");
@@ -678,7 +683,10 @@ const DownloadCeiling = struct {
 
     fn remainingTimeoutMs(self: *const DownloadCeiling) !u64 {
         try self.io.checkCancel();
-        if (self.cancellation) |token| try token.check();
+        if (self.cancellation) |token| {
+            try token.check();
+            if (token.execution_wait) |control| try control.check();
+        }
         if (self.timeout_ms == 0) return 0;
         const elapsed_ns = std.Io.Timestamp.durationTo(
             self.started_at,
@@ -711,7 +719,7 @@ fn downloadFileAlloc(
 ) !DownloadedContent {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    return downloadFileAllocWithIo(alloc, io_impl.io(), path, security);
+    return downloadFileAllocWithIo(alloc, io_impl.io(), path, security, null);
 }
 
 fn downloadFileAllocWithContext(
@@ -729,10 +737,14 @@ fn downloadFileAllocWithContext(
     // instead of returning after it has already expired.
     if ((context.timeout_ms orelse 0) != 0) return error.FileTimeoutUnsupported;
     try context.check();
-    var downloaded = try downloadFileAllocWithIo(alloc, context.io, path, security);
+    var downloaded = try downloadFileAllocWithIo(alloc, context.io, path, security, if (context.cancellation) |token| token.execution_wait else null);
     errdefer downloaded.deinit(alloc);
     try context.check();
     return downloaded;
+}
+
+fn discardDownloadFile(file: std.Io.File, args: anytype) void {
+    file.close(args[0]);
 }
 
 fn downloadFileAllocWithIo(
@@ -740,21 +752,55 @@ fn downloadFileAllocWithIo(
     io: std.Io,
     path: []const u8,
     security: ?*const ContentSecurityConfig,
+    execution_wait: ?httpx.socket.WriteControl,
 ) !DownloadedContent {
     try requireFileAccess(security);
-
+    const control = execution_wait orelse httpx.socket.WriteControl{};
     const limit = maxDownloadSize(security);
-    try validateFilePathSecurityBeforeOpen(alloc, io, path, security);
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    try validateFilePathSecurityBeforeOpen(alloc, io, path, security, control);
+    var rejected = false;
+    const file = try control.withOwnedWait(&rejected, std.Io.Dir.openFileAbsolute, .{ io, path, std.Io.Dir.OpenFileOptions{} }, discardDownloadFile);
     defer file.close(io);
-    try validateOpenFilePathSecurity(alloc, io, file, security);
-    var reader = file.reader(io, &.{});
-    const data = try allocRemainingBounded(&reader.interface, alloc, limit);
+    try validateOpenFilePathSecurity(alloc, io, file, security, control);
+    if (control.wait_begin_fn == null and control.wait_end_fn == null) {
+        // Preserve the buffered reader and its error contract for callers that
+        // have no execution grant to lend. Context lifetime is checked by the
+        // surrounding downloader before transferring this result.
+        var reader = file.reader(io, &.{});
+        const data = try allocRemainingBounded(&reader.interface, alloc, limit);
+        errdefer alloc.free(data);
+        return .{ .content_type = try alloc.dupe(u8, guessMimeType(path)), .data = data };
+    }
+    // Read into a fixed buffer while parked; growth and ownership transfer
+    // happen only after checked CPU return. Probe one byte beyond the bound.
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(alloc);
+    const buffer = try alloc.alloc(u8, @min(limit +| 1, 1024 * 1024));
+    defer alloc.free(buffer);
+    var streaming = false;
+    while (true) {
+        const room = limit - bytes.items.len;
+        const vectors: []const []u8 = &.{buffer[0..@min(buffer.len, room +| 1)]};
+        const count = if (streaming)
+            try control.withWait(std.Io.File.readStreaming, .{ file, io, vectors })
+        else
+            control.withWait(std.Io.File.readPositional, .{ file, io, vectors, @as(u64, bytes.items.len) }) catch |err| switch (err) {
+                error.Unseekable => {
+                    streaming = true;
+                    continue;
+                },
+                else => return err,
+            };
+        if (count == 0) break;
+        if (count > room) return error.StreamTooLong;
+        try bytes.appendSlice(alloc, buffer[0..count]);
+    }
+    const data = try bytes.toOwnedSlice(alloc);
     errdefer alloc.free(data);
-    return .{
-        .content_type = try alloc.dupe(u8, guessMimeType(path)),
-        .data = data,
-    };
+    const mime = try alloc.dupe(u8, guessMimeType(path));
+    errdefer alloc.free(mime);
+    try control.check();
+    return .{ .content_type = mime, .data = data };
 }
 
 fn requireFileAccess(security: ?*const ContentSecurityConfig) !void {
@@ -867,7 +913,7 @@ pub const PinnedRange = struct {
                 headers[1] = .{ "If-Match", self.version };
                 headers[2] = .{ "Accept-Encoding", "identity" };
                 for (self.headers, headers[3..]) |header, *dest| dest.* = .{ header.name, header.value };
-                var response = try client.get(self.uri, .{ .headers = headers, .max_response_size = out.len, .follow_redirects = false, .max_retries = 0, .cookies_enabled = false, .timeout_ms = try ceiling.remainingTimeoutMs(), .cancellation = if (self.context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null });
+                var response = try client.get(self.uri, .{ .headers = headers, .max_response_size = out.len, .follow_redirects = false, .max_retries = 0, .cookies_enabled = false, .timeout_ms = try ceiling.remainingTimeoutMs(), .socket_control = if (self.context.cancellation) |token| token.execution_wait else null, .cancellation = if (self.context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null });
                 defer response.deinit();
                 try self.context.check();
                 if (response.status.code == 412) return error.SourceVersionChanged;
@@ -1136,12 +1182,13 @@ fn validateOpenFilePathSecurity(
     io: std.Io,
     file: std.Io.File,
     security: ?*const ContentSecurityConfig,
+    control: httpx.socket.WriteControl,
 ) !void {
     const cfg = security orelse return;
     const allowed_paths = cfg.allowed_paths orelse return;
     var canonical_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const canonical_path = canonical_path_buf[0..try file.realPath(io, &canonical_path_buf)];
-    try validateCanonicalFilePathSecurity(alloc, io, canonical_path, allowed_paths);
+    const canonical_path = canonical_path_buf[0..try control.withWait(std.Io.File.realPath, .{ file, io, &canonical_path_buf })];
+    try validateCanonicalFilePathSecurity(alloc, io, canonical_path, allowed_paths, control);
 }
 
 fn validateFilePathSecurityBeforeOpen(
@@ -1149,22 +1196,23 @@ fn validateFilePathSecurityBeforeOpen(
     io: std.Io,
     path: []const u8,
     security: ?*const ContentSecurityConfig,
+    control: httpx.socket.WriteControl,
 ) !void {
     const cfg = security orelse return;
     const allowed_paths = cfg.allowed_paths orelse return;
-    const resolved_path = try lexicalAbsolutePathAlloc(alloc, io, path);
+    const resolved_path = try lexicalAbsolutePathAlloc(alloc, io, path, control);
     defer alloc.free(resolved_path);
     for (allowed_paths) |allowed| {
-        const resolved_allowed = try lexicalAbsolutePathAlloc(alloc, io, allowed);
+        const resolved_allowed = try lexicalAbsolutePathAlloc(alloc, io, allowed, control);
         defer alloc.free(resolved_allowed);
         if (hasComponentPrefix(resolved_path, resolved_allowed, std.fs.path.sep)) return;
     }
     return error.PathNotAllowed;
 }
 
-fn lexicalAbsolutePathAlloc(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
+fn lexicalAbsolutePathAlloc(alloc: Allocator, io: std.Io, path: []const u8, control: httpx.socket.WriteControl) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return std.fs.path.resolve(alloc, &.{path});
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
+    const cwd = try realPathExistingAlloc(alloc, io, ".", control);
     defer alloc.free(cwd);
     return std.fs.path.resolve(alloc, &.{ cwd, path });
 }
@@ -1174,9 +1222,10 @@ fn validateCanonicalFilePathSecurity(
     io: std.Io,
     canonical_path: []const u8,
     allowed_paths: []const []u8,
+    control: httpx.socket.WriteControl,
 ) !void {
     for (allowed_paths) |allowed| {
-        const canonical_allowed = realPathExistingAlloc(alloc, io, allowed) catch |err| switch (err) {
+        const canonical_allowed = realPathExistingAlloc(alloc, io, allowed, control) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => continue,
             else => return err,
         };
@@ -1195,11 +1244,10 @@ fn validateS3PathSecurity(path: []const u8, security: ?*const ContentSecurityCon
     return error.PathNotAllowed;
 }
 
-fn realPathExistingAlloc(alloc: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
-    if (std.fs.path.isAbsolute(path)) {
-        return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, alloc);
-    }
-    return try std.Io.Dir.cwd().realPathFileAlloc(io, path, alloc);
+fn realPathExistingAlloc(alloc: Allocator, io: std.Io, path: []const u8, control: httpx.socket.WriteControl) ![:0]u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try control.withWait(std.Io.Dir.realPathFile, .{ std.Io.Dir.cwd(), io, path, &buffer });
+    return alloc.dupeSentinel(u8, buffer[0..n], 0);
 }
 
 fn hasComponentPrefix(path: []const u8, prefix: []const u8, separator: u8) bool {
@@ -1638,6 +1686,71 @@ test "caller-owned IO preserves file downloads without a request deadline" {
     try std.testing.expectEqualStrings("bounded by size", downloaded.data);
 }
 
+// Deterministic transition gates around real filesystem and socket operations.
+const DownloadWaitTest = struct {
+    parked: bool = false,
+    returns: usize = 0,
+    reject_at: ?usize = null,
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn begin(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        try std.testing.expect(!self.parked);
+        self.parked = true;
+    }
+    fn end(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        try std.testing.expect(self.parked);
+        self.parked = false;
+        self.returns += 1;
+        if (self.reject_at == self.returns) return error.DownloadGrantRevoked;
+    }
+    fn never(_: *const anyopaque) bool {
+        return false;
+    }
+    fn token(self: *@This()) CancellationToken {
+        return .{ .ptr = self, .is_cancelled_fn = never, .execution_wait = .{ .ptr = self, .wait_begin_fn = begin, .wait_end_fn = end } };
+    }
+};
+
+test "controlled file downloads check every physical return and retain file security and bounds" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = try a.alloc(u8, 2 * 1024 * 1024 + 9);
+    defer a.free(body);
+    @memset(body, 'a');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "asset.txt", .data = body });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "asset.txt", a);
+    defer a.free(path);
+    const security: ContentSecurityConfig = .{ .allowed_paths = &.{root}, .max_download_size_bytes = body.len };
+    var wait: DownloadWaitTest = .{};
+    var result = try downloadFileAllocWithContext(a, .{ .io = std.testing.io, .cancellation = wait.token() }, path, &security);
+    defer result.deinit(a);
+    try std.testing.expectEqualSlices(u8, body, result.data);
+    try std.testing.expect(!wait.parked);
+    const returns = wait.returns;
+    // Open, opened-descriptor canonicalization, allowed-root resolution,
+    // bounded reads and EOF all pass through the owner's paired transition.
+    try std.testing.expect(returns >= 7);
+    for (1..returns + 1) |reject_at| {
+        wait = .{ .reject_at = reject_at };
+        try std.testing.expectError(error.DownloadGrantRevoked, downloadFileAllocWithContext(a, .{ .io = std.testing.io, .cancellation = wait.token() }, path, &security));
+        try std.testing.expectEqual(reject_at, wait.returns);
+        try std.testing.expect(!wait.parked);
+    }
+    wait = .{};
+    try std.testing.expectError(error.PathNotAllowed, downloadFileAllocWithContext(a, .{ .io = std.testing.io, .cancellation = wait.token() }, path, null));
+    try std.testing.expectError(error.FileTimeoutUnsupported, downloadFileAllocWithContext(a, .{ .io = std.testing.io, .timeout_ms = 1, .cancellation = wait.token() }, path, &security));
+    try std.testing.expectEqual(@as(usize, 0), wait.returns);
+    const bounded: ContentSecurityConfig = .{ .allowed_paths = &.{root}, .max_download_size_bytes = body.len - 1 };
+    try std.testing.expectError(error.StreamTooLong, downloadFileAllocWithContext(a, .{ .io = std.testing.io, .cancellation = wait.token() }, path, &bounded));
+    try std.testing.expect(!wait.parked);
+}
+
 test "file download accepts an exact cap and rejects cap plus one" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1709,6 +1822,7 @@ test "file path security accepts relative roots and rejects outside paths before
         std.testing.io,
         "/definitely/not/an/antfly/outside/file",
         &.{ .allowed_paths = &nonexistent_allowed },
+        .{},
     ));
 }
 
@@ -2171,7 +2285,8 @@ test "pinned remote ranges enforce immutable length and version without whole ob
         const uri = try std.fmt.allocPrint(a, "http://{f}/blob", .{server.socket.address});
         defer a.free(uri);
         var security = ContentSecurityConfig{ .block_private_ips = false };
-        const range = try PinnedRange.create(a, .{ .io = io }, uri, "\"v1\"", .strong_etag, 10, &security, null, &.{});
+        var wait: DownloadWaitTest = .{};
+        const range = try PinnedRange.create(a, .{ .io = io, .cancellation = wait.token() }, uri, "\"v1\"", .strong_etag, 10, &security, null, &.{});
         defer range.destroy();
         var thread = try std.testing.io.concurrent(TestHttpResponseServer.serve, .{&fixture});
         var out: [4]u8 = undefined;
@@ -2180,6 +2295,8 @@ test "pinned remote ranges enforce immutable length and version without whole ob
         open = false;
         thread.await(std.testing.io);
         if (fixture.failure) |err| return err;
+        try std.testing.expect(wait.returns > 0);
+        try std.testing.expect(!wait.parked);
         if (case.expected) |err| try std.testing.expectError(err, result) else {
             try std.testing.expectEqual(@as(usize, 4), try result);
             try std.testing.expectEqualStrings("2345", &out);

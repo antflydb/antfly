@@ -816,3 +816,54 @@ lease renewal, other maintenance provider boundaries and graph preparation
 checkpoints remain open, along with the original cross-engine resource gates
 (including file-engine descriptor recovery). Full GNU/full qualification remains
 waived; the installed CLI is not rebuilt by these focused tests.
+
+
+### Query-template remote input waits
+
+Query-time embedding templates now enter an invocation-local execution scope
+before evaluating remoteText, remoteMedia and remotePDF. The normal distributed
+semantic-query planner already forwards its query runnable, I/O, deadline and
+cancellation into this managed entry. Rendering and subsequent provider dispatch
+retain that request's authority. Configured and invocation cancellation compose;
+request callbacks and mutable failure state are not cached in the shared entry.
+Only the owning worker performs park/reentry transitions. Transport monitors
+inspect lifetime without reading the owner's mutable failure state. A refused
+transition stops rendering instead of becoming an inline helper-error directive;
+the outer scope returns its exact original cause before provider dispatch.
+
+The scraping HTTP path forwards the existing objectstore cancellation token's
+execution-wait control on every redirect and pinned-range request. Response
+classification and result transfer check the original context. S3 already
+forwards this token to its HEAD/GET transport. Allowed local files now lend
+capacity around physical open, descriptor and allowlist canonicalization, and
+bounded positional/streaming reads. Owned-open refusal closes the descriptor.
+Controlled reads use at most 1 MiB per syscall, with scratch/result allocation
+and growth on CPU. Callers without execution transitions retain the original
+buffered reader. Path allowlists, symlink confinement, response limits, and the
+fail-closed policy for unsupported file deadlines remain in force.
+
+Evidence is in `template-download-waits-v4-debug.json` in the cumulative receipts
+directory. The integration fixture calls the production ManagedEmbedder template
+API and real renderer, uses a real scheduler with a two-slot background grant,
+and downloads through a real loopback HTTP listener before provider dispatch.
+It proves independent query/control progress while waiting, retained-byte
+ownership, restoration of the original width on success, exact source-revocation
+failure while queued for response reentry, no embedding dispatch after that
+failure, and complete root retirement. This is an integration fixture through
+production APIs, not an end-to-end serverless semantic-query endpoint test.
+The old entry-based test-only renderer bypass was removed after the fixture
+exposed it. Separate actual-file tests inject deterministic return refusal at
+every physical boundary, check exact bytes and overflow, and preserve path and
+deadline denials. Pinned-range listener tests also assert paired execution waits.
+Existing remote-content security and renderer regressions remain covered.
+These checks are not cloud/TLS or disk/network throughput qualification.
+
+Remaining in the broader remote-asset milestone: native inference media-download
+contexts still carry cancellation without execution-wait ownership; normal
+serverless semantic-query dispatch needs per-invocation runnable forwarding;
+remaining asset-producer provider and capability paths need controlled waits.
+Registry pulls are explicitly node-free CLI/SDK operations and must not be
+mistaken for a model loader owned by the node scheduler. The wider maintenance
+work and original cross-engine resource gates, including file-engine descriptor
+recovery, remain open. Full GNU/full qualification remains waived; the installed
+CLI is not rebuilt by these focused tests.
