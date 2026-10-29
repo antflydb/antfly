@@ -25,6 +25,11 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 var journal_mutexes: [64]std.Io.Mutex = @splat(.init);
 var content_mutexes: [64]std.Io.Mutex = @splat(.init);
 
+const Provider = @import("../provider_operation.zig");
+const ReadContext = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
+fn closeDirectory(dir: std.Io.Dir, args: anytype) void {
+    dir.close(args[1]);
+}
 pub const FsStore = struct {
     const verified_file_cache_limit: usize = 4096;
 
@@ -443,13 +448,15 @@ pub const FsStore = struct {
     /// Offset continuations read each inventory record once. The attempt name
     /// is ordered; the record offset is stable across deletion and process
     /// restart. No filename sorting or suffix-wide rescanning is required.
-    fn visitUploadJournal(self: *FsStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
+    fn visitUploadJournal(self: *FsStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken, operation: ?*const Provider.Operation) !void {
+        var io_impl: ?std.Io.Threaded = if (operation == null) threadedIo() else null;
+        defer if (io_impl) |*value| value.deinit();
+        const io = if (operation) |op| try op.receiver() else io_impl.?.io();
+        const control: @import("httpx").socket.WriteControl = if (operation) |op| op.control() else .{};
+        if (operation) |op| try op.ready();
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(path);
-        const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        const dir = (if (operation) |op| op.openDirAt(std.Io.Dir.cwd(), path, .{ .iterate = true, .follow_symlinks = false }) else std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false })) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -474,8 +481,9 @@ pub const FsStore = struct {
             // again once their journal exists.
             var selected: ?[32]u8 = null;
             var attempts = dir.iterate();
-            while (try attempts.next(io)) |entry| {
+            while (try control.withWait(std.Io.Dir.Iterator.next, .{ &attempts, io })) |entry| {
                 try cancellation.check();
+                if (operation) |op| try op.ready();
                 if (entry.kind != .directory or entry.name.len != 32) continue;
                 var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
                 _ = std.fmt.hexToBytes(&scope.attempt, entry.name) catch continue;
@@ -487,22 +495,26 @@ pub const FsStore = struct {
                 if (selected == null or std.mem.order(u8, entry.name, &selected.?) == .lt) selected = entry.name[0..32].*;
             }
             const name = selected orelse return;
-            const attempt = try dir.openDir(io, &name, .{ .iterate = true, .follow_symlinks = false });
+            const attempt = try (if (operation) |op| op.openDirAt(dir, &name, .{ .iterate = true, .follow_symlinks = false }) else dir.openDir(io, &name, .{ .iterate = true, .follow_symlinks = false }));
             defer attempt.close(io);
             var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
             _ = try std.fmt.hexToBytes(&scope.attempt, &name);
+            // Journal backfill mixes directory discovery and metadata parsing
+            // under shared locks. Keep its CPU grant until those holder
+            // boundaries are converted; never park this entire compound call.
             const journal = try self.uploadJournal(io, attempt, scope, null, cancellation);
             defer journal.close(io);
             var offset: u64 = if (after_attempt != null and std.mem.eql(u8, &name, after_attempt.?)) after_offset else journal_header.len;
-            const end = try journal.length(io);
+            const end = try control.withWait(std.Io.File.length, .{ journal, io });
             if (offset > end) return error.InvalidArtifactEnumerationContinuation;
             while (offset < end) {
                 try cancellation.check();
+                if (operation) |op| try op.ready();
                 if (visited == maximum) return error.ArtifactEnumerationPaused;
                 var suffix: [97]u8 = undefined;
                 @memcpy(suffix[0..32], &name);
                 suffix[32] = '/';
-                if (try journal.readPositionalAll(io, suffix[33..97], offset) != 64) return error.InvalidArtifactUploadInventory;
+                if (try control.withWait(std.Io.File.readPositionalAll, .{ journal, io, suffix[33..97], offset }) != 64) return error.InvalidArtifactUploadInventory;
                 if (@import("builtin").is_test) _ = self.journal_records_read.fetchAdd(1, .monotonic);
                 try artifact_store.validateSha256Checksum(suffix[33..97]);
                 if (visitor.cleanup_staging) {
@@ -511,13 +523,13 @@ pub const FsStore = struct {
                     var staging: [75]u8 = undefined;
                     @memcpy(staging[0..64], suffix[33..97]);
                     @memcpy(staging[64..], ".pending-v2");
-                    attempt.deleteFile(io, &staging) catch |err| switch (err) {
+                    control.withWait(std.Io.Dir.deleteFile, .{ attempt, io, &staging }) catch |err| switch (err) {
                         error.FileNotFound => {},
                         else => return err,
                     };
                 }
                 // Backfill entries and interrupted uploads may already be gone.
-                if (attempt.access(io, suffix[33..97], .{})) |_| {
+                if (control.withWait(std.Io.Dir.access, .{ attempt, io, suffix[33..97], std.Io.Dir.AccessOptions{} })) |_| {
                     try artifact_store.visitScopedSuffix(domain, &suffix, visitor);
                 } else |err| switch (err) {
                     error.FileNotFound => {},
@@ -538,13 +550,18 @@ pub const FsStore = struct {
     }
 
     fn visitScopedUploads(self: *FsStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
-        if (visitor.checkpoint != null) return self.visitUploadJournal(domain, visitor, cancellation);
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        return self.visitForOperation(domain, visitor, cancellation, null);
+    }
+    fn visitForOperation(self: *FsStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken, operation: ?*const Provider.Operation) !void {
+        if (visitor.checkpoint != null) return self.visitUploadJournal(domain, visitor, cancellation, operation);
+        var io_impl: ?std.Io.Threaded = if (operation == null) threadedIo() else null;
+        defer if (io_impl) |*value| value.deinit();
+        const io = if (operation) |op| try op.receiver() else io_impl.?.io();
+        const control: @import("httpx").socket.WriteControl = if (operation) |op| op.control() else .{};
+        if (operation) |op| try op.ready();
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(path);
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        var dir = (if (operation) |op| op.openDirAt(std.Io.Dir.cwd(), path, .{ .iterate = true }) else std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true })) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -563,8 +580,9 @@ pub const FsStore = struct {
         var candidates = std.PriorityQueue(Candidate, void, Order.compare).initContext({});
         defer candidates.deinit(self.alloc);
         var attempts = dir.iterate();
-        while (try attempts.next(io)) |attempt| {
+        while (try control.withWait(std.Io.Dir.Iterator.next, .{ &attempts, io })) |attempt| {
             try cancellation.check();
+            if (operation) |op| try op.ready();
             if (attempt.kind != .directory or attempt.name.len != 32) continue;
             var encoded_attempt: [16]u8 = undefined;
             _ = std.fmt.hexToBytes(&encoded_attempt, attempt.name) catch continue;
@@ -574,14 +592,15 @@ pub const FsStore = struct {
             if (fence < visitor.fencing_floor) continue;
             if (visitor.fencing_cutoff) |cutoff| if (fence >= cutoff) continue;
             if (visitor.after_suffix) |after| if (after.len == 97 and std.mem.order(u8, attempt.name, after[0..32]) == .lt) continue;
-            var attempt_dir = dir.openDir(io, attempt.name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+            var attempt_dir = (if (operation) |op| op.openDirAt(dir, attempt.name, .{ .iterate = true, .follow_symlinks = false }) else dir.openDir(io, attempt.name, .{ .iterate = true, .follow_symlinks = false })) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
             defer attempt_dir.close(io);
             var entries = attempt_dir.iterate();
-            while (try entries.next(io)) |entry| {
+            while (try control.withWait(std.Io.Dir.Iterator.next, .{ &entries, io })) |entry| {
                 try cancellation.check();
+                if (operation) |op| try op.ready();
                 if (entry.kind != .file or entry.name.len != 64) continue;
                 var suffix: [97]u8 = undefined;
                 @memcpy(suffix[0..32], attempt.name);
@@ -606,63 +625,76 @@ pub const FsStore = struct {
     }
 
     fn cleanupRetiredScopedTemporaries(ptr: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
+        return cleanupRetiredScopedTemporariesOperation(ptr, domain, floor, cutoff, cancellation, null);
+    }
+    fn cleanupRetiredScopedTemporariesOperation(ptr: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken, operation: ?*const Provider.Operation) !void {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        var io_impl: ?std.Io.Threaded = if (operation == null) threadedIo() else null;
+        defer if (io_impl) |*value| value.deinit();
+        const io = if (operation) |op| try op.receiver() else io_impl.?.io();
+        const control: @import("httpx").socket.WriteControl = if (operation) |op| op.control() else .{};
+        if (operation) |op| try op.ready();
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(path);
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        var dir = (if (operation) |op| op.openDirAt(std.Io.Dir.cwd(), path, .{ .iterate = true }) else std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true })) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer dir.close(io);
         var attempts = dir.iterate();
-        while (try attempts.next(io)) |entry| {
+        while (try control.withWait(std.Io.Dir.Iterator.next, .{ &attempts, io })) |entry| {
             try cancellation.check();
+            if (operation) |op| try op.ready();
             if (entry.kind != .directory or entry.name.len != 32) continue;
             var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
             _ = std.fmt.hexToBytes(&scope.attempt, entry.name) catch continue;
             scope.validate() catch continue;
             if (scope.fencingToken() < floor or scope.fencingToken() >= cutoff) continue;
-            var attempt = dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+            var attempt = (if (operation) |op| op.openDirAt(dir, entry.name, .{ .iterate = true, .follow_symlinks = false }) else dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false })) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
             defer attempt.close(io);
             var files = attempt.iterate();
             var changed = false;
-            while (try files.next(io)) |file| {
+            while (try control.withWait(std.Io.Dir.Iterator.next, .{ &files, io })) |file| {
                 try cancellation.check();
+                if (operation) |op| try op.ready();
                 if (file.kind != .file or file.name.len != 64 + 5 + 32 or !std.mem.eql(u8, file.name[64..69], ".tmp-")) continue;
                 artifact_store.validateSha256Checksum(file.name[0..64]) catch continue;
                 var nonce: [16]u8 = undefined;
                 _ = std.fmt.hexToBytes(&nonce, file.name[69..]) catch continue;
-                attempt.deleteFile(io, file.name) catch |err| switch (err) {
+                control.withWait(std.Io.Dir.deleteFile, .{ attempt, io, file.name }) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
                 };
                 changed = true;
             }
-            if (changed) try fs_paths.syncDirectoryHandlePortable(io, attempt);
+            if (changed) try control.withWait(fs_paths.syncDirectoryHandlePortable, .{ io, attempt });
         }
     }
 
     fn reclaimRetiredScopedInventory(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
+        return reclaimRetiredScopedInventoryOperation(raw, domain, floor, cutoff, cancellation, null);
+    }
+    fn reclaimRetiredScopedInventoryOperation(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken, operation: ?*const Provider.Operation) !void {
         const self: *FsStore = @ptrCast(@alignCast(raw));
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        var io_impl: ?std.Io.Threaded = if (operation == null) threadedIo() else null;
+        defer if (io_impl) |*value| value.deinit();
+        const io = if (operation) |op| try op.receiver() else io_impl.?.io();
+        const control: @import("httpx").socket.WriteControl = if (operation) |op| op.control() else .{};
+        if (operation) |op| try op.ready();
         const path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(path);
-        const inventory = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        const inventory = (if (operation) |op| op.openDirAt(std.Io.Dir.cwd(), path, .{ .iterate = true, .follow_symlinks = false }) else std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false })) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer inventory.close(io);
         var attempts = inventory.iterate();
-        while (try attempts.next(io)) |entry| {
+        while (try control.withWait(std.Io.Dir.Iterator.next, .{ &attempts, io })) |entry| {
             try cancellation.check();
+            if (operation) |op| try op.ready();
             if (entry.kind != .directory or entry.name.len != 32) continue;
             var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
             _ = std.fmt.hexToBytes(&scope.attempt, entry.name) catch continue;
@@ -670,7 +702,7 @@ pub const FsStore = struct {
             if (scope.fencingToken() < floor or scope.fencingToken() >= cutoff) continue;
             const payload = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&domain, .lower), entry.name });
             defer self.alloc.free(payload);
-            std.Io.Dir.cwd().deleteDir(io, payload) catch |err| switch (err) {
+            control.withWait(std.Io.Dir.deleteDir, .{ std.Io.Dir.cwd(), io, payload }) catch |err| switch (err) {
                 error.FileNotFound => {},
                 error.DirNotEmpty => continue,
                 else => return err,
@@ -678,10 +710,10 @@ pub const FsStore = struct {
             // Only fenced, empty attempts reach this point. A stale uploader
             // cannot publish here; a later orphan retries through registration
             // and is backfilled if it races this advisory metadata cleanup.
-            try inventory.deleteTree(io, entry.name);
+            try control.withWait(std.Io.Dir.deleteTree, .{ inventory, io, entry.name });
             try @import("retained_closure.zig").forgetNamespace(self, scope);
-            try fs_paths.syncDirPortable(io, std.fs.path.dirname(payload).?);
-            try fs_paths.syncDirectoryHandlePortable(io, inventory);
+            try control.withWait(fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(payload).? });
+            try control.withWait(fs_paths.syncDirectoryHandlePortable, .{ io, inventory });
         }
     }
 
@@ -703,7 +735,39 @@ pub const FsStore = struct {
         return self.retention.seal(self, token);
     }
 
+    fn deleteFor(raw: *anyopaque, id: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        const op: Provider.Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
+        if (try artifact_store.uploadScopeFromArtifactId(id)) |scope| try @import("retained_closure.zig").invalidate(self, scope, token);
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, id);
+        defer self.alloc.free(path);
+        try op.removeFile(path);
+        try @import("retained_closure.zig").forget(self, id);
+        self.forgetVerifiedFile(id);
+        try op.ready();
+    }
+    fn visitFor(raw: *anyopaque, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, token: CancellationToken, context: ReadContext) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        const op: Provider.Operation = .{ .context = context, .cancellation = token };
+        try self.visitForOperation(domain, visitor, token, &op);
+        try op.ready();
+    }
+    fn reclaimFor(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, token: CancellationToken, context: ReadContext) !void {
+        const op: Provider.Operation = .{ .context = context, .cancellation = token };
+        try reclaimRetiredScopedInventoryOperation(raw, domain, floor, cutoff, token, &op);
+        try op.ready();
+    }
+    fn cleanupFor(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, token: CancellationToken, context: ReadContext) !void {
+        const op: Provider.Operation = .{ .context = context, .cancellation = token };
+        try cleanupRetiredScopedTemporariesOperation(raw, domain, floor, cutoff, token, &op);
+        try op.ready();
+    }
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .delete_for = deleteFor,
+        .visit_scoped_uploads_for = visitFor,
+        .reclaim_retired_scoped_inventory_for = reclaimFor,
+        .cleanup_retired_scoped_temporaries_for = cleanupFor,
         .retention_witness = retentionWitness,
         .retained_closure = retainedClosure,
         .remember_closure = rememberClosure,

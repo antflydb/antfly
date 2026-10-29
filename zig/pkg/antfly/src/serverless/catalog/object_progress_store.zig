@@ -331,6 +331,10 @@ pub const ObjectProgressStore = struct {
         if (expected) |prior| if (deadline < prior) return false;
         const key = try self.pinKey(namespace, version);
         defer self.alloc.free(key);
+        return self.casNumberFor(key, expected, deadline, context);
+    }
+    fn casNumberFor(self: *ObjectProgressStore, key: []const u8, expected: ?u64, deadline: u64, context: Context) !bool {
+        if (expected) |prior| if (deadline < prior) return false;
         const current = try self.readPinValue(key, context);
         defer if (current) |value| if (value.etag) |etag| self.alloc.free(etag);
         if ((if (current) |value| value.value else null) != expected) return false;
@@ -750,7 +754,64 @@ pub const ObjectProgressStore = struct {
         };
     }
 
+    fn watermarkFor(raw: *anyopaque, ns: []const u8, context: Context) !?u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        const key = try keyAlloc(self.alloc, self.prefix, ns, "GC_WATERMARK");
+        defer self.alloc.free(key);
+        const current = try self.readPinValue(key, context);
+        defer if (current) |value| if (value.etag) |etag| self.alloc.free(etag);
+        return if (current) |value| value.value else null;
+    }
+    fn casWatermarkFor(raw: *anyopaque, ns: []const u8, expected: ?u64, value: u64, context: Context) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        const key = try keyAlloc(self.alloc, self.prefix, ns, "GC_WATERMARK");
+        defer self.alloc.free(key);
+        return self.casNumberFor(key, expected, value, context);
+    }
+    fn casFloorFor(raw: *anyopaque, ns: []const u8, expected: ?u64, value: u64, context: Context) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        const key = try keyAlloc(self.alloc, self.prefix, ns, "MANIFEST_GC_FLOOR");
+        defer self.alloc.free(key);
+        return self.casNumberFor(key, expected, value, context);
+    }
+    fn prunePinsFor(raw: *anyopaque, ns: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken, context: Context) !void {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(raw));
+        const operation: Provider.Operation = .{ .context = context, .cancellation = cancellation };
+        const prefix = try keyAlloc(self.alloc, self.prefix, ns, "READ_PINS/");
+        defer self.alloc.free(prefix);
+        var token: ?[]u8 = null;
+        defer if (token) |value| self.alloc.free(value);
+        while (true) {
+            var page = try operation.list(&self.client, self.bucket, .{ .prefix = prefix, .recursive = true, .max_keys = 256, .continuation_token = token });
+            defer page.deinit(self.alloc);
+            const next = if (page.next_continuation_token) |value| try self.alloc.dupe(u8, value) else null;
+            errdefer if (next) |value| self.alloc.free(value);
+            if (token != null and next != null and std.mem.eql(u8, token.?, next.?)) return error.InvalidContinuationToken;
+            for (page.entries) |entry| {
+                try operation.ready();
+                if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidManifestReadPinKey;
+                const version = std.fmt.parseInt(u64, entry.key[prefix.len..], 10) catch continue;
+                if (version >= floor) continue;
+                const current = try self.readPinValue(entry.key, context) orelse continue;
+                defer if (current.etag) |etag| self.alloc.free(etag);
+                if (current.value >= expired_before) continue;
+                const etag = current.etag orelse return error.MissingObjectEtag;
+                operation.delete(&self.client, self.bucket, entry.key, .{ .if_match_etag = etag }) catch |err| switch (err) {
+                    error.FileNotFound, error.PreconditionFailed => continue,
+                    else => return err,
+                };
+            }
+            if (token) |value| self.alloc.free(value);
+            token = next;
+            if (token == null) return;
+        }
+    }
+
     const vtable: progress_store.ProgressStore.VTable = .{
+        .get_gc_watermark_for = watermarkFor,
+        .cas_gc_watermark_for = casWatermarkFor,
+        .cas_manifest_gc_floor_for = casFloorFor,
+        .prune_manifest_read_deadlines_for = prunePinsFor,
         .get_manifest_gc_floor_for = floorFor,
         .get_manifest_read_deadline_for = pinFor,
         .cas_manifest_read_deadline_for = casPinFor,

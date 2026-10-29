@@ -2551,7 +2551,11 @@ test "serverless execution manifest pins share renewal and join blocked provider
             // Retirement prevents new rights, but does not revoke a live pin
             // before its renewal margin. A failed source must not poison an
             // independent reader registered on the same control worker.
-            try std.testing.expect(try progress.compareAndSwapManifestGcFloor("docs", null, 2));
+            // This mutation belongs to the active independent caller; the
+            // reader parent remains parked while its renewal child runs.
+            var publisher_progress = progress;
+            publisher_progress.context = (@import("antfly_local_sources").serverless_query_lake_read_context.Context{ .io = io }).withExecution(&query);
+            try std.testing.expect(try publisher_progress.compareAndSwapManifestGcFloor("docs", null, 2));
             try pin.check();
             pin.unix_deadline.store(time.realtimeNs() + 2 * std.time.ns_per_s, .release);
             pin.authority_deadline.store(time.authorityNs() + 2 * std.time.ns_per_s, .release);
@@ -2858,4 +2862,179 @@ test "serverless execution held lease disabled scheduling and retired execution 
     var inherited: maintenance.GraphBridge = .{ .maintenance = retired.maintenance.?.withContext(live_bridge.readContext()) };
     const still_invalid = base.withContext(inherited.readContext());
     try std.testing.expectError(error.InvalidRunnableTransition, still_invalid.acquire("retired", "one", leases.nowUnixNs(std.testing.io), 30 * std.time.ns_per_s));
+}
+
+test "serverless execution retention joins canceled WAL I/O and resumes native and object pruning" {
+    const local = @import("antfly_local_sources");
+    const stores = @import("serverless/artifacts/mod.zig");
+    const manifests_mod = @import("serverless/manifest/mod.zig");
+    const progress_mod = @import("serverless/catalog/mod.zig");
+    const wal_mod = @import("serverless/wal/mod.zig");
+    const builds = @import("serverless/build/mod.zig");
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const objectstore = @import("objectstore");
+    const Fixture = struct {
+        threaded: std.Io.Threaded,
+        wal: wal_mod.WalStore,
+        entered: std.atomic.Value(bool) = .init(false),
+        armed: std.atomic.Value(bool) = .init(false),
+        release: std.Io.Event = .unset,
+        fn sync(raw: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(raw.?));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            const io = threaded.io();
+            if (self.armed.swap(false, .acq_rel)) {
+                self.entered.store(true, .release);
+                self.release.waitUncancelable(io);
+            }
+            return io.vtable.fileSync(raw, file);
+        }
+        fn truncate(raw: *anyopaque, namespace: []const u8, keep: u64, context: local.serverless_query_lake_read_context.Context) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.armed.store(true, .release);
+            var wal = self.wal;
+            wal.context = context;
+            return wal.truncatePrefix(namespace, keep);
+        }
+    };
+    const Job = struct {
+        pruner: *builds.Pruner,
+        token: maintenance.Token,
+        result: ?builds.PruneResult = null,
+        cause: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.result = self.pruner.pruneNamespaceUntil("docs", 1, self.token) catch |err| {
+                self.cause = err;
+                return;
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |objects| for ([_]bool{ false, true }) |cancel| {
+        var directory = try local.common_test_directory.TestDirectory.init("retention-admission");
+        defer directory.cleanup();
+        const artifact_root = try std.fs.path.join(a, &.{ directory.path(), "artifacts" });
+        defer a.free(artifact_root);
+        const metadata_root = try std.fs.path.join(a, &.{ directory.path(), "metadata" });
+        defer a.free(metadata_root);
+        const wal_root = try std.fs.path.join(a, &.{ directory.path(), "wal" });
+        defer a.free(wal_root);
+        var native_artifacts = try stores.FsStore.init(a, artifact_root);
+        defer native_artifacts.deinit();
+        var native_manifests = try manifests_mod.FsStore.init(a, metadata_root);
+        defer native_manifests.deinit();
+        var native_progress = try progress_mod.FsProgressStore.init(a, metadata_root);
+        defer native_progress.deinit();
+        var native_wal = try wal_mod.FsStore.init(a, wal_root);
+        defer native_wal.deinit();
+        var fixture: Fixture = .{ .threaded = .init(a, .{}), .wal = undefined };
+        defer fixture.threaded.deinit();
+        var io = fixture.threaded.io();
+        var io_vtable = io.vtable.*;
+        io_vtable.fileSync = Fixture.sync;
+        io.vtable = &io_vtable;
+        var filesystem = try objectstore.FilesystemClient.initWithIo(a, directory.path(), io);
+        defer filesystem.deinit();
+        var object_artifacts = try @import("serverless/artifacts/object_store.zig").ObjectStore.initWithClientOptions(a, filesystem.client(), "objects", "", .{ .ensure_bucket = true, .filesystem = &filesystem });
+        defer object_artifacts.deinit();
+        var object_manifests = try @import("serverless/manifest/object_store.zig").ObjectStore.initWithClient(a, filesystem.client(), "metadata", "");
+        defer object_manifests.deinit();
+        var object_progress = try @import("serverless/catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(a, filesystem.client(), "metadata", "");
+        defer object_progress.deinit();
+        var object_wal = try @import("serverless/wal/object_store.zig").ObjectStore.initWithClient(a, filesystem.client(), "wal", "");
+        defer object_wal.deinit();
+        var artifacts = if (objects) object_artifacts.artifactStore() else native_artifacts.artifactStore();
+        var manifests = if (objects) object_manifests.manifestStore() else native_manifests.manifestStore();
+        var progress = if (objects) object_progress.progressStore() else native_progress.progressStore();
+        var wal = if (objects) object_wal.walStore() else native_wal.walStore();
+        var builder = builds.Builder.init(a, &artifacts, &manifests, &progress, &wal);
+        var api = @import("serverless/api/service.zig").Service.init(a, &wal, &builder);
+        for ([_][]const u8{ "alpha", "beta", "gamma" }, 1..) |body, timestamp| {
+            var accepted = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = timestamp, .mutations = &.{.{ .kind = .upsert, .doc_id = "a", .body = body }} });
+            defer accepted.deinit(a);
+            var published = try builder.publishNamespace("docs");
+            defer published.deinit(a);
+            try std.testing.expect(published.published);
+        }
+        const latest = try wal.latestLsn("docs");
+        fixture.wal = wal;
+        var wal_vtable = wal.vtable.*;
+        wal_vtable.truncate_prefix_for = Fixture.truncate;
+        var observed_wal = wal;
+        observed_wal.ptr = &fixture;
+        observed_wal.vtable = &wal_vtable;
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .publication_slots = 1, .read_isolation = false });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = io }, .background);
+        defer execution.finish();
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var pruner = builds.Pruner.init(a, &artifacts, &manifests, &progress, &observed_wal);
+        const gc_now = @import("antfly_platform").time.realtimeNs() + @import("serverless/manifest/read_lease.zig").duration_ns + @import("serverless/manifest/read_lease.zig").gc_grace_ns + 1;
+        pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
+            fn now(raw: *const anyopaque) u64 {
+                return @as(*const u64, @ptrCast(@alignCast(raw))).*;
+            }
+        }.now };
+        var job: Job = .{ .pruner = &pruner, .token = .{ .io = io, .execution = &execution, .requested = &canceled } };
+        defer if (job.result) |*result| result.deinit(a);
+        var task = try io.concurrent(Job.run, .{&job});
+        defer {
+            fixture.release.set(io);
+            task.cancel(io);
+        }
+        const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (!fixture.entered.load(.acquire)) {
+            if (job.done.load(.acquire)) return job.cause orelse error.RetentionDidNotReachWal;
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.RetentionDidNotReachWal;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        query.finish();
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        if (cancel) {
+            canceled.store(true, .release);
+            try io.sleep(.fromMilliseconds(3), .awake);
+            try std.testing.expect(!job.done.load(.acquire));
+        }
+        fixture.release.set(io);
+        task.await(io);
+        if (cancel) {
+            try std.testing.expectEqual(error.Canceled, job.cause.?);
+            try std.testing.expect(job.result == null);
+            execution.finish();
+            try execution.start(&scheduler, .{ .io = io }, .background);
+            canceled.store(false, .release);
+            job.result = try pruner.pruneNamespaceUntil("docs", 1, job.token);
+        } else if (job.cause) |err| return err;
+        try std.testing.expectEqual(@as(u64, 3), try progress.getHead("docs"));
+        const versions = try manifests.listVersionsAlloc("docs");
+        defer a.free(versions);
+        try std.testing.expectEqualSlices(u64, &.{3}, versions);
+        var head = try manifests.getAlloc("docs", 3);
+        defer head.deinit(a);
+        try std.testing.expectEqual(@as(u64, 1), head.stats.document_count);
+        for (head.artifacts) |artifact| {
+            const bytes = try artifacts.getAlloc(artifact.artifact_id);
+            a.free(bytes);
+        }
+        const records = try wal.readFromAlloc("docs", 1);
+        defer wal_mod.freeRecords(a, records);
+        try std.testing.expect(records.len != 0);
+        try std.testing.expect(records[0].lsn >= job.result.?.wal_keep_from_lsn);
+        try std.testing.expectEqual(latest, try wal.latestLsn("docs"));
+        try std.testing.expectEqual(latest + 1, try wal.append("docs", 4, "next"));
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        try std.testing.expect(artifacts.write_context == null and manifests.context == null and progress.context == null and wal.context == null);
+    };
 }

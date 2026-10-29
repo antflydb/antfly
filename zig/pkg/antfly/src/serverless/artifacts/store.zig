@@ -284,6 +284,11 @@ pub const ArtifactStore = struct {
     }
 
     pub const VTable = struct {
+        delete_for: ?*const fn (*anyopaque, []const u8, CancellationToken, ReadContext) anyerror!void = null,
+        visit_scoped_uploads_for: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken, ReadContext) anyerror!void = null,
+        reclaim_retired_scoped_inventory_for: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken, ReadContext) anyerror!void = null,
+        cleanup_retired_scoped_temporaries_for: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken, ReadContext) anyerror!void = null,
+
         put_for: ?*const fn (*anyopaque, Allocator, ?UploadScope, []const u8, CancellationToken, ReadContext) anyerror!ArtifactMetadata = null,
         object_store: ?*const fn (*anyopaque) *@import("object_store.zig").ObjectStore = null,
         retention_witness: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!?RetentionWitness = null,
@@ -399,6 +404,7 @@ pub const ArtifactStore = struct {
     pub fn visitScopedUploads(self: *ArtifactStore, domain: [32]u8, visitor: ScopedUploadVisitor, cancellation: CancellationToken) !void {
         if (std.mem.allEqual(u8, &domain, 0)) return error.InvalidArtifactUploadScope;
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.visit_scoped_uploads_for) |call| return call(self.ptr, domain, visitor, cancellation, context);
         const visit = self.vtable.visit_scoped_uploads orelse return error.ArtifactUploadScopesUnsupported;
         try visit(self.ptr, domain, visitor, cancellation);
     }
@@ -408,6 +414,7 @@ pub const ArtifactStore = struct {
     pub fn reclaimRetiredScopedInventory(self: *ArtifactStore, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
         if (std.mem.allEqual(u8, &domain, 0) or floor > cutoff or cutoff == 0) return error.InvalidArtifactUploadScope;
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.reclaim_retired_scoped_inventory_for) |call| return call(self.ptr, domain, floor, cutoff, cancellation, context);
         if (self.vtable.reclaim_retired_scoped_inventory) |reclaim| try reclaim(self.ptr, domain, floor, cutoff, cancellation);
     }
 
@@ -422,6 +429,7 @@ pub const ArtifactStore = struct {
         if (cutoff == 0 or std.mem.allEqual(u8, &domain, 0)) return error.InvalidArtifactUploadScope;
         if (floor > cutoff) return error.InvalidArtifactUploadScope;
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.cleanup_retired_scoped_temporaries_for) |call| return call(self.ptr, domain, floor, cutoff, cancellation, context);
         if (self.vtable.cleanup_retired_scoped_temporaries) |cleanup| try cleanup(self.ptr, domain, floor, cutoff, cancellation);
     }
 
@@ -881,6 +889,7 @@ pub const ArtifactStore = struct {
     }
     pub fn deleteWithCancellation(self: *ArtifactStore, artifact_id: []const u8, token: CancellationToken) !void {
         try token.check();
+        if (self.write_context) |context| if (self.vtable.delete_for) |call| return call(self.ptr, artifact_id, token, context);
         if (self.vtable.delete_with_cancellation) |call| try call(self.ptr, artifact_id, token) else try self.vtable.delete(self.ptr, artifact_id);
         try token.check();
     }

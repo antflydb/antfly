@@ -35,6 +35,7 @@ pub const WalStore = struct {
         append_idempotent_if_latest: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, u64) anyerror!?u64 = null,
         read_from_alloc: *const fn (*anyopaque, Allocator, []const u8, u64) anyerror![]wal_types.Record,
         latest_lsn: *const fn (*anyopaque, []const u8) anyerror!u64,
+        truncate_prefix_for: ?*const fn (*anyopaque, []const u8, u64, Context) anyerror!u64 = null,
         truncate_prefix: *const fn (*anyopaque, []const u8, u64) anyerror!u64,
     };
 
@@ -114,6 +115,7 @@ pub const WalStore = struct {
     }
 
     pub fn truncatePrefix(self: *WalStore, namespace: []const u8, keep_from_lsn: u64) !u64 {
+        if (self.context) |context| if (self.vtable.truncate_prefix_for) |call| return call(self.ptr, namespace, keep_from_lsn, context);
         return try self.vtable.truncate_prefix(self.ptr, namespace, keep_from_lsn);
     }
 };

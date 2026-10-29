@@ -31,6 +31,10 @@ pub const ManifestStore = struct {
     context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        delete_version_for: ?*const fn (*anyopaque, []const u8, u64, Context) anyerror!void = null,
+        delete_retired_candidate_for: ?*const fn (*anyopaque, []const u8, u64, u64, Context) anyerror!bool = null,
+        cleanup_retired_temporaries_for: ?*const fn (*anyopaque, []const u8, u64, CancellationToken, Context) anyerror!void = null,
+
         list_versions_for: ?*const fn (*anyopaque, Allocator, []const u8, Context) anyerror![]u64 = null,
         get_alloc_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, CancellationToken, Context) anyerror!manifest_types.Manifest = null,
         put_for: ?*const fn (*anyopaque, manifest_types.Manifest, Context) anyerror!void = null,
@@ -100,6 +104,7 @@ pub const ManifestStore = struct {
     }
 
     pub fn deleteVersion(self: *ManifestStore, namespace: []const u8, version: u64) !void {
+        if (self.context) |context| if (self.vtable.delete_version_for) |call| return call(self.ptr, namespace, version, context);
         try self.vtable.delete_version(self.ptr, namespace, version);
     }
 
@@ -108,6 +113,7 @@ pub const ManifestStore = struct {
     /// must be atomic against immutable creation, never GET followed by DELETE.
     pub fn deleteRetiredCandidate(self: *ManifestStore, namespace: []const u8, version: u64, cutoff: u64) !bool {
         if (cutoff == 0) return error.InvalidPublicationFence;
+        if (self.context) |context| if (self.vtable.delete_retired_candidate_for) |call| return call(self.ptr, namespace, version, cutoff, context);
         const remove = self.vtable.delete_retired_candidate orelse return error.ConditionalManifestDeletionUnsupported;
         return remove(self.ptr, namespace, version, cutoff);
     }
@@ -117,6 +123,7 @@ pub const ManifestStore = struct {
     pub fn cleanupRetiredTemporaries(self: *ManifestStore, namespace: []const u8, cutoff: u64, cancellation: CancellationToken) !void {
         try cancellation.check();
         if (cutoff == 0) return error.InvalidPublicationFence;
+        if (self.context) |context| if (self.vtable.cleanup_retired_temporaries_for) |call| return call(self.ptr, namespace, cutoff, cancellation, context);
         if (self.vtable.cleanup_retired_temporaries) |cleanup| try cleanup(self.ptr, namespace, cutoff, cancellation);
     }
 

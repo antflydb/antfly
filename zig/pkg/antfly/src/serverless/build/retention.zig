@@ -88,19 +88,24 @@ pub const Pruner = struct {
         if (self.limits.max_working_set_bytes == 0) return error.InvalidGarbageCollectionLimits;
         var working_set = try WorkingSetAllocator.init(self.alloc, .{ .max_working_set_bytes = self.limits.max_working_set_bytes });
         const operation_alloc = working_set.allocator();
+        var artifacts = self.artifacts.*;
         var manifests = self.manifests.*;
         manifests.allocator = operation_alloc;
         var progress = self.progress.*;
         var wal = self.wal.*;
-        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
-        if (cancellation != null and cancellation.?.execution != null) {
-            const context = bridge.readContext();
-            manifests.context = context;
-            progress.context = context;
-            wal.context = context;
+        var artifact_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = if (cancellation) |token| token.withContext(self.artifacts.write_context) else null };
+        var manifest_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = if (cancellation) |token| token.withContext(self.manifests.context) else null };
+        var progress_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = if (cancellation) |token| token.withContext(self.progress.context) else null };
+        var wal_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = if (cancellation) |token| token.withContext(self.wal.context) else null };
+        if (cancellation != null) {
+            artifacts.write_context = artifact_bridge.readContext();
+            manifests.context = manifest_bridge.readContext();
+            progress.context = progress_bridge.readContext();
+            wal.context = wal_bridge.readContext();
         }
         var operation_pruner = self.*;
         operation_pruner.alloc = operation_alloc;
+        operation_pruner.artifacts = &artifacts;
         operation_pruner.manifests = &manifests;
         operation_pruner.progress = &progress;
         operation_pruner.wal = &wal;
@@ -249,6 +254,7 @@ pub const Pruner = struct {
         var graph_write_bytes: u64 = 0;
         var graph_pages: graph_page_store.PageStore = .{
             .artifacts = self.artifacts,
+            .read_context = self.artifacts.write_context orelse .{},
             .cancellation = graph_bridge.token(),
             .remaining_read_bytes = &graph_read_bytes,
             .remaining_write_bytes = &graph_write_bytes,

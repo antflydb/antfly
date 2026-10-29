@@ -20,6 +20,9 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const wal_types = @import("types.zig");
 const wal_store = @import("store.zig");
 const record_codec = @import("object_store.zig");
+const Provider = @import("../provider_operation.zig");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
+const WriteControl = @import("httpx").socket.WriteControl;
 const Execution = @import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution;
 
 pub const FsStore = struct {
@@ -233,32 +236,57 @@ pub const FsStore = struct {
     }
 
     pub fn truncatePrefix(self: *FsStore, namespace: []const u8, keep_from_lsn: u64) !u64 {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        var lock_io_impl = threadedIo();
-        defer lock_io_impl.deinit();
-        const lock_io = lock_io_impl.io();
-        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
-        defer namespace_lock.close(lock_io);
-        try namespace_lock.lock(lock_io, .exclusive);
-        defer namespace_lock.unlock(lock_io);
+        return self.truncatePrefixOperation(namespace, keep_from_lsn, null);
+    }
+
+    fn truncatePrefixFor(raw: *anyopaque, namespace: []const u8, keep_from_lsn: u64, context: Context) !u64 {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        defer guard.deinit();
+        try guard.lock(&self.mutex);
+        const operation = guard.operation();
+        const removed = try self.truncatePrefixOperation(namespace, keep_from_lsn, &operation);
+        try guard.finish();
+        return removed;
+    }
+
+    fn discardFile(file: std.Io.File, args: anytype) void {
+        file.close(args[1]);
+    }
+
+    fn truncatePrefixOperation(self: *FsStore, namespace: []const u8, keep_from_lsn: u64, operation: ?*const Provider.Operation) !u64 {
+        if (operation == null) lockAtomic(&self.mutex);
+        defer if (operation == null) self.mutex.unlock();
+        var fallback: ?std.Io.Threaded = if (operation == null) threadedIo() else null;
+        defer if (fallback) |*value| value.deinit();
+        const io = if (operation) |op| try op.receiver() else fallback.?.io();
+        const control: WriteControl = if (operation) |op| op.control() else .{};
+        if (operation) |op| try op.ready();
+        const lock_path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, ".wal.lock" });
+        defer self.alloc.free(lock_path);
+        try control.withWait(fs_paths.createDirPathPortable, .{ io, std.fs.path.dirname(lock_path).? });
+        var rejected = false;
+        const namespace_lock = try control.withOwnedWait(&rejected, fs_paths.createFilePortable, .{ io, lock_path, std.Io.Dir.CreateFileOptions{ .truncate = false, .read = true } }, discardLockFile);
+        defer namespace_lock.close(io);
+        while (!try control.withWait(std.Io.File.tryLock, .{ namespace_lock, io, std.Io.File.Lock.exclusive })) {
+            if (operation) |op| try op.sleep(1) else try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        defer namespace_lock.unlock(io);
 
         const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(log_path);
         const next_path = try nextLsnPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(next_path);
-        if (!fileExists(log_path)) return 0;
-
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        const source = try std.Io.Dir.cwd().openFile(io, log_path, .{});
+        const source = control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, log_path, std.Io.Dir.OpenFileOptions{} }, discardFile) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
         defer source.close(io);
-        var scanner: LogScanner = .{ .file = source, .io = io, .length = try source.length(io) };
+        var scanner: LogScanner = .{ .file = source, .io = io, .control = control, .length = try control.withWait(std.Io.File.length, .{ source, io }) };
         const tmp_path = try temporaryPath(self.alloc, log_path);
         defer self.alloc.free(tmp_path);
         defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-        var output = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+        const output = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, tmp_path, std.Io.Dir.CreateFileOptions{ .truncate = true } }, discardFile);
         var output_open = true;
         defer if (output_open) output.close(io);
         var removed: u64 = 0;
@@ -266,28 +294,36 @@ pub const FsStore = struct {
         var output_bytes: u64 = 0;
         var scratch: [32 * 1024]u8 = undefined;
         while (try scanner.next()) |record| {
+            if (operation) |op| try op.ready();
             latest = record.lsn;
             if (record.lsn < keep_from_lsn) {
                 removed += 1;
                 continue;
             }
-            try copyRange(source, output, io, record.offset, output_bytes, record.next_offset - record.offset, &scratch);
+            try copyRangeControlled(source, output, io, record.offset, output_bytes, record.next_offset - record.offset, &scratch, control);
             output_bytes += record.next_offset - record.offset;
         }
         const next_lsn = try nextAfter(latest);
+        try control.withWait(std.Io.File.sync, .{ output, io });
         output.close(io);
         output_open = false;
         var next = try PreparedNextState.init(self.alloc, next_path, next_lsn, output_bytes);
         defer next.deinit(self.alloc);
         if (output_bytes == 0) {
             // Keep the durable next LSN before removing the last log record.
-            try next.write(next_path);
-            deleteFileIfExists(log_path);
+            try next.writeControlled(next_path, io, control);
+            try control.withWait(std.Io.Dir.deleteFile, .{ std.Io.Dir.cwd(), io, log_path });
+            try control.withWait(fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(log_path).? });
         } else {
-            try renameTemporary(io, tmp_path, log_path);
-            try next.write(next_path);
+            try control.withWait(renameTemporary, .{ io, tmp_path, log_path });
+            try control.withWait(fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(log_path).? });
+            try next.writeControlled(next_path, io, control);
         }
         return removed;
+    }
+
+    fn discardLockFile(file: std.Io.File, args: anytype) void {
+        file.close(args[0]);
     }
 
     const vtable: wal_store.WalStore.VTable = .{
@@ -299,6 +335,7 @@ pub const FsStore = struct {
         .read_from_alloc = erasedReadFromAlloc,
         .latest_lsn = erasedLatestLsn,
         .truncate_prefix = erasedTruncatePrefix,
+        .truncate_prefix_for = truncatePrefixFor,
     };
 
     fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
@@ -421,6 +458,7 @@ const RecordLocation = struct {
 /// The on-disk format is unchanged. Scan only fixed headers and verify every
 /// range against the pinned file length; payload size never drives scratch.
 const LogScanner = struct {
+    control: WriteControl = .{},
     file: std.Io.File,
     io: std.Io,
     length: u64,
@@ -435,7 +473,7 @@ const LogScanner = struct {
         {
             self.buffered_offset = offset;
             self.buffered_len = @intCast(@min(self.length - offset, self.buffer.len));
-            try readExact(self.file, self.io, self.buffer[0..self.buffered_len], offset);
+            try self.control.withWait(readExact, .{ self.file, self.io, self.buffer[0..self.buffered_len], offset });
         }
         @memcpy(bytes, self.buffer[@intCast(offset - self.buffered_offset)..][0..bytes.len]);
     }
@@ -520,11 +558,15 @@ fn temporaryPath(alloc: Allocator, path: []const u8) ![]u8 {
 }
 
 fn copyRange(source: std.Io.File, output: std.Io.File, io: std.Io, start: u64, destination: u64, length: u64, scratch: []u8) !void {
+    return copyRangeControlled(source, output, io, start, destination, length, scratch, .{});
+}
+
+fn copyRangeControlled(source: std.Io.File, output: std.Io.File, io: std.Io, start: u64, destination: u64, length: u64, scratch: []u8, control: WriteControl) !void {
     var done: u64 = 0;
     while (done < length) {
         const count: usize = @intCast(@min(length - done, scratch.len));
-        try readExact(source, io, scratch[0..count], start + done);
-        try output.writePositionalAll(io, scratch[0..count], destination + done);
+        try control.withWait(readExact, .{ source, io, scratch[0..count], start + done });
+        try control.withWait(std.Io.File.writePositionalAll, .{ output, io, scratch[0..count], destination + done });
         done += count;
     }
 }
@@ -654,6 +696,18 @@ const PreparedNextState = struct {
     fn deinit(self: *PreparedNextState, alloc: Allocator) void {
         alloc.free(self.temporary_path);
         self.* = undefined;
+    }
+    fn writeControlled(self: *const PreparedNextState, path: []const u8, io: std.Io, control: WriteControl) !void {
+        defer std.Io.Dir.cwd().deleteFile(io, self.temporary_path) catch {};
+        var rejected = false;
+        const file = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, self.temporary_path, std.Io.Dir.CreateFileOptions{ .truncate = true } }, FsStore.discardFile);
+        {
+            defer file.close(io);
+            try control.withWait(std.Io.File.writePositionalAll, .{ file, io, self.payload[0..self.payload_len], @as(u64, 0) });
+            try control.withWait(std.Io.File.sync, .{ file, io });
+        }
+        try control.withWait(renameTemporary, .{ io, self.temporary_path, path });
+        try control.withWait(fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(path).? });
     }
     fn write(self: *const PreparedNextState, path: []const u8) !void {
         try writeFileAtomicallyPrepared(path, self.temporary_path, self.payload[0..self.payload_len]);

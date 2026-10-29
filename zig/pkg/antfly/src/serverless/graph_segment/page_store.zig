@@ -51,6 +51,8 @@ pub const PageStore = struct {
     /// Explicitly borrowed by synchronous publication tree operations only.
     /// Async readers keep their independent scheduling and never inherit this.
     read_phase: ?*const artifacts.IoPhase = null,
+    /// Synchronous retention reads keep the collector's original authority.
+    read_context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{},
     pub fn admitPublication(self: *PageStore) void {
         self.pack_pages = true;
         if (self.artifacts.io_phase) |phase| {
@@ -80,7 +82,7 @@ pub const PageStore = struct {
             try cache.read(cache.ptr, alloc, self.artifacts, source, 0, graph.Root.encoded_bytes, try artifacts.sha256DigestFromChecksum(source.checksum), self.cancellation, self.remaining_read_bytes)
         else bytes: {
             try artifacts.chargeReadBudget(self.remaining_read_bytes, source.byte_len);
-            break :bytes try self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, source.artifact_id, 0, graph.Root.encoded_bytes, self.cancellation);
+            break :bytes try self.artifacts.getRangeAllocFor(alloc, source.artifact_id, 0, graph.Root.encoded_bytes, self.cancellation, self.read_context);
         };
         defer alloc.free(bytes);
         if (bytes.len != graph.Root.encoded_bytes) return error.ArtifactIntegrityMismatch;
@@ -152,7 +154,7 @@ pub const PageStore = struct {
             .byte_len = ref.artifactBytes(),
         }, ref.offset(), ref.bytes, ref.digest, self.cancellation, self.remaining_read_bytes);
         try artifacts.chargeReadBudget(self.remaining_read_bytes, ref.bytes);
-        return self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, id, ref.offset(), ref.bytes, self.cancellation);
+        return self.artifacts.getRangeAllocFor(alloc, id, ref.offset(), ref.bytes, self.cancellation, self.read_context);
     }
 
     fn readDecoded(raw: *anyopaque, a: std.mem.Allocator, ref: tree.Ref) !tree.Page {

@@ -1438,3 +1438,56 @@ License headers, formatting and the Apache product boundary pass. The earlier
 cache-file failure and observed removal of the entire worktree cache are
 recorded in `work-lease-cache-removal.json`; the final run reuses the rebuilt
 worktree-local cache.
+
+### Contextual production retention (2026-10-29)
+
+The production pruner now carries its original execution, deadline and
+cancellation through artifact cleanup, manifest discovery/deletion, GC progress
+and read-pin pruning, graph/facts reads and WAL truncation. Its borrowed store
+views and bridges remain alive for the entire pass; shared backend caches and
+mutexes are never copied into those views. Explicit unadmitted cancellation
+also reaches the contextual callbacks.
+
+Native progress and manifest providers loan CPU around physical directory,
+file, synchronization and lock-readiness operations. Parsing, ordering,
+manifest decoding and GC traversal retain admitted CPU. Conditional native
+mutations preserve the existing namespace locks and protected return capacity;
+object mutations preserve conditional ETags, including expired-pin deletion.
+Artifact enumeration and payload deletion use the same context without
+modifying shared object clients. Rejected directory/file opens retire their
+owned handle before returning the original refusal.
+
+Native WAL truncation scans and copies through bounded buffers, loans CPU at
+physical reads/writes, preserves namespace serialization, and synchronizes the
+replacement log and next-LSN sidecar. Removing the entire log still persists
+its next LSN first. Object truncation retains CPU while decoding/encoding and
+passes the original context to conditional provider GET/PUT/DELETE. A canceled
+physical call is joined before the pruning owner returns.
+
+A production-pruner fixture runs against both native stores and a real local
+filesystem object client. It blocks actual WAL synchronization after manifest
+and artifact cleanup, verifies unrelated query and protected health progress,
+cancels without detaching physical I/O, then resumes pruning with a new admitted
+owner. It checks the retained manifest and readable artifacts, WAL retention,
+monotonic LSNs and complete scheduler ownership retirement. The existing managed
+publication/compaction/pruning path and retention concurrency/cancellation cases
+remain covered; native WAL reopen, allocation-refusal, malformed-input and
+cross-instance append tests cover the changed streaming helpers. The read-pin
+fixture's independent GC-floor update now uses its active publisher execution,
+rather than its parked reader parent.
+
+This completes the contextual retention provider milestone, not the full
+design. Retained-closure metadata journals and other metadata-holder critical
+sections still conservatively retain CPU and need their own integrated owner
+boundaries. Remaining immutable-artifact and preparation paths, serial graph
+checkpoints, vendor/framework preparation and the unresolved file-engine FD
+recovery gate remain open. These deterministic physical-provider fixtures do
+not qualify live cloud or an installed native CLI. Full qualification remains
+waived.
+
+Evidence: `retention-provider-v8-final.json` records the final lifecycle,
+background-execution and SQL-lake admission checks with unchanged native inputs.
+The combined run passes 70/70 build steps and 47/47 lifecycle tests; local
+dependency tests also pass. `retention-admission-final.json` binds the committed
+files to those tested inputs and retained source snapshots. Formatting, license
+headers and the Apache product boundary pass.

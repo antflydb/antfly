@@ -107,10 +107,77 @@ pub const Operation = struct {
         try self.ready();
         return result;
     }
+    pub fn delete(self: *const Operation, client: *objectstore.Client, bucket: []const u8, key: []const u8, options: objectstore.DeleteOptions) !void {
+        try self.ready();
+        var opts = options;
+        opts.cancellation = self.token();
+        client.deleteObject(bucket, key, opts) catch |err| {
+            try self.check();
+            return err;
+        };
+        try self.ready();
+    }
+    pub fn receiver(self: *const Operation) !std.Io {
+        return self.context.io orelse error.BackendRuntimeIoUnavailable;
+    }
+    pub fn control(self: *const Operation) @import("httpx").socket.WriteControl {
+        return self.token().execution_wait orelse .{};
+    }
+    fn discardFile(file: std.Io.File, args: anytype) void {
+        file.close(args[1]);
+    }
+    fn discardDir(dir: std.Io.Dir, args: anytype) void {
+        dir.close(args[1]);
+    }
+    pub fn openDir(self: *const Operation, path: []const u8) !std.Io.Dir {
+        return self.openDirAt(std.Io.Dir.cwd(), path, .{ .iterate = true });
+    }
+    pub fn openDirAt(self: *const Operation, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
+        try self.ready();
+        var rejected = false;
+        return self.control().withOwnedWait(&rejected, std.Io.Dir.openDir, .{ dir, try self.receiver(), path, options }, discardDir);
+    }
+
+    pub fn readFile(self: *const Operation, a: std.mem.Allocator, path: []const u8, maximum: usize) ![]u8 {
+        try self.ready();
+        const receiver_io = try self.receiver();
+        const wait = self.control();
+        var rejected = false;
+        const file = wait.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), receiver_io, path, std.Io.Dir.OpenFileOptions{} }, discardFile) catch |err| {
+            try self.check();
+            return err;
+        };
+        defer file.close(receiver_io);
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(a);
+        var buffer: [8192]u8 = undefined;
+        while (true) {
+            const n = wait.withWait(std.Io.File.readStreaming, .{ file, receiver_io, &.{&buffer} }) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    try self.check();
+                    return err;
+                },
+            };
+            if (n == 0) break;
+            try self.ready();
+            if (n > maximum -| bytes.items.len) return error.StreamTooLong;
+            try bytes.appendSlice(a, buffer[0..n]);
+        }
+        try self.ready();
+        return bytes.toOwnedSlice(a);
+    }
+    pub fn removeFile(self: *const Operation, path: []const u8) !void {
+        try self.ready();
+        const receiver_io = try self.receiver();
+        try self.control().withWait(std.Io.Dir.deleteFile, .{ std.Io.Dir.cwd(), receiver_io, path });
+        if (std.fs.path.dirname(path)) |parent| try self.control().withWait(@import("antfly_runtime_fs").fs_paths.syncDirPortable, .{ receiver_io, parent });
+        try self.ready();
+    }
     pub fn sleep(self: *const Operation, milliseconds: u64) !void {
         const io = self.context.io orelse return error.BackendRuntimeIoUnavailable;
-        const control: @import("httpx").socket.WriteControl = self.token().execution_wait orelse .{};
-        try control.withWait(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(@intCast(milliseconds)), std.Io.Clock.awake });
+        const wait: @import("httpx").socket.WriteControl = self.token().execution_wait orelse .{};
+        try wait.withWait(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(@intCast(milliseconds)), std.Io.Clock.awake });
         try self.ready();
     }
 };

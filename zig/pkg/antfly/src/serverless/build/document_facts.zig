@@ -595,7 +595,7 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
         try cache.read(cache.ptr, alloc, pages.artifacts, source, 0, source.byte_len, try artifacts.sha256DigestFromChecksum(source.checksum), pages.cancellation, pages.remaining_read_bytes)
     else bytes: {
         try artifacts.chargeReadBudget(pages.remaining_read_bytes, source.byte_len);
-        break :bytes try pages.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, source.artifact_id, 0, source.byte_len, pages.cancellation);
+        break :bytes try pages.artifacts.getRangeAllocFor(alloc, source.artifact_id, 0, source.byte_len, pages.cancellation, pages.read_context);
     };
     defer alloc.free(bytes);
     try artifacts.validatePayloadSha256WithCancellation(bytes, source.checksum, pages.cancellation);

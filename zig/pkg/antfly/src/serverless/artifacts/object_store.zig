@@ -259,11 +259,20 @@ pub const ObjectStore = struct {
     }
 
     pub fn usesObjectVersions(self: *ObjectStore, token: CancellationToken) !bool {
+        return self.usesObjectVersionsFor(token, .{});
+    }
+    fn usesObjectVersionsFor(self: *ObjectStore, token: CancellationToken, context: ReadContext) !bool {
         try token.check();
         if (self.fs_client != null) return false;
         const held = self.version_operations.load(.acquire);
         if (held != 0) return held == 2;
-        const supported = try self.client.supportsObjectVersions(self.bucket, objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn));
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
+        const supported = self.client.supportsObjectVersions(self.bucket, op.token()) catch |err| {
+            try op.check();
+            return err;
+        };
+        try op.ready();
         self.version_operations.store(if (supported) 2 else 1, .release);
         return supported;
     }
@@ -719,14 +728,19 @@ pub const ObjectStore = struct {
         return self.deleteWithCancellation(artifact_id, .none);
     }
     pub fn deleteWithCancellation(self: *ObjectStore, artifact_id: []const u8, token: CancellationToken) !void {
+        return self.deleteForOperation(artifact_id, token, .{});
+    }
+    fn deleteForOperation(self: *ObjectStore, artifact_id: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
         try token.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
         if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, .none);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
-        if (try self.usesObjectVersions(token)) {
-            try self.deleteVersions(key, token);
-        } else try self.client.deleteObject(self.bucket, key, .{ .cancellation = objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) });
+        if (try self.usesObjectVersionsFor(token, context)) {
+            try self.deleteVersionsFor(key, token, context);
+        } else try op.delete(&self.client, self.bucket, key, .{});
         if (self.local_inventory) |*fs| try @import("retained_closure.zig").forget(fs, artifact_id);
         lockAtomic(&self.verified_mu);
         defer self.verified_mu.unlock();
@@ -740,23 +754,34 @@ pub const ObjectStore = struct {
     /// Called only after the collector proved this artifact name is absent
     /// from every live closure. Never issue a current-name delete marker.
     fn deleteVersions(self: *ObjectStore, key: []const u8, token: CancellationToken) !void {
+        return self.deleteVersionsFor(key, token, .{});
+    }
+    fn deleteVersionsFor(self: *ObjectStore, key: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
         var deleted: usize = 0;
         while (true) {
-            try token.check();
-            const remote_token = objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn);
-            var page = try self.client.listObjectVersions(self.bucket, .{ .prefix = key, .max_keys = 128, .cancellation = remote_token });
+            try op.ready();
+            const remote_token = op.token();
+            var page = self.client.listObjectVersions(self.bucket, .{ .prefix = key, .max_keys = 128, .cancellation = remote_token }) catch |err| {
+                try op.check();
+                return err;
+            };
             defer page.deinit(self.client.allocator);
             var found = false;
             var protected = false;
             for (page.entries) |entry| {
-                try token.check();
+                try op.ready();
                 if (!std.mem.eql(u8, entry.key, key)) continue;
                 found = true;
                 if (deleted == 256) return error.ArtifactVersionDeletionPaused;
-                self.client.deleteObject(self.bucket, key, .{ .version_id = entry.version_id, .cancellation = remote_token }) catch |err| switch (err) {
+                op.delete(&self.client, self.bucket, key, .{ .version_id = entry.version_id }) catch |err| switch (err) {
                     error.FileNotFound => {},
                     error.AccessDenied, error.PreconditionFailed => {
-                        const proof = try self.client.versionRetention(self.bucket, key, entry.version_id, remote_token);
+                        const proof = self.client.versionRetention(self.bucket, key, entry.version_id, remote_token) catch |failure| {
+                            try op.check();
+                            return failure;
+                        };
+                        try op.ready();
                         if (proof == null) return err;
                         protected = true;
                     },
@@ -764,6 +789,7 @@ pub const ObjectStore = struct {
                 };
                 deleted += 1;
             }
+            try op.ready();
             if (protected) return error.ArtifactRetentionActive;
             if (!found) return;
         }
@@ -828,8 +854,14 @@ pub const ObjectStore = struct {
     }
 
     fn visitScopedUploads(self: *ObjectStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        return self.visitForOperation(domain, visitor, cancellation, .{});
+    }
+    fn visitForOperation(self: *ObjectStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken, context: ReadContext) !void {
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+        try op.ready();
         if (!self.read_only and visitor.checkpoint != null) if (self.local_inventory) |*inventory| {
             var local_store = inventory.artifactStore();
+            local_store.write_context = context;
             return local_store.visitScopedUploads(domain, visitor, cancellation);
         };
         const prefix = if (self.prefix.len == 0)
@@ -837,28 +869,28 @@ pub const ObjectStore = struct {
         else
             try std.fmt.allocPrint(self.alloc, "{s}/graph/{s}/", .{ self.prefix, std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(prefix);
-        if (try self.usesObjectVersions(cancellation)) return self.visitVersionedScopes(domain, prefix, visitor, cancellation);
+        if (try self.usesObjectVersionsFor(cancellation, context)) return self.visitVersionedScopesFor(domain, prefix, visitor, cancellation, context);
         const start = if (visitor.after_suffix) |after| try std.mem.concat(self.alloc, u8, &.{ prefix, after }) else null;
         defer if (start) |key| self.alloc.free(key);
         var visited: usize = 0;
         var token: ?[]u8 = null;
         defer if (token) |value| self.alloc.free(value);
         while (true) {
-            try cancellation.check();
-            var page = try self.client.listObjects(self.bucket, .{
+            try op.ready();
+            var page = try op.list(&self.client, self.bucket, .{
                 .prefix = prefix,
                 .recursive = true,
                 .max_keys = 256,
                 .continuation_token = token,
                 .start_after = if (token == null) start else null,
-                .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+                .cancellation = op.token(),
             });
             defer page.deinit(self.client.allocator);
             var next = if (page.next_continuation_token) |value| try self.alloc.dupe(u8, value) else null;
             errdefer if (next) |value| self.alloc.free(value);
             if (token != null and next != null and std.mem.eql(u8, token.?, next.?)) return error.InvalidContinuationToken;
             for (page.entries) |entry| {
-                try cancellation.check();
+                try op.ready();
                 if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidArtifactId;
                 const suffix = entry.key[prefix.len..];
                 if (suffix.len != 97 or suffix[32] != '/') continue;
@@ -880,7 +912,8 @@ pub const ObjectStore = struct {
         }
     }
 
-    fn visitVersionedScopes(self: *ObjectStore, domain: [32]u8, prefix: []const u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+    fn visitVersionedScopesFor(self: *ObjectStore, domain: [32]u8, prefix: []const u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken, context: ReadContext) !void {
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
         const Position = struct { key: ?[]const u8 = null, version: ?[]const u8 = null, page_token: ?[]const u8 = null };
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -889,11 +922,14 @@ pub const ObjectStore = struct {
         defer if (start) |value| self.alloc.free(value);
         var visited: usize = 0;
         while (true) {
-            try cancellation.check();
-            var page = try self.client.listObjectVersions(self.bucket, .{ .prefix = prefix, .max_keys = 256, .key_marker = position.key, .version_id_marker = position.version, .continuation_token = position.page_token, .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn) });
+            try op.ready();
+            var page = self.client.listObjectVersions(self.bucket, .{ .prefix = prefix, .max_keys = 256, .key_marker = position.key, .version_id_marker = position.version, .continuation_token = position.page_token, .cancellation = op.token() }) catch |err| {
+                try op.check();
+                return err;
+            };
             defer page.deinit(self.client.allocator);
             for (page.entries) |entry| {
-                try cancellation.check();
+                try op.ready();
                 if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidArtifactId;
                 if (start) |after| if (std.mem.order(u8, entry.key, after) != .gt) continue;
                 const suffix = entry.key[prefix.len..];
@@ -909,6 +945,7 @@ pub const ObjectStore = struct {
                 try artifact_store.visitScopedSuffix(domain, suffix, visitor);
                 visited += 1;
             }
+            try op.ready();
             if (!page.is_truncated) return;
             const next: Position = .{ .key = page.next_key_marker, .version = page.next_version_id_marker, .page_token = page.next_continuation_token };
             if (next.key == null and next.page_token == null) return error.InvalidListVersionsResponse;
@@ -965,6 +1002,10 @@ pub const ObjectStore = struct {
         return @ptrCast(@alignCast(raw));
     }
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .delete_for = deleteFor,
+        .visit_scoped_uploads_for = visitFor,
+        .reclaim_retired_scoped_inventory_for = reclaimFor,
+        .cleanup_retired_scoped_temporaries_for = cleanupFor,
         .object_store = objectStore,
         .retention_witness = retentionWitness,
         .retained_closure = retainedClosure,
@@ -997,6 +1038,30 @@ pub const ObjectStore = struct {
         self.deinit();
     }
 
+    fn deleteFor(raw: *anyopaque, id: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        return self.deleteForOperation(id, token, context);
+    }
+    fn visitFor(raw: *anyopaque, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        return self.visitForOperation(domain, visitor, token, context);
+    }
+    fn reclaimFor(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*inventory| {
+            var store = inventory.artifactStore();
+            store.write_context = context;
+            try store.reclaimRetiredScopedInventory(domain, floor, cutoff, token);
+        }
+    }
+    fn cleanupFor(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*inventory| {
+            var store = inventory.artifactStore();
+            store.write_context = context;
+            try store.cleanupRetiredScopedTemporaryRange(domain, floor, cutoff, token);
+        }
+    }
     fn erasedPutFor(ptr: *anyopaque, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken, context: ReadContext) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.putInScopeFor(alloc, scope, contents, cancellation, context);

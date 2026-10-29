@@ -341,17 +341,31 @@ pub const ObjectStore = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        return self.truncatePrefixOperation(namespace, keep_from_lsn, .{});
+    }
+
+    fn truncatePrefixFor(raw: *anyopaque, namespace: []const u8, keep_from_lsn: u64, context: Context) !u64 {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        defer guard.deinit();
+        try guard.lock(&self.mutex);
+        const removed = try self.truncatePrefixOperation(namespace, keep_from_lsn, guard.operation());
+        try guard.finish();
+        return removed;
+    }
+
+    fn truncatePrefixOperation(self: *ObjectStore, namespace: []const u8, keep_from_lsn: u64, operation: Provider.Operation) !u64 {
+        try operation.ready();
         const key = try logKeyAlloc(self.alloc, self.prefix, namespace);
         defer self.alloc.free(key);
 
-        var current = try self.tryReadLog(self.alloc, key);
-        defer if (current) |*value| {
-            self.alloc.free(value.body);
-            if (value.etag) |etag| self.alloc.free(etag);
+        var current = operation.get(&self.client, self.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
         };
-        if (current == null) return 0;
+        defer current.deinit(self.alloc);
 
-        const records = try decodeRecordsFromAlloc(self.alloc, current.?.body, 1);
+        const records = try decodeRecordsFromAlloc(self.alloc, current.body, 1);
         defer wal_types.freeRecords(self.alloc, records);
 
         var kept = std.ArrayListUnmanaged(wal_types.Record).empty;
@@ -365,6 +379,7 @@ pub const ObjectStore = struct {
 
         var removed: u64 = 0;
         for (records) |record| {
+            try operation.ready();
             if (record.lsn < keep_from_lsn) {
                 removed += 1;
                 continue;
@@ -378,17 +393,17 @@ pub const ObjectStore = struct {
         }
 
         if (kept.items.len == 0) {
-            try self.client.deleteObject(self.bucket, key, .{
-                .if_match_etag = current.?.etag,
+            try operation.delete(&self.client, self.bucket, key, .{
+                .if_match_etag = current.metadata.etag,
             });
             return removed;
         }
 
         const encoded = try encodeRecordsAlloc(self.alloc, kept.items);
         defer self.alloc.free(encoded);
-        var result = try self.client.putObject(self.bucket, key, encoded, .{
+        var result = try operation.put(&self.client, self.bucket, key, encoded, .{
             .content_type = "application/octet-stream",
-            .if_match_etag = current.?.etag,
+            .if_match_etag = current.metadata.etag,
         });
         defer result.deinit(self.alloc);
         return removed;
@@ -421,6 +436,7 @@ pub const ObjectStore = struct {
         .read_from_alloc = erasedReadFromAlloc,
         .latest_lsn = erasedLatestLsn,
         .truncate_prefix = erasedTruncatePrefix,
+        .truncate_prefix_for = truncatePrefixFor,
     };
 
     fn erasedDeinit(_: std.mem.Allocator, ptr: *anyopaque) void {

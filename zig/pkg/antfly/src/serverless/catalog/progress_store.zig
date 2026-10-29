@@ -190,6 +190,11 @@ pub const ProgressStore = struct {
     context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        get_gc_watermark_for: ?*const fn (*anyopaque, []const u8, Context) anyerror!?u64 = null,
+        cas_gc_watermark_for: ?*const fn (*anyopaque, []const u8, ?u64, u64, Context) anyerror!bool = null,
+        cas_manifest_gc_floor_for: ?*const fn (*anyopaque, []const u8, ?u64, u64, Context) anyerror!bool = null,
+        prune_manifest_read_deadlines_for: ?*const fn (*anyopaque, []const u8, u64, u64, CancellationToken, Context) anyerror!void = null,
+
         get_manifest_gc_floor_for: ?*const fn (*anyopaque, []const u8, Context) anyerror!?u64 = null,
         get_manifest_read_deadline_for: ?*const fn (*anyopaque, []const u8, u64, Context) anyerror!?u64 = null,
         cas_manifest_read_deadline_for: ?*const fn (*anyopaque, []const u8, u64, ?u64, u64, Context) anyerror!bool = null,
@@ -284,6 +289,7 @@ pub const ProgressStore = struct {
     }
 
     pub fn getGcWatermark(self: *ProgressStore, namespace: []const u8) !?u64 {
+        if (self.context) |context| if (self.vtable.get_gc_watermark_for) |call| return call(self.ptr, namespace, context);
         return try self.vtable.get_gc_watermark(self.ptr, namespace);
     }
 
@@ -296,6 +302,7 @@ pub const ProgressStore = struct {
     }
 
     pub fn compareAndSwapManifestGcFloor(self: *ProgressStore, namespace: []const u8, expected: ?u64, floor: u64) !bool {
+        if (self.context) |context| if (self.vtable.cas_manifest_gc_floor_for) |call| return call(self.ptr, namespace, expected, floor, context);
         return try self.vtable.compare_and_swap_manifest_gc_floor(self.ptr, namespace, expected, floor);
     }
 
@@ -320,10 +327,12 @@ pub const ProgressStore = struct {
     pub fn pruneManifestReadDeadlines(self: *ProgressStore, namespace: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken) !void {
         const prune = self.vtable.prune_manifest_read_deadlines orelse return;
         if (floor > (try self.getManifestGcFloor(namespace) orelse 0)) return error.ManifestGcFloorNotCommitted;
+        if (self.context) |context| if (self.vtable.prune_manifest_read_deadlines_for) |call| return call(self.ptr, namespace, floor, expired_before, cancellation, context);
         return prune(self.ptr, namespace, floor, expired_before, cancellation);
     }
 
     pub fn compareAndSwapGcWatermark(self: *ProgressStore, namespace: []const u8, expected: ?u64, watermark: u64) !bool {
+        if (self.context) |context| if (self.vtable.cas_gc_watermark_for) |call| return call(self.ptr, namespace, expected, watermark, context);
         return try self.vtable.compare_and_swap_gc_watermark(self.ptr, namespace, expected, watermark);
     }
 
