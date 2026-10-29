@@ -1207,7 +1207,7 @@ test "external lake projection cache reuses schema across closed pages without r
     try std.testing.expectEqual(@as(usize, 1), cache.builds);
 }
 
-test "external lake prepared inline scalars preserve canonical numeric extremes without allocation" {
+test "external lake prepared scalars preserve canonical extremes and inline fitting values without allocation" {
     const a = std.testing.allocator;
     for ([_]std.json.Value{
         .{ .integer = std.math.minInt(i64) },  .{ .integer = std.math.maxInt(i64) },
@@ -1215,10 +1215,13 @@ test "external lake prepared inline scalars preserve canonical numeric extremes 
         .{ .float = -0.0 },                    .{ .bool = true },
         .null,
     }) |value| {
-        const prepared = try Prepared.Value.prepare(std.testing.failing_allocator, value, false);
-        try std.testing.expect(prepared == .scalar);
         const canonical = try std.json.Stringify.valueAlloc(a, value, .{});
         defer a.free(canonical);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const fits = canonical.len <= 24;
+        const prepared = try Prepared.Value.prepare(if (fits) std.testing.failing_allocator else arena.allocator(), value, false);
+        try std.testing.expect(if (fits) prepared == .scalar else prepared == .raw);
         const encoded = try std.json.Stringify.valueAlloc(a, prepared, .{});
         defer a.free(encoded);
         try std.testing.expectEqualStrings(canonical, encoded);
