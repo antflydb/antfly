@@ -28,14 +28,14 @@ async function hash(value) {
 const attributeDiagnostics=new WeakMap();
 function attrs(values = []) {
  if (!Array.isArray(values) || values.length > 256) reject('TelemetryAttributeBudgetExceeded');
- const out = Object.create(null),encoded=new Map();let duplicates=0;
+ const out = Object.create(null),encoded=new Map();let duplicates=0;const invalid=[];
  for (const pair of values) {
-  if(typeof pair?.key!=='string')reject('TelemetryAttributeInvalid');
+  if(typeof pair?.key!=='string'){invalid.push({kind:pair===null?'null':Array.isArray(pair)?'array':typeof pair,known_keys:pair&&typeof pair==='object'?Object.keys(pair).filter(k=>['key','value','Key','Value'].includes(k)):[],key_type:typeof pair?.key});continue;}
   const serialized=JSON.stringify(pair.value);if(encoded.has(pair.key)){if(encoded.get(pair.key)!==serialized)throw Object.assign(Error('TelemetryAttributeConflict'),{attribute_key:['service.name','faas.name','faas.version','faas.invocation_id','cloudflare.handler_type','cloudflare.outcome','cloudflare.cpu_time_ms','cloudflare.wall_time_ms','cloudflare.invocation.sequence.number','cloudflare.execution_model'].includes(pair.key)?pair.key:'other'});duplicates++;continue;}encoded.set(pair.key,serialized);
   const v=pair.value;
   out[pair.key]=typeof v?.stringValue==='string'?v.stringValue:typeof v?.boolValue==='boolean'?v.boolValue:v?.intValue!=null&&/^-?\d+$/.test(String(v.intValue))?Number(v.intValue):typeof v?.doubleValue==='number'?v.doubleValue:null;
  }
- attributeDiagnostics.set(out,{duplicates});return out;
+ attributeDiagnostics.set(out,{duplicates,invalid});return out;
 }
 function timestamp(value) {
  if (!/^\d{1,20}$/.test(String(value??''))) return null;
@@ -68,7 +68,8 @@ export async function sanitizeOtel(envelope, source, signal) {
     const body=typeof item.body?.stringValue==='string'?item.body.stringValue:'';
     const sequence=a['cloudflare.invocation.sequence.number'];
     const row={signal,script:source,trace_id_sha256:await hash(trace),span_id_sha256:await hash(span),parent_span_id_sha256:await hash(hex(item.parentSpanId,16)),invocation_id_sha256:await hash(a['faas.invocation_id']),version_id:uuid(a['faas.version'])?a['faas.version'].toLowerCase():null,handler:handlers.has(a['cloudflare.handler_type'])?a['cloudflare.handler_type']:'unknown',execution_model:['stateless','stateful','durableObject'].includes(a['cloudflare.execution_model'])?a['cloudflare.execution_model']:null,start:timestamp(item.startTimeUnixNano??item.timeUnixNano),end:timestamp(item.endTimeUnixNano),sequence:Number.isSafeInteger(sequence)&&sequence>=0?sequence:null,terminal:signal==='traces'&&Object.hasOwn(a,'cloudflare.outcome'),outcome,probes:signal==='logs'?probes(body):[],event:sanitizeTailEvent({outcome,cpuTime:a['cloudflare.cpu_time_ms'],wallTime:a['cloudflare.wall_time_ms'],logs:body?[{message:[body]}]:[],exceptions:[]})??{},duplicate_attributes:attributeDiagnostics.get(resource).duplicates+attributeDiagnostics.get(own).duplicates,attribute_keys:Object.keys(a).filter(k=>['faas.version','faas.invocation_id','cloudflare.handler_type','cloudflare.outcome','cloudflare.cpu_time_ms','cloudflare.wall_time_ms','cloudflare.invocation.sequence.number','cloudflare.execution_model'].includes(k)).sort(),attribute_schema:Object.keys(a).filter(k=>/^(cloudflare|faas|service|http|rpc|telemetry)\.[a-z0-9_.]{1,96}$/.test(k)).sort(),body_schema:{kind:Object.keys(item.body??{}).filter(k=>['stringValue','kvlistValue','arrayValue','intValue','doubleValue','boolValue'].includes(k)),known_json_keys:(()=>{try{const parsed=JSON.parse(body);return parsed&&typeof parsed==='object'?Object.keys(parsed).filter(k=>['outcome','cpuTime','cpuTimeMs','wallTime','wallTimeMs','requestId','request','response','event','exceptions','logs'].includes(k)):[];}catch{return [];}})()},unknown_attribute_count:Object.keys(a).filter(k=>!['service.name','faas.name','faas.version','faas.invocation_id','cloudflare.handler_type','cloudflare.outcome','cloudflare.cpu_time_ms','cloudflare.wall_time_ms','cloudflare.invocation.sequence.number','cloudflare.execution_model'].includes(k)).length};
-    if(item.droppedAttributesCount||item.droppedEventsCount||item.droppedLinksCount)row.dropped=true;
+    const invalid=[...attributeDiagnostics.get(resource).invalid,...attributeDiagnostics.get(own).invalid];if(invalid.length)row.invalid_attributes=invalid;
+    if(item.droppedAttributesCount||item.droppedEventsCount||item.droppedLinksCount||invalid.length)row.dropped=true;
     if(a['cloudflare.warning.type']!=null)row.warning=true;
     rows.push(row);
    }
