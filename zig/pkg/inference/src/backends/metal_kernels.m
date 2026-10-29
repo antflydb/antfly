@@ -56775,7 +56775,7 @@ int termite_metal_decode_runtime_gemma4_audio_local_attention_device(
 // Arbitrary const host views can refer to read-only Mach-O or mapped pages.
 // Metal's no-copy path may accept those addresses yet make later CPU reads
 // fault. Query the current VM region rather than caching mutable map ownership.
-static id<MTLBuffer> termite_metal_ternary_attention_host_input(id<MTLDevice> device, const float *input, size_t bytes) {
+static id<MTLBuffer> termite_metal_host_const_input(id<MTLDevice> device, const float *input, size_t bytes) {
     mach_vm_address_t region = (mach_vm_address_t)(uintptr_t)input;
     mach_vm_size_t length = 0;
     vm_region_basic_info_data_64_t info;
@@ -56796,7 +56796,7 @@ static id<MTLBuffer> termite_metal_ternary_attention_host_input(id<MTLDevice> de
 
 // Ternary projection slots retain their native codec metadata and immutable
 // weight buffer. Their packed matrices are not fixed-size per-input blocks.
-static int termite_metal_require_ternary_attention_slot(termite_metal_decode_runtime *runtime, size_t slot, size_t in_dim, size_t out_dim) {
+static int termite_metal_require_ternary_slot(termite_metal_decode_runtime *runtime, size_t slot, size_t in_dim, size_t out_dim) {
     if (runtime == NULL || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -1;
     if (in_dim == 0 || out_dim == 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -1;
     const uint32_t format = runtime->quant_linear_formats[slot];
@@ -56827,7 +56827,7 @@ typedef union {
     termite_metal_tl2_params tl2;
 } termite_metal_ternary_slot_params;
 
-static inline size_t termite_metal_ternary_attention_params(termite_metal_decode_runtime *runtime, size_t slot, size_t in_dim, size_t out_dim, termite_metal_ternary_slot_params *params) {
+static inline size_t termite_metal_ternary_slot_params_init(termite_metal_decode_runtime *runtime, size_t slot, size_t in_dim, size_t out_dim, termite_metal_ternary_slot_params *params) {
     if (runtime->quant_linear_formats[slot] == TERMITE_METAL_QUANT_FORMAT_TL1) {
         params->tl1 = (termite_metal_tl1_params){ .rows = 1, .in_dim = (uint32_t)in_dim, .out_dim = (uint32_t)out_dim, .packed_len = runtime->quant_linear_tl1_packed_len[slot], .bm = runtime->quant_linear_tl1_bm[slot], .cfg_by = runtime->quant_linear_tl1_cfg_by[slot], .bmm = runtime->quant_linear_tl1_bmm[slot] };
         return sizeof(params->tl1);
@@ -56889,7 +56889,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tern
 
         {
             termite_metal_ternary_slot_params params;
-            const size_t params_bytes = termite_metal_ternary_attention_params(runtime, attention_linear_slot, attention_input_size, hidden_size, &params);
+            const size_t params_bytes = termite_metal_ternary_slot_params_init(runtime, attention_linear_slot, attention_input_size, hidden_size, &params);
             id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:params_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -11;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, label, __LINE__);
@@ -57603,14 +57603,14 @@ int termite_metal_decode_runtime_apply_attention_residual_ternary_slot(
     float *output
 ) {
     if (runtime == NULL || attention_input == NULL || residual == NULL || output == NULL) return -1;
-    if (termite_metal_require_ternary_attention_slot(runtime, attention_linear_slot, attention_input_size, hidden_size) != 0) return -5;
+    if (termite_metal_require_ternary_slot(runtime, attention_linear_slot, attention_input_size, hidden_size) != 0) return -5;
     const bool is_tl2 = runtime->quant_linear_formats[attention_linear_slot] == TERMITE_METAL_QUANT_FORMAT_TL2;
     const char *label = is_tl2 ? "termite_metal_decode_runtime_apply_attention_residual_tl2" : "termite_metal_decode_runtime_apply_attention_residual_tl1";
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = termite_metal_ternary_attention_host_input(runtime->device, attention_input, attention_input_bytes);
-        id<MTLBuffer> residual_buffer = termite_metal_ternary_attention_host_input(runtime->device, residual, hidden_bytes);
+        id<MTLBuffer> input_buffer = termite_metal_host_const_input(runtime->device, attention_input, attention_input_bytes);
+        id<MTLBuffer> residual_buffer = termite_metal_host_const_input(runtime->device, residual, hidden_bytes);
         BOOL output_borrowed = YES;
         id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (output_buffer == nil) {
@@ -57977,7 +57977,7 @@ int termite_metal_decode_runtime_apply_attention_span_residual_ternary_slot(
     float *output
 ) {
     if (runtime == NULL || q == NULL || encoded_key == NULL || v == NULL || residual == NULL || output == NULL) return -1;
-    if (termite_metal_require_ternary_attention_slot(runtime, attention_linear_slot, attention_input_size, hidden_size) != 0) return -5;
+    if (termite_metal_require_ternary_slot(runtime, attention_linear_slot, attention_input_size, hidden_size) != 0) return -5;
     const bool is_tl2 = runtime->quant_linear_formats[attention_linear_slot] == TERMITE_METAL_QUANT_FORMAT_TL2;
     const char *label = is_tl2 ? "termite_metal_decode_runtime_apply_attention_span_residual_tl2" : "termite_metal_decode_runtime_apply_attention_span_residual_tl1";
     if (num_heads == 0 || head_dim == 0 || num_heads > SIZE_MAX / head_dim || num_heads * head_dim != attention_input_size) return -5;
@@ -57985,8 +57985,8 @@ int termite_metal_decode_runtime_apply_attention_span_residual_ternary_slot(
         const size_t q_bytes = num_heads * head_dim * sizeof(float);
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> q_buffer = termite_metal_ternary_attention_host_input(runtime->device, q, q_bytes);
-        id<MTLBuffer> residual_buffer = termite_metal_ternary_attention_host_input(runtime->device, residual, hidden_bytes);
+        id<MTLBuffer> q_buffer = termite_metal_host_const_input(runtime->device, q, q_bytes);
+        id<MTLBuffer> residual_buffer = termite_metal_host_const_input(runtime->device, residual, hidden_bytes);
         id<MTLBuffer> attention_output_buffer;
         if (is_tl2) {
             attention_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:attention_input_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
@@ -58202,33 +58202,41 @@ int termite_metal_decode_runtime_apply_attention_f32_span_residual_q8_0_slot(
     }
 }
 
-// TL1 and TL2 share the host allocation and encoder schedule. Keep pipeline
-// reads at their use sites; the two public callers specialize the codec flag.
-static inline __attribute__((always_inline)) int termite_metal_apply_host_ternary_ffn(
+// Prepared TL1/TL2 slots share the native host allocation and encoder schedule.
+// Preserve codec-specific pipeline reads and the original projection order.
+int termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
     termite_metal_decode_runtime *runtime,
     const float *input, const float *residual,
     size_t hidden_size, size_t intermediate_size, uint32_t activation_kind,
-    const uint8_t *gate_weight_raw, size_t gate_weight_bytes,
-    const uint8_t *up_weight_raw, size_t up_weight_bytes,
-    size_t post_gate_rms_norm_slot,
-    const uint8_t *down_weight_raw, size_t down_weight_bytes,
-    const void *gate_params, const void *up_params, const void *down_params,
-    size_t params_bytes, bool is_tl2, const char *command_label, float *output
+    size_t gate_linear_slot, size_t up_linear_slot,
+    size_t post_gate_rms_norm_slot, size_t down_linear_slot, float *output
 ) {
+    if (runtime == NULL || input == NULL || residual == NULL || output == NULL) return -1;
+    if (termite_metal_require_ternary_slot(runtime, gate_linear_slot, hidden_size, intermediate_size) != 0 ||
+        termite_metal_require_ternary_slot(runtime, up_linear_slot, hidden_size, intermediate_size) != 0 ||
+        termite_metal_require_ternary_slot(runtime, down_linear_slot, intermediate_size, hidden_size) != 0) return -17;
+    const uint32_t format = runtime->quant_linear_formats[gate_linear_slot];
+    if (runtime->quant_linear_formats[up_linear_slot] != format || runtime->quant_linear_formats[down_linear_slot] != format) return -17;
+    const bool is_tl2 = format == TERMITE_METAL_QUANT_FORMAT_TL2;
+    const char *command_label = is_tl2 ? "termite_metal_decode_runtime_apply_gated_ffn_residual_tl2" : "termite_metal_decode_runtime_apply_gated_ffn_residual_tl1";
+    if ((is_tl2 ? runtime->tl2_pipeline : runtime->tl1_pipeline) == nil || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
+    if (post_gate_rms_norm_slot != SIZE_MAX) {
+        if (post_gate_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -4;
+        if (runtime->rms_norm_slot_prepared[post_gate_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_gate_rms_norm_slot] != intermediate_size) return -5;
+    }
+    termite_metal_ternary_slot_params gate_params, up_params, down_params;
+    const size_t params_bytes = termite_metal_ternary_slot_params_init(runtime, gate_linear_slot, hidden_size, intermediate_size, &gate_params);
+    termite_metal_ternary_slot_params_init(runtime, up_linear_slot, hidden_size, intermediate_size, &up_params);
+    termite_metal_ternary_slot_params_init(runtime, down_linear_slot, intermediate_size, hidden_size, &down_params);
 #define TERMITE_METAL_HOST_TERNARY_PIPELINE(Runtime, IsTl2) ((IsTl2) ? (Runtime)->tl2_pipeline : (Runtime)->tl1_pipeline)
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (gate_weight_buffer == nil) gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (up_weight_buffer == nil) up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
-        if (down_weight_buffer == nil) down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> input_buffer = termite_metal_host_const_input(runtime->device, input, hidden_bytes);
+        id<MTLBuffer> residual_buffer = termite_metal_host_const_input(runtime->device, residual, hidden_bytes);
+        id<MTLBuffer> gate_weight_buffer = runtime->quant_linear_weight_buffers[gate_linear_slot];
+        id<MTLBuffer> up_weight_buffer = runtime->quant_linear_weight_buffers[up_linear_slot];
+        id<MTLBuffer> down_weight_buffer = runtime->quant_linear_weight_buffers[down_linear_slot];
         id<MTLBuffer> gate_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         id<MTLBuffer> up_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         id<MTLBuffer> activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
@@ -58243,9 +58251,9 @@ static inline __attribute__((always_inline)) int termite_metal_apply_host_ternar
         termite_metal_apply_add_params multiply_params = { .rows = 1, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_layer_norm_params rms_params = { .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
         termite_metal_apply_add_params add_params = { .rows = 1, .dim = (uint32_t)hidden_size };
-        id<MTLBuffer> gate_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:gate_params length:params_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> up_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:up_params length:params_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        id<MTLBuffer> down_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:down_params length:params_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&gate_params length:params_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> up_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&up_params length:params_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&down_params length:params_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         id<MTLBuffer> activation_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         id<MTLBuffer> multiply_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         id<MTLBuffer> rms_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED) : nil;
@@ -58259,7 +58267,7 @@ static inline __attribute__((always_inline)) int termite_metal_apply_host_ternar
         if (gate_encoder == nil) return -9;
         [gate_encoder setComputePipelineState:TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2)];
         [gate_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [gate_encoder setBuffer:gate_weight_buffer offset:0 atIndex:1];
+        [gate_encoder setBuffer:gate_weight_buffer offset:runtime->quant_linear_weight_offsets[gate_linear_slot] atIndex:1];
         [gate_encoder setBuffer:gate_output_buffer offset:0 atIndex:2];
         [gate_encoder setBuffer:gate_params_buffer offset:0 atIndex:3];
         [gate_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), intermediate_size), 1, 1)];
@@ -58269,7 +58277,7 @@ static inline __attribute__((always_inline)) int termite_metal_apply_host_ternar
         if (up_encoder == nil) return -10;
         [up_encoder setComputePipelineState:TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2)];
         [up_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [up_encoder setBuffer:up_weight_buffer offset:0 atIndex:1];
+        [up_encoder setBuffer:up_weight_buffer offset:runtime->quant_linear_weight_offsets[up_linear_slot] atIndex:1];
         [up_encoder setBuffer:up_output_buffer offset:0 atIndex:2];
         [up_encoder setBuffer:up_params_buffer offset:0 atIndex:3];
         [up_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), intermediate_size), 1, 1)];
@@ -58312,7 +58320,7 @@ static inline __attribute__((always_inline)) int termite_metal_apply_host_ternar
         if (down_encoder == nil) return -14;
         [down_encoder setComputePipelineState:TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2)];
         [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_weight_buffer offset:0 atIndex:1];
+        [down_encoder setBuffer:down_weight_buffer offset:runtime->quant_linear_weight_offsets[down_linear_slot] atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBuffer:down_params_buffer offset:0 atIndex:3];
         [down_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), hidden_size), 1, 1)];
@@ -58339,50 +58347,6 @@ static inline __attribute__((always_inline)) int termite_metal_apply_host_ternar
 #undef TERMITE_METAL_HOST_TERNARY_PIPELINE
 }
 
-int termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
-    termite_metal_decode_runtime *runtime,
-    const float *input,
-    const float *residual,
-    size_t hidden_size,
-    size_t intermediate_size,
-    uint32_t activation_kind,
-    const uint8_t *gate_weight_raw,
-    size_t gate_weight_bytes,
-    uint32_t gate_packed_len,
-    uint32_t gate_bm,
-    uint32_t gate_cfg_by,
-    uint32_t gate_bmm,
-    const uint8_t *up_weight_raw,
-    size_t up_weight_bytes,
-    uint32_t up_packed_len,
-    uint32_t up_bm,
-    uint32_t up_cfg_by,
-    uint32_t up_bmm,
-    size_t post_gate_rms_norm_slot,
-    const uint8_t *down_weight_raw,
-    size_t down_weight_bytes,
-    uint32_t down_packed_len,
-    uint32_t down_bm,
-    uint32_t down_cfg_by,
-    uint32_t down_bmm,
-    float *output
-) {
-    if (runtime == NULL || input == NULL || residual == NULL || gate_weight_raw == NULL || up_weight_raw == NULL || down_weight_raw == NULL || output == NULL) return -1;
-    if (runtime->tl1_pipeline == nil || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
-    if (hidden_size == 0 || intermediate_size == 0 || hidden_size > UINT32_MAX || intermediate_size > UINT32_MAX) return -3;
-    if (post_gate_rms_norm_slot != SIZE_MAX) {
-        if (post_gate_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -4;
-        if (runtime->rms_norm_slot_prepared[post_gate_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_gate_rms_norm_slot] != intermediate_size) return -5;
-    }
-    termite_metal_tl1_params gate_params = { .rows = 1, .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size, .packed_len = gate_packed_len, .bm = gate_bm, .cfg_by = gate_cfg_by, .bmm = gate_bmm };
-    termite_metal_tl1_params up_params = { .rows = 1, .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size, .packed_len = up_packed_len, .bm = up_bm, .cfg_by = up_cfg_by, .bmm = up_bmm };
-    termite_metal_tl1_params down_params = { .rows = 1, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .packed_len = down_packed_len, .bm = down_bm, .cfg_by = down_cfg_by, .bmm = down_bmm };
-    return termite_metal_apply_host_ternary_ffn(
-        runtime, input, residual, hidden_size, intermediate_size, activation_kind,
-        gate_weight_raw, gate_weight_bytes, up_weight_raw, up_weight_bytes,
-        post_gate_rms_norm_slot, down_weight_raw, down_weight_bytes,
-        &gate_params, &up_params, &down_params, sizeof(gate_params), false, __func__, output);
-}
 
 int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s(
     termite_metal_decode_runtime *runtime,
@@ -59065,62 +59029,6 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual_slot(
     }
 }
 
-int termite_metal_decode_runtime_apply_gated_ffn_residual_tl2(
-    termite_metal_decode_runtime *runtime,
-    const float *input,
-    const float *residual,
-    size_t hidden_size,
-    size_t intermediate_size,
-    uint32_t activation_kind,
-    const uint8_t *gate_weight_raw,
-    size_t gate_weight_bytes,
-    uint32_t gate_scale_off,
-    uint32_t gate_three_value_len,
-    uint32_t gate_three_sign_len,
-    uint32_t gate_bm,
-    uint32_t gate_cfg_by,
-    uint32_t gate_bmm,
-    uint32_t gate_three_cols,
-    uint32_t gate_two_cols,
-    const uint8_t *up_weight_raw,
-    size_t up_weight_bytes,
-    uint32_t up_scale_off,
-    uint32_t up_three_value_len,
-    uint32_t up_three_sign_len,
-    uint32_t up_bm,
-    uint32_t up_cfg_by,
-    uint32_t up_bmm,
-    uint32_t up_three_cols,
-    uint32_t up_two_cols,
-    size_t post_gate_rms_norm_slot,
-    const uint8_t *down_weight_raw,
-    size_t down_weight_bytes,
-    uint32_t down_scale_off,
-    uint32_t down_three_value_len,
-    uint32_t down_three_sign_len,
-    uint32_t down_bm,
-    uint32_t down_cfg_by,
-    uint32_t down_bmm,
-    uint32_t down_three_cols,
-    uint32_t down_two_cols,
-    float *output
-) {
-    if (runtime == NULL || input == NULL || residual == NULL || gate_weight_raw == NULL || up_weight_raw == NULL || down_weight_raw == NULL || output == NULL) return -1;
-    if (runtime->tl2_pipeline == nil || runtime->activation_pipeline == nil || runtime->multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
-    if (hidden_size == 0 || intermediate_size == 0 || hidden_size > UINT32_MAX || intermediate_size > UINT32_MAX) return -3;
-    if (post_gate_rms_norm_slot != SIZE_MAX) {
-        if (post_gate_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -4;
-        if (runtime->rms_norm_slot_prepared[post_gate_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[post_gate_rms_norm_slot] != intermediate_size) return -5;
-    }
-    termite_metal_tl2_params gate_params = { .rows = 1, .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size, .scale_off = gate_scale_off, .three_value_len = gate_three_value_len, .three_sign_len = gate_three_sign_len, .bm = gate_bm, .cfg_by = gate_cfg_by, .bmm = gate_bmm, .three_cols = gate_three_cols, .two_cols = gate_two_cols };
-    termite_metal_tl2_params up_params = { .rows = 1, .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size, .scale_off = up_scale_off, .three_value_len = up_three_value_len, .three_sign_len = up_three_sign_len, .bm = up_bm, .cfg_by = up_cfg_by, .bmm = up_bmm, .three_cols = up_three_cols, .two_cols = up_two_cols };
-    termite_metal_tl2_params down_params = { .rows = 1, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .scale_off = down_scale_off, .three_value_len = down_three_value_len, .three_sign_len = down_three_sign_len, .bm = down_bm, .cfg_by = down_cfg_by, .bmm = down_bmm, .three_cols = down_three_cols, .two_cols = down_two_cols };
-    return termite_metal_apply_host_ternary_ffn(
-        runtime, input, residual, hidden_size, intermediate_size, activation_kind,
-        gate_weight_raw, gate_weight_bytes, up_weight_raw, up_weight_bytes,
-        post_gate_rms_norm_slot, down_weight_raw, down_weight_bytes,
-        &gate_params, &up_params, &down_params, sizeof(gate_params), true, __func__, output);
-}
 
 int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
     termite_metal_decode_runtime *runtime,

@@ -210,7 +210,8 @@ int main(int argc, const char **argv) { @autoreleasepool {
 #endif
     termite_metal_decode_runtime *runtime = termite_metal_decode_runtime_create();
     if (runtime == NULL) return 1;
-    if (argc == 2 && strcmp(argv[1], "--benchmark-ternary-gpu") == 0) {
+    if (argc == 2 && (strcmp(argv[1], "--benchmark-ternary-gpu") == 0 || strcmp(argv[1], "--benchmark-ternary-host") == 0)) {
+        ternary_ffn_host_timing = strcmp(argv[1], "--benchmark-ternary-host") == 0;
         const int rc = check_host_ternary_ffn(runtime, true);
         termite_metal_decode_runtime_destroy(runtime);
         return rc;

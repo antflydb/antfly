@@ -24165,72 +24165,17 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32_span_residual_q8_
     output: [*c]f32,
 ) c_int;
 
-pub extern fn termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
+pub extern fn termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
     runtime: ?*RawMetalDecodeRuntime,
     input: [*c]const f32,
     residual: [*c]const f32,
     hidden_size: usize,
     intermediate_size: usize,
     activation_kind: u32,
-    gate_weight_raw: [*c]const u8,
-    gate_weight_bytes: usize,
-    gate_packed_len: u32,
-    gate_bm: u32,
-    gate_cfg_by: u32,
-    gate_bmm: u32,
-    up_weight_raw: [*c]const u8,
-    up_weight_bytes: usize,
-    up_packed_len: u32,
-    up_bm: u32,
-    up_cfg_by: u32,
-    up_bmm: u32,
+    gate_linear_slot: usize,
+    up_linear_slot: usize,
     post_gate_rms_norm_slot: usize,
-    down_weight_raw: [*c]const u8,
-    down_weight_bytes: usize,
-    down_packed_len: u32,
-    down_bm: u32,
-    down_cfg_by: u32,
-    down_bmm: u32,
-    output: [*c]f32,
-) c_int;
-pub extern fn termite_metal_decode_runtime_apply_gated_ffn_residual_tl2(
-    runtime: ?*RawMetalDecodeRuntime,
-    input: [*c]const f32,
-    residual: [*c]const f32,
-    hidden_size: usize,
-    intermediate_size: usize,
-    activation_kind: u32,
-    gate_weight_raw: [*c]const u8,
-    gate_weight_bytes: usize,
-    gate_scale_off: u32,
-    gate_three_value_len: u32,
-    gate_three_sign_len: u32,
-    gate_bm: u32,
-    gate_cfg_by: u32,
-    gate_bmm: u32,
-    gate_three_cols: u32,
-    gate_two_cols: u32,
-    up_weight_raw: [*c]const u8,
-    up_weight_bytes: usize,
-    up_scale_off: u32,
-    up_three_value_len: u32,
-    up_three_sign_len: u32,
-    up_bm: u32,
-    up_cfg_by: u32,
-    up_bmm: u32,
-    up_three_cols: u32,
-    up_two_cols: u32,
-    post_gate_rms_norm_slot: usize,
-    down_weight_raw: [*c]const u8,
-    down_weight_bytes: usize,
-    down_scale_off: u32,
-    down_three_value_len: u32,
-    down_three_sign_len: u32,
-    down_bm: u32,
-    down_cfg_by: u32,
-    down_bmm: u32,
-    down_three_cols: u32,
-    down_two_cols: u32,
+    down_linear_slot: usize,
     output: [*c]f32,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s(
@@ -28977,9 +28922,6 @@ pub fn tryRawQuantizedGatedFfnResidualHost(
     const gate_storage = self.raw_linear_slot_quantized_storage[request.gate_linear_slot] orelse return false;
     const up_storage = self.raw_linear_slot_quantized_storage[request.up_linear_slot] orelse return false;
     const down_storage = self.raw_linear_slot_quantized_storage[request.down_linear_slot] orelse return false;
-    const gate_bytes = gate_storage.preparedBytes(.row_major_blocks) orelse gate_storage.raw_bytes;
-    const up_bytes = up_storage.preparedBytes(.row_major_blocks) orelse up_storage.raw_bytes;
-    const down_bytes = down_storage.preparedBytes(.row_major_blocks) orelse down_storage.raw_bytes;
     const request_eps: f32 = if (@hasField(@TypeOf(request), "eps")) request.eps else 0.0;
 
     if (std.meta.eql(gate_storage.tensor_type, up_storage.tensor_type) and
@@ -29083,6 +29025,38 @@ pub fn tryRawQuantizedGatedFfnResidualHost(
     {
         stats.quantized_gated_ffn_type_mismatches += 1;
         return false;
+    }
+
+    const ternary_kind = quantizedRuntimeLinearKind(gate_storage);
+    if (ternary_kind == .tl1 or ternary_kind == .tl2) {
+        if (request.rows != 1 or request.post_down_rms_norm_slot != null) return false;
+        if (ternary_kind == .tl1) {
+            traceQuantizedGatedFfnPath("tl1", gate_storage.tensor_type, up_storage.tensor_type, down_storage.tensor_type);
+        } else {
+            traceQuantizedGatedFfnPath("bitnet_tl2", gate_storage.tensor_type, up_storage.tensor_type, down_storage.tensor_type);
+        }
+        if (!try ensureTernaryRuntimeLinearSlot(self, request.gate_linear_slot, request.hidden_size, request.intermediate_size, ternary_kind) or
+            !try ensureTernaryRuntimeLinearSlot(self, request.up_linear_slot, request.hidden_size, request.intermediate_size, ternary_kind) or
+            !try ensureTernaryRuntimeLinearSlot(self, request.down_linear_slot, request.intermediate_size, request.hidden_size, ternary_kind))
+        {
+            stats.quantized_gated_ffn_runtime_failures += 1;
+            return false;
+        }
+        const rc = termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
+            runtime,
+            request.input,
+            request.residual,
+            request.hidden_size,
+            request.intermediate_size,
+            @backingInt(request.activation),
+            request.gate_linear_slot,
+            request.up_linear_slot,
+            request.post_gate_rms_norm_slot orelse none,
+            request.down_linear_slot,
+            request.output,
+        );
+        if (rc != 0) stats.quantized_gated_ffn_runtime_failures += 1;
+        return rc == 0;
     }
 
     return switch (gate_storage.tensor_type) {
@@ -29236,45 +29210,6 @@ pub fn tryRawQuantizedGatedFfnResidualHost(
                 if (rc != 0) stats.quantized_gated_ffn_runtime_failures += 1;
                 break :blk rc == 0;
             },
-            .TL1 => blk: {
-                traceQuantizedGatedFfnPath("tl1", gate_storage.tensor_type, up_storage.tensor_type, down_storage.tensor_type);
-                const gate_view = try quant_codec.bitnetTL1View(gate_storage.shape, gate_bytes);
-                const up_view = try quant_codec.bitnetTL1View(up_storage.shape, up_bytes);
-                const down_view = try quant_codec.bitnetTL1View(down_storage.shape, down_bytes);
-                if (gate_view.cols != request.hidden_size or gate_view.rows != request.intermediate_size) break :blk false;
-                if (up_view.cols != request.hidden_size or up_view.rows != request.intermediate_size) break :blk false;
-                if (down_view.cols != request.intermediate_size or down_view.rows != request.hidden_size) break :blk false;
-                const rc = termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
-                    runtime,
-                    request.input,
-                    request.residual,
-                    request.hidden_size,
-                    request.intermediate_size,
-                    @backingInt(request.activation),
-                    gate_bytes.ptr,
-                    gate_bytes.len,
-                    @intCast(gate_view.packed_bytes.len),
-                    @intCast(gate_view.config.bm),
-                    @intCast(gate_view.config.by),
-                    @intCast(gate_view.config.bmm),
-                    up_bytes.ptr,
-                    up_bytes.len,
-                    @intCast(up_view.packed_bytes.len),
-                    @intCast(up_view.config.bm),
-                    @intCast(up_view.config.by),
-                    @intCast(up_view.config.bmm),
-                    request.post_gate_rms_norm_slot orelse none,
-                    down_bytes.ptr,
-                    down_bytes.len,
-                    @intCast(down_view.packed_bytes.len),
-                    @intCast(down_view.config.bm),
-                    @intCast(down_view.config.by),
-                    @intCast(down_view.config.bmm),
-                    request.output,
-                );
-                if (rc != 0) stats.quantized_gated_ffn_runtime_failures += 1;
-                break :blk rc == 0;
-            },
             else => blk: {
                 stats.quantized_gated_ffn_unsupported_types += 1;
                 if (!logged_unsupported_type.*) {
@@ -29287,60 +29222,7 @@ pub fn tryRawQuantizedGatedFfnResidualHost(
                 break :blk false;
             },
         },
-        .bitnet_tl2 => blk: {
-            traceQuantizedGatedFfnPath("bitnet_tl2", gate_storage.tensor_type, up_storage.tensor_type, down_storage.tensor_type);
-            const gate_view = try quant_codec.bitnetTL2View(gate_storage.shape, gate_bytes);
-            const up_view = try quant_codec.bitnetTL2View(up_storage.shape, up_bytes);
-            const down_view = try quant_codec.bitnetTL2View(down_storage.shape, down_bytes);
-            if (gate_view.cols != request.hidden_size or gate_view.rows != request.intermediate_size) break :blk false;
-            if (up_view.cols != request.hidden_size or up_view.rows != request.intermediate_size) break :blk false;
-            if (down_view.cols != request.intermediate_size or down_view.rows != request.hidden_size) break :blk false;
-            const gate_scale_off = (gguf_tensor_types.byteLen(.bitnet_tl2, &.{ @intCast(gate_view.cols), @intCast(gate_view.rows) }) orelse return error.UnsupportedTensorShape) - 32;
-            const up_scale_off = (gguf_tensor_types.byteLen(.bitnet_tl2, &.{ @intCast(up_view.cols), @intCast(up_view.rows) }) orelse return error.UnsupportedTensorShape) - 32;
-            const down_scale_off = (gguf_tensor_types.byteLen(.bitnet_tl2, &.{ @intCast(down_view.cols), @intCast(down_view.rows) }) orelse return error.UnsupportedTensorShape) - 32;
-            const rc = termite_metal_decode_runtime_apply_gated_ffn_residual_tl2(
-                runtime,
-                request.input,
-                request.residual,
-                request.hidden_size,
-                request.intermediate_size,
-                @backingInt(request.activation),
-                gate_bytes.ptr,
-                gate_bytes.len,
-                @intCast(gate_scale_off),
-                @intCast(gate_view.three_values.len),
-                @intCast(gate_view.three_signs.len),
-                @intCast(gate_view.config.bm),
-                @intCast(gate_view.config.by),
-                @intCast(gate_view.config.bmm),
-                @intCast(gate_view.three_cols),
-                @intCast(gate_view.two_cols),
-                up_bytes.ptr,
-                up_bytes.len,
-                @intCast(up_scale_off),
-                @intCast(up_view.three_values.len),
-                @intCast(up_view.three_signs.len),
-                @intCast(up_view.config.bm),
-                @intCast(up_view.config.by),
-                @intCast(up_view.config.bmm),
-                @intCast(up_view.three_cols),
-                @intCast(up_view.two_cols),
-                request.post_gate_rms_norm_slot orelse none,
-                down_bytes.ptr,
-                down_bytes.len,
-                @intCast(down_scale_off),
-                @intCast(down_view.three_values.len),
-                @intCast(down_view.three_signs.len),
-                @intCast(down_view.config.bm),
-                @intCast(down_view.config.by),
-                @intCast(down_view.config.bmm),
-                @intCast(down_view.three_cols),
-                @intCast(down_view.two_cols),
-                request.output,
-            );
-            if (rc != 0) stats.quantized_gated_ffn_runtime_failures += 1;
-            break :blk rc == 0;
-        },
+        .bitnet_tl2 => false,
         .unknown => blk: {
             stats.quantized_gated_ffn_unsupported_types += 1;
             if (!logged_unsupported_type.*) {
@@ -33501,7 +33383,7 @@ pub fn selectCompressedAttentionGatedQkv(
     return null;
 }
 
-fn ensureTernaryAttentionSlot(self: anytype, slot: usize, in_dim: usize, out_dim: usize, kind: RawQuantizedRuntimeLinearKind) !bool {
+fn ensureTernaryRuntimeLinearSlot(self: anytype, slot: usize, in_dim: usize, out_dim: usize, kind: RawQuantizedRuntimeLinearKind) !bool {
     if (self.raw_linear_slot_runtime_prepared_kind[slot] == kind) return true;
     if (ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim) == kind) return true;
     // Preserve malformed-codec errors from the original raw host entry points.
@@ -33543,7 +33425,7 @@ pub fn tryRawAttentionResidualHost(
     if (storage) |quantized_storage| {
         const native_kind = quantizedRuntimeLinearKind(quantized_storage);
         const specialized_ok = if (native_kind == .tl1 or native_kind == .tl2) blk: {
-            if (!try ensureTernaryAttentionSlot(self, attention_linear_slot, attention_input_size, hidden_size, native_kind)) break :blk false;
+            if (!try ensureTernaryRuntimeLinearSlot(self, attention_linear_slot, attention_input_size, hidden_size, native_kind)) break :blk false;
             break :blk termite_metal_decode_runtime_apply_attention_residual_ternary_slot(
                 runtime,
                 attention_input,
@@ -33734,7 +33616,7 @@ pub fn tryRawCompressedAttentionResidualHost(
     const format_int: u32 = CompressedKeyFormat.nativeTag(format);
     const native_kind = quantizedRuntimeLinearKind(storage);
     if (native_kind == .tl1 or native_kind == .tl2) {
-        if (!try ensureTernaryAttentionSlot(self, attention_linear_slot, attention_input_size, hidden_size, native_kind)) return false;
+        if (!try ensureTernaryRuntimeLinearSlot(self, attention_linear_slot, attention_input_size, hidden_size, native_kind)) return false;
         return termite_metal_decode_runtime_apply_attention_span_residual_ternary_slot(
             runtime,
             format_int,
@@ -34266,34 +34148,20 @@ test "metal native decoderRuntimeApplyLinear tl1 and host FFN match trivial refe
     // Exercise the Zig/C ABI, including every argument after the dimensions.
     // The former unused C-only attention_input_size argument shifted this call.
     std.mem.writeInt(u32, weight_raw[packed_len..][0..4], @bitCast(@as(f32, 1.0 / 128.0)), .little);
-    const view = try quant_codec.bitnetTL1View(&shape, weight_raw);
+    provider.raw_linear_slot_runtime_prepared_kind[0] = .none;
+    try std.testing.expect(try ensureTernaryRuntimeLinearSlot(&provider, 0, in_dim, out_dim, .tl1));
     var ffn_output: [in_dim]f32 = undefined;
-    const rc = termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
+    const rc = termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
         runtime,
         &input_data,
         &input_data,
         in_dim,
         out_dim,
         2,
-        weight_raw.ptr,
-        weight_raw.len,
-        @intCast(packed_len),
-        @intCast(view.config.bm),
-        @intCast(view.config.by),
-        @intCast(view.config.bmm),
-        weight_raw.ptr,
-        weight_raw.len,
-        @intCast(packed_len),
-        @intCast(view.config.bm),
-        @intCast(view.config.by),
-        @intCast(view.config.bmm),
+        0,
+        0,
         std.math.maxInt(usize),
-        weight_raw.ptr,
-        weight_raw.len,
-        @intCast(packed_len),
-        @intCast(view.config.bm),
-        @intCast(view.config.by),
-        @intCast(view.config.bmm),
+        0,
         &ffn_output,
     );
     try std.testing.expectEqual(@as(c_int, 0), rc);
@@ -50018,6 +49886,45 @@ test "metal native ternary attention prepared slots preserve the Zig C boundary"
             const keys_ptr: [*c]const u8 = if (iteration == 0) keys.ptr else &constant_keys;
             const values_ptr: [*c]const f32 = if (iteration == 0) values.ptr else &constant_values;
             @memset(&output, -777);
+            var logged_unsupported_type = false;
+            var ffn_request: struct {
+                input: [*c]const f32,
+                residual: [*c]const f32,
+                rows: usize,
+                hidden_size: usize,
+                intermediate_size: usize,
+                activation: ops.DecoderRuntimeActivationKind,
+                gate_linear_slot: usize,
+                up_linear_slot: usize,
+                down_linear_slot: usize,
+                post_gate_rms_norm_slot: ?usize,
+                post_down_rms_norm_slot: ?usize,
+                output: [*c]f32,
+            } = .{
+                .input = input_ptr,
+                .residual = residual_ptr,
+                .rows = @as(usize, 1),
+                .hidden_size = dim,
+                .intermediate_size = dim,
+                .activation = @as(ops.DecoderRuntimeActivationKind, .silu),
+                .gate_linear_slot = 0,
+                .up_linear_slot = 0,
+                .down_linear_slot = 0,
+                .post_gate_rms_norm_slot = @as(?usize, null),
+                .post_down_rms_norm_slot = @as(?usize, null),
+                .output = &output,
+            };
+            try std.testing.expect(try tryRawQuantizedGatedFfnResidualHost(&provider, ffn_request, &stats, &logged_unsupported_type));
+            const gate: f32 = 0.1875;
+            const ffn_expected = (gate / (1.0 + @exp(-gate))) * gate * 12.0 + 0.25;
+            for (output) |value| try std.testing.expectApproxEqAbs(ffn_expected, value, 3e-5);
+            for (0..2) |rejection| {
+                @memset(&output, -777);
+                ffn_request.rows = if (rejection == 0) 2 else 1;
+                ffn_request.post_down_rms_norm_slot = if (rejection == 1) 0 else null;
+                try std.testing.expect(!try tryRawQuantizedGatedFfnResidualHost(&provider, ffn_request, &stats, &logged_unsupported_type));
+                for (output) |value| try std.testing.expectEqual(@as(f32, -777), value);
+            }
             try std.testing.expect(try tryRawAttentionResidualHost(&provider, input_ptr, residual_ptr, dim, dim, 0, 0, null, null, &output));
             const expected_kind: RawQuantizedRuntimeLinearKind = if (tl2) .tl2 else .tl1;
             try std.testing.expectEqual(expected_kind, provider.raw_linear_slot_runtime_prepared_kind[0]);
