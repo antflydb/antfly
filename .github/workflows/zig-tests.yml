@@ -2660,6 +2660,12 @@ jobs:
             echo "TMPDIR=$test_tmp"
             echo "UV_CACHE_DIR=$uv_cache"
             echo "HF_HOME=$hf_home"
+            suite="${{ matrix.suite }}"
+            if [[ "$suite" == inference-* ]]; then
+              # Managed pulls lock and atomically publish verified model bundles.
+              # All lanes reuse these immutable artifacts; runtime caches stay local.
+              echo "ANTFLY_INFERENCE_MODELS_DIR=$home_cache_root/inference-models-full-v1"
+            fi
             echo "ANTFLY_E2E_DURATION_FILE=$duration_file"
           } >> "$GITHUB_ENV"
           mkdir -p "$test_tmp" "$uv_cache" "$hf_home" "$(dirname "$duration_file")"
@@ -2768,7 +2774,10 @@ jobs:
           # steady request deadline on CPU-only release runners. Only tests
           # explicitly covering first-use paths opt into this hard bound.
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
-          ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
+          # Byte admission evicts under pressure. Do not force reloads just
+          # because a compound endpoint needs a small second model. The explicit
+          # eviction regression starts its own one-model server.
+          ANTFLY_INFERENCE_MAX_LOADED_MODELS: "0"
           # Keep the model process inside its existing 14GiB admission budget.
           # Shards remain serial and use the existing heavy runner envelope.
           ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"

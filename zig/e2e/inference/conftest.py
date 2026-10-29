@@ -560,7 +560,7 @@ class InferenceServer:
 
 
 @pytest.fixture(scope="session")
-def base_url():
+def base_url(request):
     """Return the base URL of the inference server under test.
 
     If ANTFLY_INFERENCE_URL is set, use it directly (external server).
@@ -597,7 +597,10 @@ def base_url():
             "ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND"
         )
 
+    forced_eviction = getattr(request, "param", None) == "eviction"
     url = env_first("ANTFLY_INFERENCE_URL")
+    if url and forced_eviction:
+        pytest.skip("forced-eviction coverage requires an E2E-managed one-model server")
     if url:
         if required_backend:
             raise pytest.UsageError(
@@ -625,7 +628,9 @@ def base_url():
         ml_path,
         "127.0.0.1",
         port,
-        max_loaded_models=env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
+        max_loaded_models="1"
+        if forced_eviction
+        else env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
         extra_args=_server_budget_args(),
     )
     _LOCAL_SERVERS_BY_URL[server.url] = server
@@ -971,6 +976,9 @@ def openai_client(base_url):
 
 def pytest_configure(config):
     """Model downloads are handled lazily by the request helpers when enabled."""
+    config.addinivalue_line(
+        "markers", "inference_model(name): primary model affinity for CI scheduling"
+    )
     if os.environ.get("ANTFLY_INFERENCE_DOWNLOAD") == "1":
         print(
             "ANTFLY_INFERENCE_DOWNLOAD=1: missing E2E models will be fetched with `antfly inference pull` on demand"
