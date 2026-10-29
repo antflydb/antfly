@@ -176,9 +176,13 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
   if (beginMarker >= 0 !== endMarker >= 0 || (beginMarker >= 0 && endMarker < beginMarker)) {
     throw new Error(`unpaired quant-kernel-codegen markers in ${KERNELS_M}`);
   }
-  const kernelRe = /kernel void ([a-zA-Z0-9_]+)/g;
+  // Plain kernels, plus template instances (`template [[host_name("x")]]
+  // kernel ...`); a templated definition is not itself a host function.
+  const kernelRe =
+    /(template\s*<[^>]*>\\n"\s*")?kernel void ([a-zA-Z0-9_]+)|host_name\(\\"([a-zA-Z0-9_]+)\\"\)/g;
   for (const m of blankComments(mContent).matchAll(kernelRe)) {
-    const name = m[1];
+    if (m[1]) continue;
+    const name = m[2] ?? m[3];
     if (seen.has(name)) continue;
     const inGenerated = beginMarker >= 0 && m.index > beginMarker && m.index < endMarker;
     seen.set(name, {
