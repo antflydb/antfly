@@ -496,7 +496,7 @@ The immutable Cloudflare proposal is under
 is unchanged except local entry paths. Following explicit token-upload and
 post-test cleanup approval, an operational copy was deployed to the existing
 `antfly-1278-g-mvslyh876561-1-{b,c}` pair and both disposable tokens verified.
-The current candidate is `489e28c436`; the earlier `131a703fed` deployment and
+The tested candidate was `489e28c436`; the earlier `131a703fed` deployment and
 local proposals remain historical evidence. See the
 [SQLite memory and deployment audit](cloudflare-sqlite-memory.md).
 AWS's fresh default-profile check still returns `NoCredentials`. The historical
@@ -508,3 +508,28 @@ The final native 50,000-record repeat passes 32 focused cases with two
 live-provider skips and no failures/leaks, reproducing all batched collection
 counters and exact retained-record/receipt checks. Its executed binary is
 preserved. All 334 Node cases pass again after the envelope-inspector fix.
+
+
+## SQLite attribution and approved live diagnostic
+
+The [memory audit](cloudflare-sqlite-memory.md) corrects recent local
+`SQLITE_NOMEM` attribution: those workerd lines are deliberate legacy fault
+injections. The separate historical live compatibility-profile error remains
+unreproduced. All 334 Node tests, 33 workerd checks and 12 guarded native R2
+workerd cases pass. The guard rejects application platform SQL/KV access from
+initialization through collection, reindex and recovery.
+
+The approved 512-document-per-tenant paired probe completed but failed
+qualification prerequisites: R2/actor-boundary errors, control publication
+nonconvergence, abandoned candidate I/O, live connection gaps, sampled/unsettled
+persisted logs and incomplete independent populations. No explicit resource
+failure was observed; incomplete coverage prevents claiming none occurred.
+Successful-only read/write p95 is tens of seconds on both sides, with failures
+retained. This is neither a performance win nor a gate pass.
+
+Both approved stacks and their test data are now removed, with post-cleanup
+inventory confirming zero scoped Workers, namespaces, queues or R2 buckets.
+Reports remain preserved; cold epochs were not consumed. Resume qualification
+with fresh stacks only after cancellation/recovery, convergence and diagnostic
+completeness are addressed. Resource caps, retries and gate thresholds are
+unchanged.
