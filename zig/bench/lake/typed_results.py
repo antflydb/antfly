@@ -63,6 +63,7 @@ if not archive.exists():
     pq.write_table(pa.table(data), archive, use_dictionary=False, row_group_size=128)
 fixture = bench.import_fixture(shared / "fixture", [archive], "typed-results")
 properties = {name: {"type": "integer"} for name in ["id"] + names}
+properties["id"]["x-antfly-field"] = {"type": "number", "sortable": True}
 properties["body"] = {"type": "string", "x-antfly-field": {"type": "text"}}
 definition = {
     "schema": {
