@@ -261,9 +261,9 @@ pub const BackgroundPublisher = struct {
             else
                 null;
             const build_cancellation = if (held_lease) |*lease|
-                lease.cancellation(cancellation)
+                try lease.cancellation(cancellation)
             else if (held_bootstrap_lease) |*lease|
-                lease.cancellation(cancellation)
+                try lease.cancellation(cancellation)
             else
                 cancellation;
             var result = catalog.buildNamespaceGuardedUntil(

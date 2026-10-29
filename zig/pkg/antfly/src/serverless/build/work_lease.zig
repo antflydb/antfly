@@ -30,11 +30,20 @@ pub const Acquisition = struct {
     took_over: bool,
 };
 
+pub const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
+
 pub const Provider = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    context: ?Context = null,
 
+    pub fn withContext(self: Provider, context: Context) Provider {
+        var result = self;
+        result.context = context;
+        return result;
+    }
     pub const VTable = struct {
+        renew_for: ?*const fn (*anyopaque, []const u8, []const u8, u64, u64, u64, Context) anyerror!u64 = null,
         acquire: *const fn (
             *anyopaque,
             []const u8,
@@ -144,6 +153,11 @@ pub const Provider = struct {
         ttl_ns: u64,
     ) !u64 {
         if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        if (self.context) |context| {
+            try context.ensureActive();
+            if (self.vtable.renew_for) |renew_for| return renew_for(self.ptr, namespace, owner_id, fencing_token, now_unix_ns, ttl_ns, context);
+            if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;
+        }
         return try self.vtable.renew(
             self.ptr,
             namespace,
@@ -196,6 +210,11 @@ pub const Provider = struct {
         ttl_ns: u64,
     ) !u64 {
         if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        if (self.context) |context| {
+            try context.ensureActive();
+            if (self.vtable.renew_for) |renew_for| return renew_for(self.ptr, namespace, owner_id, fencing_token, now_unix_ns, ttl_ns, context);
+            if (context.execution != null or context.wait != null) return error.ExecutionWaitUnsupported;
+        }
         return try self.vtable.renew_bootstrap(
             self.ptr,
             namespace,
@@ -234,6 +253,7 @@ pub const HeldLease = struct {
     acquisition: Acquisition,
     ttl_ns: u64,
     released: bool = false,
+    renewal: @import("lease_renewal.zig").Renewal = .{},
 
     pub fn guard(self: *HeldLease) PublicationGuard {
         return .{
@@ -243,8 +263,13 @@ pub const HeldLease = struct {
         };
     }
 
-    pub fn cancellation(self: *HeldLease, token: maintenance_cancellation.Token) maintenance_cancellation.Token {
-        return token.withCheckpoint(self, erasedMaintenanceCheckpoint);
+    pub fn cancellation(self: *HeldLease, token: maintenance_cancellation.Token) !maintenance_cancellation.Token {
+        try self.renewal.start(token.withContext(self.provider.context), self, renewOwned, self.ttl_ns, self.acquisition.expires_at_unix_ns, self.io);
+        return self.renewal.parent.withCheckpoint(self, erasedMaintenanceCheckpoint);
+    }
+    fn renewOwned(raw: *anyopaque, context: Context) !u64 {
+        const self: *HeldLease = @ptrCast(@alignCast(raw));
+        return self.provider.withContext(context).renew(self.namespace, self.owner_id, self.acquisition.fencing_token, nowUnixNs(self.io), self.renewal.ttl_ns.load(.acquire));
     }
 
     pub fn validate(self: *HeldLease) !void {
@@ -260,18 +285,17 @@ pub const HeldLease = struct {
     /// Renews the exact fencing token. An elapsed TTL can be recovered when no
     /// other worker took over; a changed durable owner or token fails closed.
     pub fn renew(self: *HeldLease, ttl_ns: u64) !void {
+        if (ttl_ns == 0) return error.InvalidLeaseTtl;
         if (self.released) return error.WorkLeaseLost;
-        self.acquisition.expires_at_unix_ns = try self.provider.renew(
-            self.namespace,
-            self.owner_id,
-            self.acquisition.fencing_token,
-            nowUnixNs(self.io),
-            ttl_ns,
-        );
+        if (self.renewal.active()) {
+            self.renewal.ttl_ns.store(ttl_ns, .release);
+            self.acquisition.expires_at_unix_ns = try self.renewal.renew(self.renewal.context(self.renewal.parent.execution));
+        } else self.acquisition.expires_at_unix_ns = try self.provider.renew(self.namespace, self.owner_id, self.acquisition.fencing_token, nowUnixNs(self.io), ttl_ns);
         self.ttl_ns = ttl_ns;
     }
 
     pub fn release(self: *HeldLease) !bool {
+        self.renewal.stop();
         if (self.released) return false;
         const released = try self.provider.release(
             self.namespace,
@@ -287,7 +311,7 @@ pub const HeldLease = struct {
         if (!std.mem.eql(u8, namespace, self.namespace)) {
             return error.WorkLeaseNamespaceMismatch;
         }
-        try self.renewIfNeeded();
+        if (self.renewal.active()) try self.renewal.check() else try self.renewIfNeeded();
     }
 
     fn renewIfNeeded(self: *HeldLease) !void {
@@ -300,7 +324,7 @@ pub const HeldLease = struct {
 
     fn erasedMaintenanceCheckpoint(ptr: *anyopaque) !void {
         const self: *HeldLease = @ptrCast(@alignCast(ptr));
-        try self.renewIfNeeded();
+        if (self.renewal.active()) try self.renewal.check() else try self.renewIfNeeded();
     }
 
     fn preparePublication(ptr: *anyopaque, namespace: []const u8) !?head_coordination.Fence {
@@ -329,6 +353,7 @@ pub const HeldBootstrapLease = struct {
     acquisition: Acquisition,
     ttl_ns: u64,
     released: bool = false,
+    renewal: @import("lease_renewal.zig").Renewal = .{},
 
     pub fn guard(self: *HeldBootstrapLease) PublicationGuard {
         return .{
@@ -338,22 +363,25 @@ pub const HeldBootstrapLease = struct {
         };
     }
 
-    pub fn cancellation(self: *HeldBootstrapLease, token: maintenance_cancellation.Token) maintenance_cancellation.Token {
-        return token.withCheckpoint(self, erasedMaintenanceCheckpoint);
+    pub fn cancellation(self: *HeldBootstrapLease, token: maintenance_cancellation.Token) !maintenance_cancellation.Token {
+        try self.renewal.start(token.withContext(self.provider.context), self, renewOwned, self.ttl_ns, self.acquisition.expires_at_unix_ns, self.io);
+        return self.renewal.parent.withCheckpoint(self, erasedMaintenanceCheckpoint);
+    }
+    fn renewOwned(raw: *anyopaque, context: Context) !u64 {
+        const self: *HeldBootstrapLease = @ptrCast(@alignCast(raw));
+        return self.provider.withContext(context).renewBootstrap(self.namespace, self.owner_id, self.acquisition.fencing_token, nowUnixNs(self.io), self.renewal.ttl_ns.load(.acquire));
     }
 
     pub fn renew(self: *HeldBootstrapLease) !void {
         if (self.released) return error.WorkLeaseLost;
-        self.acquisition.expires_at_unix_ns = try self.provider.renewBootstrap(
-            self.namespace,
-            self.owner_id,
-            self.acquisition.fencing_token,
-            nowUnixNs(self.io),
-            self.ttl_ns,
-        );
+        self.acquisition.expires_at_unix_ns = if (self.renewal.active())
+            try self.renewal.renew(self.renewal.context(self.renewal.parent.execution))
+        else
+            try self.provider.renewBootstrap(self.namespace, self.owner_id, self.acquisition.fencing_token, nowUnixNs(self.io), self.ttl_ns);
     }
 
     pub fn release(self: *HeldBootstrapLease) !bool {
+        self.renewal.stop();
         if (self.released) return false;
         const released = try self.provider.releaseBootstrap(
             self.namespace,
@@ -369,7 +397,7 @@ pub const HeldBootstrapLease = struct {
         if (!std.mem.eql(u8, namespace, self.namespace)) {
             return error.WorkLeaseNamespaceMismatch;
         }
-        try self.renewIfNeeded();
+        if (self.renewal.active()) try self.renewal.check() else try self.renewIfNeeded();
     }
 
     fn preparePublication(ptr: *anyopaque, namespace: []const u8) !?head_coordination.Fence {
@@ -393,7 +421,7 @@ pub const HeldBootstrapLease = struct {
 
     fn erasedMaintenanceCheckpoint(ptr: *anyopaque) !void {
         const self: *HeldBootstrapLease = @ptrCast(@alignCast(ptr));
-        try self.renewIfNeeded();
+        if (self.renewal.active()) try self.renewal.check() else try self.renewIfNeeded();
     }
 };
 

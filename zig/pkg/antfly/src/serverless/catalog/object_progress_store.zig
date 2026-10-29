@@ -746,7 +746,13 @@ pub const ObjectProgressStore = struct {
         return .{ .ptr = ptr, .vtable = &lease_vtable };
     }
 
+    fn leaseRenewFor(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64, context: Context) !u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        var borrowed = self.borrowedLeaseStore();
+        return ObjectWorkLeaseStore.renewFor(&borrowed, ns, owner, token, now, ttl, context);
+    }
     const lease_vtable: work_lease.Provider.VTable = .{
+        .renew_for = leaseRenewFor,
         .acquire = leaseAcquire,
         .validate = leaseValidate,
         .renew = leaseRenew,

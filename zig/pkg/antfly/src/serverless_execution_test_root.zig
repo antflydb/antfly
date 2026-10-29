@@ -952,19 +952,29 @@ test "serverless execution managed metadata borrows provider waits and preserves
     const Probe = struct {
         execution: *Runnable.Execution,
         scheduler: *Runnable.Scheduler,
-        waits: usize = 0,
-        lost: bool = false,
+        waits: std.atomic.Value(usize) = .init(0),
+        lost: std.atomic.Value(bool) = .init(false),
+        saw_renewal: std.atomic.Value(bool) = .init(false),
         reject_return: bool = false,
         fn observe(self: *@This()) !void {
-            if (self.execution.entry.?.state != .resource_blocked) return;
+            @import("antfly_platform").sync.lockYielding(&self.scheduler.mutex);
+            const blocked = self.execution.entry.?.state == .resource_blocked;
+            self.scheduler.mutex.unlock();
+            if (self.scheduler.stats().control_children != 0) self.saw_renewal.store(true, .release);
+            if (!blocked) return;
             var unrelated: Runnable.Execution = .{};
             defer unrelated.finish();
-            try unrelated.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
-            self.waits += 1;
+            unrelated.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query) catch |err| switch (err) {
+                // A concurrently resuming parent can consume the observed
+                // ordinary slot; this observer never rejects its authority.
+                error.ResourceTemporarilyUnavailable, error.SchedulerFull => return,
+                else => return err,
+            };
+            _ = self.waits.fetchAdd(1, .acq_rel);
         }
         fn authority(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.lost) return error.WorkLeaseLost;
+            if (self.lost.load(.acquire)) return error.WorkLeaseLost;
             try self.observe();
         }
         fn original(raw: *const anyopaque) !void {
@@ -979,7 +989,7 @@ test "serverless execution managed metadata borrows provider waits and preserves
         }
         fn end(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.reject_return) self.lost = true;
+            if (self.reject_return) self.lost.store(true, .release);
             try self.execution.enter(.background);
             try authority(raw);
         }
@@ -1027,15 +1037,16 @@ test "serverless execution managed metadata borrows provider waits and preserves
         _ = try catalog.getPolicy("docs");
         // Catalog read sequences preserve their mutex; a disabled return
         // reserve keeps CPU rather than queueing while holding that mutex.
-        try std.testing.expectEqual(reserved_return, probe.waits != 0);
-        const before = probe.waits;
+        try std.testing.expectEqual(reserved_return, probe.waits.load(.acquire) != 0);
+        const before = probe.waits.load(.acquire);
         try std.testing.expectEqual(@as(u64, 1), try catalog.wal.latestLsn("docs"));
         const records = try catalog.wal.readFromAlloc("docs", 1);
         defer @import("serverless/wal/mod.zig").freeRecords(catalog.wal.allocator, records);
         try std.testing.expectEqual(@as(usize, 1), records.len);
-        try std.testing.expect(probe.waits > before);
+        try std.testing.expect(probe.waits.load(.acquire) > before);
         const token: maintenance.Token = .{ .io = std.testing.io, .execution = &execution, .cooperative = .{ .ptr = &probe, .check_fn = Probe.original } };
-        var publication = try catalog.buildNamespaceGuardedUntil("docs", null, token);
+        var publication = try catalog.buildNamespace("docs");
+        try std.testing.expect(probe.saw_renewal.load(.acquire));
         defer publication.deinit(catalog.alloc);
         try std.testing.expect(publication.published);
         var second = try stack.api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 2, .mutations = &.{.{ .kind = .upsert, .doc_id = "b", .body = "{\"body\":\"beta\"}" }} });
@@ -2237,6 +2248,145 @@ test "serverless execution credential vendor process waits preserve publication 
         try std.testing.expectEqual(terminal == .success, cache.cached != null);
         try std.testing.expect(!cache.refreshing);
         query.finish();
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "serverless execution held lease renewals own control work and keep watchdogs passive" {
+    const leases = @import("serverless/build/work_lease.zig");
+    const maintenance = @import("serverless/maintenance_cancellation.zig");
+    const objectstore = @import("objectstore");
+    const FsProgress = @import("serverless/catalog/fs_progress_store.zig").FsProgressStore;
+    const ObjectLease = @import("serverless/build/object_work_lease_store.zig").ObjectWorkLeaseStore;
+    const Mode = enum { success, canceled, deadline, takeover };
+    const Fixture = struct {
+        threaded: std.Io.Threaded,
+        armed: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn shiftedNow(raw: ?*anyopaque, clock_id: std.Io.Clock) std.Io.Timestamp {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(raw.?));
+            const base = threaded.io();
+            const timestamp = base.vtable.now(raw, clock_id);
+            // Acquisition and renewal must use the supplied clock authority;
+            // consulting the host wall clock would immediately expire this lease.
+            return if (clock_id == .real) .fromNanoseconds(timestamp.toNanoseconds() - std.time.ns_per_day) else timestamp;
+        }
+        fn sync(raw: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const threaded: *std.Io.Threaded = @ptrCast(@alignCast(raw.?));
+            const self: *@This() = @fieldParentPtr("threaded", threaded);
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            const io = threaded.io();
+            if (self.armed.swap(false, .acq_rel)) {
+                self.entered.store(true, .release);
+                try self.release.wait(io);
+            }
+            return io.vtable.fileSync(raw, file);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |objects| for ([_]bool{ false, true }) |is_bootstrap| for (std.enums.values(Mode)) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(root);
+        var fixture: Fixture = .{ .threaded = .init(a, .{}) };
+        defer fixture.threaded.deinit();
+        var io = fixture.threaded.io();
+        var vtable = io.vtable.*;
+        vtable.fileSync = Fixture.sync;
+        vtable.now = Fixture.shiftedNow;
+        io.vtable = &vtable;
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+        defer a.free(cwd);
+        const relative_root = try std.fs.path.relativeAlloc(a, cwd, null, cwd, root);
+        defer a.free(relative_root);
+        var native = try FsProgress.init(a, if (is_bootstrap) relative_root else root);
+        defer native.deinit();
+        var filesystem = try objectstore.FilesystemClient.initWithIo(a, root, io);
+        defer filesystem.deinit();
+        var store = try ObjectLease.initWithClient(a, filesystem.client(), "leases", "");
+        defer store.deinit();
+        var progress = native.progressStore();
+        const provider = if (objects) store.provider() else try progress.workLeaseProvider();
+        const ttl = 800 * std.time.ns_per_ms;
+        var held = (try leases.acquireHeld(provider, io, "docs", "one", ttl)).?;
+        var initial = (try leases.acquireBootstrapHeld(provider, io, "bootstrap", "one", ttl)).?;
+        defer _ = held.release() catch false;
+        defer _ = initial.release() catch false;
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = io, .retained_bytes = 4096 }, .background, 2);
+        var canceled = std.atomic.Value(bool).init(false);
+        const token: maintenance.Token = .{ .io = io, .execution = &execution, .requested = &canceled, .deadline_ns = @import("antfly_platform").time.monotonicNs() + if (mode == .deadline) @as(u64, 400 * std.time.ns_per_ms) else 5 * std.time.ns_per_s };
+        const control = if (is_bootstrap) try initial.cancellation(token) else try held.cancellation(token);
+        const renewal = if (is_bootstrap) &initial.renewal else &held.renewal;
+        const original_expiry = renewal.unix_deadline.load(.acquire);
+        defer renewal.stop();
+        fixture.armed.store(true, .release);
+        try execution.park(.resource_blocked);
+        const until = @import("antfly_platform").time.monotonicNs() + 3 * std.time.ns_per_s;
+        while (!fixture.entered.load(.acquire)) {
+            try control.check();
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.LeaseRenewalDidNotEnterProvider;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        defer fixture.release.set(io);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        // Watchdog checks must neither wait for the provider mutex nor perform
+        // another provider request while the renewal sync is physically blocked.
+        const calls = fixture.calls.load(.acquire);
+        for (0..8) |_| try control.check();
+        try std.testing.expectEqual(calls, fixture.calls.load(.acquire));
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.startWithSlots(&scheduler, .{ .io = io, .allow_wait = false }, .query, 2);
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        if (mode == .canceled) canceled.store(true, .release);
+        if (mode == .deadline) {
+            while (@import("antfly_platform").time.monotonicNs() < token.deadline_ns.?) try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        if (mode == .canceled) try std.testing.expectError(error.Canceled, control.check());
+        if (mode == .deadline) try std.testing.expectError(error.DeadlineExceeded, control.check());
+        fixture.release.set(io);
+        if (mode == .success or mode == .takeover) {
+            while (renewal.unix_deadline.load(.acquire) <= original_expiry) {
+                try control.check();
+                if (@import("antfly_platform").time.monotonicNs() >= until) return error.LeaseRenewalDidNotPublish;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            if (mode == .takeover) {
+                const now = @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) + ttl * 2;
+                const namespace = if (is_bootstrap) "bootstrap" else "docs";
+                const other = (try provider.acquire(namespace, "two", now, ttl)).?;
+                while (true) {
+                    control.check() catch |err| {
+                        try std.testing.expectEqual(error.WorkLeaseLost, err);
+                        break;
+                    };
+                    if (@import("antfly_platform").time.monotonicNs() >= until) return error.LeaseTakeoverWasNotObserved;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                try provider.validate(namespace, "two", other.fencing_token, now);
+            }
+        }
+        query.finish();
+        if (mode == .success) {
+            try execution.enter(.background);
+            const guard = if (is_bootstrap) initial.guard() else held.guard();
+            try std.testing.expect((try guard.preparePublication(if (is_bootstrap) "bootstrap" else "docs")) != null);
+            try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+        }
+        if (is_bootstrap) _ = try initial.release() else _ = try held.release();
+        try std.testing.expect(!renewal.active());
         execution.finish();
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);

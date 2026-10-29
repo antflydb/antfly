@@ -1474,6 +1474,11 @@ pub const HttpHandler = struct {
 
     fn publicationFailureResponse(alloc: std.mem.Allocator, err: anyerror) !?HttpResponse {
         return switch (err) {
+            error.SchedulerFull, error.ResourceTemporarilyUnavailable => blk: {
+                var response = try textResponse(alloc, 503, "publication capacity is busy; retry");
+                response.retry_after_seconds = 1;
+                break :blk response;
+            },
             error.ExternalSourcePlanResolverUnavailable, error.ExternalSourcePlanRequired => try textResponse(alloc, 503, "external source resolution is required; configure an external source resolver before publishing"),
             error.WorkLeaseLost, error.ManifestVersionRetired, error.ManifestReadLeaseExpired, error.ManifestReadLeaseContended, error.DocumentFactsSourceChanged => blk: {
                 var response = try textResponse(alloc, 503, "publication authority changed or another builder is active; retry");
@@ -15765,7 +15770,7 @@ test "serverless publication errors distinguish retryable authority from identit
         try std.testing.expectEqualStrings("external source resolution is required; configure an external source resolver before publishing", response.body);
         try std.testing.expectEqual(@as(?u32, null), response.retry_after_seconds);
     }
-    for ([_]anyerror{ error.WorkLeaseLost, error.ManifestVersionRetired, error.ManifestReadLeaseExpired, error.ManifestReadLeaseContended, error.DocumentFactsSourceChanged }) |err| {
+    for ([_]anyerror{ error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.WorkLeaseLost, error.ManifestVersionRetired, error.ManifestReadLeaseExpired, error.ManifestReadLeaseContended, error.DocumentFactsSourceChanged }) |err| {
         var response = (try HttpHandler.publicationFailureResponse(alloc, err)).?;
         defer response.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 503), response.status);

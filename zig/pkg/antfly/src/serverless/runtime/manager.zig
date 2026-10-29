@@ -291,7 +291,7 @@ pub const ManagedRuntime = struct {
                         else
                             null;
                         const compaction_cancellation = if (held_lease) |*lease|
-                            lease.cancellation(pass)
+                            try lease.cancellation(pass)
                         else
                             pass;
                         try self.chargeWork(.compaction_round, 1);
@@ -451,7 +451,7 @@ pub const ManagedRuntime = struct {
         var maintenance = self.cancellationToken();
         maintenance.cooperative = cancellation;
         maintenance.execution = execution orelse if (catalog.progress.context) |context| context.execution else null;
-        if (held_lease) |*lease| maintenance = lease.cancellation(maintenance);
+        if (held_lease) |*lease| maintenance = try lease.cancellation(maintenance);
         try self.chargeWork(.enrichment_round, 1);
         try maintenance.check();
         var phase_control = maintenance;

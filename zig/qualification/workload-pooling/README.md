@@ -1082,3 +1082,74 @@ explicit audit and qualification. Lease renewal, remaining maintenance provider
 boundaries, serial graph preparation and original cross-engine gates (including
 file-engine descriptor recovery) remain open. Full GNU/full qualification remains
 waived, and the installed CLI is not rebuilt by the focused checks.
+
+
+### Joined held-work-lease renewal
+
+Ordinary and bootstrap held work leases now start one physically joined renewal
+worker before their builder/compactor/enricher proceeds. The worker is reserved
+under the original maintenance root, retains its original clock/cancellation
+borrow, releases CPU between attempts, and uses one control slot when renewal is
+due. A startup handoff prevents an activation race with the parent's CPU team.
+The parent regains its original class and width before production work resumes.
+Release stops and joins renewal before releasing the durable fencing token.
+Progress-store provider views carry their original request context into held
+leases. Convenience build calls therefore inherit the caller's execution, Io,
+deadline and authority even without an explicit maintenance-token argument.
+Existing explicit maintenance controls compose with that provider context.
+
+A held-lease maintenance checkpoint now reads published refusal and lease
+lifetime rather than performing provider I/O. Cached lease checks retain the
+acquisition's supplied wall clock plus a suspend-inclusive authority deadline;
+request clocks and deadlines are inherited without renewal. Model watchdogs and graph workers
+therefore do not renew work leases or borrow the invocation owner's CPU grant.
+Explicit publication renewal and periodic renewal serialize through the same
+lease-local lane. Contenders lend their own capacity while waiting; checks do
+not take that lane. A takeover, source cancellation or original deadline remains
+terminal and cannot authorize publication with a new lease or a renewed request
+budget.
+
+Object-backed renewal forwards the operation's execution context through the
+existing physical provider boundaries, including filesystem, S3 and GCS client
+adapters. Native filesystem renewal uses the supplied Io, the existing namespace
+file lock, the exact owner/token check, atomic HEAD replacement and directory
+sync. It lends physical file waits while JSON, allocation and fencing remain
+runnable. The namespace file lock serializes native renewal with legacy writers;
+no process-local metadata cache mutex is held across its I/O.
+
+This required an explicit protected-control child capability, rather than
+promoting ordinary children after publication. Runnable ABI 22 adds the checked
+control-child reservation flag; legacy prefixes and malformed flags fail before
+worker IO is borrowed. The original root remains alive through every child join.
+Control children and cleanup together cannot consume the last control registry
+slot or more than half of control retained-byte capacity. Both opaque owner and
+native-borrow forwarding preserve that reservation and its original lifetime.
+The SQL completion adapter also enforces its existing one-slot coordinator rule
+before reserving completion children; ordinary producer team reservations keep
+their existing path. Public publication routes report exhausted scheduler/control
+capacity as HTTP 503 with a one-second retry hint.
+
+The production fixture covers native and object-backed filesystem stores,
+ordinary/bootstrap leases, absolute/relative native roots, success, cancellation,
+original deadline and durable takeover. It executes real reads, conditional metadata updates, fsync and rename,
+with a deterministic barrier at a sync boundary to hold physical I/O. While that
+barrier is held, query and health work make progress and repeated lease checks
+perform no new provider I/O. Publication revalidates the exact token; every case
+joins renewal and retires its root/retained bytes. This is real local-provider
+integration with injected waiting, not cloud or slow-disk performance evidence.
+
+Evidence: `lease-renewal-v11-final.json` records affected serverless publication,
+scheduler cleanup, control-owner/borrow/ABI, SQL completion, real worker-pipe and
+worker semantic checks. `lease-renewal-v12-clock.json` adds the supplied-clock
+fixture, shifted one day behind the host clock, across all sixteen provider/
+lease/outcome combinations; all production source hashes match the broader run.
+The only subsequent Zig change is the clock fixture itself. Both runs pass with
+unchanged inputs. `lease-renewal-final.json` binds tested bytes to committed
+snapshots. Staged licensing and the Apache product boundary checks pass.
+
+Manifest read-pin renewal and external lake snapshot heartbeats remain separate
+open lease paths. Initial lease acquisition/release and remaining maintenance
+mutation/retention/immutable-artifact provider boundaries still need their full
+scheduling audit. Vendor framework/registry download preparation, serial graph
+preparation and original cross-engine recovery gates (including file-engine
+FD recovery) remain open. Full GNU/full qualification remains waived.

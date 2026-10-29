@@ -4056,6 +4056,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-asset-provider-wait-test", "Verify asset HTTP/capability waits and independently owned compatibility workers")
         .dependOn(&b.addRunArtifact(asset_provider_wait_tests).step);
 
+    const lease_renewal_tests = b.addTest(.{
+        .name = "lease-renewal-tests",
+        .root_module = serverless_execution_root,
+        .filters = &.{ "serverless execution held lease", "serverless execution managed metadata", "serverless execution model quota wait", "serverless publication errors distinguish retryable authority" },
+        .max_rss = 16 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-lease-renewal-test", "Verify admitted work-lease renewal, passive watchdogs and physical cleanup")
+        .dependOn(&b.addRunArtifact(lease_renewal_tests).step);
+
     const credential_process_wait_tests = b.addTest(.{
         .name = "credential-process-wait-tests",
         .root_module = serverless_execution_root,

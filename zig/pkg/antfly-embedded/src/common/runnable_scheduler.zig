@@ -291,6 +291,7 @@ pub const Entry = struct {
     cleanup_duration_ns: ?u64 = null,
     cleanup_active: bool = false,
     protected_cleanup_root: bool = false,
+    protected_control_child: bool = false,
     dormant_cleanup_root: bool = false,
     /// CPU partition only: never changes query, completion or cleanup authority.
     publication_active: bool = false,
@@ -431,6 +432,8 @@ pub const Scheduler = struct {
         read_lane_grants: [3]u64 = @splat(0),
         operations: usize = 0,
         child_operations: usize = 0,
+        control_children: usize = 0,
+        control_child_bytes: u64 = 0,
         retained_bytes: u64 = 0,
         control_operations: usize = 0,
         control_retained_bytes: u64 = 0,
@@ -1086,7 +1089,8 @@ pub const Scheduler = struct {
         child.options.io = io;
         child.options.retained_bytes = child.bytes;
         if (self.boundedRead(parent)) return error.InvalidRunnableTransition;
-        child.class = parent.class;
+        if (child.protected_control_child and (parent.retainedPhase() or parent.reserved_control)) return error.InvalidRunnableTransition;
+        child.class = if (child.protected_control_child) .control else parent.class;
         child.read_lane = parent.read_lane;
         child.slots = 1;
         // Accepted completion is inherited, never reserved or extended by the
@@ -1126,12 +1130,23 @@ pub const Scheduler = struct {
                 budget.max_wait_ms == 0 or budget.max_wait_ms > self.config.max_wait_ms or budget.estimated_work_ns == 0)
                 return error.InvalidRunnableDemand;
         }
+        if (e.protected_control_child) {
+            // Background lease keepers cannot consume the final control registry
+            // slot or more than half its retained memory, including cleanup.
+            if (!control or self.metrics.control_children + self.metrics.cleanup_operations >= control_count -| 1 or
+                e.bytes > (self.config.control_bytes / 2) -| (self.metrics.control_child_bytes + self.metrics.cleanup_retained_bytes))
+            {
+                self.metrics.rejected +|= 1;
+                return error.SchedulerFull;
+            }
+        }
         if (e.protected_cleanup_root) {
             // Cleanup roots share the control partition, but cannot consume
             // its last operation or more than half its retained byte reserve.
             const cleanup_limit = @min(@as(usize, 2), control_count -| 1);
             if (!control or self.metrics.cleanup_operations >= cleanup_limit or
-                e.bytes > (self.config.control_bytes / 2) -| self.metrics.cleanup_retained_bytes)
+                self.metrics.cleanup_operations + self.metrics.control_children >= control_count -| 1 or
+                e.bytes > (self.config.control_bytes / 2) -| (self.metrics.cleanup_retained_bytes + self.metrics.control_child_bytes))
             {
                 self.metrics.rejected +|= 1;
                 return error.ResourceTemporarilyUnavailable;
@@ -1162,6 +1177,10 @@ pub const Scheduler = struct {
         if (e.protected_cleanup_root) {
             self.metrics.cleanup_operations += 1;
             self.metrics.cleanup_retained_bytes += e.bytes;
+        }
+        if (e.protected_control_child) {
+            self.metrics.control_children += 1;
+            self.metrics.control_child_bytes += e.bytes;
         }
         // Registry/count/bytes cover queued, running AND blocked operations.
         // Resume never needs another reservation or allocation.
@@ -1890,6 +1909,11 @@ pub const Scheduler = struct {
             self.metrics.cleanup_retained_bytes -= e.bytes;
             e.protected_cleanup_root = false;
         }
+        if (e.protected_control_child) {
+            self.metrics.control_children -= 1;
+            self.metrics.control_child_bytes -= e.bytes;
+            e.protected_control_child = false;
+        }
         if (e.publication_active) {
             std.debug.assert(self.publication_owner == e);
             self.publication_owner = null;
@@ -2042,6 +2066,7 @@ pub const Execution = struct {
         enter: *const fn (*anyopaque, Class) anyerror!void,
         enter_checked: ?*const fn (*anyopaque, Class, AdmissionCheck) anyerror!void = null,
         reserve_child: *const fn (*anyopaque, std.Io, u64, *Execution) anyerror!void,
+        reserve_control_child: ?*const fn (*anyopaque, std.Io, u64, *Execution) anyerror!void = null,
         activate_child: *const fn (*anyopaque) anyerror!void,
         activate_child_checked: ?*const fn (*anyopaque, AdmissionCheck) anyerror!void = null,
         finish: *const fn (*anyopaque) void,
@@ -2279,17 +2304,26 @@ pub const Execution = struct {
 
     /// Reserve before task publication without waiting for CPU on the parent
     /// coordinator. The independent worker activates after publication.
+    pub fn reserveControlChild(self: *Execution, parent: *Execution, io: std.Io, retained_bytes: u64) !void {
+        return self.reserveChildMode(parent, io, retained_bytes, true);
+    }
     pub fn reserveChild(self: *Execution, parent: *Execution, io: std.Io, retained_bytes: u64) !void {
+        return self.reserveChildMode(parent, io, retained_bytes, false);
+    }
+    fn reserveChildMode(self: *Execution, parent: *Execution, io: std.Io, retained_bytes: u64, control: bool) !void {
         if (self.entry != null or self.borrowed != null or self == parent or parent.child_pending) return error.InvalidRunnableTransition;
         if (retained_bytes < @sizeOf(Execution)) return error.InvalidRunnableDemand;
         if (parent.borrowed) |borrow| {
-            try borrow.reserve_child(borrow.ptr, io, retained_bytes, self);
+            if (control) {
+                const reserve = borrow.reserve_control_child orelse return error.ExecutionWaitUnsupported;
+                try reserve(borrow.ptr, io, retained_bytes, self);
+            } else try borrow.reserve_child(borrow.ptr, io, retained_bytes, self);
             self.child_pending = true;
             return;
         }
         const parent_entry = if (parent.entry) |*entry| entry else return error.InvalidRunnableTransition;
         const owner = try schedulerFor(parent_entry, true);
-        self.entry = .{ .options = parent_entry.options, .class = parent_entry.class, .bytes = retained_bytes };
+        self.entry = .{ .options = parent_entry.options, .class = parent_entry.class, .bytes = retained_bytes, .protected_control_child = control };
         errdefer self.finish();
         try owner.reserveChild(parent_entry, &self.entry.?, io);
         self.child_pending = true;

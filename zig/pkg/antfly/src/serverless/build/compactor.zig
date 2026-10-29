@@ -93,7 +93,7 @@ pub const Compactor = struct {
             var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse
                 return error.WorkLeaseLost;
             defer _ = held.release() catch false;
-            return self.compactHeadGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
+            return self.compactHeadGuardedUntil(namespace, held.guard(), try held.cancellation(cancellation orelse .{ .io = io }));
         }
         var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
         var scoped_artifacts = self.artifacts.*;

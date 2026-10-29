@@ -21,7 +21,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 21;
+pub const abi_version: u32 = 22;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -171,9 +171,14 @@ pub const ChildStart = extern struct {
     struct_size: u32 = @sizeOf(@This()),
     io: *const native.IoBorrow,
     retained_bytes: u64 = 0,
+    /// Trusted maintenance control child. Inherits the original root authority;
+    /// the owner reserves bounded control metadata before task publication.
+    control: u8 = 0,
+    reserved: [7]u8 = @splat(0),
     out_child: *Child,
     pub fn validate(self: *const ChildStart) !void {
         if (self.version != abi_version or self.struct_size != @sizeOf(ChildStart)) return error.UnsupportedVersion;
+        if (self.control > 1 or !std.mem.allEqual(u8, &self.reserved, 0)) return error.InvalidArgument;
     }
 };
 
@@ -1337,4 +1342,18 @@ test "runnable lifetime ABI guarded publication rejects stale prefixes and incom
     borrow.park_publication = null;
     try std.testing.expect(!try borrow.parkPublication());
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "runnable child ABI validates explicit control reservation before borrowing IO" {
+    var io: native.IoBorrow = undefined;
+    var child: Child = undefined;
+    var request: ChildStart = .{ .io = &io, .out_child = &child, .control = 2 };
+    try std.testing.expectError(error.InvalidArgument, request.validate());
+    request.control = 1;
+    request.reserved[0] = 1;
+    try std.testing.expectError(error.InvalidArgument, request.validate());
+    request.reserved = @splat(0);
+    try request.validate();
+    request.version = 21;
+    try std.testing.expectError(error.UnsupportedVersion, request.validate());
 }

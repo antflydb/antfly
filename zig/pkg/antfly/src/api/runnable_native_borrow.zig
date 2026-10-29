@@ -55,6 +55,7 @@ pub const Bridge = struct {
             .enter = enter,
             .enter_checked = if (self.borrow.enter_checked != null) enterChecked else null,
             .reserve_child = reserveChild,
+            .reserve_control_child = reserveControlChild,
             .activate_child = activateChild,
             .activate_child_checked = if (self.borrow.activate_child_checked != null) activateChildChecked else null,
             .finish = finish,
@@ -170,6 +171,12 @@ pub const Bridge = struct {
         try self.borrow.enterChecked(next, &.{ .context = &forwarded, .check = Forward.check });
     }
     fn reserveChild(raw: *anyopaque, io: std.Io, retained_bytes: u64, execution: *native.Execution) !void {
+        return reserveChildMode(raw, io, retained_bytes, execution, false);
+    }
+    fn reserveControlChild(raw: *anyopaque, io: std.Io, retained_bytes: u64, execution: *native.Execution) !void {
+        return reserveChildMode(raw, io, retained_bytes, execution, true);
+    }
+    fn reserveChildMode(raw: *anyopaque, io: std.Io, retained_bytes: u64, execution: *native.Execution, control: bool) !void {
         const self = from(raw);
         const bytes = std.math.add(u64, retained_bytes, @sizeOf(ChildReceiver)) catch return error.InvalidRunnableDemand;
         const receiver = try self.allocator.create(ChildReceiver);
@@ -178,7 +185,7 @@ pub const Bridge = struct {
         // Keep the IO value in the retained packet. Its underlying executor
         // remains borrowed from the caller through the child's physical join.
         const io_borrow = runtime.native_abi.IoBorrow.init(&receiver.io);
-        try self.borrow.reserveChild(&.{ .io = &io_borrow, .retained_bytes = bytes, .out_child = &receiver.child });
+        try self.borrow.reserveChild(&.{ .io = &io_borrow, .retained_bytes = bytes, .control = @intFromBool(control), .out_child = &receiver.child });
         errdefer receiver.child.deinit();
         try receiver.child.validate();
         receiver.bridge = try init(&receiver.child.borrow, self.allocator);
@@ -904,4 +911,31 @@ test "native execution borrow checked child activation rejects queued private au
     child.finish();
     try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
     try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+}
+
+test "native execution borrow forwards explicit control children without new authority" {
+    const io = std.testing.io;
+    var scheduler = try native.Scheduler.init(.{ .slots = 3 });
+    defer scheduler.close();
+    var original: native.Execution = .{};
+    defer original.finish();
+    try original.start(&scheduler, .{ .io = io, .retained_bytes = 19 }, .query);
+    var authority: TestAuthority = .{ .execution = &original };
+    var borrowed = authority.borrowed();
+    var bridge = try Bridge.init(&borrowed, std.testing.allocator);
+    var parent: native.Execution = .{};
+    try bridge.bind(&parent);
+    defer parent.finish();
+    var child: native.Execution = .{};
+    defer child.finish();
+    try child.reserveControlChild(&parent, io, @sizeOf(native.Execution));
+    try child.activateChild();
+    try std.testing.expectEqual(native.Class.control, try child.retainedClass());
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_children);
+    try child.park(.resource_blocked);
+    try std.testing.expectError(error.InvalidRunnableTransition, child.enter(.query));
+    child.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().control_children);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
 }

@@ -54,6 +54,7 @@ pub const ObjectWorkLeaseStore = struct {
     client: objectstore.Client,
     bucket: []u8,
     prefix: []u8,
+    operation: @import("../provider_operation.zig").Operation = .{},
 
     pub fn initWithClient(
         alloc: Allocator,
@@ -131,7 +132,7 @@ pub const ObjectWorkLeaseStore = struct {
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
 
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.operation.put(&self.client, self.bucket, key, payload, .{
             .content_type = content_type,
             .if_none_match = current == null,
             .if_match_etag = if (current) |value| value.etag else null,
@@ -229,7 +230,7 @@ pub const ObjectWorkLeaseStore = struct {
         defer self.alloc.free(payload);
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.operation.put(&self.client, self.bucket, key, payload, .{
             .content_type = content_type,
             .if_match_etag = current.etag,
         }) catch |err| switch (err) {
@@ -271,7 +272,7 @@ pub const ObjectWorkLeaseStore = struct {
         defer self.alloc.free(payload);
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, released_record);
         defer self.alloc.free(content_type);
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.operation.put(&self.client, self.bucket, key, payload, .{
             .content_type = content_type,
             .if_match_etag = current.etag,
         }) catch |err| switch (err) {
@@ -286,7 +287,7 @@ pub const ObjectWorkLeaseStore = struct {
     }
 
     fn readCurrentAlloc(self: *ObjectWorkLeaseStore, key: []const u8) !?CurrentLease {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.operation.get(&self.client, self.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -361,7 +362,7 @@ pub const ObjectWorkLeaseStore = struct {
                 return error.LeaseFencingTokenExhausted;
             const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{proposed});
             defer self.alloc.free(payload);
-            var result = self.client.putObject(self.bucket, key, payload, .{
+            var result = self.operation.put(&self.client, self.bucket, key, payload, .{
                 .content_type = "text/plain",
                 .if_none_match = current == null,
                 .if_match_etag = if (current) |value| value.etag else null,
@@ -396,7 +397,7 @@ pub const ObjectWorkLeaseStore = struct {
             }
             const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{minimum});
             defer self.alloc.free(payload);
-            var result = self.client.putObject(self.bucket, key, payload, .{
+            var result = self.operation.put(&self.client, self.bucket, key, payload, .{
                 .content_type = "text/plain",
                 .if_none_match = current == null,
                 .if_match_etag = if (current) |value| value.etag else null,
@@ -417,7 +418,7 @@ pub const ObjectWorkLeaseStore = struct {
     }
 
     fn readFenceFloorAlloc(self: *ObjectWorkLeaseStore, key: []const u8) !?CurrentFenceFloor {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.operation.get(&self.client, self.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -429,7 +430,14 @@ pub const ObjectWorkLeaseStore = struct {
         };
     }
 
+    pub fn renewFor(ptr: *anyopaque, namespace: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64, context: work_lease.Context) !u64 {
+        const original: *ObjectWorkLeaseStore = @ptrCast(@alignCast(ptr));
+        var view: ObjectWorkLeaseStore = .{ .alloc = original.alloc, .client = original.client, .bucket = original.bucket, .prefix = original.prefix, .operation = .{ .context = context } };
+        return view.renew(namespace, owner, token, now, ttl);
+    }
+
     const vtable: work_lease.Provider.VTable = .{
+        .renew_for = renewFor,
         .acquire = erasedAcquire,
         .validate = erasedValidate,
         .renew = erasedRenew,

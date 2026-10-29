@@ -124,6 +124,7 @@ pub const FsProgressStore = struct {
     }
 
     const lease_vtable: work_lease.Provider.VTable = .{
+        .renew_for = leaseRenewFor,
         .acquire = leaseAcquire,
         .validate = leaseValidate,
         .renew = leaseRenew,
@@ -180,6 +181,73 @@ pub const FsProgressStore = struct {
         proposed.expires_at_unix_ns = expiry orelse 0;
         proposed.released = expiry == null;
         try self.writeHeadUnlocked(ns, proposed);
+    }
+
+    fn closeControlledFile(file: std.Io.File, args: anytype) void {
+        file.close(args[1]);
+    }
+    fn leaseRenewFor(raw: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64, context: work_lease.Context) !u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const io = context.io orelse return error.BackendRuntimeIoUnavailable;
+        const expiry = std.math.add(u64, now, ttl) catch return error.LeaseExpiryOverflow;
+        // The namespace file lock serializes this conditional replacement
+        // with every legacy writer. Readers consume atomic HEAD snapshots;
+        // no process-local cache mutex is needed across renewal I/O.
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context };
+        try op.ready();
+        const control: @import("httpx").socket.WriteControl = op.token().execution_wait orelse .{};
+        const path = try headPathAlloc(self.alloc, self.root_dir, ns);
+        defer self.alloc.free(path);
+        const parent = std.fs.path.dirname(path) orelse return error.InvalidLeaseNamespace;
+        try control.withWait(fs_paths.createDirPathPortable, .{ io, parent });
+        const lock_path = try std.fs.path.join(self.alloc, &.{ parent, ".progress.lock" });
+        defer self.alloc.free(lock_path);
+        var rejected = false;
+        const file_lock = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, lock_path, std.Io.Dir.CreateFileOptions{ .truncate = false, .read = true } }, closeControlledFile);
+        defer file_lock.close(io);
+        try control.withWait(std.Io.File.lock, .{ file_lock, io, std.Io.File.Lock.exclusive });
+        var locked = true;
+        defer if (locked) file_lock.unlock(io);
+        const file = try control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, closeControlledFile);
+        var contents: std.ArrayList(u8) = .empty;
+        defer contents.deinit(self.alloc);
+        {
+            defer file.close(io);
+            var buffer: [4096]u8 = undefined;
+            while (true) {
+                const count = control.withWait(std.Io.File.readStreaming, .{ file, io, &.{&buffer} }) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    else => return err,
+                };
+                if (count == 0) break;
+                if (count > (16 * 1024 * 1024) -| contents.items.len) return error.InvalidHeadCoordinationRecord;
+                try contents.appendSlice(self.alloc, buffer[0..count]);
+            }
+        }
+        var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, contents.items, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (!head_coordination.valid(parsed.value)) return error.InvalidHeadCoordinationRecord;
+        try requireFence(parsed.value, owner, token);
+        var proposed = parsed.value;
+        proposed.expires_at_unix_ns = expiry;
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
+        defer self.alloc.free(payload);
+        const tmp = try std.fmt.allocPrint(self.alloc, "{s}.tmp-{d}", .{ path, test_nonce.fetchAdd(1, .monotonic) });
+        defer self.alloc.free(tmp);
+        defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        {
+            const output = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, tmp, std.Io.Dir.CreateFileOptions{} }, closeControlledFile);
+            defer output.close(io);
+            try control.withWait(std.Io.File.writeStreamingAll, .{ output, io, payload });
+            try control.withWait(std.Io.File.sync, .{ output, io });
+        }
+        try control.withWait(std.Io.Dir.rename, .{ std.Io.Dir.cwd(), tmp, std.Io.Dir.cwd(), path, io });
+        try control.withWait(fs_paths.syncDirPortable, .{ io, parent });
+        try control.withWait(fs_paths.syncDirPortable, .{ io, self.root_dir });
+        file_lock.unlock(io);
+        locked = false;
+        try op.ready();
+        return expiry;
     }
 
     fn leaseRenew(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64) !u64 {

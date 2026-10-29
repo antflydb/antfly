@@ -29,14 +29,30 @@ pub const Token = struct {
     deadline_ns: ?u64 = null,
     checkpoint_ptr: ?*anyopaque = null,
     checkpoint_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    provider_context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
-    pub fn check(self: Token) !void {
+    pub fn withContext(self: Token, context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context) Token {
+        const value = context orelse return self;
+        var result = self;
+        result.provider_context = value;
+        result.io = value.io orelse self.io;
+        if (result.execution == null or (result.execution.?.entry == null and result.execution.?.borrowed == null)) result.execution = value.execution;
+        if (value.deadline_ns) |deadline| result.deadline_ns = if (self.deadline_ns) |original| @min(original, deadline) else deadline;
+        return result;
+    }
+
+    pub fn checkLifetime(self: Token) !void {
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         try self.cooperative.check();
+        if (self.provider_context) |context| try context.checkLifetime();
         if (self.requested) |requested| {
             if (requested.load(.acquire)) return error.Canceled;
         }
         try self.io.checkCancel();
+    }
+
+    pub fn check(self: Token) !void {
+        try self.checkLifetime();
         if (self.checkpoint_ptr) |ptr| {
             if (self.checkpoint_fn) |checkpoint_fn| try checkpoint_fn(ptr);
         }

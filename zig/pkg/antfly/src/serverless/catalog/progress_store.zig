@@ -249,7 +249,8 @@ pub const ProgressStore = struct {
 
     /// The provider and HEAD CAS must share the same atomic coordination record.
     pub fn workLeaseProvider(self: *ProgressStore) !work_lease.Provider {
-        return (self.vtable.work_lease_provider orelse return error.WorkLeaseUnsupported)(self.ptr);
+        const provider = (self.vtable.work_lease_provider orelse return error.WorkLeaseUnsupported)(self.ptr);
+        return if (self.context) |context| provider.withContext(context) else provider;
     }
 
     pub fn compareAndSwapHead(self: *ProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {

@@ -186,7 +186,7 @@ fn reserveChildChecked(raw: *anyopaque, options: *const abi.ChildStart) !void {
     value.* = .{ .state = owner, .io = try options.io.receive(), .clock_io = null, .cancellation = .{} };
     errdefer value.execution.finish();
     const bytes = std.math.add(u64, options.retained_bytes, @sizeOf(Capsule)) catch return error.InvalidRunnableDemand;
-    try value.execution.reserveChild(&parent.execution, value.io.io(), bytes);
+    if (options.control != 0) try value.execution.reserveControlChild(&parent.execution, value.io.io(), bytes) else try value.execution.reserveChild(&parent.execution, value.io.io(), bytes);
     options.out_child.* = .{
         .borrow = try abi.Borrowed.fromOwner(owner.port(), value, 1, @fromBackingInt(@intCast(@backingInt(value.execution.entry.?.class)))),
         .finish = finish,
@@ -1371,4 +1371,57 @@ test "runnable execution reserved activation observes queued caller rejection wi
             try std.testing.expectError(error.DeadlineExceeded, reserved.enter());
         }
     }
+}
+
+test "runnable execution port protected control children preserve health registry and original lifetime" {
+    TestClock.now_ns = 0;
+    var owner_state: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = TestClock.now };
+    defer owner_state.owner.tryDeinit() catch @panic("control child owner leaked");
+    const owner = owner_state.port();
+    const io = std.testing.io;
+    const borrowed_io = runtime.native_abi.IoBorrow.init(&io);
+    var parent: ?*anyopaque = null;
+    try std.testing.expect(owner.start(owner.context, &.{ .io = &borrowed_io, .native_deadline = 1, .has_deadline = 1, .deadline_ns = 100, .class = @backingInt(abi.Class.inference), .slots = 2, .retained_bytes = 19, .out_handle = &parent }).isOk());
+    defer owner.finish(parent.?);
+    const initial = owner_state.owner.scheduler.stats();
+    var oversized: abi.Child = undefined;
+    try std.testing.expectError(error.SchedulerFull, owner.reserveChild(parent.?, &.{ .io = &borrowed_io, .control = 1, .retained_bytes = (owner_state.owner.scheduler.config.control_bytes / 2) + 1, .out_child = &oversized }));
+    try std.testing.expectEqual(initial.retained_bytes, owner_state.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(initial.operations, owner_state.owner.scheduler.stats().operations);
+    var children: [3]abi.Child = undefined;
+    var count: usize = 0;
+    defer while (count != 0) {
+        count -= 1;
+        children[count].deinit();
+    };
+    for (&children) |*child| {
+        try owner.reserveChild(parent.?, &.{ .io = &borrowed_io, .control = 1, .retained_bytes = 23, .out_child = child });
+        count += 1;
+        try std.testing.expectEqual(abi.Class.control, try child.borrow.currentClass());
+    }
+    try std.testing.expectEqual(@as(usize, 3), owner_state.owner.scheduler.stats().control_children);
+    const before = owner_state.owner.scheduler.stats();
+    var denied: abi.Child = undefined;
+    try std.testing.expectError(error.SchedulerFull, owner.reserveChild(parent.?, &.{ .io = &borrowed_io, .control = 1, .out_child = &denied }));
+    try std.testing.expectEqual(before.retained_bytes, owner_state.owner.scheduler.stats().retained_bytes);
+    var health: ?*anyopaque = null;
+    try std.testing.expect(owner.start(owner.context, &.{ .io = &borrowed_io, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &health }).isOk());
+    owner.finish(health.?);
+    try children[0].activate();
+    try std.testing.expectEqual(@as(usize, 3), owner_state.owner.scheduler.stats().runnable_slots);
+    try std.testing.expect(children[0].borrow.park(children[0].borrow.context, @backingInt(abi.Wait.resource)).isOk());
+    try std.testing.expectError(error.InvalidRunnableTransition, children[0].borrow.enterChecked(.query, &.{ .context = &owner_state, .check = struct {
+        fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return .ok;
+        }
+    }.check }));
+    TestClock.now_ns = 100;
+    try std.testing.expectError(error.DeadlineExceeded, children[0].borrow.checkLifetime());
+    while (count != 0) {
+        count -= 1;
+        children[count].deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), owner_state.owner.scheduler.stats().control_children);
+    try std.testing.expectEqual(@as(u64, 0), owner_state.owner.scheduler.stats().control_child_bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner_state.owner.scheduler.stats().operations);
 }

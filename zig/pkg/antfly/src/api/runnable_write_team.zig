@@ -174,6 +174,10 @@ pub const Completion = struct {
     fn reserveChild(raw: *anyopaque, options: *const runtime.runnable_abi.ChildStart) callconv(.c) runtime.error_abi.Status {
         const self = from(raw);
         self.active() catch |err| return runtime.error_abi.statusFromError(err);
+        // Accepted completion publishes independent workers from its one-slot
+        // coordinator. Ordinary producer reservations retain their team path.
+        const slots = self.execution.retainedSlots() catch |err| return runtime.error_abi.statusFromError(err);
+        if (slots != 1) return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
         @import("runnable_local_child.zig").reserve(self.execution, self.allocator, options) catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
