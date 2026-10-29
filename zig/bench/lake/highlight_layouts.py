@@ -124,11 +124,13 @@ with bench.managed_server(
         client.call("POST", f"/tables/{bench.TABLE}", definition)
         client.ready(bench.readiness_indexes({"definition": definition}))
         publication_ns = time.perf_counter_ns() - started
-        artifact_bytes = sum(
-            p.stat().st_size
-            for p in out.rglob("*")
-            if p.is_file() and p.suffix not in {".log", ".json"}
-        )
+        artifact_objects = [
+            p
+            for p in server.root.rglob("*")
+            if p.is_file() and "artifacts" in p.relative_to(server.root).parts
+        ]
+        assert artifact_objects, "native artifact store was not found"
+        artifact_bytes = sum(p.stat().st_size for p in artifact_objects)
         for query in queries.values():
             client.query({"request": query})
         for sample in range(7):
@@ -177,7 +179,7 @@ report = {
         )
         for name in queries
     },
-    "qualification": "Warm local Debug; seven samples per shape; synthetic real Parquet with regular stride-eight 2-MiB text, 20,000 distinct prefix matches and a sparse control. Artifact bytes are an observational server-output size, not isolated index size. Compare both binary orders and complete hit digests. Publication includes table admission and readiness polling and is a single observational sample per run. No task-owned build, E2E or cleanup overlap. No Release, cloud, empty-cache or archive-scale qualification.",
+    "qualification": "Warm local Debug; seven samples per shape; synthetic real Parquet with regular stride-eight 2-MiB text, 20,000 distinct prefix matches and a sparse control. Artifact bytes count every native artifact-store object after readiness, including any superseded objects; they do not isolate live text-index bytes. Compare both binary orders and complete hit digests. Publication includes table admission and readiness polling and is a single observational sample per run. No task-owned build, E2E or cleanup overlap. No Release, cloud, empty-cache or archive-scale qualification.",
 }
 (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 print(json.dumps(report["summary"], indent=2))

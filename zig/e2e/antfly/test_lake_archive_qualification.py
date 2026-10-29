@@ -2256,12 +2256,24 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                                 ]
                                 == fragment["text"]
                             )
-                            assert all(
-                                fragment["text"][
-                                    span["start"] : span["end"]
-                                ].startswith(term)
-                                for span in fragment["spans"]
-                            )
+                            stride = 8 if term == "running" else 11
+                            begin = fragment["offset"]
+                            end = begin + len(fragment["text"])
+                            expected_spans = []
+                            for token_start in range(
+                                begin // stride * stride, end, stride
+                            ):
+                                token_end = token_start + stride - 1
+                                assert original[token_start:token_end].startswith(term)
+                                left, right = (
+                                    max(begin, token_start),
+                                    min(end, token_end),
+                                )
+                                if left < right:
+                                    expected_spans.append(
+                                        {"start": left - begin, "end": right - begin}
+                                    )
+                            assert fragment["spans"] == expected_spans
                     base = {
                         "full_text_search": {"match": "needle", "field": "body"},
                         "highlight": {

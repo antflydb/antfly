@@ -122,8 +122,17 @@ with bench.managed_server(
 ) as server:
     client = bench.Client(server, 120)
     try:
+        publication_started = time.perf_counter_ns()
         client.call("POST", f"/tables/{bench.TABLE}", definition)
         client.ready(bench.readiness_indexes({"definition": definition}))
+        publication_ns = time.perf_counter_ns() - publication_started
+        artifact_objects = [
+            p
+            for p in server.root.rglob("*")
+            if p.is_file() and "artifacts" in p.relative_to(server.root).parts
+        ]
+        assert artifact_objects, "native artifact store was not found"
+        artifact_bytes = sum(p.stat().st_size for p in artifact_objects)
         for query in queries.values():
             client.query({"request": query})
         time.sleep(5.2)
@@ -189,6 +198,8 @@ report = {
     "parquet_sha256": sha(archive),
     "rows": count,
     "wide_fields": len(names),
+    "publication_ns": publication_ns,
+    "artifact_bytes": artifact_bytes,
     "queries": queries,
     "samples": samples,
     "hit_oracles": oracles,
@@ -202,7 +213,7 @@ report = {
         }
         for mode in queries
     },
-    "qualification": "Warm local Debug, three samples per shape, alternating query order. Compare identical query shapes across immutable binaries; projected-wide and hidden-narrow are separate controls. No build, E2E or cleanup from this task overlaps these measurements; the host is shared. This does not qualify cloud latency or archive scale.",
+    "qualification": "Warm local Debug, three samples per shape, alternating query order. Compare identical query shapes across immutable binaries; projected-wide and hidden-narrow are separate controls. No build, E2E or cleanup from this task overlaps these measurements; the host is shared. Publication is one observational readiness sample per run. Artifact bytes include all native-store objects after readiness, including superseded objects; they do not isolate live text bytes. This does not qualify cloud latency or archive scale.",
 }
 (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 print(json.dumps(report["summary"], indent=2))
