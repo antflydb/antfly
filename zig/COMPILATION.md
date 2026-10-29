@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-22
+Last updated: 2026-10-28
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -1860,3 +1860,59 @@ reported lost communication. GKE's retained pod deletion status identifies an
 container limit; this was not merely a GitHub runner connectivity failure.
 Sampling the next run identifies the auth underclaim directly, rather than
 attributing a vanished runner to a test assertion or increasing runner size.
+
+
+### Linux-to-Darwin release admission (2026-10-28)
+
+[Release run 40791025212](https://github.com/antflydb/antfly/actions/runs/40791025212/job/123177113959)
+compiled source `d35a1ef33e` on the Linux x86-64 ARC publish runner with the
+pinned Nix glibc-linked Zig 0.17.0, macOS SDK 26.1, baseline
+`aarch64-macos.15.0`, stripped ReleaseFast, Metal and Accelerate. Its completed
+server build reported these per-archive measurements:
+
+| Archive | Compile time | Rounded MaxRSS | Reservation |
+| --- | ---: | ---: | ---: |
+| Apache storage owner | 26 min | 13G | 16 GiB |
+| Apache inference owner | 17 min | 11G | 14 GiB |
+| API kernel | 23 min | 14G | 17 GiB |
+| Storage adapter | 14 min | 9G | 11 GiB |
+| Distributed | 12 min | 8G | 10 GiB |
+| Serverless | 6 min | 4G | 6 GiB |
+| CLI | 2 min | 2G | 4 GiB |
+| Enrichment | 45 s | 1G | 3 GiB |
+| Inference bridge | 48 s | 1G | Existing shared-owner claim: 4 GiB |
+
+Read-only runner inspection confirmed a 40 GiB cgroup and the unchanged
+32 GiB compiler budget. The broad fallback reserved 28 GiB for both API and
+storage adapter, 24 GiB for the Apache storage owner and 20 GiB for its
+inference owner. Each pair therefore compiled serially despite its measured
+working sets fitting together. The reservations above add a whole GiB to each
+rounded measurement, then 10% headroom, rounding up again to GiB. The shared
+inference bridge retains its existing 4 GiB claim.
+
+The new profile requires this compiler version, GNU Linux x86-64 host,
+baseline macOS ARM64 target, SDK 26.1, stripped ReleaseFast, shared owners,
+Metal/Accelerate and no CUDA, PJRT or thread sanitizer. Native macOS, other
+SDKs, CPUs, optimization modes and sanitizers retain their prior policies.
+Regression tests check both margins and rejection of unqualified profiles.
+Storage plus inference now reserves 30 GiB; API plus adapter reserves 28 GiB.
+No runner size, aggregate budget, optimization mode or coverage changes.
+A cold rerun is required to measure the resulting wall-time improvement;
+these observations establish admission, not a claimed speedup.
+
+
+### Base benchmark gate OOM (2026-10-28)
+
+PR run `40799072264`, job `123203194445`, lost its ARC runner during the
+Debug storage/graph benchmark compile. GKE recorded `TaskOOM` at 01:41:40 UTC
+and container exit 137. This was an unbounded `zig build`, using the static
+compiler, while the graph consumer also declared zero scheduler memory.
+
+The gate now uses pinned Nix/glibc Zig and the bounded runner under its existing
+20 GiB compiler / 24 GiB pod budget. The graph consumer inherits the conservative
+storage compilation envelope (20 GiB on Linux); the independent storage-boundary
+shim reserves 4 GiB in addition to its linked archives' own reservations. This
+accounts for source codegen instead of allowing it to overlap large owners for
+free. No forced single-job mode, larger runner or dropped benchmark contract
+is introduced. These consumer claims are conservative pending isolated peak
+measurements; they are not new measured reductions.
