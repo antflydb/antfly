@@ -315,12 +315,26 @@ class ShardTests(unittest.TestCase):
         self.assertIn("/failure-diagnostics.json", low_fd)
         self.assertIn("*.log", low_fd)
         gate = workflow.split("  e2e-base:\n")[1].split("  e2e-full-build:\n")[0]
-        self.assertIn(
-            "e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
-            gate,
+        needs = next(
+            line for line in gate.splitlines() if line.strip().startswith("needs:")
+        )
+        dependencies = {
+            name.strip() for name in needs.split("[", 1)[1].split("]", 1)[0].split(",")
+        }
+        self.assertTrue(
+            {
+                "e2e-base-plan",
+                "e2e-base-tests",
+                "e2e-base-low-fd",
+                "embedded-sdk-native",
+                "pgwire-driver-conformance",
+                "better-auth",
+            }
+            <= dependencies
         )
         self.assertIn('test "$LOW_FD_RESULT" = "success"', gate)
         self.assertIn('test "$PLAN_RESULT" = "success"', gate)
+        self.assertIn('test "$BETTER_AUTH_RESULT" = "success"', gate)
         for block in workflow.split('if ! "$helper"')[1:3]:
             paths = shlex.split(
                 block.split("\n          then", 1)[0]
