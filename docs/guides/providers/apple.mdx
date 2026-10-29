@@ -1,0 +1,199 @@
+---
+title: Apple
+description: macOS Vision OCR, SpeechAnalyzer transcription, and Foundation Models generation on device
+---
+
+The `apple` provider uses Apple's on-device frameworks on macOS: Vision for OCR,
+SpeechAnalyzer for file transcription, and Foundation Models for text
+generation. Each component is available independently; working OCR does not
+mean the Apple Intelligence generation model is ready.
+
+## What It Provides
+
+| Component | Inputs | Framework | Minimum macOS |
+|---|---|---|---|
+| Reader | PNG and JPEG images, rendered PDF pages | Vision text recognition | Any supported |
+| Transcriber | Audio files up to one hour | SpeechAnalyzer | 26 |
+| Generator | Text | Foundation Models (Apple Intelligence) | 26 |
+
+Apple components take no `model`: macOS provides it.
+
+## Credentials
+
+None. Everything runs on the device.
+
+## Enable It
+
+macOS server release archives include Vision OCR. For source builds, run this
+from the repository's `zig` directory with Zig 0.17:
+
+```bash
+zig build antfly -Dapple-ocr=true          # OCR only
+zig build antfly -Dapple-providers=true    # OCR, transcription, and generation
+```
+
+The build needs the macOS 27 SDK and the Swift 6 command-line toolchain.
+Transcription and generation live in `lib/libantfly-apple.dylib`, which both the
+`antfly` and `capi` steps install. Keep it in the `lib/` directory beside
+`libantfly`, or beside the CLI's installation. For a custom Lite layout, set
+`ANTFLY_APPLE_BRIDGE_PATH` to the library's absolute path. The CLI and `libantfly`
+can target older macOS releases:
+
+```bash
+zig build antfly capi -Dapple-providers=true -Dtarget=aarch64-macos.15.0
+```
+
+On macOS below 26, transcription and generation return
+`AppleIntelligenceProviderUnavailable`, while OCR keeps working. If the library
+is missing or from a different build, calls return `AppleNativeBridgeUnavailable`
+or `AppleNativeBridgeIncompatible`; install the right library and restart
+Antfly.
+
+## Read Images
+
+Use a `reader` producer on an asset enrichment whose field holds a PNG or JPEG
+URL:
+
+```json
+{
+  "type": "reader",
+  "config": {
+    "provider": "apple",
+    "recognition_languages": ["en-US"],
+    "recognition_level": "accurate",
+    "uses_language_correction": false
+  }
+}
+```
+
+`recognition_level` is `accurate` (the default) or `fast`. Language tags must be
+supported by the installed Vision runtime. The defaults are accurate
+recognition, English, and no language correction. Inputs can be HTTP(S) URLs or
+inline `data:image/...;base64,...` URIs; local file URLs are blocked.
+
+Plain-text output contains the recognized lines. With `content_type:
+"application/json"`, the reader returns its result array with `regions_json`:
+text, confidence, and bounding boxes in image pixels from the top left.
+
+Vision recognizes text; it does not rebuild tables or multi-column layouts, and
+it does not describe scenes. Use [LightOnOCR-3](/docs/guides/lightonocr3) for
+documents with tables and formulas, or a vision-capable generator to describe
+images.
+
+To try it interactively, open **Inference → Reader Playground** in Antfarm on a
+server built with Apple providers, pick the **Local inference** connection and
+**Apple Vision OCR**, then upload an image or choose **Load Sample**. The first
+request can take noticeably longer while macOS initializes Vision.
+
+## Index Scanned PDFs
+
+A document extraction producer renders PDF pages and passes their pixels to
+Vision. OCR boxes are mapped to page coordinates and kept as text spans for
+grounding. This table indexes OCR chunks:
+
+```json
+{
+  "num_shards": 1,
+  "indexes": {
+    "document_text": {
+      "type": "full_text",
+      "field": "text",
+      "artifact_name": "document_chunks",
+      "enrichments": [
+        {
+          "name": "document_units",
+          "kind": "asset",
+          "field": "document_url",
+          "content_type": "application/json",
+          "producer": {
+            "type": "document_extraction",
+            "config": {
+              "ocr": {
+                "mode": "always",
+                "render": {"dpi": 150},
+                "reader": {
+                  "provider": "apple",
+                  "recognition_languages": ["en-US"]
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "document_chunks",
+          "kind": "chunk",
+          "field": "text",
+          "source_artifact_name": "document_units",
+          "chunk_size": 256,
+          "full_text_index": true
+        }
+      ]
+    }
+  }
+}
+```
+
+Send that body to `POST /db/v1/tables/documents`, then write documents whose
+`document_url` points to a PDF, either a URL or an inline
+`data:application/pdf;base64,...` value. `mode: "always"` OCRs every page; `auto`
+OCRs only pages whose native text is missing or fails the quality checks.
+
+## Transcribe Recordings
+
+Use this configuration in a transcriber enrichment:
+
+```json
+{
+  "provider": "apple",
+  "language_code": "en-US",
+  "timestamps": true,
+  "download_assets": false
+}
+```
+
+The locale defaults to `en-US` and must be supported by the installed
+SpeechTranscriber runtime. Installed assets are used as-is; set
+`download_assets: true` to let macOS install a missing locale. Responses contain
+the final text, phrase segments, and word time ranges when `timestamps` is set.
+Diarization and live transcription are not supported; for speaker turns, see
+[Index Recorded Calls and Podcasts](/docs/guides/transcription).
+
+Audio can come from HTTP(S), S3 with request credentials, or an inline data URI,
+up to 128 MiB, in any format AVAudioFile reads.
+
+## Generate Text
+
+Use this generator configuration with the generation endpoints or a generator
+enrichment:
+
+```json
+{"provider": "apple", "max_tokens": 256, "temperature": 0.2}
+```
+
+System instructions and alternating user and assistant turns keep their roles.
+Tools, image or audio attachments, and other sampling options are rejected.
+
+macOS must have Apple Intelligence enabled and its model downloaded; on macOS 27
+the setting is under **Siri**. Antfly never downloads the model or falls back to
+the cloud. `AppleModelNotReady` means the model isn't available yet, and
+`AppleIntelligenceDisabled` means Apple Intelligence is off. Context overflow and
+refusals return errors rather than truncated output.
+
+## Limits
+
+- One native OCR call, and one transcription or generation call, runs per
+  process at a time. Others get the retryable `AppleOcrBusy` or `AppleNativeBusy`
+  error, and batches run serially.
+- OCR accepts at most eight images per request: 16 Mi pixels per image, 64 Mi
+  pixels and 64 MiB of encoded media per batch. Responses are capped at 8 MiB
+  and fail rather than truncate.
+- OCR takes no instruction prompt or `max_tokens`.
+- Each OCR call reserves 384 MiB of working memory in Antfly's scheduler, and
+  each transcription or generation call reserves 512 MiB. Small process memory
+  budgets can reject large documents with `DocumentExtractionWorkingSetTooLarge`.
+
+## Related
+
+- [Inference providers](/docs/guides/inference-providers): every provider and component
+- [Multimodal Embeddings](/docs/guides/multimodal): document extraction and OCR options
+- [Apple native provider design](https://github.com/antflydb/antfly/blob/main/docs/design/apple-intelligence-provider.md): bridge loading, validation, and test commands

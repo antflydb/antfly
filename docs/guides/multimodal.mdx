@@ -303,7 +303,7 @@ The `ocr` block takes:
 | `render` | PDF rasterization: `dpi` (default 150), `resolution`, `max_pixels`, `max_dimension`. |
 | `quality` | Thresholds that decide when native PDF text is too poor to keep. |
 
-Any reader provider works, including [Apple Vision](/docs/guides/apple-native-ocr)
+Any reader provider works, including [Apple Vision](/docs/guides/providers/apple)
 on macOS. Without an `ocr` block, pages that need OCR keep their native text and
 report `extraction_status: "ocr_not_configured"`. If the configured model is not
 installed, the page records a failed OCR outcome; install the model and
