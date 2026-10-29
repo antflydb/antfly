@@ -160,3 +160,9 @@ those are local regression fixtures, not evidence of a live allocator recurrence
 or a platform allocator fix. All 28 frozen application bundle artifacts still
 match their original hashes. Cache GC was invoked and its activity/inspection
 guard skipped deletion.
+
+The selected 135-artifact closure is
+`dist/qualification/paired-rehearsal-1793307402258/evidence.json`, 254,723,545
+bytes, source `8a45e47fe6a962ad406324216d40ee5eaf39db9b`. Its manifest SHA-256 is
+`9b194996a1063260989605a13e79b8399d437740e53d4e340f7c1a2538189a08`.
+All selected artifacts verify; the five preceding closures remain unchanged.
