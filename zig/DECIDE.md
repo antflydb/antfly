@@ -3,7 +3,7 @@
 Standalone inference decisions use `POST /decisions` and `/ai/v1/decisions`
 on the standalone server. The authoritative schemas live in
 [`specs/openapi/ai/decision.yaml`](../specs/openapi/ai/decision.yaml), and
-[`docs/guides/decisions.md`](../docs/guides/decisions.md) documents requests,
+[`docs/reference/decisions.md`](../docs/reference/decisions.md) documents requests,
 responses, provider configuration and examples.
 
 The public contract uses `input`, named question and answer arrays,

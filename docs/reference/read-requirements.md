@@ -60,7 +60,7 @@ An unmet readiness requirement returns `53300`; malformed or mismatched receipts
 return `22023`, and unsupported visibility returns `0A000`.
 
 These helpers are part of the development source API. Use the
-[pinned SDK installation](reference/sdks.mdx#installation); the npm `0.0.14`,
+[pinned SDK installation](sdks.mdx#installation); the npm `0.0.14`,
 PyPI `0.0.2.dev2`, and TestPyPI `0.0.1` packages inspected on 2026-10-22 do not
 contain the TypeScript/Python helpers described here.
 
