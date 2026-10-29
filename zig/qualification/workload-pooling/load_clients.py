@@ -34,6 +34,14 @@ def operation_kind(index, mixed):
     return "cheap"
 
 
+def changing_payload(phase_name, index, size):
+    """Keep the offered byte size while forcing successive durable postimages."""
+    if size < 16:
+        raise ValueError("changing writes require at least 16 payload bytes")
+    marker = hashlib.sha256(f"{phase_name}:{index}".encode()).hexdigest()
+    return "x" * max(0, size - len(marker)) + marker[:size]
+
+
 def workload_breakdown(results, offered, dropped, elapsed):
     kinds = {}
     for kind, count in offered.items():
@@ -164,7 +172,15 @@ def run_phase(target, phase, manifest, pid):
                     "inserts": {
                         f"row-{row}": {
                             "id": 9007199254740993 + row,
-                            "payload": "x" * manifest.get("fixture_payload_bytes", 0),
+                            "payload": (
+                                changing_payload(
+                                    phase["name"],
+                                    index,
+                                    manifest.get("fixture_payload_bytes", 0),
+                                )
+                                if manifest.get("changing_write_payload")
+                                else "x" * manifest.get("fixture_payload_bytes", 0)
+                            ),
                         }
                     },
                     "sync_level": "write",
@@ -474,7 +490,12 @@ def runnable_diagnostics(before, after):
 
 
 def runnable_evidence_failures(
-    measured, policy, minimum_yields=0, minimum_observed_slot_ns=0
+    measured,
+    policy,
+    minimum_yields=0,
+    minimum_observed_slot_ns=0,
+    *,
+    publication_capacity_slots=None,
 ):
     diagnostics = measured.get("runnable_diagnostics")
     stats = (measured.get("workload_after") or {}).get("runnable", {})
@@ -496,6 +517,22 @@ def runnable_evidence_failures(
         for field, value in expected.items()
         if stats.get(field) != value
     ]
+    if publication_capacity_slots is not None:
+        fields = (
+            "capacity_slots",
+            "control_capacity_slots",
+            "general_capacity_slots",
+            "bounded_read_capacity_slots",
+        )
+        if any(not isinstance(stats.get(field), int) for field in fields):
+            failures.append("guarded publication capacity was not measured")
+        elif (
+            stats["capacity_slots"] - sum(stats[field] for field in fields[1:])
+            != publication_capacity_slots
+        ):
+            failures.append(
+                "effective guarded publication reserve differs from manifest"
+            )
     kinds = measured.get("by_kind", {})
     if (
         any(
@@ -659,6 +696,9 @@ def main():
                         manifest["runnable_policy"],
                         limits.get("runnable_yields_min", 0),
                         limits.get("runnable_observed_slot_ns_min", 0),
+                        publication_capacity_slots=manifest.get(
+                            "expected_publication_capacity_slots"
+                        ),
                     )
                 )
             if (
@@ -700,6 +740,11 @@ def main():
                 failures.append(
                     phase["name"] + ": unexpected request or authorization error"
                 )
+            if any(
+                r.get("status", 0) >= 500 and r.get("status") != 503
+                for r in measured["operations"]
+            ):
+                failures.append(phase["name"] + ": unexpected server failure")
             if any(r.get("invalid_response") for r in measured["operations"]):
                 failures.append(phase["name"] + ": invalid successful response")
             for key, maximum in manifest["resource_thresholds"].items():

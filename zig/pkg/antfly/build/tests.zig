@@ -2361,6 +2361,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "linked transport admits a streaming body before the kernel pulls it",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "httpx write admission rejects saturated table mutations",
+        "httpx write admission schedules batch workers and inline fallback under original authority",
         "httpx request lifecycle hook suspends after admission without leaking capacity",
         "httpx owned response preserves retryable JSON metadata",
         "httpx lake query delivery requires a transport",

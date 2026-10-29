@@ -6,7 +6,7 @@ import struct
 
 
 class Peer:
-    def __init__(self, host, port):
+    def __init__(self, host, port, *, password=None):
         self.sock = socket.create_connection((host, port), timeout=5)
         try:
             startup = struct.pack("!I", 196608) + b"user\0admin\0database\0default\0\0"
@@ -16,11 +16,12 @@ class Peer:
                 if tag == b"R":
                     mode = struct.unpack("!I", payload[:4])[0]
                     if mode == 3:
-                        password = (
-                            os.environ["ANTFLY_QUALIFICATION_PGWIRE_PASSWORD"].encode()
-                            + b"\0"
+                        secret = (
+                            password
+                            if password is not None
+                            else os.environ["ANTFLY_QUALIFICATION_PGWIRE_PASSWORD"]
                         )
-                        self.send(b"p", password)
+                        self.send(b"p", secret.encode() + b"\0")
                     elif mode != 0:
                         raise RuntimeError(
                             f"unsupported pgwire authentication mode {mode}"

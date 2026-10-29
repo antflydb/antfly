@@ -617,3 +617,64 @@ test "retained physical wait polls independent readiness but cannot wait for a s
     try std.testing.expectError(error.ExecutionWaitUnsupported, local.common_cleanup_wait.lockAtomic(&mutex, std.testing.io, original));
     mutex.unlock();
 }
+
+// The hosted server supplies shared execution services, with no local threaded
+// executor. Keep the producer alive through both database and consumer joins.
+test "guarded managed DB commit hosted shared services open commit and reopen with index workers enabled" {
+    const a = std.testing.allocator;
+    const Resources = @import("storage/physical_resources.zig").PhysicalStorageResources;
+    const budgets = @import("storage/memory_budget.zig");
+    var resources = try Resources.initWithBudgets(a, budgets.smartResourceBudgetsForTotal(1 << 30));
+    defer resources.deinit();
+    resources.attachResourceManager();
+    var producer = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{
+        .backend = .io_threaded,
+        .memory_parent = resources.resource_manager.memoryParentPort(),
+        .lane_limits = .{
+            .durable_background = 8,
+            .api = 1,
+            .request_forward = 6,
+            .raft_inbound = 1,
+            .raft_outbound = 1,
+            .inference = 1,
+            .control = 1,
+            .pdf_render = 1,
+            .worker_capacity = 0,
+            .sql_worker_capacity = 0,
+        },
+    });
+    defer producer.deinit();
+    var offer = local.storage_execution_services.Offer.init(producer.runtime);
+    var consumer = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{
+        .backend = .manual,
+        .execution_services = &offer,
+        .memory_parent = resources.resource_manager.memoryParentPort(),
+    });
+    defer consumer.deinit();
+    try std.testing.expect(consumer.runtime.io_impl == null);
+    var directory = try local.common_test_directory.TestDirectory.init("hosted-derived-runtime");
+    defer directory.cleanup();
+    const options: local.storage_db_mod.OpenOptions = .{
+        .backend_runtime = consumer.runtime,
+        .resource_manager = &resources.resource_manager,
+        .lsm_cache = &resources.lsm_cache,
+        .hbc_cache = &resources.hbc_cache,
+        .start_index_workers = true,
+        .start_independent_maintenance = false,
+        .start_optional_runtimes = false,
+        .start_resolver_workers = false,
+    };
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.ensureDurableReplicationStartupBarrier();
+        try db.batch(.{ .writes = &.{.{ .key = "hosted", .value = "{\"value\":1}" }} });
+    }
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        const value = (try db.get(a, "hosted")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("{\"value\":1}", value);
+    }
+}

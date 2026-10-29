@@ -273,14 +273,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return try self.waitForIndexes(sequence, index_names);
     }
 } else struct {
-    const IoOwner = enum {
-        owned,
-        borrowed,
-    };
-
     alloc: Allocator,
-    threaded: *Io.Threaded,
-    threaded_owner: IoOwner,
+    io: Io,
+    owned_threaded: ?*Io.Threaded,
     scheduler: ?*Scheduler = null,
     owns_scheduler: bool = false,
     replay_source: replay_source_mod.Source,
@@ -333,8 +328,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         threaded.* = threaded_io_limits.initService(alloc);
         return initWithIo(
             alloc,
+            threaded.io(),
             threaded,
-            .owned,
             replay_source,
             ctx,
             apply_fn,
@@ -350,7 +345,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn initBorrowed(
         alloc: Allocator,
-        threaded: *Io.Threaded,
+        io: Io,
         replay_source: replay_source_mod.Source,
         ctx: *anyopaque,
         apply_fn: ApplyFn,
@@ -364,8 +359,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     ) DerivedRuntime {
         return initWithIo(
             alloc,
-            threaded,
-            .borrowed,
+            io,
+            null,
             replay_source,
             ctx,
             apply_fn,
@@ -381,8 +376,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     fn initWithIo(
         alloc: Allocator,
-        threaded: *Io.Threaded,
-        threaded_owner: IoOwner,
+        io: Io,
+        owned_threaded: ?*Io.Threaded,
         replay_source: replay_source_mod.Source,
         ctx: *anyopaque,
         apply_fn: ApplyFn,
@@ -396,8 +391,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     ) DerivedRuntime {
         return .{
             .alloc = alloc,
-            .threaded = threaded,
-            .threaded_owner = threaded_owner,
+            .io = io,
+            .owned_threaded = owned_threaded,
             .replay_source = replay_source,
             .ctx = ctx,
             .apply_fn = apply_fn,
@@ -412,7 +407,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn ioContext(self: *DerivedRuntime) Io {
-        return self.threaded.io();
+        return self.io;
     }
 
     fn signalWorkers(self: *DerivedRuntime, io: Io) void {
@@ -445,9 +440,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.workers.deinit(self.alloc);
         self.backlog.deinit(self.alloc);
         if (self.owns_scheduler) if (self.scheduler) |scheduler| scheduler.destroy();
-        if (self.threaded_owner == .owned) {
-            self.threaded.deinit();
-            self.alloc.destroy(self.threaded);
+        if (self.owned_threaded) |threaded| {
+            threaded.deinit();
+            self.alloc.destroy(threaded);
         }
         self.* = undefined;
     }
@@ -2363,7 +2358,7 @@ test "io threaded applied callback observes published watermark outside runtime 
 
     try std.testing.expectEqual(
         Io.Limit.limited(threaded_io_limits.service),
-        runtime.threaded.concurrent_limit,
+        runtime.owned_threaded.?.concurrent_limit,
     );
 
     try runtime.addWorker("text_idx", .{ .name = "text_idx", .kind = .full_text }, 0);

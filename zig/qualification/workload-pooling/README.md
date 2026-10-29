@@ -304,3 +304,46 @@ physical pause hooks. It includes an ordinary status request holding the sole
 ordinary CPU while waiting on the publisher's apply fence, independent health
 progress, cancellation/deadline joins and bounded ordinary-return refusal. This
 focused evidence does not qualify HTTP transport overload or every engine.
+
+## Native directory publication pressure
+
+`macos-guarded-publication-pressure.json` selects the standalone `local`
+directory engine and a four-slot automatic policy. It requires an observed
+publication reserve of one CPU, query/write progress, bounded waiting, status
+latency and resource recovery during mixed load. Eight HTTP peers, eight pgwire
+sessions, four held cursors and two unfinished uploads remain live through the
+phases. Changing, fixed-size payloads force updates instead of repeating the
+seeded postimage. Successful queries and writes must record grants in their
+respective runnable classes; unexpected server errors fail qualification.
+The native HTTP batch worker and its inline fallback retain a write capsule
+and the original request authority through physical completion. Historical
+profiles keep their original byte pattern and file-engine selection.
+
+```sh
+python3 zig/qualification/workload-pooling/run_local.py \
+  --binary zig/zig-out/bin/antfly \
+  --manifest zig/qualification/workload-pooling/macos-guarded-publication-pressure.json \
+  --policy runnable --output /tmp/guarded-publication-pressure.json
+```
+
+After load and client retirement, the launcher acknowledges one fresh primary
+write, verifies its exact large integer and payload over HTTP and pgwire, joins
+server shutdown, and reopens the same isolated store. Both protocols must return
+the same postimage after restart. The receipt retains both exit statuses,
+postimage hashes and harness hashes; missing restart evidence fails the run.
+This is joined-restart evidence. Crash/power-loss durability and comparisons
+across all engines require their own runs. This profile checks status progress;
+operator-policy drain testing remains in the existing dedicated profiles.
+
+File-engine qualification remains open. The same changing-write workload exposes
+retained immutable-artifact lease descriptors and intermittent
+`InvalidSourceSnapshot` query failures, reproduced with the cached server from
+before HTTP batch scheduling was integrated. Keep the descriptor-recovery and
+unexpected-server-error gates enabled while completing that production path.
+A passing directory-engine receipt does not qualify the file engine.
+
+Directory overload/restart has a passing native receipt, but repeatability is
+still open: a repeat of the same binary and semantically identical harness
+observed warm-up capacity rejections and no successful slow-reader operation
+in the sustained-overload phase. Preserve these gates rather than treating the
+single passing run as stable qualification of the whole design.

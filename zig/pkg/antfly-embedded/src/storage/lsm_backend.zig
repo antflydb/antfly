@@ -5384,15 +5384,21 @@ pub const Backend = struct {
     }
 
     fn drainRetiredMutableSnapshots(self: *Backend) void {
-        for (self.retired_mutable_snapshots.items) |state| {
+        var retired_index: usize = 0;
+        while (retired_index < self.retired_mutable_snapshots.items.len) {
+            const state = self.retired_mutable_snapshots.items[retired_index];
             if (self.mutableSnapshotReaderRefIndex(state)) |index| {
-                std.debug.assert(self.mutable_snapshot_reader_refs.items[index].readers == 0);
+                // Exact generation pins can outlive the aggregate version
+                // reader count. Only their own release authorizes reclamation.
+                if (self.mutable_snapshot_reader_refs.items[index].readers != 0) {
+                    retired_index += 1;
+                    continue;
+                }
                 _ = self.removeMutableSnapshotReaderRef(index);
             }
+            self.removeRetiredMutableSnapshot(retired_index);
             self.destroyMutableSnapshot(state);
         }
-        self.retired_mutable_snapshots.clearRetainingCapacity();
-        self.retired_mutable_snapshot_by_state.clearRetainingCapacity();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
@@ -34698,4 +34704,36 @@ test "lsm backend bounded background threaded owner joins accepted windows befor
         var key: [8]u8 = undefined;
         try std.testing.expectEqualStrings("value", try read.get(.{}, try std.fmt.bufPrint(&key, "k{d}", .{i})));
     }
+}
+
+test "mutable generation pins survive the last unrelated writer release" {
+    var backend = Backend.init(std.testing.allocator, .{ .wal_enabled = false });
+    defer backend.close();
+    const ns: backend_types.Namespace = .{ .name = "docs" };
+    {
+        var writer = try backend.beginWrite();
+        try writer.put(ns, "row", "old");
+        try writer.commit();
+    }
+    const snapshot = try backend.snapshotMutableState();
+    var pinned = true;
+    defer if (pinned) backend.releaseMutableReadSnapshot(snapshot);
+    try std.testing.expect(!backend.hasVersionReaderPins());
+    {
+        var writer = try backend.beginWrite();
+        try writer.put(ns, "row", "new");
+        try writer.commit();
+    }
+    try std.testing.expectEqualStrings("old", try snapshot.get(ns, "row"));
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_mutable_snapshots.items.len);
+    {
+        var read = try backend.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("new", try read.get(ns, "row"));
+    }
+    // Another reader's release must not reclaim this independently pinned cut.
+    try std.testing.expectEqualStrings("old", try snapshot.get(ns, "row"));
+    backend.releaseMutableReadSnapshot(snapshot);
+    pinned = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
 }

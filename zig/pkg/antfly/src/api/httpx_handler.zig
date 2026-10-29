@@ -1709,6 +1709,9 @@ pub const AntflyApiHandler = struct {
     }
 
     const OffloadedTableBatch = struct {
+        server: *ApiHttpServer,
+        options: @import("antfly_local_sources").common_bounded_admission.Options,
+        admission_failed: bool = true,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         body_data: []const u8,
@@ -1718,19 +1721,50 @@ pub const AntflyApiHandler = struct {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.result = self.handler(
-                self.alloc,
-                self.table_name,
-                self.body_data,
-                self.api,
-            ) catch |err| {
+            self.result = self.runChecked() catch |err| {
                 self.err = err;
                 return;
             };
         }
+
+        fn runChecked(self: *@This()) !public_table_http.OwnedResponse {
+            try self.api.request.ensureActive();
+            // Nested callers retain their existing authority. Fresh HTTP work
+            // owns one write capsule through every synchronous child join.
+            if (self.api.request.execution_team != null) {
+                self.admission_failed = false;
+                return self.handler(self.alloc, self.table_name, self.body_data, self.api);
+            }
+            var execution: http_server_mod.RunnableScheduler.Execution = .{};
+            var options = self.options;
+            options.retained_bytes +|= @sizeOf(@This());
+            try self.server.startSqlRunnable(&execution, options, .write);
+            defer execution.finish();
+            var completion: ?@import("runnable_write_team.zig").Completion = if (execution.entry != null)
+                try @import("runnable_write_team.zig").Completion.init(&execution, self.alloc)
+            else
+                null;
+            var team: @import("antfly_runtime_abi").runnable_abi.Team = undefined;
+            var api = self.api;
+            if (completion) |*owner| {
+                team = try owner.team();
+                api.request.execution_team = &team;
+            }
+            self.admission_failed = false;
+            return self.handler(self.alloc, self.table_name, self.body_data, api);
+        }
     };
 
+    fn tableBatchAdmissionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "write canceled"),
+            error.DeadlineExceeded, error.Timeout => textResponse(ctx, 504, "write deadline exceeded"),
+            else => writeOverloadedResponse(ctx),
+        };
+    }
+
     fn handleTableBatchInline(
+        self: *AntflyApiHandler,
         ctx: *httpx.Context,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -1738,11 +1772,18 @@ pub const AntflyApiHandler = struct {
         api: public_table_http.TableApi,
         handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
     ) !httpx.Response {
-        var resp = try handler(alloc, table_name, body_data, api);
+        var job: OffloadedTableBatch = .{ .server = self.api_server, .options = queryAdmissionOptions(ctx), .alloc = alloc, .table_name = table_name, .body_data = body_data, .api = api, .handler = handler };
+        job.run();
+        if (job.err) |err| {
+            if (job.admission_failed) return tableBatchAdmissionError(ctx, err);
+            return err;
+        }
+        var resp = job.result.?;
         return respondOwnedApiResponseWithAllocator(ctx, &resp, alloc);
     }
 
     fn handleTableBatchOffEventLoop(
+        self: *AntflyApiHandler,
         ctx: *httpx.Context,
         executor: ?std.Io,
         table_name: []const u8,
@@ -1750,19 +1791,23 @@ pub const AntflyApiHandler = struct {
         api: public_table_http.TableApi,
         handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
     ) !httpx.Response {
-        const runtime_io = executor orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
-        const job_alloc = std.heap.page_allocator;
+        const runtime_io = executor orelse return self.handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
+        const job_alloc = self.api_server.alloc;
         const owned_table_name = job_alloc.dupe(u8, table_name) catch |err| {
             std.log.warn("batch offload table-name allocation failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
+            return self.handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         };
         defer job_alloc.free(owned_table_name);
         const owned_body_data = job_alloc.dupe(u8, body_data) catch |err| {
             std.log.warn("batch offload body allocation failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
+            return self.handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         };
         defer job_alloc.free(owned_body_data);
+        var options = queryAdmissionOptions(ctx);
+        options.io = runtime_io;
         var job = OffloadedTableBatch{
+            .server = self.api_server,
+            .options = options,
             .alloc = job_alloc,
             .table_name = owned_table_name,
             .body_data = owned_body_data,
@@ -1774,13 +1819,16 @@ pub const AntflyApiHandler = struct {
             // an empty HTTP disconnect. The request still owns its buffers, so
             // executing synchronously is a safe bounded degradation path.
             std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
+            return self.handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         };
         // Future.await can forward caller cancellation to its child. Protect
         // this wait so proposal cannot be interrupted before durability is
         // known. The batch's request token still controls visibility waits.
         @import("protected_future.zig").wait(runtime_io, &future);
-        if (job.err) |err| return err;
+        if (job.err) |err| {
+            if (job.admission_failed) return tableBatchAdmissionError(ctx, err);
+            return err;
+        }
         var resp = job.result.?;
         return respondOwnedApiResponseWithAllocator(ctx, &resp, job_alloc);
     }
@@ -9168,7 +9216,7 @@ pub const AntflyApiHandler = struct {
             var response = value;
             return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
         }
-        return try handleTableBatchOffEventLoop(
+        return try self.handleTableBatchOffEventLoop(
             ctx,
             http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg),
             decoded_table_name,
@@ -9219,7 +9267,7 @@ pub const AntflyApiHandler = struct {
             .retire => public_table_http.handleRelationalConstraintRetirement,
             else => public_table_http.handleRelationalRowsMutation,
         };
-        return handleTableBatchOffEventLoop(ctx, http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg), decoded_table_name, body, self.api_server.tableApi(request), handler);
+        return self.handleTableBatchOffEventLoop(ctx, http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg), decoded_table_name, body, self.api_server.tableApi(request), handler);
     }
 
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -19711,7 +19759,7 @@ test "httpx HEAD fallback enforces GET table permission" {
     const authorization = try encodeBasicAuthorization(alloc, "head_reader", "secret");
     defer alloc.free(authorization);
 
-    var source = SchemaUpdateStatusSource{};
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, null);
     defer api_server.deinit();
@@ -22591,7 +22639,7 @@ test "SQL bounded read workers refuse insufficient waiting envelopes and unsuppo
 
 test "native memory HTTP validates route and space without loading a model" {
     const a = std.testing.allocator;
-    var source = SchemaUpdateStatusSource{};
+    var source = SchemaUpdateStatusSource{ .schema_allocator = a };
     defer source.deinit(a);
     var api = ApiHttpServer.init(a, .{}, source.iface(), null, null);
     defer api.deinit();
@@ -22641,7 +22689,7 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     a.free(created);
     var reads = table_reads.BoundTableReadSource.init("memory_team", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
-    var status_source = SchemaUpdateStatusSource{ .table_name = "memory_team" };
+    var status_source = SchemaUpdateStatusSource{ .schema_allocator = a, .table_name = "memory_team" };
     var api = ApiHttpServer.init(a, .{}, status_source.memoryIface(), reads.source(), writes.source());
     defer api.deinit();
     var server: HttpxE2eServer = undefined;
@@ -22876,7 +22924,7 @@ test "native memory HTTP and MCP share persistent storage and private provenance
 
 test "native memory catalog ownership denies generic and batched data admission" {
     const a = std.testing.allocator;
-    var fixture: SchemaUpdateStatusSource = .{ .table_name = "memory_team" };
+    var fixture: SchemaUpdateStatusSource = .{ .schema_allocator = a, .table_name = "memory_team" };
     const source = fixture.memoryIface();
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve = .{ .table = "memory_team" } }));
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }} } }));
@@ -23095,7 +23143,7 @@ test "native memory dedicated MCP and HTTP authorize scoped credentials across c
     const physical = "table:0123456789abcdef0123456789abcdef";
     var reads = table_reads.BoundTableReadSource.init(physical, 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init(physical, &db);
-    var source: SchemaUpdateStatusSource = .{ .table_name = physical, .memory_logical_name = "memory_team" };
+    var source: SchemaUpdateStatusSource = .{ .schema_allocator = a, .table_name = physical, .memory_logical_name = "memory_team" };
     var api = ApiHttpServer.init(a, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.memoryIface(), reads.source(), writes.source());
     defer api.deinit();
     var server: HttpxE2eServer = undefined;
@@ -24451,4 +24499,57 @@ test "httpx inference gateway document jobs persist before dispatch and publish 
     var submitted_json = try std.json.parseFromSlice(std.json.Value, a, submitted.body.?, .{});
     defer submitted_json.deinit();
     try store.cancel(work, submitted_json.value.object.get("id").?.string, "anonymous");
+}
+
+test "httpx write admission schedules batch workers and inline fallback under original authority" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Probe = struct {
+        var expected_scheduled: bool = false;
+        var calls: usize = 0;
+        fn handle(alloc: std.mem.Allocator, table: []const u8, body: []const u8, api: public_table_http.TableApi) !public_table_http.OwnedResponse {
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqualStrings("original-body", body);
+            try std.testing.expectEqualStrings("original-request", api.request.request_id);
+            try std.testing.expectEqual(expected_scheduled, api.request.execution_team != null);
+            if (api.request.execution_team) |team| {
+                try std.testing.expectEqual(@import("antfly_runtime_abi").runnable_abi.Class.write, try team.borrow.currentClass());
+                try team.borrow.checkLifetime();
+            }
+            calls += 1;
+            return .{ .status = 201, .body = try alloc.dupe(u8, "accepted") };
+        }
+    };
+    for ([_]bool{ false, true }) |enabled| {
+        var source = AuthStatusSource{};
+        var server = ApiHttpServer.init(a, .{ .runnable_policy = if (enabled) .{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 } else null }, source.iface(), null, null);
+        defer server.deinit();
+        var handler: AntflyApiHandler = .{ .api_server = &server };
+        Probe.expected_scheduled = enabled;
+        Probe.calls = 0;
+        for ([_]?std.Io{ null, std.testing.io }) |executor| {
+            var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/tables/docs/batch");
+            defer request.deinit();
+            request.body = "original-body";
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.handleTableBatchOffEventLoop(&ctx, executor, "docs", request.body.?, server.tableApi(.{ .request_id = "original-request" }), Probe.handle);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 201), response.status.code);
+            try std.testing.expectEqualStrings("accepted", response.body.?);
+            try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+        }
+        try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+        try std.testing.expectEqual(@as(u64, if (enabled) 2 else 0), server.runnableSchedulingStats().grants[1]);
+        var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/tables/docs/batch");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var canceled = std.atomic.Value(bool).init(true);
+        var denied = try handler.handleTableBatchOffEventLoop(&ctx, std.testing.io, "docs", "original-body", server.tableApi(.{ .request_id = "original-request", .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled) }), Probe.handle);
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 408), denied.status.code);
+        try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+        try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+    }
 }

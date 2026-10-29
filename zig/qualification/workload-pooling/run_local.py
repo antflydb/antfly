@@ -52,6 +52,63 @@ def free_port():
         return peer.getsockname()[1]
 
 
+def standalone_command(binary, root, api_port, manifest):
+    engine = manifest.get("storage_engine", "lite")
+    if engine not in ("local", "lite"):
+        raise ValueError("qualification storage_engine must be local or lite")
+    command = [
+        str(binary),
+        "standalone",
+        "--config",
+        str(root / "config.json"),
+        "--auth",
+        "true",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(api_port),
+        "--health",
+        "false",
+        "--data-dir",
+        str(root / "data"),
+        "--models-dir",
+        str(root / "models"),
+        "--ml-dir",
+        str(root / "ml"),
+        "--storage-engine",
+        engine,
+    ]
+    if engine == "lite":
+        command.extend(["--storage-path", str(root / "data.aflite")])
+    return command
+
+
+def wait_ready(child, api_port, authorization, log_path):
+    deadline = time.monotonic() + 60
+    while True:
+        if child.poll() is not None:
+            raise RuntimeError(f"server exited {child.returncode}; see {log_path}")
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", api_port, timeout=1)
+            try:
+                connection.request(
+                    "GET",
+                    "/db/v1/status",
+                    headers={"Authorization": authorization},
+                )
+                response = connection.getresponse()
+                response.read()
+                if response.status == 200:
+                    break
+            finally:
+                connection.close()
+        except (OSError, http.client.HTTPException):
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"server did not become ready; see {log_path}")
+        time.sleep(0.1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=pathlib.Path)
@@ -90,6 +147,7 @@ def main():
     root = pathlib.Path(tempfile.mkdtemp(prefix="antfly-pooling-qualification-"))
     try:
         config = configuration_for_policy(manifest, args.policy)
+        command = standalone_command(binary, root, api_port, manifest)
     except ValueError as error:
         args.output.write_text(
             json.dumps(
@@ -123,30 +181,6 @@ def main():
     config_path = root / "config.json"
     config_path.write_text(json.dumps(config))
     log_path = root / "server.log"
-    command = [
-        str(binary),
-        "standalone",
-        "--config",
-        str(config_path),
-        "--auth",
-        "true",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(api_port),
-        "--health",
-        "false",
-        "--data-dir",
-        str(root / "data"),
-        "--models-dir",
-        str(root / "models"),
-        "--ml-dir",
-        str(root / "ml"),
-        "--storage-engine",
-        "lite",
-        "--storage-path",
-        str(root / "data.aflite"),
-    ]
     password = secrets.token_urlsafe(24)
     authorization = "Basic " + base64.b64encode(("admin:" + password).encode()).decode()
     server_env = dict(os.environ, ANTFLY_BOOTSTRAP_ADMIN_PASSWORD=password)
@@ -158,6 +192,9 @@ def main():
     )
     result = None
     startup_problem = None
+    checkpoint = None
+    durability = {}
+    exit_codes = []
     with log_path.open("w") as log:
         child = subprocess.Popen(
             command,
@@ -167,33 +204,7 @@ def main():
             preexec_fn=child_limits,
         )
         try:
-            deadline = time.monotonic() + 60
-            while True:
-                if child.poll() is not None:
-                    raise RuntimeError(
-                        f"server exited {child.returncode}; see {log_path}"
-                    )
-                try:
-                    connection = http.client.HTTPConnection(
-                        "127.0.0.1", api_port, timeout=1
-                    )
-                    try:
-                        connection.request(
-                            "GET",
-                            "/db/v1/status",
-                            headers={"Authorization": authorization},
-                        )
-                        response = connection.getresponse()
-                        response.read()
-                        if response.status == 200:
-                            break
-                    finally:
-                        connection.close()
-                except (OSError, http.client.HTTPException):
-                    pass
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f"server did not become ready; see {log_path}")
-                time.sleep(0.1)
+            wait_ready(child, api_port, authorization, log_path)
             if manifest.get("http_auth_mode") == "api_key":
                 peer = http.client.HTTPConnection("127.0.0.1", api_port, timeout=5)
                 try:
@@ -241,6 +252,16 @@ def main():
                 ],
                 env=probe_env,
             )
+            if result.returncode == 0 and manifest.get("durability_restart_probe"):
+                import durability_probe
+
+                checkpoint, durability["before_shutdown"] = durability_probe.write(
+                    api_port,
+                    sql_port,
+                    authorization,
+                    password,
+                    manifest.get("fixture_payload_bytes", 0),
+                )
         except Exception as error:
             startup_problem = str(error)
         finally:
@@ -251,6 +272,47 @@ def main():
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait()
+    exit_codes.append(child.returncode)
+    if checkpoint is not None and child.returncode == 0:
+        # Reopen the same isolated directory/file and authentication state.
+        # Do not seed or rewrite anything after restart: only verify the exact
+        # postimage whose primary acknowledgment was observed before shutdown.
+        with log_path.open("a") as log:
+            try:
+                reopened = subprocess.Popen(
+                    command,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=server_env,
+                    preexec_fn=child_limits,
+                )
+            except Exception as error:
+                startup_problem = "restart launch failed: " + type(error).__name__
+            else:
+                child = reopened
+                try:
+                    wait_ready(child, api_port, authorization, log_path)
+                    durability["after_restart"] = durability_probe.verify(
+                        api_port,
+                        sql_port,
+                        authorization,
+                        password,
+                        checkpoint,
+                    )
+                except Exception as error:
+                    startup_problem = (
+                        "restart durability verification failed: "
+                        + type(error).__name__
+                    )
+                finally:
+                    if child.poll() is None:
+                        child.send_signal(signal.SIGINT)
+                        try:
+                            child.wait(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait()
+                exit_codes.append(child.returncode)
     if not args.output.exists():
         args.output.write_text(
             json.dumps(
@@ -285,13 +347,39 @@ def main():
             enforced_limits=observed_limits,
             manifest_sha256=hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
             binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+            harness_sha256={
+                name: hashlib.sha256(
+                    pathlib.Path(__file__).with_name(name).read_bytes()
+                ).hexdigest()
+                for name in (
+                    "run_local.py",
+                    "load_clients.py",
+                    "idle_clients.py",
+                    "pressure_clients.py",
+                    "pgwire_peer.py",
+                    "durability_probe.py",
+                )
+            },
             configuration=config,
             server_exit_code=child.returncode,
+            server_exit_codes=exit_codes,
+            durability_probe=durability,
             server_log=str(saved_log),
             command=command,
         )
-        if child.returncode != 0:
-            receipt["failures"].append(f"server shutdown exited {child.returncode}")
+        if startup_problem is not None:
+            receipt["failures"].append(startup_problem)
+            receipt["passed"] = False
+        if (
+            manifest.get("durability_restart_probe")
+            and "after_restart" not in durability
+        ):
+            receipt["failures"].append(
+                "acknowledged postimage was not verified after restart"
+            )
+            receipt["passed"] = False
+        if any(code != 0 for code in exit_codes):
+            receipt["failures"].append("a server incarnation failed joined shutdown")
             receipt["passed"] = False
         args.output.write_text(json.dumps(receipt, indent=2) + "\n")
         return not receipt["passed"]

@@ -1085,6 +1085,8 @@ const LocalStandaloneMetadata = struct {
             .ptr = self,
             .vtable = &.{
                 .admin_snapshot = catalogAdminSnapshot,
+                .transaction_snapshot_with_budget = catalogTransactionSnapshot,
+                .free_transaction_snapshot = catalogFreeTransactionSnapshot,
                 .export_catalog = exportCatalog,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
                 .acquire_routing_generation = acquireRoutingGeneration,
@@ -1835,6 +1837,44 @@ const LocalStandaloneMetadata = struct {
         errdefer catalogFreeAdminSnapshot(ptr, &snapshot);
         try request.ensureActive();
         return snapshot;
+    }
+
+    fn catalogTransactionSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.AdminSnapshot {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try budget.checkpoint();
+        while (!self.mutex.tryLock()) try budget.waitForProgress();
+        defer self.mutex.unlock();
+        try budget.checkpoint();
+        if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+        const store = self.lifecycle_store orelse return error.CatalogRoutingUnavailable;
+        // The durable read captures topology and active transition fences at
+        // one revision, under the request's original clock and cancellation.
+        const captured = try store.captureTransactionRoutingProjection(alloc, group_ids.main_metadata_group_id, budget);
+        return .{
+            .status = .{
+                .metadata_group_id = group_ids.main_metadata_group_id,
+                .metadata_incarnation = captured.metadata_incarnation,
+                .metrics = .{},
+            },
+            .tables = captured.tables,
+            .ranges = captured.ranges,
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = captured.split_transitions,
+            .merge_transitions = captured.merge_transitions,
+        };
+    }
+
+    fn catalogFreeTransactionSnapshot(_: *anyopaque, alloc: std.mem.Allocator, snapshot: *antfly.metadata_api.AdminSnapshot) void {
+        for (snapshot.tables) |table| antfly.metadata.table_manager.freeTable(alloc, table);
+        alloc.free(snapshot.tables);
+        for (snapshot.ranges) |range| antfly.metadata.table_manager.freeRange(alloc, range);
+        alloc.free(snapshot.ranges);
+        for (snapshot.split_transitions) |transition| antfly.metadata.table_manager.freeSplitTransitionRecord(alloc, transition);
+        alloc.free(snapshot.split_transitions);
+        for (snapshot.merge_transitions) |transition| antfly.metadata.table_manager.freeMergeTransitionRecord(alloc, transition);
+        alloc.free(snapshot.merge_transitions);
+        snapshot.* = undefined;
     }
 
     fn catalogAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
@@ -16650,4 +16690,37 @@ test "standalone shared document state follows metadata HA replay and fenced own
     };
     metadata.hot_standby_gate = .{ .borrowed = .{ .ptr = &metadata, .check_fn = Denied.check } };
     try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", &queued_hash, queued, 1));
+}
+
+test "system catalog standalone relation coordinator preserves bounded transaction routing capture" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/transaction-catalog.json", .{tmp.sub_path});
+    defer a.free(path);
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    const catalog = metadata.catalogSource();
+    const capture = catalog.vtable.transaction_snapshot_with_budget.?;
+    const release = catalog.vtable.free_transaction_snapshot.?;
+    const store = metadata.lifecycle_store.?;
+    try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .upsert_table = .{ .table_id = 7, .name = "transaction_rows", .indexes_json = "{}" } });
+    try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .upsert_range = .{ .group_id = 11, .table_id = 7, .start_key = "" } });
+    var captured = try capture(catalog.ptr, a, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s });
+    defer release(catalog.ptr, a, &captured);
+    try std.testing.expectEqual(@as(usize, 1), captured.tables.len);
+    try std.testing.expectEqualStrings("transaction_rows", captured.tables[0].name);
+    try std.testing.expectEqual(@as(u64, 7), captured.tables[0].table_id);
+    try std.testing.expectEqual(@as(usize, 0), captured.stores.len);
+    var routing = (try antfly.public_api.table_catalog.transactionRoutingSnapshotWithBudget(a, catalog, "transaction_rows", .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s })).?;
+    defer routing.deinit(a);
+    try std.testing.expectEqual(@as(?u64, 11), routing.resolveGroupForKey("row-0"));
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, capture(catalog.ptr, a, .{ .deadline_ns = 0 }));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, capture(catalog.ptr, a, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expect(metadata.mutex.tryLock());
+    defer metadata.mutex.unlock();
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, capture(catalog.ptr, a, .{ .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_ms }));
 }

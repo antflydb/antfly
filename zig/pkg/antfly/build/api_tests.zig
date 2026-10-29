@@ -164,7 +164,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const guarded_commit_tests = b.addTest(.{
         .name = "guarded-db-commit-tests",
         .root_module = guarded_commit_root,
-        .filters = &.{ "guarded managed DB commit", "retained physical wait", "guarded incremental publication" },
+        .filters = &.{ "guarded managed DB commit", "retained physical wait", "guarded incremental publication", "mutable generation pins" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

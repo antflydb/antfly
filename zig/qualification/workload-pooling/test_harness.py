@@ -824,5 +824,182 @@ class ConcurrencySweepTests(unittest.TestCase):
             self.assertTrue(summary["points"][-1]["passed"])
 
 
+class NativePublicationQualificationTests(unittest.TestCase):
+    def test_storage_selection_preserves_file_default_and_supports_directory(self):
+        from pathlib import Path
+        from run_local import standalone_command
+
+        root = Path("/isolated-fixture")
+        file_command = standalone_command(Path("/antfly"), root, 8080, {})
+        self.assertEqual(
+            "lite", file_command[file_command.index("--storage-engine") + 1]
+        )
+        self.assertEqual(
+            str(root / "data.aflite"),
+            file_command[file_command.index("--storage-path") + 1],
+        )
+        manifest = {"storage_engine": "local"}
+        directory_command = standalone_command(Path("/antfly"), root, 8080, manifest)
+        self.assertNotIn("--storage-path", directory_command)
+        self.assertEqual(
+            "local", directory_command[directory_command.index("--storage-engine") + 1]
+        )
+        self.assertEqual(
+            str(root / "config.json"),
+            directory_command[directory_command.index("--config") + 1],
+        )
+        self.assertEqual({"storage_engine": "local"}, manifest)
+        with self.assertRaises(ValueError):
+            standalone_command(
+                Path("/antfly"), root, 8080, {"storage_engine": "object"}
+            )
+
+    def test_changing_writes_preserve_bytes_and_change_across_operations_and_phases(
+        self,
+    ):
+        from load_clients import changing_payload
+
+        for size in (16, 64, 4096):
+            values = [
+                changing_payload("burst", 7, size),
+                changing_payload("burst", 15, size),
+                changing_payload("recovery", 7, size),
+            ]
+            self.assertEqual(3, len(set(values)))
+            self.assertTrue(all(len(value.encode()) == size for value in values))
+            self.assertNotIn("x" * size, values)
+        with self.assertRaises(ValueError):
+            changing_payload("burst", 7, 0)
+
+    def test_publication_gate_requires_effective_capacity_observation(self):
+        from load_clients import runnable_evidence_failures
+
+        base = RunnableQualificationTests()
+        measured = base.measured()
+        policy = base.manifest()["runnable_policy"]
+        check = lambda value: runnable_evidence_failures(
+            value, policy, publication_capacity_slots=1
+        )
+        self.assertTrue(check(measured))
+        stats = measured["workload_after"]["runnable"]
+        stats.update(general_capacity_slots=1, bounded_read_capacity_slots=0)
+        self.assertEqual([], check(measured))
+        stats["general_capacity_slots"] = 2
+        self.assertTrue(check(measured))
+
+    def test_durability_gate_requires_identical_http_and_pgwire_postimages(self):
+        import json
+        from unittest.mock import Mock
+        import durability_probe as probe
+
+        def response(value):
+            result = Mock(status=200)
+            result.read.return_value = json.dumps(value).encode()
+            return result
+
+        expected = "new durable image"
+        http_result = {
+            "columns": [{"name": "id"}, {"name": "payload"}],
+            "rows": [[str(probe.ROW_ID), expected]],
+        }
+        with (
+            patch.object(probe.http.client, "HTTPConnection") as factory,
+            patch.object(probe, "Peer") as peers,
+        ):
+            factory.return_value.getresponse.return_value = response(http_result)
+            peers.return_value.query.return_value = [[str(probe.ROW_ID), expected]]
+            result = probe.verify(8080, 5432, "test-auth", "test-password", expected)
+            self.assertTrue(result["http_verified"] and result["pgwire_verified"])
+            peers.assert_called_with("127.0.0.1", 5432, password="test-password")
+            peers.return_value.query.return_value = [[str(probe.ROW_ID), "stale"]]
+            with self.assertRaises(RuntimeError):
+                probe.verify(8080, 5432, "test-auth", "test-password", expected)
+            http_result["rows"][0][0] = str(probe.ROW_ID - 1)
+            factory.return_value.getresponse.return_value = response(http_result)
+            with self.assertRaises(RuntimeError):
+                probe.verify(8080, 5432, "test-auth", "test-password", expected)
+            factory.return_value.getresponse.return_value = response(
+                {"errors": ["failed"]}
+            )
+            with self.assertRaises(RuntimeError):
+                probe.request(8080, "test-auth", "/batch", {})
+
+    def test_restart_launch_failure_cannot_leave_a_passing_load_receipt(self):
+        import json
+        import pathlib
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import run_local
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            server_root = root / "server"
+            server_root.mkdir()
+            binary = root / "antfly"
+            binary.write_bytes(b"fixture binary")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"durability_restart_probe": True}))
+            output = root / "receipt.json"
+            child = Mock(returncode=None)
+            child.poll.return_value = None
+            child.send_signal.side_effect = lambda _: setattr(child, "returncode", 0)
+            child.wait.return_value = 0
+
+            def load(*args, **kwargs):
+                output.write_text(json.dumps({"passed": True, "failures": []}))
+                return SimpleNamespace(returncode=0)
+
+            from contextlib import ExitStack
+
+            contexts = [
+                patch.object(
+                    run_local.sys,
+                    "argv",
+                    [
+                        "run_local.py",
+                        "--binary",
+                        str(binary),
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                    ],
+                ),
+                patch.object(
+                    run_local.tempfile, "mkdtemp", return_value=str(server_root)
+                ),
+                patch.object(run_local, "enforced_limits", return_value={}),
+                patch.object(run_local, "check_container", return_value=[]),
+                patch.object(run_local, "free_port", side_effect=[8080, 5432]),
+                patch.object(run_local, "wait_ready"),
+                patch.object(
+                    run_local.subprocess,
+                    "Popen",
+                    side_effect=[child, OSError("unavailable")],
+                ),
+                patch.object(run_local.subprocess, "run", side_effect=load),
+                patch(
+                    "durability_probe.write",
+                    return_value=(
+                        "new postimage",
+                        {"http_verified": True, "pgwire_verified": True},
+                    ),
+                ),
+            ]
+            with ExitStack() as stack:
+                for context in contexts:
+                    stack.enter_context(context)
+                self.assertTrue(run_local.main())
+            receipt = json.loads(output.read_text())
+            self.assertFalse(receipt["passed"])
+            self.assertTrue(
+                any("restart launch failed" in reason for reason in receipt["failures"])
+            )
+            self.assertNotIn("after_restart", receipt["durability_probe"])
+            self.assertEqual([0], receipt["server_exit_codes"])
+            self.assertIn("durability_probe.py", receipt["harness_sha256"])
+
+
 if __name__ == "__main__":
     unittest.main()

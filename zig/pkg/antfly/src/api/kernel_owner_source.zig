@@ -2505,7 +2505,6 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (request.operation != .artifact) try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{
             .execution_deadline_ns = context.deadline_ns,
             .execution_io = context.deadline_io,
-            .fanout_io = context.fanout_io,
             .cancellation = context.cancellation,
         }, .read_index);
         const json = try std.json.Stringify.valueAlloc(alloc, request, .{});

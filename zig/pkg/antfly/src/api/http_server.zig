@@ -15779,6 +15779,7 @@ pub const ApiHttpServer = struct {
             error.PreDecisionDeadlineExceeded => return error.DeadlineExceeded,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.Backpressured,
             error.ResourceBudgetExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,

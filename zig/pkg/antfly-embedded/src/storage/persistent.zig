@@ -2105,7 +2105,7 @@ pub const PersistentIndex = struct {
     pub fn runLsmMaintenanceStepWithLifetime(self: *PersistentIndex, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
         if (lifetime) |original| try original.checkpoint();
         if (lifetime) |original| {
-            try @import("../common/seed_snapshot_lifetime.zig").lockIo(persistentStorageIo(self.io), &self.storage_mu, original);
+            try @import("../common/seed_snapshot_lifetime.zig").lockIo(persistentStorageIo(self.io), self.storage_mu, original);
         } else self.lockStorage();
         defer self.unlockStorage();
         return try self.main_store_owner.runLsmMaintenanceStepWithLifetime(lifetime);
