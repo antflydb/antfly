@@ -21,7 +21,8 @@
 // - Antfly running with inference
 // - CLIP model: antfly inference pull openai/clip-vit-base-patch32
 //
-// Run: go run main.go
+// Run: go run .                       (sample images and optional MMIR import)
+//      go run . -dir ~/Desktop [query...]  (your own screenshots, images, and PDFs)
 
 // ANCHOR: imports
 package main
@@ -31,6 +32,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -45,30 +47,41 @@ import (
 // ANCHOR_END: imports
 
 func main() {
+	dir := flag.String("dir", "", "index and search screenshots, images, and PDFs in this folder instead of the sample images")
+	flag.Parse()
 	ctx := context.Background()
 
 	// Step 1: Create the client
-	client, err := antfly.NewAntflyClient("http://localhost:8080/db/v1", http.DefaultClient)
+	antflyURL := os.Getenv("ANTFLY_URL")
+	if antflyURL == "" {
+		antflyURL = "http://localhost:8080/db/v1"
+	}
+	client, err := antfly.NewAntflyClient(antflyURL, http.DefaultClient)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	if *dir != "" {
+		searchLocalFolder(ctx, client, *dir, flag.Args())
+		return
 	}
 
 	// ANCHOR: create_table
 	// Step 2: Create the table with embeddings index
 	fmt.Println("Creating table 'images' with CLIP embeddings index...")
 
-	// Build the embedder config (union type)
-	var embedderConfig oapi.EmbedderConfig
-	embedderConfig.Provider = oapi.EmbedderProviderAntfly
-	embedderConfig.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{
+	embedderConfig, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model: "openai/clip-vit-base-patch32",
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Build the path-identified index request.
 	indexConfig, err := antfly.NewCreateIndexRequest(oapi.EmbeddingsIndexConfig{
 		Dimension: 512,
 		Template:  "{{media url=image_url}}{{caption}}",
-		Embedder:  embedderConfig,
+		Embedder:  *embedderConfig,
 	})
 	if err != nil {
 		log.Fatal(err)

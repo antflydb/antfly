@@ -28,8 +28,8 @@ import (
 // old configuration. verifyExistingIndexConfigs compares what this build
 // would create against what the database actually has and fails with a
 // rebuild instruction on drift, the same guard
-// examples/epstein/autoschema.go's verifyAutoschemaGraphIndexConfig applies
-// on the server.
+// verifyAutoschemaGraphIndexConfig applied on the server in the removed
+// examples/epstein/autoschema.go.
 
 // verifyKnowledgeGraphConfig subset-compares the desired graph config against
 // the stored one. Graph configs pass through Lite's AddIndex untranslated, so
