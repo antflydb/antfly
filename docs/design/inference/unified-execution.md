@@ -3419,3 +3419,9 @@ weights, retired raw-weight bridges, and explicit single-row fallback admission.
 [The AX register](unified-execution-ax-outcomes.md) records retirement of nine
 superseded C/Zig entry points, whole-repository reference checks, byte-identical
 surviving implementations, and validation of the active decoder paths.
+
+### AY fresh Glowworm qualification and model-kernel families
+
+[The AY register](unified-execution-ay-outcomes.md) records fresh CUDA
+correctness/host/stream/graph measurements, their shared-GPU tail limitations,
+and a concrete plan for model-independent implementations with tuned variants.
