@@ -196,8 +196,8 @@ func chunkVectorsIndexJSON(embedModel, inferenceURL string, targetTokens, overla
 // knowledgeGraphIndexJSON returns the "autograph" graph index: a GLiNER2.5
 // extractor asset producer (relations_v1) materialized into graph edges, with
 // an entity resolver canonicalizing the relation endpoints. This mirrors
-// examples/epstein/autoschema.go's createAutoschemaKnowledgeGraphIndex
-// pattern, expressed directly as the raw index JSON consumed by
+// the createAutoschemaKnowledgeGraphIndex pattern from the removed
+// examples/epstein/autoschema.go (see https://github.com/antflydb/antfly/blob/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein/autoschema.go), expressed directly as the raw index JSON consumed by
 // antfly_db_add_index_json instead of SDK builder types.
 //
 // Relation endpoints are NOT template-mapped: GLiNER2.5 relations reference

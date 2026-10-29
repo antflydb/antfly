@@ -182,7 +182,7 @@ try {
 ```
 
 For decision question types and examples, see the
-[typed decision guide](../../../docs/guides/decisions.md).
+[typed decision guide](../../../docs/reference/decisions.md).
 
 - **Calls**: `embed`, `rerank`, `chunk`, `generate`, `generateBatch`,
   `rewrite`, `decide`, `extract`, `read` (OCR), `transcribe`, `listModels` -- each with

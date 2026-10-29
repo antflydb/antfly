@@ -86,9 +86,7 @@ class AuthPublicationTests(unittest.TestCase):
         workflow = (
             ROOT / ".github/workflows/better-auth-compatibility.yml"
         ).read_text()
-        self.assertLess(
-            workflow.index("xz-utils"), workflow.index("name: Install Nix")
-        )
+        self.assertLess(workflow.index("xz-utils"), workflow.index("name: Install Nix"))
         self.assertIn("name: Install glibc-linked Zig", workflow)
 
 

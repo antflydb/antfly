@@ -73,7 +73,7 @@ may depend on this expiring bucket.
 
 ## October 10 measured blockers
 
-The [recorded results](../../examples/hackernews/archive-results-20261010.json)
+The [recorded results](../operations/hackernews/history/archive-results-20261010.json)
 contain the initial attempts over the same raw archive. Merged main rejected a large
 Parquet page with `ParquetRowGroupTooLarge`. The decoder fix eliminates redundant
 per-column row-reference arrays while retaining the existing materialization
@@ -284,7 +284,7 @@ Work starts from `origin/main` after PR #1066, in
 that checkout; the main checkout contains independent work.
 
 The updated detailed billing export is captured in
-[`archive-spend-20261011.json`](../../examples/hackernews/archive-spend-20261011.json).
+[`archive-spend-20261011.json`](../operations/hackernews/history/archive-spend-20261011.json).
 The six identified qualification pods cost $0.927106 gross. All HN-labelled
 benchmark pods since October 9 cost $7.996654 gross, including those six and
 other HN work. The shared import bucket has $0.277859 in exported charges;
@@ -360,7 +360,7 @@ not establish a running Firebase feed, replacement-pod recovery or serving SLO.
 
 ## First regional publication result and corrections
 
-[`publication-baseline-20261011.json`](../../examples/hackernews/publication-baseline-20261011.json)
+[`publication-baseline-20261011.json`](../operations/hackernews/history/publication-baseline-20261011.json)
 records the first completed regional one-file publication. The unchanged
 142,577-row file and all declared text/metadata indexes published, and SQL count
 passed. The qualification verdict failed: cold highlighted search took
@@ -379,7 +379,7 @@ source-free recipe identity or the segment format. This increases sidecar storag
 measured; it is not yet a qualified latency improvement. The serving candidate
 uses the same policy.
 
-The next [registration probe](../../examples/hackernews/publication-registration-20261011.json)
+The next [registration probe](../operations/hackernews/history/publication-registration-20261011.json)
 stopped before publication because the public full-text allow-list omitted
 `store_source`. Its pod was deleted and its artifact prefix was empty. Public
 create-table/create-index admission and response projection now preserve the
@@ -389,7 +389,7 @@ remain available from the authenticated segment. These are local contract
 checks, not regional latency measurements.
 
 The latest billing export still omits today's two pods. The
-[closed-pod evidence](../../examples/hackernews/archive-compute-bounds-20261011.json)
+[closed-pod evidence](../operations/hackernews/history/archive-compute-bounds-20261011.json)
 replaces their excess compute reservations with two full hours each at their
 admitted resources, preserving $10 per run for pending noncompute. This is an
 explicit upper estimate, not posted spend. Exposure is $113.301782 before another
@@ -535,7 +535,7 @@ identities, source authority and total normalization must remain unchanged. Qual
 this with the same 1,000-row current fixture and mutation/restart cursor checks.
 
 Final local evidence is in
-`examples/hackernews/combined-main-search-qualification-20261012.json`. The raw
+`docs/operations/hackernews/history/combined-main-search-qualification-20261012.json`. The raw
 empty-cache matrix measured 32.25–78.91 ms first-query, 7.87–9.03 ms warm p95,
 and 29.61–38.56 ms restart latency. Readiness-enabled runs measured 30.74–49.13 ms
 first-query latency and now prove positive warmup (42 planning pages before query).
@@ -639,7 +639,7 @@ separately before treating them as a performance comparison.
 
 ### Optimized 1,024-file local comparison, October 13
 
-[Recorded evidence](../../examples/hackernews/lake-scalability-qualification-20261013.json)
+[Recorded evidence](../operations/hackernews/history/lake-scalability-qualification-20261013.json)
 compares the retained optimized #1081 executable with the follow-up implementation
 on the same 142,577 logical rows, re-encoded into 1,024 Snappy files. Each executable
 ran two application-cache-cleared/restart cycles, 20 warm samples and 10 cursor
@@ -742,7 +742,7 @@ matrix results follow below.
 
 ### Rebuilt composed-query qualification, October 13
 
-[Recorded local evidence](../../examples/hackernews/composed-lake-qualification-20261013.json)
+[Recorded local evidence](../operations/hackernews/history/composed-lake-qualification-20261013.json)
 binds production revision `37fa71b50d` and the optimized executable's digest to two
 complete cycles on the same 142,577-row, 1,024-file fixture with 128 serving runs.
 Both cycles pass filters, highlights, composition, retained pagination and
@@ -779,7 +779,7 @@ measurements do not establish full-archive or managed Cloud latency.
 
 ### Restart outlier investigation after #1121
 
-[Investigation evidence](../../examples/hackernews/restart-latency-investigation-20261013.json)
+[Investigation evidence](../operations/hackernews/history/restart-latency-investigation-20261013.json)
 retains the original failures and records 35 isolated restart probes and four
 additional full sequences on the unchanged merged executable. The 4,385 ms
 single-search stall did not recur. Two sequences used process-local filesystem
@@ -869,7 +869,7 @@ They do not establish the cause of the original already-ready-cache stall or
 eliminate host paging. Keep the retained failures and require controlled-host,
 full-archive and managed Cloud qualification before treating latency as passed.
 
-[Follow-up evidence](../../examples/hackernews/cache-startup-qualification-20261013.json)
+[Follow-up evidence](../operations/hackernews/history/cache-startup-qualification-20261013.json)
 records the optimized build at `05420a779c` and three immediate-start cycles on
 the same 142,577-row fixture. First searches take 116–371 ms; a retained 128-hit
 cursor issued as the first request after restart takes 361–421 ms. Each cycle

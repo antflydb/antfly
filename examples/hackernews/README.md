@@ -68,7 +68,7 @@ publication/count, remove only that state's cache, and start before measuring.
 
 ## October 7 results
 
-`qualification.json` records observations from a local Debug build against GCS.
+`docs/operations/hackernews/history/qualification.json` records observations from a local Debug build against GCS.
 
 | 10,000-row sample | First highlighted query | Repeat | After restart | Exact ordered filter |
 |---|---:|---:|---:|---|
@@ -157,7 +157,7 @@ Debug timings use a different platform and optimization level.
 
 ### October 8 results
 
-[regional-qualification.json](regional-qualification.json) records two runs per
+[regional-qualification.json](../../docs/operations/hackernews/history/regional-qualification.json) records two runs per
 mode on one `us-central1` worker, using main `d2e9138f3f` and a Linux `fast` build.
 All five metadata indexes published, with exact filter totals/ranked pages
 matching residual evaluation before and after restart. HN IDs and scores also
@@ -193,7 +193,7 @@ only and about 38 KB with metadata indexes, rather than downloading megabytes.
 
 ### Automatic predicate planner results
 
-[planner-qualification.json](planner-qualification.json) records the follow-up
+[planner-qualification.json](../../docs/operations/hackernews/history/planner-qualification.json) records the follow-up
 on `10e36b97f1`, using the same raw export, GKE node, Linux `fast` optimization,
 and pod resources. Each mode ran twice with five warm samples per filter in
 each cycle. The table pools those ten samples per filter:
@@ -631,7 +631,7 @@ The temporary bucket is unsuitable for the public service's durable storage.
 
 ### October 10 full-archive results
 
-[archive-results-20261010.json](archive-results-20261010.json) records the pinned
+[archive-results-20261010.json](../../docs/operations/hackernews/history/archive-results-20261010.json) records the pinned
 47,717,307-row raw export and the merged-main Linux `fast` attempt. Registration
 took 49.6 seconds, then publication failed with `ParquetRowGroupTooLarge` before
 SQL counts or search timings could be measured. The temporary pod and its 36
@@ -739,7 +739,7 @@ without erasing original reservations or failed attempts:
 ```sh
 python examples/hackernews/archive_budget.py \
   --ledger /private/tmp/hn-archive-budget.json \
-  --evidence examples/hackernews/archive-reconciliation-20261011.json
+  --evidence docs/operations/hackernews/history/archive-reconciliation-20261011.json
 ```
 
 Evidence must identify a deleted pod, the matching ledger run, closure and export
@@ -774,7 +774,7 @@ historical/current replacement semantics, and restart/cursor correctness passed.
 Restart searches took 703–712 ms. Cold highlighted queries still took 15.9–18.0
 seconds, and early deep cursor pages exceeded the 2-second p95 gate. This is a
 **failed** one-file performance qualification; see
-`publication-stored-source-20261012.json`. The owned pod and all 7,429 derived
+`docs/operations/hackernews/history/publication-stored-source-20261012.json`. The owned pod and all 7,429 derived
 objects were removed with generation conditions; source data was preserved.
 
 The harness exposes health metrics only on the daemon's loopback host at the
@@ -789,7 +789,7 @@ the public HTTP recovery tests. An incomplete local cut directory now validates
 as a cache miss and opens the same authenticated remote generation; loss of
 remote authority still fails closed. Malformed manifests, missing sealed files,
 and active-reader admission are covered by engine units. Exact validation layers
-and binary provenance are in `native-recovery-qualification-20261012.json`.
+and binary provenance are in `docs/operations/hackernews/history/native-recovery-qualification-20261012.json`.
 
 New seekable text publications can bundle their opening metadata pages into one
 authenticated object per segment. The bundle stays below 1 MiB and below half of
@@ -809,7 +809,7 @@ The metadata bundle binary at revision `89ccd33a2f` passed both public native
 recovery profiles and completed two regional cycles. Cold searches improved to
 12.1–13.9 seconds but still missed the 10-second gate; early cursor pages also
 missed their latency gate. Restart search took roughly half a second. See
-`publication-metadata-qualification-20261012.json`; this remains failed
+`docs/operations/hackernews/history/publication-metadata-qualification-20261012.json`; this remains failed
 performance evidence. Phase counters placed most residual cold time in ranking
 and initial deep-page time in hydration.
 
@@ -873,7 +873,7 @@ replacement suppression, saved visibility and mutable composed cursor restart
 checks passed. Initial publication took 449.62 seconds plus 1.64 seconds of
 registration; reopening the same publication took 0.22 seconds.
 
-See `publication-ordinal-qualification-20261012.json` for binary and harness
+See `docs/operations/hackernews/history/publication-ordinal-qualification-20261012.json` for binary and harness
 provenance, gate thresholds, sample summaries and retained-report hashes. The
 first attempt lost its Kubernetes output stream and supplied only partial evidence;
 the detached supervised replacement supplied the complete passing verdict. The
@@ -969,7 +969,7 @@ IDs and scores while reducing provider reads from 397 to 314 (20.91%) and bytes
 from 53,487,307 to 46,458,677 (13.14%). These are provider counters, not an HTTP
 request trace. Native physical layouts can differ from the x86 layouts.
 
-See `local-search-comparison-20261012.json` for provenance, samples and limits.
+See `docs/operations/hackernews/history/local-search-comparison-20261012.json` for provenance, samples and limits.
 The host had unrelated concurrent work; these timings are diagnostic rather than
 a production guarantee. OS file caches were not flushed. Antfly cleared its
 serving cache before each restart; startup created one cache file, and measured
@@ -1059,7 +1059,7 @@ sample. That diagnostic remains a separate SQL qualification finding; successful
 composition does not imply that SQL shape has been qualified.
 
 The combined implementation is recorded in
-[`combined-main-search-qualification-20261012.json`](combined-main-search-qualification-20261012.json).
+[`docs/operations/hackernews/history/combined-main-search-qualification-20261012.json`](../../docs/operations/hackernews/history/combined-main-search-qualification-20261012.json).
 On the raw 142,577-row sample, final empty-serving-cache searches took
 32.25–78.91 ms, warm p95 7.87–9.03 ms, and restart searches 29.61–38.56 ms.
 After default readiness warmup, first searches took 30.74–49.13 ms; 42 planning
@@ -1120,7 +1120,7 @@ readers before publishing this format. See the deployment qualification plan for
 bounds and separate correctness/performance evidence.
 
 
-The [October 13 optimized local comparison](lake-scalability-qualification-20261013.json)
+The [October 13 optimized local comparison](../../docs/operations/hackernews/history/lake-scalability-qualification-20261013.json)
 uses 1,024 source files and 128 serving runs. Two cycles preserve exact ranked
 IDs/scores and reduce first-search provider reads from 1,461 to 405 and bytes from
 50.85 MB to 24.33 MB. First highlighted search is 136–240 ms, warm p95 51–55 ms,

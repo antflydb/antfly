@@ -360,10 +360,18 @@ test "GLiNER production CUDA extraction through concurrent HTTP sockets multi" {
     try extractionSockets(multi_dir, multi_case.native_schema_json, multi_case.text, multi_case.native_expected);
 }
 
-const BatchCase = struct { text: []const u8, schema: std.json.Value };
+pub const BatchCase = struct { text: []const u8, schema: std.json.Value };
+pub const additional_multi_batch_fixtures = [_][]const u8{
+    "family/multi_v1_general_classification_capture.json",
+    "family/multi_v1_endpoint_capture.json",
+    "family/multi_v1_clean_entity_short_capture.json",
+    "family/multi_v1_classification_floor_capture.json",
+    "family/multi_v1_general_entity_capture.json",
+    "family/multi_v1_source_word_floor_capture.json",
+};
 const BatchInput = struct { id: []const u8, content: []const u8, schema: std.json.Value };
 
-fn batchBody(a: std.mem.Allocator, model: []const u8, cases: []const BatchCase, n: usize, reverse: bool) ![]u8 {
+pub fn batchBody(a: std.mem.Allocator, model: []const u8, cases: []const BatchCase, n: usize, reverse: bool) ![]u8 {
     const inputs = try a.alloc(BatchInput, n);
     defer a.free(inputs);
     var built: usize = 0;
@@ -376,7 +384,7 @@ fn batchBody(a: std.mem.Allocator, model: []const u8, cases: []const BatchCase, 
     return std.json.Stringify.valueAlloc(a, .{ .schema_version = 2, .model = model, .schema = cases[0].schema, .inputs = inputs, .options = .{ .include_confidence = true, .include_spans = true, .offset_unit = "unicode_codepoints" } }, .{});
 }
 
-fn equalBatchValue(want: std.json.Value, got: std.json.Value, tolerance: f64) anyerror!void {
+pub fn equalBatchValue(want: std.json.Value, got: std.json.Value, tolerance: f64) anyerror!void {
     try std.testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
     switch (want) {
         .object => |object| {
@@ -475,15 +483,7 @@ fn batchPool(node: *Node, transport: *Loopback, directory: []const u8, cases: []
 fn additionalMultiBatchProfiles(node: *Node, transport: *Loopback, directory: []const u8, intents: []const BatchCase) !void {
     const a = std.testing.allocator;
     const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
-    const files = [_][]const u8{
-        "family/multi_v1_general_classification_capture.json",
-        "family/multi_v1_endpoint_capture.json",
-        "family/multi_v1_clean_entity_short_capture.json",
-        "family/multi_v1_classification_floor_capture.json",
-        "family/multi_v1_general_entity_capture.json",
-        "family/multi_v1_source_word_floor_capture.json",
-    };
-    for (files, 0..) |file, file_index| {
+    for (additional_multi_batch_fixtures, 0..) |file, file_index| {
         std.debug.print("production_cuda_batch_profile fixture={s}\n", .{file});
         const bytes = try fixtures.fixtureBytes(a, file);
         defer a.free(bytes);

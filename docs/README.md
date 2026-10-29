@@ -6,9 +6,9 @@ shared terminology is in the [glossary](glossary.mdx).
 
 ## Sections
 
-- [Guides](guides/) — tutorials, examples, integrations, and development setup.
-- [Reference](reference/) — authentication, secrets, SDKs, formats, CLI packaging, and [licensing maintenance](reference/licensing.md).
-- [Operations](operations/) — object-storage operations and runtime verification history.
+- [Guides](guides/) — tutorials, examples, and integrations.
+- [Reference](reference/) — authentication, secrets, SDKs, formats, [document TTL](reference/ttl.md), [typed decisions](reference/decisions.md), [inference runtime configuration](reference/inference-runtime.md), CLI packaging, and [licensing maintenance](reference/licensing.md).
+- [Operations](operations/) — object-storage operations and development, [store-root enrollment](operations/store-root-enrollment.md), and runtime verification history.
 - [Design](design/) — current architecture and technical decisions; the [Zig roadmap](../zig/ROADMAP.md#design-documents) indexes subsystem documents kept beside their code.
 - [Plans](plans/README.md) — proposed and active work.
 - [UI](ui/react-antfly.mdx) — React integration.
