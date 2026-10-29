@@ -467,7 +467,7 @@ test "serverless execution H2 slow readers preserve owners and allow queries and
     const Adapter = @import("serverless_http_server.zig").ServerlessHttpServer;
     const Types = @import("serverless/api/types.zig");
     const Memory = @import("common/allocation_budget.zig").Partitioned;
-    const Case = enum { resumed, reset, disconnect };
+    const Case = enum { resumed, reset, disconnect, unacknowledged_disconnect, silent };
     const Helper = struct {
         fn request(peer: *Httpx.H2Connection, socket: *Httpx.Socket, path: []const u8, credit: bool) !*Httpx.Stream {
             const stream = try peer.stream_manager.createStream();
@@ -477,10 +477,11 @@ test "serverless execution H2 slow readers preserve owners and allow queries and
             if (credit) try peer.sendWindowUpdate(socket, stream.id, 8192);
             return stream;
         }
-        fn waitRetired(io: std.Io, scheduler: *Runnable.Scheduler, memory: *Memory, expected: usize) !void {
+        fn waitRetired(io: std.Io, scheduler: *Runnable.Scheduler, memory: *Memory, expected: usize, disconnected: ?*const Httpx.Server) !void {
             const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
             while (scheduler.stats().operations != expected or
-                (expected == 0 and (memory.foreground.stats().used_bytes != 0 or memory.control.stats().used_bytes != 0)))
+                (expected == 0 and (memory.foreground.stats().used_bytes != 0 or memory.control.stats().used_bytes != 0)) or
+                (if (disconnected) |server| server.runtimeStats().active_connections != 0 else false))
             {
                 if (@import("antfly_platform").time.monotonicNs() >= until) {
                     std.debug.print("slow-output retirement timeout: operations {d}, output {d}, foreground {d}, control {d}\n", .{ scheduler.stats().operations, scheduler.stats().output_blocked, memory.foreground.stats().used_bytes, memory.control.stats().used_bytes });
@@ -518,6 +519,13 @@ test "serverless execution H2 slow readers preserve owners and allow queries and
         var adapter = Adapter.init(memory.allocator(false), .{}, &handler);
         var cfg = Listener.listenerHttpxConfig(.{ .max_connections = 4, .max_request_tasks = 4 }, null);
         cfg.protected_request_tasks = 2;
+        if (case == .unacknowledged_disconnect or case == .silent) {
+            // No terminal packet need reach a server after abandonment. Keep
+            // the original finite request/idle ceilings authoritative when
+            // abort is unobserved, including a peer that never closes at all.
+            cfg.request_timeout_ms = 1500;
+            cfg.h2_idle_timeout_ms = 250;
+        }
         cfg.application_allocator = memory.allocator(false);
         cfg.protected_application_allocator = memory.allocator(true);
         cfg.application_memory_budget_bytes = 3 << 20;
@@ -542,7 +550,7 @@ test "serverless execution H2 slow readers preserve owners and allow queries and
         const slow = try Helper.request(&peer, &socket, "/status", false);
         while (!slow.got_headers) _ = try peer.processOneFrame(&socket, &socket);
         std.debug.print("slow-output case {s}: stalled headers, content length {any}\n", .{ @tagName(case), slow.content_length });
-        try Helper.waitRetired(io, &scheduler, &memory, 1);
+        try Helper.waitRetired(io, &scheduler, &memory, 1, null);
         try std.testing.expect(!slow.completed);
         try std.testing.expectEqual(@as(usize, 0), slow.data_buf.items.len);
         try std.testing.expectEqual(@as(usize, 1), scheduler.stats().output_blocked);
@@ -570,7 +578,7 @@ test "serverless execution H2 slow readers preserve owners and allow queries and
             try std.testing.expect(std.mem.indexOf(u8, control.data_buf.items, if (std.mem.eql(u8, path, "/healthz")) "ok" else "ready") != null);
             peer.stream_manager.removeStream(control.id);
         }
-        try Helper.waitRetired(io, &scheduler, &memory, 1);
+        try Helper.waitRetired(io, &scheduler, &memory, 1, null);
         try std.testing.expect(!slow.completed);
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
         switch (case) {
@@ -581,13 +589,25 @@ test "serverless execution H2 slow readers preserve owners and allow queries and
                 try std.testing.expectEqualStrings(expected, slow.data_buf.items);
             },
             .reset => try peer.sendRstStream(&socket, slow.id, .cancel),
-            .disconnect => {
+            .disconnect, .unacknowledged_disconnect => {
+                // Abort at an acknowledged frame boundary. Closing the local
+                // descriptor with queued control frames alone does not prove
+                // the peer observed disconnect (the socket can stay live).
+                if (case == .disconnect) {
+                    try peer.sendPing(&socket, "closing!".*);
+                    while (!peer.ping_ack_event.isSet()) _ = try peer.processOneFrame(&socket, &socket);
+                    try std.testing.expectEqual(@as(usize, 0), slow.data_buf.items.len);
+                    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().output_blocked);
+                }
                 socket.abortRequest();
                 socket.close();
                 socket_live = false;
             },
+            .silent => {}, // Leave the transport open with no response credit.
         }
-        try Helper.waitRetired(io, &scheduler, &memory, 0);
+        const disconnected = case == .disconnect or case == .unacknowledged_disconnect or case == .silent;
+        try Helper.waitRetired(io, &scheduler, &memory, 0, if (disconnected) &server else null);
+        if (disconnected) try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_requests);
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().output_blocked);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }

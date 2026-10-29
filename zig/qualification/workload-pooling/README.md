@@ -405,7 +405,24 @@ pinning a synthetic slot correctly caused bounded capacity rejections.
 
 The production server builds and the focused gate passes. These listener tests
 use local filesystem providers; they do not qualify cloud/distributed providers
-or all serverless maintenance waits. Earlier runs also reproduced intermittent
-H2 disconnect retirement beyond the unchanged five-second assertion. Passing
-runs do not resolve that repeatability issue; preserve the failed receipts and
-the original cleanup limit while investigating frame-reader/response retirement.
+or all serverless maintenance waits.
+
+The H2 lifecycle probe now distinguishes peer-visible disconnect from local
+socket close. Diagnostics reproduced a closed client descriptor and a still
+established server socket despite correctly installed zero linger. An acknowledged
+PING boundary drains preceding control frames before the abort case; it neither
+grants response credit nor retires the stalled owner. The probe still requires
+zero scheduler operations, retained bytes, foreground/control allocations, active
+requests and physical connections within the original five-second limit, before
+server shutdown.
+
+The original unfenced abort also remains covered. That case and an additional
+fully silent peer use explicit 1.5-second request and 250-millisecond idle
+ceilings, proving bounded ownership when no immediate close notification reaches
+the server. These are local native-listener checks of the existing production
+request/idle policies; they do not promise five-second detection of an unseen
+abort under arbitrary policy or network conditions. Ten consecutive runs of
+the complete focused serverless binary pass all five lifecycle cases and the
+managed ingestion/publication checks. Published-read polling may observe
+retryable capacity responses before success within its existing retry bound.
+The failed baseline and native socket/stack diagnostics remain available.
