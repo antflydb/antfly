@@ -89,6 +89,12 @@ export function validateDocuments(documents: DocumentInterface[]): void {
         (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype)
       )
         throw new TypeError("Metadata must be acyclic JSON");
+      if (
+        Object.getOwnPropertySymbols(value).length ||
+        (Array.isArray(value) &&
+          Array.from({ length: value.length }, (_, i) => i).some((i) => !(i in value)))
+      )
+        throw new TypeError("Metadata must be lossless JSON");
       seen.add(value);
       for (const item of Object.values(value)) visit(item);
       seen.delete(value);

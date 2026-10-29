@@ -160,6 +160,18 @@ it("rejects malformed vectors and metadata before writes", async () => {
   ).rejects.toThrow();
   expect(calls).toEqual([]);
 });
+it.each([
+  { slots: new Array(2) },
+  { nested: { slots: new Array(2) } },
+  { [Symbol("required")]: "lost" },
+  { nested: [{ [Symbol("required")]: "lost" }] },
+])("rejects lossy metadata before embedding or writing: %j", async (metadata) => {
+  const documents = [{ id: "a", pageContent: "x", metadata }];
+  await expect(store().addDocuments(documents)).rejects.toThrow("lossless JSON");
+  await expect(store().addVectors([[1, 0]], documents)).rejects.toThrow("lossless JSON");
+  expect(embeddings.embedDocuments).not.toHaveBeenCalled();
+  expect(calls).toEqual([]);
+});
 it("reports partial progress without mutation replay", async () => {
   failBatch = 2;
   const error = await store({ batchSize: 1 })
