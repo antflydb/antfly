@@ -464,3 +464,25 @@ around physical provider I/O, finer joined-kernel participant scheduling, and
 model/provider waits remain required to complete the maintenance milestone.
 Local filesystem evidence does not qualify remote/cloud providers or all engines;
 the existing full-qualification waiver and failed file-engine resource gate remain.
+
+Maintenance artifact uploads also carry an operation-local provider context from
+the normal catalog and builder entrypoints. Shared object-store handles never
+receive that owner's execution pointer. Filesystem providers hash before lending
+CPU, join the prepared durable mutation and release its content locks before CPU
+return. S3 and GCS forward the same operation's wait control to their existing
+HTTP transport readiness and pool waits; cancellation monitors retain only the
+lifetime predicate.
+
+Page upload batches reserve bounded child metadata before publishing workers.
+The coordinator parks its complete existing team before child activation and
+reenters after every physical task joins and its child entry retires. Deferred
+reservation supports an existing foreground team as well as serial background
+orchestration. Original lifetime, clock, class and accepted-completion authority
+remain inherited; no child creates a fresh admission root or deadline.
+
+The provider integration remains part of the open maintenance milestone.
+Manifest/WAL/catalog/progress calls, retention and pruning operations, direct
+filesystem artifact adapters, and model/kernel participant waits still need
+complete physical-boundary integration. Transport forwarding alone does not
+qualify remote providers. The existing file-engine resource-gate failure and
+full-qualification waiver are unchanged.

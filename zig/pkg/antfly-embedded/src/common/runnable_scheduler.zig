@@ -1064,6 +1064,8 @@ pub const Scheduler = struct {
 
     /// Reserve registry ownership without publishing CPU demand. An unused
     /// packet cannot hold capacity needed by another physical worker or root.
+    /// A team owner may reserve children before parking its complete team;
+    /// activation still belongs to each independently published worker.
     fn reserveChild(self: *Scheduler, parent: *Entry, child: *Entry, io: std.Io) !void {
         return self.submitChildMode(parent, child, io, true);
     }
@@ -1074,7 +1076,7 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (parent == child or parent.scheduler != self or parent.state != .running or parent.publication_active or parent.cleanup_active or parent.protected_cleanup_root or parent.cpu_borrow_budget != null or child.cpu_borrow_budget != null or
-            child.state != .fresh or child.scheduler != null or child.parent != null or child.children != 0 or parent.slots != 1) return error.InvalidRunnableTransition;
+            child.state != .fresh or child.scheduler != null or child.parent != null or child.children != 0 or (!initially_blocked and parent.slots != 1)) return error.InvalidRunnableTransition;
         try self.checkAncestorsLocked(parent);
         if (child.bytes < @sizeOf(Entry)) return error.InvalidRunnableDemand;
         child.options = parent.options;

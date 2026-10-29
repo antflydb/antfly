@@ -215,6 +215,7 @@ const HttpxTransport = struct {
             .headers = request_headers.items,
             .body = body,
             .max_response_size = max_response_size,
+            .socket_control = if (cancellation) |token| token.execution_wait else null,
             .cancellation = if (cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else

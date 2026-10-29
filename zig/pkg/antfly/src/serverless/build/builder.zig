@@ -385,9 +385,12 @@ pub const Builder = struct {
             .domain = graph_page_store.PageStore.namespaceDomain(namespace),
             .attempt = try graphPublicationAttempt(publication_guard, namespace, io),
         };
+        const protected = protection.token(io);
+        var upload_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = protected };
+        if (protected.execution != null) scoped_artifacts.write_context = upload_bridge.readContext();
         var publisher = self.*;
         publisher.artifacts = &scoped_artifacts;
-        return publisher.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protection.token(io)) catch |err| return graphPublicationError(err, false);
+        return publisher.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protected) catch |err| return graphPublicationError(err, false);
     }
 
     fn publishNamespaceWithMetricAndPlanPinnedUntil(

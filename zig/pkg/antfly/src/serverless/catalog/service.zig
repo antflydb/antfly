@@ -884,6 +884,7 @@ pub const CatalogService = struct {
         var bridge = maintenance_cancellation.GraphBridge{ .maintenance = protected };
         var scoped = self.artifacts.*;
         scoped.upload_scope = .{ .domain = graph_page_store.PageStore.namespaceDomain(namespace), .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io) };
+        if (protected.execution != null) scoped.write_context = bridge.readContext();
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication, .{ .artifacts = &scoped, .cancellation = bridge.token(), .maintenance = protected });
         defer plan.deinit(self.alloc);

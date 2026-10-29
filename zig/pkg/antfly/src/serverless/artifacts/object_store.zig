@@ -303,8 +303,12 @@ pub const ObjectStore = struct {
     }
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
-        try self.upload_context.ensureActive();
-        const lifetime: UploadCancellation = .{ .context = self.upload_context, .parent = cancellation };
+        return self.putInScopeFor(alloc, scope, contents, cancellation, self.upload_context);
+    }
+
+    fn putInScopeFor(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken, context: ReadContext) !artifact_store.ArtifactMetadata {
+        try context.ensureActive();
+        const lifetime: UploadCancellation = .{ .context = context, .parent = cancellation };
         const token = lifetime.token();
         try token.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
@@ -318,8 +322,8 @@ pub const ObjectStore = struct {
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
 
-        if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUploadWithWait(upload, checksum, token, self.upload_context.wait);
-        try self.upload_context.ensureActive();
+        if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUploadWithWait(upload, checksum, token, context.wait);
+        try context.ensureActive();
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
         var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
@@ -332,16 +336,19 @@ pub const ObjectStore = struct {
             // not be used to bypass content verification.
             .checksum_sha256_hex = null,
             .if_none_match = true,
-            .cancellation = objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn),
+            .cancellation = lifetime.providerToken(),
         };
-        var result = execution_wait.runOwned(self.upload_context.wait, objectstore.Client.putObject, .{ &self.client, self.bucket, key, contents, options }, discardProvider, .{self.client.allocator}) catch |err| switch (normalizeCancellationError(err, token)) {
+        // Native execution is lent at provider readiness/physical-write
+        // boundaries. Legacy explicit wait-only adapters retain their contract.
+        const outer_wait = if (context.execution == null) context.wait else null;
+        var result = execution_wait.runOwned(outer_wait, objectstore.Client.putObject, .{ &self.client, self.bucket, key, contents, options }, discardProvider, .{self.client.allocator}) catch |err| switch (normalizeCancellationError(err, token)) {
             error.PreconditionFailed => {
                 // Content-addressed keys are immutable. Concurrent/idempotent
                 // writers may lose the create race, but the existing object is
                 // accepted only after authenticating it against the digest we
                 // computed from `contents`.
-                try self.upload_context.ensureActive();
-                try self.verifyContentWithContext(artifact_id, contents.len, checksum, token, null, self.upload_context);
+                try context.ensureActive();
+                try self.verifyContentWithContext(artifact_id, contents.len, checksum, token, null, context);
                 var pin = try self.verifiedObjectPinAlloc(alloc, artifact_id, contents.len, null);
                 defer if (pin) |*value| value.deinit(alloc);
                 return .{
@@ -354,7 +361,7 @@ pub const ObjectStore = struct {
             else => |normalized| return normalized,
         };
         defer result.deinit(self.client.allocator);
-        try self.upload_context.ensureActive();
+        try context.ensureActive();
         try self.captureGeneration(artifact_id, contents.len, result.version_id, cancellation);
 
         return .{
@@ -374,8 +381,34 @@ pub const ObjectStore = struct {
         }
         fn check(raw: *const anyopaque) !void {
             const self: *const @This() = @ptrCast(@alignCast(raw));
-            try self.context.checkLifetime();
             try self.parent.check();
+            try self.context.checkLifetime();
+        }
+        fn providerToken(self: *const @This()) objectstore.CancellationToken {
+            return .{
+                .ptr = self,
+                .is_cancelled_fn = cancelled,
+                .execution_wait = if (self.context.execution != null and self.context.wait != null) .{
+                    .ptr = @constCast(self),
+                    .wait_begin_fn = begin,
+                    .wait_end_fn = end,
+                } else null,
+            };
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            try check(self);
+            const wait = self.context.wait.?;
+            try wait.begin(wait.ptr);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            const wait = self.context.wait.?;
+            wait.end(wait.ptr) catch |err| {
+                try check(self);
+                return err;
+            };
+            try check(self);
         }
         fn token(self: *const @This()) CancellationToken {
             return .{ .ptr = self, .is_cancelled_fn = cancelled, .check_fn = check };
@@ -939,6 +972,7 @@ pub const ObjectStore = struct {
         .inherit_closure = inheritClosure,
         .seal_closures = sealClosures,
         .deinit = erasedDeinit,
+        .put_for = erasedPutFor,
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
@@ -961,6 +995,11 @@ pub const ObjectStore = struct {
     fn erasedDeinit(_: std.mem.Allocator, ptr: *anyopaque) void {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         self.deinit();
+    }
+
+    fn erasedPutFor(ptr: *anyopaque, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken, context: ReadContext) !artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.putInScopeFor(alloc, scope, contents, cancellation, context);
     }
 
     fn erasedPut(ptr: *anyopaque, alloc: std.mem.Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
@@ -1663,4 +1702,140 @@ test "external lake global frontier unversioned S3-compatible GC uses names thro
     try store.delete(&id);
     try std.testing.expectEqual(@as(usize, 1), state.lists);
     try std.testing.expectEqual(@as(usize, 1), state.deletes);
+}
+
+test "serverless execution filesystem uploads return CPU only after preparation and preserve durable rejection" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Probe = struct {
+        execution: *Runnable.Execution,
+        scheduler: *Runnable.Scheduler,
+        checks_on_cpu: usize = 0,
+        checks_in_io: usize = 0,
+        waits: usize = 0,
+        lost: bool = false,
+        mode: enum { success, lease_lost, scheduler_closed },
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.lost) return error.WorkLeaseLost;
+            if (self.execution.entry.?.state == .running) self.checks_on_cpu += 1 else self.checks_in_io += 1;
+        }
+        fn authority(raw: *anyopaque) !void {
+            try check(raw);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(Runnable.State.running, self.execution.entry.?.state);
+            try self.execution.park(.resource_blocked);
+            // With a single ordinary CPU, this proves a real provider wait
+            // leaves execution capacity available to an unrelated query.
+            var query: Runnable.Execution = .{};
+            defer query.finish();
+            try query.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+            self.waits += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(Runnable.State.resource_blocked, self.execution.entry.?.state);
+            switch (self.mode) {
+                .success => {},
+                .lease_lost => self.lost = true,
+                .scheduler_closed => self.scheduler.close(),
+            }
+            try self.execution.enter(.background);
+        }
+    };
+    for (std.enums.values(@FieldType(Probe, "mode"))) |mode| {
+        var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("maintenance-upload");
+        defer directory.cleanup();
+        var filesystem = try objectstore.FilesystemClient.initWithIo(std.testing.allocator, directory.path(), std.testing.io);
+        defer filesystem.deinit();
+        var object = try ObjectStore.initWithClient(std.testing.allocator, filesystem.client(), "artifacts", "native");
+        var store = object.artifactStore();
+        defer store.deinit();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_wait_ms = 1000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) }, .background);
+        var probe: Probe = .{ .execution = &execution, .scheduler = &scheduler, .mode = mode };
+        store.write_context = .{
+            .io = std.testing.io,
+            .execution = &execution,
+            .authority = .{ .ptr = &probe, .check = Probe.authority },
+            .wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end },
+        };
+        const body = "filesystem publication survives denied execution return";
+        const result = store.put(body);
+        if (mode == .success) {
+            var metadata = try result;
+            metadata.deinit(std.testing.allocator);
+        } else try std.testing.expectError(if (mode == .lease_lost) error.WorkLeaseLost else error.SchedulerClosed, result);
+        try std.testing.expect(probe.checks_on_cpu > 0);
+        try std.testing.expect(probe.checks_in_io > 0);
+        try std.testing.expectEqual(@as(usize, 1), probe.waits);
+        // Execution context is operation-local; the shared provider did not
+        // acquire the rejected owner's authority or lose its durable object.
+        try std.testing.expect(object.upload_context.execution == null);
+        store.write_context = null;
+        const checksum = try sha256StringWithCancellationAlloc(std.testing.allocator, body, .none);
+        defer std.testing.allocator.free(checksum);
+        const id = try makeArtifactIdAlloc(std.testing.allocator, checksum);
+        defer std.testing.allocator.free(id);
+        const bytes = try store.getAlloc(id);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualStrings(body, bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "serverless execution page uploads own bounded children and join before parent retirement" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Mode = enum { serial, write_team, reservation_full };
+    for (std.enums.values(Mode)) |mode| {
+        const reject_reservation = mode == .reservation_full;
+        var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("maintenance-upload-batch");
+        defer directory.cleanup();
+        var filesystem = try objectstore.FilesystemClient.initWithIo(std.testing.allocator, directory.path(), std.testing.io);
+        defer filesystem.deinit();
+        var object = try ObjectStore.initWithClient(std.testing.allocator, filesystem.client(), "artifacts", "native");
+        var store = object.artifactStore();
+        defer store.deinit();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = if (mode == .write_team) 3 else 2, .max_operations = if (reject_reservation) 3 else 32, .max_wait_ms = 2000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) }, if (mode == .write_team) .write else .background, if (mode == .write_team) 2 else 1);
+        store.write_context = (ReadContext{ .io = std.testing.io }).withExecution(&execution);
+        const contents = [_][]const u8{ "first page", "second page", "third page", "first page" };
+        var output: [contents.len]artifact_store.ArtifactMetadata = undefined;
+        const result = store.putBatchWithCancellation(std.testing.io, &contents, &output, .none);
+        if (reject_reservation) {
+            try std.testing.expectError(error.SchedulerFull, result);
+            // Reservation failure publishes no worker or provider mutation.
+            var client = filesystem.client();
+            var listed = try client.listObjects("artifacts", .{});
+            defer listed.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 0), listed.entries.len);
+        } else {
+            result catch |err| {
+                std.debug.print("maintenance upload mode={s}: {s}\n", .{ @tagName(mode), @errorName(err) });
+                return err;
+            };
+            defer for (&output) |*metadata| metadata.deinit(std.testing.allocator);
+            for (output, contents) |metadata, expected| {
+                const bytes = try store.getAlloc(metadata.artifact_id);
+                defer std.testing.allocator.free(bytes);
+                try std.testing.expectEqualStrings(expected, bytes);
+            }
+        }
+        try std.testing.expectEqual(Runnable.State.running, execution.entry.?.state);
+        try std.testing.expectEqual(@as(usize, if (mode == .write_team) 2 else 1), execution.entry.?.slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
 }

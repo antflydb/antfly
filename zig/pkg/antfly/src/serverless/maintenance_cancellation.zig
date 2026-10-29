@@ -155,6 +155,22 @@ pub const GraphBridge = struct {
     mutex: std.Io.Mutex = .init,
     failure: ?anyerror = null,
 
+    /// Borrow the same lifetime into physical provider operations. Children
+    /// replace only execution ownership; renewal remains serialized here.
+    pub fn readContext(self: *GraphBridge) @import("antfly_local_sources").serverless_query_lake_read_context.Context {
+        const maintenance = self.maintenance orelse return .{};
+        var context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{
+            .io = maintenance.io,
+            .deadline_ns = maintenance.deadline_ns,
+            .authority = .{ .ptr = self, .check = checkOriginal },
+        };
+        if (maintenance.execution) |execution| context = context.withExecution(execution);
+        return context;
+    }
+    fn checkOriginal(raw: *anyopaque) !void {
+        try checkpoint(raw);
+    }
+
     pub fn token(self: *GraphBridge) CancellationToken {
         if (self.maintenance == null) return .none;
         return .{ .ptr = self, .check_fn = checkpoint, .is_cancelled_fn = isCancelled };

@@ -109,6 +109,20 @@ pub const FilesystemClient = struct {
 
     fn putObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
         if (opts.cancellation) |token| try token.check();
+        // Hash while the caller still owns CPU. The prepared mutation below
+        // retains all path/content locks through physical durability and drops
+        // them before CPU return, including conditional-write refusal.
+        const etag = try sha256HexAllocWithCancellation(alloc, body, opts.cancellation);
+        errdefer alloc.free(etag);
+        const control = if (opts.cancellation) |token| token.execution_wait else null;
+        if (control) |wait| {
+            try wait.withWait(putPreparedObject, .{ self, alloc, bucket, key, body, etag, opts });
+        } else try self.putPreparedObject(alloc, bucket, key, body, etag, opts);
+        return .{ .etag = etag };
+    }
+
+    fn putPreparedObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, etag: []const u8, opts: types.PutOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         _ = self.cleanupStagingIfDue(std.Io.Timestamp.now(self.io, .awake).toSeconds(), stale_staging_age_ns, opts.cancellation) catch false;
         try self.makeBucket(bucket);
 
@@ -128,15 +142,9 @@ pub const FilesystemClient = struct {
         }
 
         try self.durable_dirs.ensure(self.alloc, self.io, std.fs.path.dirname(object_path) orelse ".");
-        const etag = try sha256HexAllocWithCancellation(alloc, body, opts.cancellation);
-        errdefer alloc.free(etag);
         const staging_path = try stagingPathAlloc(alloc, self.io, self.root_dir, bucket);
         defer alloc.free(staging_path);
         try writeObjectAtomically(self.io, object_path, staging_path, body, etag, opts.content_type orelse "", opts.cancellation);
-
-        return .{
-            .etag = etag,
-        };
     }
 
     fn putFile(self: *FilesystemClient, alloc: Allocator, source_io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {

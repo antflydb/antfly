@@ -21,6 +21,9 @@ const Allocator = std.mem.Allocator;
 /// returns. Providers adapt this directly to their HTTP transport so an active
 /// request can be interrupted instead of merely discarded after completion.
 pub const CancellationToken = struct {
+    /// Operation-local execution transitions. Only the calling provider task
+    /// may use these; cancellation monitors borrow the predicate alone.
+    execution_wait: ?@import("httpx").socket.WriteControl = null,
     ptr: *const anyopaque,
     is_cancelled_fn: *const fn (*const anyopaque) bool,
 

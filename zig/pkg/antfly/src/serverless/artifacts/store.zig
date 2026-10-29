@@ -276,12 +276,15 @@ pub const ArtifactStore = struct {
     // A serial publication's write/retention capability. Reads may escape to
     // independently admitted prefetch owners and never borrow its CPU callback.
     io_phase: ?*const IoPhase = null,
+    /// Borrowed by this operation only; shared provider handles stay unmodified.
+    write_context: ?ReadContext = null,
     pub fn beginIo(self: *const ArtifactStore, count: usize) !IoGuard {
         if (self.io_phase) |phase| try phase.begin(phase.ptr, count);
         return .{ .phase = self.io_phase };
     }
 
     pub const VTable = struct {
+        put_for: ?*const fn (*anyopaque, Allocator, ?UploadScope, []const u8, CancellationToken, ReadContext) anyerror!ArtifactMetadata = null,
         object_store: ?*const fn (*anyopaque) *@import("object_store.zig").ObjectStore = null,
         retention_witness: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!?RetentionWitness = null,
         retained_closure: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!bool = null,
@@ -381,7 +384,10 @@ pub const ArtifactStore = struct {
         const put_scoped = self.vtable.put_scoped orelse return error.ArtifactUploadScopesUnsupported;
         var phase = try self.beginIo(1);
         defer phase.abort();
-        var metadata = put_scoped(self.ptr, self.allocator, scope, contents, cancellation) catch |err| return phase.failed(err);
+        var metadata = (if (self.write_context != null and self.vtable.put_for != null)
+            self.vtable.put_for.?(self.ptr, self.allocator, scope, contents, cancellation, self.write_context.?)
+        else
+            put_scoped(self.ptr, self.allocator, scope, contents, cancellation)) catch |err| return phase.failed(err);
         errdefer metadata.deinit(self.allocator);
         try phase.finish();
         const expected = try scope.artifactId(metadata.checksum);
@@ -424,7 +430,9 @@ pub const ArtifactStore = struct {
         try cancellation.check();
         var phase = try self.beginIo(1);
         defer phase.abort();
-        var metadata = (if (self.vtable.put_with_cancellation) |put_with_cancellation|
+        var metadata = (if (self.write_context != null and self.vtable.put_for != null)
+            self.vtable.put_for.?(self.ptr, self.allocator, null, contents, cancellation, self.write_context.?)
+        else if (self.vtable.put_with_cancellation) |put_with_cancellation|
             put_with_cancellation(self.ptr, self.allocator, contents, cancellation)
         else
             self.vtable.put(self.ptr, self.allocator, contents)) catch |err| return phase.failed(err);
@@ -441,6 +449,9 @@ pub const ArtifactStore = struct {
     /// cancellation while the publication owner resumes CPU execution.
     pub fn putBatchWithCancellation(self: *ArtifactStore, io: ?std.Io, contents: []const []const u8, result: []ArtifactMetadata, cancellation: CancellationToken) !void {
         std.debug.assert(contents.len == result.len and contents.len <= max_upload_batch);
+        if (self.write_context) |context| if (context.execution != null) {
+            return self.putBatchFor(context, contents, result, cancellation);
+        };
         var completed: [max_upload_batch]?ArtifactMetadata = @splat(null);
         defer for (&completed) |*item| if (item.*) |*metadata| metadata.deinit(self.allocator);
         var begin: usize = 0;
@@ -477,6 +488,73 @@ pub const ArtifactStore = struct {
         for (result, completed[0..result.len]) |*output, *metadata| {
             output.* = metadata.*.?;
             metadata.* = null;
+        }
+    }
+
+    /// Each upload owns a retained child before publication. The coordinator
+    /// returns CPU before workers may activate, and all workers and provider
+    /// output owners drain before that same coordinator resumes.
+    fn putBatchFor(self: *ArtifactStore, context: ReadContext, contents: []const []const u8, result: []ArtifactMetadata, cancellation: CancellationToken) !void {
+        const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+        const executor = context.io orelse return error.BackendRuntimeIoUnavailable;
+        const parent = context.execution.?;
+        const class = try parent.retainedClass();
+        const Work = struct {
+            owner: ArtifactStore,
+            execution: Runnable.Execution = .{},
+            output: ?ArtifactMetadata = null,
+            failure: ?anyerror = null,
+            fn run(job: *@This(), bytes: []const u8, token: CancellationToken) void {
+                job.execution.activateChild() catch |err| {
+                    job.failure = err;
+                    return;
+                };
+                // A finished worker cannot pin CPU while its siblings queue.
+                // Keep its entry/output retained until the coordinator joins.
+                defer job.execution.park(.resource_blocked) catch {};
+                job.owner.write_context = job.owner.write_context.?.withExecution(&job.execution);
+                job.output = job.owner.putWithCancellation(bytes, token) catch |err| {
+                    job.failure = err;
+                    return;
+                };
+            }
+        };
+        var work: [max_upload_batch]Work = undefined;
+        var reserved: usize = 0;
+        defer for (work[0..reserved]) |*item| {
+            item.execution.finish();
+            if (item.output) |*metadata| metadata.deinit(self.allocator);
+        };
+        for (contents, 0..) |bytes, index| {
+            try context.ensureActive();
+            try cancellation.check();
+            work[index] = .{ .owner = self.* };
+            // A physical provider call owns its own wait; never borrow the
+            // serial coordinator's I/O-phase callback into concurrent work.
+            work[index].owner.io_phase = null;
+            try work[index].execution.reserveChild(parent, executor, @sizeOf(Work) +| bytes.len);
+            reserved += 1;
+        }
+        try parent.park(.resource_blocked);
+        var group: std.Io.Group = .init;
+        for (contents, 0..) |bytes, index| group.async(executor, Work.run, .{ &work[index], bytes, cancellation });
+        const joined = group.await(executor);
+        if (joined) |_| {} else |_| group.cancel(executor);
+        // Retained entries outlive physical joining, including denied
+        // activation or CPU return. Parent authority is never replaced.
+        for (work[0..reserved]) |*item| item.execution.finish();
+        parent.enter(class) catch |err| {
+            try cancellation.check();
+            try context.checkLifetime();
+            return err;
+        };
+        try context.ensureActive();
+        try cancellation.check();
+        try joined;
+        for (work[0..reserved]) |item| if (item.failure) |err| return err;
+        for (work[0..reserved], result) |*item, *output| {
+            output.* = item.output.?;
+            item.output = null;
         }
     }
 
