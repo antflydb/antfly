@@ -4,7 +4,15 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
   DashboardToolbar,
+  HighlightedCodeBlock,
   Input,
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemGroup,
+  ItemMedia,
+  ItemTitle,
   Select,
   SelectContent,
   SelectItem,
@@ -30,7 +38,6 @@ import {
   ChevronDown,
   CircleDot,
   Cloud,
-  Copy,
   Cpu,
   Download,
   ExternalLink,
@@ -445,7 +452,7 @@ const TypePill: React.FC<{
   );
 };
 
-const ModelCard: React.FC<{
+const ModelRow: React.FC<{
   model: InferenceModel;
   runtime?: ModelInstancesForModel;
   providerManaged: boolean;
@@ -456,78 +463,70 @@ const ModelCard: React.FC<{
   const builtIn = model.type === "chunker" && model.source === "fixed";
 
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label={`View details for ${model.name}`}
-      className={cn(
-        "group text-left w-full",
-        "bg-card border border-border rounded-lg p-5",
-        "transition-colors duration-150",
-        "hover:bg-accent/50",
-        "focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-background"
-      )}
-    >
-      <div className="flex items-start gap-3 mb-3">
-        <div className="flex items-center justify-center w-9 h-9 rounded-md bg-muted shrink-0">
-          <Icon className="w-4 h-4 text-muted-foreground" />
-        </div>
-        <div className="min-w-0">
-          <h3 className="font-semibold text-sm text-foreground leading-tight truncate">
-            {model.name}
-          </h3>
-          <p className="text-xs text-muted-foreground truncate mt-0.5 font-mono">
-            {model.connectionName} · {model.provider}
-          </p>
-        </div>
-      </div>
-
-      <p className="text-sm text-muted-foreground line-clamp-2 mb-4 leading-relaxed">
-        {model.description}
-      </p>
-
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          {builtIn ? (
-            <span className="inline-flex items-center gap-1 af-status-text-success">
-              <CircleDot className="w-3 h-3" />
-              Built-in
-            </span>
-          ) : providerManaged ? (
-            <span className="inline-flex items-center gap-1">
-              <Zap className="w-3 h-3" />
-              {model.freshness === "configured" ? "Configured" : "Ready"}
-            </span>
-          ) : (
-            <span className={cn("inline-flex items-center gap-1", status.tone)}>
-              <CircleDot className="w-3 h-3" />
-              {status.label}
-            </span>
-          )}
-          {model.inRegistry && providerManaged ? (
-            <span className="inline-flex items-center gap-1">
-              <Zap className="w-3 h-3" />
-              Available
-            </span>
-          ) : !model.inRegistry ? (
-            <span className="inline-flex items-center gap-1">
-              <Package className="w-3 h-3" />
-              Export
-            </span>
-          ) : null}
-          {model.capabilities?.slice(0, 2).map((cap) => (
-            <span key={cap}>{capabilityLabel(cap)}</span>
-          ))}
-          {model.capabilities && model.capabilities.length > 2 && (
-            <span>+{model.capabilities.length - 2}</span>
-          )}
-        </div>
-
-        <ModelStats source={model.source} compact />
-      </div>
-    </button>
+    <div role="listitem">
+      <Item
+        asChild
+        className="rounded-none border-0 text-left hover:bg-accent/50 focus-visible:ring-inset"
+      >
+        <button type="button" onClick={onClick} aria-label={`View details for ${model.name}`}>
+          <ItemMedia className="size-9 rounded-md bg-muted">
+            <Icon className="w-4 h-4 text-muted-foreground" />
+          </ItemMedia>
+          <ItemContent className="min-w-0">
+            <ItemTitle className="max-w-full font-mono">
+              <span className="truncate">{model.name}</span>
+            </ItemTitle>
+            <p className="text-xs text-muted-foreground truncate font-mono">
+              {model.connectionName} · {model.provider}
+            </p>
+            <ItemDescription className="leading-relaxed">{model.description}</ItemDescription>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              {builtIn ? (
+                <span className="inline-flex items-center gap-1 af-status-text-success">
+                  <CircleDot className="w-3 h-3" />
+                  Built-in
+                </span>
+              ) : providerManaged ? (
+                <span className="inline-flex items-center gap-1">
+                  <Zap className="w-3 h-3" />
+                  {model.freshness === "configured" ? "Configured" : "Ready"}
+                </span>
+              ) : (
+                <span className={cn("inline-flex items-center gap-1", status.tone)}>
+                  <CircleDot className="w-3 h-3" />
+                  {status.label}
+                </span>
+              )}
+              {model.inRegistry && providerManaged ? (
+                <span className="inline-flex items-center gap-1">
+                  <Zap className="w-3 h-3" />
+                  Available
+                </span>
+              ) : !model.inRegistry ? (
+                <span className="inline-flex items-center gap-1">
+                  <Package className="w-3 h-3" />
+                  Export
+                </span>
+              ) : null}
+              {model.capabilities?.slice(0, 2).map((cap) => (
+                <span key={cap}>{capabilityLabel(cap)}</span>
+              ))}
+              {model.capabilities && model.capabilities.length > 2 && (
+                <span>+{model.capabilities.length - 2}</span>
+              )}
+            </div>
+          </ItemContent>
+          <ItemActions>
+            <ModelStats source={model.source} compact />
+          </ItemActions>
+        </button>
+      </Item>
+    </div>
   );
 };
+
+const MODEL_LIST_CLASS =
+  "gap-0 divide-y divide-border overflow-hidden rounded-lg border border-border";
 
 // Model detail sheet - refined documentation style
 const ModelDetailSheet: React.FC<{
@@ -562,7 +561,6 @@ const ModelDetailSheet: React.FC<{
   const [selectedVariant, setSelectedVariant] = useState<QuantizationType | undefined>(undefined);
   const [selectedPreset, setSelectedPreset] = useState<VariantPreset | null>("recommended");
   const [showAllVariants, setShowAllVariants] = useState(false);
-  const [copiedCommand, setCopiedCommand] = useState(false);
 
   // Reset state when model changes
   useEffect(() => {
@@ -582,12 +580,6 @@ const ModelDetailSheet: React.FC<{
   const accent = NEUTRAL_ACCENT;
   const typeInfo = types.find((t) => t.type === model.type);
   const command = getDownloadCommand(model, selectedVariant);
-
-  const handleCopyCommand = async () => {
-    await navigator.clipboard.writeText(command);
-    setCopiedCommand(true);
-    setTimeout(() => setCopiedCommand(false), 2000);
-  };
 
   const availableVariants = quantizationOptions.filter((opt) => {
     if (opt.generatorOnly && model.type !== "generator") return false;
@@ -890,44 +882,13 @@ const ModelDetailSheet: React.FC<{
               </div>
 
               {/* Command block */}
-              <div className="relative">
-                <div className="px-4 py-3 bg-muted border border-border">
-                  <div className="flex items-start justify-between gap-2">
-                    <code className="text-xs font-mono text-foreground break-all leading-relaxed">
-                      {command}
-                    </code>
-                    <button
-                      type="button"
-                      onClick={handleCopyCommand}
-                      aria-label={copiedCommand ? "Copied!" : "Copy command"}
-                      className={cn(
-                        "shrink-0 p-1.5 rounded-md transition-colors",
-                        "text-muted-foreground hover:text-foreground",
-                        "hover:bg-muted"
-                      )}
-                    >
-                      {copiedCommand ? (
-                        <Check className="w-3.5 h-3.5 text-success" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                {/* Copy feedback toast */}
-                <div
-                  className={cn(
-                    "absolute inset-x-4 bottom-full mb-2 py-1.5 px-2 rounded-md bg-foreground text-background text-xs text-center",
-                    "transition-all duration-200",
-                    copiedCommand
-                      ? "opacity-100 translate-y-0"
-                      : "opacity-0 translate-y-1 pointer-events-none"
-                  )}
-                >
-                  Copied to clipboard
-                </div>
-              </div>
+              <HighlightedCodeBlock
+                code={command}
+                language="bash"
+                size="sm"
+                wrap
+                className="rounded-none border-x-0"
+              />
 
               {/* Help text for export models */}
               {!model.inRegistry && (
@@ -1199,21 +1160,15 @@ const ModelsPage: React.FC = () => {
             <div className="h-4 w-full max-w-md animate-pulse rounded-md bg-muted" />
           </div>
         </div>
-        <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="divide-y divide-border overflow-hidden rounded-lg border border-border">
           {Array.from({ length: 6 }).map((_, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: skeleton placeholders are positional
-            <div key={i} className="bg-card border border-border rounded-lg p-5">
-              <div className="flex items-start gap-3 mb-3">
-                <div className="w-10 h-10 bg-muted animate-pulse rounded-md" />
-                <div className="flex-1">
-                  <div className="h-5 w-32 bg-muted animate-pulse rounded-md mb-2" />
-                  <div className="h-3 w-24 bg-muted animate-pulse rounded-md" />
-                </div>
-              </div>
-              <div className="h-10 bg-muted animate-pulse rounded-md mb-4" />
-              <div className="flex gap-2">
-                <div className="h-5 w-16 bg-muted animate-pulse rounded-md" />
-                <div className="h-5 w-12 bg-muted animate-pulse rounded-md" />
+            <div key={i} className="flex items-start gap-3.5 px-4 py-3.5">
+              <div className="size-9 shrink-0 bg-muted animate-pulse rounded-md" />
+              <div className="flex-1 space-y-2">
+                <div className="h-4 w-40 bg-muted animate-pulse rounded-md" />
+                <div className="h-3 w-24 bg-muted animate-pulse rounded-md" />
+                <div className="h-4 w-full max-w-xl bg-muted animate-pulse rounded-md" />
               </div>
             </div>
           ))}
@@ -1424,10 +1379,9 @@ const ModelsPage: React.FC = () => {
                   </span>
                 </div>
 
-                {/* Cards grid */}
-                <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+                <ItemGroup className={MODEL_LIST_CLASS}>
                   {typeModels.map((model) => (
-                    <ModelCard
+                    <ModelRow
                       key={model.id}
                       model={model}
                       runtime={runtime.runtimeFor(model.type, model.source)}
@@ -1435,16 +1389,16 @@ const ModelsPage: React.FC = () => {
                       onClick={() => handleModelClick(model)}
                     />
                   ))}
-                </div>
+                </ItemGroup>
               </section>
             );
           })}
         </div>
       ) : (
-        // Flat grid for filtered view
-        <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+        // Flat list for filtered view
+        <ItemGroup className={MODEL_LIST_CLASS}>
           {filteredModels.map((model) => (
-            <ModelCard
+            <ModelRow
               key={model.id}
               model={model}
               runtime={runtime.runtimeFor(model.type, model.source)}
@@ -1452,7 +1406,7 @@ const ModelsPage: React.FC = () => {
               onClick={() => handleModelClick(model)}
             />
           ))}
-        </div>
+        </ItemGroup>
       )}
 
       {/* Detail Sheet */}

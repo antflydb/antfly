@@ -13,15 +13,9 @@ import {
   DashboardPageTitle,
   FileUpload,
   type FileUploadProps,
+  Spinner,
 } from "@antfly/design-system";
-import {
-  AlertCircle,
-  ChevronDown,
-  CircleStop,
-  LoaderCircle,
-  RotateCcw,
-  Sparkles,
-} from "lucide-react";
+import { AlertCircle, ChevronDown, CircleStop, RotateCcw, Sparkles } from "lucide-react";
 import type * as React from "react";
 import { cn } from "@/lib/utils";
 
@@ -246,7 +240,7 @@ export function AIWorkflowSubmitButton({
   }
   return (
     <Button disabled={disabled || running} {...props}>
-      {running ? <LoaderCircle className="size-4 animate-spin" /> : null}
+      {running ? <Spinner className="size-4" /> : null}
       {running ? runningLabel : children}
     </Button>
   );

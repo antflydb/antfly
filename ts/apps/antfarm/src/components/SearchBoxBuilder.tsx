@@ -7,6 +7,10 @@ import {
   CardHeader,
   CardTitle,
   DashboardToolbar,
+  Field,
+  FieldDescription,
+  FieldLabel,
+  HighlightedCodeBlock,
   Input,
   Label,
   Switch,
@@ -18,9 +22,6 @@ import {
 import type { IndexStatus, QueryHit } from "@antfly/sdk";
 import { CopyIcon, PlusIcon, TrashIcon } from "@radix-ui/react-icons";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { useTheme } from "@/components/theme-provider";
 import { getAntfarmRuntimeConfig } from "@/runtime-config";
 import type { TableSchema } from "../api";
 import {
@@ -47,7 +48,6 @@ export default function SearchBoxBuilder({
   tableSchema,
   indexes = [],
 }: SearchBoxBuilderProps) {
-  const { theme } = useTheme();
   const [searchFields, setSearchFields] = useState<string[]>([]);
   const [semanticIndexes, setSemanticIndexes] = useState<string[]>([]);
   const [facets, setFacets] = useState<FacetConfig[]>([]);
@@ -667,20 +667,12 @@ ${facetsCode}${resultsCode}
               </div>
             </CardHeader>
             <CardContent>
-              <SyntaxHighlighter
-                language="jsx"
-                style={theme === "dark" ? oneDark : oneLight}
-                customStyle={{
-                  margin: 0,
-                  fontSize: "0.875rem",
-                  lineHeight: "1.25rem",
-                  maxHeight: "32rem",
-                  borderRadius: "0.375rem",
-                }}
-                wrapLongLines={false}
-              >
-                {generateReactCode()}
-              </SyntaxHighlighter>
+              <HighlightedCodeBlock
+                code={generateReactCode()}
+                language="tsx"
+                copyable={false}
+                contentClassName="max-h-[32rem]"
+              />
             </CardContent>
           </Card>
         </TabsContent>
@@ -737,9 +729,9 @@ ${facetsCode}${resultsCode}
                       </div>
                     </div>
 
-                    <div>
-                      <Label>Add Custom Field</Label>
-                      <div className="flex gap-2 mt-2">
+                    <Field className="gap-2">
+                      <FieldLabel>Add Custom Field</FieldLabel>
+                      <div className="flex gap-2">
                         <Input
                           placeholder="Enter field name"
                           value={newSearchField}
@@ -759,10 +751,10 @@ ${facetsCode}${resultsCode}
                           <PlusIcon className="h-4 w-4" />
                         </Button>
                       </div>
-                      <p className="text-sm text-muted-foreground mt-1">
+                      <FieldDescription>
                         Type a custom field name or select from available fields below
-                      </p>
-                    </div>
+                      </FieldDescription>
+                    </Field>
 
                     <div>
                       <Label>Available Fields</Label>
@@ -826,8 +818,8 @@ ${facetsCode}${resultsCode}
                       )}
                     </div>
 
-                    <div>
-                      <Label htmlFor="semantic-limit">Result Limit</Label>
+                    <Field>
+                      <FieldLabel htmlFor="semantic-limit">Result Limit</FieldLabel>
                       <Input
                         id="semantic-limit"
                         type="number"
@@ -838,10 +830,10 @@ ${facetsCode}${resultsCode}
                         placeholder="Number of results"
                         className="mt-2 w-32"
                       />
-                      <p className="text-sm text-muted-foreground mt-1">
+                      <FieldDescription>
                         Maximum number of results to return from semantic search (1-100). Default: 5
-                      </p>
-                    </div>
+                      </FieldDescription>
+                    </Field>
                   </div>
                 </div>
               )}
@@ -853,14 +845,14 @@ ${facetsCode}${resultsCode}
             <CardHeader>
               <div className="flex items-center justify-between">
                 <CardTitle>Autosuggest</CardTitle>
-                <div className="flex items-center space-x-2">
+                <Field orientation="horizontal" className="gap-2 w-auto">
                   <Switch
                     id="autosuggest-enabled"
                     checked={useAutosuggest}
                     onCheckedChange={setUseAutosuggest}
                   />
-                  <Label htmlFor="autosuggest-enabled">Enable</Label>
-                </div>
+                  <FieldLabel htmlFor="autosuggest-enabled">Enable</FieldLabel>
+                </Field>
               </div>
             </CardHeader>
             <CardContent>
@@ -977,8 +969,8 @@ ${facetsCode}${resultsCode}
 
                       {/* Common Configuration */}
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div>
-                          <Label htmlFor="autosuggest-limit">Suggestion Limit</Label>
+                        <Field>
+                          <FieldLabel htmlFor="autosuggest-limit">Suggestion Limit</FieldLabel>
                           <Input
                             id="autosuggest-limit"
                             type="number"
@@ -991,13 +983,15 @@ ${facetsCode}${resultsCode}
                             placeholder="Number of suggestions"
                             className="mt-2"
                           />
-                          <p className="text-sm text-muted-foreground mt-1">
+                          <FieldDescription>
                             Maximum number of suggestions to show (1-50)
-                          </p>
-                        </div>
+                          </FieldDescription>
+                        </Field>
 
-                        <div>
-                          <Label htmlFor="autosuggest-min-chars">Minimum Characters</Label>
+                        <Field>
+                          <FieldLabel htmlFor="autosuggest-min-chars">
+                            Minimum Characters
+                          </FieldLabel>
                           <Input
                             id="autosuggest-min-chars"
                             type="number"
@@ -1010,10 +1004,10 @@ ${facetsCode}${resultsCode}
                             placeholder="Minimum characters"
                             className="mt-2"
                           />
-                          <p className="text-sm text-muted-foreground mt-1">
+                          <FieldDescription>
                             Minimum characters before showing suggestions (1-10)
-                          </p>
-                        </div>
+                          </FieldDescription>
+                        </Field>
                       </div>
                     </>
                   )}
@@ -1027,14 +1021,14 @@ ${facetsCode}${resultsCode}
             <CardHeader>
               <div className="flex items-center justify-between">
                 <CardTitle>Results Display</CardTitle>
-                <div className="flex items-center space-x-2">
+                <Field orientation="horizontal" className="gap-2 w-auto">
                   <Switch
                     id="show-results"
                     checked={showResults}
                     onCheckedChange={setShowResults}
                   />
-                  <Label htmlFor="show-results">Enable</Label>
-                </div>
+                  <FieldLabel htmlFor="show-results">Enable</FieldLabel>
+                </Field>
               </div>
             </CardHeader>
             <CardContent>
@@ -1046,15 +1040,15 @@ ${facetsCode}${resultsCode}
 
                   {showResults && (
                     <>
-                      <div className="flex items-center space-x-2">
+                      <Field orientation="horizontal" className="gap-2 w-auto">
                         <Switch
                           id="use-pagination"
                           checked={usePagination}
                           onCheckedChange={setUsePagination}
                           disabled={useSemanticSearch}
                         />
-                        <Label htmlFor="use-pagination">Enable Pagination</Label>
-                      </div>
+                        <FieldLabel htmlFor="use-pagination">Enable Pagination</FieldLabel>
+                      </Field>
                       <p className="text-sm text-muted-foreground">
                         {useSemanticSearch
                           ? "Pagination is disabled for semantic search"
@@ -1062,8 +1056,8 @@ ${facetsCode}${resultsCode}
                       </p>
 
                       {effectivePagination && (
-                        <div>
-                          <Label htmlFor="items-per-page">Items Per Page</Label>
+                        <Field>
+                          <FieldLabel htmlFor="items-per-page">Items Per Page</FieldLabel>
                           <Input
                             id="items-per-page"
                             type="number"
@@ -1074,10 +1068,10 @@ ${facetsCode}${resultsCode}
                             placeholder="Number of items per page"
                             className="mt-2 w-32"
                           />
-                          <p className="text-sm text-muted-foreground mt-1">
+                          <FieldDescription>
                             Number of results to display per page (1-100)
-                          </p>
-                        </div>
+                          </FieldDescription>
+                        </Field>
                       )}
                     </>
                   )}
@@ -1140,14 +1134,14 @@ ${facetsCode}${resultsCode}
                       <CardHeader>
                         <div className="flex items-center justify-between">
                           <CardTitle className="text-base">Thumbnails</CardTitle>
-                          <div className="flex items-center space-x-2">
+                          <Field orientation="horizontal" className="gap-2 w-auto">
                             <Switch
                               id="use-thumbnails"
                               checked={useThumbnails}
                               onCheckedChange={setUseThumbnails}
                             />
-                            <Label htmlFor="use-thumbnails">Enable</Label>
-                          </div>
+                            <FieldLabel htmlFor="use-thumbnails">Enable</FieldLabel>
+                          </Field>
                         </div>
                       </CardHeader>
                       <CardContent>
@@ -1297,10 +1291,10 @@ ${facetsCode}${resultsCode}
             <CardHeader>
               <div className="flex items-center justify-between">
                 <CardTitle>Facets</CardTitle>
-                <div className="flex items-center space-x-2">
+                <Field orientation="horizontal" className="gap-2 w-auto">
                   <Switch id="show-facets" checked={showFacets} onCheckedChange={setShowFacets} />
-                  <Label htmlFor="show-facets">Enable</Label>
-                </div>
+                  <FieldLabel htmlFor="show-facets">Enable</FieldLabel>
+                </Field>
               </div>
             </CardHeader>
             <CardContent>

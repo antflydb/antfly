@@ -10,17 +10,18 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Spinner,
 } from "@antfly/design-system";
 import type { RerankResponse } from "@antfly/sdk";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,
   ArrowRight,
@@ -358,13 +359,13 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div className="space-y-2">
-              <Label>Table</Label>
+            <Field className="gap-2">
+              <FieldLabel>Table</FieldLabel>
               <Input value={selectedTable || "No table selected"} disabled />
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label htmlFor="index">Search Index</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="index">Search Index</FieldLabel>
               <Select
                 value={selectedIndex || "__fulltext__"}
                 onValueChange={(v) => setSelectedIndex(v === "__fulltext__" ? "" : v)}
@@ -381,10 +382,10 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label htmlFor="reranker">Reranker Model</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="reranker">Reranker Model</FieldLabel>
               <Select
                 value={selectedModel}
                 onValueChange={setSelectedModel}
@@ -409,10 +410,10 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label htmlFor="limit">Limit</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="limit">Limit</FieldLabel>
               <Input
                 id="limit"
                 type="number"
@@ -421,11 +422,11 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
                 value={limit}
                 onChange={(e) => setLimit(parseInt(e.target.value, 10) || 10)}
               />
-            </div>
+            </Field>
           </div>
 
-          <div className="space-y-2">
-            <Label htmlFor="query">Query</Label>
+          <Field className="gap-2">
+            <FieldLabel htmlFor="query">Query</FieldLabel>
             <Input
               id="query"
               placeholder="Enter a search query..."
@@ -438,7 +439,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
                 }
               }}
             />
-          </div>
+          </Field>
 
           <FormActions>
             <AIWorkflowSubmitButton
@@ -500,7 +501,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
             >
               {isReranking ? (
                 <>
-                  <ReloadIcon className="h-3 w-3 mr-1.5 animate-spin" />
+                  <Spinner className="h-3 w-3 mr-1.5" />
                   Reranking
                 </>
               ) : (

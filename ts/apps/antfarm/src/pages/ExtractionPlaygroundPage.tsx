@@ -10,9 +10,12 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldDescription,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
+  Kbd,
   Select,
   SelectContent,
   SelectItem,
@@ -864,8 +867,8 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Model Selection */}
-            <div className="space-y-2">
-              <Label>Model</Label>
+            <Field className="gap-2">
+              <FieldLabel>Model</FieldLabel>
               <Combobox
                 options={availableModels.map((model) => ({
                   value: model,
@@ -882,12 +885,12 @@ const ExtractionPlaygroundPage: React.FC = () => {
               {unavailableReason && (
                 <p className="text-xs text-muted-foreground">{unavailableReason}</p>
               )}
-            </div>
+            </Field>
 
             {/* Confidence Threshold (entity mode) */}
             {mode === "entities" && (
-              <div className="space-y-2">
-                <Label htmlFor="threshold">Confidence Threshold</Label>
+              <Field className="gap-2">
+                <FieldLabel htmlFor="threshold">Confidence Threshold</FieldLabel>
                 <div className="flex items-center gap-2">
                   <Input
                     id="threshold"
@@ -906,13 +909,13 @@ const ExtractionPlaygroundPage: React.FC = () => {
                   />
                   <span className="text-sm text-muted-foreground">%</span>
                 </div>
-              </div>
+              </Field>
             )}
 
             {/* Threshold (extract mode) */}
             {mode === "structured" && (
-              <div className="space-y-2">
-                <Label htmlFor="extract-threshold">Threshold</Label>
+              <Field className="gap-2">
+                <FieldLabel htmlFor="extract-threshold">Threshold</FieldLabel>
                 <div className="flex items-center gap-2">
                   <Input
                     id="extract-threshold"
@@ -931,40 +934,40 @@ const ExtractionPlaygroundPage: React.FC = () => {
                   />
                   <span className="text-sm text-muted-foreground">%</span>
                 </div>
-              </div>
+              </Field>
             )}
           </div>
 
           {/* Extract mode options */}
           {mode === "structured" && (
             <div className="flex gap-6">
-              <div className="flex items-center gap-2">
+              <Field orientation="horizontal" className="gap-2 w-auto">
                 <Switch
                   id="include-confidence"
                   checked={includeConfidence}
                   onCheckedChange={setIncludeConfidence}
                 />
-                <Label htmlFor="include-confidence" className="text-sm">
+                <FieldLabel htmlFor="include-confidence" className="text-sm">
                   Include confidence
-                </Label>
-              </div>
-              <div className="flex items-center gap-2">
+                </FieldLabel>
+              </Field>
+              <Field orientation="horizontal" className="gap-2 w-auto">
                 <Switch
                   id="include-spans"
                   checked={includeSpans}
                   onCheckedChange={setIncludeSpans}
                 />
-                <Label htmlFor="include-spans" className="text-sm">
+                <FieldLabel htmlFor="include-spans" className="text-sm">
                   Include spans
-                </Label>
-              </div>
+                </FieldLabel>
+              </Field>
             </div>
           )}
 
           {/* Entity Labels (entity mode) */}
           {mode === "entities" && (
-            <div className="space-y-2">
-              <Label>Entity Labels (GLiNER)</Label>
+            <Field className="gap-2">
+              <FieldLabel>Entity Labels (GLiNER)</FieldLabel>
               <div className="flex flex-wrap gap-2 mb-2">
                 {labels.map((label) => {
                   const colors = getColorForLabel(label);
@@ -1003,16 +1006,16 @@ const ExtractionPlaygroundPage: React.FC = () => {
                   <Plus className="h-4 w-4" />
                 </Button>
               </div>
-              <p className="text-xs text-muted-foreground">
+              <FieldDescription className="text-xs">
                 GLiNER models extract entities matching these labels. Press Enter or click + to add.
-              </p>
-            </div>
+              </FieldDescription>
+            </Field>
           )}
 
           {/* Schema Builder (extract mode) */}
           {mode === "structured" && (
-            <div className="space-y-3">
-              <Label>Extraction Schema</Label>
+            <Field>
+              <FieldLabel>Extraction Schema</FieldLabel>
               {schema.map((structure, si) => (
                 <div
                   key={`structure-${structure.name || `unnamed-${structure.fields.length}`}`}
@@ -1087,11 +1090,11 @@ const ExtractionPlaygroundPage: React.FC = () => {
                 <Plus className="h-4 w-4 mr-1" />
                 Add Structure
               </Button>
-              <p className="text-xs text-muted-foreground">
+              <FieldDescription className="text-xs">
                 Define structures with named fields. Each field can be "str" (single value) or
                 "list" (multiple values).
-              </p>
-            </div>
+              </FieldDescription>
+            </Field>
           )}
 
           <FormActions>
@@ -1287,11 +1290,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
                   <div className="text-center">
                     <Tag className="h-12 w-12 mx-auto mb-3 opacity-20" />
                     <p className="mb-3">
-                      Enter text and press{" "}
-                      <kbd className="px-1.5 py-0.5 text-xs border rounded-md bg-muted">
-                        Cmd+Enter
-                      </kbd>{" "}
-                      to extract entities
+                      Enter text and press <Kbd>Cmd+Enter</Kbd> to extract entities
                     </p>
                     <Button
                       variant="outline"

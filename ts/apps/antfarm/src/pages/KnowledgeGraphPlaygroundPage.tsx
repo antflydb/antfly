@@ -11,9 +11,10 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
   Tabs,
   TabsContent,
   TabsList,
@@ -665,8 +666,8 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         <CardContent className="space-y-4">
           {/* Model and Build Button */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label>Model</Label>
+            <Field className="gap-2">
+              <FieldLabel>Model</FieldLabel>
               <Combobox
                 options={availableModels.map((model) => ({
                   value: model,
@@ -683,10 +684,10 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
               {unavailableReason && (
                 <p className="text-xs text-muted-foreground">{unavailableReason}</p>
               )}
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label htmlFor="similarity">Similarity Threshold</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="similarity">Similarity Threshold</FieldLabel>
               <Input
                 id="similarity"
                 type="number"
@@ -701,14 +702,14 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                   })
                 }
               />
-            </div>
+            </Field>
           </div>
 
           {/* Labels Configuration */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {/* Entity Labels */}
-            <div className="space-y-2">
-              <Label>Entity Labels</Label>
+            <Field className="gap-2">
+              <FieldLabel>Entity Labels</FieldLabel>
               {untypedEntities ? (
                 <p className="text-sm text-muted-foreground">
                   This model emits generic ENTITY nodes. Relation names can be constrained below.
@@ -759,11 +760,11 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                   <Plus className="h-4 w-4" />
                 </Button>
               </div>
-            </div>
+            </Field>
 
             {/* Relation Labels */}
-            <div className="space-y-2">
-              <Label>Relation Labels</Label>
+            <Field className="gap-2">
+              <FieldLabel>Relation Labels</FieldLabel>
               <div className="flex flex-wrap gap-2 mb-2">
                 {relationLabels.map((label) => (
                   <Badge key={label} className="gap-1">
@@ -800,7 +801,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                   <Plus className="h-4 w-4" />
                 </Button>
               </div>
-            </div>
+            </Field>
           </div>
 
           {/* Advanced Options */}

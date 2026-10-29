@@ -1,17 +1,18 @@
-import { Badge, Collapsible, CollapsibleContent, CollapsibleTrigger } from "@antfly/design-system";
-import type { AgentStep, SSEStepStarted } from "@antfly/sdk";
 import {
-  ChevronDown,
-  ChevronRight,
-  Filter,
-  Globe,
-  Loader2,
-  Search,
-  TreePine,
-  Waypoints,
-} from "lucide-react";
+  HighlightedCodeBlock,
+  Spinner,
+  Trace,
+  TraceCollapsible,
+  TraceCollapsibleContent,
+  TraceCollapsibleTrigger,
+  TraceDescription,
+  TraceIcon,
+  TraceLine,
+  TraceTitle,
+} from "@antfly/design-system";
+import type { AgentStep, SSEStepStarted } from "@antfly/sdk";
+import { Filter, Globe, Search, TreePine, Waypoints } from "lucide-react";
 import type React from "react";
-import { useState } from "react";
 
 interface ReasoningChainCollapsibleProps {
   chain: AgentStep[];
@@ -35,81 +36,66 @@ function getStepIcon(stepName: string) {
   return STEP_ICONS[stepName] ?? <Search className="h-3.5 w-3.5" />;
 }
 
-function getStatusBadgeVariant(status?: string): "default" | "destructive" {
-  return status === "error" ? "destructive" : "default";
+function StepLine({ step }: { step: AgentStep }) {
+  return (
+    <TraceLine status={step.status === "error" ? "error" : undefined}>
+      <TraceIcon>{getStepIcon(step.name ?? "")}</TraceIcon>
+      <TraceTitle>
+        <span className="font-mono">{step.name}</span>
+        {step.action ? ` ${step.action}` : null}
+      </TraceTitle>
+      {step.status && <TraceDescription>{step.status}</TraceDescription>}
+      {step.duration_ms !== undefined && <TraceDescription>{step.duration_ms}ms</TraceDescription>}
+    </TraceLine>
+  );
 }
 
 function StepItem({ step, defaultOpen = false }: { step: AgentStep; defaultOpen?: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
   const hasDetails = step.details && Object.keys(step.details).length > 0;
+  const errorMessage = step.error_message ? (
+    <p className="ml-6 text-xs text-destructive">{step.error_message}</p>
+  ) : null;
+
+  if (!hasDetails) {
+    return (
+      <>
+        <StepLine step={step} />
+        {errorMessage}
+      </>
+    );
+  }
 
   return (
-    <div className="flex gap-2">
-      {/* Connector line + icon */}
-      <div className="flex flex-col items-center">
-        <div className="flex h-6 w-6 items-center justify-center rounded-full border bg-background">
-          {getStepIcon(step.name ?? "")}
-        </div>
-        <div className="w-px flex-1 bg-border" />
-      </div>
-
-      {/* Step content */}
-      <div className="flex-1 pb-3 min-w-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          <Badge className="text-xs font-mono">{step.name}</Badge>
-          {step.status && (
-            <Badge variant={getStatusBadgeVariant(step.status)} className="text-xs">
-              {step.status}
-            </Badge>
-          )}
-          {step.duration_ms !== undefined && (
-            <span className="text-xs text-muted-foreground">{step.duration_ms}ms</span>
-          )}
-        </div>
-        {step.action && (
-          <p className="text-xs text-muted-foreground mt-1 truncate">{step.action}</p>
-        )}
-        {step.error_message && (
-          <p className="text-xs text-destructive mt-1">{step.error_message}</p>
-        )}
-        {hasDetails && (
-          <button
-            type="button"
-            onClick={() => setOpen(!open)}
-            className="text-xs text-muted-foreground mt-1 hover:text-foreground flex items-center gap-1"
-          >
-            {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-            Details
-          </button>
-        )}
-        {open && hasDetails && (
-          <pre className="text-xs bg-muted p-2 rounded-md mt-1 overflow-auto max-h-40">
-            {JSON.stringify(step.details, null, 2)}
-          </pre>
-        )}
-      </div>
-    </div>
+    <>
+      <TraceCollapsible defaultOpen={defaultOpen}>
+        <TraceCollapsibleTrigger>
+          <StepLine step={step} />
+        </TraceCollapsibleTrigger>
+        <TraceCollapsibleContent>
+          <HighlightedCodeBlock
+            code={JSON.stringify(step.details, null, 2)}
+            language="json"
+            size="sm"
+            contentClassName="max-h-40"
+          />
+        </TraceCollapsibleContent>
+      </TraceCollapsible>
+      {errorMessage}
+    </>
   );
 }
 
 function ActiveStepItem({ step }: { step: SSEStepStarted }) {
   return (
-    <div className="flex gap-2">
-      <div className="flex flex-col items-center">
-        <div className="flex h-6 w-6 items-center justify-center rounded-full border bg-background">
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-        </div>
-        <div className="w-px flex-1 bg-border" />
-      </div>
-      <div className="flex-1 pb-3 min-w-0">
-        <div className="flex items-center gap-2">
-          <Badge className="text-xs font-mono">{step.name}</Badge>
-        </div>
-        {step.action && (
-          <p className="text-xs text-muted-foreground mt-1 truncate">{step.action}</p>
-        )}
-      </div>
-    </div>
+    <TraceLine status="running">
+      <TraceIcon>
+        <Spinner className="h-3.5 w-3.5" />
+      </TraceIcon>
+      <TraceTitle>
+        <span className="font-mono">{step.name}</span>
+        {step.action ? ` ${step.action}` : null}
+      </TraceTitle>
+    </TraceLine>
   );
 }
 
@@ -128,19 +114,19 @@ export function ReasoningChainCollapsible({
     : `${toolCallsMade || chain.length} tool call${(toolCallsMade || chain.length) !== 1 ? "s" : ""}`;
 
   return (
-    <Collapsible>
-      <CollapsibleTrigger asChild>
-        <button
-          type="button"
-          className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground py-1 group"
-        >
-          <ChevronRight className="h-3 w-3 transition-transform group-data-[state=open]:rotate-90" />
-          {isStreaming && <Loader2 className="h-3 w-3 animate-spin" />}
-          <span>{label}</span>
-        </button>
-      </CollapsibleTrigger>
-      <CollapsibleContent>
-        <div className="mt-2 ml-1 space-y-0">
+    <TraceCollapsible>
+      <TraceCollapsibleTrigger className="py-1">
+        <TraceLine status={isStreaming ? "running" : undefined}>
+          {isStreaming && (
+            <TraceIcon>
+              <Spinner className="h-3 w-3" />
+            </TraceIcon>
+          )}
+          <TraceTitle>{label}</TraceTitle>
+        </TraceLine>
+      </TraceCollapsibleTrigger>
+      <TraceCollapsibleContent>
+        <Trace>
           {chain.map((step) => (
             <StepItem key={step.id || `${step.name}-${step.action}`} step={step} />
           ))}
@@ -152,8 +138,8 @@ export function ReasoningChainCollapsible({
               {reasoningText}
             </div>
           )}
-        </div>
-      </CollapsibleContent>
-    </Collapsible>
+        </Trace>
+      </TraceCollapsibleContent>
+    </TraceCollapsible>
   );
 }

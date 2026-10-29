@@ -1,8 +1,9 @@
 import {
   Button,
   Checkbox,
+  Field,
+  FieldLabel,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -90,15 +91,15 @@ const QueryNode: React.FC<QueryNodeProps> = ({
     onFieldSelect: (field: string) => void
   ) => (
     <div className="flex flex-col gap-2 mt-2">
-      <div>
-        <Label className="text-xs mb-1 block">Field</Label>
+      <Field className="gap-1">
+        <FieldLabel className="text-xs">Field</FieldLabel>
         <Input
           placeholder="Type field name..."
           value={currentField || ""}
           onChange={(e) => onFieldSelect(e.target.value)}
           className="h-8"
         />
-      </div>
+      </Field>
       <FieldSelector availableFields={availableFields} onFieldSelect={onFieldSelect} />
     </div>
   );
@@ -350,8 +351,8 @@ const QueryNode: React.FC<QueryNodeProps> = ({
   return (
     <div className="p-3 mb-2 border rounded-lg bg-card space-y-2">
       <div className="flex items-start gap-2 flex-wrap">
-        <div className="shrink-0 w-44">
-          <Label className="text-xs mb-1 block">Query Type</Label>
+        <Field className="gap-1 shrink-0 w-44">
+          <FieldLabel className="text-xs">Query Type</FieldLabel>
           <Select value={queryType} onValueChange={handleTypeChange}>
             <SelectTrigger size="sm">
               <SelectValue placeholder="Query Type" />
@@ -364,7 +365,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
               ))}
             </SelectContent>
           </Select>
-        </div>
+        </Field>
         {!isComplex && <div className="flex-1 min-w-0">{renderQueryFields()}</div>}
         {onDelete && (
           <Button onClick={onDelete} variant="ghost" size="icon" className="h-8 w-8 mt-5">

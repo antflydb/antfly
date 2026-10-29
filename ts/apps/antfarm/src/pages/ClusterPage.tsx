@@ -13,20 +13,13 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Spinner,
   StatCard,
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@antfly/design-system";
-import {
-  AlertTriangle,
-  Database,
-  GitBranch,
-  Loader2,
-  Network,
-  RefreshCw,
-  Scissors,
-} from "lucide-react";
+import { AlertTriangle, Database, GitBranch, Network, RefreshCw, Scissors } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
@@ -414,7 +407,7 @@ const ClusterPage: React.FC = () => {
       {/* Loading state */}
       {cluster.isLoading && storeList.length === 0 && (
         <div className="flex items-center justify-center py-16">
-          <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+          <Spinner className="w-6 h-6 text-muted-foreground" />
         </div>
       )}
 

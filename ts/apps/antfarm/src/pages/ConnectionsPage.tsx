@@ -98,7 +98,7 @@ function ModelGroup({
                 {model.name}
               </span>
               {model.configured && (
-                <span className="px-1 py-0 rounded-sm text-[10px] border bg-primary/10 text-primary border-primary/20 shrink-0">
+                <span className="px-1 py-0 rounded-sm text-[10px] border bg-muted text-foreground shrink-0">
                   configured
                 </span>
               )}
@@ -133,7 +133,7 @@ function ProviderCard({ connection }: { connection: Connection }) {
   ].filter((group) => group.models.length > 0);
 
   return (
-    <div className="bg-card border border-border rounded-lg p-5">
+    <div className="p-5">
       <div className="flex items-start gap-3 mb-3">
         <div className="w-9 h-9 bg-muted rounded-md flex items-center justify-center shrink-0">
           <Icon className="w-4.5 h-4.5 text-muted-foreground" />
@@ -201,7 +201,7 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
   const capabilities = connection.capabilities ?? [];
 
   return (
-    <div className="bg-card border border-border rounded-lg p-5">
+    <div className="p-5">
       <div className="flex items-start gap-3">
         <div className="w-9 h-9 bg-muted rounded-md flex items-center justify-center shrink-0">
           <Icon className="w-4.5 h-4.5 text-muted-foreground" />
@@ -273,7 +273,7 @@ function WebSearchCard({ connection }: { connection: Connection }) {
   const domains = [...(webSearch.include_domains ?? []), ...(webSearch.exclude_domains ?? [])];
 
   return (
-    <div className="bg-card border border-border rounded-lg p-5">
+    <div className="p-5">
       <div className="flex items-start gap-3">
         <div className="w-9 h-9 bg-muted rounded-md flex items-center justify-center shrink-0">
           <Globe className="w-4.5 h-4.5 text-muted-foreground" />
@@ -357,7 +357,7 @@ function CdcCard({ connection }: { connection: Connection }) {
   const label = connection.display_name ?? connection.name;
 
   return (
-    <div className="bg-card border border-border rounded-lg p-5">
+    <div className="p-5">
       <div className="flex items-start gap-3">
         <div className="w-9 h-9 bg-muted rounded-md flex items-center justify-center shrink-0">
           <Database className="w-4.5 h-4.5 text-muted-foreground" />
@@ -438,10 +438,10 @@ export default function ConnectionsPage() {
             <div className="h-4 w-full max-w-md animate-pulse rounded-md bg-muted" />
           </div>
         </DashboardPageHeader>
-        <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="divide-y divide-border rounded-lg border border-border bg-card">
           {Array.from({ length: 6 }).map((_, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: skeleton placeholders are positional
-            <div key={i} className="bg-card border border-border rounded-lg p-5">
+            <div key={i} className="p-5">
               <div className="flex items-start gap-3 mb-3">
                 <div className="w-9 h-9 bg-muted animate-pulse rounded-md" />
                 <div className="flex-1">
@@ -522,7 +522,7 @@ export default function ConnectionsPage() {
               <span className="mb-3 block text-xs font-medium text-muted-foreground">
                 Inference providers
               </span>
-              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="divide-y divide-border rounded-lg border border-border bg-card">
                 {providers.map((connection) => (
                   <ProviderCard key={connection.id} connection={connection} />
                 ))}
@@ -535,7 +535,7 @@ export default function ConnectionsPage() {
               <span className="mb-3 block text-xs font-medium text-muted-foreground">
                 Web search
               </span>
-              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="divide-y divide-border rounded-lg border border-border bg-card">
                 {webSearchConnections.map((connection) => (
                   <WebSearchCard key={connection.id} connection={connection} />
                 ))}
@@ -548,7 +548,7 @@ export default function ConnectionsPage() {
               <span className="mb-3 block text-xs font-medium text-muted-foreground">
                 External IO
               </span>
-              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="divide-y divide-border rounded-lg border border-border bg-card">
                 {infrastructure.map((connection) => (
                   <InfrastructureCard key={connection.id} connection={connection} />
                 ))}
@@ -561,7 +561,7 @@ export default function ConnectionsPage() {
               <span className="mb-3 block text-xs font-medium text-muted-foreground">
                 CDC sources
               </span>
-              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="divide-y divide-border rounded-lg border border-border bg-card">
                 {cdcConnections.map((connection) => (
                   <CdcCard key={connection.id} connection={connection} />
                 ))}

@@ -23,6 +23,9 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  Field,
+  FieldDescription,
+  FieldLabel,
   Input,
   Label,
   Select,
@@ -31,10 +34,10 @@ import {
   SelectTrigger,
   SelectValue,
   Separator,
+  Spinner,
   Textarea,
 } from "@antfly/design-system";
 import type { GeneratorConfig } from "@antfly/sdk";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   Check,
   CheckCircle,
@@ -535,8 +538,8 @@ const EvalsPlaygroundPage: React.FC = () => {
         <CardContent>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {/* Eval Set Selection */}
-            <div className="space-y-2">
-              <Label>Eval Set</Label>
+            <Field className="gap-2">
+              <FieldLabel>Eval Set</FieldLabel>
               <Select value={selectedSetName} onValueChange={setSelectedSetName}>
                 <SelectTrigger>
                   <SelectValue placeholder="Select eval set..." />
@@ -549,13 +552,13 @@ const EvalsPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label>Answer Model</Label>
-              <p className="text-xs text-muted-foreground">
+            <Field className="gap-2">
+              <FieldLabel>Answer Model</FieldLabel>
+              <FieldDescription className="text-xs">
                 Generates the RAG answer that will be scored.
-              </p>
+              </FieldDescription>
               <Button
                 variant="outline"
                 onClick={() => setShowAnswerGeneratorSettings(true)}
@@ -566,13 +569,13 @@ const EvalsPlaygroundPage: React.FC = () => {
                 {answerGeneratorOverride?.temperature !== undefined &&
                   ` (t=${answerGeneratorOverride.temperature})`}
               </Button>
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label>Judge Model</Label>
-              <p className="text-xs text-muted-foreground">
+            <Field className="gap-2">
+              <FieldLabel>Judge Model</FieldLabel>
+              <FieldDescription className="text-xs">
                 Scores the generated answer against the reference answer.
-              </p>
+              </FieldDescription>
               <Button
                 variant="outline"
                 onClick={() => setShowJudgeSettings(true)}
@@ -582,7 +585,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                 {formatGeneratorSummary(judgeOverride, inheritedJudgeLabel)}
                 {judgeOverride?.temperature !== undefined && ` (t=${judgeOverride.temperature})`}
               </Button>
-            </div>
+            </Field>
 
             {/* Run Button */}
             <div className="space-y-2 flex flex-col items-stretch">
@@ -604,7 +607,7 @@ const EvalsPlaygroundPage: React.FC = () => {
               >
                 {isLoading && progress ? (
                   <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                    <Spinner className="h-4 w-4 mr-2" />
                     {progress.current} / {progress.total}
                   </>
                 ) : (
@@ -822,8 +825,8 @@ const EvalsPlaygroundPage: React.FC = () => {
             <DialogDescription>Enter a name for your new evaluation set.</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label htmlFor="setName">Name</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="setName">Name</FieldLabel>
               <Input
                 id="setName"
                 value={newSetName}
@@ -831,7 +834,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                 placeholder="My Eval Set"
                 onKeyDown={(e) => e.key === "Enter" && handleCreateSet()}
               />
-            </div>
+            </Field>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowNewSetDialog(false)}>
@@ -852,8 +855,8 @@ const EvalsPlaygroundPage: React.FC = () => {
             <DialogDescription>Add a question and reference answer pair.</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label htmlFor="question">Question</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="question">Question</FieldLabel>
               <Textarea
                 id="question"
                 value={newItemQuestion}
@@ -861,9 +864,9 @@ const EvalsPlaygroundPage: React.FC = () => {
                 placeholder="What is the capital of France?"
                 className="h-20"
               />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="answer">Reference Answer</Label>
+            </Field>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="answer">Reference Answer</FieldLabel>
               <Textarea
                 id="answer"
                 value={newItemAnswer}
@@ -871,7 +874,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                 placeholder="Paris is the capital of France."
                 className="h-20"
               />
-            </div>
+            </Field>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowAddItemDialog(false)}>
@@ -901,15 +904,15 @@ const EvalsPlaygroundPage: React.FC = () => {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4 flex-1 min-h-0">
-            <div className="space-y-2">
-              <Label htmlFor="importSetName">Eval Set Name</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="importSetName">Eval Set Name</FieldLabel>
               <Input
                 id="importSetName"
                 value={importSetName}
                 onChange={(e) => setImportSetName(e.target.value)}
                 placeholder="My Eval Set"
               />
-            </div>
+            </Field>
             <div className="space-y-2 flex-1 min-h-0">
               <Label>Preview</Label>
               <div className="p-3 bg-muted rounded-lg text-xs max-h-40 overflow-auto">

@@ -4,13 +4,11 @@ import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
+  HighlightedCodeBlock,
 } from "@antfly/design-system";
 import { Check, ChevronDown, ChevronRight, Copy, ExternalLink } from "lucide-react";
 import type React from "react";
 import { useMemo, useState } from "react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { useTheme } from "@/hooks/use-theme";
 
 interface FieldValueDisplayProps {
   value: unknown;
@@ -25,7 +23,6 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
   maxLength = 200,
   compact = false,
 }) => {
-  const { theme } = useTheme();
   const [copied, setCopied] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
 
@@ -300,21 +297,13 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
             </Button>
           </div>
           <CollapsibleContent className="mt-2">
-            <SyntaxHighlighter
+            <HighlightedCodeBlock
+              code={jsonString}
               language="json"
-              style={theme === "dark" ? oneDark : oneLight}
-              customStyle={{
-                margin: 0,
-                fontSize: "0.75rem",
-                lineHeight: "1.25rem",
-                padding: "0.5rem",
-                borderRadius: "0.375rem",
-                maxHeight: "16rem",
-                overflowX: "auto",
-              }}
-            >
-              {jsonString}
-            </SyntaxHighlighter>
+              size="sm"
+              copyable={false}
+              contentClassName="max-h-64"
+            />
           </CollapsibleContent>
         </Collapsible>
       );

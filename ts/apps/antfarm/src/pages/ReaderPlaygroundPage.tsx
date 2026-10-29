@@ -10,9 +10,11 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
+  HighlightedCodeBlock,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -24,7 +26,7 @@ import {
   TabsList,
   TabsTrigger,
 } from "@antfly/design-system";
-import { Clock, Copy, FileText, Hash, RotateCcw, ScanLine, Upload, X, Zap } from "lucide-react";
+import { Clock, FileText, Hash, RotateCcw, ScanLine, Upload, X, Zap } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -138,10 +140,6 @@ function generateSampleInvoiceImage(): Promise<UploadedImage> {
   });
 }
 
-function copyToClipboard(text: string) {
-  navigator.clipboard.writeText(text);
-}
-
 // --- Component ---
 
 const ReaderPlaygroundPage: React.FC = () => {
@@ -162,7 +160,6 @@ const ReaderPlaygroundPage: React.FC = () => {
   const [isDraggingImage, setIsDraggingImage] = useState(false);
   const [showBboxOverlay, setShowBboxOverlay] = useState(true);
   const [outputTab, setOutputTab] = useState("text");
-  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   // Refs
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -356,7 +353,6 @@ const ReaderPlaygroundPage: React.FC = () => {
     setProcessingTime(null);
     setSelectedImageIndex(0);
     setIsLoading(false);
-    setCopiedId(null);
   };
 
   const loadSampleData = async () => {
@@ -365,12 +361,6 @@ const ReaderPlaygroundPage: React.FC = () => {
     setSelectedImageIndex(0);
     setReadResult(null);
     setError(null);
-  };
-
-  const handleCopy = (text: string, id: string) => {
-    copyToClipboard(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
   };
 
   // Current result for selected image
@@ -430,8 +420,8 @@ const ReaderPlaygroundPage: React.FC = () => {
           </CardHeader>
           <CardContent>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="reader-model">Reader</Label>
+              <Field className="gap-2">
+                <FieldLabel htmlFor="reader-model">Reader</FieldLabel>
                 <Select
                   value={selectedReaderModel}
                   onValueChange={setSelectedReaderModel}
@@ -456,11 +446,11 @@ const ReaderPlaygroundPage: React.FC = () => {
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
+              </Field>
               {isAppleOcr ? (
                 <>
-                  <div className="space-y-2">
-                    <Label htmlFor="ocr-recognition-level">Recognition</Label>
+                  <Field className="gap-2">
+                    <FieldLabel htmlFor="ocr-recognition-level">Recognition</FieldLabel>
                     <Select
                       value={recognitionLevel}
                       onValueChange={(value) => setRecognitionLevel(value as "accurate" | "fast")}
@@ -473,16 +463,16 @@ const ReaderPlaygroundPage: React.FC = () => {
                         <SelectItem value="fast">Fast</SelectItem>
                       </SelectContent>
                     </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="ocr-languages">Languages</Label>
+                  </Field>
+                  <Field className="gap-2">
+                    <FieldLabel htmlFor="ocr-languages">Languages</FieldLabel>
                     <Input
                       id="ocr-languages"
                       value={recognitionLanguages}
                       onChange={(event) => setRecognitionLanguages(event.target.value)}
                       placeholder="en-US, fr-FR"
                     />
-                  </div>
+                  </Field>
                   <p className="text-sm text-muted-foreground sm:col-span-3">
                     Extracts visible text from PNG and JPEG images on the connected Mac. For image
                     descriptions or questions, select a vision model such as Qwen3-VL. Enter
@@ -491,17 +481,17 @@ const ReaderPlaygroundPage: React.FC = () => {
                 </>
               ) : (
                 <>
-                  <div className="space-y-2">
-                    <Label htmlFor="prompt">Prompt</Label>
+                  <Field className="gap-2">
+                    <FieldLabel htmlFor="prompt">Prompt</FieldLabel>
                     <Input
                       id="prompt"
                       placeholder="Optional prompt..."
                       value={prompt}
                       onChange={(e) => setPrompt(e.target.value)}
                     />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="max-tokens">Max Tokens</Label>
+                  </Field>
+                  <Field className="gap-2">
+                    <FieldLabel htmlFor="max-tokens">Max Tokens</FieldLabel>
                     <Input
                       id="max-tokens"
                       type="number"
@@ -509,7 +499,7 @@ const ReaderPlaygroundPage: React.FC = () => {
                       value={maxTokens}
                       onChange={(e) => setMaxTokens(e.target.value)}
                     />
-                  </div>
+                  </Field>
                 </>
               )}
             </div>
@@ -703,20 +693,11 @@ const ReaderPlaygroundPage: React.FC = () => {
                     </TabsList>
 
                     <TabsContent value="text" className="mt-3">
-                      <div className="relative">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="absolute top-2 right-2 h-7 gap-1.5 text-xs"
-                          onClick={() => handleCopy(currentResult.text, "ocr-text")}
-                        >
-                          <Copy className="h-3 w-3" />
-                          {copiedId === "ocr-text" ? "Copied!" : "Copy"}
-                        </Button>
-                        <pre className="p-4 pr-20 bg-muted/30 rounded-lg border text-sm font-mono whitespace-pre-wrap max-h-[500px] overflow-y-auto">
-                          {currentResult.text || "(no text extracted)"}
-                        </pre>
-                      </div>
+                      <HighlightedCodeBlock
+                        code={currentResult.text || "(no text extracted)"}
+                        wrap
+                        contentClassName="max-h-[500px]"
+                      />
                     </TabsContent>
 
                     {hasFields && (
@@ -747,16 +728,16 @@ const ReaderPlaygroundPage: React.FC = () => {
                     {hasRegions && (
                       <TabsContent value="regions" className="mt-3 space-y-3">
                         {/* Bbox overlay on image */}
-                        <div className="flex items-center gap-2 mb-2">
+                        <Field orientation="horizontal" className="gap-2 mb-2 w-auto">
                           <Switch
                             id="bbox-toggle"
                             checked={showBboxOverlay}
                             onCheckedChange={setShowBboxOverlay}
                           />
-                          <Label htmlFor="bbox-toggle" className="text-sm">
+                          <FieldLabel htmlFor="bbox-toggle" className="text-sm">
                             Show bounding boxes
-                          </Label>
-                        </div>
+                          </FieldLabel>
+                        </Field>
                         {images[selectedImageIndex] && (
                           <div className="relative rounded-lg overflow-hidden border bg-muted/20 inline-block max-w-full">
                             <img
@@ -839,22 +820,13 @@ const ReaderPlaygroundPage: React.FC = () => {
                     )}
 
                     <TabsContent value="json" className="mt-3">
-                      <div className="relative">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="absolute top-2 right-2 h-7 gap-1.5 text-xs"
-                          onClick={() =>
-                            handleCopy(JSON.stringify(currentResult, null, 2), "ocr-json")
-                          }
-                        >
-                          <Copy className="h-3 w-3" />
-                          {copiedId === "ocr-json" ? "Copied!" : "Copy"}
-                        </Button>
-                        <pre className="p-4 pr-20 bg-muted/30 rounded-lg border text-xs font-mono whitespace-pre-wrap max-h-[500px] overflow-y-auto">
-                          {JSON.stringify(currentResult, null, 2)}
-                        </pre>
-                      </div>
+                      <HighlightedCodeBlock
+                        code={JSON.stringify(currentResult, null, 2)}
+                        language="json"
+                        size="sm"
+                        wrap
+                        contentClassName="max-h-[500px]"
+                      />
                     </TabsContent>
                   </Tabs>
                 </div>

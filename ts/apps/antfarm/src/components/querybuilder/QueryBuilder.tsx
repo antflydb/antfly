@@ -5,8 +5,9 @@ import {
   AccordionTrigger,
   Badge,
   Button,
+  Field,
+  FieldLabel,
   Input,
-  Label,
   Switch,
 } from "@antfly/design-system";
 import type { components, query_components } from "@antfly/sdk";
@@ -140,18 +141,18 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
       )}
       {showLimitAndOffset && (
         <div className="flex gap-2">
-          <div className="flex-1">
-            <Label className="text-xs mb-1 block">Limit</Label>
+          <Field className="gap-1 flex-1">
+            <FieldLabel className="text-xs">Limit</FieldLabel>
             <Input
               placeholder="Limit"
               type="number"
               value={queryRequest.limit}
               onChange={(e) => handleLimitChange(parseInt(e.target.value, 10))}
             />
-          </div>
+          </Field>
           {showOrderByAndFacets && (
-            <div className="flex-1">
-              <Label className="text-xs mb-1 block">Offset</Label>
+            <Field className="gap-1 flex-1">
+              <FieldLabel className="text-xs">Offset</FieldLabel>
               <Input
                 placeholder={disableOffset ? "Disabled" : "Offset"}
                 type="number"
@@ -161,7 +162,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
                 }
                 disabled={disableOffset}
               />
-            </div>
+            </Field>
           )}
         </div>
       )}

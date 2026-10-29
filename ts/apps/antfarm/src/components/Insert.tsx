@@ -17,6 +17,7 @@ import {
   FormLabel,
   FormMessage,
   Input,
+  Spinner,
   Textarea,
 } from "@antfly/design-system";
 import type { BatchRequest } from "@antfly/sdk";
@@ -26,7 +27,6 @@ import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
-import { Spinner } from "@/components/spinner";
 
 import { api, type TableSchema } from "../api";
 

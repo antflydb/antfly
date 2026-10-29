@@ -8,13 +8,13 @@ import {
   CardHeader,
   CardTitle,
   Input,
+  Spinner,
   Textarea,
 } from "@antfly/design-system";
 import type { BatchRequest } from "@antfly/sdk";
 import { CircleAlert, CircleCheck } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useState } from "react";
-import { Spinner } from "@/components/spinner";
 import { api, type JSONSchemaProperty, type TableSchema } from "../api";
 
 interface DocumentBuilderProps {

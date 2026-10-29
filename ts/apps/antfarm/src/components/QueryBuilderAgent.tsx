@@ -11,6 +11,8 @@ import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
+  Field,
+  FieldLabel,
   Label,
   Textarea,
 } from "@antfly/design-system";
@@ -115,8 +117,8 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
         <CardDescription>Describe what you want to search for in natural language</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="space-y-2">
-          <Label htmlFor="intent">Search Intent</Label>
+        <Field className="gap-2">
+          <FieldLabel htmlFor="intent">Search Intent</FieldLabel>
           <Textarea
             id="intent"
             placeholder="e.g., Find all published articles about machine learning from the last year"
@@ -131,7 +133,7 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
             rows={3}
             className="resize-none"
           />
-        </div>
+        </Field>
 
         {/* Generator Settings */}
         <Collapsible open={isSettingsOpen} onOpenChange={setIsSettingsOpen}>
@@ -192,9 +194,7 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
               )}
             </div>
 
-            <div className="rounded-md border">
-              <JsonViewer json={result.query} />
-            </div>
+            <JsonViewer json={result.query} />
 
             {result.explanation && (
               <Collapsible open={isExplanationOpen} onOpenChange={setIsExplanationOpen}>

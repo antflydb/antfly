@@ -11,8 +11,15 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
   DashboardPageActions,
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldLabel,
+  FieldTitle,
   Input,
   Label,
+  Message,
+  MessageContent,
   Separator,
   Switch,
   Textarea,
@@ -30,7 +37,11 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useState } from "react";
-import { Message, MessageContent, MessageResponse } from "@/components/ai-elements/message";
+import {
+  Message as AIMessage,
+  MessageContent as AIMessageContent,
+  MessageResponse,
+} from "@/components/ai-elements/message";
 import {
   PromptInput,
   PromptInputFooter,
@@ -88,8 +99,8 @@ const AVAILABLE_TOOLS = [
 const DEFAULT_ENABLED_TOOLS: ChatToolName[] = ["semantic_search", "full_text_search", "add_filter"];
 
 const aiRenderers = createAIElementsRenderers({
-  Message,
-  MessageContent,
+  Message: AIMessage,
+  MessageContent: AIMessageContent,
   MessageResponse,
   Sources,
   SourcesTrigger,
@@ -200,8 +211,10 @@ const ChatPlaygroundPage: React.FC = () => {
                     </div>
 
                     {/* Query Options */}
-                    <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground">Result Limit</Label>
+                    <Field className="gap-2">
+                      <FieldLabel className="text-xs text-muted-foreground">
+                        Result Limit
+                      </FieldLabel>
                       <Input
                         type="number"
                         value={limit}
@@ -210,7 +223,7 @@ const ChatPlaygroundPage: React.FC = () => {
                         max={50}
                         className="w-24"
                       />
-                    </div>
+                    </Field>
 
                     <Separator />
 
@@ -219,14 +232,14 @@ const ChatPlaygroundPage: React.FC = () => {
                       <Label className="text-sm font-medium">Pipeline Steps</Label>
 
                       {/* Classification */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
-                        <div className="flex items-center gap-3">
-                          <Sparkles className="h-4 w-4 text-muted-foreground" />
-                          <div>
-                            <p className="text-sm font-medium">Classification</p>
-                            <p className="text-xs text-muted-foreground">Analyze query strategy</p>
-                          </div>
-                        </div>
+                      <Field orientation="horizontal" className="p-3 rounded-lg border">
+                        <Sparkles className="h-4 w-4 text-muted-foreground shrink-0" />
+                        <FieldContent>
+                          <FieldTitle>Classification</FieldTitle>
+                          <FieldDescription className="text-xs">
+                            Analyze query strategy
+                          </FieldDescription>
+                        </FieldContent>
                         <Switch
                           checked={steps.classification.enabled}
                           onCheckedChange={(v) =>
@@ -236,23 +249,21 @@ const ChatPlaygroundPage: React.FC = () => {
                             }))
                           }
                         />
-                      </div>
+                      </Field>
 
                       {/* Follow-up */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
-                        <div className="flex items-center gap-3">
-                          <HelpCircle className="h-4 w-4 text-muted-foreground" />
-                          <div>
-                            <p className="text-sm font-medium">Follow-up Questions</p>
-                            <p className="text-xs text-muted-foreground">
-                              Generate related questions
-                            </p>
-                          </div>
-                        </div>
+                      <Field orientation="horizontal" className="p-3 rounded-lg border">
+                        <HelpCircle className="h-4 w-4 text-muted-foreground shrink-0" />
+                        <FieldContent>
+                          <FieldTitle>Follow-up Questions</FieldTitle>
+                          <FieldDescription className="text-xs">
+                            Generate related questions
+                          </FieldDescription>
+                        </FieldContent>
                         <div className="flex items-center gap-3">
                           {steps.followup.enabled && (
-                            <div className="flex items-center gap-2">
-                              <Label className="text-xs">Count</Label>
+                            <Field orientation="horizontal" className="w-auto gap-2">
+                              <FieldLabel className="text-xs">Count</FieldLabel>
                               <Input
                                 type="number"
                                 value={steps.followup.count}
@@ -269,7 +280,7 @@ const ChatPlaygroundPage: React.FC = () => {
                                 min={1}
                                 max={10}
                               />
-                            </div>
+                            </Field>
                           )}
                           <Switch
                             checked={steps.followup.enabled}
@@ -281,17 +292,17 @@ const ChatPlaygroundPage: React.FC = () => {
                             }
                           />
                         </div>
-                      </div>
+                      </Field>
 
                       {/* Confidence */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
-                        <div className="flex items-center gap-3">
-                          <Target className="h-4 w-4 text-muted-foreground" />
-                          <div>
-                            <p className="text-sm font-medium">Confidence Scores</p>
-                            <p className="text-xs text-muted-foreground">Rate answer confidence</p>
-                          </div>
-                        </div>
+                      <Field orientation="horizontal" className="p-3 rounded-lg border">
+                        <Target className="h-4 w-4 text-muted-foreground shrink-0" />
+                        <FieldContent>
+                          <FieldTitle>Confidence Scores</FieldTitle>
+                          <FieldDescription className="text-xs">
+                            Rate answer confidence
+                          </FieldDescription>
+                        </FieldContent>
                         <Switch
                           checked={steps.confidence.enabled}
                           onCheckedChange={(v) =>
@@ -301,32 +312,30 @@ const ChatPlaygroundPage: React.FC = () => {
                             }))
                           }
                         />
-                      </div>
+                      </Field>
                     </div>
 
                     <Separator />
 
                     {/* Agentic Mode */}
                     <div className="space-y-4">
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
-                        <div className="flex items-center gap-3">
-                          <Bot className="h-4 w-4 text-muted-foreground" />
-                          <div>
-                            <p className="text-sm font-medium">Agentic Mode</p>
-                            <p className="text-xs text-muted-foreground">
-                              LLM autonomously picks tools
-                            </p>
-                          </div>
-                        </div>
+                      <Field orientation="horizontal" className="p-3 rounded-lg border">
+                        <Bot className="h-4 w-4 text-muted-foreground shrink-0" />
+                        <FieldContent>
+                          <FieldTitle>Agentic Mode</FieldTitle>
+                          <FieldDescription className="text-xs">
+                            LLM autonomously picks tools
+                          </FieldDescription>
+                        </FieldContent>
                         <Switch checked={agenticEnabled} onCheckedChange={setAgenticEnabled} />
-                      </div>
+                      </Field>
 
                       {agenticEnabled && (
                         <div className="space-y-3 pl-2">
-                          <div className="space-y-2">
-                            <Label className="text-xs text-muted-foreground">
+                          <Field className="gap-2">
+                            <FieldLabel className="text-xs text-muted-foreground">
                               Max Internal Iterations
-                            </Label>
+                            </FieldLabel>
                             <Input
                               type="number"
                               value={maxInternalIterations}
@@ -339,7 +348,7 @@ const ChatPlaygroundPage: React.FC = () => {
                               max={20}
                               className="w-20 h-7 text-xs"
                             />
-                          </div>
+                          </Field>
                           <div className="space-y-2">
                             <Label className="text-xs text-muted-foreground">Tools</Label>
                             <div className="space-y-1">
@@ -373,26 +382,26 @@ const ChatPlaygroundPage: React.FC = () => {
                     <Separator />
 
                     {/* System Prompt */}
-                    <div className="space-y-2">
-                      <Label>System Prompt (optional)</Label>
+                    <Field className="gap-2">
+                      <FieldLabel>System Prompt (optional)</FieldLabel>
                       <Textarea
                         placeholder="Custom instructions for the generator..."
                         value={systemPrompt}
                         onChange={(e) => setSystemPrompt(e.target.value)}
                         className="min-h-[80px] resize-none text-sm"
                       />
-                    </div>
+                    </Field>
 
                     {/* Agent Knowledge */}
-                    <div className="space-y-2">
-                      <Label>Agent Knowledge (optional)</Label>
+                    <Field className="gap-2">
+                      <FieldLabel>Agent Knowledge (optional)</FieldLabel>
                       <Textarea
                         placeholder="Domain-specific knowledge for the agent..."
                         value={agentKnowledge}
                         onChange={(e) => setAgentKnowledge(e.target.value)}
                         className="min-h-[60px] resize-none text-sm"
                       />
-                    </div>
+                    </Field>
                   </CardContent>
                 </CollapsibleContent>
               </Collapsible>
@@ -442,17 +451,26 @@ const ChatPlaygroundPage: React.FC = () => {
                   }
                   placeholder="Ask a question..."
                   {...aiRenderers}
+                  renderUserMessage={(message: string) => (
+                    <Message align="end">
+                      <MessageContent className="w-fit max-w-[95%] rounded-md bg-secondary px-4 py-3 text-foreground">
+                        <MessageResponse>{message}</MessageResponse>
+                      </MessageContent>
+                    </Message>
+                  )}
                   renderAssistantMessage={(
                     message: string,
                     isStreaming: boolean,
                     turn: ChatTurn
                   ) => (
-                    <>
-                      {aiRenderers.renderAssistantMessage?.(message, isStreaming, turn)}
-                      {(turn.steps.length > 0 ||
-                        turn.activeSteps.length > 0 ||
-                        turn.reasoningText) && (
-                        <div className="mt-1 ml-1">
+                    <Message>
+                      <MessageContent className="max-w-[95%] text-foreground">
+                        <MessageResponse parseIncompleteMarkdown={isStreaming}>
+                          {message || " "}
+                        </MessageResponse>
+                        {(turn.steps.length > 0 ||
+                          turn.activeSteps.length > 0 ||
+                          turn.reasoningText) && (
                           <ReasoningChainCollapsible
                             chain={turn.steps}
                             activeSteps={turn.activeSteps}
@@ -460,9 +478,9 @@ const ChatPlaygroundPage: React.FC = () => {
                             reasoningText={turn.reasoningText}
                             isStreaming={turn.isStreaming}
                           />
-                        </div>
-                      )}
-                    </>
+                        )}
+                      </MessageContent>
+                    </Message>
                   )}
                   renderInput={({
                     value,

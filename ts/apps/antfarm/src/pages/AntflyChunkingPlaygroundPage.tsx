@@ -10,19 +10,20 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
   Separator,
+  Spinner,
   Textarea,
 } from "@antfly/design-system";
 import type { ChunkResponse } from "@antfly/sdk";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ClipboardCopy,
   Clock,
@@ -441,8 +442,8 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="model">Model</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="model">Model</FieldLabel>
               <Select
                 value={config.model}
                 onValueChange={(value) => setConfig({ ...config, model: value })}
@@ -459,12 +460,12 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
             {config.model === "fixed" && (
               <>
-                <div className="space-y-2">
-                  <Label htmlFor="target_tokens">Target Tokens</Label>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="target_tokens">Target Tokens</FieldLabel>
                   <Input
                     id="target_tokens"
                     type="number"
@@ -475,9 +476,9 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                       setConfig({ ...config, target_tokens: parseInt(e.target.value, 10) || 500 })
                     }
                   />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="overlap_tokens">Overlap Tokens</Label>
+                </Field>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="overlap_tokens">Overlap Tokens</FieldLabel>
                   <Input
                     id="overlap_tokens"
                     type="number"
@@ -488,9 +489,9 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                       setConfig({ ...config, overlap_tokens: parseInt(e.target.value, 10) || 0 })
                     }
                   />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="separator">Separator</Label>
+                </Field>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="separator">Separator</FieldLabel>
                   <Select
                     value={config.separator}
                     onValueChange={(value) => setConfig({ ...config, separator: value })}
@@ -505,14 +506,14 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                       <SelectItem value=" ">Word ( )</SelectItem>
                     </SelectContent>
                   </Select>
-                </div>
+                </Field>
               </>
             )}
 
             {config.model !== "fixed" && (
               <>
-                <div className="space-y-2">
-                  <Label htmlFor="target_tokens">Target Tokens</Label>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="target_tokens">Target Tokens</FieldLabel>
                   <Input
                     id="target_tokens"
                     type="number"
@@ -523,9 +524,9 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                       setConfig({ ...config, target_tokens: parseInt(e.target.value, 10) || 0 })
                     }
                   />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="threshold">Threshold</Label>
+                </Field>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="threshold">Threshold</FieldLabel>
                   <Input
                     id="threshold"
                     type="text"
@@ -539,12 +540,12 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                       }
                     }}
                   />
-                </div>
+                </Field>
               </>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="max_chunks">Max Chunks</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="max_chunks">Max Chunks</FieldLabel>
               <Input
                 id="max_chunks"
                 type="number"
@@ -555,7 +556,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                   setConfig({ ...config, max_chunks: parseInt(e.target.value, 10) || 50 })
                 }
               />
-            </div>
+            </Field>
           </div>
           <FormActions>
             <AIWorkflowSubmitButton
@@ -661,11 +662,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                     onClick={handleSearchDocuments}
                     disabled={isSearching || !searchQuery.trim()}
                   >
-                    {isSearching ? (
-                      <ReloadIcon className="h-3 w-3 animate-spin" />
-                    ) : (
-                      <Search className="h-3 w-3" />
-                    )}
+                    {isSearching ? <Spinner className="h-3 w-3" /> : <Search className="h-3 w-3" />}
                   </Button>
                 </div>
 
@@ -689,7 +686,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                     onClick={() => handleFetchDocument(documentId)}
                     disabled={isFetchingDoc || !documentId.trim()}
                   >
-                    {isFetchingDoc ? <ReloadIcon className="h-3 w-3 animate-spin" /> : "Load"}
+                    {isFetchingDoc ? <Spinner className="h-3 w-3" /> : "Load"}
                   </Button>
                 </div>
 

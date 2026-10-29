@@ -1,4 +1,9 @@
-import { Badge, Collapsible, CollapsibleContent } from "@antfly/design-system";
+import {
+  Badge,
+  Collapsible,
+  CollapsibleContent,
+  HighlightedCodeBlock,
+} from "@antfly/design-system";
 import type React from "react";
 import { cn } from "@/lib/utils";
 import type {
@@ -112,9 +117,15 @@ function renderStepContent(
                     <Badge className="text-[10px]">{hit._score?.toFixed(3)}</Badge>
                   </div>
                   {hit._source && (
-                    <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap mt-1 line-clamp-3">
-                      {JSON.stringify(hit._source, null, 2).slice(0, 300)}
-                    </pre>
+                    <HighlightedCodeBlock
+                      code={JSON.stringify(hit._source, null, 2).slice(0, 300)}
+                      language="json"
+                      size="sm"
+                      wrap
+                      copyable={false}
+                      className="mt-1"
+                      contentClassName="max-h-20"
+                    />
                   )}
                 </div>
               ))}

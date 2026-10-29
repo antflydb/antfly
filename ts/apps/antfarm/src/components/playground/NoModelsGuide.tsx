@@ -1,4 +1,13 @@
-import { Badge, Button } from "@antfly/design-system";
+import {
+  Badge,
+  Button,
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemGroup,
+  ItemTitle,
+} from "@antfly/design-system";
 import { Check, Copy, ExternalLink, PackageSearch } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
@@ -87,38 +96,42 @@ export function NoModelsGuide({
           </p>
 
           {suggestions.length > 0 && (
-            <div className="mt-3 space-y-2">
+            <ItemGroup className="mt-3 gap-2">
               {suggestions.map((model) => {
                 const command = model.allowDownloads ? getDownloadCommand(model) : "";
                 return (
-                  <div
+                  <Item
                     key={model.id}
-                    className="flex items-center gap-2 rounded-md border bg-background/80 p-2"
+                    variant="outline"
+                    size="xs"
+                    className="gap-2 bg-background/80 p-2"
                   >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="text-xs font-medium truncate">{model.name}</span>
+                    <ItemContent className="min-w-0">
+                      <ItemTitle className="text-xs">
+                        <span className="truncate font-mono">{model.name}</span>
                         {model.size && (
                           <Badge className="text-[10px] px-1.5 py-0 h-4 shrink-0">
                             {model.size}
                           </Badge>
                         )}
-                      </div>
-                      {command ? (
-                        <code className="text-[11px] text-muted-foreground font-mono block truncate">
-                          {command}
-                        </code>
-                      ) : (
-                        <span className="text-[11px] text-muted-foreground">
-                          Available through {model.connectionName}
-                        </span>
-                      )}
-                    </div>
-                    {command ? <CopyCommandButton command={command} /> : null}
-                  </div>
+                      </ItemTitle>
+                      <ItemDescription className="text-[11px] line-clamp-1">
+                        {command ? (
+                          <code className="font-mono block truncate">{command}</code>
+                        ) : (
+                          <>Available through {model.connectionName}</>
+                        )}
+                      </ItemDescription>
+                    </ItemContent>
+                    {command ? (
+                      <ItemActions>
+                        <CopyCommandButton command={command} />
+                      </ItemActions>
+                    ) : null}
+                  </Item>
                 );
               })}
-            </div>
+            </ItemGroup>
           )}
 
           <div className="mt-3">

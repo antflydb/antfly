@@ -1,10 +1,10 @@
+import { Spinner } from "@antfly/design-system";
 import {
   AlertCircle,
   BookOpen,
   Check,
   ChevronDown,
   HelpCircle,
-  Loader2,
   Search,
   Sparkles,
   Target,
@@ -50,7 +50,7 @@ export const PipelineNode: React.FC<PipelineNodeProps> = ({
       case "complete":
         return <Check className="af-status-icon-success w-3.5 h-3.5" />;
       case "running":
-        return <Loader2 className="af-status-icon-info w-3.5 h-3.5 animate-spin" />;
+        return <Spinner className="af-status-icon-info w-3.5 h-3.5" />;
       case "error":
         return <AlertCircle className="af-status-icon-error w-3.5 h-3.5" />;
       case "pending":

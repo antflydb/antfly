@@ -10,9 +10,10 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -330,8 +331,8 @@ const EmbeddingPlaygroundPage: React.FC = () => {
         <CardContent className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Model Selection */}
-            <div className="space-y-2">
-              <Label htmlFor="model">Embedder Model</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="model">Embedder Model</FieldLabel>
               <Select
                 value={selectedModel}
                 onValueChange={setSelectedModel}
@@ -356,18 +357,18 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
             {/* Query */}
-            <div className="space-y-2">
-              <Label htmlFor="query">Query</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="query">Query</FieldLabel>
               <Input
                 id="query"
                 placeholder="Enter a query to compare against documents..."
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
               />
-            </div>
+            </Field>
           </div>
           <FormActions>
             <AIWorkflowSubmitButton
@@ -448,9 +449,11 @@ const EmbeddingPlaygroundPage: React.FC = () => {
           <CardContent className="flex-1 space-y-3 max-h-[600px] overflow-y-auto">
             {documents.map((doc, index) => (
               // biome-ignore lint/suspicious/noArrayIndexKey: document inputs identified by position
-              <div key={index} className="space-y-1">
+              <Field key={index} className="gap-1">
                 <div className="flex items-center justify-between">
-                  <Label className="text-xs text-muted-foreground">Document {index + 1}</Label>
+                  <FieldLabel className="text-xs text-muted-foreground">
+                    Document {index + 1}
+                  </FieldLabel>
                   <Button
                     variant="ghost"
                     size="sm"
@@ -467,7 +470,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                   value={doc}
                   onChange={(e) => updateDocument(index, e.target.value)}
                 />
-              </div>
+              </Field>
             ))}
           </CardContent>
         </Card>

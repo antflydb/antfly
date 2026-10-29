@@ -17,6 +17,9 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  Field,
+  FieldDescription,
+  FieldLabel,
   FormActions,
   Input,
   Label,
@@ -26,9 +29,9 @@ import {
   SelectTrigger,
   SelectValue,
   Skeleton,
+  Spinner,
   Textarea,
 } from "@antfly/design-system";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, HelpCircle, ListPlus, MessageCircle, Plus, RotateCcw, Zap } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -362,8 +365,8 @@ const RewritingPlaygroundPage: React.FC = () => {
         <CardContent>
           <div className="grid grid-cols-1 gap-4">
             {/* Model Selection */}
-            <div className="space-y-2">
-              <Label htmlFor="model">Model</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="model">Model</FieldLabel>
               <Select
                 value={selectedModel}
                 onValueChange={setSelectedModel}
@@ -388,7 +391,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
           </div>
           <FormActions>
             <Button
@@ -397,7 +400,7 @@ const RewritingPlaygroundPage: React.FC = () => {
             >
               {isLoading ? (
                 <>
-                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  <Spinner className="h-4 w-4 mr-2" />
                   Generating
                 </>
               ) : (
@@ -443,8 +446,8 @@ const RewritingPlaygroundPage: React.FC = () => {
           </CardHeader>
           <CardContent className="flex-1 space-y-4">
             {/* Context */}
-            <div className="space-y-2">
-              <Label htmlFor="context">Context Passage</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="context">Context Passage</FieldLabel>
               <Textarea
                 id="context"
                 placeholder="Enter a passage of text containing the answer..."
@@ -452,11 +455,11 @@ const RewritingPlaygroundPage: React.FC = () => {
                 value={context}
                 onChange={(e) => setContext(e.target.value)}
               />
-            </div>
+            </Field>
 
             {/* Answer */}
-            <div className="space-y-2">
-              <Label htmlFor="answer">Answer</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="answer">Answer</FieldLabel>
               <Textarea
                 id="answer"
                 placeholder="Enter the answer that the question should target..."
@@ -464,10 +467,10 @@ const RewritingPlaygroundPage: React.FC = () => {
                 value={answer}
                 onChange={(e) => setAnswer(e.target.value)}
               />
-              <p className="text-xs text-muted-foreground">
+              <FieldDescription className="text-xs">
                 The answer should appear in the context passage above.
-              </p>
-            </div>
+              </FieldDescription>
+            </Field>
           </CardContent>
         </Card>
 
@@ -573,8 +576,8 @@ const RewritingPlaygroundPage: React.FC = () => {
 
             {/* Select existing eval set */}
             {getEvalSetNames().length > 0 && (
-              <div className="space-y-2">
-                <Label>Select Eval Set</Label>
+              <Field className="gap-2">
+                <FieldLabel>Select Eval Set</FieldLabel>
                 <Select value={selectedEvalSet} onValueChange={setSelectedEvalSet}>
                   <SelectTrigger>
                     <SelectValue placeholder="Choose an eval set..." />
@@ -587,12 +590,12 @@ const RewritingPlaygroundPage: React.FC = () => {
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
+              </Field>
             )}
 
             {/* Or create new */}
-            <div className="space-y-2">
-              <Label>Or Create New</Label>
+            <Field className="gap-2">
+              <FieldLabel>Or Create New</FieldLabel>
               <div className="flex gap-2">
                 <Input
                   value={newEvalSetName}
@@ -615,7 +618,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                   <Plus className="h-4 w-4" />
                 </Button>
               </div>
-            </div>
+            </Field>
           </div>
           <DialogFooter>
             {evalSetSuccess ? (

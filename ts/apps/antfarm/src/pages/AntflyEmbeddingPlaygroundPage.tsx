@@ -10,9 +10,11 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
+  HighlightedCodeBlock,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -214,13 +216,13 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div className="space-y-2">
-              <Label>Table</Label>
+            <Field className="gap-2">
+              <FieldLabel>Table</FieldLabel>
               <Input value={selectedTable || "No table selected"} disabled />
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label htmlFor="index">Embedding Index</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="index">Embedding Index</FieldLabel>
               <Select
                 value={selectedIndex}
                 onValueChange={setSelectedIndex}
@@ -241,10 +243,10 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label htmlFor="limit">Result Limit</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="limit">Result Limit</FieldLabel>
               <Input
                 id="limit"
                 type="number"
@@ -253,11 +255,11 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
                 value={limit}
                 onChange={(e) => setLimit(parseInt(e.target.value, 10) || 10)}
               />
-            </div>
+            </Field>
           </div>
 
-          <div className="space-y-2">
-            <Label htmlFor="query">Semantic Query</Label>
+          <Field className="gap-2">
+            <FieldLabel htmlFor="query">Semantic Query</FieldLabel>
             <Input
               id="query"
               placeholder="Enter a natural language query to find similar documents..."
@@ -270,7 +272,7 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
                 }
               }}
             />
-          </div>
+          </Field>
 
           <FormActions>
             <AIWorkflowSubmitButton
@@ -348,9 +350,11 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
                   <DocumentPreview source={hit.source} />
                   {showRawScores && hit.indexScores && (
                     <div className="pt-2 border-t">
-                      <pre className="text-[10px] text-muted-foreground font-mono overflow-x-auto">
-                        {JSON.stringify(hit.indexScores, null, 2)}
-                      </pre>
+                      <HighlightedCodeBlock
+                        code={JSON.stringify(hit.indexScores, null, 2)}
+                        language="json"
+                        size="sm"
+                      />
                     </div>
                   )}
                 </CardContent>

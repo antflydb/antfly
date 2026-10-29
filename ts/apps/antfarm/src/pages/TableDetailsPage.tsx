@@ -31,8 +31,10 @@ import {
   DialogDescription,
   DialogTitle,
   DialogTrigger,
+  Field,
+  FieldDescription,
+  FieldLabel,
   Input,
-  Label,
   MultiSelect,
   MultiSelectContent,
   MultiSelectItem,
@@ -1272,8 +1274,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                               </AlertDescription>
                             </Alert>
                           )}
-                          <div>
-                            <Label className="text-xs mb-1 block">Vector Index (optional)</Label>
+                          <Field className="gap-1">
+                            <FieldLabel className="text-xs">Vector Index (optional)</FieldLabel>
                             {indexes.filter((idx) => idx.config.type === "embeddings").length ===
                             0 ? (
                               <p className="text-xs text-muted-foreground">
@@ -1305,10 +1307,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                                 use full-text search.
                               </p>
                             )}
-                          </div>
+                          </Field>
                           {indexes.some((idx) => idx.config.type === "full_text") && (
-                            <div>
-                              <Label className="text-xs mb-1 block">Full-text Index</Label>
+                            <Field className="gap-1">
+                              <FieldLabel className="text-xs">Full-text Index</FieldLabel>
                               <Select
                                 value={fullTextIndex || "__active_schema__"}
                                 onValueChange={handleFullTextIndexChange}
@@ -1330,14 +1332,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                                     ))}
                                 </SelectContent>
                               </Select>
-                              <p className="mt-1 text-xs text-muted-foreground">
+                              <FieldDescription className="text-xs">
                                 {queryIndexes.length > 0
                                   ? "Clear vector indexes to run full-text search."
                                   : fullTextIndex
                                     ? "Queries the selected named full-text index."
                                     : "Uses the full-text index for the table's active read schema."}
-                              </p>
-                            </div>
+                              </FieldDescription>
+                            </Field>
                           )}
                           {queryIndexes.length > 1 && (
                             <Alert className="py-1.5 px-3">
@@ -1361,8 +1363,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                               </AlertDescription>
                             </Alert>
                           )}
-                          <div>
-                            <Label className="text-xs mb-1 block">Query</Label>
+                          <Field className="gap-1">
+                            <FieldLabel className="text-xs">Query</FieldLabel>
                             <Input
                               placeholder="Enter search query..."
                               value={query}
@@ -1374,7 +1376,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                                 }
                               }}
                             />
-                          </div>
+                          </Field>
                         </div>
                       </AccordionContent>
                     </AccordionItem>
@@ -1430,16 +1432,16 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                           <p className="font-medium">Not enabled for this query</p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <Field orientation="horizontal" className="gap-2 w-auto">
                         <Checkbox
                           id="include-retrieval-profile"
                           checked={includeProfile}
                           onCheckedChange={(checked) => setIncludeProfile(checked === true)}
                         />
-                        <Label htmlFor="include-retrieval-profile" className="font-normal">
+                        <FieldLabel htmlFor="include-retrieval-profile" className="font-normal">
                           Request execution profile and show it as the retrieval trace
-                        </Label>
-                      </div>
+                        </FieldLabel>
+                      </Field>
                     </CardContent>
                   </Card>
                 </TabsContent>
