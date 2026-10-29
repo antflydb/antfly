@@ -1859,3 +1859,132 @@ opposite binary order. Freeze binaries in separate directories with basename
 input/helper/executable hash; stop task-owned builds, E2Es and cache cleanup
 before measuring. The covering report replaces redundant ID arrays with their
 counts and hashes while retaining complete hit hashes and every sort profile.
+
+
+## Compact match plans, suffix bounds and request projection plans
+
+The retained [observation](native-compact-plans-and-projection-cache-v1-observation.json)
+contains **244 measured HTTP requests** for the main refinement, followed by a
+separate **112-request** qualification of projection-plan admission. Every
+successful complete hit and outer total agrees within each comparison, including
+IDs, scores, sort values, source masks and exact snippets. Parquet and helper
+hashes match. The 64-column case independently checks every integer above `2^53`;
+the exclusion cases require the same two physical source columns in both binaries.
+
+The primary comparison uses control `fd30bc6ffd` and runtime
+`599b748319`, both on main `04dd50548a`. The frozen
+helpers are at `a6541a5d36`. Executable SHA-256 values
+are `d7f122b4600ef784d8493b8c62f0a20cee3f8c610d6039e4ad75928b467037d1` and
+`e893763401f47f2e315d18d866e693d1c00ebb4d0b2a764ae5ac5312be4fdb88`. These are local Debug observations,
+with seven samples per layout shape and three per other shape/cache mode. Old/new
+and new/old blocks contain no overlapping task-owned build, E2E or cache cleanup.
+
+Warm/local medians, milliseconds (restart rows are labeled explicitly):
+
+| Shape | Old → new, primary | Old → new, reverse |
+| --- | ---: | ---: |
+| Regular 2-MiB control | 10.65 → 12.03 | 11.29 → 12.79 |
+| Prefix matching 20,000 terms | 103.10 → 99.94 | 104.11 → 103.64 |
+| Sparse 32-KiB control | 9.69 → 10.83 | 10.35 → 11.86 |
+| Early dense cluster, mixed-term remainder | 21.27 → 13.09 | 22.05 → 13.28 |
+| Hidden eight-field highlights, 256 hits | 180.21 → 171.06 | 162.65 → 162.57 |
+| Projected eight-field highlights, 256 hits | 221.01 → 207.56 | 202.33 → 194.63 |
+| Hidden one-field control, 256 hits | 109.99 → 107.43 | 92.36 → 90.74 |
+| 64 covered integer columns, process restart | 390.24 → 296.98 | 415.84 → 289.97 |
+| 64 covered integer columns, warm | 381.91 → 281.19 | 391.87 → 278.18 |
+| Explicit narrow projection, process restart | 117.52 → 75.34 | 81.32 → 74.94 |
+| Explicit narrow projection, warm | 50.26 → 49.95 | 54.15 → 50.58 |
+| Wildcard exclusions, process restart | 139.98 → 75.32 | 112.48 → 74.90 |
+| Wildcard exclusions, warm | 91.85 → 50.38 | 101.17 → 49.85 |
+| Exclusion-only mask, process restart | 107.00 → 75.36 | 113.74 → 74.37 |
+| Exclusion-only mask, warm | 95.96 → 50.80 | 99.80 → 49.71 |
+
+The layout fixture reports **1.6–1.8%** more total artifact-store bytes and
+readiness increases by **0.10–0.28 s**. The small-field fixture reports
+**0.3–0.5%** more bytes, with readiness changing by **−0.03 to +0.25 s**.
+Each is a single readiness/storage observation per run, includes superseded
+objects, and does not isolate live index bytes or ingestion CPU.
+
+Both orders support **26–29%** faster warm wide covering delivery, **45–51%**
+faster warm excluded-column delivery, and **38–40%** faster highlights after an
+early dense cluster. Broad-prefix latency changes by only **0.4–3.1%**; the
+compact navigation and reduced block work do not establish a large end-to-end
+win for that shape. Hidden wide highlighting ranges from effectively unchanged
+to 5% faster; projected wide highlighting improves by 3.8–6.1%.
+
+The regular and sparse one-hit controls are **11.8–14.6% slower**, about
+**1.1–1.5 ms**. That tradeoff is retained rather than hidden. A subsequent
+admission rule avoids building a projection plan when only one hit can use it;
+its separate same-main comparison does **not** demonstrate a material latency
+gain or explain/remove the earlier controls regression. It is an allocation and
+reuse policy, not a claimed point-query speedup. There is no universal latency
+improvement claim.
+
+Independent work/exactness probes show:
+
+- After the early cluster, **2,304 of 32,769 occurrences** and **10 blocks** are
+  visited, versus 32,769 occurrences and 39 blocks in the prior probe, with exact
+  full-selector agreement.
+- For 8,192 distinct singleton terms, navigation retains a **1,024-byte term-ID
+  mask**, no selected term strings and no inverted read references. The fragment
+  kernel visits at most 1,024 spans and decodes **four blocks**, down from eleven.
+  Its **112,537-byte peak** excludes navigation and is not a full-query heap claim.
+- Whole and half-vocabulary selections over irregular spacing agree with the
+  exact selector for four widths; another **288 configurations** cover disjoint
+  and crossing spans. OOM and cancellation checks remain active.
+- Request projection plans retain no page leases, reuse one plan across 256
+  closed producer pages, cap retained schemas at four, and preserve nested
+  fallback, include order, duplicate/wildcard masks, hidden dependencies and
+  canonical numeric extremes.
+
+The representation uses stored-source recipe **v10**, reader protocol **96**,
+runtime ABI **72**, and `AFOV0005` offsets. Old native representations rebuild.
+See [the current serving contract](../../REMOTE_TABLE_SERVING.md#request-owned-projection-plans-and-scalar-delivery)
+for ownership, physical masks and canonical metadata. A strict response oracle
+caught synthetic `_id`/`_type` leakage on covering reads; covering and accepted
+sources now preserve physical columns and declared type values/nulls, while
+virtual identity is explicit and identity sorting does not inject source fields.
+The unavailable-Parquet regression fails on the old wildcard path and passes
+with both directions of physical-ID sorting, ascending virtual-ID sorting,
+explicit identity, restart, and unavailable originals after the correction.
+
+The final tree additionally merges main `1cfa5178d4`, resolving the append-only
+serving/cloud-retention documentation conflict by preserving both designs. Its
+lake execution files match the measured runtime until the separately qualified
+one-hit admission rule. The record identifies each measured revision; it does
+not relabel the earlier timings as measurements of a later executable.
+
+Reproduce from the worktree root with `highlight_refinements.py`,
+`hidden_highlights.py`, `covering_batches.py` and `excluded_columns.py`, each
+accepting `LABEL IMMUTABLE_BINARY RUNTIME_SOURCE_COMMIT`. Run all four old/new,
+then all four new/old, using fresh labels and frozen executables named `antfly`.
+The layout fixture has its own directory and asserts every input ID/body before
+starting a server. Retain all samples, full hit/total oracles and input/helper/
+executable hashes. The follow-up uses the layout helper alone and separately
+identifies main `1cfa5178d4`, control `c532682337`, and admission revision
+`e23de32d9c`.
+
+Process restart retains OS/persistent caches and readiness warming; it is not an
+empty-cache measurement. Artifact bytes include superseded objects, and single
+readiness observations do not isolate ingestion CPU. The observation retains
+those storage/publication samples. No Release, cloud, archive-scale, or full-query
+memory qualification is claimed. Real cloud retention enforcement remains a
+separate qualification, as previously deferred.
+
+
+Final admission runtime `e23de32d9c` passes **32 API and 77 shared native checks**
+with no failures, skips or leaks, and **48 real Parquet/Iceberg cases** in
+**366.37 s**. Those checks include direct single-hit transport, multi-hit plan
+reuse, exact highlighting, canonical source metadata, allocation failures,
+unavailable originals, accepted rows, restart and deadline propagation. Success
+E2E requests allow 500 ms for scheduling variability; separate 1-ms cases assert
+the public timeout outcome. Native work budgets and the dedicated comparisons,
+rather than a fragile success wall-clock threshold, qualify efficiency.
+
+Before the final metadata correction, the broader source `1812cfbd12` passes
+**531 API plus 316 shared checks**, and **115 frontier plus 35 shared checks**,
+with no failures, skips or leaks. The record keeps that revision separate from
+the final focused qualification and retains its frozen executable identity.
+The latest-main source `c532682337` also passes 32 API/75 shared cases and all
+48 real-file cases before admission refinement. These stage-specific counts are
+not combined into a distinct-test or final-runtime full-suite claim.

@@ -2131,15 +2131,15 @@ aggregate count. Source-order blocks also attest suffix spacing for the union
 of all tokens. Any selected subset is bounded by that union, so dense broad
 selections can prune even when all matching terms occur only once. The reader
 uses either safe union or per-term bounds, whichever proves sufficient.
-They do not retain selected term strings or inverted read
-references. The span-only iterator tests the bitset directly, without a binary
-search for every occurrence. Public full-token iteration and materialization
+These plans retain neither selected term strings nor inverted read references.
+The span-only iterator tests the bitset directly, without a binary search for
+every occurrence. Public full-token iteration and materialization
 lazily expand the selected inverted navigation when term strings are required.
 A selection that proves too sparse falls back using the already matched bitset,
 without evaluating patterns again. The fragment kernel retains one occurrence
-block, bounded windows and the output spans. It does not retain a decoded token vector for each
-selected term. Reads and future-block hints use the existing cancellation,
-read-admission and shared source-I/O scheduling paths.
+block, bounded windows and the output spans. It does not retain a decoded token
+vector for each selected term. Reads and future-block hints use the existing
+cancellation, read-admission and shared source-I/O scheduling paths.
 
 Compatible original strings from 256 bytes through 4 KiB now retain analyzed
 source offsets in an inline source descriptor (`AFSI1`). These descriptors and
