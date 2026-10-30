@@ -489,3 +489,13 @@ pipeline retains its eight actual-workerd passes and SQL/KV-forbidden native R2
 integration pass. The four recent evidence closures reverify all 349 artifacts
 with no missing files or changed hashes. The older 163-artifact availability gap
 remains historical and is not relabeled as recovered by this audit.
+
+The hosted investigation is sealed at
+`examples/cloudflare-serverless/dist/qualification/diagnostic-memory-hosted-1793388433394/evidence.json`:
+1,069 verified artifacts / 91,038,670 bytes, source `e4d0be5d7d`, manifest SHA-256
+`8c4dd3573fe315aa598eeaee719bd83247b91c7dbf988d8a3828042f50122444`.
+It retains all four attempts, the explicit collector interruption, selected
+sanitized archives, both passing minute checks, frozen deployed bundles and
+source revisions, test logs and independent cleanup inventory. An earlier seal
+had an incorrect top-level source label due to a script variable being reused;
+it remains preserved as invalid and is explicitly superseded by this seal.
