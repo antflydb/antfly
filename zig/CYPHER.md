@@ -4723,3 +4723,15 @@ exact examined populations; the coordinator checks and sums them within the
 statement anchor limit. Nested evaluator work forwards to the original owner
 meter even on failures. Wire tests verify NULL parameters, zero row-scan RPCs,
 multiple owners, state/anchor exhaustion and complete callback cleanup.
+
+Final qualification of this merged follow-up succeeds in all 147 build steps,
+with all 514 core Cypher tests and the callback ABI gate passing. The selected
+native suites pass 13 transport, five retained-cut/SQL, five local C API, one
+portable embedded and 52 runtime-boundary cases, with zero reported leaks.
+All eight focused debug tests, the complete Go SDK suite and all 37
+source-boundary/test-ownership contracts pass. The rebuilt CLI passes the
+expanded authenticated property-plan/SQL-overlay regression in 34.33 seconds
+and the replicated-owner qualification in 161.72 seconds. The nonunique
+127-key public regression counts 254 matches while visiting exactly 254 anchors.
+The enrichment owner-loss campaign caveat recorded above
+remains open; these gates do not rerun or establish a fix for that campaign.
