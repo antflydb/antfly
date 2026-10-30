@@ -59,20 +59,30 @@ default baseline x86-64 target (no AVX/FMA) is about 15x slower.
 failure). The model kernels are generated for Metal and CUDA but no runtime
 launches them yet; the OpenCL harness is the host-side reference for doing so.
 
-## Production kernel families (`rms_norm.zig`, `argmax.zig`)
+## Production kernel families
 
-Three production families in `metal_kernels.m` and
-`inference_cuda_kernels.cu` come from tables of descriptions, written into
-marker-delimited regions (`tile-codegen:begin/end <family> family`):
+Most hand-written kernels in `metal_kernels.m`, `inference_cuda_kernels.cu`
+and a few `src/ops/cuda/kernels/*.cuh` headers are rendered from Zig
+descriptions into marker-delimited regions
+(`tile-codegen:begin/end <family> family`). `families.zig` lists every
+region, one module per slice under `families/`:
 
-| Family | Metal | CUDA | Source |
-| --- | --- | --- | --- |
-| `rms_norm` | 17 | 8 | `rms_norm.zig` (`kernels`) |
-| `layer_norm` | 9 | 2 | `rms_norm.zig` (`layer_norm_kernels`) |
-| `argmax` | 7 | 7 | `argmax.zig` |
+| Slice | Generators | What they describe |
+| --- | --- | --- |
+| core | `rms_norm.zig`, `argmax.zig` | RMSNorm, LayerNorm, argmax (Metal + CUDA) |
+| `reduce` | `reduce_*.zig` | embedding lookup, RoPE, row reductions, scans, gated norms, samplers |
+| `elementwise` | `elementwise.zig` | GELU backward, broadcast ops and AdamW, LoRA, LightOn gate wrappers |
+| `quant_metal` | `quant_metal_*.zig` | Metal quantized and dense matmul/GEMV, quant get/set/cpy rows |
+| `quant_cuda` | `quant_cuda.zig` | CUDA quantized and dense linear, tensor-core epilogues, Q8_1 quantizers |
+| `attention` | `attention_*.zig` | split-K GQA decode and paired attention variants (Metal + CUDA) |
+| `model` | `model_*.zig` | LightOnOCR-3 batch GEMV, DeBERTa/GLiNER kernels (one MSL source for both backends), small-M dot_general |
 
-Names, buffer slots, params structs and CUDA argument order are unchanged,
-so host dispatch is untouched.
+Kernel names, buffer slots, params structs and CUDA argument order are
+unchanged, so host dispatch is untouched. Each generated kernel is either
+character-identical to the hand-written kernel it replaced
+(`compare_kernel_text.py`) or bit-identical on the CPU harness below; the
+compiled CUDA PTX of every kernel is unchanged. Kernels with no structure to
+share stay hand-written.
 
 `scripts/tile/check_kernels.py` checks a family against the previous
 hand-written kernels on the CPU, with no GPU: it compiles the old and new
@@ -87,10 +97,15 @@ python3 -I scripts/tile/check_kernels.py <metal|cuda> <family> <old file> <new f
 CHECK_FLAGS="-O2 -march=native -ffp-contract=fast" python3 -I scripts/tile/check_kernels.py ...
 ```
 
+Other checks: `compare_kernel_text.py <metal|cuda> <old> <new>` lists
+kernels whose text changed, and `check_source_order.py <metal_kernels.m>
+--baseline <old>` catches a generated region placed above a helper it uses
+(MSL is only compiled on macOS).
+
 To hand another family to the generator: describe it, then run
 `scripts/tile/adopt_kernels.py <family> <kernels...>` (removes the
 hand-written kernels and leaves an empty region), add the region to
-`codegen_main.zig`, `zig build tile-kernel-codegen -- --write`, add a spec,
+its slice module under `families/`, `zig build tile-kernel-codegen -- --write`, add a spec,
 and check against the old file.
 
 ## MSL templates for near-copy kernels
