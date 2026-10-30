@@ -117,6 +117,22 @@ Environment variables are convenient for local development and platform
 workload identity. Avoid process arguments because they may be visible in
 process listings.
 
+## Hosted standalone authentication
+
+Standalone reads `antfly.trusted_principal.secret` and
+`antfly.trusted_principal.issuer` from the configured secret store. The matching
+environment variables are `ANTFLY_TRUSTED_PRINCIPAL_SECRET` and
+`ANTFLY_TRUSTED_PRINCIPAL_ISSUER`. With a verifier configured, public API requests
+require authentication and signed proxy principals retain their table and
+operation restrictions. `enable_auth` independently controls local password
+authentication and its admin bootstrap; a hosted verifier alone needs no
+bootstrap password. The signing key must differ from the internal-service key.
+
+Before upgrading a hosted standalone process, ensure the control plane forwards
+authenticated principals on table and catalog routes and authenticates its own
+management calls. A proxy that strips credentials and forwards unsigned requests
+cannot access the authenticated runtime.
+
 ## Distributed internal-service authentication
 
 Distributed metadata and data processes require a dedicated credential for
