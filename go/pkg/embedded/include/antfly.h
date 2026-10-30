@@ -160,7 +160,8 @@ typedef struct antfly_open_options {
     /* Milliseconds to retry Lite admission while another process holds the
      * writer lease or advances the allocator checkpoint (ANTFLY_BUSY), like
      * sqlite3_busy_timeout. 0 fails immediately. Mutation bodies are never
-     * replayed by this admission retry. */
+     * replayed by this admission retry. A successful proof may admit an
+     * unchanged tip after the timeout if no lease wait is needed. */
     uint64_t busy_timeout_ms;
     uint64_t reserved[6];
     /* Optional model directory for database enrichments; empty uses default. */
