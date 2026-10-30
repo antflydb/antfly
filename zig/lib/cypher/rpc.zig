@@ -215,7 +215,8 @@ pub const Client = struct {
         var bounded = request;
         bounded.read_fields = self.read_fields;
         if (self.work) |work| if (work.remaining) |remaining| {
-            bounded.max_work = remaining(work.ptr);
+            const left = remaining(work.ptr);
+            bounded.max_work = if (request.operation == .count) @min(bounded.max_work, left) else left;
         };
         const reply = if (self.channel.typed) |typed| try typed(self.channel.ptr, a, bounded) else response: {
             const body = try std.json.Stringify.valueAlloc(a, bounded, .{});
@@ -1181,4 +1182,26 @@ test "retained adjacency directory clones owned bounds and rejects invalid exclu
     try std.testing.expect(!owned.adjacency_routes[0].incoming.?.contains("a"));
     try std.testing.expectError(error.CypherInvalidBackendPage, b.validateAdjacencyRoutes(&.{.{ .index = "links", .outgoing = .{ .min = "z", .max = "a" } }}));
     try std.testing.expectError(error.CypherInvalidBackendPage, b.validateAdjacencyRoutes(&.{ .{ .index = "links" }, .{ .index = "links" } }));
+}
+
+test "owner count retains its narrower work ceiling through client metering" {
+    const Fixture = struct {
+        seen: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn wireCall(_: *anyopaque, _: A, _: []const u8) ![]u8 {
+            return error.TestUnexpectedWireCall;
+        }
+        fn call(ptr: *anyopaque, _: A, request: Request) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen = request.max_work;
+            return .{ .count = .{ .count = 0, .examined = 0 } };
+        }
+    };
+    var fixture: Fixture = .{};
+    var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.wireCall, .typed = Fixture.call }, .incarnation = 1, .revision = 1 };
+    var meter: b.Meter = .{ .a = std.testing.allocator, .backend = .{ .ptr = &fixture, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.check, .scan = undefined, .get = undefined, .expand = undefined } }, .limit = 1000 };
+    const backend = client.backend();
+    backend.vtable.set_work.?(backend.ptr, meter.work());
+    _ = try backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", .{ .node = .{ .span = .{}, .alias = "n", .labels = &.{"D"}, .properties = &.{} }, .max_work = 32 });
+    try std.testing.expectEqual(@as(usize, 32), fixture.seen);
 }
