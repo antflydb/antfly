@@ -4783,3 +4783,31 @@ any directory operation starts. The original mutation fences are released
 before auxiliary metadata I/O; immutable snapshots retain their own roots. A
 metadata failure closes every captured snapshot. The same bounded scheduler preserves local
 thread affinity during validation and directory reads.
+
+Final owner-wave qualification on 2026-10-30 also merges `origin/main` through
+`f754d49fc4` in `da2623baab`, with the Go SDK regenerated from the merged
+OpenAPI source. The released-status regression explicitly preserves upstream's
+read/storage additions before the appended Cypher status range.
+
+The frozen implementation passes all 117 steps of the stripped ReleaseFast
+CLI, native retained-cut and private transport build with pinned Zig 0.17.0.
+All five retained-cut/SQL graph tests and 13 transport tests pass with zero
+reported leaks. All 518 core Cypher tests, 57 source-boundary, ownership and
+compilation-contract tests, runtime error/callback ABI gates and the complete
+Go SDK suite also pass. The physical endpoint helper passed all 510 graph
+tests earlier in this follow-up, before the final upstream merge.
+
+The rebuilt CLI passes all four authenticated public regressions in 369.08
+seconds: property plans and SQL overlays, replicated-owner reads/search, and
+both producer-postimage variants. These public tests run with the normal
+runtime allocator environment and exercise the post-validation routing phase
+that initially exposed premature retained-capability access.
+
+Cold native compilation encountered macOS
+`GUARD_EXC_RECLAIM_ACCOUNTING_FAILURE` in LLVM's system allocator. The successful
+build retry uses process-local `MallocLargeCache=0`, which
+[Apple's allocator implementation](https://github.com/apple-oss-distributions/libmalloc/blob/main/src/xzone_malloc/xzone_malloc.c#L7866-L7884)
+supports to disable deferred reclamation. This build-command workaround is not
+part of the product configuration. The previously recorded enrichment
+owner-loss campaign remains outside this qualification and has not been
+established as fixed.
