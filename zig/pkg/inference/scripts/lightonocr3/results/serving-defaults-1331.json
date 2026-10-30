@@ -227,5 +227,37 @@
     "isolation_error_samples": 0,
     "log_sha256": "a982d728d12f40f11c2197a6eb38e9b77d5cc75738611a3f19af4bc819ba4e5b",
     "isolation_sha256": "afe8ff03ffd90ed71963f46f24f4c42e6515d486ce517ec3ab8472ac4c8b0881"
-  }
+  },
+  "post_main_validation": {
+    "runtime_commit": "b3b045d98ff68e2510c300be05859caef7faf548",
+    "merged_main": "c2896f43244e2e46d1cd1e294d93fde8604989f4",
+    "source_manifest_sha256": "142ce0cfc34d8938db09a3112a9b5f0483476a8b807793293abb9aed6887a7d0",
+    "selected": 402,
+    "passed": 381,
+    "skipped": 21,
+    "test_log_sha256": "e83ba4b13ff89342d605b295459fef1f77988307d61f1561ff23a1c0fd7e4fc0",
+    "real_model_smoke": {
+      "status": "blocked_by_shared_host_memory_pressure",
+      "error": "ResourceTemporarilyUnavailable",
+      "available_host_bytes": [
+        2607374336,
+        1692106752
+      ],
+      "requested_host_bytes_08": 1706030528,
+      "requested_host_bytes_4b": 9078620536,
+      "placement_not_reached": true,
+      "live_memory_guard_disabled": false,
+      "interpretation": "Both loads were safely rejected before model placement. This does not supersede the earlier passing real-model results; the post-main real-model rerun still needs a free host."
+    },
+    "build_options": [
+      "Zig 0.17.0",
+      "ReleaseFast",
+      "cuda=true",
+      "cuda-artifacts=fatbin",
+      "cuda-libs=auto"
+    ],
+    "binary_sha256": null,
+    "binary_hash_status": "Not retrieved: the shared host subsequently timed out over SSH. The source manifest and passing test-log fingerprints were saved before that timeout."
+  },
+  "recorded_at_utc": "2026-10-30T22:29:30.187872+00:00"
 }

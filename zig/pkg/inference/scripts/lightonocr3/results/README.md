@@ -2,9 +2,12 @@
 
 The [serving-default qualification](serving-defaults-1331.json) records the
 GPU-first recurrent dispatch and memory-admission checks added for Grepstein:
-352 CUDA tests passed with 21 skips, the matched host-recurrence rollback checks
-passed, and both pinned reader checkpoints passed five private page-tail checks
-at a 2048-token allowance. Raw DOJ content remains private. This sample does
+381 post-main CUDA-suite tests passed with 21 skips. The earlier matched
+host-recurrence rollback checks passed, and both pinned reader checkpoints
+passed five private page-tail checks at a 2048-token allowance. The final
+real-model rerun was rejected before placement because the shared host had
+insufficient free memory; its retry remains pending. Raw DOJ content remains
+private. This sample does
 not qualify full-corpus accuracy, A100 capacity, or the hosted activation path.
 The [release qualification guide](../../../../../../docs/design/inference/grepstein-release-qualification.md)
 describes the separate deployment and enrichment gates. Hardware performance
