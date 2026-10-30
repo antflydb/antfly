@@ -106,3 +106,30 @@ test('UTC windows read each physical minute once and preserve single-millisecond
  assert.deepEqual(partitionCanonicalTimeframe({from:59999,to:60000}),[{from:59999,to:59999},{from:60000,to:60000}]);
  assert.throws(()=>partitionCanonicalTimeframe(time,'unknown'),/ScopeInvalid/);
 });
+
+test('window inventory pins every page ETag and rejects cross-minute or oversized bodies',async()=>{
+ const env=fixture();await seed(env);const request=(mode,value)=>reader.fetch(new Request('https://reader.invalid/source/'+source+'/'+mode,{method:'POST',headers:{Authorization:'Bearer '+env.API_TOKEN},body:JSON.stringify(value)}),env);
+ const inventory=await(await request('window-inventory',{minute:0})).json();assert.ok(inventory.objects.length>0);assert.ok(inventory.objects.every(o=>o.etag&&o.key.startsWith(windowPrefix(captureId,0))));
+ const response=await request('window-objects',{minute:0,objects:inventory.objects});assert.equal(response.status,200);assert.equal((await response.json()).objects.length,inventory.objects.length);
+ const item=inventory.objects[0];await env.LOGS.put(item.key,JSON.stringify({changed:true}));
+ const changed=await request('window-objects',{minute:0,objects:[item]});assert.equal(changed.status,503);await changed.body.cancel();
+ for(const value of[{minute:60000,objects:[item]},{minute:0,objects:Array(33).fill(item)},{minute:0,objects:[{...item,size:4*1024*1024+1}]},{minute:0,objects:[{...item,etag:''}]}]){const r=await request('window-objects',value);assert.equal(r.status,503);await r.body.cancel();}
+});
+
+test('pipelined window capture retains the original page cap and independently re-reads all objects',async()=>{
+ const env=fixture();await seed(env);
+ for(let i=0;i<97;i++)await env.LOGS.put(windowPrefix(captureId,0)+'batches/extra-'+String(i).padStart(3,'0')+'.json',JSON.stringify({schema:2,rows:[]}));
+ const original=globalThis.fetch;
+ // captures installs its own fetch adapter; instrument the backing binding to
+ // prove all immutable bodies are re-read in each independent observation.
+ const get=env.LOGS.get.bind(env.LOGS);let reads=0;env.LOGS.get=async(...args)=>{reads++;return get(...args);};
+ await captures(env,async(a,b)=>{assert.equal(a.windows.length,1);assert.equal(b.windows.length,1);assert.ok(reads>=2*97);const one=JSON.parse(await readFile(a.windows[0].path));assert.equal(one.objects.length,JSON.parse(await readFile(b.windows[0].path)).objects.length);assert.ok(one.pages>=6);});
+ assert.equal(globalThis.fetch,original);
+});
+
+test('a resource failure in a pipelined proof page remains visible and all other started reads settle',async()=>{
+ const env=fixture();await seed(env);for(let i=0;i<100;i++)await env.LOGS.put(windowPrefix(captureId,0)+'batches/extra-'+String(i).padStart(3,'0')+'.json',JSON.stringify({rows:[]}));
+ const get=env.LOGS.get.bind(env.LOGS);let active=0,failed=false;
+ env.LOGS.get=async(key,...args)=>{active++;try{await new Promise(ok=>setTimeout(ok,1));if(!failed&&key.endsWith('extra-035.json')){failed=true;throw Error('SQLITE_NOMEM');}return await get(key,...args);}finally{active--;}};
+ await assert.rejects(captures(env,async()=>{}),/ObserverResourceFailure:SQLITE_NOMEM/);assert.equal(active,0);const{diagnosticReadResponses}=await import('../qualification/diagnostic-memory.mjs');assert.equal(diagnosticReadResponses.report().active,0);assert.equal(diagnosticReadResponses.report().pending,0);
+});

@@ -51,3 +51,16 @@ test('workerd Tail publication overlaps bounded writes across 32 originating cal
   const bucket=await mf.getR2Bucket('LOGS'),page=await bucket.list({prefix:'probe-v1/',limit:1000});assert.equal(page.objects.filter(o=>o.key.includes('/counter/')).length,256);
  }finally{await mf.dispose();}
 });
+
+test('workerd pipelined immutable proof pages retain one delivery lane across originating requests',{timeout:30000},async()=>{
+ const pair='antfly-1278-g-readpipe-1',scopes=['b','c'].flatMap(side=>['','-writer','-reader','-builder'].map(role=>({source:pair+'-'+side+role,capture_id:crypto.randomUUID()}))).map((s,i)=>({...s,binding:'PRODUCER_'+i})),token='local-read-pipe-only';
+ const code="import reader from'./qualification/paired-evidence-reader.mjs';import{diagnosticReadResponses}from'./qualification/diagnostic-memory.mjs';export default{fetch(request,env){if(new URL(request.url).pathname==='/metrics')return Response.json(diagnosticReadResponses.report());return reader.fetch(request,env);}};",bundle=await build({stdin:{contents:code,resolveDir:process.cwd()},bundle:true,write:false,format:'esm',platform:'neutral'}),mf=new Miniflare(convertV4MiniflareOptions({name:'read-pipe',modules:[{type:'ESModule',path:resolve('read-pipe.mjs'),contents:bundle.outputFiles[0].text}],compatibilityDate:'2026-10-23',bindings:{API_TOKEN:token,SOURCE_SCOPES:JSON.stringify(scopes),WINDOWED_EVIDENCE:'true'},r2Buckets:{LOGS:'read-pipe-proof'}}));
+ try{
+  const{windowPrefix}=await import('../qualification/canonical-windows.mjs'),scope=scopes[0],bucket=await mf.getR2Bucket('LOGS');
+  for(let i=0;i<128;i++)await bucket.put(windowPrefix(scope.capture_id,0)+'batches/'+String(i).padStart(3,'0')+'.json',JSON.stringify({schema:2,rows:[],fixture:i}));
+  const post=(mode,body)=>mf.dispatchFetch('https://fixture.invalid/source/'+scope.source+'/'+mode,{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(body)}),inventory=await(await post('window-inventory',{minute:0})).json();assert.equal(inventory.objects.length,128);
+  const calls=Array.from({length:4},async(_,i)=>{const items=inventory.objects.slice(i*32,(i+1)*32),response=await post('window-objects',{minute:0,objects:items});assert.equal(response.status,200);const page=await response.json();assert.deepEqual(page.objects.map(o=>o.key),items.map(o=>o.key));return page.objects;});
+  assert.equal((await Promise.all(calls)).flat().length,128);
+  const metrics=await(await mf.dispatchFetch('https://fixture.invalid/metrics')).json();assert.equal(metrics.peak_active,1);assert.equal(metrics.active,0);assert.equal(metrics.pending,0);
+ }finally{await mf.dispose();}
+});

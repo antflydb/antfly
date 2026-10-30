@@ -1239,3 +1239,21 @@ test('packed WAL ranges remain bounded after a 512-document publication and sixt
  for(let i=0;i<16;i++)await host.request(request('mutate',{...flags,operation_id:'update/'+i,mutations:[{kind:'upsert',doc_id:'doc/0',body:JSON.stringify({text:'new '+i})}]}));
  for(let i=0;i<8;i++)assert.equal((await reader.request(request('lookup',{...flags,doc_id:'doc/0',native_read_plan_mode:true,native_read_plan:first.__read_plan,working_set_bytes:128*1024}))).body,'{"text":"new 15"}');
 });
+
+test('fresh WAL point updates and deletes defer base facts I/O, including resumed immutable plans',async()=>{
+ const bucket=new Bucket(),get=bucket.get.bind(bucket);let forbid=false,denied=0;
+ bucket.get=async(key,...args)=>{const bytes=bucket.objects.get(key)?.body;if(forbid&&bytes&&new TextDecoder().decode(bytes.subarray(0,7))==='AFDFACT'){denied++;throw Error('UnexpectedObsoleteFactsRead');}return get(key,...args);};
+ const{host}=await setup(bucket),native=(op,args={})=>request(op,args),body=text=>JSON.stringify({text});
+ await host.request(native('mutate',{operation_id:'lazy-base',mutations:['updated','deleted','stable'].map(doc_id=>({kind:'upsert',doc_id,body:body(doc_id)}))}));await host.request(native('publish'));
+ const reader=(await setup(bucket)).host,plan=(await reader.request(native('lookup',{doc_id:'updated',native_read_plan_mode:true}))).__read_plan;assert.ok(plan);
+ const token=Array(16).fill(23),prepared=await reader.request(native('lookup',{doc_id:'updated',native_read_plan_mode:true,native_read_plan:plan,native_read_prepare:token}));assert.equal(prepared.__read_prepared,true);
+ const changed=await host.request(native('mutate',{operation_id:'lazy-overlay',mutations:[{kind:'upsert',doc_id:'updated',body:body('fresh')},{kind:'delete',doc_id:'deleted'}]}));
+ forbid=true;
+ const cold=(await setup(bucket)).host;
+ assert.equal((await cold.request(native('lookup',{doc_id:'updated',required_visibility:changed.visibility}))).body,body('fresh'));
+ assert.equal((await cold.request(native('lookup',{doc_id:'deleted',required_visibility:changed.visibility}))).body,null);
+ assert.equal((await reader.request(native('lookup',{doc_id:'updated',required_visibility:changed.visibility,native_read_plan_mode:true,native_read_resume:token}))).body,body('fresh'));
+ assert.equal(denied,0,'an overlay hit must not open the obsolete immutable base');
+ await assert.rejects(cold.request(native('lookup',{doc_id:'stable',required_visibility:changed.visibility})));assert.ok(denied>0,'a base miss must still authenticate its published facts');
+ forbid=false;assert.equal((await(await setup(bucket)).host.request(native('lookup',{doc_id:'stable',required_visibility:changed.visibility}))).body,body('stable'));
+});

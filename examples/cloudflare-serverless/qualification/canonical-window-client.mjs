@@ -32,7 +32,8 @@ export async function collectCanonicalWindows(observer,scope,{witnesses},call) {
  if(!observer.dir||!witnesses?.before||!witnesses?.after)throw Error('ObserverWindowScopeInvalid');
  const base='/source/'+scope.source,version=observer.reader_version;
  const scoped=p=>{if(p.qualification!==false||p.capture_id!==scope.capture_id||p.collector_version!==version||p.evidence_layout!==canonicalLayout)throw Error('ObserverSnapshotScopeInvalid');return p;};
- const started=Date.now();scoped(await call(observer,base+'/layout'));
+ const started=Date.now(),layout=scoped(await call(observer,base+'/layout'));
+ const inventory=layout.capabilities?.window_inventory===true;
  const boundary=[];
  for(const hash of[witnesses.before,witnesses.after]){
   const p=scoped(await call(observer,base+'/witnesses',{hash})),body=await call(observer,base+'/objects',{objects:[p.object]});
@@ -49,7 +50,25 @@ export async function collectCanonicalWindows(observer,scope,{witnesses},call) {
   const start=Date.now(),objects=new Map();let bytes=0,pages=0;
   const add=o=>{if(objects.has(o.key)){if(JSON.stringify(objects.get(o.key))!==JSON.stringify(o))throw Error('ObserverObjectChanged');return;}bytes+=Buffer.byteLength(JSON.stringify(o));if(objects.size>=20000||bytes>64*1024*1024)throw Error('ObserverSnapshotBudgetExceeded');objects.set(o.key,o);};
   const drain=async(mode,input,prefix)=>{let cursor=null;const cursors=new Set();do{if(++pages>2000||Date.now()-start>120000)throw Error('ObserverSnapshotBudgetExceeded');const p=scoped(await call(observer,base+'/'+mode,{...input,...(cursor?{cursor}:{})}));if(!Array.isArray(p.objects)||p.objects.length>32)throw Error('ObserverSnapshotScopeInvalid');for(const o of p.objects){if(typeof o.key!=='string'||!o.key.startsWith(prefix)||objects.has(o.key))throw Error('ObserverSnapshotObjectInvalid');add(o);}cursor=p.cursor;if(cursor!==null){if(typeof cursor!=='string'||!cursor||cursors.has(cursor))throw Error('ObserverCursorInvalid');cursors.add(cursor);}}while(cursor!==null);};
-  for(let minute=minuteOf(from);minute<=minuteOf(to);minute+=60000)await drain('window',{minute},windowPrefix(scope.capture_id,minute));
+  const fetchWindow=async minute=>{
+   const prefix=windowPrefix(scope.capture_id,minute),items=[],seen=new Set(),cursors=new Set();let cursor=null,rawBytes=0;
+   const budget=()=>{if(pages>2000||Date.now()-start>120000)throw Error('ObserverSnapshotBudgetExceeded');observer.capture_signal?.throwIfAborted();};
+   do{
+    budget();const page=scoped(await call(observer,base+'/window-inventory',{minute,...cursor?{cursor}:{}}));pages++;
+    if(!Array.isArray(page.objects)||page.objects.length>1000)throw Error('ObserverSnapshotScopeInvalid');
+    for(const item of page.objects){if(typeof item?.key!=='string'||!item.key.startsWith(prefix)||seen.has(item.key)||items.length&&items.at(-1).key>=item.key||!Number.isSafeInteger(item.size)||item.size<0||item.size>4*1024*1024||typeof item.etag!=='string'||!item.etag||item.etag.length>256)throw Error('ObserverSnapshotObjectInvalid');seen.add(item.key);rawBytes+=item.size;if(items.length>=20000||rawBytes>64*1024*1024)throw Error('ObserverSnapshotBudgetExceeded');items.push(item);}
+    if(page.inline_objects!=null){if(cursor!==null||page.cursor!==null||!Array.isArray(page.inline_objects)||page.inline_objects.length>32||page.inline_objects.length!==items.length||page.inline_objects.some((o,i)=>o?.key!==items[i].key))throw Error('ObserverSnapshotScopeInvalid');for(const object of page.inline_objects)add(object);budget();return;}
+    cursor=page.cursor;if(cursor!==null){if(typeof cursor!=='string'||!cursor||cursors.has(cursor))throw Error('ObserverCursorInvalid');cursors.add(cursor);}
+   }while(cursor!==null);
+   const groups=[];let group=[],size=0;
+   for(const item of items){if(group.length===32||size+item.size>4*1024*1024||Buffer.byteLength(JSON.stringify({minute,objects:[...group,item]}))>8192){if(!group.length)throw Error('ObserverPageBudgetExceeded');groups.push(group);group=[];size=0;}if(Buffer.byteLength(JSON.stringify({minute,objects:[item]}))>8192)throw Error('ObserverPageBudgetExceeded');group.push(item);size+=item.size;}if(group.length)groups.push(group);
+   let next=0,failure;
+   // The reader retains one original-size page through delivery; the four
+   // request-owned callers hide network round trips, not decoded-page limits.
+   await Promise.all(Array.from({length:Math.min(4,groups.length)},async()=>{while(next<groups.length&&!failure){const selected=groups[next++];try{budget();pages++;const page=scoped(await call(observer,base+'/window-objects',{minute,objects:selected}));if(!Array.isArray(page.objects)||page.objects.length!==selected.length||page.objects.some((o,i)=>o?.key!==selected[i].key))throw Error('ObserverSnapshotScopeInvalid');for(const object of page.objects)add(object);}catch(error){failure??=error;}}}));
+   if(failure)throw failure;budget();
+  };
+  for(let minute=minuteOf(from);minute<=minuteOf(to);minute+=60000){if(inventory)await fetchWindow(minute);else await drain('window',{minute},windowPrefix(scope.capture_id,minute));}
   await drain('rejections',{},proofPrefix(scope.capture_id)+'rejections/');
   for(const b of boundary)add(b.object);
   const snapshot={qualification:false,evidence_layout:canonicalLayout,capture_id:scope.capture_id,collector_version:version,timeframe:{from,to},snapshot_started_at:start,snapshot_finished_at:Date.now(),pages,bytes,objects:[...objects.values()].sort((a,b)=>a.key.localeCompare(b.key))};

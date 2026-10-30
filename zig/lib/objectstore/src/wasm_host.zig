@@ -288,6 +288,7 @@ pub const Host = struct {
         .put_objects = putMany,
         .get_object = get,
         .get_objects = getMany,
+        .preferred_read_window = 4,
         .stat_object = stat,
         .stat_object_with_options = statWithOptions,
         .get_object_attributes = attributes,

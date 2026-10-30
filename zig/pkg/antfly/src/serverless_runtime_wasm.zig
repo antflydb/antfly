@@ -570,6 +570,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             .cancellation = cancellation,
             .version = if (cursor) |value| value.cursor.generation else null,
             .max_read_bytes = read_allowance,
+            .lazy_facts = req.op == .lookup,
             .view = .{ .required = required, .cutoff = if (cursor) |value| value.cursor.cutoff else null, .cancellation = transport_cancellation, .state_cache = if (req.native_read_state) &read_states else null, .cache_allocator = wasm_allocator, .point_id = if (req.op == .lookup and req.wal_document_index) req.doc_id else null },
         });
         defer live.deinit();

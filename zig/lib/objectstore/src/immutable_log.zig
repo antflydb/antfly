@@ -477,6 +477,11 @@ pub const Log = struct {
         epoch: [16]u8 = @splat(0),
         first: u64 = 0,
 
+        fn deinit(self: *ObservationBatch) void {
+            const a = self.arena.allocator();
+            for (self.results) |*result| if (result.*) |*value| value.deinit(a);
+            self.arena.deinit();
+        }
         fn clear(self: *ObservationBatch) void {
             const a = self.arena.allocator();
             for (self.results) |*result| if (result.*) |*value| value.deinit(a);
@@ -486,7 +491,8 @@ pub const Log = struct {
         fn load(self: *ObservationBatch, log: Log, state: State, remaining: usize) !void {
             self.clear();
             const a = self.arena.allocator();
-            const count = @min(@as(usize, 8), remaining, @as(usize, @intCast(epoch_commits - state.next)));
+            const width = std.math.clamp(@as(usize, log.client.vtable.preferred_read_window), 1, 8);
+            const count = @min(width, remaining, @as(usize, @intCast(epoch_commits - state.next)));
             var requests: [8]types.GetObjectRequest = undefined;
             for (requests[0..count], 0..) |*request, offset| request.* = .{
                 .key = try log.key(a, state.epoch, state.next + offset),
@@ -515,10 +521,7 @@ pub const Log = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var batch = ObservationBatch{ .arena = std.heap.ArenaAllocator.init(result_alloc) };
-        defer {
-            batch.clear();
-            batch.arena.deinit();
-        }
+        defer batch.deinit();
         var consecutive: usize = 0;
         var root_buffer: [max_root_bytes]u8 = undefined;
         var state = source;
@@ -608,10 +611,47 @@ pub const Log = struct {
     }
     /// At most one successful checkpoint overwrite per second. A forced
     /// checkpoint reports false until its rate window opens; callers retry.
+    /// A recovery hint may reuse a bounded certificate for accepted bytes, but
+    /// must still freshly check the GC floor and ownership seal. It does not
+    /// renew the certificate, observe a serving cut, or replace the strict GC
+    /// barrier below. All speculative responses settle before publication.
+    pub fn writeCheckpointHintCertified(self: Log, a: A, state: State, authority: ProofAuthority, proof: WriteProof) !bool {
+        try authority.check(self, state, proof);
+        if (!std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
+        const checkpoint_key = try std.fmt.allocPrint(a, "{s}/CHECKPOINT", .{self.prefix});
+        defer a.free(checkpoint_key);
+        const seal_key = try self.key(a, state.epoch, null);
+        defer a.free(seal_key);
+        var client = self.client;
+        client.allocator = a;
+        const results = try client.getObjects(self.bucket, &.{
+            .{ .key = checkpoint_key, .options = .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = self.cancellation } },
+            .{ .key = seal_key, .options = .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = self.cancellation } },
+        });
+        defer {
+            for (results) |*result| if (result.*) |*value| value.deinit(a);
+            a.free(results);
+        }
+        try authority.check(self, state, proof);
+        if (results[1] != null) return error.ImmutableLogFenced;
+        const previous = results[0] orelse return error.ImmutableLogCheckpointMissing;
+        const floor = try std.json.parseFromSlice(Checkpoint, a, previous.body, .{});
+        defer floor.deinit();
+        if (floor.value.format != 1) return error.InvalidImmutableLog;
+        try validate(floor.value.state);
+        if (floor.value.state.revision > state.revision) return error.ImmutableLogFenced;
+        if (floor.value.state.revision == state.revision and !same(floor.value.state, state)) return error.InvalidImmutableLog;
+        const done = try self.writeCheckpointAt(a, state, true, previous);
+        try authority.check(self, state, proof);
+        return done;
+    }
     pub fn writeCheckpoint(self: Log, a: A, state: State, force: bool) !bool {
         try self.unfenced(a, state);
         const k = try std.fmt.allocPrint(a, "{s}/CHECKPOINT", .{self.prefix});
-        const previous = try self.read(a, k);
+        return self.writeCheckpointAt(a, state, force, try self.read(a, k));
+    }
+    fn writeCheckpointAt(self: Log, a: A, state: State, force: bool, previous: ?types.GetResult) !bool {
+        const k = try std.fmt.allocPrint(a, "{s}/CHECKPOINT", .{self.prefix});
         const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
         if (previous) |value| {
             const old = (try std.json.parseFromSlice(Checkpoint, a, value.body, .{})).value;
@@ -1279,5 +1319,119 @@ test "immutable log batched scratch and decoded results release every allocation
             try std.testing.expectEqualStrings("accepted", value.recovery.state.root);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Fixture.observe, .{ log, auth, initial, proof, &backend });
+    // Arena retention may resize large allocations in place depending on VM
+    // adjacency. Force explicit allocation so the injected failure schedule is
+    // deterministic and covers every growth path, including scratch resets.
+    const Stable = struct {
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const underlying: *const A = @ptrCast(@alignCast(raw));
+            return underlying.rawAlloc(len, alignment, ret);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const underlying: *const A = @ptrCast(@alignCast(raw));
+            underlying.rawFree(bytes, alignment, ret);
+        }
+    };
+    var underlying = a;
+    const stable = A{ .ptr = &underlying, .vtable = &.{ .alloc = Stable.alloc, .resize = Stable.resize, .remap = Stable.remap, .free = Stable.free } };
+    try std.testing.checkAllAllocationFailures(stable, Fixture.observe, .{ log, auth, initial, proof, &backend });
+}
+
+test "immutable log transport-sized catchup bounds short cold speculation without changing accepted roots" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory, .read_batch_delay_ms = 1 };
+    var table: Client.VTable = undefined;
+    var metrics = ObservationMetrics{};
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "window", .owner = @splat(1), .io = std.testing.io, .read_batch = true, .observation_metrics = &metrics };
+    table.preferred_read_window = 4;
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    var accepted = CertifiedRecovery{ .recovery = .{ .state = initial }, .proof = try auth.issue(log, initial, auth.now()) };
+    for (0..32) |i| {
+        accepted = try log.appendCertified(m, accepted.recovery.state, "accepted", auth, accepted.proof);
+        if (i != 1 and i != 6 and i != 31) continue;
+        metrics = .{};
+        const observed = try log.observeFromCheckpointCertified(m, auth);
+        try std.testing.expectEqual(accepted.recovery.state.revision, observed.recovery.state.revision);
+        try std.testing.expect(!observed.recovery.has_more);
+        try std.testing.expectEqual(@as(usize, 4), backend.maximum_batch);
+        if (i == 1) try std.testing.expectEqual(@as(u32, 4), metrics.prefetched_slots);
+        if (i == 6) try std.testing.expectEqual(@as(u32, 8), metrics.prefetched_slots);
+        if (i == 31) try std.testing.expectEqual(@as(u32, 32), metrics.prefetched_slots);
+    }
+}
+
+test "immutable log certified checkpoint hints retain floor seal clocks and strict barrier validation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory, .read_batch_delay_ms = 1 };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "hint", .owner = @splat(1), .io = std.testing.io };
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    const accepted = try log.appendCertified(m, initial, "accepted", auth, try auth.issue(log, initial, auth.now()));
+    var cp = (try log.checkpoint(m)).?;
+    cp.written_ms = 0;
+    var receipt = try base.putObject("db", "hint/CHECKPOINT", try std.json.Stringify.valueAlloc(m, cp, .{}), .{});
+    receipt.deinit(a);
+    backend.scalar_reads = 0;
+    backend.batch_reads = 0;
+    try std.testing.expect(try log.writeCheckpointHintCertified(m, accepted.recovery.state, auth, accepted.proof));
+    try std.testing.expectEqual(@as(usize, 1), backend.batch_reads);
+    try std.testing.expectEqual(@as(usize, 1), backend.scalar_reads); // required-floor marker only
+    try std.testing.expectEqual(accepted.recovery.state.revision, (try log.checkpoint(m)).?.state.revision);
+    var forged = accepted.recovery.state;
+    forged.root = "forged";
+    memory.resetOperationCount();
+    try std.testing.expectError(error.InvalidImmutableLogProof, log.writeCheckpointHintCertified(m, forged, auth, accepted.proof));
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+    // A still-valid old proof never bypasses a newly published ownership seal.
+    var winner = log;
+    winner.owner = @splat(2);
+    _ = try winner.recover(m, accepted.recovery.state, true);
+    try std.testing.expectError(error.ImmutableLogFenced, log.writeCheckpointHintCertified(m, accepted.recovery.state, auth, accepted.proof));
+    try std.testing.expectError(error.ImmutableLogFenced, log.writeCheckpoint(m, accepted.recovery.state, true));
+    backend.time.mono_ms += 30000;
+    backend.time.wall_ms += 30000;
+    memory.resetOperationCount();
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.writeCheckpointHintCertified(m, accepted.recovery.state, auth, accepted.proof));
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+}
+
+test "immutable log checkpoint hint cannot publish after its original proof deadline during IO" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory, .read_batch_delay_ms = 30000 };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "hint-expired", .owner = @splat(1), .io = std.testing.io };
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    const accepted = try log.appendCertified(m, initial, "accepted", auth, try auth.issue(log, initial, auth.now()));
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.writeCheckpointHintCertified(m, accepted.recovery.state, auth, accepted.proof));
+    try std.testing.expectEqual(initial.revision, (try log.checkpoint(m)).?.state.revision);
 }

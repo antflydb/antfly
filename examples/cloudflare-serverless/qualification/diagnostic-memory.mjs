@@ -76,3 +76,34 @@ export function reserveTailInput(value,{limitBytes=16*1024*1024}={}){
  return()=>{if(held){held=false;tailInputBytes-=bytes;}};
 }
 export const tailInputMetrics=()=>({reserved_bytes:tailInputBytes,peak_reserved_bytes:tailInputPeak,limit_bytes:16*1024*1024});
+
+// One decoded proof page may be retained through HTTP delivery. Client-side
+// pipelining can hide round trips without multiplying the existing 4 MiB /
+// 32-object page working set. The lane belongs to the originating request and
+// is released only after its body is consumed or cancellation has settled.
+export class DiagnosticResponseAdmission {
+ constructor(options={}){this.lane=new DiagnosticAdmission(options);}
+ report(){return this.lane.report();}
+ run(work,{signal}={}){
+  let deliver,reject;
+  const response=new Promise((ok,bad)=>{deliver=ok;reject=bad;});
+  this.lane.run(async()=>{
+   const value=await work();
+   if(!value.ok||!value.body){deliver(value);return;}
+   const reader=value.body.getReader();let finish,ended=false;
+   const done=new Promise(ok=>finish=ok);
+   const end=()=>{if(ended)return;ended=true;signal?.removeEventListener('abort',abort);finish();};
+   const abort=()=>{reader.cancel().catch(()=>{}).finally(end);};
+   const body=new ReadableStream({
+    async pull(controller){try{const part=await reader.read();if(part.done){controller.close();end();}else controller.enqueue(part.value);}catch(error){controller.error(error);end();}},
+    async cancel(reason){try{await reader.cancel(reason);}finally{end();}},
+   },{highWaterMark:0});
+   signal?.addEventListener('abort',abort,{once:true});
+   if(signal?.aborted){await reader.cancel();end();throw Error('TelemetryDiagnosticCanceled');}
+   deliver(new Response(body,{status:value.status,statusText:value.statusText,headers:value.headers}));
+   await done;
+  },{signal}).catch(reject);
+  return response;
+ }
+}
+export const diagnosticReadResponses=new DiagnosticResponseAdmission({pollMs:1});

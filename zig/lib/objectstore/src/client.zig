@@ -55,6 +55,10 @@ pub const Client = struct {
         get_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!void = null,
         get_file_with_options: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.GetOptions) anyerror!void = null,
         get_prefix: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!usize = null,
+        /// Preferred speculative read window, bounded by the caller's own cap.
+        /// Match the transport's useful parallelism rather than issuing extra
+        /// waves of misses on short tails. Exact requested batches are unchanged.
+        preferred_read_window: u8 = 8,
         get_objects: ?*const fn (*anyopaque, Allocator, []const u8, []const types.GetObjectRequest) anyerror![]?types.GetResult = null,
         get_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, types.GetOptions) anyerror!types.GetResult,
         get_object_attributes: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectAttributes,

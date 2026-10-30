@@ -103,3 +103,19 @@ test('a failed parallel Tail write retains its byte permit until all remaining p
  bucket.put=async(...args)=>{if(++calls===1)throw Error('SQLITE_NOMEM [test-only injected write failure]');entered.release();await hold.promise;return put(...args);};
  const result=persistObserverTail(scopes.slice(0,4).map(s=>({scriptName:s.source,eventTimestamp:1500,outcome:'ok',cpuTime:1,wallTime:1})),{SOURCE_SCOPES:JSON.stringify(scopes),LOGS:bucket});await entered.promise;assert.equal(diagnosticWrites.active,1);assert.ok(diagnosticWrites.bytes>0);hold.release();await assert.rejects(result,/SQLITE_NOMEM/);assert.equal(diagnosticWrites.active,0);assert.equal(diagnosticWrites.bytes,0);
 });
+
+test('proof page admission stays held through body delivery and cancellation',async()=>{
+ const{DiagnosticResponseAdmission}=await import('../qualification/diagnostic-memory.mjs'),lane=new DiagnosticResponseAdmission({pollMs:1});let calls=0;
+ const first=await lane.run(async()=>{calls++;return Response.json({first:true});});
+ const second=lane.run(async()=>{calls++;return Response.json({second:true});});
+ await new Promise(ok=>setTimeout(ok,5));assert.equal(calls,1);assert.equal(lane.report().active,1);
+ await first.body.cancel();const next=await second;assert.deepEqual(await next.json(),{second:true});
+ await new Promise(ok=>setTimeout(ok,0));assert.equal(lane.report().active,0);assert.equal(lane.report().peak_active,1);
+});
+test('proof page admission retains failures and releases aborted request ownership',async()=>{
+ const{DiagnosticResponseAdmission}=await import('../qualification/diagnostic-memory.mjs'),lane=new DiagnosticResponseAdmission({pollMs:1}),abort=new AbortController();
+ const response=await lane.run(()=>Response.json({held:true}),{signal:abort.signal});
+ abort.abort();await new Promise(ok=>setTimeout(ok,2));assert.equal(lane.report().active,0);await response.body.cancel();
+ await assert.rejects(lane.run(()=>{throw Error('SQLITE_NOMEM');}),/SQLITE_NOMEM/);
+ assert.deepEqual(await(await lane.run(()=>Response.json({recovered:true}))).json(),{recovered:true});
+});

@@ -82,8 +82,12 @@ export class R2CoordinatorStore {
   async checkpointHint({deadlineMs=Infinity}={}) {
     if(this.rootBackend==="conditional"||!this.acquired||this.recovering||this.ioDrain||!this.state)return{busy:true};
     const state=structuredClone(this.state),physical={};
+    // Capture the proof and its state together before yielding. Expired proofs
+    // retain the existing strict recovery path; hints never renew authority.
+    const certified=this.checkpointHintSupported===true&&this.rootBackend==="bounded_journal"&&!this.needsWriteRefresh();
+    const authority=certified?structuredClone(this.rootOptions()):{};
     const transport=this.cache.wrap(instrumentTransport(this.rawTransport,physical),`coordinator/${this.namespace}`);
-    const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{action:"checkpoint",owner:this.owner,state,checkpoint_commits:this.checkpointCommits}},{transport,fairKey:this.namespace,priority:"maintenance",deadlineMs:Math.min(this.clock()+10000,deadlineMs),maxOperations:32,maxTransferBytes:1024*1024,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.checkpoint_hint",...sample,physical_r2:physical});}catch{}}});
+    const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{...authority,action:certified?"checkpoint_hint":"checkpoint",owner:this.owner,state,checkpoint_commits:this.checkpointCommits}},{transport,fairKey:this.namespace,priority:"maintenance",deadlineMs:Math.min(this.clock()+10000,deadlineMs),maxOperations:32,maxTransferBytes:1024*1024,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.checkpoint_hint",...sample,physical_r2:physical});}catch{}}});
     return{done:result.checkpointed,revision:state.revision};
   }
   async native(coordinate) {
@@ -135,6 +139,7 @@ export class R2CoordinatorStore {
     try {
       if ((this.usedOperations ?? 0) >= 1024 || (this.usedBytes ?? 0) >= 32*1024*1024) throw new Error("CoordinatorIoBudgetExceeded");
       const result=await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {...this.rootOptions(),checkpoint_commits:this.checkpointCommits,owner: this.owner, state: cursor, inline_read_set:this.inlineReadSet, ...coordinate}}, {transport,drainTransport:()=>cleanup(),background:this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+      if(result.checkpoint_hint_supported===true)this.checkpointHintSupported=true;
       if(this.rootBackend==="conditional"&&Object.hasOwn(result,"root_cursor"))this.rootCursor=result.root_cursor;
       if(this.rootBackend==="bounded_journal"&&Object.hasOwn(result,"journal_proof"))this.journalProof=result.journal_proof;
       return result;

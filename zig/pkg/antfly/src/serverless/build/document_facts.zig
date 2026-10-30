@@ -973,11 +973,17 @@ pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: 
     return alloc.realloc(bytes, body_len);
 }
 
-pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef) !Root {
+/// Validate immutable identity and format without fetching the root body.
+/// An overlay-only lookup may skip base I/O, never its declared source checks.
+pub fn validateRootSource(source: refs.ArtifactRef) !artifacts.UploadScope {
     if (source.kind != .document_facts or !((source.metadata_version == Root.packed_metadata_version and source.byte_len >= Root.packed_header_bytes and source.byte_len <= Root.max_encoded_bytes) or ((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or (source.metadata_version == 10 or source.metadata_version == 11 or source.metadata_version == Root.metadata_version)) and source.byte_len == Root.encoded_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
-    const scope = (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
+    return (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
+}
+
+pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef) !Root {
+    const scope = try validateRootSource(source);
     const bytes = if (pages.read_cache) |cache|
         try cache.read(cache.ptr, alloc, pages.artifacts, source, 0, @intCast(source.byte_len), try artifacts.sha256DigestFromChecksum(source.checksum), pages.cancellation, pages.remaining_read_bytes)
     else bytes: {

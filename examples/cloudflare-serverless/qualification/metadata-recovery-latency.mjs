@@ -19,7 +19,7 @@ import{execFileSync}from'node:child_process';
 import{Bucket}from'../test/object-fixture.mjs';import{R2CoordinatorStore}from'../r2-coordinator-store.mjs';import{resourceFailureCode}from'../performance.mjs';
 const arg=(name,fallback)=>process.argv.find(a=>a.startsWith('--'+name+'='))?.slice(name.length+3)??fallback;
 const control=resolve(arg('control','../../.zig-cache/twofold-control/antfly-serverless.wasm')),candidate=resolve(arg('candidate','dist/antfly-serverless.wasm')),out=resolve(arg('out','dist/qualification/metadata-recovery-'+Date.now())),delays=arg('delays','0,50,100,200').split(',').map(Number),lags=arg('lags','1,8,32').split(',').map(Number),samples=Number(arg('samples','3'));
-if(delays.some(n=>!Number.isInteger(n)||n<0||n>200)||lags.some(n=>![1,8,32].includes(n))||!Number.isInteger(samples)||samples<1||samples>16)throw Error('InvalidMetadataRecoveryExperiment');await mkdir(out,{recursive:true});
+if(delays.some(n=>!Number.isInteger(n)||n<0||n>200)||lags.some(n=>!Number.isInteger(n)||n<0||n>63)||!Number.isInteger(samples)||samples<1||samples>16)throw Error('InvalidMetadataRecoveryExperiment');await mkdir(out,{recursive:true});
 const sha=b=>createHash('sha256').update(b).digest('hex'),modules=await Promise.all([control,candidate].map(async path=>{const bytes=await readFile(path);return{path,sha256:sha(bytes),module:await WebAssembly.compile(bytes)};}));
 const clone=b=>{const copy=new Bucket();copy.revision=b.revision;copy.objects=new Map([...b.objects].map(([k,v])=>[k,{...v,body:v.body.slice()}]));return copy;};
 const fixtureHash=b=>sha(Buffer.from(JSON.stringify([...b.objects].sort(([a],[b])=>a.localeCompare(b)).map(([key,v])=>({key,etag:v.etag,sha256:sha(v.body)})))));

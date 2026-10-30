@@ -39,7 +39,7 @@ pub const Request = struct {
     journal_read_batch: bool = true,
     root_proof_scope: [16]u8 = @splat(0),
     root_proof_key: ?[32]u8 = null,
-    action: enum { begin, observe, observe_committed, observe_read, read, commit, commit_wal, checkpoint, trace, retire_logs },
+    action: enum { begin, observe, observe_committed, observe_read, read, commit, commit_wal, checkpoint, checkpoint_hint, trace, retire_logs },
     owner: [16]u8,
     state: ?journal.State = null,
     commands: []const Command = &.{},
@@ -347,7 +347,7 @@ pub const Context = struct {
         const observed = if (observing) blk: {
             const recovered = if (req.action == .observe_committed or (req.action == .observe_read and !req.observe_owned)) try log.observeCommitted(m, req.state) else if (req.action == .observe or req.action == .observe_read) try log.observe(m, req.state orelse return error.CoordinatorSessionRequired) else try log.recover(m, req.state, req.state == null or !std.mem.eql(u8, &req.state.?.owner, &req.owner));
             if (req.action != .observe_read or recovered.has_more) {
-                if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .journal_proof = log.journal_proof, .journal_observation = journal_observation, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
+                if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .checkpoint_hint_supported = true, .journal_proof = log.journal_proof, .journal_observation = journal_observation, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
                 if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .root_cursor = log.cursor, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
                 if (req.action != .observe_read or recovered.has_more) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
             }
@@ -356,6 +356,12 @@ pub const Context = struct {
         const state = if (observed) |value| value.state else req.state orelse return error.CoordinatorSessionRequired;
         if (req.action != .observe_read and !std.mem.eql(u8, &state.owner, &req.owner)) return error.ImmutableLogFenced;
         if (req.action == .retire_logs) return std.json.Stringify.valueAlloc(self.alloc, .{ .keys = try log.retirable(m, req.keys, try std.fmt.parseInt(u64, req.before, 10)) }, .{});
+        if (req.action == .checkpoint_hint) {
+            if (req.root_backend != .bounded_journal) return error.ImmutableLogProofRequired;
+            const auth = log.journal_auth orelse return error.ImmutableLogProofRequired;
+            const proof = req.journal_proof orelse return error.ImmutableLogProofRequired;
+            return std.json.Stringify.valueAlloc(self.alloc, .{ .checkpointed = try journal_log.writeCheckpointHintCertified(m, state, auth, proof) }, .{});
+        }
         if (req.action == .checkpoint) return std.json.Stringify.valueAlloc(self.alloc, .{ .checkpointed = try log.writeCheckpoint(m, state, true) }, .{});
         if (req.commands.len > 512) return error.CoordinatorBatchExceeded;
         const page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}", .{ base, std.fmt.bytesToHex(domain, .lower) });
@@ -397,7 +403,7 @@ pub const Context = struct {
                 };
             }
             if (selected) |row| try read_budget.charge(row);
-            if (req.root_backend == .bounded_journal) return read_budget.encode(self.alloc, .{ .state = state, .journal_proof = log.journal_proof, .journal_observation = journal_observation, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
+            if (req.root_backend == .bounded_journal) return read_budget.encode(self.alloc, .{ .state = state, .checkpoint_hint_supported = true, .journal_proof = log.journal_proof, .journal_observation = journal_observation, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
             if (req.root_backend == .conditional) return read_budget.encode(self.alloc, .{ .state = state, .root_cursor = log.cursor, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
             return read_budget.encode(self.alloc, .{ .state = state, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
         }
@@ -498,7 +504,7 @@ pub const Context = struct {
             const encoded = try root.encodeBounded(m, state);
             try uploads.flush();
             const next = try log.append(m, state, encoded);
-            if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .journal_proof = log.journal_proof, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
+            if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .checkpoint_hint_supported = true, .journal_proof = log.journal_proof, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
             if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .root_cursor = log.cursor, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
             return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
         }
@@ -541,7 +547,7 @@ pub const Context = struct {
         const encoded = try root.encodeBounded(m, state);
         try uploads.flush();
         const next = try log.append(m, state, encoded);
-        if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .journal_proof = log.journal_proof, .base = base }, .{});
+        if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .checkpoint_hint_supported = true, .journal_proof = log.journal_proof, .base = base }, .{});
         if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .root_cursor = log.cursor, .base = base }, .{});
         return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .base = base }, .{});
     }

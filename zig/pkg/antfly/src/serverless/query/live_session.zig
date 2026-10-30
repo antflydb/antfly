@@ -39,6 +39,9 @@ pub const Session = struct {
         view: View.Options = .{},
         version: ?u64 = null,
         max_read_bytes: u64 = 16 * 1024 * 1024,
+        /// Point reads may be satisfied entirely by the freshly admitted WAL.
+        /// Defer immutable base-root I/O until that overlay actually misses.
+        lazy_facts: bool = false,
         cancellation: CancellationToken = .none,
         io: ?std.Io = null,
     };
@@ -56,7 +59,15 @@ pub const Session = struct {
                 else => return err,
             };
         if (self.published) |*published| {
-            self.reader = (try facts.Reader.create(alloc, published, &self.remaining_read_bytes)) orelse return error.HostedDocumentFactsRequired;
+            var has_facts = false;
+            for (published.manifest.artifacts) |ref| if (ref.kind == .document_facts) {
+                if (has_facts) return error.InvalidDocumentFactsRoot;
+                const source = try @import("../build/document_facts.zig").validateRootSource(ref);
+                if (!std.mem.eql(u8, &source.domain, &@import("../graph_segment/page_store.zig").PageStore.namespaceDomain(published.manifest.namespace))) return error.DocumentFactsSourceChanged;
+                has_facts = true;
+            };
+            if (!has_facts) return error.HostedDocumentFactsRequired;
+            if (!options.lazy_facts) _ = try self.ensureReader();
         }
         errdefer if (self.reader) |reader| reader.destroy();
         var view_options = options.view;
@@ -71,9 +82,16 @@ pub const Session = struct {
         const self: *const Session = @ptrCast(@alignCast(raw));
         return self.cancellation.isCancelled() or if (self.wal_cancellation) |token| token.isCancelled() else false;
     }
+    pub fn ensureReader(self: *Session) !?*facts.Reader {
+        try self.cancellation.check();
+        if (self.reader == null) if (self.published) |*published| {
+            self.reader = (try facts.Reader.create(self.alloc, published, &self.remaining_read_bytes)) orelse return error.HostedDocumentFactsRequired;
+        };
+        return self.reader;
+    }
     fn resolveCheckpoint(raw: *anyopaque, alloc: A, bytes: []const u8) ![]u8 {
         const self: *Session = @ptrCast(@alignCast(raw));
-        const reader = self.reader orelse return error.HostedDocumentFactsRequired;
+        const reader = (try self.ensureReader()) orelse return error.HostedDocumentFactsRequired;
         try self.cancellation.check();
         return @import("../build/document_facts.zig").resolveCheckpointBodyAlloc(alloc, &reader.pages, bytes);
     }
@@ -87,7 +105,7 @@ pub const Session = struct {
         const Base = struct {
             session: *Session,
             pub fn lookupAlloc(base: @This(), _: A, key: []const u8) !?[]u8 {
-                const reader = base.session.reader orelse return null;
+                const reader = (try base.session.ensureReader()) orelse return null;
                 return try reader.lookupBodyAlloc(key);
             }
         };
@@ -219,10 +237,11 @@ pub const Session = struct {
 
     pub fn countDocuments(self: *Session) !u64 {
         if (self.view.point_id != null) return error.PointReadIdentityMismatch;
+        const base_reader = try self.ensureReader();
         var count: u64 = if (self.published) |published| published.manifest.stats.document_count else 0;
         for (self.view.overlay.ordered) |id| {
             try self.cancellation.check();
-            const existed = if (self.reader) |reader| (try reader.lookup(id)) != null else false;
+            const existed = if (base_reader) |reader| (try reader.lookup(id)) != null else false;
             const mutation = self.view.overlay.by_id.get(id) orelse unreachable;
             if (mutation.kind == .delete) {
                 if (existed) count -= 1;
@@ -241,7 +260,7 @@ pub const Session = struct {
         after: []const u8,
         body: ?[]u8 = null,
         fn init(session: *Session, after: []const u8) !Cursor {
-            return .{ .session = session, .after = after, .cursor = if (session.reader) |reader| try tree.Cursor.init(session.alloc, reader.cache.store(), reader.root.page, after, null) else null };
+            return .{ .session = session, .after = after, .cursor = if (try session.ensureReader()) |reader| try tree.Cursor.init(session.alloc, reader.cache.store(), reader.root.page, after, null) else null };
         }
         fn deinit(self: *Cursor) void {
             if (self.body) |body| self.session.alloc.free(body);

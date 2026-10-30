@@ -85,18 +85,18 @@ pub const Prepared = struct {
     pub fn lookupAlloc(self: Prepared, live: *Live, id: []const u8) !?[]u8 {
         if (!std.mem.eql(u8, self.id, id)) return error.InvalidNativeReadPlan;
         if (!self.materialized) return live.lookupAlloc(id);
-        const reader = live.reader orelse return live.lookupAlloc(id);
         const Base = struct {
             prepared: Prepared,
-            reader: *@import("document_facts_reader.zig").Reader,
+            live: *Live,
             pub fn lookupAlloc(base: @This(), a: A, key: []const u8) !?[]u8 {
                 // The live overlay gets first refusal. An acknowledged recent
                 // update/delete need not fetch or validate an obsolete row.
-                if (base.prepared.root.eql(base.reader.root)) return if (base.prepared.body) |body| try a.dupe(u8, body) else null;
-                return base.reader.lookupBodyWithHintAlloc(key, if (base.prepared.fact) |fact| .{ .fact = fact, .body = base.prepared.body.? } else null);
+                const reader = (try base.live.ensureReader()) orelse return null;
+                if (base.prepared.root.eql(reader.root)) return if (base.prepared.body) |body| try a.dupe(u8, body) else null;
+                return reader.lookupBodyWithHintAlloc(key, if (base.prepared.fact) |fact| .{ .fact = fact, .body = base.prepared.body.? } else null);
             }
         };
-        return live.view.lookupAlloc(id, Base{ .prepared = self, .reader = reader });
+        return live.view.lookupAlloc(id, Base{ .prepared = self, .live = live });
     }
 };
 
