@@ -17,7 +17,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const objectstore = @import("objectstore");
 
-pub const data_uri = @import("data_uri.zig");
+pub const data_uri = @import("antfly_data_uri");
 
 const Allocator = std.mem.Allocator;
 const default_max_download_size_bytes: u64 = 100 * 1024 * 1024;

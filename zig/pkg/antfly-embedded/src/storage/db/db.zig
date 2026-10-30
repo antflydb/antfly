@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const storage_engine = @import("../engine.zig");
+const storage_engine = @import("../engine_dispatch.zig").implementation;
 const snapshot_staging = @import("snapshot_staging.zig");
 const execution_resources = @import("execution_resources.zig");
 const read_projection = @import("read_projection.zig");
@@ -28791,6 +28791,7 @@ pub const DB = struct {
         try self.startResolverReplayRuntimesIfConfigured();
         if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
         self.startArtifactRepairMetadataWorkerIfNeeded();
+        self.independent_maintenance.notify();
         return generation;
     }
 
@@ -38767,7 +38768,7 @@ pub const DB = struct {
         io: Io,
         file: std.Io.File,
         file_size: u64,
-        options: storage_engine.PortableRestoreImportOptions,
+        options: portable_backup.RestoreImportOptions,
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("importPortableRestoreFileIntoUnpublishedEmpty", .{ self, alloc, io, file, file_size, options });
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;

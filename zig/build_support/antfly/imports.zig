@@ -313,6 +313,7 @@ pub const AntflyRootImports = struct {
     // keep owner-specific dependencies in their constructors below.
     fn configureDatabase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         self.configureBase(mod, link_libc);
+        self.addImport(mod, "chunking_api_openapi");
         inline for (.{
             "bloom",            "chunking",           "common_openapi",    "credentials",
             "embeddings",       "embeddings_openapi", "extracting",        "generating",

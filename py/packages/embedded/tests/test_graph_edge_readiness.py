@@ -189,7 +189,9 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
             return [rng.uniform(0, 0.9) for _ in range(384)]
         return value
 
-    with antfly_embedded.create(path) as db:
+    # This is a replay/lock-order regression. Keep every original batch and
+    # vector dimension, but leave power-loss sync to durable checkpoint tests.
+    with antfly_embedded.create_with_options(path, antfly_embedded.OpenOptions(no_sync=True)) as db:
         db.add_index({"name": "graph", "kind": "graph", "config_json": "{}"})
         for field in ("name_embedding", "fact_embedding"):
             db.add_index(
@@ -206,9 +208,17 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
                     ),
                 }
             )
+        latest = {}
         for ordinal, batch in enumerate(batches):
             print(f"{wait_mode}: batch {ordinal} write", flush=True)
             inserts = {key: {field: expand(value) for field, value in doc.items()} for key, doc in batch.items()}
+            for doc in inserts.values():
+                # External indexes consume explicit payloads. Merely storing
+                # a vector field leaves the index empty and misses its replay.
+                vectors = {field: doc[field] for field in ("name_embedding", "fact_embedding") if field in doc}
+                if vectors:
+                    doc["_embeddings"] = vectors
+            latest.update(inserts)
             request: dict[str, object] = {"inserts": inserts}
             if wait_mode == "full_index":
                 request["sync_level"] = "full_index"
@@ -217,6 +227,16 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
                 print(f"{wait_mode}: batch {ordinal} drain", flush=True)
                 db.run_until_idle()
             print(f"{wait_mode}: batch {ordinal} complete", flush=True)
+        print(f"{wait_mode}: verify readiness", flush=True)
+        stats = db.stats()
+        for field in ("name_embedding", "fact_embedding"):
+            print(f"{wait_mode}: verify {field}", flush=True)
+            index = _index(stats, field)
+            assert index["replay_applied_sequence"] >= index["replay_target_sequence"] > 0, index
+            expected = {key for key, doc in latest.items() if field in doc}
+            vector = next(doc[field] for doc in latest.values() if field in doc)
+            result = db.search({"embeddings": {field: vector}, "indexes": [field], "limit": len(latest)})
+            assert {hit["_id"] for hit in result["responses"][0]["hits"]["hits"]} == expected, result
         print(f"{wait_mode}: closing", flush=True)
     print(f"{wait_mode}: closed", flush=True)
 
@@ -261,11 +281,12 @@ def test_public_traversal_retains_each_seed_path(aflite_path) -> None:
         assert {node["path"][0]["key"] for node in nodes} == {"concept:a", "concept:b"}
 
 
-@pytest.mark.parametrize("destination_storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
-@pytest.mark.parametrize("restore_method", ["memory", "file", "import"])
-def test_query_resolution_uses_durable_aliases_without_promotion(
-    aflite_path, tmp_path, destination_storage, restore_method
-) -> None:
+@pytest.fixture(scope="module")
+def durable_resolver_backup(tmp_path_factory, require_native):
+    # Exercise the complete source lifecycle once. Every restore case below
+    # gets an independent destination; only immutable backup bytes are shared.
+    tmp_path = tmp_path_factory.mktemp("durable-resolver")
+    aflite_path = tmp_path / "source.aflite"
     options = antfly_embedded.OpenOptions(profile=antfly_embedded.Profile.NATIVE, generated_enrichment_replay=True)
     with antfly_embedded.create_with_options(aflite_path, options) as db:
         config = {
@@ -360,6 +381,25 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         backup = db.backup()
         backup_file = tmp_path / "resolver.afb"
         db.backup_to_file(backup_file)
+    with antfly_embedded.open_with_options(aflite_path, options) as db:
+        db.add_index(config)
+        db.run_until_idle()
+        assert len(db.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
+    with antfly_embedded.open_readonly(aflite_path) as db:
+        result = db.resolve_query("concepts", request)
+        assert result["resolution"]["config_generation"] == 4
+        assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen_embedding"
+        assert json.loads(db.resolve_query("concepts", request, raw=True)) == result
+    return backup, backup_file, json.dumps(config), json.dumps(request), aflite_path
+
+
+@pytest.mark.parametrize("destination_storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("restore_method", ["memory", "file", "import"])
+def test_query_resolution_uses_durable_aliases_without_promotion(
+    tmp_path, destination_storage, restore_method, durable_resolver_backup
+) -> None:
+    backup, backup_file, config_json, request_json, source_path = durable_resolver_backup
+    config, request = json.loads(config_json), json.loads(request_json)
     restored_path = tmp_path / (
         "restored.aflite" if destination_storage == antfly_embedded.Storage.LITE else "restored"
     )
@@ -483,15 +523,12 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         )
         restored.run_until_idle()
         assert restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen"
-    with antfly_embedded.open_with_options(aflite_path, options) as db:
-        db.add_index(config)
-        db.run_until_idle()
-        assert len(db.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
-    with antfly_embedded.open_readonly(aflite_path) as db:
-        result = db.resolve_query("concepts", request)
+    # Destination migrations must never change the shared source or backup.
+    with antfly_embedded.open_readonly(source_path) as source:
+        result = source.resolve_query("concepts", request)
         assert result["resolution"]["config_generation"] == 4
         assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen_embedding"
-        assert json.loads(db.resolve_query("concepts", request, raw=True)) == result
+        assert len(source.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
 
 
 def test_resolver_revision_advances_for_unmerged_config_changes(tmp_path):
@@ -1188,17 +1225,21 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
     path = tmp_path / ("busy-shadow.aflite" if storage == antfly_embedded.Storage.LITE else "busy-shadow")
     with _open_graph_test(path, options) as db:
         db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
-        db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(500)}})
+        # Cross the detached builder's 256-document page boundary. More rows
+        # only add repeated page work; the native tests force cutover races.
+        db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(257)}})
         db.run_until_idle()
         stop = threading.Event()
         started = threading.Event()
+        revisions = 0
 
         def write():
-            revisions = 0
-            started.set()
+            nonlocal revisions
             while not stop.is_set():
                 db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": [f"v{revisions}"]}}})
                 revisions += 1
+                if revisions == 2:
+                    started.set()
                 time.sleep(0.002)
             return revisions
 
@@ -1206,6 +1247,7 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
             future = executor.submit(write)
             try:
                 assert started.wait(timeout=5)
+                writes_before_replacement = revisions
                 request = {
                     "name": "new",
                     "type": "graph",
@@ -1220,10 +1262,12 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
                     time.sleep(0.01)
             finally:
                 stop.set()
-            assert future.result(timeout=10) > 1
+            assert future.result(timeout=10) > writes_before_replacement
         db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": ["final"]}}})
         db.run_until_idle()
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "source:0000", "R", 0)] == ["final"]
+        for key in ("source:0001", "source:0256"):
+            assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", key, "R", 0)] == ["new"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGKILL and pipe-polling fixture")
@@ -1522,13 +1566,23 @@ def test_inline_resolver_background_work_settles_after_writes(
                 time.sleep(0.1)
             assert docs.edges(graph_name, "d0", "about", antfly_embedded.GraphDirection.OUT)
             sequence = stats["derived_target_sequence"]
-            # Let the real worker run several further rounds without a write
-            # or a foreground drain that could hide detached publication bugs.
-            time.sleep(2)
-            after = docs.pending_work_stats()
-            assert after["derived_target_sequence"] == sequence, after
-            assert not after["resolution"]["catch_up_required"], after
-            assert not after["promotion"]["catch_up_required"], after
+            # Observe two actual rounds, rather than assuming a fixed sleep
+            # let the worker run. Never write or drain: either could hide a
+            # detached publication that keeps generating new work while idle.
+            publications = stats["background_publications"]
+            rounds = publications["maintenance_rounds"]
+            stable_deadline = background_progress_deadline()
+            while True:
+                after = docs.pending_work_stats()
+                observed = after["background_publications"]
+                assert after["derived_target_sequence"] == sequence, after
+                assert not after["resolution"]["catch_up_required"], after
+                assert not after["promotion"]["catch_up_required"], after
+                if observed["maintenance_rounds"] >= rounds + 2:
+                    break
+                if stable_deadline.expired(after, completed=observed["maintenance_rounds"]):
+                    pytest.fail(f"background worker stopped after settling: {json.dumps(after, sort_keys=True)}")
+                time.sleep(0.02)
 
 
 def test_native_child_replacement_replays_generated_artifacts_beside_idle_root(tmp_path):
