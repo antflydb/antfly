@@ -10235,7 +10235,7 @@ fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer,
 // bandwidth (~180MB/s observed for the per-token 1MB logits row). Stage
 // through a reusable pinned buffer instead: pinned DMA + host memcpy is
 // ~10-20x faster for the sampled-decode logits path.
-const pinned_bulk_download_min_bytes: usize = 32 * 1024;
+const pinned_bulk_download_min_bytes: usize = 16 * 1024;
 const pinned_bulk_download_max_bytes: usize = 4 * 1024 * 1024;
 
 fn pinnedBulkDownloadCapacity(bytes: usize) ?usize {
@@ -36349,7 +36349,10 @@ test "CUDA pinned bulk readback capacity is bounded and follows demand" {
     const Case = struct { bytes: usize, capacity: ?usize };
     for ([_]Case{
         .{ .bytes = 0, .capacity = null },
-        .{ .bytes = 32767, .capacity = null },
+        .{ .bytes = 16383, .capacity = null },
+        .{ .bytes = 16384, .capacity = 16384 },
+        .{ .bytes = 24576, .capacity = 32768 },
+        .{ .bytes = 32767, .capacity = 32768 },
         .{ .bytes = 32768, .capacity = 32768 },
         .{ .bytes = 49152, .capacity = 65536 },
         .{ .bytes = 65536, .capacity = 65536 },
@@ -36389,7 +36392,7 @@ test "CUDA pinned bulk readback grows reuses and preserves fallback bytes and gu
     defer a.free(output);
     var previous: ?*anyopaque = null;
     var previous_capacity: usize = 0;
-    for ([_]usize{ 32768, 49152, 65536, 65540, 196608, 1048576, 4194304, 4194308, 0, 49152 }) |bytes| {
+    for ([_]usize{ 16384, 24576, 32768, 49152, 65536, 65540, 196608, 1048576, 4194304, 4194308, 0, 49152 }) |bytes| {
         @memset(output, 0xa7);
         const syncs = compute.stats.download_syncs;
         const pinned = compute.stats.pinned_bulk_downloads;
