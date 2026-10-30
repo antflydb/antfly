@@ -121,6 +121,9 @@ pub fn create(ctx: Context) Suite {
     if (ctx.backend.enable_system_blas) {
         runtime_build.configureSystemBlas(b, tests.root_module, ctx.target, ctx.backend.blas_root);
     }
+    // No-copy host buffer wrapping can succeed even for misaligned pointers
+    // on some devices. Exercise the copied-output fallback deterministically.
+    if (ctx.backend.enable_metal) tests.root_module.addCMacro("ANTFLY_METAL_TEST_FORCE_HOST_OUTPUT_COPY", "1");
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
     runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;

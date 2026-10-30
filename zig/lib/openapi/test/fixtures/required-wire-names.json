@@ -1,0 +1,106 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Required wire names",
+    "version": "1"
+  },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "RequiredFields": {
+        "type": "object",
+        "properties": {
+          "toolUseId": {
+            "type": "string"
+          },
+          "content-block-index": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "toolUseId",
+          "content-block-index",
+          "error"
+        ]
+      },
+      "ComposedFields": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/RequiredFields"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "stopReason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "stopReason"
+            ]
+          }
+        ]
+      },
+      "TextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ToolVariant": {
+        "type": "object",
+        "properties": {
+          "toolUse": {
+            "$ref": "#/components/schemas/RequiredFields"
+          }
+        },
+        "required": [
+          "toolUse"
+        ],
+        "additionalProperties": false
+      },
+      "ContentUnion": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolVariant"
+          }
+        ]
+      },
+      "Document": {},
+      "DocumentAlias": {
+        "$ref": "#/components/schemas/Document"
+      },
+      "DocumentEnvelope": {
+        "type": "object",
+        "properties": {
+          "requiredDocument": {
+            "$ref": "#/components/schemas/DocumentAlias"
+          },
+          "optionalDocument": {
+            "$ref": "#/components/schemas/Document"
+          },
+          "inlineDocument": {},
+          "objectOnly": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "requiredDocument"
+        ]
+      }
+    }
+  }
+}
