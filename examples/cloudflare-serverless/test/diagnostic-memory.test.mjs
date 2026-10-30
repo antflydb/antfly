@@ -82,3 +82,24 @@ test('an injected reader allocation failure survives a later healthy response an
 test('unauthorized observer requests do not enter diagnostic admission or create rejection records',async()=>{
  const observer=(await import('../qualification/paired-observer-worker.mjs')).default,bucket=new Bucket(),before=diagnosticAdmission.pending.length,response=await observer.fetch(new Request('https://fixture.invalid/v1/traces',{method:'POST',body:'{}'}),{API_TOKEN:'local-only',LOGS:bucket});assert.equal(response.status,401);assert.equal(bucket.writes,0);assert.equal(diagnosticAdmission.pending.length,before);
 });
+
+test('byte-charged Tail pipeline overlaps slow writes without retaining parser permits or leaking reservations',async()=>{
+ const {persistObserverTail}=await import('../qualification/paired-observer.mjs'),{diagnosticWrites,tailAdmission,tailInputMetrics}=await import('../qualification/diagnostic-memory.mjs'),bucket=new Bucket(),archive=new Bucket(),env={API_TOKEN:'local',SOURCE_SCOPES:JSON.stringify(scopes),WINDOWED_EVIDENCE:'true',LOGS:bucket,ARCHIVE:archive},put=bucket.put.bind(bucket);let active=0,peak=0;
+ bucket.put=async(...args)=>{active++;peak=Math.max(peak,active);try{await new Promise(resolve=>setTimeout(resolve,10));return await put(...args);}finally{active--;}};
+ const calls=Array.from({length:32},()=>persistObserverTail(scopes.map(s=>({scriptName:s.source,eventTimestamp:1500,outcome:'ok',cpuTime:1,wallTime:2})),env));await Promise.all(calls);
+ assert.ok(peak>1);assert.equal([...bucket.objects.keys()].filter(k=>k.includes('/counter/')).length,32*8);assert.equal(tailAdmission.peak,1);assert.equal(diagnosticWrites.active,0);assert.equal(diagnosticWrites.bytes,0);assert.ok(diagnosticWrites.peakActive<=16);assert.ok(diagnosticWrites.peakBytes<=16*1024*1024);assert.equal(tailInputMetrics().reserved_bytes,0);
+});
+test('prepared-write and decoded-input byte budgets reject overflow and remain held until publication settles',async()=>{
+ const {DiagnosticWriteBudget,reserveTailInput}=await import('../qualification/diagnostic-memory.mjs'),budget=new DiagnosticWriteBudget({maxBytes:16,maxActive:2}),first=await budget.reserve(12);let entered=false;const pending=budget.reserve(8).then(release=>{entered=true;return release;});await new Promise(resolve=>setTimeout(resolve,10));assert.equal(entered,false);assert.equal(budget.bytes,12);first();const second=await pending;assert.equal(budget.bytes,8);second();second();assert.equal(budget.bytes,0);await assert.rejects(budget.reserve(17),/WriteBudgetExceeded/);
+ assert.throws(()=>reserveTailInput({body:'x'.repeat(1024)},{limitBytes:1000}),/InputBudgetExceeded/);const release=reserveTailInput({body:'small'});release();release();
+});
+test('new capture generations retain failed prefixes while checking only their own immutable evidence',async()=>{
+ const {diagnosticPrefix}=await import('../qualification/diagnostic-scope.mjs'),reader=(await import('../qualification/paired-evidence-reader.mjs')).default,bucket=new Bucket(),id=crypto.randomUUID(),env={API_TOKEN:'local',SOURCE_SCOPES:JSON.stringify(scopes),LOGS:bucket,OBSERVATION_CAPTURE_ID:id};
+ await bucket.put('observer-v1/rejections/historical.json',JSON.stringify({error:'ObserverTailFailed'}));const request=()=>reader.fetch(new Request('https://fixture.invalid/health',{headers:{Authorization:'Bearer local'}}),env);const clean=await(await request()).json();assert.equal(clean.rejections_present,false);assert.equal(clean.observation_capture_id,id);await bucket.put(diagnosticPrefix(env,'receiver')+'rejections/new.json',JSON.stringify({error:'TelemetryDiagnosticAdmissionExceeded'}));assert.equal((await(await request()).json()).rejections_present,true);assert.ok(bucket.objects.has('observer-v1/rejections/historical.json'));assert.throws(()=>diagnosticPrefix({...env,OBSERVATION_CAPTURE_ID:'invalid'},'observer'),/ScopeInvalid/);
+});
+
+test('a failed parallel Tail write retains its byte permit until all remaining physical writes settle',async()=>{
+ const {persistObserverTail}=await import('../qualification/paired-observer.mjs'),{diagnosticWrites}=await import('../qualification/diagnostic-memory.mjs'),hold=gate(),entered=gate(),bucket=new Bucket(),put=bucket.put.bind(bucket);let calls=0;
+ bucket.put=async(...args)=>{if(++calls===1)throw Error('SQLITE_NOMEM [test-only injected write failure]');entered.release();await hold.promise;return put(...args);};
+ const result=persistObserverTail(scopes.slice(0,4).map(s=>({scriptName:s.source,eventTimestamp:1500,outcome:'ok',cpuTime:1,wallTime:1})),{SOURCE_SCOPES:JSON.stringify(scopes),LOGS:bucket});await entered.promise;assert.equal(diagnosticWrites.active,1);assert.ok(diagnosticWrites.bytes>0);hold.release();await assert.rejects(result,/SQLITE_NOMEM/);assert.equal(diagnosticWrites.active,0);assert.equal(diagnosticWrites.bytes,0);
+});

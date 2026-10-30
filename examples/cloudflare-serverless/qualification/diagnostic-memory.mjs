@@ -49,3 +49,29 @@ export function parseDiagnosticJson(text,{lines=false,...limits}={}){
  checkDiagnosticJson(text,limits);
  try{return JSON.parse(text);}catch(error){if(!lines)throw error;return text.trim().split('\n').map(line=>JSON.parse(line));}
 }
+
+// Prepared bytes are charged through completion of every physical write. The
+// parser can admit another caller once this independent I/O permit is owned.
+export class DiagnosticWriteBudget {
+ constructor({maxBytes=16*1024*1024,maxActive=16,waitMs=15000,pollMs=5,clock=()=>performance.now(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}){Object.assign(this,{maxBytes,maxActive,waitMs,pollMs,clock,sleep});this.bytes=0;this.active=0;this.peakBytes=0;this.peakActive=0;this.pending=[];}
+ report(){return {active:this.active,reserved_bytes:this.bytes,peak_active:this.peakActive,peak_reserved_bytes:this.peakBytes,limit_bytes:this.maxBytes,limit_active:this.maxActive};}
+ async reserve(bytes){
+  if(!Number.isSafeInteger(bytes)||bytes<0||bytes>this.maxBytes)throw Error('TelemetryDiagnosticWriteBudgetExceeded');
+  const ticket=Object.freeze({}),deadline=this.clock()+this.waitMs;this.pending.push(ticket);
+  try{for(;;){if(this.clock()>=deadline)throw Error('TelemetryDiagnosticWriteAdmissionExpired');if(this.pending[0]===ticket&&this.active<this.maxActive&&bytes<=this.maxBytes-this.bytes){this.pending.shift();this.bytes+=bytes;this.active++;this.peakBytes=Math.max(this.peakBytes,this.bytes);this.peakActive=Math.max(this.peakActive,this.active);let owned=true;return()=>{if(owned){owned=false;this.bytes-=bytes;this.active--;}};}await this.sleep(this.pollMs);}}
+  finally{const index=this.pending.indexOf(ticket);if(index>=0)this.pending.splice(index,1);}
+ }
+}
+export const diagnosticWrites=new DiagnosticWriteBudget();
+
+// Tail events arrive already decoded by the provider. More small deliveries
+// can wait for the CPU lane only while their aggregate input charge fits.
+export const tailAdmission=new DiagnosticAdmission({maxQueued:64});
+let tailInputBytes=0,tailInputPeak=0;
+export function reserveTailInput(value,{limitBytes=16*1024*1024}={}){
+ let bytes=0,nodes=0;
+ const visit=(item,depth)=>{if(depth>32||++nodes>262144)throw Error('TelemetryJsonComplexityExceeded');bytes+=32;if(typeof item==='string')bytes+=item.length*2;else if(item&&typeof item==='object'){for(const key in item){bytes+=key.length*2+16;if(bytes>limitBytes)throw Error('TelemetryDiagnosticInputBudgetExceeded');visit(item[key],depth+1);}}if(bytes>limitBytes)throw Error('TelemetryDiagnosticInputBudgetExceeded');};visit(value,0);
+ if(bytes>limitBytes-tailInputBytes)throw Error('TelemetryDiagnosticInputBudgetExceeded');tailInputBytes+=bytes;tailInputPeak=Math.max(tailInputPeak,tailInputBytes);let held=true;
+ return()=>{if(held){held=false;tailInputBytes-=bytes;}};
+}
+export const tailInputMetrics=()=>({reserved_bytes:tailInputBytes,peak_reserved_bytes:tailInputPeak,limit_bytes:16*1024*1024});

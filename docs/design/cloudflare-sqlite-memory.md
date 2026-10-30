@@ -206,3 +206,74 @@ provider investigation. Capture exact Worker versions, time ranges, sanitized
 failure codes, sampled isolate metrics and a minimal reproducer for Cloudflare.
 A sampled low-memory interval or a successful run cannot establish the absence
 of every transient allocator fault.
+
+### Hosted rejection and bounded Tail publication pipeline
+
+The first approved deployment of this hardening used candidate `07456d5cb3`,
+corrected control `c44896ac8c` and observer
+`antfly-1278-observe-mvv6mn5tacc2`. The initial attempt,
+`d81c381a-7073-423f-802d-1302086be55e`, was stopped during seeding because real
+Tail deliveries exceeded the monolithic admission queue. The final health
+sample retained `ObserverTailFailed:TelemetryDiagnosticAdmissionExceeded`.
+Its original report, manifests and diagnostics remain preserved. No measured
+read/write workload completed, and no latency or allocator-absence claim follows
+from this failed attempt. Its client and reader ledgers recorded no resource
+signals, but incomplete ingestion prevents using that as exhaustive evidence.
+
+Holding the parser permit during R2 writes was the bottleneck. Tail publication
+now separates preparation from persistence:
+
+1. Decoded provider inputs have a conservative aggregate 16 MiB input charge.
+   A single Tail preparation lane can queue up to 64 small tickets only while
+   that byte charge fits; HTTP receiver/reader admission retains its original
+   four-waiter bound. Input estimates include strings, property names and node
+   overhead, without copying or logging raw values.
+2. Preparation produces bounded encoded archive/counter/witness objects, rather
+   than retaining arbitrary parsed object trees during slow writes. Before
+   releasing the parser, the caller owns an independent write permit: at most
+   16 active deliveries and 16 MiB of total prepared bytes. A single Tail
+   dispatch's prepared output is additionally capped at 8 MiB + 64 KiB.
+3. The originating caller persists up to four source scopes concurrently. Each
+   scope commits its archive before its counter and real witness pointers.
+   All physical writes settle before its byte reservation is released, including
+   when a peer write fails. No promise, transport or request context migrates
+   to another caller. Completed layout booleans are cached by bucket identity;
+   pending I/O is never cached across invocations.
+
+This overlaps binding latency within an explicit byte budget. It does not
+increase the application's memory limit, loosen diagnostic settlement or discard
+failed events. The local regression sends 32 simultaneous deliveries across
+all eight sources and checks all 256 counter objects, caller-context behavior,
+byte ceilings and complete release after success/failure. Tests in actual
+workerd exercise the same burst and observe overlapping publication with a
+single active preparation lane. The native R2 SQL/KV-forbidden regression also
+passes collection, reindexing, eviction and erased-platform-storage recovery.
+
+Capture retries now have explicit generations. `begin-capture` requires all
+local rehearsal reports to be complete, archives the previous exact manifests
+and failed report, and assigns new source capture IDs plus an observer capture
+UUID. New global observer/receiver rejection prefixes use that UUID; the reader
+and driver pin it. Old rejection objects and failed reports remain under their
+original prefixes. Versioned `revise-observer`, `revise-reader` and
+`revise-receiver` actions retain prior bundles and verify the newly deployed
+version before another rehearsal. This creates a separate trial, never a way
+to clear a failure inside an existing trial.
+
+The same failed hosted generation also retained 16
+`TelemetryJsonComplexityExceeded` receiver rejections in its final bounded
+health sample. Valid bulk exports can exceed a whole-payload node ceiling even
+when each sanitized storage chunk fits. The receiver now validates complete
+JSON syntax with a depth-bounded, non-materializing walk, then materializes only
+bounded resource metadata and record slices. Whole-payload byte, envelope,
+resource, scope, record and chunk limits remain. Every parsed record slice stays
+within the existing JSON allocation-node guard; oversized embedded log JSON
+still becomes a diagnostic gap. Invalid trailing syntax is rejected before any
+chunk is published. Raw provider bodies are not spooled to storage.
+
+The dense-export regression uses 6,000 records and 16 attributes per record,
+below the original six-MiB body limit but above the former whole-tree node
+ceiling. It preserves all records in Node and actual workerd while parsing only
+bounded slices. The revised local suite passes 479 Node tests and seven focused
+workerd integrations, including the dense export and 32-caller Tail burst. The
+first failed hosted generation remains failed; these local results authorize a
+new reproduction, not relabeling the old evidence.

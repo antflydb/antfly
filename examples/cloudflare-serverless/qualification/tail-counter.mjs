@@ -16,11 +16,11 @@
 // An independent provider-terminal delivery ledger, never an application
 // invocation ID. Each delivery owns an immutable R2 object; no shared counter
 // row or write is placed on the producer's critical path.
-import{persistCanonicalTail}from'./canonical-windows.mjs';
+import{prepareCanonicalTail,publishCanonicalTail}from'./canonical-windows.mjs';
 import{attemptParameter,requestAttemptUuid,portableAttemptIdentity,versionIdentity}from'./attempt-token.mjs';
 import {sanitizeTailEvent} from './metrics-tail.mjs';
 const uuid=v=>typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(v);
-export async function persistTailDelivery(events,env){
+export async function prepareTailDelivery(events,env){
  if(!uuid(env.CAPTURE_ID)||!/^antfly-1278-(?:telemetry-[a-z0-9]+-source|g-[a-z0-9]+-[1-3]-[bc](?:-(?:writer|reader|builder))?)$/.test(env.SOURCE_WORKER??''))throw Error('CounterScopeInvalid');
  if(!Array.isArray(events)||events.length>1000)throw Error('CounterDeliveryBudgetExceeded');
  const records=[],witnesses=[];let foreign=0;
@@ -33,11 +33,18 @@ export async function persistTailDelivery(events,env){
  }
  const delivery=crypto.randomUUID(),record={schema:1,qualification:false,source:'provider-tail-dispatch',delivery_id:delivery,producer:env.SOURCE_WORKER,received_at:Date.now(),collector_version:env.WORKER_VERSION?.id??null,foreign_events:foreign,count:records.length,records},value=JSON.stringify(record);
  if(new TextEncoder().encode(value).byteLength>4*1024*1024)throw Error('CounterDeliveryBudgetExceeded');
- if(env.WINDOWED_EVIDENCE==='true'){await persistCanonicalTail(env,record,witnesses);return{delivery_id:delivery,count:records.length};}
- const result=await env.LOGS.put('probe-v1/'+env.CAPTURE_ID+'/counter/'+delivery+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});
- if(!result)throw Error('CounterDeliveryCollision');
- return{delivery_id:delivery,count:records.length};
+ if(env.WINDOWED_EVIDENCE==='true'){const prepared=await prepareCanonicalTail(env,record,witnesses);return {...prepared,windowed:true,delivery_id:delivery,count:records.length};}
+ return {windowed:false,key:'probe-v1/'+env.CAPTURE_ID+'/counter/'+delivery+'.json',body:new TextEncoder().encode(value),bytes:new TextEncoder().encode(value).length,delivery_id:delivery,count:records.length};
 }
+export async function publishTailDelivery(prepared,env){
+ if(prepared.windowed)await publishCanonicalTail(env,prepared);else{
+ const result=await env.LOGS.put(prepared.key,prepared.body,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});
+ if(!result)throw Error('CounterDeliveryCollision');
+ }
+ return {delivery_id:prepared.delivery_id,count:prepared.count};
+}
+export async function persistTailDelivery(events,env){return publishTailDelivery(await prepareTailDelivery(events,env),env);}
+
 
 export async function counterWitness(env,id){
  if(!versionIdentity(id)||!env.PRODUCER)throw Error('CounterWitnessInvalid');
