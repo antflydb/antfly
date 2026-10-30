@@ -33895,15 +33895,37 @@ fn testAttentionResidualHostCopyback(comptime tl2: bool) !void {
     backing[0] = 12345;
     backing[dim + 1] = -12345;
     const none = std.math.maxInt(usize);
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_quantized_linear_slot(
-        runtime,
-        @backingInt(if (tl2) MetalQuantFormat.tl2 else MetalQuantFormat.tl1),
-        0,
-        weight_raw.ptr,
-        weight_raw.len,
-        dim,
-        dim,
-    ));
+    const prepare_rc = if (tl2)
+        termite_metal_decode_runtime_prepare_bitnet_tl2_linear_slot(
+            runtime,
+            0,
+            weight_raw.ptr,
+            weight_raw.len,
+            dim,
+            dim,
+            @intCast(scale_off),
+            @intCast(view.three_values.len),
+            @intCast(view.three_signs.len),
+            @intCast(view.config.bm),
+            @intCast(view.config.by),
+            @intCast(view.config.bmm),
+            @intCast(view.three_cols),
+            @intCast(view.two_cols),
+        )
+    else
+        termite_metal_decode_runtime_prepare_bitnet_tl1_linear_slot(
+            runtime,
+            0,
+            weight_raw.ptr,
+            weight_raw.len,
+            dim,
+            dim,
+            @intCast(view.packed_bytes.len),
+            @intCast(view.config.bm),
+            @intCast(view.config.by),
+            @intCast(view.config.bmm),
+        );
+    try std.testing.expectEqual(@as(c_int, 0), prepare_rc);
     const rc = termite_metal_decode_runtime_apply_attention_residual_ternary_slot(runtime, &input, none, 0, none, &residual, dim, dim, 1e-5, output.ptr);
     try std.testing.expectEqual(@as(c_int, 0), rc);
     for (output, residual) |actual, r| try std.testing.expectApproxEqAbs(dot + r, actual, 1e-4);

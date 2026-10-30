@@ -198,12 +198,6 @@
 // _ZZ22antfly_q4_0_mmv_f32_v1E7partial has been demoted
 // _ZZ21antfly_q4_0_mm_f32_v1E7partial has been demoted
 // _ZZ27antfly_q4_0_pair_mmv_f32_v1E7partial has been demoted
-// _ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial has been demoted
-// _ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial has been demoted
-// _ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial has been demoted
-// _ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial has been demoted
-// _ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial has been demoted
-// _ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial has been demoted
 // _ZZ44antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1E12warp_partial has been demoted
 // _ZZ44antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1E12warp_partial has been demoted
 // _ZZ44antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1E12warp_partial has been demoted
@@ -540,6 +534,12 @@
 .shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE10up_partial[192];
 .shared .align 4 .b8 _ZZ17antfly_q4_q8_pairILj3E14antfly_q8_ggmlEvPhPKhS3_S3_jjjjE9activated[128];
 .shared .align 4 .b8 _ZZ17antfly_q4_q8_downILj128ELj1E14antfly_q8_ggmlEvPfPKhS3_jjjE12warp_partial[16];
+// _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial has been demoted
+// _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial has been demoted
+// _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial has been demoted
+// _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial has been demoted
+// _ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial has been demoted
+// _ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial has been demoted
 // _ZZ33termite_small_warp_attention_implILj512ELb0EEvPfPKfS2_S2_PKxjjjjjS0_E7partial has been demoted
 // _ZZ33termite_small_warp_attention_implILj512ELb0EEvPfPKfS2_S2_PKxjjjjjS0_E7maximum has been demoted
 // _ZZ33termite_small_warp_attention_implILj512ELb0EEvPfPKfS2_S2_PKxjjjjjS0_E11denominator has been demoted
@@ -301873,9 +301873,9 @@ $L__BB403_11:
 	.reg .b32 	%r<250>;
 	.reg .b64 	%rd<48>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial[64];
+	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial[64];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial[64];
+	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial[64];
 
 	ld.param.u64 	%rd7, [antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1_param_1];
@@ -302183,9 +302183,9 @@ $L__BB404_14:
 	add.f32 	%f35, %f126, %f127;
 	shr.u32 	%r140, %r3, 3;
 	and.b32  	%r141, %r140, 536870908;
-	mov.u32 	%r142, _ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial;
+	mov.u32 	%r142, _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial;
 	add.s32 	%r18, %r142, %r141;
-	mov.u32 	%r143, _ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial;
+	mov.u32 	%r143, _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial;
 	add.s32 	%r19, %r143, %r141;
 	@%p21 bra 	$L__BB404_16;
 
@@ -302356,22 +302356,22 @@ $L__BB404_60:
 	setp.ge.u32 	%p83, %r2, %r29;
 	@%p83 bra 	$L__BB404_62;
 
-	ld.shared.f32 	%f390, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial];
+	ld.shared.f32 	%f390, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial];
 	add.f32 	%f391, %f390, 0f00000000;
 	mov.f32 	%f392, 0f00000000;
-	ld.shared.f32 	%f393, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial];
+	ld.shared.f32 	%f393, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial];
 	add.f32 	%f394, %f393, 0f00000000;
-	ld.shared.f32 	%f395, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+4];
+	ld.shared.f32 	%f395, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+4];
 	add.f32 	%f396, %f391, %f395;
-	ld.shared.f32 	%f397, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+4];
+	ld.shared.f32 	%f397, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+4];
 	add.f32 	%f398, %f394, %f397;
-	ld.shared.f32 	%f399, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+8];
+	ld.shared.f32 	%f399, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+8];
 	add.f32 	%f400, %f396, %f399;
-	ld.shared.f32 	%f401, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+8];
+	ld.shared.f32 	%f401, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+8];
 	add.f32 	%f402, %f398, %f401;
-	ld.shared.f32 	%f403, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+12];
+	ld.shared.f32 	%f403, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+12];
 	add.f32 	%f404, %f400, %f403;
-	ld.shared.f32 	%f405, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+12];
+	ld.shared.f32 	%f405, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+12];
 	add.f32 	%f406, %f402, %f405;
 	mul.f32 	%f407, %f404, 0f3F000000;
 	mul.f32 	%f408, %f404, 0f3D372713;
@@ -302414,22 +302414,22 @@ $L__BB404_62:
 	setp.ge.u32 	%p86, %r24, %r29;
 	@%p86 bra 	$L__BB404_64;
 
-	ld.shared.f32 	%f436, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+16];
+	ld.shared.f32 	%f436, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+16];
 	add.f32 	%f437, %f436, 0f00000000;
 	mov.f32 	%f438, 0f00000000;
-	ld.shared.f32 	%f439, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+16];
+	ld.shared.f32 	%f439, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+16];
 	add.f32 	%f440, %f439, 0f00000000;
-	ld.shared.f32 	%f441, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+20];
+	ld.shared.f32 	%f441, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+20];
 	add.f32 	%f442, %f437, %f441;
-	ld.shared.f32 	%f443, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+20];
+	ld.shared.f32 	%f443, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+20];
 	add.f32 	%f444, %f440, %f443;
-	ld.shared.f32 	%f445, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+24];
+	ld.shared.f32 	%f445, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+24];
 	add.f32 	%f446, %f442, %f445;
-	ld.shared.f32 	%f447, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+24];
+	ld.shared.f32 	%f447, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+24];
 	add.f32 	%f448, %f444, %f447;
-	ld.shared.f32 	%f449, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+28];
+	ld.shared.f32 	%f449, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+28];
 	add.f32 	%f450, %f446, %f449;
-	ld.shared.f32 	%f451, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+28];
+	ld.shared.f32 	%f451, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+28];
 	add.f32 	%f452, %f448, %f451;
 	mul.f32 	%f453, %f450, 0f3F000000;
 	mul.f32 	%f454, %f450, 0f3D372713;
@@ -302472,22 +302472,22 @@ $L__BB404_64:
 	setp.ge.u32 	%p89, %r25, %r29;
 	@%p89 bra 	$L__BB404_66;
 
-	ld.shared.f32 	%f482, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+32];
+	ld.shared.f32 	%f482, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+32];
 	add.f32 	%f483, %f482, 0f00000000;
 	mov.f32 	%f484, 0f00000000;
-	ld.shared.f32 	%f485, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+32];
+	ld.shared.f32 	%f485, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+32];
 	add.f32 	%f486, %f485, 0f00000000;
-	ld.shared.f32 	%f487, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+36];
+	ld.shared.f32 	%f487, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+36];
 	add.f32 	%f488, %f483, %f487;
-	ld.shared.f32 	%f489, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+36];
+	ld.shared.f32 	%f489, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+36];
 	add.f32 	%f490, %f486, %f489;
-	ld.shared.f32 	%f491, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+40];
+	ld.shared.f32 	%f491, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+40];
 	add.f32 	%f492, %f488, %f491;
-	ld.shared.f32 	%f493, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+40];
+	ld.shared.f32 	%f493, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+40];
 	add.f32 	%f494, %f490, %f493;
-	ld.shared.f32 	%f495, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+44];
+	ld.shared.f32 	%f495, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+44];
 	add.f32 	%f496, %f492, %f495;
-	ld.shared.f32 	%f497, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+44];
+	ld.shared.f32 	%f497, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+44];
 	add.f32 	%f498, %f494, %f497;
 	mul.f32 	%f499, %f496, 0f3F000000;
 	mul.f32 	%f500, %f496, 0f3D372713;
@@ -302530,22 +302530,22 @@ $L__BB404_66:
 	setp.ge.u32 	%p92, %r26, %r29;
 	@%p92 bra 	$L__BB404_68;
 
-	ld.shared.f32 	%f528, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+48];
+	ld.shared.f32 	%f528, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+48];
 	add.f32 	%f529, %f528, 0f00000000;
 	mov.f32 	%f530, 0f00000000;
-	ld.shared.f32 	%f531, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+48];
+	ld.shared.f32 	%f531, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+48];
 	add.f32 	%f532, %f531, 0f00000000;
-	ld.shared.f32 	%f533, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+52];
+	ld.shared.f32 	%f533, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+52];
 	add.f32 	%f534, %f529, %f533;
-	ld.shared.f32 	%f535, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+52];
+	ld.shared.f32 	%f535, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+52];
 	add.f32 	%f536, %f532, %f535;
-	ld.shared.f32 	%f537, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+56];
+	ld.shared.f32 	%f537, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+56];
 	add.f32 	%f538, %f534, %f537;
-	ld.shared.f32 	%f539, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+56];
+	ld.shared.f32 	%f539, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+56];
 	add.f32 	%f540, %f536, %f539;
-	ld.shared.f32 	%f541, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+60];
+	ld.shared.f32 	%f541, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+60];
 	add.f32 	%f542, %f538, %f541;
-	ld.shared.f32 	%f543, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+60];
+	ld.shared.f32 	%f543, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+60];
 	add.f32 	%f544, %f540, %f543;
 	mul.f32 	%f545, %f542, 0f3F000000;
 	mul.f32 	%f546, %f542, 0f3D372713;
@@ -302588,21 +302588,21 @@ $L__BB404_24:
 	setp.ge.u32 	%p67, %r2, %r29;
 	@%p67 bra 	$L__BB404_33;
 
-	ld.shared.f32 	%f182, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial];
+	ld.shared.f32 	%f182, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial];
 	add.f32 	%f183, %f182, 0f00000000;
-	ld.shared.f32 	%f184, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial];
+	ld.shared.f32 	%f184, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial];
 	add.f32 	%f185, %f184, 0f00000000;
-	ld.shared.f32 	%f186, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+4];
+	ld.shared.f32 	%f186, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+4];
 	add.f32 	%f187, %f183, %f186;
-	ld.shared.f32 	%f188, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+4];
+	ld.shared.f32 	%f188, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+4];
 	add.f32 	%f189, %f185, %f188;
-	ld.shared.f32 	%f190, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+8];
+	ld.shared.f32 	%f190, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+8];
 	add.f32 	%f191, %f187, %f190;
-	ld.shared.f32 	%f192, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+8];
+	ld.shared.f32 	%f192, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+8];
 	add.f32 	%f193, %f189, %f192;
-	ld.shared.f32 	%f194, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+12];
+	ld.shared.f32 	%f194, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+12];
 	add.f32 	%f42, %f191, %f194;
-	ld.shared.f32 	%f195, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+12];
+	ld.shared.f32 	%f195, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+12];
 	add.f32 	%f43, %f193, %f195;
 	setp.eq.s32 	%p68, %r30, 2;
 	@%p68 bra 	$L__BB404_30;
@@ -302680,21 +302680,21 @@ $L__BB404_33:
 	setp.ge.u32 	%p71, %r21, %r29;
 	@%p71 bra 	$L__BB404_42;
 
-	ld.shared.f32 	%f234, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+16];
+	ld.shared.f32 	%f234, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+16];
 	add.f32 	%f235, %f234, 0f00000000;
-	ld.shared.f32 	%f236, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+16];
+	ld.shared.f32 	%f236, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+16];
 	add.f32 	%f237, %f236, 0f00000000;
-	ld.shared.f32 	%f238, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+20];
+	ld.shared.f32 	%f238, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+20];
 	add.f32 	%f239, %f235, %f238;
-	ld.shared.f32 	%f240, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+20];
+	ld.shared.f32 	%f240, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+20];
 	add.f32 	%f241, %f237, %f240;
-	ld.shared.f32 	%f242, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+24];
+	ld.shared.f32 	%f242, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+24];
 	add.f32 	%f243, %f239, %f242;
-	ld.shared.f32 	%f244, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+24];
+	ld.shared.f32 	%f244, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+24];
 	add.f32 	%f245, %f241, %f244;
-	ld.shared.f32 	%f246, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+28];
+	ld.shared.f32 	%f246, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+28];
 	add.f32 	%f49, %f243, %f246;
-	ld.shared.f32 	%f247, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+28];
+	ld.shared.f32 	%f247, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+28];
 	add.f32 	%f50, %f245, %f247;
 	setp.eq.s32 	%p72, %r30, 2;
 	@%p72 bra 	$L__BB404_39;
@@ -302772,21 +302772,21 @@ $L__BB404_42:
 	setp.ge.u32 	%p75, %r22, %r29;
 	@%p75 bra 	$L__BB404_51;
 
-	ld.shared.f32 	%f286, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+32];
+	ld.shared.f32 	%f286, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+32];
 	add.f32 	%f287, %f286, 0f00000000;
-	ld.shared.f32 	%f288, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+32];
+	ld.shared.f32 	%f288, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+32];
 	add.f32 	%f289, %f288, 0f00000000;
-	ld.shared.f32 	%f290, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+36];
+	ld.shared.f32 	%f290, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+36];
 	add.f32 	%f291, %f287, %f290;
-	ld.shared.f32 	%f292, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+36];
+	ld.shared.f32 	%f292, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+36];
 	add.f32 	%f293, %f289, %f292;
-	ld.shared.f32 	%f294, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+40];
+	ld.shared.f32 	%f294, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+40];
 	add.f32 	%f295, %f291, %f294;
-	ld.shared.f32 	%f296, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+40];
+	ld.shared.f32 	%f296, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+40];
 	add.f32 	%f297, %f293, %f296;
-	ld.shared.f32 	%f298, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+44];
+	ld.shared.f32 	%f298, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+44];
 	add.f32 	%f56, %f295, %f298;
-	ld.shared.f32 	%f299, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+44];
+	ld.shared.f32 	%f299, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+44];
 	add.f32 	%f57, %f297, %f299;
 	setp.eq.s32 	%p76, %r30, 2;
 	@%p76 bra 	$L__BB404_48;
@@ -302864,21 +302864,21 @@ $L__BB404_51:
 	setp.ge.u32 	%p79, %r23, %r29;
 	@%p79 bra 	$L__BB404_68;
 
-	ld.shared.f32 	%f338, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+48];
+	ld.shared.f32 	%f338, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+48];
 	add.f32 	%f339, %f338, 0f00000000;
-	ld.shared.f32 	%f340, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+48];
+	ld.shared.f32 	%f340, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+48];
 	add.f32 	%f341, %f340, 0f00000000;
-	ld.shared.f32 	%f342, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+52];
+	ld.shared.f32 	%f342, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+52];
 	add.f32 	%f343, %f339, %f342;
-	ld.shared.f32 	%f344, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+52];
+	ld.shared.f32 	%f344, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+52];
 	add.f32 	%f345, %f341, %f344;
-	ld.shared.f32 	%f346, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+56];
+	ld.shared.f32 	%f346, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+56];
 	add.f32 	%f347, %f343, %f346;
-	ld.shared.f32 	%f348, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+56];
+	ld.shared.f32 	%f348, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+56];
 	add.f32 	%f349, %f345, %f348;
-	ld.shared.f32 	%f350, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E12gate_partial+60];
+	ld.shared.f32 	%f350, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE12gate_partial+60];
 	add.f32 	%f63, %f347, %f350;
-	ld.shared.f32 	%f351, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1E10up_partial+60];
+	ld.shared.f32 	%f351, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhS4_jjjjE10up_partial+60];
 	add.f32 	%f64, %f349, %f351;
 	setp.eq.s32 	%p80, %r30, 2;
 	@%p80 bra 	$L__BB404_57;
@@ -302971,9 +302971,9 @@ $L__BB404_59:
 	.reg .b32 	%r<250>;
 	.reg .b64 	%rd<48>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial[64];
+	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial[64];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial[64];
+	.shared .align 4 .b8 _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial[64];
 
 	ld.param.u64 	%rd7, [antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1_param_0];
 	ld.param.u64 	%rd6, [antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1_param_1];
@@ -303281,9 +303281,9 @@ $L__BB405_14:
 	add.f32 	%f35, %f126, %f127;
 	shr.u32 	%r140, %r3, 3;
 	and.b32  	%r141, %r140, 536870908;
-	mov.u32 	%r142, _ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial;
+	mov.u32 	%r142, _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial;
 	add.s32 	%r18, %r142, %r141;
-	mov.u32 	%r143, _ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial;
+	mov.u32 	%r143, _ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial;
 	add.s32 	%r19, %r143, %r141;
 	@%p21 bra 	$L__BB405_16;
 
@@ -303454,22 +303454,22 @@ $L__BB405_60:
 	setp.ge.u32 	%p83, %r2, %r29;
 	@%p83 bra 	$L__BB405_62;
 
-	ld.shared.f32 	%f390, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial];
+	ld.shared.f32 	%f390, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial];
 	add.f32 	%f391, %f390, 0f00000000;
 	mov.f32 	%f392, 0f00000000;
-	ld.shared.f32 	%f393, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial];
+	ld.shared.f32 	%f393, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial];
 	add.f32 	%f394, %f393, 0f00000000;
-	ld.shared.f32 	%f395, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+4];
+	ld.shared.f32 	%f395, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+4];
 	add.f32 	%f396, %f391, %f395;
-	ld.shared.f32 	%f397, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+4];
+	ld.shared.f32 	%f397, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+4];
 	add.f32 	%f398, %f394, %f397;
-	ld.shared.f32 	%f399, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+8];
+	ld.shared.f32 	%f399, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+8];
 	add.f32 	%f400, %f396, %f399;
-	ld.shared.f32 	%f401, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+8];
+	ld.shared.f32 	%f401, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+8];
 	add.f32 	%f402, %f398, %f401;
-	ld.shared.f32 	%f403, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+12];
+	ld.shared.f32 	%f403, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+12];
 	add.f32 	%f404, %f400, %f403;
-	ld.shared.f32 	%f405, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+12];
+	ld.shared.f32 	%f405, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+12];
 	add.f32 	%f406, %f402, %f405;
 	mul.f32 	%f407, %f404, 0f3F000000;
 	mul.f32 	%f408, %f404, 0f3D372713;
@@ -303512,22 +303512,22 @@ $L__BB405_62:
 	setp.ge.u32 	%p86, %r24, %r29;
 	@%p86 bra 	$L__BB405_64;
 
-	ld.shared.f32 	%f436, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+16];
+	ld.shared.f32 	%f436, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+16];
 	add.f32 	%f437, %f436, 0f00000000;
 	mov.f32 	%f438, 0f00000000;
-	ld.shared.f32 	%f439, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+16];
+	ld.shared.f32 	%f439, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+16];
 	add.f32 	%f440, %f439, 0f00000000;
-	ld.shared.f32 	%f441, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+20];
+	ld.shared.f32 	%f441, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+20];
 	add.f32 	%f442, %f437, %f441;
-	ld.shared.f32 	%f443, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+20];
+	ld.shared.f32 	%f443, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+20];
 	add.f32 	%f444, %f440, %f443;
-	ld.shared.f32 	%f445, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+24];
+	ld.shared.f32 	%f445, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+24];
 	add.f32 	%f446, %f442, %f445;
-	ld.shared.f32 	%f447, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+24];
+	ld.shared.f32 	%f447, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+24];
 	add.f32 	%f448, %f444, %f447;
-	ld.shared.f32 	%f449, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+28];
+	ld.shared.f32 	%f449, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+28];
 	add.f32 	%f450, %f446, %f449;
-	ld.shared.f32 	%f451, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+28];
+	ld.shared.f32 	%f451, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+28];
 	add.f32 	%f452, %f448, %f451;
 	mul.f32 	%f453, %f450, 0f3F000000;
 	mul.f32 	%f454, %f450, 0f3D372713;
@@ -303570,22 +303570,22 @@ $L__BB405_64:
 	setp.ge.u32 	%p89, %r25, %r29;
 	@%p89 bra 	$L__BB405_66;
 
-	ld.shared.f32 	%f482, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+32];
+	ld.shared.f32 	%f482, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+32];
 	add.f32 	%f483, %f482, 0f00000000;
 	mov.f32 	%f484, 0f00000000;
-	ld.shared.f32 	%f485, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+32];
+	ld.shared.f32 	%f485, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+32];
 	add.f32 	%f486, %f485, 0f00000000;
-	ld.shared.f32 	%f487, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+36];
+	ld.shared.f32 	%f487, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+36];
 	add.f32 	%f488, %f483, %f487;
-	ld.shared.f32 	%f489, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+36];
+	ld.shared.f32 	%f489, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+36];
 	add.f32 	%f490, %f486, %f489;
-	ld.shared.f32 	%f491, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+40];
+	ld.shared.f32 	%f491, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+40];
 	add.f32 	%f492, %f488, %f491;
-	ld.shared.f32 	%f493, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+40];
+	ld.shared.f32 	%f493, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+40];
 	add.f32 	%f494, %f490, %f493;
-	ld.shared.f32 	%f495, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+44];
+	ld.shared.f32 	%f495, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+44];
 	add.f32 	%f496, %f492, %f495;
-	ld.shared.f32 	%f497, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+44];
+	ld.shared.f32 	%f497, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+44];
 	add.f32 	%f498, %f494, %f497;
 	mul.f32 	%f499, %f496, 0f3F000000;
 	mul.f32 	%f500, %f496, 0f3D372713;
@@ -303628,22 +303628,22 @@ $L__BB405_66:
 	setp.ge.u32 	%p92, %r26, %r29;
 	@%p92 bra 	$L__BB405_68;
 
-	ld.shared.f32 	%f528, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+48];
+	ld.shared.f32 	%f528, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+48];
 	add.f32 	%f529, %f528, 0f00000000;
 	mov.f32 	%f530, 0f00000000;
-	ld.shared.f32 	%f531, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+48];
+	ld.shared.f32 	%f531, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+48];
 	add.f32 	%f532, %f531, 0f00000000;
-	ld.shared.f32 	%f533, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+52];
+	ld.shared.f32 	%f533, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+52];
 	add.f32 	%f534, %f529, %f533;
-	ld.shared.f32 	%f535, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+52];
+	ld.shared.f32 	%f535, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+52];
 	add.f32 	%f536, %f532, %f535;
-	ld.shared.f32 	%f537, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+56];
+	ld.shared.f32 	%f537, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+56];
 	add.f32 	%f538, %f534, %f537;
-	ld.shared.f32 	%f539, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+56];
+	ld.shared.f32 	%f539, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+56];
 	add.f32 	%f540, %f536, %f539;
-	ld.shared.f32 	%f541, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+60];
+	ld.shared.f32 	%f541, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+60];
 	add.f32 	%f542, %f538, %f541;
-	ld.shared.f32 	%f543, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+60];
+	ld.shared.f32 	%f543, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+60];
 	add.f32 	%f544, %f540, %f543;
 	mul.f32 	%f545, %f542, 0f3F000000;
 	mul.f32 	%f546, %f542, 0f3D372713;
@@ -303686,21 +303686,21 @@ $L__BB405_24:
 	setp.ge.u32 	%p67, %r2, %r29;
 	@%p67 bra 	$L__BB405_33;
 
-	ld.shared.f32 	%f182, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial];
+	ld.shared.f32 	%f182, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial];
 	add.f32 	%f183, %f182, 0f00000000;
-	ld.shared.f32 	%f184, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial];
+	ld.shared.f32 	%f184, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial];
 	add.f32 	%f185, %f184, 0f00000000;
-	ld.shared.f32 	%f186, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+4];
+	ld.shared.f32 	%f186, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+4];
 	add.f32 	%f187, %f183, %f186;
-	ld.shared.f32 	%f188, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+4];
+	ld.shared.f32 	%f188, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+4];
 	add.f32 	%f189, %f185, %f188;
-	ld.shared.f32 	%f190, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+8];
+	ld.shared.f32 	%f190, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+8];
 	add.f32 	%f191, %f187, %f190;
-	ld.shared.f32 	%f192, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+8];
+	ld.shared.f32 	%f192, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+8];
 	add.f32 	%f193, %f189, %f192;
-	ld.shared.f32 	%f194, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+12];
+	ld.shared.f32 	%f194, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+12];
 	add.f32 	%f42, %f191, %f194;
-	ld.shared.f32 	%f195, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+12];
+	ld.shared.f32 	%f195, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+12];
 	add.f32 	%f43, %f193, %f195;
 	setp.eq.s32 	%p68, %r30, 2;
 	@%p68 bra 	$L__BB405_30;
@@ -303778,21 +303778,21 @@ $L__BB405_33:
 	setp.ge.u32 	%p71, %r21, %r29;
 	@%p71 bra 	$L__BB405_42;
 
-	ld.shared.f32 	%f234, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+16];
+	ld.shared.f32 	%f234, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+16];
 	add.f32 	%f235, %f234, 0f00000000;
-	ld.shared.f32 	%f236, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+16];
+	ld.shared.f32 	%f236, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+16];
 	add.f32 	%f237, %f236, 0f00000000;
-	ld.shared.f32 	%f238, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+20];
+	ld.shared.f32 	%f238, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+20];
 	add.f32 	%f239, %f235, %f238;
-	ld.shared.f32 	%f240, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+20];
+	ld.shared.f32 	%f240, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+20];
 	add.f32 	%f241, %f237, %f240;
-	ld.shared.f32 	%f242, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+24];
+	ld.shared.f32 	%f242, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+24];
 	add.f32 	%f243, %f239, %f242;
-	ld.shared.f32 	%f244, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+24];
+	ld.shared.f32 	%f244, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+24];
 	add.f32 	%f245, %f241, %f244;
-	ld.shared.f32 	%f246, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+28];
+	ld.shared.f32 	%f246, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+28];
 	add.f32 	%f49, %f243, %f246;
-	ld.shared.f32 	%f247, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+28];
+	ld.shared.f32 	%f247, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+28];
 	add.f32 	%f50, %f245, %f247;
 	setp.eq.s32 	%p72, %r30, 2;
 	@%p72 bra 	$L__BB405_39;
@@ -303870,21 +303870,21 @@ $L__BB405_42:
 	setp.ge.u32 	%p75, %r22, %r29;
 	@%p75 bra 	$L__BB405_51;
 
-	ld.shared.f32 	%f286, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+32];
+	ld.shared.f32 	%f286, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+32];
 	add.f32 	%f287, %f286, 0f00000000;
-	ld.shared.f32 	%f288, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+32];
+	ld.shared.f32 	%f288, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+32];
 	add.f32 	%f289, %f288, 0f00000000;
-	ld.shared.f32 	%f290, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+36];
+	ld.shared.f32 	%f290, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+36];
 	add.f32 	%f291, %f287, %f290;
-	ld.shared.f32 	%f292, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+36];
+	ld.shared.f32 	%f292, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+36];
 	add.f32 	%f293, %f289, %f292;
-	ld.shared.f32 	%f294, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+40];
+	ld.shared.f32 	%f294, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+40];
 	add.f32 	%f295, %f291, %f294;
-	ld.shared.f32 	%f296, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+40];
+	ld.shared.f32 	%f296, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+40];
 	add.f32 	%f297, %f293, %f296;
-	ld.shared.f32 	%f298, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+44];
+	ld.shared.f32 	%f298, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+44];
 	add.f32 	%f56, %f295, %f298;
-	ld.shared.f32 	%f299, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+44];
+	ld.shared.f32 	%f299, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+44];
 	add.f32 	%f57, %f297, %f299;
 	setp.eq.s32 	%p76, %r30, 2;
 	@%p76 bra 	$L__BB405_48;
@@ -303962,21 +303962,21 @@ $L__BB405_51:
 	setp.ge.u32 	%p79, %r23, %r29;
 	@%p79 bra 	$L__BB405_68;
 
-	ld.shared.f32 	%f338, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+48];
+	ld.shared.f32 	%f338, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+48];
 	add.f32 	%f339, %f338, 0f00000000;
-	ld.shared.f32 	%f340, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+48];
+	ld.shared.f32 	%f340, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+48];
 	add.f32 	%f341, %f340, 0f00000000;
-	ld.shared.f32 	%f342, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+52];
+	ld.shared.f32 	%f342, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+52];
 	add.f32 	%f343, %f339, %f342;
-	ld.shared.f32 	%f344, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+52];
+	ld.shared.f32 	%f344, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+52];
 	add.f32 	%f345, %f341, %f344;
-	ld.shared.f32 	%f346, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+56];
+	ld.shared.f32 	%f346, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+56];
 	add.f32 	%f347, %f343, %f346;
-	ld.shared.f32 	%f348, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+56];
+	ld.shared.f32 	%f348, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+56];
 	add.f32 	%f349, %f345, %f348;
-	ld.shared.f32 	%f350, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E12gate_partial+60];
+	ld.shared.f32 	%f350, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE12gate_partial+60];
 	add.f32 	%f63, %f347, %f350;
-	ld.shared.f32 	%f351, [_ZZ50antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1E10up_partial+60];
+	ld.shared.f32 	%f351, [_ZZ49antfly_q4_0_pair_activation_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhS4_jjjjE10up_partial+60];
 	add.f32 	%f64, %f349, %f351;
 	setp.eq.s32 	%p80, %r30, 2;
 	@%p80 bra 	$L__BB405_57;
@@ -304067,7 +304067,7 @@ $L__BB405_59:
 	.reg .b32 	%r<147>;
 	.reg .b64 	%rd<27>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial[128];
+	.shared .align 4 .b8 _ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial[128];
 
 	ld.param.u64 	%rd7, [antfly_q4_0_down_f32_e2b_6144_exact_v1_param_0];
 	ld.param.u64 	%rd8, [antfly_q4_0_down_f32_e2b_6144_exact_v1_param_1];
@@ -304262,7 +304262,7 @@ $L__BB406_12:
 	mov.b32 	%f50, %r85;
 	add.f32 	%f18, %f49, %f50;
 	shl.b32 	%r86, %r4, 2;
-	mov.u32 	%r87, _ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial;
+	mov.u32 	%r87, _ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial;
 	add.s32 	%r24, %r87, %r86;
 	@%p18 bra 	$L__BB406_14;
 
@@ -304361,21 +304361,21 @@ $L__BB406_20:
 	add.s64 	%rd6, %rd24, %rd25;
 	@%p43 bra 	$L__BB406_23;
 
-	ld.shared.f32 	%f78, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial];
+	ld.shared.f32 	%f78, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial];
 	add.f32 	%f79, %f78, 0f00000000;
-	ld.shared.f32 	%f80, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+4];
+	ld.shared.f32 	%f80, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+4];
 	add.f32 	%f81, %f79, %f80;
-	ld.shared.f32 	%f82, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+8];
+	ld.shared.f32 	%f82, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+8];
 	add.f32 	%f83, %f81, %f82;
-	ld.shared.f32 	%f84, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+12];
+	ld.shared.f32 	%f84, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+12];
 	add.f32 	%f85, %f83, %f84;
-	ld.shared.f32 	%f86, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+16];
+	ld.shared.f32 	%f86, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+16];
 	add.f32 	%f87, %f85, %f86;
-	ld.shared.f32 	%f88, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+20];
+	ld.shared.f32 	%f88, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+20];
 	add.f32 	%f89, %f87, %f88;
-	ld.shared.f32 	%f90, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+24];
+	ld.shared.f32 	%f90, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+24];
 	add.f32 	%f91, %f89, %f90;
-	ld.shared.f32 	%f92, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+28];
+	ld.shared.f32 	%f92, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+28];
 	add.f32 	%f93, %f91, %f92;
 	st.global.f32 	[%rd6], %f93;
 
@@ -304384,21 +304384,21 @@ $L__BB406_23:
 	setp.gt.u32 	%p44, %r139, 1535;
 	@%p44 bra 	$L__BB406_25;
 
-	ld.shared.f32 	%f94, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+32];
+	ld.shared.f32 	%f94, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+32];
 	add.f32 	%f95, %f94, 0f00000000;
-	ld.shared.f32 	%f96, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+36];
+	ld.shared.f32 	%f96, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+36];
 	add.f32 	%f97, %f95, %f96;
-	ld.shared.f32 	%f98, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+40];
+	ld.shared.f32 	%f98, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+40];
 	add.f32 	%f99, %f97, %f98;
-	ld.shared.f32 	%f100, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+44];
+	ld.shared.f32 	%f100, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+44];
 	add.f32 	%f101, %f99, %f100;
-	ld.shared.f32 	%f102, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+48];
+	ld.shared.f32 	%f102, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+48];
 	add.f32 	%f103, %f101, %f102;
-	ld.shared.f32 	%f104, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+52];
+	ld.shared.f32 	%f104, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+52];
 	add.f32 	%f105, %f103, %f104;
-	ld.shared.f32 	%f106, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+56];
+	ld.shared.f32 	%f106, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+56];
 	add.f32 	%f107, %f105, %f106;
-	ld.shared.f32 	%f108, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+60];
+	ld.shared.f32 	%f108, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+60];
 	add.f32 	%f109, %f107, %f108;
 	st.global.f32 	[%rd6+4], %f109;
 
@@ -304407,21 +304407,21 @@ $L__BB406_25:
 	setp.gt.u32 	%p45, %r140, 1535;
 	@%p45 bra 	$L__BB406_27;
 
-	ld.shared.f32 	%f110, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+64];
+	ld.shared.f32 	%f110, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+64];
 	add.f32 	%f111, %f110, 0f00000000;
-	ld.shared.f32 	%f112, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+68];
+	ld.shared.f32 	%f112, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+68];
 	add.f32 	%f113, %f111, %f112;
-	ld.shared.f32 	%f114, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+72];
+	ld.shared.f32 	%f114, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+72];
 	add.f32 	%f115, %f113, %f114;
-	ld.shared.f32 	%f116, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+76];
+	ld.shared.f32 	%f116, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+76];
 	add.f32 	%f117, %f115, %f116;
-	ld.shared.f32 	%f118, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+80];
+	ld.shared.f32 	%f118, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+80];
 	add.f32 	%f119, %f117, %f118;
-	ld.shared.f32 	%f120, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+84];
+	ld.shared.f32 	%f120, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+84];
 	add.f32 	%f121, %f119, %f120;
-	ld.shared.f32 	%f122, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+88];
+	ld.shared.f32 	%f122, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+88];
 	add.f32 	%f123, %f121, %f122;
-	ld.shared.f32 	%f124, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+92];
+	ld.shared.f32 	%f124, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+92];
 	add.f32 	%f125, %f123, %f124;
 	st.global.f32 	[%rd6+8], %f125;
 
@@ -304430,21 +304430,21 @@ $L__BB406_27:
 	setp.gt.u32 	%p46, %r141, 1535;
 	@%p46 bra 	$L__BB406_29;
 
-	ld.shared.f32 	%f126, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+96];
+	ld.shared.f32 	%f126, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+96];
 	add.f32 	%f127, %f126, 0f00000000;
-	ld.shared.f32 	%f128, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+100];
+	ld.shared.f32 	%f128, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+100];
 	add.f32 	%f129, %f127, %f128;
-	ld.shared.f32 	%f130, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+104];
+	ld.shared.f32 	%f130, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+104];
 	add.f32 	%f131, %f129, %f130;
-	ld.shared.f32 	%f132, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+108];
+	ld.shared.f32 	%f132, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+108];
 	add.f32 	%f133, %f131, %f132;
-	ld.shared.f32 	%f134, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+112];
+	ld.shared.f32 	%f134, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+112];
 	add.f32 	%f135, %f133, %f134;
-	ld.shared.f32 	%f136, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+116];
+	ld.shared.f32 	%f136, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+116];
 	add.f32 	%f137, %f135, %f136;
-	ld.shared.f32 	%f138, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+120];
+	ld.shared.f32 	%f138, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+120];
 	add.f32 	%f139, %f137, %f138;
-	ld.shared.f32 	%f140, [_ZZ38antfly_q4_0_down_f32_e2b_6144_exact_v1E12warp_partial+124];
+	ld.shared.f32 	%f140, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj6144EEvPfPKfPKhjjjE12warp_partial+124];
 	add.f32 	%f141, %f139, %f140;
 	st.global.f32 	[%rd6+12], %f141;
 
@@ -304468,7 +304468,7 @@ $L__BB406_29:
 	.reg .b32 	%r<147>;
 	.reg .b64 	%rd<27>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial[128];
+	.shared .align 4 .b8 _ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial[128];
 
 	ld.param.u64 	%rd7, [antfly_q4_0_down_f32_e2b_12288_exact_v1_param_0];
 	ld.param.u64 	%rd8, [antfly_q4_0_down_f32_e2b_12288_exact_v1_param_1];
@@ -304663,7 +304663,7 @@ $L__BB407_12:
 	mov.b32 	%f50, %r85;
 	add.f32 	%f18, %f49, %f50;
 	shl.b32 	%r86, %r4, 2;
-	mov.u32 	%r87, _ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial;
+	mov.u32 	%r87, _ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial;
 	add.s32 	%r24, %r87, %r86;
 	@%p18 bra 	$L__BB407_14;
 
@@ -304762,21 +304762,21 @@ $L__BB407_20:
 	add.s64 	%rd6, %rd24, %rd25;
 	@%p43 bra 	$L__BB407_23;
 
-	ld.shared.f32 	%f78, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial];
+	ld.shared.f32 	%f78, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial];
 	add.f32 	%f79, %f78, 0f00000000;
-	ld.shared.f32 	%f80, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+4];
+	ld.shared.f32 	%f80, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+4];
 	add.f32 	%f81, %f79, %f80;
-	ld.shared.f32 	%f82, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+8];
+	ld.shared.f32 	%f82, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+8];
 	add.f32 	%f83, %f81, %f82;
-	ld.shared.f32 	%f84, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+12];
+	ld.shared.f32 	%f84, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+12];
 	add.f32 	%f85, %f83, %f84;
-	ld.shared.f32 	%f86, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+16];
+	ld.shared.f32 	%f86, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+16];
 	add.f32 	%f87, %f85, %f86;
-	ld.shared.f32 	%f88, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+20];
+	ld.shared.f32 	%f88, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+20];
 	add.f32 	%f89, %f87, %f88;
-	ld.shared.f32 	%f90, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+24];
+	ld.shared.f32 	%f90, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+24];
 	add.f32 	%f91, %f89, %f90;
-	ld.shared.f32 	%f92, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+28];
+	ld.shared.f32 	%f92, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+28];
 	add.f32 	%f93, %f91, %f92;
 	st.global.f32 	[%rd6], %f93;
 
@@ -304785,21 +304785,21 @@ $L__BB407_23:
 	setp.gt.u32 	%p44, %r139, 1535;
 	@%p44 bra 	$L__BB407_25;
 
-	ld.shared.f32 	%f94, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+32];
+	ld.shared.f32 	%f94, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+32];
 	add.f32 	%f95, %f94, 0f00000000;
-	ld.shared.f32 	%f96, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+36];
+	ld.shared.f32 	%f96, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+36];
 	add.f32 	%f97, %f95, %f96;
-	ld.shared.f32 	%f98, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+40];
+	ld.shared.f32 	%f98, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+40];
 	add.f32 	%f99, %f97, %f98;
-	ld.shared.f32 	%f100, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+44];
+	ld.shared.f32 	%f100, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+44];
 	add.f32 	%f101, %f99, %f100;
-	ld.shared.f32 	%f102, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+48];
+	ld.shared.f32 	%f102, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+48];
 	add.f32 	%f103, %f101, %f102;
-	ld.shared.f32 	%f104, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+52];
+	ld.shared.f32 	%f104, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+52];
 	add.f32 	%f105, %f103, %f104;
-	ld.shared.f32 	%f106, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+56];
+	ld.shared.f32 	%f106, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+56];
 	add.f32 	%f107, %f105, %f106;
-	ld.shared.f32 	%f108, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+60];
+	ld.shared.f32 	%f108, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+60];
 	add.f32 	%f109, %f107, %f108;
 	st.global.f32 	[%rd6+4], %f109;
 
@@ -304808,21 +304808,21 @@ $L__BB407_25:
 	setp.gt.u32 	%p45, %r140, 1535;
 	@%p45 bra 	$L__BB407_27;
 
-	ld.shared.f32 	%f110, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+64];
+	ld.shared.f32 	%f110, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+64];
 	add.f32 	%f111, %f110, 0f00000000;
-	ld.shared.f32 	%f112, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+68];
+	ld.shared.f32 	%f112, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+68];
 	add.f32 	%f113, %f111, %f112;
-	ld.shared.f32 	%f114, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+72];
+	ld.shared.f32 	%f114, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+72];
 	add.f32 	%f115, %f113, %f114;
-	ld.shared.f32 	%f116, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+76];
+	ld.shared.f32 	%f116, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+76];
 	add.f32 	%f117, %f115, %f116;
-	ld.shared.f32 	%f118, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+80];
+	ld.shared.f32 	%f118, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+80];
 	add.f32 	%f119, %f117, %f118;
-	ld.shared.f32 	%f120, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+84];
+	ld.shared.f32 	%f120, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+84];
 	add.f32 	%f121, %f119, %f120;
-	ld.shared.f32 	%f122, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+88];
+	ld.shared.f32 	%f122, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+88];
 	add.f32 	%f123, %f121, %f122;
-	ld.shared.f32 	%f124, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+92];
+	ld.shared.f32 	%f124, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+92];
 	add.f32 	%f125, %f123, %f124;
 	st.global.f32 	[%rd6+8], %f125;
 
@@ -304831,21 +304831,21 @@ $L__BB407_27:
 	setp.gt.u32 	%p46, %r141, 1535;
 	@%p46 bra 	$L__BB407_29;
 
-	ld.shared.f32 	%f126, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+96];
+	ld.shared.f32 	%f126, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+96];
 	add.f32 	%f127, %f126, 0f00000000;
-	ld.shared.f32 	%f128, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+100];
+	ld.shared.f32 	%f128, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+100];
 	add.f32 	%f129, %f127, %f128;
-	ld.shared.f32 	%f130, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+104];
+	ld.shared.f32 	%f130, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+104];
 	add.f32 	%f131, %f129, %f130;
-	ld.shared.f32 	%f132, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+108];
+	ld.shared.f32 	%f132, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+108];
 	add.f32 	%f133, %f131, %f132;
-	ld.shared.f32 	%f134, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+112];
+	ld.shared.f32 	%f134, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+112];
 	add.f32 	%f135, %f133, %f134;
-	ld.shared.f32 	%f136, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+116];
+	ld.shared.f32 	%f136, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+116];
 	add.f32 	%f137, %f135, %f136;
-	ld.shared.f32 	%f138, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+120];
+	ld.shared.f32 	%f138, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+120];
 	add.f32 	%f139, %f137, %f138;
-	ld.shared.f32 	%f140, [_ZZ39antfly_q4_0_down_f32_e2b_12288_exact_v1E12warp_partial+124];
+	ld.shared.f32 	%f140, [_ZZ38antfly_q4_0_down_f32_e2b_exact_v1_implILj12288EEvPfPKfPKhjjjE12warp_partial+124];
 	add.f32 	%f141, %f139, %f140;
 	st.global.f32 	[%rd6+12], %f141;
 

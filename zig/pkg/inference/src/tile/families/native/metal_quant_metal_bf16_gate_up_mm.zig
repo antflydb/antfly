@@ -1,0 +1,65 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Qualified native program instances and specialization exports.
+
+pub const source_0 =
+    \\           TERMITE_MSL_ABI_BF16_GATE_UP_MATRIX(termite_apply_bf16_gate_up_mm_m64_n32_vec4) "\n"
+    \\           "    threadgroup float4 storage[1024];\n"
+    \\           "    threadgroup float *shared=reinterpret_cast<threadgroup float *>(storage);\n"
+    \\           "    threadgroup float *a=shared, *g=shared+2048, *u=g+1024;\n"
+    \\           "    uint row0=tg.y*64u, col0=tg.x*32u;\n"
+    \\           "    uint sr=(uint(sg)/2u)*16u, sc=(uint(sg)%2u)*16u;\n"
+    \\           "    simdgroup_float8x8 ag[4],au[4];\n"
+    \\           "    TERMITE_FOR_UNROLL(uint i=0;i<4u;i++){ag[i]=make_filled_simdgroup_matrix<float,8>(0.0f);au[i]=make_filled_simdgroup_matrix<float,8>(0.0f);}\n"
+    \\           "    for(uint k0=0;k0<p.in_dim;k0+=32u){\n"
+    \\           "        // Dispatch admits aligned bases. All tails retain the measured\n"
+    \\           "        // scalar staging. Float4 shared storage guarantees alignment.\n"
+    \\           "        bool full=(p.in_dim&3u)==0u&&row0+64u<=p.rows&&col0+32u<=p.out_dim&&k0+32u<=p.in_dim;\n"
+    \\           "        if(full){\n"
+    \\           "            termite_bf16_matrix_stage_input_vec4(x, a, p, row0, k0, tid);\n"
+    \\           "            for(uint i=uint(tid);i<256u;i+=256u){\n"
+    \\           "                uint c=i/8u,k=(i%8u)*4u;\n"
+    \\           "                ushort4 gb=*reinterpret_cast<device const ushort4 *>(wg+(col0+c)*p.in_dim+k0+k);\n"
+    \\           "                ushort4 ub=*reinterpret_cast<device const ushort4 *>(wu+(col0+c)*p.in_dim+k0+k);\n"
+    \\           "                float4 gv=as_type<float4>(uint4(gb)<<16u),uv=as_type<float4>(uint4(ub)<<16u);\n"
+    \\           "                uint j=(k/8u*4u+c/8u)*64u+k%8u*8u+c%8u;\n"
+    \\           "                TERMITE_FOR_UNROLL(uint q=0u;q<4u;q++){g[j+q*8u]=gv[q];u[j+q*8u]=uv[q];}\n"
+    \\           "            }\n"
+    \\           "        }else{\n"
+    \\           "        termite_bf16_matrix_stage_input_scalar(x, a, p, row0, k0, tid);\n"
+    \\           "        for(uint i=uint(tid);i<1024u;i+=256u){\n"
+    \\           "            uint c=i/32u,k=i%32u,j=(k/8u*4u+c/8u)*64u+k%8u*8u+c%8u;\n"
+    \\           "            bool valid=col0+c<p.out_dim&&k0+k<p.in_dim;\n"
+    \\           "            g[j]=valid?termite_bf16_to_f32(wg[(col0+c)*p.in_dim+k0+k]):0.0f;\n"
+    \\           "            u[j]=valid?termite_bf16_to_f32(wu[(col0+c)*p.in_dim+k0+k]):0.0f;\n"
+    \\           "        }\n"
+    \\           "        }\n"
+    \\           TERMITE_MSL_BF16_GATE_UP_MMA
+    \\           "    }\n"
+    \\           TERMITE_MSL_BF16_GATE_UP_PUBLISH
+    \\           "}\n"
+    \\           TERMITE_MSL_ABI_BF16_GATE_UP_MATRIX(termite_apply_bf16_gate_up_mm_m64_n32) "\n"
+    \\           "    // Share exact F32 activations across two BF16 projections; accumulate in F32.\n"
+    \\           "    // Eight simdgroups cover a 64x32 tile. Reuse the 16 KiB staging area for\n"
+    \\           "    // both results before the precise SiLU/multiply epilogue. No global temporaries.\n"
+    \\           "    threadgroup float shared[4096];\n"
+    \\           "    threadgroup float *a=shared, *g=shared+2048, *u=g+1024;\n"
+    \\           "    uint row0=tg.y*64u, col0=tg.x*32u;\n"
+    \\           "    uint sr=(uint(sg)/2u)*16u, sc=(uint(sg)%2u)*16u;\n"
+    \\           "    simdgroup_float8x8 ag[4],au[4];\n"
+    \\           "    TERMITE_FOR_UNROLL(uint i=0;i<4u;i++){ag[i]=make_filled_simdgroup_matrix<float,8>(0.0f);au[i]=make_filled_simdgroup_matrix<float,8>(0.0f);}\n"
+    \\           "    for(uint k0=0;k0<p.in_dim;k0+=32u){\n"
+    \\           "        termite_bf16_matrix_stage_input_scalar(x, a, p, row0, k0, tid);\n"
+    \\           "        for(uint i=uint(tid);i<1024u;i+=256u){\n"
+    \\           "            uint c=i/32u,k=i%32u,j=(k/8u*4u+c/8u)*64u+k%8u*8u+c%8u;\n"
+    \\           "            bool valid=col0+c<p.out_dim&&k0+k<p.in_dim;\n"
+    \\           "            g[j]=valid?termite_bf16_to_f32(wg[(col0+c)*p.in_dim+k0+k]):0.0f;\n"
+    \\           "            u[j]=valid?termite_bf16_to_f32(wu[(col0+c)*p.in_dim+k0+k]):0.0f;\n"
+    \\           "        }\n"
+    \\           TERMITE_MSL_BF16_GATE_UP_MMA
+    \\           "    }\n"
+    \\           TERMITE_MSL_BF16_GATE_UP_PUBLISH
+    \\           "}\n"
+    \\
+;

@@ -1737,6 +1737,9 @@ class RuntimeCacheTest(unittest.TestCase):
                 native_templates.append(
                     self.own("zig/pkg/inference/src/graph/kernel_source_owner.zig")
                 )
+                native_templates.append(self.own("zig/pkg/inference/src/tile/whisper_logits.zig"))
+                if backend == "metal":
+                    native_templates.append(self.own("zig/pkg/inference/src/ops/metal/generated/tile_whisper_logits_partials.msl.h"))
                 first = self.build(
                     "cache-identity", "runtime-unit-cli", backend=backend
                 )
@@ -1785,11 +1788,14 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/kernel_reduction.zig",
                     "src/ops/gpu/depthwise_program.h",
                     "src/ops/gpu/masked_pool_program.h",
+                    "src/graph/cuda_kernel_fold.zig",
+                    "src/tile/source_inputs.zig",
                     "src/backends/metal_param_abi.h",
                     "src/backends/metal_gdn_source.h",
                     "src/backends/metal_buffer_observation.h",
                     "src/backends/metal_mtp_head.h",
                     "src/backends/metal_mtp_head_impl.h",
+                    "src/ops/metal/generated/tile_whisper_logits_partials.msl.h",
                 ] if backend == "metal" else [
                     "src/ops/cuda/kernels.zig",
                     "src/graph/kernel_jit.zig",
@@ -1805,6 +1811,8 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/kernel_reduction.zig",
                     "src/ops/gpu/depthwise_program.h",
                     "src/ops/gpu/masked_pool_program.h",
+                    "src/graph/cuda_kernel_fold.zig",
+                    "src/tile/source_inputs.zig",
                     "src/ops/cuda/embedded_module.zig",
                     "src/ops/cuda/gated_delta.zig",
                     "src/ops/cuda/paged_attention_bf16.zig",
@@ -1868,6 +1876,12 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/cuda/kernels/training_row_softmax.cuh",
                     "src/ops/cuda/kernels/relative_attention_training.cuh",
                 ]
+                qualifier += sorted(
+                    str((Path(directory) / name).relative_to(self.root / "zig/pkg/inference"))
+                    for directory, _, names in os.walk(self.root / "zig/pkg/inference/src/tile", followlinks=True)
+                    for name in names
+                    if name.endswith(".zig") and name != "source_inputs.zig"
+                )
                 self.assertEqual(after[1], self.bundle_digest(qualifier))
                 if backend == "cuda":
                     self.assertEqual(

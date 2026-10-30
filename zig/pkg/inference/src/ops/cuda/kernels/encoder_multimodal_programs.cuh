@@ -987,6 +987,7 @@ extern "C" __global__ void termite_embedding_gemma2_training_unpack_bhsd_bf16(
     else ((__nv_bfloat16*)out)[i] = rounded;
 }
 
+// tile-codegen:begin quant_cuda.bshd family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_embedding_gemma2_pack_bshd_bf16_f32(
     float* out, const __nv_bfloat16* input, unsigned int batch,
     unsigned int sequence, unsigned int heads, unsigned int dim) {
@@ -1010,6 +1011,7 @@ extern "C" __global__ void termite_embedding_gemma2_unpack_bhsd_f32_bf16(
     unsigned int sequence, unsigned int heads, unsigned int dim) {
     antfly_reorder_heads<__nv_bfloat16,float,true>(out, input, batch, sequence, heads, dim);
 }
+// tile-codegen:end quant_cuda.bshd family
 
 // Retain the mean and normalization division boundaries used by the training
 // graph. Frozen inference continues to use its separately qualified kernel.

@@ -526,6 +526,7 @@ extern "C" __global__ void termite_add_weighted_scalars_f32(
     if (i < n) dst[i] = a[i] * scale_a + b[i] * scale_b;
 }
 
+// tile-codegen:begin quant_cuda.dense_f32.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_f32(ANTFLY_CUDA_LINEAR_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = rows * out_dim;
@@ -559,6 +560,7 @@ extern "C" __global__ void termite_linear_f32_tiled(ANTFLY_CUDA_LINEAR_F32_PARAM
     }
     if (tid == 0u) dst[global] = partial[0];
 }
+// tile-codegen:end quant_cuda.dense_f32.0 family
 
 __device__ __forceinline__ float termite_bf16_to_f32(unsigned short value) {
     return __uint_as_float(((unsigned int)value) << 16);
@@ -647,19 +649,24 @@ __device__ __forceinline__ void termite_linear_u16_weight_f32_tiled_impl(
     if (tid == 0u) dst[global] = partial[0];
 }
 
+// tile-codegen:begin quant_cuda.dense_f32.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(ANTFLY_CUDA_LINEAR_BF16_WEIGHT_F32_TILED_PARAMS) {
     termite_linear_u16_weight_f32_tiled_impl<true>(dst, input, weight, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.dense_f32.1 family
 
 // Compatibility route for native FP16 encoder weights when cuBLASLt cannot
 // produce or execute an algorithm for a newly introduced dense shape. This is
 // intentionally simple and universally shaped: qualified tensor-core plans
 // remain the fast path, while an unsupported heuristic degrades to correct
 // device-resident execution instead of failing the request.
+// tile-codegen:begin quant_cuda.dense_f32.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_f16_weight_f32_tiled(ANTFLY_CUDA_LINEAR_BF16_WEIGHT_F32_TILED_PARAMS) {
     termite_linear_u16_weight_f32_tiled_impl<false>(dst, input, weight, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.dense_f32.2 family
 
+// tile-codegen:begin argmax.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_argmax_last_row_f32(
     unsigned int* dst,
     const float* input,
@@ -729,6 +736,7 @@ extern "C" __global__ void termite_argmax_last_row_suppress_f32(
 #include "../kernels/scalar_argmax_fold.cuh"
     if (tid == 0u) dst[0] = best_indices[0];
 }
+// tile-codegen:end argmax.0 family
 
 __device__ __forceinline__ float termite_mtp_load_preproject_weight(
     const void* weight,
@@ -1184,6 +1192,7 @@ extern "C" __global__ void termite_gemma4_mtp_verify_commit_u32(
     result[11] = invalid_model_output;
 }
 
+// tile-codegen:begin quant_cuda.dense_f32.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_bias_f32(
     float* dst,
     const float* input,
@@ -1204,6 +1213,7 @@ extern "C" __global__ void termite_linear_bias_f32(
     }
     dst[idx] = acc;
 }
+// tile-codegen:end quant_cuda.dense_f32.3 family
 
 extern "C" __global__ void termite_add_bias_rows_f32(
     float* dst,
@@ -1299,6 +1309,7 @@ __device__ void termite_linear_bias_f32_tile_rows_cols(
     }
 }
 
+// tile-codegen:begin quant_cuda.linear_f32_tile.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_bias_f32_tile4_r2(
     float* dst,
     const float* input,
@@ -1347,6 +1358,7 @@ extern "C" __global__ void termite_linear_bias_add_f32_tile4_r2(
 ) {
     termite_linear_bias_f32_tile_rows_cols<2u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.linear_f32_tile.0 family
 
 // Projection count is an unrolled specialization, never a runtime loop.
 template<unsigned int Count>
@@ -1431,6 +1443,7 @@ __device__ __forceinline__ void termite_linear_grouped_bias_tile4_r2(
     }
 }
 
+// tile-codegen:begin quant_cuda.linear_f32_tile.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(ANTFLY_CUDA_LINEAR_PAIR_BIAS_F32_TILE4_R2_PARAMS) {
     float* outputs[] = {dst_a, dst_b};
     const float* weights[] = {weight_a, weight_b};
@@ -1444,6 +1457,7 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(ANTFLY_CUDA_L
     const float* biases[] = {bias_a, bias_b, bias_c};
     termite_linear_grouped_bias_tile4_r2<3>(outputs, input, weights, biases, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.linear_f32_tile.1 family
 
 // One RMS reduction schedule; epilogues specialize before device code generation.
 // ScaleStage: 0=none, 1=scale normalized value before residual, 2=scale final sum.
@@ -1474,6 +1488,7 @@ __device__ __forceinline__ void termite_rms_norm_impl(
     }
 }
 
+// tile-codegen:begin rms_norm.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rms_norm_f32(ANTFLY_CUDA_RMS_NORM_PARAMS) {
     termite_rms_norm_impl<true, false, false, 0>(dst, nullptr, input, weight, nullptr, nullptr, rows, dim, eps);
 }
@@ -1501,10 +1516,12 @@ extern "C" __global__ void termite_rms_norm_add_output_scale_f32(ANTFLY_CUDA_RMS
 extern "C" __global__ void termite_rms_norm_bare_f32(ANTFLY_CUDA_RMS_NORM_BARE_PARAMS) {
     termite_rms_norm_impl<false, false, false, 0>(dst, nullptr, input, nullptr, nullptr, nullptr, rows, dim, eps);
 }
+// tile-codegen:end rms_norm.0 family
 
 // Gemma 4 A4B branches three RMSNorms from the same attention residual. Share
 // the denominator reduction while preserving the ordinary RMSNorm reduction
 // order, then materialize the three independently weighted outputs.
+// tile-codegen:begin rms_norm.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(ANTFLY_CUDA_GEMMA4_A4B_RMS_NORM_TRIPLE_PARAMS) {
     const unsigned int row = blockIdx.x;
     if (row >= rows) return;
@@ -1522,6 +1539,7 @@ extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(ANTFLY_CUDA_GE
         third[idx] = normalized * third_weight[i];
     }
 }
+// tile-codegen:end rms_norm.1 family
 
 // Fused Gemma 4 A4B parallel-FFN epilogue:
 //   rms(shared) + rms(routed) -> rms(combined) + attention residual.
@@ -1603,6 +1621,7 @@ __device__ __forceinline__ void termite_layer_norm_impl(
         });
 }
 
+// tile-codegen:begin layer_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_layer_norm_f32(ANTFLY_CUDA_LAYER_NORM_PARAMS) {
     termite_layer_norm_impl<false>(dst, input, nullptr, gamma, beta, rows, dim, eps);
 }
@@ -1610,6 +1629,7 @@ extern "C" __global__ void termite_layer_norm_f32(ANTFLY_CUDA_LAYER_NORM_PARAMS)
 extern "C" __global__ void termite_add_layer_norm_f32(ANTFLY_CUDA_ADD_LAYER_NORM_PARAMS) {
     termite_layer_norm_impl<true>(dst, a, b, gamma, beta, rows, dim, eps);
 }
+// tile-codegen:end layer_norm family
 
 extern "C" __global__ void termite_elementwise_f32(
     float* dst,
@@ -1889,6 +1909,7 @@ __device__ __forceinline__ void termite_embedding_dense_impl(
     dst[idx] = value * scale;
 }
 
+// tile-codegen:begin reduce.embedding_lookup family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_embedding_lookup_f32(
     float* dst,
     const float* weight,
@@ -1940,6 +1961,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_f16_weight_f32(
 ) {
     termite_embedding_dense_impl<2u>(dst, weight, ids, total, dim, scale);
 }
+// tile-codegen:end reduce.embedding_lookup family
 
 extern "C" __global__ void termite_take_rows_f32(
     float* dst,
@@ -2171,11 +2193,13 @@ extern "C" __global__ void termite_attention_f32(ANTFLY_CUDA_DENSE_ATTENTION_PAR
     dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
 }
 
+// tile-codegen:begin attention.block family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_block(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     constexpr bool Local = false;
     const unsigned int radius = 0u;
 #include "../kernels/block_local_attention.cuh"
 }
+// tile-codegen:end attention.block family
 
 // Qwen3-VL vision attention for graph-layout [B, S, H, 64] tensors.  The
 // generic scalar fallback assigns one thread to every output channel and
@@ -2428,16 +2452,20 @@ __device__ __forceinline__ void termite_bert_prefill_hd64_impl(
     dst[q_base + lane + 32u] = acc1 / denom;
 }
 
+// tile-codegen:begin attention.bert_prefill.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     termite_bert_prefill_hd64_impl<8, unsigned int>(dst, q, k, v, mask, bias, batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major);
 }
+// tile-codegen:end attention.bert_prefill.0 family
 
 // Sixteen-query version of the exact q8 schedule above. It preserves every
 // per-row arithmetic and reduction order, but doubles query rows per launch
 // block to reduce grid traffic and improve occupancy on encoder prefill.
+// tile-codegen:begin attention.bert_prefill.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q16(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     termite_bert_prefill_hd64_impl<16, unsigned long long>(dst, q, k, v, mask, bias, batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major);
 }
+// tile-codegen:end attention.bert_prefill.1 family
 
 // Opt-in WMMA candidate for full BERT/XLM-R prefill attention. A block owns
 // 16 query rows for one [batch, head] pair and streams all 256 keys in four
@@ -3072,9 +3100,11 @@ __device__ __forceinline__ void termite_rope_impl(
     dst[idx] = Scaled ? value * scale : value;
 }
 
+// tile-codegen:begin reduce.rope.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rope_f32(ANTFLY_CUDA_ROPE_PARAMS) {
     termite_rope_impl<false, false>(dst, input, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, 1.0f, nullptr);
 }
+// tile-codegen:end reduce.rope.0 family
 
 // Qwen3-VL text M-RoPE. Positions are axis-major [3, token_count], while
 // input/output are token-major chunks of head_dim floats. The section values
@@ -3090,6 +3120,7 @@ static __device__ __forceinline__ float termite_qwen3vl_rotate(
     return d < rotary_pairs ? left * c - right * s : left * s + right * c;
 }
 
+// tile-codegen:begin reduce.rope.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_qwen3vl_mrope_f32(ANTFLY_CUDA_QWEN3VL_MROPE_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = total_chunks * head_dim;
@@ -3112,9 +3143,11 @@ extern "C" __global__ void termite_qwen3vl_mrope_f32(ANTFLY_CUDA_QWEN3VL_MROPE_F
     float angle = (float)position * freq_scale * frequency;
     dst[idx] = termite_qwen3vl_rotate(input, chunk * head_dim, pair, rotary_pairs, d, angle);
 }
+// tile-codegen:end reduce.rope.1 family
 
 // Qwen3-VL vision RoPE. Positions are axis-major [height,width] and each
 // axis restarts the frequency index at zero, matching the HF concatenation.
+// tile-codegen:begin reduce.rope.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_qwen3vl_vision_rope_f32(ANTFLY_CUDA_QWEN3VL_VISION_ROPE_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = total_chunks * head_dim;
@@ -3138,6 +3171,7 @@ extern "C" __global__ void termite_qwen3vl_vision_rope_f32(ANTFLY_CUDA_QWEN3VL_V
 extern "C" __global__ void termite_rope_decode_scalars_f32(ANTFLY_CUDA_ROPE_DECODE_SCALARS_PARAMS) {
     termite_rope_impl<false, true>(dst, input, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, 1.0f, decode_scalars);
 }
+// tile-codegen:end reduce.rope.2 family
 
 extern "C" __global__ void termite_decode_scalars_advance(
     unsigned int* decode_scalars,
@@ -3155,6 +3189,7 @@ extern "C" __global__ void termite_decode_scalars_advance(
     decode_scalars[4] += kv_position_delta;
 }
 
+// tile-codegen:begin reduce.rope.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rope_scaled_f32(ANTFLY_CUDA_ROPE_SCALED_PARAMS) {
     termite_rope_impl<true, false>(dst, input, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, scale, nullptr);
 }
@@ -3180,6 +3215,7 @@ extern "C" __global__ void termite_rope_per_item_f32(ANTFLY_CUDA_ROPE_PER_ITEM_P
     unsigned int base = chunk * head_dim;
     dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
 }
+// tile-codegen:end reduce.rope.3 family
 
 // Fused normalization keeps its guarded scalar load and original reduction.
 template<bool Decode>
@@ -3240,6 +3276,7 @@ __device__ __forceinline__ void termite_rms_norm_heads_rope_impl(
     }
 }
 
+// tile-codegen:begin reduce.rope.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rms_norm_heads_rope_f32(ANTFLY_CUDA_RMS_NORM_HEADS_ROPE_PARAMS) {
     termite_rms_norm_heads_rope_impl<false>(dst, input, weight, total_chunks, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, output_scale, nullptr);
 }
@@ -3247,6 +3284,7 @@ extern "C" __global__ void termite_rms_norm_heads_rope_f32(ANTFLY_CUDA_RMS_NORM_
 extern "C" __global__ void termite_rms_norm_heads_rope_decode_scalars_f32(ANTFLY_CUDA_RMS_NORM_HEADS_ROPE_DECODE_SCALARS_PARAMS) {
     termite_rms_norm_heads_rope_impl<true>(dst, input, weight, total_chunks, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, output_scale, decode_scalars);
 }
+// tile-codegen:end reduce.rope.4 family
 
 extern "C" __global__ void termite_gqa_attention_f32(
     float* dst,
@@ -3332,6 +3370,7 @@ extern "C" __global__ void termite_gqa_attention_f32(
     dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
 }
 
+// tile-codegen:begin attention.gqa_fast family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_scalars_fast_f32(
     float* dst,
     const float* q,
@@ -3434,6 +3473,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_fast_f32(
 
 #include "../kernels/dense_fast_attention_online.cuh"
 }
+// tile-codegen:end attention.gqa_fast family
 
 template<bool DeviceScalars>
 __device__ __forceinline__ void termite_gqa_scalar_decode_impl(
@@ -3557,6 +3597,7 @@ __device__ __forceinline__ void termite_gqa_scalar_decode_impl(
     }
 }
 
+// tile-codegen:begin attention.gqa_decode family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_f32(
     float* dst,
     const float* q,
@@ -3603,6 +3644,7 @@ extern "C" __global__ void termite_gqa_attention_decode_scalars_f32(
 ) {
     termite_gqa_scalar_decode_impl<true>(dst, q, k, v, attn_or_mask, bias, batch, q_seq_len, kv_seq_len, num_heads, num_kv_heads, head_dim, query_position_offset, kv_position_offset, sliding_window, total_sequence_len, mask_len, bias_mode, decode_scalars);
 }
+// tile-codegen:end attention.gqa_decode family
 
 // quant-kernel-codegen:begin generated CUDA attention kernels (do not edit; run: zig build quant-kernel-codegen -- --write)
 // Copyright 2026 Antfly, Inc.
@@ -8018,6 +8060,7 @@ __device__ void termite_quant_tile_rows_cols_fast(
     }
 }
 
+// tile-codegen:begin quant_cuda.q8_0_tile.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_f32_tile4_r2(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
     termite_q8_0_tile_rows_cols<2u, 4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
@@ -8065,6 +8108,7 @@ extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_fast_r4c4(ANTFLY_CU
 extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r4c4(ANTFLY_CUDA_QUANT_LINEAR_RESIDUAL_PARAMS) {
     termite_quant_tile_rows_cols_fast<false, 4u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.q8_0_tile.0 family
 
 // Dequantize Q4_0 into BF16 with exactly the existing F32 multiply and RNE
 // conversion. Adjacent threads write adjacent elements rather than each
@@ -8254,6 +8298,7 @@ __device__ __forceinline__ void termite_quantize_q8_1_rows_impl(
 #include "../kernels/q8_1_zero_sum_store.cuh"
 }
 
+// tile-codegen:begin quant_cuda.quantize_q8_1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_quantize_f32_q8_1_rows(
     unsigned char* dst,
     const float* input,
@@ -8273,6 +8318,7 @@ extern "C" __global__ void termite_quantize_gated_f32_q8_1_rows(
 ) {
     termite_quantize_q8_1_rows_impl<true>(dst, gate, up, rows, in_dim, activation);
 }
+// tile-codegen:end quant_cuda.quantize_q8_1 family
 
 
 
@@ -8379,9 +8425,11 @@ __device__ void termite_q8_0_tile_cols(
     }
 }
 
+// tile-codegen:begin quant_cuda.q8_0_tile.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_f32_tile4(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
     termite_q8_0_tile_cols<4u>(dst, input, weight, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.q8_0_tile.1 family
 
 extern "C" __global__ void termite_linear_q8_0_gated_down_f32_tile4(ANTFLY_CUDA_QUANT_GATED_DOWN_PARAMS) {
     unsigned int col_tile = blockIdx.x * 4u;
@@ -8485,6 +8533,7 @@ __device__ __forceinline__ void termite_q4_0_tile_cols(
     termite_q4_0_tile_cols_at<COLS, WARPS, Gated>(dst, input, weight, rows, in_dim, out_dim, blockIdx.y, blockIdx.x * COLS, up, activation);
 }
 
+// tile-codegen:begin quant_cuda.q4_0_tile.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_f32_tile4(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
     termite_q4_0_tile_cols<4u>(dst, input, weight, rows, in_dim, out_dim);
 }
@@ -8492,6 +8541,7 @@ extern "C" __global__ void termite_linear_q4_0_f32_tile4(ANTFLY_CUDA_QUANT_LINEA
 extern "C" __global__ void termite_linear_q4_0_f32_tile4_w4(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
     termite_q4_0_tile_cols<4u, 4u>(dst, input, weight, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.q4_0_tile.0 family
 
 // Packed-input MMV traversal; callers retain their exact shared arrays and epilogues.
 template<unsigned int Cols>
@@ -8528,6 +8578,7 @@ __device__ __forceinline__ void termite_q4_0_q8_1_cols_partial(
     }
 }
 
+// tile-codegen:begin quant_cuda.q4_0_tile.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
     unsigned int col_tile = blockIdx.x * 4u;
     unsigned int row = blockIdx.y;
@@ -8591,6 +8642,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8(ANTFLY_CUDA_Q8_
     termite_q4_0_q8_1_cols_partial<4u>(acc, q8_input, weight, row, row_blocks, out_dim, col_tile, full_tile, tid);
     termite_store_q4_0_cols_warp_sum_warps<4u, 8u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
+// tile-codegen:end quant_cuda.q4_0_tile.1 family
 
 template<unsigned int Rows>
 __device__ __forceinline__ void termite_q4_0_q8_1_rows_impl(
@@ -8811,6 +8863,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows2(ANTFLY_CU
     }
 }
 
+// tile-codegen:begin quant_cuda.q4_0_tile.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows4(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
     termite_q4_0_q8_1_rows_impl<4u>(dst, q8_input, weight, rows, in_dim, out_dim);
 }
@@ -8835,6 +8888,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down(
     termite_q4_0_q8_1_cols_partial<4u>(acc, q8_input, weight, 0u, row_blocks, 0u, col_tile, true, tid);
     termite_store_q4_0_cols_warp_sum_warps<4u, 8u, true, true>(dst, 0u, 0u, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
+// tile-codegen:end quant_cuda.q4_0_tile.2 family
 
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows(
     float* dst,
@@ -8855,6 +8909,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows(
     termite_store_q4_0_cols_warp_sum_warps<4u, 8u, true, true>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 
+// tile-codegen:begin quant_cuda.q4_0_tile.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down(
     float* dst,
     const unsigned char* q8_input,
@@ -8871,6 +8926,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down(
     termite_q4_0_q8_1_cols_partial<4u>(acc, q8_input, weight, 0u, row_blocks, 0u, col_tile, true, tid);
     termite_store_q4_0_cols_warp_sum_warps<4u, 10u, true, true>(dst, 0u, 0u, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
+// tile-codegen:end quant_cuda.q4_0_tile.3 family
 
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
     const unsigned int cols = 8u;
@@ -8888,9 +8944,11 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INP
     termite_store_q4_0_cols_warp_sum_warps<8u, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 
+// tile-codegen:begin quant_cuda.q4_0_tile.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_f32_tile8(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
     termite_q4_0_tile_cols<8u>(dst, input, weight, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.q4_0_tile.4 family
 
 // Keep activation in the exported epilogue: factoring it into the shared
 // dot helper changes NVCC libdevice inlining and raises SM89/SM90 register use.
@@ -8931,6 +8989,7 @@ __device__ __forceinline__ void termite_q4_0_activation_slice_partials(
     }
 }
 
+// tile-codegen:begin quant_cuda.q4_0_tile.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_f32_tile4(ANTFLY_CUDA_LINEAR_Q4_0_ACTIVATION_SLICE_LAST_DIM_F32_TILE4_PARAMS) {
     unsigned int col_tile = blockIdx.x * 4u;
     unsigned int row = blockIdx.y;
@@ -8982,6 +9041,7 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_f32_til
         }
     }
 }
+// tile-codegen:end quant_cuda.q4_0_tile.5 family
 
 extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4(
     float* dst,
@@ -9028,6 +9088,7 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_q8_1_f3
     }
 }
 
+// tile-codegen:begin quant_cuda.q4_0_tile.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile4(ANTFLY_CUDA_QUANT_GATED_DOWN_PARAMS) {
     termite_q4_0_tile_cols<4u, 8u, true>(dst, gate, weight, rows, in_dim, out_dim, up, activation);
 }
@@ -9043,6 +9104,7 @@ extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile8(ANTFLY_CUDA_
 extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile16(ANTFLY_CUDA_QUANT_GATED_DOWN_PARAMS) {
     termite_q4_0_tile_cols<16u, 8u, true>(dst, gate, weight, rows, in_dim, out_dim, up, activation);
 }
+// tile-codegen:end quant_cuda.q4_0_tile.6 family
 
 __device__ __forceinline__ int termite_pack_q6k_i8x4(const unsigned char* bp, unsigned int base_value_index) {
     signed char values[4];
@@ -9334,6 +9396,7 @@ __device__ void termite_qtc_hmma_tile(
     }
 }
 
+// tile-codegen:begin quant_cuda.tc_hmma.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_f32_tc_hmma(
     float* dst,
     const float* input,
@@ -9464,6 +9527,7 @@ extern "C" __global__ void termite_linear_q4_0_bias_add_f32_tc_hmma(
 ) {
     termite_qtc_hmma_tile<3u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.tc_hmma.0 family
 
 // BF16 tensor-core mirror of the Q4_0 tc_hmma linear set. Same signatures and
 // launch geometry as the f16 kernels above (block=256, grid.x=ceil(out_dim/32),
@@ -9471,6 +9535,7 @@ extern "C" __global__ void termite_linear_q4_0_bias_add_f32_tc_hmma(
 // element type. Consumes the identical q4_0_hmma packed layout. bf16 has f32's
 // exponent range, so these stay numerically close to the exact f32 mirror even
 // when Gemma activations exceed f16's 65504 limit.
+// tile-codegen:begin quant_cuda.tc_hmma.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_f32_tc_hmma_bf16(
     float* dst,
     const float* input,
@@ -9483,6 +9548,7 @@ extern "C" __global__ void termite_linear_q4_0_f32_tc_hmma_bf16(
     termite_qtc_hmma_tile<0u, TERMITE_QTC_FMT_Q4_0, __nv_bfloat16>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
 #endif
 }
+// tile-codegen:end quant_cuda.tc_hmma.1 family
 
 
 
@@ -9721,6 +9787,7 @@ __device__ void termite_q4k_pair_tile_rows_cols(
     }
 }
 
+// tile-codegen:begin quant_cuda.k_quant family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_k_f32_tile4(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
     termite_q4k_tile_cols<4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
@@ -9976,7 +10043,9 @@ extern "C" __global__ void termite_linear_q4_k_pair_bias_f32_tiled(ANTFLY_CUDA_L
 #include "../kernels/q4_k_tiled_dot.cuh"
     if (tid == 0u) dst[local] = partial[0] + bias[col];
 }
+// tile-codegen:end quant_cuda.k_quant family
 
+// tile-codegen:begin quant_cuda.cols4_tree.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_pair_nobias_f32_tile4(ANTFLY_CUDA_QUANT_PAIR_PARAMS) {
     const unsigned int cols = 4u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
@@ -9991,7 +10060,9 @@ extern "C" __global__ void termite_linear_q8_0_pair_nobias_f32_tile4(ANTFLY_CUDA
     float* dst = projection == 0u ? dst_a : dst_b;
 #include "../kernels/q8_projection_tile4.cuh"
 }
+// tile-codegen:end quant_cuda.cols4_tree.0 family
 
+// tile-codegen:begin quant_cuda.q4_0_projections.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4(ANTFLY_CUDA_QUANT_PAIR_PARAMS) {
     const unsigned int cols = 4u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
@@ -10006,6 +10077,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4(ANTFLY_CUDA
     float* dst = projection == 0u ? dst_a : dst_b;
     termite_q4_0_tile_cols_at<4u, 8u>(dst, input, weight, rows, in_dim, out_dim, row, col_tile);
 }
+// tile-codegen:end quant_cuda.q4_0_projections.0 family
 
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4_w4(ANTFLY_CUDA_QUANT_PAIR_PARAMS) {
     const unsigned int cols = 4u;
@@ -10080,6 +10152,7 @@ __device__ __forceinline__ void termite_q4_0_pair_q8_1_tile4_impl(
     termite_store_q4_0_cols_warp_sum_warps<4u, Warps>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 
+// tile-codegen:begin quant_cuda.q4_0_projections.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4(ANTFLY_CUDA_Q8_INPUT_PAIR_PARAMS) {
     termite_q4_0_pair_q8_1_tile4_impl<4u>(dst_a, dst_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim);
 }
@@ -10087,6 +10160,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4(ANTFLY
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_w8(ANTFLY_CUDA_Q8_INPUT_PAIR_PARAMS) {
     termite_q4_0_pair_q8_1_tile4_impl<8u>(dst_a, dst_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.q4_0_projections.1 family
 
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INPUT_PAIR_PARAMS) {
     const unsigned int cols = 8u;
@@ -10290,6 +10364,7 @@ __device__ __forceinline__ void termite_q4_0_pair_activation_q8_1_tile4_impl(
     }
 }
 
+// tile-codegen:begin quant_cuda.pair_activation_q8_1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4(ANTFLY_CUDA_Q8_INPUT_PAIR_ACTIVATION_PARAMS) {
     termite_q4_0_pair_activation_q8_1_tile4_impl<4u>(dst, q8_input, weight_gate, weight_up, rows, in_dim, out_dim, activation);
 }
@@ -10297,6 +10372,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4(AN
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8(ANTFLY_CUDA_Q8_INPUT_PAIR_ACTIVATION_PARAMS) {
     termite_q4_0_pair_activation_q8_1_tile4_impl<8u>(dst, q8_input, weight_gate, weight_up, rows, in_dim, out_dim, activation);
 }
+// tile-codegen:end quant_cuda.pair_activation_q8_1 family
 
 // Qualified resident Gemma 4 26B-A4B Q4_0 path. The router and both expert
 // projections remain device-side for decode and prefill. Packed projection
@@ -10608,6 +10684,7 @@ __device__ __forceinline__ void termite_e4b_ffn_pair_impl(float* dst,
     }
 }
 
+// tile-codegen:begin quant_cuda.q4_0_projections.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn(
     float* dst,
     const unsigned char* q8_input,
@@ -10627,6 +10704,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5
 ) {
     termite_e4b_ffn_pair_impl<5u>(dst, q8_input, weight_gate, weight_up, activation);
 }
+// tile-codegen:end quant_cuda.q4_0_projections.2 family
 
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn(
     unsigned char* dst_q8,
@@ -11282,6 +11360,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile8(AN
     }
 }
 
+// tile-codegen:begin quant_cuda.q4_0_projections.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile8(ANTFLY_CUDA_QUANT_PAIR_PARAMS) {
     const unsigned int cols = 8u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
@@ -11296,7 +11375,9 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile8(ANTFLY_CUDA
     float* dst = projection == 0u ? dst_a : dst_b;
     termite_q4_0_tile_cols_at<8u, 8u>(dst, input, weight, rows, in_dim, out_dim, row, col_tile);
 }
+// tile-codegen:end quant_cuda.q4_0_projections.3 family
 
+// tile-codegen:begin quant_cuda.cols4_tree.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_k_pair_nobias_f32_tile4(ANTFLY_CUDA_QUANT_PAIR_PARAMS) {
     const unsigned int cols = 4u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
@@ -11401,6 +11482,7 @@ extern "C" __global__ void termite_linear_q4_k_argmax_stage1_tile4(ANTFLY_CUDA_Q
     }
 #include "../kernels/quant_argmax_publish.cuh"
 }
+// tile-codegen:end quant_cuda.cols4_tree.1 family
 
 template<bool Q8, unsigned int Columns>
 __device__ __forceinline__ void termite_scalar_projection_argmax_impl(    float* partial_values,      unsigned int* partial_indices,      const float* input,      const unsigned char* weight,      const int* suppress_token_ids,      unsigned int rows,      unsigned int in_dim,      unsigned int out_dim,      unsigned int suppress_count){
@@ -11438,10 +11520,13 @@ __device__ __forceinline__ void termite_scalar_projection_argmax_impl(    float*
 #include "../kernels/quant_argmax_publish.cuh"
 }
 
+// tile-codegen:begin quant_cuda.cols4_tree.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_argmax_rows_stage1_tile4(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {
     termite_scalar_projection_argmax_impl<true, 4u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
 }
+// tile-codegen:end quant_cuda.cols4_tree.2 family
 
+// tile-codegen:begin quant_cuda.q4_0_projections.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_argmax_rows_stage1_tile4(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {
     termite_scalar_projection_argmax_impl<false, 4u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
 }
@@ -11449,6 +11534,7 @@ extern "C" __global__ void termite_linear_q4_0_argmax_rows_stage1_tile4(ANTFLY_C
 extern "C" __global__ void termite_linear_q4_0_argmax_rows_stage1_tile16(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {
     termite_scalar_projection_argmax_impl<false, 16u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
 }
+// tile-codegen:end quant_cuda.q4_0_projections.4 family
 
 template<bool Q6, unsigned int Columns>
 __device__ __forceinline__ void termite_k_projection_argmax_impl(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {
@@ -11484,10 +11570,13 @@ __device__ __forceinline__ void termite_k_projection_argmax_impl(ANTFLY_CUDA_QUA
 #include "../kernels/quant_argmax_publish.cuh"
 }
 
+// tile-codegen:begin quant_cuda.cols4_tree.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_k_argmax_rows_stage1_tile4(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {
     termite_k_projection_argmax_impl<false, 4u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
 }
+// tile-codegen:end quant_cuda.cols4_tree.3 family
 
+// tile-codegen:begin quant_cuda.q4_0_projections.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile4(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {
     termite_k_projection_argmax_impl<true, 4u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
 }
@@ -11499,6 +11588,7 @@ extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile8(ANTFLY_C
 extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile16(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {
     termite_k_projection_argmax_impl<true, 16u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
 }
+// tile-codegen:end quant_cuda.q4_0_projections.5 family
 
 extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8(ANTFLY_CUDA_Q8_QUANT_ARGMAX_PARAMS) {
     const unsigned int cols = 8u;
@@ -11870,6 +11960,7 @@ __device__ __forceinline__ void termite_argmax_reduce_pairs_impl(
     }
 }
 
+// tile-codegen:begin argmax.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_argmax_reduce_rows_pairs_f32(
     unsigned int* dst,
     const float* partial_values,
@@ -11944,10 +12035,12 @@ extern "C" __global__ void termite_argmax_reduce_pairs_f32(
         dst[0] = final_index == 0xffffffffu ? 0u : final_index;
     }
 }
+// tile-codegen:end argmax.1 family
 
 static __device__ __forceinline__ float termite_qkv_weight_value(float value) { return value; }
 static __device__ __forceinline__ float termite_qkv_weight_value(unsigned short value) { return termite_bf16_to_f32(value); }
 
+// tile-codegen:begin attention.qkv_tiled family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_f32_qkv_nobias_tiled(ANTFLY_CUDA_LINEAR_F32_QKV_NOBIAS_TILED_PARAMS) {
     typedef float Weight;
 #include "../kernels/dense_qkv_tiled.cuh"
@@ -11957,6 +12050,7 @@ extern "C" __global__ void termite_linear_bf16_weight_f32_qkv_nobias_tiled(ANTFL
     typedef unsigned short Weight;
 #include "../kernels/dense_qkv_tiled.cuh"
 }
+// tile-codegen:end attention.qkv_tiled family
 
 extern "C" __global__ void termite_linear_q8_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     const unsigned int cols = 4u;
@@ -12029,9 +12123,11 @@ __device__ __forceinline__ void termite_q4_0_qkv_projection_impl(ANTFLY_CUDA_QUA
     termite_q4_0_tile_cols_at<COLS, WARPS>(dst, input, weight, rows, in_dim, out_dim, row, col_tile);
 }
 
+// tile-codegen:begin quant_cuda.q4_0_projections.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     termite_q4_0_qkv_projection_impl<4u, 8u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
+// tile-codegen:end quant_cuda.q4_0_projections.6 family
 
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4_w4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     termite_q4_0_qkv_projection_impl<4u, 4u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
@@ -12106,9 +12202,11 @@ __device__ __forceinline__ void termite_packed_qkv_projection_impl(    float* ds
     termite_store_q4_0_cols_warp_sum_warps<Columns, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 
+// tile-codegen:begin quant_cuda.qkv_q8_1.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile4(ANTFLY_CUDA_Q8_INPUT_QKV_PARAMS) {
     termite_packed_qkv_projection_impl<4u>(dst_q, dst_k, dst_v, q8_input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
+// tile-codegen:end quant_cuda.qkv_q8_1.0 family
 
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INPUT_QKV_PARAMS) {
     termite_packed_qkv_projection_impl<8u>(dst_q, dst_k, dst_v, q8_input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
@@ -12248,6 +12346,7 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4(A
     }
 }
 
+// tile-codegen:begin quant_cuda.qkv_q8_1.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8(ANTFLY_CUDA_Q8_INPUT_QKV_PARAMS) {
     const unsigned int cols = 8u;
     unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
@@ -12304,10 +12403,13 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8(ANTF
     }
     termite_store_q4_0_cols_warp_sum_warps<8u, 8u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
+// tile-codegen:end quant_cuda.qkv_q8_1.1 family
 
+// tile-codegen:begin quant_cuda.q4_0_projections.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile8(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     termite_q4_0_qkv_projection_impl<8u, 8u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
+// tile-codegen:end quant_cuda.q4_0_projections.7 family
 
 extern "C" __global__ void termite_linear_q4_k_qkv_nobias_f32_tiled(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     unsigned int q_plane = rows * q_out_dim;
@@ -12440,6 +12542,7 @@ __device__ __forceinline__ void termite_embedding_quant_impl(
     dst[idx] = value * scale;
 }
 
+// tile-codegen:begin quant_cuda.embedding.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_embedding_lookup_q4_k_f32(ANTFLY_CUDA_EMBEDDING_LOOKUP_Q4_K_F32_PARAMS) {
     termite_embedding_quant_impl<0u>(dst, weight, ids, total, dim, scale);
 }
@@ -12486,6 +12589,7 @@ extern "C" __global__ void termite_embedding_add_weighted_i32_q6_k_f32(
     const unsigned char* bp = weight + (src_row * row_blocks + block) * 210ull;
     dst[idx] = termite_q6k_value(bp, value_index) * lhs_scale + rhs[idx] * rhs_scale;
 }
+// tile-codegen:end quant_cuda.embedding.0 family
 
 extern "C" __global__ void termite_rms_norm_add_weighted_embedding_i32_q6_k_f32(ANTFLY_CUDA_RMS_NORM_ADD_WEIGHTED_EMBEDDING_I32_Q6_K_F32_PARAMS) {
     unsigned int group_row = blockIdx.x;
@@ -12522,6 +12626,7 @@ extern "C" __global__ void termite_rms_norm_add_weighted_embedding_i32_q6_k_f32(
     }
 }
 
+// tile-codegen:begin quant_cuda.embedding.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(ANTFLY_CUDA_EMBEDDING_LOOKUP_I32_Q4_K_F32_PARAMS) {
     termite_embedding_quant_impl<2u>(dst, weight, ids, total, dim, scale);
 }
@@ -12529,6 +12634,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(ANTFLY_CUDA_EMB
 extern "C" __global__ void termite_embedding_lookup_i32_q4_0_f32(ANTFLY_CUDA_EMBEDDING_LOOKUP_I32_Q4_K_F32_PARAMS) {
     termite_embedding_quant_impl<3u>(dst, weight, ids, total, dim, scale);
 }
+// tile-codegen:end quant_cuda.embedding.1 family
 
 __device__ __forceinline__ bool termite_deberta_attention_key_valid(
     const long long* mask,
@@ -14242,7 +14348,9 @@ extern "C" __global__ void antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1(ANTFLY_Q4
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
-extern "C" __global__ void antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1(
+// cuda-kernel-fold: shared body, instantiated by the wrappers below
+template <unsigned int N0>
+__device__ __forceinline__ void antfly_q4_0_pair_activation_f32_e2b_exact_v1_impl(
     float* dst,
     const float* input,
     const unsigned char* weight_gate,
@@ -14260,7 +14368,7 @@ extern "C" __global__ void antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1(
     const unsigned int lane = tid & 31u;
     const unsigned int warp = tid >> 5u;
     const unsigned int row_blocks = in_dim / 32u;
-    if (rows != 1u || in_dim != 1536u || out_dim != 6144u || blockDim.x != 128u || row >= rows) return;
+    if (rows != 1u || in_dim != 1536u || out_dim != N0 || blockDim.x != 128u || row >= rows) return;
 
     __shared__ float gate_partial[4][4];
     __shared__ float up_partial[4][4];
@@ -14317,6 +14425,16 @@ extern "C" __global__ void antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1(
         }
     }
 }
+extern "C" __global__ void antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1(
+    float* dst,
+    const float* input,
+    const unsigned char* weight_gate,
+    const unsigned char* weight_up,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int activation
+) { antfly_q4_0_pair_activation_f32_e2b_exact_v1_impl<6144u>(dst, input, weight_gate, weight_up, rows, in_dim, out_dim, activation); }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
@@ -14329,76 +14447,13 @@ extern "C" __global__ void antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1(
     unsigned int in_dim,
     unsigned int out_dim,
     unsigned int activation
-) {
-    const unsigned int cols = 4u;
-    const unsigned int tiles = (out_dim + cols - 1u) / cols;
-    const unsigned int row = blockIdx.x / tiles;
-    const unsigned int col_tile = (blockIdx.x - row * tiles) * cols;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int row_blocks = in_dim / 32u;
-    if (rows != 1u || in_dim != 1536u || out_dim != 12288u || blockDim.x != 128u || row >= rows) return;
-
-    __shared__ float gate_partial[4][4];
-    __shared__ float up_partial[4][4];
-    float gate_acc[4];
-    float up_acc[4];
-    #pragma unroll
-    for (unsigned int c = 0u; c < 4u; ++c) {
-        gate_acc[c] = 0.0f;
-        up_acc[c] = 0.0f;
-    }
-
-    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        const float x = input[row * in_dim + i];
-        const unsigned int block = i / 32u;
-        const unsigned int value_lane = i - block * 32u;
-        const unsigned int q_offset = 2u + (value_lane & 15u);
-        const unsigned int high_nibble = value_lane >> 4u;
-        #pragma unroll
-        for (unsigned int c = 0u; c < 4u; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
-                const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
-                gate_acc[c] += x * termite_q4_0_value_nibble(gate_bp, q_offset, high_nibble);
-                up_acc[c] += x * termite_q4_0_value_nibble(up_bp, q_offset, high_nibble);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0u; c < 4u; ++c) {
-        const float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
-        const float up_sum = termite_warp_reduce_sum(up_acc[c]);
-        if (lane == 0u && warp < 4u) {
-            gate_partial[c][warp] = gate_sum;
-            up_partial[c][warp] = up_sum;
-        }
-    }
-    __syncthreads();
-    if (tid == 0u) {
-        #pragma unroll
-        for (unsigned int c = 0u; c < 4u; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                float gate_y = 0.0f;
-                float up_y = 0.0f;
-                #pragma unroll
-                for (unsigned int w = 0u; w < 4u; ++w) {
-                    gate_y += gate_partial[c][w];
-                    up_y += up_partial[c][w];
-                }
-                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
-            }
-        }
-    }
-}
+) { antfly_q4_0_pair_activation_f32_e2b_exact_v1_impl<12288u>(dst, input, weight_gate, weight_up, rows, in_dim, out_dim, activation); }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_down_f32_e2b_6144_exact_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
-extern "C" __global__ void antfly_q4_0_down_f32_e2b_6144_exact_v1(
+// cuda-kernel-fold: shared body, instantiated by the wrappers below
+template <unsigned int N0>
+__device__ __forceinline__ void antfly_q4_0_down_f32_e2b_exact_v1_impl(
     float* dst,
     const float* input,
     const unsigned char* weight,
@@ -14413,7 +14468,7 @@ extern "C" __global__ void antfly_q4_0_down_f32_e2b_6144_exact_v1(
     const unsigned int lane = tid & 31u;
     const unsigned int warp = tid >> 5u;
     const unsigned int row_blocks = in_dim / 32u;
-    if (rows != 1u || in_dim != 6144u || out_dim != 1536u || blockDim.x != 256u) return;
+    if (rows != 1u || in_dim != N0 || out_dim != 1536u || blockDim.x != 256u) return;
 
     __shared__ float warp_partial[4][8];
     float acc[4];
@@ -14455,6 +14510,14 @@ extern "C" __global__ void antfly_q4_0_down_f32_e2b_6144_exact_v1(
         }
     }
 }
+extern "C" __global__ void antfly_q4_0_down_f32_e2b_6144_exact_v1(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { antfly_q4_0_down_f32_e2b_exact_v1_impl<6144u>(dst, input, weight, rows, in_dim, out_dim); }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_down_f32_e2b_12288_exact_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
@@ -14465,56 +14528,7 @@ extern "C" __global__ void antfly_q4_0_down_f32_e2b_12288_exact_v1(
     unsigned int rows,
     unsigned int in_dim,
     unsigned int out_dim
-) {
-    const unsigned int cols = 4u;
-    const unsigned int col_tile = blockIdx.x * cols;
-    const unsigned int row = 0u;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int row_blocks = in_dim / 32u;
-    if (rows != 1u || in_dim != 12288u || out_dim != 1536u || blockDim.x != 256u) return;
-
-    __shared__ float warp_partial[4][8];
-    float acc[4];
-    #pragma unroll
-    for (unsigned int c = 0u; c < 4u; ++c) acc[c] = 0.0f;
-
-    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        const float x = input[row * in_dim + i];
-        const unsigned int block = i / 32u;
-        const unsigned int value_lane = i - block * 32u;
-        const unsigned int q_offset = 2u + (value_lane & 15u);
-        const unsigned int high_nibble = value_lane >> 4u;
-        #pragma unroll
-        for (unsigned int c = 0u; c < 4u; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
-                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0u; c < 4u; ++c) {
-        const float sum = termite_warp_reduce_sum(acc[c]);
-        if (lane == 0u && warp < 8u) warp_partial[c][warp] = sum;
-    }
-    __syncthreads();
-    if (tid == 0u) {
-        #pragma unroll
-        for (unsigned int c = 0u; c < 4u; ++c) {
-            const unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                float y = 0.0f;
-                #pragma unroll
-                for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[c][w];
-                dst[row * out_dim + col] = y;
-            }
-        }
-    }
-}
+) { antfly_q4_0_down_f32_e2b_exact_v1_impl<12288u>(dst, input, weight, rows, in_dim, out_dim); }
 
 // Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1 plan_id=cuda/q4_0/rows_1/argmax/mmv
@@ -14836,6 +14850,7 @@ extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
 #include "../kernels/relative_attention_training.cuh"
 
 // Laya inference kernels. Keep outside compiler-owned generated regions.
+// tile-codegen:begin attention.block_laya family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_laya_local_attention_f32(
     float* dst,
     const float* q,
@@ -14853,6 +14868,7 @@ extern "C" __global__ void termite_laya_local_attention_f32(
     const float* bias = nullptr;
 #include "../kernels/block_local_attention.cuh"
 }
+// tile-codegen:end attention.block_laya family
 
 // Laya action features use uncalibrated, padded-option-masked logits.
 // One block owns each question; only thread zero reduces the at-most-20 options.
@@ -14952,6 +14968,7 @@ __device__ __forceinline__ void termite_small_warp_attention_impl(float* dst, co
     }
 }
 
+// tile-codegen:begin attention.warp.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_laya_attention_warp_f32(
     float* dst, const float* q, const float* k, const float* v,
     const long long* mask, unsigned int batch, unsigned int seq,
@@ -14960,6 +14977,7 @@ extern "C" __global__ void termite_laya_attention_warp_f32(
     __shared__ float scores[512];
     termite_small_warp_attention_impl<512u, false>(dst, q, k, v, mask, batch, seq, heads, dim, radius, scores);
 }
+// tile-codegen:end attention.warp.0 family
 
 extern "C" __global__ void termite_laya_packed_geglu_f32(
     float* dst, const float* src, unsigned int rows, unsigned int width
@@ -15004,6 +15022,7 @@ extern "C" __global__ void termite_gliner_qkv_rope_f32(
 
 // GLiNER ModernBERT: dynamic shared scores cover only the attended key
 // window. Global layers support 8192 keys; local layers retain bounded scratch.
+// tile-codegen:begin attention.warp.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gliner_encoder_attention_f32(
     float* dst, const float* q, const float* k, const float* v,
     const long long* mask, unsigned int batch, unsigned int seq,
@@ -15012,6 +15031,7 @@ extern "C" __global__ void termite_gliner_encoder_attention_f32(
     extern __shared__ float scores[];
     termite_small_warp_attention_impl<8192u, true>(dst, q, k, v, mask, batch, seq, heads, dim, radius, scores);
 }
+// tile-codegen:end attention.warp.1 family
 
 // Diagnostic mixed-precision GLiNER global and local attention. FP16 Q/K/V and
 // probabilities feed tensor cores; online softmax and output accumulate F32.
@@ -15552,19 +15572,23 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
 // the ordinary policy allocates none of the compact policy's run workspace.
 
 
+// tile-codegen:begin attention.ragged_tc.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_m64(ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS) {
     constexpr bool Compact = false;
 #include "../kernels/relative_attention_tensor_rows64.cuh"
 }
+// tile-codegen:end attention.ragged_tc.0 family
 
 // Long-sequence direct attention. Adjacent equal relative buckets share one
 // product; the run list is derived from every actual bucket, so arbitrary
 // non-monotonic maps remain correct. Products, score addition and expf retain
 // the wider tile's arithmetic. No global cache or additional workspace.
+// tile-codegen:begin attention.ragged_tc.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_compact(ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS) {
     constexpr bool Compact = true;
 #include "../kernels/relative_attention_tensor_rows64.cuh"
 }
+// tile-codegen:end attention.ragged_tc.1 family
 
 // Native Attention Matching repeat-only kernels; host dispatch is opt-in.
 #include "../../../graph/templates/cuda_gqa_repeat_split_f16.cuh"

@@ -10,6 +10,7 @@ silently produce an empty successful comparison. --strict requires identity.
 
 import argparse
 import json
+import hashlib
 import re
 import subprocess
 from pathlib import Path
@@ -44,7 +45,14 @@ def records(text, resources, default_arch=None):
     return result
 
 
-def compare(tool, original, candidate, output):
+def select_programs(parsed, functions):
+    selected = [{key: value for key, value in rows.items() if key[1] in functions} for rows in parsed]
+    for rows in selected:
+        assert {key[1] for key in rows} == set(functions), "missing requested native program"
+    return selected
+
+
+def compare(tool, original, candidate, output, functions=None):
     reports = []
     for label, image in (("original", original), ("candidate", candidate)):
         parsed = []
@@ -61,7 +69,7 @@ def compare(tool, original, candidate, output):
             label,
             "instruction/resource key mismatch",
         )
-        reports.append(parsed)
+        reports.append(select_programs(parsed, functions) if functions else parsed)
     (old_code, old_resources), (new_code, new_resources) = reports
     assert old_code.keys() <= new_code.keys(), "missing existing entrypoints"
     result = {
@@ -83,6 +91,20 @@ def compare(tool, original, candidate, output):
             if old_resources[k] != new_resources[k]
         ],
     }
+    if functions:
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
+        result.update(
+            original_image_sha256=hashlib.sha256(original.read_bytes()).hexdigest(),
+            candidate_image_sha256=hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            programs=[dict(
+                arch=key[0], function=key[1],
+                original_instructions_sha256=digest(old_code[key]),
+                candidate_instructions_sha256=digest(new_code[key]),
+                original_resources_sha256=digest(old_resources[key]),
+                candidate_resources_sha256=digest(new_resources[key]),
+            ) for key in sorted(old_code)],
+        )
     (output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
@@ -94,9 +116,10 @@ def main():
     parser.add_argument("--cuobjdump", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--function", action="append", help="Bind a historical proof to these exact exported programs")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    result = compare(args.cuobjdump, args.original, args.candidate, args.output)
+    result = compare(args.cuobjdump, args.original, args.candidate, args.output, args.function)
     print(json.dumps(result))
     if args.strict:
         assert not result["changed_instructions"] and not result["changed_resources"], (

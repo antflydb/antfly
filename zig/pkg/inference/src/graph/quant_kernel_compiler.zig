@@ -30,6 +30,7 @@ const tensor_types = @import("../gguf/tensor_types.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");
 const kernel_jit = @import("kernel_jit.zig");
 const cuda_renderer = @import("quant_kernel_cuda_renderer.zig");
+const cuda_kernel_fold = @import("cuda_kernel_fold.zig");
 const metal_renderer = @import("quant_kernel_metal_renderer.zig");
 
 pub const metal_promotion_min_speedup: f64 = 1.02;
@@ -5214,7 +5215,10 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
         emitted += 1;
     }
     if (emitted == 0) return error.MissingCudaAttentionRenderPlan;
-    return out.toOwnedSlice(allocator);
+    // Plans bake their shape constants in; share each repeated body.
+    const raw = try out.toOwnedSlice(allocator);
+    defer allocator.free(raw);
+    return cuda_kernel_fold.fold(allocator, raw);
 }
 
 /// The attention runtime region emits bodies only. Keep the block-reduction
@@ -5292,7 +5296,10 @@ pub fn renderCudaRuntimeDevMatmulRegion(allocator: std.mem.Allocator) ![]u8 {
         emitted += 1;
     }
     if (emitted == 0) return error.MissingCudaRenderPlan;
-    return out.toOwnedSlice(allocator);
+    // Plans bake their shape constants in; share each repeated body.
+    const raw = try out.toOwnedSlice(allocator);
+    defer allocator.free(raw);
+    return cuda_kernel_fold.fold(allocator, raw);
 }
 
 /// Verifies that renderer helpers intentionally kept outside the owned dev
@@ -8070,6 +8077,10 @@ test "quant kernel compiler paged CUDA address helpers stay in sync with the pro
     }
 }
 
+test {
+    _ = cuda_kernel_fold;
+}
+
 test "quant kernel compiler renders the runtime-wired CUDA attention region deterministically" {
     const first = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
     defer std.testing.allocator.free(first);
@@ -8077,6 +8088,8 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expectEqual(@as(usize, 17), first_generated_attention_artifacts.len);
+    const unfolded = try cuda_kernel_fold.unfold(std.testing.allocator, first);
+    defer std.testing.allocator.free(unfolded);
 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, cuda_renderer.flashPrefillCommonSource()));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, cuda_renderer.splitkOnlineCommonSource()));
@@ -8134,7 +8147,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, metadata));
             const body = try cuda_renderer.renderAttentionInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
-            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, unfolded, body));
         }
     }
     try std.testing.expectEqual(@as(usize, 14), runtime_wired_count);
@@ -8150,6 +8163,8 @@ test "quant kernel compiler renders runtime-wired dev CUDA matmul candidates det
     const second = try renderCudaRuntimeDevMatmulRegion(std.testing.allocator);
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+    const unfolded = try cuda_kernel_fold.unfold(std.testing.allocator, first);
+    defer std.testing.allocator.free(unfolded);
 
     var runtime_dev_count: usize = 0;
     for (first_generated_matmul_artifacts) |artifact| {
@@ -8164,7 +8179,7 @@ test "quant kernel compiler renders runtime-wired dev CUDA matmul candidates det
 
         const body = try cuda_renderer.renderBodyAlloc(std.testing.allocator, plan);
         defer std.testing.allocator.free(body);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, unfolded, body));
         const declaration = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{plan.kernel_id});
         defer std.testing.allocator.free(declaration);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, declaration));
@@ -8179,6 +8194,8 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
     const attention_marker = "// quant-kernel-codegen:begin generated CUDA attention kernels";
     const attention_region_begin = std.mem.indexOf(u8, bundle, attention_marker) orelse return error.MissingCudaAttentionRuntimeMarker;
     try validateCudaRuntimeAttentionExternalHelpers(bundle[0..attention_region_begin]);
+    const unfolded_bundle = try cuda_kernel_fold.unfold(std.testing.allocator, bundle);
+    defer std.testing.allocator.free(unfolded_bundle);
     var runtime_cuda_attention_count: usize = 0;
     var standalone_cuda_attention_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
@@ -14017,7 +14034,7 @@ test "quant kernel compiler serial schedules emit one owner and retain every exp
 
 const readSemanticGeneratedSourceForTest = @import("../ops/testing/native_source_files.zig").read;
 
-test "CUDA source refactor evidence binds unchanged SM89 image and semantic source" {
+test "CUDA source refactor evidence binds qualified SM89 programs and semantic source" {
     const allocator = std.testing.allocator;
     const Proof = struct {
         candidate_source_fingerprint: u64,
@@ -14025,6 +14042,11 @@ test "CUDA source refactor evidence binds unchanged SM89 image and semantic sour
         candidate_image_path: []const u8,
         candidate_image_sha256: []const u8,
         baseline_image_sha256: []const u8,
+        current_image_binding: ?struct {
+            image_sha256: []const u8,
+            receipt_path: []const u8,
+            receipt_sha256: []const u8,
+        } = null,
         image_byte_identical: bool,
         all_seven_targets_native_instructions_and_resources_identical: bool,
     };
@@ -14043,8 +14065,45 @@ test "CUDA source refactor evidence binds unchanged SM89 image and semantic sour
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         const hash = std.fmt.bytesToHex(digest, .lower);
-        try std.testing.expectEqualStrings(&hash, proof.candidate_image_sha256);
-        try std.testing.expectEqualStrings(&hash, proof.baseline_image_sha256);
+        // Preserve the historical whole-image proof. Later unrelated kernels
+        // may change the module without changing either qualified program.
+        try std.testing.expectEqualStrings(proof.candidate_image_sha256, proof.baseline_image_sha256);
+        if (proof.current_image_binding) |binding| {
+            try std.testing.expectEqualStrings(&hash, binding.image_sha256);
+            const receipt_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, binding.receipt_path, allocator, .limited(1024 * 1024));
+            defer allocator.free(receipt_bytes);
+            std.crypto.hash.sha2.Sha256.hash(receipt_bytes, &digest, .{});
+            const receipt_hash = std.fmt.bytesToHex(digest, .lower);
+            try std.testing.expectEqualStrings(&receipt_hash, binding.receipt_sha256);
+            const Receipt = struct {
+                original_image_sha256: []const u8,
+                candidate_image_sha256: []const u8,
+                programs: []const struct {
+                    arch: []const u8,
+                    function: []const u8,
+                    original_instructions_sha256: []const u8,
+                    candidate_instructions_sha256: []const u8,
+                    original_resources_sha256: []const u8,
+                    candidate_resources_sha256: []const u8,
+                },
+            };
+            const receipt = try std.json.parseFromSlice(Receipt, allocator, receipt_bytes, .{ .ignore_unknown_fields = true });
+            defer receipt.deinit();
+            try std.testing.expectEqualStrings(proof.candidate_image_sha256, receipt.value.original_image_sha256);
+            try std.testing.expectEqualStrings(&hash, receipt.value.candidate_image_sha256);
+            var matches: usize = 0;
+            for (receipt.value.programs) |program| {
+                if (!std.mem.eql(u8, program.function, parsed.value.kernel_id) or !std.mem.eql(u8, program.arch, "sm_89")) continue;
+                try std.testing.expectEqual(@as(usize, 64), program.original_instructions_sha256.len);
+                try std.testing.expectEqual(@as(usize, 64), program.original_resources_sha256.len);
+                try std.testing.expectEqualStrings(program.original_instructions_sha256, program.candidate_instructions_sha256);
+                try std.testing.expectEqualStrings(program.original_resources_sha256, program.candidate_resources_sha256);
+                matches += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), matches);
+        } else {
+            try std.testing.expectEqualStrings(&hash, proof.candidate_image_sha256);
+        }
         const full = try readSemanticGeneratedSourceForTest(artifact.source_path);
         defer allocator.free(full);
         std.crypto.hash.sha2.Sha256.hash(full, &digest, .{});

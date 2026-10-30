@@ -79,6 +79,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/gguf/tensor_types.zig",
         },
     };
+    const tile_inputs = @import("../src/tile/source_inputs.zig").paths;
     const contracts = [_][]const u8{
         "src/ops/kernel_descriptor.zig",
         "src/graph/kernel_source_owner.zig",
@@ -87,6 +88,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/kernel_reduction.zig",
         "src/ops/gpu/depthwise_program.h",
         "src/ops/gpu/masked_pool_program.h",
+        "src/graph/cuda_kernel_fold.zig",
+        "src/tile/source_inputs.zig",
     };
     // Native includes and host ABI consumers affect qualification even when
     // the translation-unit text is unchanged. Declare the complete local
@@ -97,6 +100,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/backends/metal_buffer_observation.h",
         "src/backends/metal_mtp_head.h",
         "src/backends/metal_mtp_head_impl.h",
+        "src/ops/metal/generated/tile_whisper_logits_partials.msl.h",
     };
     const cuda_dependencies = [_][]const u8{
         "src/ops/cuda/embedded_module.zig",
@@ -162,10 +166,11 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/kernels/training_row_softmax.cuh",
         "src/ops/cuda/kernels/relative_attention_training.cuh",
     };
-    run.addArg(b.fmt("{d}", .{qualification.len + contracts.len + if (backend == .cuda) cuda_dependencies.len else metal_dependencies.len}));
+    run.addArg(b.fmt("{d}", .{qualification.len + contracts.len + tile_inputs.len + if (backend == .cuda) cuda_dependencies.len else metal_dependencies.len}));
     for (qualification) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     for (contracts) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     for (if (backend == .cuda) &cuda_dependencies else &metal_dependencies) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+    for (tile_inputs) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     if (backend == .cuda) {
         const dispatch_dependencies = [_][]const u8{
             "src/ops/cuda/cuda_compute.zig",

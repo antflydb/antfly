@@ -113,3 +113,26 @@ maximum-load order as well as arithmetic; compare the optimized row bodies.
 projection phases with complete shader identity, pipeline resources, independent
 references and optional paired timing. The CUDA WMMA fixture's `--m64-only`
 mode covers preloaded row products, compact runs and non-monotonic bucket maps.
+
+
+## Tile descriptions and native ownership
+
+The portable Tile IR in `src/tile/` is a prototype with CPU vector lowering,
+Metal/CUDA emitters and scalar references. Its model descriptions are adapters;
+they do not replace the qualified native schedules by default. The optional
+Whisper logits hook is qualified separately from the production library.
+
+`families/native.zig` registers native source specializations. Extend an existing
+operation-named owner, preserving its layout, precision and static schedule.
+`native_program.zig` expands descriptions before native compilation. Keep Tile
+regions disjoint from `quant-kernel-codegen` regions: each has one generator.
+Both freshness checks are required. New Tile files must enter the generated
+`source_inputs.zig` manifest and the enabled backend qualification identities.
+
+Run `zig build tile-kernel-codegen quant-kernel-codegen test-tile-kernels` and
+`zig build check-tile-whisper` for host checks. The latter compiles the prototype
+CLI without requiring a model. `scripts/check_metal_tile_programs.m` compiles all
+prototype Metal kernels and checks the actual opt-in catalog hook against an
+independent logits reference, canaries and optional AA/AB/BA timing controls.
+Moving existing programs into generated regions earns no reduction credit; all
+Tile renderer and native specialization sources remain authored production code.

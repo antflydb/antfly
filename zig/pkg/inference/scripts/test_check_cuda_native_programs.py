@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from check_cuda_native_programs import records
+from check_cuda_native_programs import records, select_programs
 
 
 class NativeRecordsTest(unittest.TestCase):
@@ -24,6 +24,15 @@ class NativeRecordsTest(unittest.TestCase):
             records(report, False),
             {("sm_121", "kernel"): ["/*0000*/ MOV R1, R2;", "/* 0x1234 */"]},
         )
+
+    def test_requested_programs_must_exist_in_both_record_sets(self):
+        rows = {( "sm_89", "qualified"): ["record"], ("sm_89", "unrelated"): ["other"]}
+        selected = select_programs([rows, rows], ["qualified"])
+        self.assertEqual(list(selected[0]), [("sm_89", "qualified")])
+        with self.assertRaisesRegex(AssertionError, "missing requested"):
+            select_programs([rows, {}], ["qualified"])
+        with self.assertRaisesRegex(AssertionError, "missing requested"):
+            select_programs([rows, rows], ["absent"])
 
     def test_empty_malformed_and_duplicate_reports_are_errors(self):
         for text in [

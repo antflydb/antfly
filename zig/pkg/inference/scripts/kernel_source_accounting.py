@@ -14,16 +14,21 @@ import hashlib
 
 
 def managed(text):
-    authored = []
-    generated = []
-    inside = False
+    authored, generated, owners = [], [], []
+    marker = re.compile(r"\s*// (quant-kernel-codegen|tile-codegen):(begin|end)\b")
     for line in text.splitlines(True):
-        if re.match('\\s*// quant-kernel-codegen:begin', line):
-            inside = True
-        (generated if inside else authored).append(line)
-        if re.match('\\s*// quant-kernel-codegen:end', line):
-            inside = False
-    return (''.join(authored), ''.join(generated))
+        match = marker.match(line)
+        if match and match[2] == "begin":
+            if owners and owners[-1] != match[1]:
+                raise ValueError("overlapping generator owners")
+            owners.append(match[1])
+        (generated if owners else authored).append(line)
+        if match and match[2] == "end":
+            if not owners or owners.pop() != match[1]:
+                raise ValueError("unmatched generated-region marker")
+    if owners:
+        raise ValueError("unclosed generated region")
+    return ''.join(authored), ''.join(generated)
 
 
 skip=re.compile(r'(?m:^[ \t]*\\\\[^\n]*)|//[^\n]*|/\*|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
@@ -186,7 +191,7 @@ def account(root, baseline):
             continue
         a = before.decode()
         b = after.decode()
-        if name.startswith('docs/') or path.name == 'AGENTS.md':
+        if name.startswith('docs/') or path.suffix in {'.md', '.mdx'}:
             row['groups'].append(add('documentation', a, b))
         elif '/scripts/' in name or '/bench/' in name or '/tools/' in name or '/testing/' in name or (name == 'zig/pkg/inference/build.zig') or name.endswith('/quant_kernel_metal_runtime_check.zig'):
             row['groups'].append(add('tests_and_benchmark_tooling', a, b))
@@ -225,6 +230,8 @@ def account(root, baseline):
                 group = 'authored_cuda_launch'
             elif name.endswith(('/native_compute.zig', '/cuda/cuda_compute.zig')):
                 group = 'authored_cpu_and_result_ownership'
+            elif '/src/tile/' in name:
+                group = 'authored_tile_program_owners'
             elif '/graph/quant_kernel_' in name:
                 group = 'authored_generator_owners'
             else:

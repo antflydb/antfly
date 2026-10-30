@@ -23,6 +23,7 @@
 #include "metal_gdn_source.h"
 #include "../ops/gpu/depthwise_program.h"
 #include "../ops/gpu/masked_pool_program.h"
+#include "../ops/metal/generated/tile_whisper_logits_partials.msl.h"
 // Use libdispatch's exported implementation: the SDK inline fast path's
 // completion-state assumption trips Zig 0.17's C sanitizer on macOS.
 #undef dispatch_once
@@ -6718,7 +6719,9 @@ static NSString *termite_metal_gated_delta_source(void) {
         "    }\n"
         "}\n"
         ANTFLY_MSL_GDN_PREPARE(termite_lightonocr3_prefill_prepare_parallel, CoreParams, 32, true, p.seq*p.value_heads, ", ushort lane [[thread_index_in_simdgroup]]", "uint(lane)")
+           // tile-codegen:begin reduce.recurrent_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)
         ANTFLY_MSL_GDN_NORM(termite_lightonocr3_prefill_norm_parallel, CoreParams, 32, p.seq*p.value_heads, ", ushort lane [[thread_index_in_simdgroup]]", "uint(lane)")
+           // tile-codegen:end reduce.recurrent_norm family
         ;
 }
 
@@ -7119,11 +7122,13 @@ static NSString *termite_metal_tensor_program_source(void) {
         "#undef K\n"
         "kernel void termite_gate_split_reduce(device const float*s[[buffer(0)]],device const float*gb[[buffer(1)]],device const float*ub[[buffer(2)]],device float*y[[buffer(3)]],constant GateSplitParams&p[[buffer(4)]],uint i[[thread_position_in_grid]]){uint count=p.rows*p.out_dim;if(i>=count)return;float g=0,u=0;for(uint j=0;j<p.pad;j++){g+=s[j*count+i];u+=s[(p.pad+j)*count+i];}g+=gb[i%p.out_dim];u+=ub[i%p.out_dim];y[i]=(g/(1.0f+exp(-g)))*u;}\n"
         TERMITE_MSL_MPP_GATE_PROGRAM("template<uint N, uint M=8, uint SG=1> inline void ","antfly_mpp_gate_up_f32","float","float"," tensor<device float,dextents<int,2>,tensor_inline>dest(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n","auto out=dest.slice(int(group.x)*N,int(group.y)*M);","g[i]=(gs/(1.0f+exp(-gs)))*us;"," g.store(out);\n")
+           // tile-codegen:begin elementwise.gated_product family (do not edit; run: zig build tile-kernel-codegen -- --write)
         "kernel void termite_lightonocr3_gate_up_small16(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<16>(x,gw,uw,gb,ub,y,p,group);}\n"
         "kernel void termite_lightonocr3_gate_up_small32(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<32>(x,gw,uw,gb,ub,y,p,group);}\n"
         "kernel void termite_lightonocr3_gate_up_wide16(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<16,16>(x,gw,uw,gb,ub,y,p,group);}\n"
         "kernel void termite_lightonocr3_gate_up_wide32(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<16,32,2>(x,gw,uw,gb,ub,y,p,group);}\n"
         "kernel void termite_lightonocr3_gate_up_wide64(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<32,64,4>(x,gw,uw,gb,ub,y,p,group);}\n"
+           // tile-codegen:end elementwise.gated_product family
         "kernel void termite_lightonocr3_down_split_reduce(device const float*s[[buffer(0)]], device const float*bias[[buffer(1)]], device float*y[[buffer(2)]], constant Params&p[[buffer(3)]],uint i[[thread_position_in_grid]]) {\n"
         " if(i>=p.rows*p.out_dim)return;float sum=0;for(uint j=0;j<p.pad;j++)sum+=s[j*p.rows*p.out_dim+i];y[i]=sum+bias[i%p.out_dim];\n"
         "}\n"
@@ -7570,6 +7575,7 @@ static NSString *termite_metal_shader_source(void) {
            "    dst[10] = uchar((scs[6] & 0x0Fu) | ((mins[6] & 0x0Fu) << 4));\n"
            "    dst[11] = uchar((scs[7] & 0x0Fu) | ((mins[7] & 0x0Fu) << 4));\n"
            "}\n"
+           // tile-codegen:begin quant_metal.gemv_q1_0.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_q1_0_linear) "\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 18u; float acc = 0.0f;\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 18u; ushort bits = (ushort(weight[off + 1]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float signed_sum = 0.0f; uint in_off = r * p.in_dim + b * 128u; for (uint by = 0; by < 16u; ++by) { uchar sbits = weight[off + 2u + by]; uint base = in_off + by * 8u; signed_sum += (sbits & 0x01u) != 0u ? input[base] : -input[base]; signed_sum += (sbits & 0x02u) != 0u ? input[base + 1u] : -input[base + 1u]; signed_sum += (sbits & 0x04u) != 0u ? input[base + 2u] : -input[base + 2u]; signed_sum += (sbits & 0x08u) != 0u ? input[base + 3u] : -input[base + 3u]; signed_sum += (sbits & 0x10u) != 0u ? input[base + 4u] : -input[base + 4u]; signed_sum += (sbits & 0x20u) != 0u ? input[base + 5u] : -input[base + 5u]; signed_sum += (sbits & 0x40u) != 0u ? input[base + 6u] : -input[base + 6u]; signed_sum += (sbits & 0x80u) != 0u ? input[base + 7u] : -input[base + 7u]; } acc += d * signed_sum; }\n"
@@ -7592,6 +7598,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint b = ib0; b < p.row_blocks; b += NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; TERMITE_FOR_UNROLL (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = (expert_row + o) * p.row_blocks * 18u + b * 18u; ushort bits = (ushort(weight[off + 1]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); const device ushort *qs = reinterpret_cast<const device ushort *>(weight + off + 2u) + (il >> 1); float qacc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; TERMITE_FOR_UNROLL (uint i = 0u; i < 8u; i += 2u) { uint packed = uint(qs[i >> 1]); qacc[0] += yl[i] * float(packed & 0x000Fu); qacc[1] += yl[i + 1u] * float(packed & 0x0F00u); qacc[2] += yl[i + 8u] * float(packed & 0x00F0u); qacc[3] += yl[i + 9u] * float(packed & 0xF000u); } acc[row] += d * (qacc[0] + qacc[1] + qacc[2] + qacc[3] - 8.0f * sumy); } }\n"
            "    TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) acc[row] = simd_sum(acc[row]); if (lane == 0u) { uint idx = r * p.out_dim + first_o; TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) if (first_o + row < p.out_dim) output[idx + row] = acc[row]; }\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q1_0.0 family
            // Exact Gemma4 26B-A4B decode shapes. Keeping the route count,
            // dimensions, row strides, and shared-input rule compile-time
            // constant removes the dynamic address arithmetic from the two
@@ -7605,12 +7612,14 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint b = ix; b < ROW_BLOCKS; b += NQ) { float yl[16]; float sumy = 0.0f; uint in_off = (PerRouteInput ? route * ROW_BLOCKS * 32u : 0u) + b * 32u + il; TERMITE_FOR_UNROLL (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) { uint off = (expert_row + first_o + row) * (ROW_BLOCKS * 18u) + b * 18u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); const device ushort *qs = reinterpret_cast<const device ushort *>(weight + off + 2u) + (il >> 1); float qacc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; TERMITE_FOR_UNROLL (uint i = 0u; i < 8u; i += 2u) { uint packed = uint(qs[i >> 1]); qacc[0] += yl[i] * float(packed & 0x000Fu); qacc[1] += yl[i + 1u] * float(packed & 0x0F00u); qacc[2] += yl[i + 8u] * float(packed & 0x00F0u); qacc[3] += yl[i + 9u] * float(packed & 0xF000u); } acc[row] += d * (qacc[0] + qacc[1] + qacc[2] + qacc[3] - 8.0f * sumy); } }\n"
            "    TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) acc[row] = simd_sum(acc[row]); if (lane == 0u) { uint idx = route * OUT_DIM + first_o; TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) output[idx + row] = acc[row]; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.gemv_q1_0.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_EXPERT_SIMD(termite_q4_0_linear_id_a4b_gate_up) "\n"
            "    termite_q4_0_a4b_projection_impl<88u, 1408u, false>(input, weight, output, expert_ids, p, lane, sgitg, tg);\n"
            "}\n"
            TERMITE_MSL_ABI_QUANT_EXPERT_SIMD(termite_q4_0_linear_id_a4b_down) "\n"
            "    termite_q4_0_a4b_projection_impl<22u, 2816u, true>(input, weight, output, expert_ids, p, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q1_0.1 family
            // NQ8 distributes each 32-value Q4_0 block across four lanes and
            // assigns only eight block columns per SIMD group. For A4B's
            // 22-block routed-down rows this changes the K-loop occupancy from
@@ -7628,6 +7637,7 @@ static NSString *termite_metal_shader_source(void) {
            // reduction in the same k order. This avoids the 8x2816 device
            // round-trip and its following dispatch without reducing the 352
            // independent output-row threadgroups available to the GPU.
+           // tile-codegen:begin quant_metal.q4_0_id.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_q4_0_linear_id_a4b_down_reduce(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device const uint *expert_ids [[buffer(2)]], device const float *route_weights [[buffer(3)]], device const float *expert_scale [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_a4b_down_reduce_params &p [[buffer(6)]], threadgroup float *route_values [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint NR0 = 4u; const uint NSG = 2u; const uint NQ = 16u; const uint NW = 32u; const uint ROW_BLOCKS = 22u; const uint IN_DIM = 704u; const uint OUT_DIM = 2816u; const uint EXPERTS = 128u; uint first_o = (tg.x * NSG + uint(sgitg)) * NR0; if (lane >= NW) return; uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u;\n"
            "    TERMITE_FOR_UNROLL (uint route = 0u; route < 8u; ++route) { uint expert = expert_ids[route]; float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; if (expert < EXPERTS) { uint in_row = route * IN_DIM; uint expert_row = expert * OUT_DIM; for (uint b = ix; b < ROW_BLOCKS; b += NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; TERMITE_FOR_UNROLL (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) { uint off = (expert_row + first_o + row) * 396u + b * 18u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); const device ushort *qs = reinterpret_cast<const device ushort *>(weight + off + 2u) + (il >> 1); float qacc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; TERMITE_FOR_UNROLL (uint i = 0u; i < 8u; i += 2u) { uint packed = uint(qs[i >> 1]); qacc[0] += yl[i] * float(packed & 0x000Fu); qacc[1] += yl[i + 1u] * float(packed & 0x0F00u); qacc[2] += yl[i + 8u] * float(packed & 0x00F0u); qacc[3] += yl[i + 9u] * float(packed & 0xF000u); } acc[row] += d * (qacc[0] + qacc[1] + qacc[2] + qacc[3] - 8.0f * sumy); } } } TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) acc[row] = simd_sum(acc[row]); if (lane == 0u) { TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) route_values[(uint(sgitg) * NR0 + row) * 8u + route] = acc[row]; } }\n"
@@ -7647,10 +7657,12 @@ static NSString *termite_metal_shader_source(void) {
            " for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= pa.out_dim) continue; uint off_a = (expert_row_a + o) * pa.row_blocks * 18u + block * 18u; uint off_b = (expert_row_b + o) * pb.row_blocks * 18u + block * 18u; ushort bits_a = (ushort(weight_a[off_a + 1]) << 8) | ushort(weight_a[off_a]); ushort bits_b = (ushort(weight_b[off_b + 1]) << 8) | ushort(weight_b[off_b]); float d_a = float(as_type<half>(bits_a)); float d_b = float(as_type<half>(bits_b)); const device ushort *qs_a = reinterpret_cast<const device ushort *>(weight_a + off_a + 2u) + (il >> 1); const device ushort *qs_b = reinterpret_cast<const device ushort *>(weight_b + off_b + 2u) + (il >> 1); float qacc_a = 0.0f; float qacc_b = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint qa = uint(qs_a[i >> 1]); uint qb = uint(qs_b[i >> 1]); qacc_a += yl[i] * float(qa & 0x000Fu); qacc_a += yl[i + 1u] * float(qa & 0x0F00u); qacc_a += yl[i + 8u] * float(qa & 0x00F0u); qacc_a += yl[i + 9u] * float(qa & 0xF000u); qacc_b += yl[i] * float(qb & 0x000Fu); qacc_b += yl[i + 1u] * float(qb & 0x0F00u); qacc_b += yl[i + 8u] * float(qb & 0x00F0u); qacc_b += yl[i + 9u] * float(qb & 0xF000u); } acc_a[row] += d_a * (qacc_a - 8.0f * sumy); acc_b[row] += d_b * (qacc_b - 8.0f * sumy); } }\n"
            "    for (uint row = 0u; row < NR0; ++row) { acc_a[row] = simd_sum(acc_a[row]); acc_b[row] = simd_sum(acc_b[row]); } if (lane == 0u) { uint idx = r * pa.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) if (first_o + row < pa.out_dim) { output_a[idx + row] = acc_a[row]; output_b[idx + row] = acc_b[row]; } }\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_id.0 family
            // A4B decode specialization. The route index selects the expert but
            // input rows are shared by each token's top-k routes, so this kernel
            // consumes the original hidden state directly. Gate and up use one
            // dispatch and materialize only their activated product.
+           // tile-codegen:begin quant_metal.q4_0_id.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_q4_0_pair_activation_id(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device float *output [[buffer(3)]], device const uint *expert_ids [[buffer(4)]], constant termite_metal_pair_activation_id_params &p [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    constant termite_metal_linear_id_params &gate_p = p.pair.first; constant termite_metal_linear_id_params &up_p = p.pair.second; const uint NR0 = 4u; const uint NSG = 2u; const uint NQ = 16u; const uint NW = 32u; uint first_o = (tg.x * NSG + uint(sgitg)) * NR0; uint route = tg.y; if (route >= gate_p.rows || lane >= NW || p.top_k == 0u) return; uint expert = expert_ids[route];\n"
            "    if (expert >= gate_p.expert_count || expert >= up_p.expert_count) { if (lane == 0u) { uint idx = route * gate_p.out_dim + first_o; TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) if (first_o + row < gate_p.out_dim) output[idx + row] = 0.0f; } return; }\n"
@@ -7660,6 +7672,7 @@ static NSString *termite_metal_shader_source(void) {
            " TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= gate_p.out_dim) continue; uint gate_off = (gate_expert_row + o) * gate_p.row_blocks * 18u + block * 18u; uint up_off = (up_expert_row + o) * up_p.row_blocks * 18u + block * 18u; ushort gate_bits = (ushort(weight_gate[gate_off + 1u]) << 8) | ushort(weight_gate[gate_off]); ushort up_bits = (ushort(weight_up[up_off + 1u]) << 8) | ushort(weight_up[up_off]); float d_gate = float(as_type<half>(gate_bits)); float d_up = float(as_type<half>(up_bits)); const device ushort *qs_gate = reinterpret_cast<const device ushort *>(weight_gate + gate_off + 2u) + (il >> 1); const device ushort *qs_up = reinterpret_cast<const device ushort *>(weight_up + up_off + 2u) + (il >> 1); float qacc_gate[4] = {0.0f, 0.0f, 0.0f, 0.0f}; float qacc_up[4] = {0.0f, 0.0f, 0.0f, 0.0f}; TERMITE_FOR_UNROLL (uint i = 0u; i < 8u; i += 2u) { uint packed_gate = uint(qs_gate[i >> 1]); uint packed_up = uint(qs_up[i >> 1]); qacc_gate[0] += yl[i] * float(packed_gate & 0x000Fu); qacc_gate[1] += yl[i + 1u] * float(packed_gate & 0x0F00u); qacc_gate[2] += yl[i + 8u] * float(packed_gate & 0x00F0u); qacc_gate[3] += yl[i + 9u] * float(packed_gate & 0xF000u); qacc_up[0] += yl[i] * float(packed_up & 0x000Fu); qacc_up[1] += yl[i + 1u] * float(packed_up & 0x0F00u); qacc_up[2] += yl[i + 8u] * float(packed_up & 0x00F0u); qacc_up[3] += yl[i + 9u] * float(packed_up & 0xF000u); } gate[row] += d_gate * (qacc_gate[0] + qacc_gate[1] + qacc_gate[2] + qacc_gate[3] - 8.0f * sumy); up[row] += d_up * (qacc_up[0] + qacc_up[1] + qacc_up[2] + qacc_up[3] - 8.0f * sumy); } }\n"
            "    TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) { gate[row] = simd_sum(gate[row]); up[row] = simd_sum(up[row]); } if (lane == 0u) { uint idx = route * gate_p.out_dim + first_o; TERMITE_FOR_UNROLL (uint row = 0u; row < NR0; ++row) if (first_o + row < gate_p.out_dim) output[idx + row] = termite_gated_activation_product(gate[row], up[row], p.activation_kind); }\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_id.1 family
            "kernel void termite_moe_merged_gate_up_activation(device const float *merged [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_apply_activation_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint r = gid / p.dim; uint c = gid - r * p.dim; uint base = r * p.dim * 2u; output[gid] = termite_gated_activation_product(merged[base + c], merged[base + p.dim + c], p.activation_kind);\n"
            "}\n"
@@ -7752,6 +7765,7 @@ static NSString *termite_metal_shader_source(void) {
            "        output[index] = PAIR ? termite_gated_activation_product(acc[row], up[row], activation_kind) : acc[row];\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_shared family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_CACHE(termite_q4_0_shared_linear_nr4_nsg2_r2) " termite_q4_0_shared_mmv<2u, 4u, 2u, false>(input, weight, weight, output, p, 0u, cache, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_CACHE(termite_q4_0_shared_linear_nr4_nsg2_r4) " termite_q4_0_shared_mmv<4u, 4u, 2u, false>(input, weight, weight, output, p, 0u, cache, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_CACHE(termite_q4_0_shared_linear_nr8_nsg2_r2) " termite_q4_0_shared_mmv<2u, 8u, 2u, false>(input, weight, weight, output, p, 0u, cache, lane, sgitg, tg); }\n"
@@ -7768,6 +7782,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_PAIR_CACHE(termite_q4_0_shared_pair_nr4_nsg4_r4) " termite_q4_0_shared_mmv<4u, 4u, 4u, true>(input, weight, up, output, p, ap.activation_kind, cache, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_CACHE(termite_q4_0_shared_pair_nr8_nsg4_r2) " termite_q4_0_shared_mmv<2u, 8u, 4u, true>(input, weight, up, output, p, ap.activation_kind, cache, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_CACHE(termite_q4_0_shared_pair_nr8_nsg4_r4) " termite_q4_0_shared_mmv<4u, 8u, 4u, true>(input, weight, up, output, p, ap.activation_kind, cache, lane, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q4_0_shared family
            "__attribute__((always_inline)) inline void termite_q4_0_pair_packed_fold(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, constant termite_metal_linear_params &p, uint NR0, uint first_o, uint ib0, uint in_row, uint il, thread float *gate, thread float *up) {\n"
            "    const uint NQ = 16u;\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 18u + b * 18u; ushort gate_bits = (ushort(weight_gate[off + 1]) << 8) | ushort(weight_gate[off]); ushort up_bits = (ushort(weight_up[off + 1]) << 8) | ushort(weight_up[off]); float d_gate = float(as_type<half>(gate_bits)); float d_up = float(as_type<half>(up_bits)); const device ushort *qs_gate = reinterpret_cast<const device ushort *>(weight_gate + off + 2u) + (il >> 1); const device ushort *qs_up = reinterpret_cast<const device ushort *>(weight_up + off + 2u) + (il >> 1); float qacc_gate = 0.0f; float qacc_up = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint packed_gate = uint(qs_gate[i >> 1]); uint packed_up = uint(qs_up[i >> 1]); qacc_gate += yl[i] * float(packed_gate & 0x000Fu); qacc_gate += yl[i + 1u] * float(packed_gate & 0x0F00u); qacc_gate += yl[i + 8u] * float(packed_gate & 0x00F0u); qacc_gate += yl[i + 9u] * float(packed_gate & 0xF000u); qacc_up += yl[i] * float(packed_up & 0x000Fu); qacc_up += yl[i + 1u] * float(packed_up & 0x0F00u); qacc_up += yl[i + 8u] * float(packed_up & 0x00F0u); qacc_up += yl[i + 9u] * float(packed_up & 0xF000u); } gate[row] += d_gate * (qacc_gate - 8.0f * sumy); up[row] += d_up * (qacc_up - 8.0f * sumy); } }\n"
@@ -7781,33 +7796,40 @@ static NSString *termite_metal_shader_source(void) {
            "    termite_q4_0_pair_packed_fold(input, weight_gate, weight_up, p, NR0, first_o, ib0, in_row, il, gate, up);\n"
            "    termite_q4_0_pair_simd_publish(output, p, ap, NR0, r, first_o, lane, gate, up);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_mmv_pair.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_1x_reduce_nr4_nsg2) " termite_q4_0_pair_activation_mmv_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 4u, 2u); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_1x_reduce_nr8_nsg2) " termite_q4_0_pair_activation_mmv_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 8u, 2u); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_1x_reduce_nr4_nsg4) " termite_q4_0_pair_activation_mmv_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 4u, 4u); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_1x_reduce_nr8_nsg4) " termite_q4_0_pair_activation_mmv_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 8u, 4u); }\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_pair.0 family
            // A4B shared-FFN candidate: NQ8 gives the 88-block K axis exact
            // eight-way striping instead of the NQ16 6/5-iteration tail.
+           // tile-codegen:begin quant_metal.q4_0_mmv_pair.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_1x_reduce_nr4_nsg2_nq8) "\n"
            "    const uint NR0 = 4u; const uint NSG = 2u; const uint NQ = 8u; const uint NW = 32u; uint first_o = (tg.x * NSG + uint(sgitg)) * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * NQ; uint in_row = r * p.in_dim; float gate[4] = {0.0f, 0.0f, 0.0f, 0.0f}; float up[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n"
            "    for (uint b = ix; b < p.row_blocks; b += NQ) { float x[8]; uint in_off = in_row + b * 32u + il; for (uint i = 0u; i < NQ; ++i) x[i] = input[in_off + i]; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 18u + b * 18u; ushort gate_bits = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort up_bits = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float d_gate = float(as_type<half>(gate_bits)); float d_up = float(as_type<half>(up_bits)); const device uchar *qs_gate = weight_gate + off + 2u; const device uchar *qs_up = weight_up + off + 2u; float block_gate = 0.0f; float block_up = 0.0f; for (uint i = 0u; i < NQ; ++i) { uint j = il + i; uchar packed_gate = qs_gate[j & 15u]; uchar packed_up = qs_up[j & 15u]; float q_gate = j < 16u ? float(int(packed_gate & 0x0Fu) - 8) : float(int(packed_gate >> 4) - 8); float q_up = j < 16u ? float(int(packed_up & 0x0Fu) - 8) : float(int(packed_up >> 4) - 8); block_gate += x[i] * q_gate; block_up += x[i] * q_up; } gate[row] += d_gate * block_gate; up[row] += d_up * block_up; } }\n"
            "    termite_q4_0_pair_simd_publish(output, p, ap, NR0, r, first_o, lane, gate, up);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_pair.1 family
            // Dev candidate: Q4_0 blocks are transposed inside each output-row
            // tile, [tile][block][row][18], so the four accumulator rows fetch
            // one compact 72-byte span instead of four distant cache lines.
+           // tile-codegen:begin quant_metal.q4_0_mmv_pair.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_1x_packed_t4_nsg2) "\n"
            "    const uint NR0 = 4u; const uint NSG = 2u; const uint NQ = 16u; const uint NW = 32u; uint first_o = (tg.x * NSG + uint(sgitg)) * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint in_row = r * p.in_dim; float gate[4] = {0.0f, 0.0f, 0.0f, 0.0f}; float up[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n"
            "    for (uint b = ix; b < p.row_blocks; b += NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = (((o >> 2u) * p.row_blocks + b) * 4u + (o & 3u)) * 18u; ushort gate_bits = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort up_bits = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float d_gate = float(as_type<half>(gate_bits)); float d_up = float(as_type<half>(up_bits)); const device ushort *qs_gate = reinterpret_cast<const device ushort *>(weight_gate + off + 2u) + (il >> 1); const device ushort *qs_up = reinterpret_cast<const device ushort *>(weight_up + off + 2u) + (il >> 1); float qacc_gate = 0.0f; float qacc_up = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint packed_gate = uint(qs_gate[i >> 1]); uint packed_up = uint(qs_up[i >> 1]); qacc_gate += yl[i] * float(packed_gate & 0x000Fu); qacc_gate += yl[i + 1u] * float(packed_gate & 0x0F00u); qacc_gate += yl[i + 8u] * float(packed_gate & 0x00F0u); qacc_gate += yl[i + 9u] * float(packed_gate & 0xF000u); qacc_up += yl[i] * float(packed_up & 0x000Fu); qacc_up += yl[i + 1u] * float(packed_up & 0x0F00u); qacc_up += yl[i + 8u] * float(packed_up & 0x00F0u); qacc_up += yl[i + 9u] * float(packed_up & 0xF000u); } gate[row] += d_gate * (qacc_gate - 8.0f * sumy); up[row] += d_up * (qacc_up - 8.0f * sumy); } }\n"
            "    termite_q4_0_pair_simd_publish(output, p, ap, NR0, r, first_o, lane, gate, up);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_pair.2 family
            "template<typename Output> inline void termite_q4_0_pair_activation_reduce(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device Output *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, threadgroup float *shmem, ushort lane, ushort sgitg, uint3 tg) {\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 16u; const uint NW = 32u; uint first_o = (tg.x * NSG + sgitg) * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint ib0 = ix; uint in_row = r * p.in_dim; float gate[4] = {0.0f, 0.0f, 0.0f, 0.0f}; float up[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n"
            "    termite_q4_0_pair_packed_fold(input, weight_gate, weight_up, p, NR0, first_o, ib0, in_row, il, gate, up);\n"
            "    for (uint row = 0u; row < NR0; ++row) { gate[row] = simd_sum(gate[row]); up[row] = simd_sum(up[row]); } if (lane == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = Output(termite_gated_activation_product(gate[row], up[row], ap.activation_kind)); } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_mmv_pair.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_REDUCE(termite_q4_0_pair_activation_1x_reduce) "\n"
            "    termite_q4_0_pair_activation_reduce<float>(input, weight_gate, weight_up, output, p, ap, shmem, lane, sgitg, tg);\n"
            "}\n"
@@ -7822,18 +7844,21 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { for (uint row = 0u; row < NR0; ++row) { shmem[row * 64u + sgitg] = gate[row]; shmem[row * 64u + 32u + sgitg] = up[row]; } } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total_gate[4]; float total_up[4]; for (uint row = 0u; row < NR0; ++row) { total_gate[row] = simd_sum(shmem[row * 64u + lane]); total_up[row] = simd_sum(shmem[row * 64u + 32u + lane]); } if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = half(termite_gated_activation_product(total_gate[row], total_up[row], ap.activation_kind)); } }\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_pair.3 family
            "template<typename Output, uint NR0> inline void termite_q4_0_activation_rhs_reduce(device const float *input, device const uchar *weight, device const float *rhs, device Output *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, threadgroup float *shmem, ushort lane, ushort sgitg, uint3 tg) {\n"
            "    const uint NSG = 4u; const uint NQ = 16u; const uint NW = 32u; uint first_o = (tg.x * NSG + sgitg) * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint ib0 = ix; uint in_row = r * p.in_dim; float acc[NR0] = {0.0f};\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 18u + b * 18u; ushort bits = (ushort(weight[off + 1]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); const device ushort *qs = reinterpret_cast<const device ushort *>(weight + off + 2u) + (il >> 1); float qacc = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint packed = uint(qs[i >> 1]); qacc += yl[i] * float(packed & 0x000Fu); qacc += yl[i + 1u] * float(packed & 0x0F00u); qacc += yl[i + 8u] * float(packed & 0x00F0u); qacc += yl[i + 9u] * float(packed & 0xF000u); } acc[row] += d * (qacc - 8.0f * sumy); } }\n"
            "    for (uint row = 0u; row < NR0; ++row) { acc[row] = simd_sum(acc[row]); } if (lane == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = Output(termite_gated_activation_product(acc[row], rhs[idx + row], ap.activation_kind)); } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_mmv_pair.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_RHS_REDUCE(termite_q4_0_activation_rhs_1x_reduce) "\n"
            "    termite_q4_0_activation_rhs_reduce<float, 16u>(input, weight, rhs, output, p, ap, shmem, lane, sgitg, tg);\n"
            "}\n"
            "kernel void termite_q4_0_activation_rhs_1x_reduce_out_f16(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device const float *rhs [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    termite_q4_0_activation_rhs_reduce<half, 4u>(input, weight, rhs, output, p, ap, shmem, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_pair.4 family
            "template<uint NR0, uint NSG, typename Input, typename Output> __attribute__((always_inline)) inline void termite_q4_0_scalar_packed16_impl(device const Input *input, device const uchar *weight, device Output *output, constant termite_metal_linear_params &p, threadgroup float *shmem, ushort lane, ushort sgitg, uint3 tg) {\n"
            "    const uint NQ = 16u; const uint NW = 32u; uint first_o = (tg.x * NSG + sgitg) * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint ib0 = ix; uint in_row = r * p.in_dim; float acc[NR0] = {0.0f};\n"
@@ -7850,6 +7875,7 @@ static NSString *termite_metal_shader_source(void) {
            "    termite_q4_0_scalar_packed16_impl<4u, 4u, float, float>(input, weight, output, p, shmem, lane, sgitg, tg);\n"
            "}\n"
            // A4B Q4_0 candidate: NQ8 balances 88- and 66-block K axes.
+           // tile-codegen:begin quant_metal.q4_0_mmv_linear.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q4_0_linear_1x_reduce_nr4_nsg4_nq8) "\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = (tg.x * NSG + uint(sgitg)) * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * NQ; uint in_row = r * p.in_dim; float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n"
@@ -7862,6 +7888,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint b = ix; b < p.row_blocks; b += NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = (((o >> 2u) * p.row_blocks + b) * 4u + (o & 3u)) * 18u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); const device ushort *qs = reinterpret_cast<const device ushort *>(weight + off + 2u) + (il >> 1); float qacc = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint packed = uint(qs[i >> 1]); qacc += yl[i] * float(packed & 0x000Fu); qacc += yl[i + 1u] * float(packed & 0x0F00u); qacc += yl[i + 8u] * float(packed & 0x00F0u); qacc += yl[i + 9u] * float(packed & 0xF000u); } acc[row] += d * (qacc - 8.0f * sumy); } }\n"
            "    for (uint row = 0u; row < NR0; ++row) acc[row] = simd_sum(acc[row]); if (lane == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = acc[row]; } }\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_linear.0 family
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q4_0_linear_1x_reduce_nr8_nsg4) "\n"
            "    termite_q4_0_scalar_packed16_impl<8u, 4u, float, float>(input, weight, output, p, shmem, lane, sgitg, tg);\n"
            "}\n"
@@ -7873,6 +7900,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { for (uint row = 0u; row < NR0; ++row) { shmem[row * 32u + sgitg] = acc[row]; } } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total[8]; for (uint row = 0u; row < NR0; ++row) { total[row] = simd_sum(shmem[row * 32u + lane]); } if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; float ss = 0.0f; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) { float v = total[row]; output[idx + row] = v; ss += v * v; } } sumsq[r * ((p.out_dim + 7u) / 8u) + tg.x] = ss; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_mmv_linear.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_q4_0_linear_1x_reduce_sumsq(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], device float *sumsq [[buffer(4)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    termite_q4_0_scalar_sumsq_impl<float, float>(input, weight, output, p, sumsq, shmem, lane, sgitg, tg);\n"
            "}\n"
@@ -7891,6 +7919,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_q4_0_linear_1x_reduce_in_f16_out_f16(device const half *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device half *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    termite_q4_0_scalar_packed16_impl<8u, 4u, half, half>(input, weight, output, p, shmem, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_linear.1 family
            "enum termite_legacy_format { termite_legacy_q4_1, termite_legacy_q5_0, termite_legacy_q5_1, termite_legacy_q8_1, termite_legacy_q8_k, termite_legacy_iq4_nl, termite_legacy_iq4_xs, termite_legacy_mxfp4, termite_legacy_q4_k, termite_legacy_q5_k };\n"
            "// Scalar folds retain each format's scale placement and lane order. Format and\n"
            "// byte stride are compile-time choices; no device-side format dispatch.\n"
@@ -7940,9 +7969,11 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[gid] = acc;\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_mmv_linear.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_q4_1_linear) "\n"
            "    termite_legacy_linear<termite_legacy_q4_1, 20u>(input, weight, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_linear.2 family
            "template <termite_legacy_format Format>\n"
            "__attribute__((always_inline)) inline float termite_legacy_reduce_block(device const uchar *weight, uint off,\n"
            "    uint qj0, thread const float *x) {\n"
@@ -8018,6 +8049,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    termite_legacy_reduce_store<NR>(acc, shmem, output, p, r, first_o, lane, sgitg);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_mmv_linear.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q4_1_linear_1x_reduce) "\n"
            "    termite_legacy_reduce<termite_legacy_q4_1, 20u, 4u, 2u>(input, weight, output, p, shmem, lane, sgitg, tg);\n"
            "}\n"
@@ -8033,6 +8065,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q5_1_linear_1x_reduce) "\n"
            "    termite_legacy_reduce<termite_legacy_q5_1, 24u, 2u, 4u>(input, weight, output, p, shmem, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mmv_linear.3 family
            "inline float termite_q4_0_block_scale(device const uchar *weight, uint off) { ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); return float(as_type<half>(bits)); }\n"
            "inline float termite_q4_0_block_value(device const uchar *weight, uint off, uint i) { const device uchar *qs = weight + off + 2u; uchar packed = qs[i & 15u]; return i < 16u ? float(int(packed & 0x0Fu) - 8) : float(int((packed >> 4) & 0x0Fu) - 8); }\n"
            "inline float termite_q4_1_block_scale(device const uchar *weight, uint off) { ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); return float(as_type<half>(bits)); }\n"
@@ -8050,12 +8083,14 @@ static NSString *termite_metal_shader_source(void) {
            "inline float termite_q8_0_block_value(device const uchar *weight, uint off, uint i) { return float(as_type<char>(weight[off + 2u + i])); }\n"
            "inline float termite_q8_1_block_scale(device const uchar *weight, uint off) { ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); return float(as_type<half>(bits)); }\n"
            "inline float termite_q8_1_block_value(device const uchar *weight, uint off, uint i) { return float(as_type<char>(weight[off + 4u + i])); }\n"
+           // tile-codegen:begin quant_metal.gemv_q8_0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_q8_0_linear) "\n"
            "    weight += p.weight_offset;\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 34u; float acc = 0.0f;\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 34u; float d = termite_q8_0_block_scale(weight, off); float block_acc = 0.0f; uint in_off = r * p.in_dim + b * 32u; for (uint i = 0; i < 32; ++i) { block_acc += input[in_off + i] * termite_q8_0_block_value(weight, off, i); } acc += d * block_acc; }\n"
            "    output[gid] = acc;\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q8_0 family
            "kernel void termite_apply_linear_bias_2d(device float *output [[buffer(0)]], device const float *bias [[buffer(1)]], constant termite_metal_linear_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total || p.out_dim == 0u) return;\n"
            "    uint col = gid - (gid / p.out_dim) * p.out_dim;\n"
@@ -8067,12 +8102,14 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 34u; float d_a = termite_q8_0_block_scale(weight_a, off); float d_b = termite_q8_0_block_scale(weight_b, off); float block_acc_a = 0.0f; float block_acc_b = 0.0f; uint in_off = r * p.in_dim + b * 32u; for (uint i = 0; i < 32; ++i) { float x = input[in_off + i]; block_acc_a += x * termite_q8_0_block_value(weight_a, off, i); block_acc_b += x * termite_q8_0_block_value(weight_b, off, i); } acc_a += d_a * block_acc_a; acc_b += d_b * block_acc_b; }\n"
            "    output_a[gid] = acc_a; output_b[gid] = acc_b;\n"
            "}\n"
+           // tile-codegen:begin quant_metal.gemv_q8_1.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_q8_1_linear) "\n"
            "    termite_legacy_linear<termite_legacy_q8_1, 36u>(input, weight, output, p, gid);\n"
            "}\n"
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q8_1_linear_1x_reduce) "\n"
            "    termite_legacy_reduce<termite_legacy_q8_1, 36u, 2u, 4u>(input, weight, output, p, shmem, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q8_1.0 family
            "// MMV schedules retain separate exact one-/two-projection accumulator folds.\n"
            "template<typename Input> inline void termite_q8_0_mmv_single(device const Input *input, device const uchar *weight, device float *output,\n"
            "    uint rows, uint in_dim, uint out_dim, uint row_blocks, threadgroup float *shmem,\n"
@@ -8094,6 +8131,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { shmem[sgitg] = acc_a0; shmem[32u + sgitg] = acc_b0; shmem[64u + sgitg] = acc_a1; shmem[96u + sgitg] = acc_b1; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total_a0 = simd_sum(shmem[lane]); float total_b0 = simd_sum(shmem[32u + lane]); float total_a1 = simd_sum(shmem[64u + lane]); float total_b1 = simd_sum(shmem[96u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * out_dim + first_o; if (first_o < out_dim) { output_a[idx] = total_a0; output_b[idx] = total_b0; } if (first_o + 1u < out_dim) { output_a[idx + 1u] = total_a1; output_b[idx + 1u] = total_b1; } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.gemv_q8_1.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q8_0_linear_mmv) "\n"
            "    termite_q8_0_mmv_single(input, weight + p.weight_offset, output, p.rows, p.in_dim, p.out_dim, p.row_blocks, shmem, lane, sgitg, tg.x * 2u, tg.y);\n"
            "}\n"
@@ -8109,6 +8147,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { for (uint row = 0u; row < NR0; ++row) shmem[row * 32u + sgitg] = acc[row]; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total[4]; for (uint row = 0u; row < NR0; ++row) total[row] = simd_sum(shmem[row * 32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = total[row]; } }\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q8_1.1 family
            "// All extended Q8 projections use the same four-value acquisition and dot.\n"
            "// Rows is the actual R2/R3/R4/R5 schedule; Pair adds one independent plane.\n"
            "__attribute__((always_inline)) inline float4 termite_q8_0_ext_weight4(device const uchar *weight, uint off, uint ci) {\n"
@@ -8166,10 +8205,12 @@ static NSString *termite_metal_shader_source(void) {
            "        }\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_linear_r_ext family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q8_0_linear_r2_ext) " termite_q8_0_ext_projection<2u, false, false>(input, weight, nullptr, output, nullptr, p, 0u, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q8_0_linear_r3_ext) " termite_q8_0_ext_projection<3u, false, false>(input, weight, nullptr, output, nullptr, p, 0u, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q8_0_linear_r4_ext) " termite_q8_0_ext_projection<4u, false, false>(input, weight, nullptr, output, nullptr, p, 0u, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q8_0_linear_r5_ext) " termite_q8_0_ext_projection<5u, false, false>(input, weight, nullptr, output, nullptr, p, 0u, lane, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q8_0_linear_r_ext family
            // quant-kernel-codegen:begin generated quant kernels (do not edit; run: zig build quant-kernel-codegen -- --write)
            "inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }\n"
            "inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }\n"
@@ -9178,10 +9219,12 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint index = tid; index < 4096u; index += 256u) { uint row = index >> 6; uint col = index & 63u; uint global_row = first_r + row; if (global_row < uint(rows) && first_o + col < uint(out_dim)) output[global_row * uint(out_dim) + first_o + col] = result_tile[index]; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.spatial_q4_k_mm_matrix family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_florence_q4_k_mm_matrix_m64_n64(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
            "    threadgroup uchar shared[16384];\n"
            "    termite_k_mm_matrix_m64_n64<float, half, false>(input, weight_q4_k, output, rows, in_dim, out_dim, thread_pos, group_pos, simdgroup_id, shared);\n"
            "}\n"
+           // tile-codegen:end quant_metal.spatial_q4_k_mm_matrix family
            // Model-neutral high-row Q6_K matrix path. This is the same typed
            // 64x64x32 schedule emitted by quant_kernel_metal_renderer for an
            // exact Q6_K encoder signature, promoted behind a runtime gate so
@@ -9191,22 +9234,30 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup uchar shared[16384];\n"
            "    termite_k_mm_matrix_m64_n64<float, float, true>(input, weight_q6_k, output, rows, in_dim, out_dim, thread_pos, group_pos, simdgroup_id, shared);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.spatial_q4_k_mm_matrix_in_f16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_florence_q4_k_mm_matrix_m64_n64_in_f16(device const half *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
            "    threadgroup uchar shared[16384];\n"
            "    termite_k_mm_matrix_m64_n64<half, half, false>(input, weight_q4_k, output, rows, in_dim, out_dim, thread_pos, group_pos, simdgroup_id, shared);\n"
            "}\n"
+           // tile-codegen:end quant_metal.spatial_q4_k_mm_matrix_in_f16 family
            "template<uint RPTG, uint NSG> inline void termite_q4_0_linear_rows_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg) {\n"
            TERMITE_MSL_Q4_ROWS_BODY("")
+           // tile-codegen:begin quant_metal.q4_0_linear_r_ext family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q4_0_linear_r2_ext) " termite_q4_0_linear_rows_impl<2u, 2u>(input, weight, output, p, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q4_0_linear_r4_ext) " termite_q4_0_linear_rows_impl<4u, 2u>(input, weight, output, p, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q4_0_linear_r8_ext) " termite_q4_0_linear_rows_impl<5u, 2u>(input, weight, output, p, lane, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q4_0_linear_r_ext family
            "template<uint RPTG, uint NSG> inline void termite_q4_0_linear_short_specialized_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg) {\n"
            TERMITE_MSL_Q4_ROWS_BODY("_Pragma(\"clang loop unroll(full)\") ")
+           // tile-codegen:begin quant_metal.q4_0_linear_specialized family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q4_0_linear_r2_specialized) " termite_q4_0_linear_short_specialized_impl<2u,4u>(input,weight,output,p,lane,sgitg,tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q4_0_linear_r3_specialized) " termite_q4_0_linear_short_specialized_impl<3u,2u>(input,weight,output,p,lane,sgitg,tg); }\n"
+           // tile-codegen:end quant_metal.q4_0_linear_specialized family
+           // tile-codegen:begin quant_metal.q4_0_linear_r_ext4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q4_0_linear_r2_ext4) " termite_q4_0_linear_rows_impl<2u, 4u>(input, weight, output, p, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q4_0_linear_r4_ext4) " termite_q4_0_linear_rows_impl<4u, 4u>(input, weight, output, p, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q4_0_linear_r8_ext4) " termite_q4_0_linear_rows_impl<5u, 4u>(input, weight, output, p, lane, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q4_0_linear_r_ext4 family
            "struct termite_block_q4_0 { half d; uchar qs[16]; };\n"
            "inline void termite_dequantize_q4_0_4x4_half(device const termite_block_q4_0 *xb, short il, thread half4x4 &reg) {\n"
            "    device const ushort *qs = reinterpret_cast<device const ushort *>(&xb->qs[0]);\n"
@@ -9251,9 +9302,11 @@ static NSString *termite_metal_shader_source(void) {
            "    if (r0 + NR0 <= int(p.out_dim) && r1 + NR1 <= int(p.rows)) { device float *C = output + uint(r1) * p.out_dim + uint(r0) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; " ANTFLY_MSL_MATRIX_4X2_STORE("for ", "mc", "C", "p.out_dim") " }\n"
            "    else { threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); " ANTFLY_MSL_MATRIX_4X2_STORE("for ", "mc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); if (sgitg == 0) { for (int j = int(tiitg); j < int(nr1); j += NR1) { device float *D = output + uint(r1 + j) * p.out_dim + uint(r0); threadgroup float *C = ((threadgroup float *)shmem) + uint(j) * uint(NR0); uint i = 0u; for (; i < uint(nr0); ++i) D[i] = C[i]; } } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_mm_sg.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg) "\n"
            "    termite_quant_linear_mm_sg<termite_block_q4_0, 18u>(input, weight, output, p, shmem, tiitg, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mm_sg.0 family
            "template<uint Mode> inline void termite_q4_0_matrix_aligned_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, threadgroup char *shmem, ushort tiitg, ushort sgitg, uint3 tg) {\n"
            "    const bool Tail = Mode != 0u; const bool Unrolled = Mode == 2u;\n"
            "    weight += p.weight_offset;\n"
@@ -9282,6 +9335,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if ((!Unrolled || r0 + NR0 <= int(p.out_dim)) && (!Tail || r1 + NR1 <= int(p.rows))) { device float *C = output + uint(r1) * p.out_dim + uint(r0) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; " ANTFLY_MSL_MATRIX_4X2_STORE("for ", "mc", "C", "p.out_dim") " }\n"
            "    else { threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); " ANTFLY_MSL_MATRIX_4X2_STORE("for ", "mc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); if (sgitg == 0) { for (int j = int(tiitg); j < int(nr1); j += NR1) { device float *D = output + uint(r1 + j) * p.out_dim + uint(r0); threadgroup float *C = ((threadgroup float *)shmem) + uint(j) * uint(NR0); for (uint i = 0u; i < uint(Unrolled ? nr0 : NR0); ++i) D[i] = C[i]; } } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_mm_sg.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg_unrolled) "\n"
            "    termite_q4_0_matrix_aligned_impl<2u>(input, weight, output, p, shmem, tiitg, sgitg, tg);\n"
            "}\n"
@@ -9291,6 +9345,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg_aligned_tail) "\n"
            "    termite_q4_0_matrix_aligned_impl<1u>(input, weight, output, p, shmem, tiitg, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_0_mm_sg.1 family
            "inline void termite_q4_0_pair_activation_mm_m32_n64_impl(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device float *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, threadgroup char *shmem, ushort tiitg, ushort sgitg, uint3 tg, bool tail) {\n"
            "    threadgroup half *sa = (threadgroup half *)shmem; threadgroup half *sb = (threadgroup half *)(shmem + 4096u); const short NR0 = 64; const short NR1 = 32; const short NK = 32; const short NL0 = 2; const short NL1 = 4;\n"
            "    const uint r0 = tg.x * uint(NR0); const uint r1 = tg.y * uint(NR1); const uint nr1 = tail ? min(uint(NR1), p.rows - r1) : uint(NR1); const short lr0 = short(tiitg) / NL0; const short lr1 = tail ? short(min(uint(short(tiitg) / NL1), nr1 - 1u)) : short(tiitg) / NL1; const short il0 = short(tiitg) % NL0; const short iy = 8 * (short(tiitg) % NL1);\n"
@@ -9301,18 +9356,24 @@ static NSString *termite_metal_shader_source(void) {
                "for ",
                "for (uint index = uint(tiitg); index < nr1 * 64u; index += 128u) { uint row = index / 64u; uint col = index - row * 64u; uint output_index = (r1 + row) * p.out_dim + r0 + col; output[output_index] = termite_gated_activation_product(gate_tile[index], up_tile[index], ap.activation_kind); }\n")
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_pair_activation_mm_m32_n64 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_MATRIX(termite_q4_0_pair_activation_mm_m32_n64_aligned) " termite_q4_0_pair_activation_mm_m32_n64_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, false); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_MATRIX(termite_q4_0_pair_activation_mm_m32_n64_tail) " termite_q4_0_pair_activation_mm_m32_n64_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, true); }\n"
+           // tile-codegen:end quant_metal.q4_0_pair_activation_mm_m32_n64 family
            "inline void termite_q4_0_pair_activation_mm_m32_n32_impl(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device float *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, threadgroup char *shmem, ushort tiitg, ushort sgitg, uint3 tg, bool tail) {\n"
            "    threadgroup half *sa = (threadgroup half *)shmem; threadgroup half *sb = (threadgroup half *)(shmem + 2048u); const short NR0 = 32; const short NR1 = 32; const short NK = 32; const short NL0 = 2; const short NL1 = 4; const uint r0 = tg.x * uint(NR0); const uint r1 = tg.y * uint(NR1); const uint nr1 = tail ? min(uint(NR1), p.rows - r1) : uint(NR1); const short lr0 = short(min(uint(tiitg) / uint(NL0), 31u)); const short lr1 = tail ? short(min(uint(tiitg) / uint(NL1), nr1 - 1u)) : short(tiitg) / NL1; const short il0 = short(tiitg) % NL0; const short iy = 8 * (short(tiitg) % NL1); device const termite_block_q4_0 *x_gate = (device const termite_block_q4_0 *)(weight_gate + (r0 + uint(lr0)) * p.row_blocks * 18u); device const termite_block_q4_0 *x_up = (device const termite_block_q4_0 *)(weight_up + (r0 + uint(lr0)) * p.row_blocks * 18u); device const float *y = input + (r1 + uint(lr1)) * p.in_dim + uint(iy); simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb; simdgroup_float8x8 gate_acc[4]; simdgroup_float8x8 up_acc[4]; for (short i = 0; i < 4; ++i) { gate_acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); up_acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); }\n"
            "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) { half4x4 temp_gate; if (tiitg < 64u) termite_dequantize_q4_0_4x4_half(x_gate, il0, temp_gate); threadgroup_barrier(mem_flags::mem_threadgroup); if (tiitg < 64u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16("", "", "4", "temp_gate") " } } const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short ly = (short(tiitg) / NL1) % 8; const short ib = 4 * sx + sy; *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device const float2x4 *)y)); threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma_gate = sa; threadgroup const half *lsmb_gate = sb + 64u * uint(sgitg); " ANTFLY_MSL_MATRIX_4X1_MMA("lsma_gate", "lsmb_gate", "gate_acc") " half4x4 temp_up; if (tiitg < 64u) termite_dequantize_q4_0_4x4_half(x_up, il0, temp_up); threadgroup_barrier(mem_flags::mem_threadgroup); if (tiitg < 64u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16("w", "", "4", "temp_up") " } } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma_up = sa; threadgroup const half *lsmb_up = sb + 64u * uint(sgitg); " ANTFLY_MSL_MATRIX_4X1_MMA("lsma_up", "lsmb_up", "up_acc") " x_gate += 1; x_up += 1; y += uint(NK); }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *gate_tile = (threadgroup float *)shmem; threadgroup float *up_tile = gate_tile + 32u * 32u; const uint tile_base = 8u * uint(sgitg) * 32u; for (short i = 0; i < 4; ++i) { const uint matrix_offset = 8u * uint(i); simdgroup_store(gate_acc[i], gate_tile + tile_base + matrix_offset, 32u, 0, false); simdgroup_store(up_acc[i], up_tile + tile_base + matrix_offset, 32u, 0, false); } threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * 32u; index += 128u) { uint row = index / 32u; uint col = index - row * 32u; uint output_index = (r1 + row) * p.out_dim + r0 + col; output[output_index] = termite_gated_activation_product(gate_tile[index], up_tile[index], ap.activation_kind); }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q4_0_pair_activation_mm_m32_n32 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_MATRIX(termite_q4_0_pair_activation_mm_m32_n32_aligned) " termite_q4_0_pair_activation_mm_m32_n32_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, false); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_MATRIX(termite_q4_0_pair_activation_mm_m32_n32_tail) " termite_q4_0_pair_activation_mm_m32_n32_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, true); }\n"
+           // tile-codegen:end quant_metal.q4_0_pair_activation_mm_m32_n32 family
+           // tile-codegen:begin quant_metal.q8_0_mm_sg family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q8_0_linear_mm_sg) "\n"
            "    termite_quant_linear_mm_sg<termite_block_q8_0, 34u>(input, weight, output, p, shmem, tiitg, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_mm_sg family
            // Schedule-equivalent Q8_0 simdgroup path derived from the aligned
            // ggml-metal v0.10.1 tile: vectorized activation loads, explicitly
            // unrolled fixed loops, and a 6 KiB bulk tile.  The tail wrapper is
@@ -9329,19 +9390,25 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) { half4x4 temp_a; if (!Rows64 || tiitg < 128u) termite_dequantize_q8_0_4x4_half(x, il0, temp_a); threadgroup_barrier(mem_flags::mem_threadgroup); if (!Rows64 || tiitg < 128u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16("", "", "8", "temp_a") " } } const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short ly = (short(tiitg) / NL1) % 8; const short ib = (Rows64 ? 8 : 4) * sx + sy; *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = termite_q8_0_sg_v2_load(y); x += 1; y += uint(NK); threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u); " ANTFLY_MSL_MATRIX_4X2_MMA("TERMITE_FOR_UNROLL", "simdgroup_barrier(mem_flags::mem_none); ", "lsma", "lsmb", "mc", "(Rows64 ? 8 : 4)") " }\n"
            "    if (!Tail) { device float *C = output + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; " ANTFLY_MSL_MATRIX_4X2_STORE("TERMITE_FOR_UNROLL", "mc", "C", "p.out_dim") " return; } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); " ANTFLY_MSL_MATRIX_4X2_STORE("TERMITE_FOR_UNROLL", "mc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += Rows64 ? 256u : 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_linear_mm_sg_v2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q8_0_linear_mm_sg_v2) " termite_q8_0_linear_mm_sg_typed_impl<false, false>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q8_0_linear_mm_sg_v2_tail) " termite_q8_0_linear_mm_sg_typed_impl<false, true>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_F16_MATRIX(termite_q8_0_linear_mm_sg_v2_in_f16) " termite_q8_0_linear_mm_sg_typed_impl<false, false>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_F16_MATRIX(termite_q8_0_linear_mm_sg_v2_in_f16_tail) " termite_q8_0_linear_mm_sg_typed_impl<false, true>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q8_0_linear_mm_sg_v2 family
            // M64 keeps each simdgroup's accumulator footprint unchanged while
            // eight simdgroups share one 64x32 activation tile and one 64x32
            // dequantized weight tile. This halves weight staging relative to
            // two M32 threadgroups. Qualified default; the runtime retains a
            // global rollback switch for production diagnosis.
+           // tile-codegen:begin quant_metal.q8_0_linear_mm_sg_m64 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q8_0_linear_mm_sg_m64) " termite_q8_0_linear_mm_sg_typed_impl<true, false>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q8_0_linear_mm_sg_m64_tail) " termite_q8_0_linear_mm_sg_typed_impl<true, true>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q8_0_linear_mm_sg_m64 family
+           // tile-codegen:begin quant_metal.q8_0_linear_mm_sg_m64_f16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_F16_MATRIX(termite_q8_0_linear_mm_sg_m64_in_f16) " termite_q8_0_linear_mm_sg_typed_impl<true, false>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_F16_MATRIX(termite_q8_0_linear_mm_sg_m64_in_f16_tail) " termite_q8_0_linear_mm_sg_typed_impl<true, true>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q8_0_linear_mm_sg_m64_f16 family
            // Qwen3 GQA emits K and V from the same normalized activation. This
            // pair kernel retains separate accumulators but loads the activation
            // tile once, avoiding one device read and one command dispatch.
@@ -9353,8 +9420,10 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_PAIR_MATRIX_32X64_TRAVERSE("k", "xk", "v", "xv", "", "v", "termite_dequantize_q8_0_4x4_half", "termite_q8_0_sg_v2_load(y)")
            "    const uint tile_base = 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); if (!tail) { device float *K = output_k + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; device float *V = output_v + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) { const uint off = 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4); simdgroup_store(k_acc[i], K + off, p.out_dim, 0, false); simdgroup_store(v_acc[i], V + off, p.out_dim, 0, false); } return; } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + tile_base; " ANTFLY_MSL_MATRIX_4X2_STORE("TERMITE_FOR_UNROLL", "k_acc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output_k[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; } threadgroup_barrier(mem_flags::mem_threadgroup); " ANTFLY_MSL_MATRIX_4X2_STORE("TERMITE_FOR_UNROLL", "v_acc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output_v[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_kv_pair_mm_sg family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_Q8_KV_PAIR_MATRIX(termite_q8_0_kv_pair_mm_sg) " termite_q8_0_kv_pair_mm_sg_impl(input, weight_k, weight_v, output_k, output_v, p, shmem, tiitg, sgitg, tg, false); }\n"
            TERMITE_MSL_ABI_Q8_KV_PAIR_MATRIX(termite_q8_0_kv_pair_mm_sg_tail) " termite_q8_0_kv_pair_mm_sg_impl(input, weight_k, weight_v, output_k, output_v, p, shmem, tiitg, sgitg, tg, true); }\n"
+           // tile-codegen:end quant_metal.q8_0_kv_pair_mm_sg family
            "inline void termite_q8_0_pair_activation_mm_sg_v2_impl(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device uchar *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, threadgroup char *shmem, ushort tiitg, ushort sgitg, uint3 tg, bool output_f16) {\n"
            "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset; threadgroup half *sa = (threadgroup half *)shmem; threadgroup half *sb = (threadgroup half *)(shmem + 4096u); const short NR0 = 64; const short NR1 = 32; const short NK = 32; const short NL0 = 2; const short NL1 = 4;\n"
            "    const uint r0 = tg.x * uint(NR0); const uint r1 = tg.y * uint(NR1); const uint nr1 = min(uint(NR1), p.rows - r1); const short lr0 = short(tiitg) / NL0; const short lr1 = short(min(uint(short(tiitg) / NL1), nr1 - 1u)); const short il0 = short(tiitg) % NL0; const short iy = 8 * (short(tiitg) % NL1);\n"
@@ -9365,8 +9434,10 @@ static NSString *termite_metal_shader_source(void) {
                "TERMITE_FOR_UNROLL",
                "for (uint index = uint(tiitg); index < nr1 * 64u; index += 128u) { const uint row = index / 64u; const uint col = index - row * 64u; const uint output_index = (r1 + row) * p.out_dim + r0 + col; const float value = termite_gated_activation_product(gate_tile[index], up_tile[index], ap.activation_kind); if (output_f16) ((device half *)output)[output_index] = half(value); else ((device float *)output)[output_index] = value; }\n")
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_pair_activation_mm_sg_v2.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_Q8_PAIR_MATRIX(termite_q8_0_pair_activation_mm_sg_v2) " termite_q8_0_pair_activation_mm_sg_v2_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, false); }\n"
            TERMITE_MSL_ABI_Q8_PAIR_MATRIX(termite_q8_0_pair_activation_mm_sg_v2_out_f16) " termite_q8_0_pair_activation_mm_sg_v2_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, true); }\n"
+           // tile-codegen:end quant_metal.q8_0_pair_activation_mm_sg_v2.0 family
            "template<typename Input> inline void termite_q8_0_scalar_matrix_impl(device const Input *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg) {\n"
            "    weight += p.weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint RPTG = 8u; const uint CHPT = 4u; const uint OPG = 2u;\n"
@@ -9376,12 +9447,14 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off0 = row_offset0 + b * 34u; ushort bits0 = (ushort(weight[off0 + 1u]) << 8) | ushort(weight[off0]); float d0 = float(as_type<half>(bits0)); float4 w0 = float4(float(as_type<char>(weight[off0 + 2u + ci * 4u])), float(as_type<char>(weight[off0 + 3u + ci * 4u])), float(as_type<char>(weight[off0 + 4u + ci * 4u])), float(as_type<char>(weight[off0 + 5u + ci * 4u]))) * d0; float4 w1 = float4(0.0f); if (has_o1) { uint off1 = row_offset1 + b * 34u; ushort bits1 = (ushort(weight[off1 + 1u]) << 8) | ushort(weight[off1]); float d1 = float(as_type<half>(bits1)); w1 = float4(float(as_type<char>(weight[off1 + 2u + ci * 4u])), float(as_type<char>(weight[off1 + 3u + ci * 4u])), float(as_type<char>(weight[off1 + 4u + ci * 4u])), float(as_type<char>(weight[off1 + 5u + ci * 4u]))) * d1; } uint in_col = c * 4u; for (uint rr = 0u; rr < RPTG; ++rr) { uint r = first_r + rr; if (r >= p.rows) continue; uint in_off = r * p.in_dim + in_col; float4 x = float4(float(input[in_off]), float(input[in_off + 1u]), float(input[in_off + 2u]), float(input[in_off + 3u])); acc0[rr] += dot(x, w0); if (has_o1) acc1[rr] += dot(x, w1); } } }\n"
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total0 = acc0[rr]; float total1 = acc1[rr]; total0 += simd_shuffle_down(total0, 4u); total1 += simd_shuffle_down(total1, 4u); total0 += simd_shuffle_down(total0, 2u); total1 += simd_shuffle_down(total1, 2u); total0 += simd_shuffle_down(total0, 1u); total1 += simd_shuffle_down(total1, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) { uint idx = r * p.out_dim + first_o; output[idx] = total0; if (has_o1) output[idx + 1u] = total1; } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_pair_activation_mm_sg_v2.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SIMD(termite_q8_0_linear_mm) "\n"
            "    termite_q8_0_scalar_matrix_impl<float>(input, weight, output, p, lane, sgitg, tg);\n"
            "}\n"
            "kernel void termite_q8_0_linear_mm_in_f16(device const half *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    termite_q8_0_scalar_matrix_impl<half>(input, weight, output, p, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_pair_activation_mm_sg_v2.1 family
            "template<typename Output> inline void termite_q8_0_pair_scalar_matrix_impl(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device Output *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, ushort lane, ushort sgitg, uint3 tg) {\n"
            "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint RPTG = 8u; const uint CHPT = 4u; const uint OPG = 2u;\n"
@@ -9391,19 +9464,23 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off0 = row_offset0 + b * 34u; ushort bits_g0 = (ushort(weight_gate[off0 + 1u]) << 8) | ushort(weight_gate[off0]); ushort bits_u0 = (ushort(weight_up[off0 + 1u]) << 8) | ushort(weight_up[off0]); float dg0 = float(as_type<half>(bits_g0)); float du0 = float(as_type<half>(bits_u0)); float4 wg0 = float4(float(as_type<char>(weight_gate[off0 + 2u + ci * 4u])), float(as_type<char>(weight_gate[off0 + 3u + ci * 4u])), float(as_type<char>(weight_gate[off0 + 4u + ci * 4u])), float(as_type<char>(weight_gate[off0 + 5u + ci * 4u]))) * dg0; float4 wu0 = float4(float(as_type<char>(weight_up[off0 + 2u + ci * 4u])), float(as_type<char>(weight_up[off0 + 3u + ci * 4u])), float(as_type<char>(weight_up[off0 + 4u + ci * 4u])), float(as_type<char>(weight_up[off0 + 5u + ci * 4u]))) * du0; float4 wg1 = float4(0.0f); float4 wu1 = float4(0.0f); if (has_o1) { uint off1 = row_offset1 + b * 34u; ushort bits_g1 = (ushort(weight_gate[off1 + 1u]) << 8) | ushort(weight_gate[off1]); ushort bits_u1 = (ushort(weight_up[off1 + 1u]) << 8) | ushort(weight_up[off1]); float dg1 = float(as_type<half>(bits_g1)); float du1 = float(as_type<half>(bits_u1)); wg1 = float4(float(as_type<char>(weight_gate[off1 + 2u + ci * 4u])), float(as_type<char>(weight_gate[off1 + 3u + ci * 4u])), float(as_type<char>(weight_gate[off1 + 4u + ci * 4u])), float(as_type<char>(weight_gate[off1 + 5u + ci * 4u]))) * dg1; wu1 = float4(float(as_type<char>(weight_up[off1 + 2u + ci * 4u])), float(as_type<char>(weight_up[off1 + 3u + ci * 4u])), float(as_type<char>(weight_up[off1 + 4u + ci * 4u])), float(as_type<char>(weight_up[off1 + 5u + ci * 4u]))) * du1; } uint in_col = c * 4u; for (uint rr = 0u; rr < RPTG; ++rr) { uint r = first_r + rr; if (r >= p.rows) continue; uint in_off = r * p.in_dim + in_col; float4 x = float4(input[in_off], input[in_off + 1u], input[in_off + 2u], input[in_off + 3u]); gate0[rr] += dot(x, wg0); up0[rr] += dot(x, wu0); if (has_o1) { gate1[rr] += dot(x, wg1); up1[rr] += dot(x, wu1); } } } }\n"
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total_gate0 = gate0[rr]; float total_up0 = up0[rr]; float total_gate1 = gate1[rr]; float total_up1 = up1[rr]; total_gate0 += simd_shuffle_down(total_gate0, 4u); total_up0 += simd_shuffle_down(total_up0, 4u); total_gate1 += simd_shuffle_down(total_gate1, 4u); total_up1 += simd_shuffle_down(total_up1, 4u); total_gate0 += simd_shuffle_down(total_gate0, 2u); total_up0 += simd_shuffle_down(total_up0, 2u); total_gate1 += simd_shuffle_down(total_gate1, 2u); total_up1 += simd_shuffle_down(total_up1, 2u); total_gate0 += simd_shuffle_down(total_gate0, 1u); total_up0 += simd_shuffle_down(total_up0, 1u); total_gate1 += simd_shuffle_down(total_gate1, 1u); total_up1 += simd_shuffle_down(total_up1, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) { uint idx = r * p.out_dim + first_o; output[idx] = Output(termite_gated_activation_product(total_gate0, total_up0, ap.activation_kind)); if (has_o1) output[idx + 1u] = Output(termite_gated_activation_product(total_gate1, total_up1, ap.activation_kind)); } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_pair_activation_mm_sg_v2.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q8_0_pair_activation_multiply_mm) "\n"
            "    termite_q8_0_pair_scalar_matrix_impl<float>(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg);\n"
            "}\n"
            "kernel void termite_q8_0_pair_activation_multiply_mm_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    termite_q8_0_pair_scalar_matrix_impl<half>(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_pair_activation_mm_sg_v2.2 family
            TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION_REDUCE(termite_q8_0_pair_linear_mmv) "\n"
            "    termite_q8_0_mmv_pair(input, weight_a + p.weight_offset, weight_b + p.second_weight_offset, output_a, output_b, p.rows, p.in_dim, p.out_dim, p.row_blocks, shmem, lane, sgitg, tg.x * 2u, tg.y);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_pair_linear_r_ext family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_SIMD(termite_q8_0_pair_linear_r2_ext) " termite_q8_0_ext_projection<2u, true, false>(input, weight_a, weight_b, output_a, output_b, p, 0u, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_SIMD(termite_q8_0_pair_linear_r3_ext) " termite_q8_0_ext_projection<3u, true, false>(input, weight_a, weight_b, output_a, output_b, p, 0u, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_SIMD(termite_q8_0_pair_linear_r4_ext) " termite_q8_0_ext_projection<4u, true, false>(input, weight_a, weight_b, output_a, output_b, p, 0u, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_SIMD(termite_q8_0_pair_linear_r5_ext) " termite_q8_0_ext_projection<5u, true, false>(input, weight_a, weight_b, output_a, output_b, p, 0u, lane, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q8_0_pair_linear_r_ext family
            "kernel void termite_q8_0_qkv_linear_mmv(device const float *input [[buffer(0)]], device const uchar *weight_q [[buffer(1)]], device const uchar *weight_k [[buffer(2)]], device const uchar *weight_v [[buffer(3)]], device float *output_q [[buffer(4)]], device float *output_k [[buffer(5)]], device float *output_v [[buffer(6)]], constant termite_metal_qkv_linear_params &p [[buffer(7)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    uint q_groups = (p.q_out_dim + 1u) / 2u;\n"
            "    if (tg.x < q_groups) {\n"
@@ -9412,6 +9489,7 @@ static NSString *termite_metal_shader_source(void) {
            "        termite_q8_0_mmv_pair(input, weight_k + p.k_weight_offset, weight_v + p.v_weight_offset, output_k, output_v, p.rows, p.in_dim, p.kv_out_dim, p.row_blocks, shmem, lane, sgitg, (tg.x - q_groups) * 2u, tg.y);\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_pair_activation.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_REDUCE(termite_q8_0_pair_activation_multiply_1x_reduce4) "\n"
            "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
@@ -9421,12 +9499,14 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { shmem[sgitg] = gate0; shmem[32u + sgitg] = up0; shmem[64u + sgitg] = gate1; shmem[96u + sgitg] = up1; shmem[128u + sgitg] = gate2; shmem[160u + sgitg] = up2; shmem[192u + sgitg] = gate3; shmem[224u + sgitg] = up3; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total_gate0 = simd_sum(shmem[lane]); float total_up0 = simd_sum(shmem[32u + lane]); float total_gate1 = simd_sum(shmem[64u + lane]); float total_up1 = simd_sum(shmem[96u + lane]); float total_gate2 = simd_sum(shmem[128u + lane]); float total_up2 = simd_sum(shmem[160u + lane]); float total_gate3 = simd_sum(shmem[192u + lane]); float total_up3 = simd_sum(shmem[224u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = termite_gated_activation_product(total_gate0, total_up0, ap.activation_kind); if (first_o + 1u < p.out_dim) output[idx + 1u] = termite_gated_activation_product(total_gate1, total_up1, ap.activation_kind); if (first_o + 2u < p.out_dim) output[idx + 2u] = termite_gated_activation_product(total_gate2, total_up2, ap.activation_kind); if (first_o + 3u < p.out_dim) output[idx + 3u] = termite_gated_activation_product(total_gate3, total_up3, ap.activation_kind); }\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_pair_activation.0 family
            "template<bool Norm, typename Output> __attribute__((always_inline)) inline void termite_q8_0_pair_scalar_impl(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device Output *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, device const float *norm_weight, device const float *inv_scale, ushort lane, ushort sgitg, uint3 tg) {\n"
            "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint r = tg.y; if (r >= p.rows || o >= p.out_dim) return; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u; uint input_row = r * p.in_dim; float scale = Norm ? inv_scale[r] : 1.0f; float gate = 0.0f; float up = 0.0f;\n"
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits_g = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort bits_u = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float dg = float(as_type<half>(bits_g)); float du = float(as_type<half>(bits_u)); float4 wg = float4(float(as_type<char>(weight_gate[off + 2u + ci * 4u])), float(as_type<char>(weight_gate[off + 3u + ci * 4u])), float(as_type<char>(weight_gate[off + 4u + ci * 4u])), float(as_type<char>(weight_gate[off + 5u + ci * 4u]))) * dg; float4 wu = float4(float(as_type<char>(weight_up[off + 2u + ci * 4u])), float(as_type<char>(weight_up[off + 3u + ci * 4u])), float(as_type<char>(weight_up[off + 4u + ci * 4u])), float(as_type<char>(weight_up[off + 5u + ci * 4u]))) * du; uint in_col = input_row + c * 4u; uint norm_col = c * 4u; float4 x; if (Norm) x = float4(input[in_col] * norm_weight[norm_col], input[in_col + 1u] * norm_weight[norm_col + 1u], input[in_col + 2u] * norm_weight[norm_col + 2u], input[in_col + 3u] * norm_weight[norm_col + 3u]) * scale; else x = float4(input[in_col], input[in_col + 1u], input[in_col + 2u], input[in_col + 3u]); gate += dot(x, wg); up += dot(x, wu); } }\n"
            "    gate += simd_shuffle_down(gate, 4u); up += simd_shuffle_down(up, 4u); gate += simd_shuffle_down(gate, 2u); up += simd_shuffle_down(up, 2u); gate += simd_shuffle_down(gate, 1u); up += simd_shuffle_down(up, 1u); if (tx == 0u) output[r * p.out_dim + o] = Output(termite_gated_activation_product(gate, up, ap.activation_kind));\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_pair_activation.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q8_0_pair_activation_multiply_1r_ext) "\n"
            "    termite_q8_0_pair_scalar_impl<false, float>(input, weight_gate, weight_up, output, p, ap, input, input, lane, sgitg, tg);\n"
            "}\n"
@@ -9436,10 +9516,13 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_q8_0_pair_activation_multiply_rms_scale_1r_ext_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], device const float *norm_weight [[buffer(6)]], device const float *inv_scale [[buffer(7)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    termite_q8_0_pair_scalar_impl<true, half>(input, weight_gate, weight_up, output, p, ap, norm_weight, inv_scale, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_pair_activation.1 family
+           // tile-codegen:begin quant_metal.q8_0_pair_activation_multiply_r_ext family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q8_0_pair_activation_multiply_r2_ext) " termite_q8_0_ext_projection<2u, true, true>(input, weight_gate, weight_up, output, nullptr, p, ap.activation_kind, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q8_0_pair_activation_multiply_r3_ext) " termite_q8_0_ext_projection<3u, true, true>(input, weight_gate, weight_up, output, nullptr, p, ap.activation_kind, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q8_0_pair_activation_multiply_r4_ext) " termite_q8_0_ext_projection<4u, true, true>(input, weight_gate, weight_up, output, nullptr, p, ap.activation_kind, lane, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q8_0_pair_activation_multiply_r5_ext) " termite_q8_0_ext_projection<5u, true, true>(input, weight_gate, weight_up, output, nullptr, p, ap.activation_kind, lane, sgitg, tg); }\n"
+           // tile-codegen:end quant_metal.q8_0_pair_activation_multiply_r_ext family
            "// q4_0 gate+up pair-activation with shared weight reads across RPTG rows\n"
            "// (the MTP verify shape: rows 2-8). Both weight streams are dequantized\n"
            "// once per chunk via the yl mask trick and dotted against all rows'\n"
@@ -9457,6 +9540,7 @@ static NSString *termite_metal_shader_source(void) {
            "            gate[rr] += dg * (qg - 8.0f * sumy); up[rr] += du * (qu - 8.0f * sumy); } } }\n"
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total_gate = gate[rr]; float total_up = up[rr]; total_gate += simd_shuffle_down(total_gate, 4u); total_up += simd_shuffle_down(total_up, 4u); total_gate += simd_shuffle_down(total_gate, 2u); total_up += simd_shuffle_down(total_up, 2u); total_gate += simd_shuffle_down(total_gate, 1u); total_up += simd_shuffle_down(total_up, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) output[r * p.out_dim + o] = termite_gated_activation_product(total_gate, total_up, ap.activation_kind); }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_multiply_r2_ext) " termite_q4_0_pair_activation_multiply_r_ext_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 2u); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_multiply_r3_ext) " termite_q4_0_pair_activation_multiply_r_ext_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 3u); }\n"
            TERMITE_MSL_ABI_QUANT_PAIR_ACTIVATION_SIMD(termite_q4_0_pair_activation_multiply_r4_ext) " termite_q4_0_pair_activation_multiply_r_ext_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 4u); }\n"
@@ -9476,6 +9560,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { shmem[sgitg] = acc0; shmem[32u + sgitg] = acc1; shmem[64u + sgitg] = acc2; shmem[96u + sgitg] = acc3; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total0 = simd_sum(shmem[lane]); float total1 = simd_sum(shmem[32u + lane]); float total2 = simd_sum(shmem[64u + lane]); float total3 = simd_sum(shmem[96u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = termite_gated_activation_product(total0, rhs[idx], ap.activation_kind); if (first_o + 1u < p.out_dim) output[idx + 1u] = termite_gated_activation_product(total1, rhs[idx + 1u], ap.activation_kind); if (first_o + 2u < p.out_dim) output[idx + 2u] = termite_gated_activation_product(total2, rhs[idx + 2u], ap.activation_kind); if (first_o + 3u < p.out_dim) output[idx + 3u] = termite_gated_activation_product(total3, rhs[idx + 3u], ap.activation_kind); }\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.0 family
            "template<uint Format, bool Indexed> inline void termite_quant_rows_decode(\n"
            "    device const uchar *weight, device const uint *ids, device float *output,\n"
            "    constant termite_metal_quant_rows_params &p, uint gid) {\n"
@@ -9497,12 +9582,15 @@ static NSString *termite_metal_shader_source(void) {
            "    else if (Format == 7u) { float d = termite_q8_0_block_scale(weight, off); output[gid] = d * termite_q8_0_block_value(weight, off, inner) * p.scale; }\n"
            "    else if (Format == 8u) { output[gid] = termite_q8_1_block_scale(weight, off) * termite_q8_1_block_value(weight, off, inner) * p.scale; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q4_0_get_rows) "\n"
            "    termite_quant_rows_decode<0u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.1 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q4_0_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 31u) != 0u) return; uint row_blocks = p.dim / 32u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 32u; float max_abs = 0.0f; for (uint i = 0u; i < 32u; ++i) max_abs = fmax(max_abs, fabs(input[input_base + i] * p.scale)); float d = max_abs == 0.0f ? 1.0f : max_abs / 8.0f; float inv = max_abs == 0.0f ? 0.0f : 1.0f / d; uint off = (target_row * row_blocks + block) * 18u; ushort bits = as_type<ushort>(half(d)); weight[off] = uchar(bits & 0xffu); weight[off + 1u] = uchar((bits >> 8) & 0xffu); for (uint i = 0u; i < 16u; ++i) { uint lo = uint(clamp(round(input[input_base + i] * p.scale * inv + 8.0f), 0.0f, 15.0f)); uint hi = uint(clamp(round(input[input_base + 16u + i] * p.scale * inv + 8.0f), 0.0f, 15.0f)); weight[off + 2u + i] = uchar(lo | (hi << 4)); }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q4_0_set_rows) "\n"
            "    termite_q4_0_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9515,9 +9603,11 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q4_1_get_rows) "\n"
            "    termite_quant_rows_decode<1u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.2 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q4_1_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 31u) != 0u) return; uint row_blocks = p.dim / 32u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 32u; float min_v = input[input_base] * p.scale; float max_v = min_v; for (uint i = 1u; i < 32u; ++i) { float v = input[input_base + i] * p.scale; min_v = fmin(min_v, v); max_v = fmax(max_v, v); } float span = max_v - min_v; float d = span == 0.0f ? 1.0f : span / 15.0f; float inv = span == 0.0f ? 0.0f : 1.0f / d; uint off = (target_row * row_blocks + block) * 20u; ushort d_bits = as_type<ushort>(half(d)); ushort m_bits = as_type<ushort>(half(min_v)); weight[off] = uchar(d_bits & 0xffu); weight[off + 1u] = uchar((d_bits >> 8) & 0xffu); weight[off + 2u] = uchar(m_bits & 0xffu); weight[off + 3u] = uchar((m_bits >> 8) & 0xffu); for (uint i = 0u; i < 16u; ++i) { uint lo = uint(clamp(round((input[input_base + i] * p.scale - min_v) * inv), 0.0f, 15.0f)); uint hi = uint(clamp(round((input[input_base + 16u + i] * p.scale - min_v) * inv), 0.0f, 15.0f)); weight[off + 4u + i] = uchar(lo | (hi << 4)); }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q4_1_set_rows) "\n"
            "    termite_q4_1_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9530,9 +9620,11 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q5_0_get_rows) "\n"
            "    termite_quant_rows_decode<2u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.3 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q5_0_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 31u) != 0u) return; uint row_blocks = p.dim / 32u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 32u; float max_abs = 0.0f; for (uint i = 0u; i < 32u; ++i) max_abs = fmax(max_abs, fabs(input[input_base + i] * p.scale)); float d = max_abs == 0.0f ? 1.0f : max_abs / 16.0f; float inv = max_abs == 0.0f ? 0.0f : 1.0f / d; uint off = (target_row * row_blocks + block) * 22u; ushort bits = as_type<ushort>(half(d)); weight[off] = uchar(bits & 0xffu); weight[off + 1u] = uchar((bits >> 8) & 0xffu); uint qh = 0u; for (uint i = 0u; i < 16u; ++i) { uint lo = uint(clamp(round(input[input_base + i] * p.scale * inv + 16.0f), 0.0f, 31.0f)); uint hi = uint(clamp(round(input[input_base + 16u + i] * p.scale * inv + 16.0f), 0.0f, 31.0f)); weight[off + 6u + i] = uchar((lo & 0x0fu) | ((hi & 0x0fu) << 4)); qh |= ((lo >> 4) & 1u) << i; qh |= ((hi >> 4) & 1u) << (i + 16u); } weight[off + 2u] = uchar(qh & 0xffu); weight[off + 3u] = uchar((qh >> 8) & 0xffu); weight[off + 4u] = uchar((qh >> 16) & 0xffu); weight[off + 5u] = uchar((qh >> 24) & 0xffu);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q5_0_set_rows) "\n"
            "    termite_q5_0_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9545,9 +9637,11 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q5_1_get_rows) "\n"
            "    termite_quant_rows_decode<3u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.4 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q5_1_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 31u) != 0u) return; uint row_blocks = p.dim / 32u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 32u; float min_v = input[input_base] * p.scale; float max_v = min_v; for (uint i = 1u; i < 32u; ++i) { float v = input[input_base + i] * p.scale; min_v = fmin(min_v, v); max_v = fmax(max_v, v); } float span = max_v - min_v; float d = span == 0.0f ? 1.0f : span / 31.0f; float inv = span == 0.0f ? 0.0f : 1.0f / d; uint off = (target_row * row_blocks + block) * 24u; ushort d_bits = as_type<ushort>(half(d)); ushort m_bits = as_type<ushort>(half(min_v)); weight[off] = uchar(d_bits & 0xffu); weight[off + 1u] = uchar((d_bits >> 8) & 0xffu); weight[off + 2u] = uchar(m_bits & 0xffu); weight[off + 3u] = uchar((m_bits >> 8) & 0xffu); uint qh = 0u; for (uint i = 0u; i < 16u; ++i) { uint lo = uint(clamp(round((input[input_base + i] * p.scale - min_v) * inv), 0.0f, 31.0f)); uint hi = uint(clamp(round((input[input_base + 16u + i] * p.scale - min_v) * inv), 0.0f, 31.0f)); weight[off + 8u + i] = uchar((lo & 0x0fu) | ((hi & 0x0fu) << 4)); qh |= ((lo >> 4) & 1u) << i; qh |= ((hi >> 4) & 1u) << (i + 16u); } weight[off + 4u] = uchar(qh & 0xffu); weight[off + 5u] = uchar((qh >> 8) & 0xffu); weight[off + 6u] = uchar((qh >> 16) & 0xffu); weight[off + 7u] = uchar((qh >> 24) & 0xffu);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q5_1_set_rows) "\n"
            "    termite_q5_1_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9560,9 +9654,11 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q4_k_get_rows) "\n"
            "    termite_quant_rows_decode<4u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.5 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q4_k_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 255u) != 0u) return; uint row_blocks = p.dim / 256u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 256u; uint off = (target_row * row_blocks + block) * 144u; for (uint i = 0u; i < 144u; ++i) weight[off + i] = 0u; float sub_scales[8]; float sub_mins[8]; float max_scale = 0.0f; float max_min = 0.0f; for (uint sub = 0u; sub < 8u; ++sub) { float min_v = input[input_base + sub * 32u] * p.scale; float max_v = min_v; for (uint i = 1u; i < 32u; ++i) { float v = input[input_base + sub * 32u + i] * p.scale; min_v = fmin(min_v, v); max_v = fmax(max_v, v); } float min_mag = fmax(-min_v, 0.0f); float sc = (max_v + min_mag) == 0.0f ? 1.0f : (max_v + min_mag) / 15.0f; sub_scales[sub] = sc; sub_mins[sub] = min_mag; max_scale = fmax(max_scale, sc); max_min = fmax(max_min, min_mag); } float d = max_scale == 0.0f ? 1.0f : max_scale / 63.0f; float dmin = max_min == 0.0f ? 1.0f : max_min / 63.0f; ushort d_bits = as_type<ushort>(half(d)); ushort dmin_bits = as_type<ushort>(half(dmin)); weight[off] = uchar(d_bits & 0xffu); weight[off + 1u] = uchar((d_bits >> 8) & 0xffu); weight[off + 2u] = uchar(dmin_bits & 0xffu); weight[off + 3u] = uchar((dmin_bits >> 8) & 0xffu); uint scs[8]; uint mins[8]; for (uint sub = 0u; sub < 8u; ++sub) { scs[sub] = max_scale == 0.0f ? 0u : uint(clamp(round(sub_scales[sub] / d), 0.0f, 63.0f)); mins[sub] = max_min == 0.0f ? 0u : uint(clamp(round(sub_mins[sub] / dmin), 0.0f, 63.0f)); } pack_q4k_scale_mins(weight + off + 4u, scs, mins); for (uint chunk = 0u; chunk < 4u; ++chunk) { uint sub0 = chunk * 2u; uint sub1 = sub0 + 1u; float inv0 = sub_scales[sub0] == 0.0f ? 0.0f : 1.0f / sub_scales[sub0]; float inv1 = sub_scales[sub1] == 0.0f ? 0.0f : 1.0f / sub_scales[sub1]; uint q_off = off + 16u + chunk * 32u; for (uint i = 0u; i < 32u; ++i) { uint q0 = uint(clamp(round((input[input_base + sub0 * 32u + i] * p.scale + sub_mins[sub0]) * inv0), 0.0f, 15.0f)); uint q1 = uint(clamp(round((input[input_base + sub1 * 32u + i] * p.scale + sub_mins[sub1]) * inv1), 0.0f, 15.0f)); weight[q_off + i] = uchar(q0 | (q1 << 4)); } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q4_k_set_rows) "\n"
            "    termite_q4_k_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9575,9 +9671,11 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q5_k_get_rows) "\n"
            "    termite_quant_rows_decode<5u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.6 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q5_k_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 255u) != 0u) return; uint row_blocks = p.dim / 256u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 256u; uint off = (target_row * row_blocks + block) * 176u; for (uint i = 0u; i < 176u; ++i) weight[off + i] = 0u; float sub_scales[8]; float sub_mins[8]; float max_scale = 0.0f; float max_min = 0.0f; for (uint sub = 0u; sub < 8u; ++sub) { float min_v = input[input_base + sub * 32u] * p.scale; float max_v = min_v; for (uint i = 1u; i < 32u; ++i) { float v = input[input_base + sub * 32u + i] * p.scale; min_v = fmin(min_v, v); max_v = fmax(max_v, v); } float min_mag = fmax(-min_v, 0.0f); float sc = (max_v + min_mag) == 0.0f ? 1.0f : (max_v + min_mag) / 31.0f; sub_scales[sub] = sc; sub_mins[sub] = min_mag; max_scale = fmax(max_scale, sc); max_min = fmax(max_min, min_mag); } float d = max_scale == 0.0f ? 1.0f : max_scale / 63.0f; float dmin = max_min == 0.0f ? 1.0f : max_min / 63.0f; ushort d_bits = as_type<ushort>(half(d)); ushort dmin_bits = as_type<ushort>(half(dmin)); weight[off] = uchar(d_bits & 0xffu); weight[off + 1u] = uchar((d_bits >> 8) & 0xffu); weight[off + 2u] = uchar(dmin_bits & 0xffu); weight[off + 3u] = uchar((dmin_bits >> 8) & 0xffu); uint scs[8]; uint mins[8]; for (uint sub = 0u; sub < 8u; ++sub) { scs[sub] = max_scale == 0.0f ? 0u : uint(clamp(round(sub_scales[sub] / d), 0.0f, 63.0f)); mins[sub] = max_min == 0.0f ? 0u : uint(clamp(round(sub_mins[sub] / dmin), 0.0f, 63.0f)); } pack_q4k_scale_mins(weight + off + 4u, scs, mins); for (uint sub = 0u; sub < 8u; ++sub) { uint chunk = sub / 2u; bool high = (sub & 1u) != 0u; uint ql_off = off + 48u + chunk * 32u; float inv = sub_scales[sub] == 0.0f ? 0.0f : 1.0f / sub_scales[sub]; for (uint i = 0u; i < 32u; ++i) { uint q = uint(clamp(round((input[input_base + sub * 32u + i] * p.scale + sub_mins[sub]) * inv), 0.0f, 31.0f)); if (high) weight[ql_off + i] |= uchar((q & 0x0fu) << 4); else weight[ql_off + i] |= uchar(q & 0x0fu); weight[off + 16u + i] |= uchar(((q >> 4) & 1u) << sub); } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q5_k_set_rows) "\n"
            "    termite_q5_k_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9590,9 +9688,11 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q6_k_get_rows) "\n"
            "    termite_quant_rows_decode<6u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.7 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q6_k_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 255u) != 0u) return; uint row_blocks = p.dim / 256u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 256u; uint off = (target_row * row_blocks + block) * 210u; for (uint i = 0u; i < 210u; ++i) weight[off + i] = 0u; float sub_scales[16]; float max_scale = 0.0f; for (uint sub = 0u; sub < 16u; ++sub) { float sub_max = 0.0f; for (uint i = 0u; i < 16u; ++i) sub_max = fmax(sub_max, fabs(input[input_base + sub * 16u + i] * p.scale)); float sc = sub_max == 0.0f ? 1.0f : sub_max / 31.0f; sub_scales[sub] = sc; max_scale = fmax(max_scale, sc); } float d = max_scale == 0.0f ? 1.0f : max_scale / 127.0f; ushort d_bits = as_type<ushort>(half(d)); weight[off + 208u] = uchar(d_bits & 0xffu); weight[off + 209u] = uchar((d_bits >> 8) & 0xffu); for (uint sub = 0u; sub < 16u; ++sub) { uint scaled = max_scale == 0.0f ? 0u : uint(clamp(round(sub_scales[sub] / d), 0.0f, 127.0f)); weight[off + 192u + sub] = as_type<uchar>(char(scaled)); uint half_idx = sub / 8u; uint group = (sub % 8u) / 2u; uint l_base = (sub % 2u) * 16u; uint ql_off = half_idx * 64u + (group & 1u) * 32u; uint qh_off = half_idx * 32u; uint qh_shift = group * 2u; uint nibble_shift = (group / 2u) * 4u; float inv = sub_scales[sub] == 0.0f ? 0.0f : 1.0f / sub_scales[sub]; for (uint i = 0u; i < 16u; ++i) { float v = input[input_base + sub * 16u + i] * p.scale; uint q = uint(clamp(round(v * inv + 32.0f), 0.0f, 63.0f)); uint l = l_base + i; weight[off + ql_off + l] |= uchar((q & 0x0fu) << nibble_shift); weight[off + 128u + qh_off + l] |= uchar(((q >> 4) & 0x03u) << qh_shift); } }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.8 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q6_k_set_rows) "\n"
            "    termite_q6_k_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9605,9 +9705,11 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q8_0_get_rows) "\n"
            "    termite_quant_rows_decode<7u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.8 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q8_0_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 31u) != 0u) return; uint row_blocks = p.dim / 32u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 32u; float max_abs = 0.0f; for (uint i = 0u; i < 32u; ++i) max_abs = fmax(max_abs, fabs(input[input_base + i] * p.scale)); float d = max_abs == 0.0f ? 0.0f : max_abs / 127.0f; float inv = d == 0.0f ? 0.0f : 1.0f / d; uint off = (target_row * row_blocks + block) * 34u; ushort bits = as_type<ushort>(half(d)); weight[off] = uchar(bits & 0xffu); weight[off + 1u] = uchar((bits >> 8) & 0xffu); for (uint i = 0u; i < 32u; ++i) { float scaled = input[input_base + i] * p.scale; int q = int(round(clamp(scaled * inv, -127.0f, 127.0f))); weight[off + 2u + i] = as_type<uchar>(char(q)); }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.9 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q8_0_set_rows) "\n"
            "    termite_q8_0_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9620,9 +9722,11 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_GATHER(termite_q8_1_get_rows) "\n"
            "    termite_quant_rows_decode<8u, true>(weight, ids, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.9 family
            "template<bool Indexed> __attribute__((always_inline)) inline void termite_q8_1_encode_rows_impl(device const float *input, device const uint *ids, device uchar *weight, constant termite_metal_quant_rows_params &p, uint gid) {\n"
            "    if ((p.dim & 31u) != 0u) return; uint row_blocks = p.dim / 32u; uint total_blocks = p.total * row_blocks; if (gid >= total_blocks) return; uint row = gid / row_blocks; uint block = gid - row * row_blocks; uint target_row = Indexed ? ids[row] : p.row_offset + row; if (target_row >= p.source_rows) return; uint input_base = row * p.dim + block * 32u; float max_abs = 0.0f; for (uint i = 0u; i < 32u; ++i) max_abs = fmax(max_abs, fabs(input[input_base + i] * p.scale)); float d = max_abs == 0.0f ? 1.0f : max_abs / 127.0f; float inv = max_abs == 0.0f ? 0.0f : 1.0f / d; uint off = (target_row * row_blocks + block) * 36u; ushort bits = as_type<ushort>(half(d)); weight[off] = uchar(bits & 0xffu); weight[off + 1u] = uchar((bits >> 8) & 0xffu); int qsum = 0; for (uint i = 0u; i < 32u; ++i) { float scaled = input[input_base + i] * p.scale; int q = int(round(clamp(scaled * inv, -127.0f, 127.0f))); qsum += q; weight[off + 4u + i] = as_type<uchar>(char(q)); } ushort sum_bits = as_type<ushort>(half(d * float(qsum))); weight[off + 2u] = uchar(sum_bits & 0xffu); weight[off + 3u] = uchar((sum_bits >> 8) & 0xffu);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q8_0_activation_rhs_rows.10 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_SCATTER(termite_q8_1_set_rows) "\n"
            "    termite_q8_1_encode_rows_impl<true>(input, ids, weight, p, gid);\n"
            "}\n"
@@ -9642,6 +9746,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float acc[2] = {acc0, acc1};\n"
            "    termite_legacy_reduce_store<2u>(acc, shmem, output, p, r, first_o, lane, sgitg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q8_0_activation_rhs_rows.10 family
            "// The four terms deliberately retain their original left-to-right expression.\n"
            "__attribute__((always_inline)) inline float termite_i2_s_value(uint code) { return code == 0u ? -1.0f : (code == 2u ? 1.0f : 0.0f); }\n"
            "__attribute__((always_inline)) inline float termite_i2_s_group_dot(uchar packed, float x0, float x1, float x2, float x3) {\n"
@@ -9725,12 +9830,14 @@ static NSString *termite_metal_shader_source(void) {
            "    float inv_std = rsqrt(variance + p.eps);\n"
            "    for (uint i = first; i < p.hidden_size; i += step) { float v = SaveSum ? sum_out[row_base + i] : termite_layer_norm_load<Mode>(input, other, bias, row_base + i, i); output[row_base + i] = ((v - mean) * inv_std) * gamma[i] + beta[i]; }\n"
            "}\n"
+           // tile-codegen:begin layer_norm.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_layer_norm_1x(device const float *input [[buffer(0)]], device const float *gamma [[buffer(1)]], device const float *beta [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_layer_norm_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    termite_layer_norm_family<0u, false, false>(input, input, input, gamma, beta, output, output, p, nullptr, gid, 0u, 1u);\n"
            "}\n"
            "kernel void termite_apply_layer_norm_rows(device const float *input [[buffer(0)]], device const float *gamma [[buffer(1)]], device const float *beta [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_layer_norm_params &p [[buffer(4)]], threadgroup float *scratch [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]], uint3 threads_per_tg [[threads_per_threadgroup]]) {\n"
            "    termite_layer_norm_family<0u, false, true>(input, input, input, gamma, beta, output, output, p, scratch, tg.x, tid, threads_per_tg.x);\n"
            "}\n"
+           // tile-codegen:end layer_norm.0 family
 	           "kernel void termite_layer_norm_bwd_dx(device const float *input [[buffer(0)]], device const float *gamma [[buffer(1)]], device const float *dy [[buffer(2)]], device float *dx [[buffer(3)]], device float *stats [[buffer(4)]], constant termite_metal_layer_norm_bwd_params &p [[buffer(5)]], threadgroup float *scratch [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]], uint3 threads_per_tg [[threads_per_threadgroup]]) {\n"
 	           "    uint row = tg.x; uint width = threads_per_tg.x; if (p.hidden_size == 0u || width == 0u || tid >= 256u) return; uint row_base = row * p.hidden_size; float N = float(p.hidden_size); threadgroup float *a = scratch; threadgroup float *b = scratch + 256u;\n"
 	           "    float sum = 0.0f; float sq = 0.0f; for (uint i = tid; i < p.hidden_size; i += width) { float v = input[row_base + i]; sum += v; sq += v * v; }\n"
@@ -9776,6 +9883,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint c = 0u; c < chunks; ++c) { dg += partial[(c * 2u) * p.hidden_size + gid]; db += partial[(c * 2u + 1u) * p.hidden_size + gid]; }\n"
            "    output[p.rows * p.hidden_size + gid] = dg; output[(p.rows + 1u) * p.hidden_size + gid] = db;\n"
            "}\n"
+           // tile-codegen:begin layer_norm.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_add_layer_norm_1x(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device const float *gamma [[buffer(2)]], device const float *beta [[buffer(3)]], device float *output [[buffer(4)]], constant termite_metal_apply_layer_norm_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
            "    termite_layer_norm_family<1u, false, false>(a, b, a, gamma, beta, output, output, p, nullptr, gid, 0u, 1u);\n"
            "}\n"
@@ -9794,6 +9902,8 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_apply_bias_add_layer_norm_rows(device const float *projected [[buffer(0)]], device const float *bias [[buffer(1)]], device const float *residual [[buffer(2)]], device const float *gamma [[buffer(3)]], device const float *beta [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_apply_layer_norm_params &p [[buffer(6)]], threadgroup float *scratch [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]], uint3 threads_per_tg [[threads_per_threadgroup]]) {\n"
            "    termite_layer_norm_family<2u, false, true>(projected, residual, bias, gamma, beta, output, output, p, scratch, tg.x, tid, threads_per_tg.x);\n"
            "}\n"
+           // tile-codegen:end layer_norm.1 family
+           // tile-codegen:begin rms_norm.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 	           "kernel void termite_apply_rms_norm_1x(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_layer_norm_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid != 0) return;\n"
            "    if (p.hidden_size == 0) return;\n"
@@ -9803,6 +9913,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float inv_rms = rsqrt(mean_square + p.eps);\n"
            "    for (uint i = 0; i < p.hidden_size; ++i) output[i] = input[i] * inv_rms * weight[i];\n"
            "}\n"
+           // tile-codegen:end rms_norm.0 family
            "// Statistics and epilogues have separate static owners; reduction trees stay exact.\n"
            "template<typename Input, bool Precomputed>\n"
            "__attribute__((always_inline)) inline float antfly_rms_tree_inverse(device const Input*input,uint base,uint hidden,float eps,threadgroup float*shmem,uint tid,uint tpg,device const float*sumsq,uint partial_base) {\n"
@@ -9818,6 +9929,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint i = tid; i < hidden; i += tpg) { if (ExpressionEpilogue) { if (Scale) output[base + i] = (float(input[base + i]) * inv_rms * weight[i] + residual[base + i]) * scale; else output[base + i] = float(input[base + i]) * inv_rms * weight[i] + residual[base + i]; } else { float value = float(input[base + i]) * inv_rms * weight[i]; if (Add) value = value + residual[base + i]; if (Scale) value = value * scale; output[base + i] = value; } }\n"
            "}\n"
 
+           // tile-codegen:begin rms_norm.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_rms_norm_1x_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_layer_norm_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]]) {\n"
            "    termite_rms_norm_tree<false, false>(input, weight, input, output, shmem, 0u, p.hidden_size, p.eps, 1.0f, tid, tpg);\n"
            "}\n"
@@ -9840,6 +9952,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_apply_rms_norm_rows_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows) return; termite_rms_norm_tree<false, false>(input, weight, input, output, shmem, row * p.hidden_size, p.hidden_size, p.eps, 1.0f, tid, tpg);\n"
            "}\n"
+           // tile-codegen:end rms_norm.1 family
            "template<uint FixedWidth = 0u> inline float antfly_row_rms_simd_inverse(device const float *input, uint base, uint width, float eps, uint lane) {\n"
            "    uint dim = FixedWidth ? FixedWidth : width;\n"
            "    float sum = 0.0f;\n"
@@ -9867,8 +9980,10 @@ static NSString *termite_metal_shader_source(void) {
            "        y[row * (H / 4) + col] = stored[i] * (scale * w[col]);\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin reduce.recurrent_norm_cached family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_lightonocr3_norm_cached1024(device const float4 *x [[buffer(0)]], device const float4 *w [[buffer(1)]], device float4 *y [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *partial [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) { termite_lightonocr3_norm_cached_body<1024>(x,w,y,p,partial,tid,sg,lane,row); }\n"
            "kernel void termite_lightonocr3_norm_cached2560(device const float4 *x [[buffer(0)]], device const float4 *w [[buffer(1)]], device float4 *y [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *partial [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) { termite_lightonocr3_norm_cached_body<2560>(x,w,y,p,partial,tid,sg,lane,row); }\n"
+           // tile-codegen:end reduce.recurrent_norm_cached family
            "// Single and triple-output SIMD4 schedules share one statistics plane.\n"
            "__attribute__((always_inline)) inline float termite_rms_norm_simd4_inverse(\n"
            "    device const float *input, uint row_base, uint dim, float eps,\n"
@@ -9906,10 +10021,13 @@ static NSString *termite_metal_shader_source(void) {
            "        output[i] = y.x; output[i + 1u] = y.y; output[i + 2u] = y.z; output[i + 3u] = y.w;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin rms_norm.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_rms_norm_rows_simd4_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    termite_rms_norm_simd4_impl<false>(input, weight, output, p.rows, p.hidden_size, p.eps, 0u, 0.0f, 0.0f, shmem, tid, tpg, simd_group, simd_lane, row);\n"
            "}\n"
+           // tile-codegen:end rms_norm.2 family
 "struct antfly_norm_clamp_params {uint rows,dim,flags,reserved;float eps,lo,hi,padding;};\n"
+           // tile-codegen:begin rms_norm.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void antfly_norm_clamp(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant antfly_norm_clamp_params &p [[buffer(3)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    threadgroup float shmem[32];\n"
            "    termite_rms_norm_simd4_impl<true>(input, weight, output, p.rows, p.dim, p.eps, p.flags, p.lo, p.hi, shmem, tid, tpg, simd_group, simd_lane, row);\n"
@@ -9931,6 +10049,7 @@ static NSString *termite_metal_shader_source(void) {
            "        third_output[i] = third_y.x; third_output[i + 1u] = third_y.y; third_output[i + 2u] = third_y.z; third_output[i + 3u] = third_y.w;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:end rms_norm.3 family
            "kernel void termite_apply_parallel_ffn_post_residual_simd4(device const float *shared [[buffer(0)]], device const float *shared_weight [[buffer(1)]], device const float *routed [[buffer(2)]], device const float *routed_weight [[buffer(3)]], device const float *combined_weight [[buffer(4)]], device const float *residual [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_apply_row_norm_params &p [[buffer(7)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.hidden_size == 0u || (p.hidden_size & 3u) != 0u) return;\n"
            "    if (simd_group == 0u) { shmem[simd_lane] = 0.0f; shmem[32u + simd_lane] = 0.0f; }\n"
@@ -10052,6 +10171,7 @@ static NSString *termite_metal_shader_source(void) {
            "        output[base + 64u + j] = x0 * sn + x1 * c;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin rms_norm.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_rms_norm_add_1x(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *residual [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_layer_norm_params &p [[buffer(4)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]]) {\n"
            "    termite_rms_norm_tree<true, false>(input, weight, residual, output, shmem, 0u, p.hidden_size, p.eps, 1.0f, tid, tpg);\n"
            "}\n"
@@ -10099,6 +10219,7 @@ static NSString *termite_metal_shader_source(void) {
            "        output[i] = y.x; output[i + 1u] = y.y; output[i + 2u] = y.z; output[i + 3u] = y.w;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:end rms_norm.4 family
 
            "static inline float termite_bf16_to_f32(ushort bits) { return as_type<float>((uint(bits) << 16u)); }\n"
            "inline float termite_dense_weight(float x) { return x; }\n"
@@ -10116,12 +10237,14 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint stride = 16u; stride > 0u; stride >>= 1u) { if (lane < stride) partials[lane] += partials[lane + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    if (lane == 0u) output[row * out_dim + col] = partials[0];\n"
            "}\n"
+           // tile-codegen:begin quant_metal.dense_f32_1x family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_linear_1x(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_linear_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.out_dim) return; termite_dense_scalar(input, weight, bias, output, p.in_dim, p.out_dim, 0u, gid);\n"
            "}\n"
            "kernel void termite_apply_linear_1x_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {\n"
            "    if (group >= p.out_dim) return; threadgroup float partials[32]; termite_dense_reduce(input, weight, bias, output, partials, p.in_dim, p.out_dim, 0u, group, lane);\n"
            "}\n"
+           // tile-codegen:end quant_metal.dense_f32_1x family
            // Exact-shape A4B router projection. The lane-local dot products
            // are unchanged; the SIMD butterfly performs the same reduction
            // tree as the baseline's 32-entry threadgroup array without five
@@ -10135,18 +10258,22 @@ static NSString *termite_metal_shader_source(void) {
            "    for (ushort delta = 16u; delta > 0u; delta >>= 1u) acc += simd_shuffle_xor(acc, delta);\n"
            "    if (lane == 0u) output[row] = acc;\n"
            "}\n"
+           // tile-codegen:begin quant_metal.dense_f16_1x family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_linear_f16_1x(device const float *input [[buffer(0)]], device const half *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_linear_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.out_dim) return; termite_dense_scalar(input, weight, bias, output, p.in_dim, p.out_dim, 0u, gid);\n"
            "}\n"
            "kernel void termite_apply_linear_f16_1x_reduce(device const float *input [[buffer(0)]], device const half *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {\n"
            "    if (group >= p.out_dim) return; threadgroup float partials[32]; termite_dense_reduce(input, weight, bias, output, partials, p.in_dim, p.out_dim, 0u, group, lane);\n"
            "}\n"
+           // tile-codegen:end quant_metal.dense_f16_1x family
+           // tile-codegen:begin quant_metal.dense_bf16_1x family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_linear_bf16_1x(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_linear_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.out_dim) return; termite_dense_scalar(input, weight, bias, output, p.in_dim, p.out_dim, 0u, gid);\n"
            "}\n"
            "kernel void termite_apply_linear_bf16_1x_reduce(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {\n"
            "    if (group >= p.out_dim) return; threadgroup float partials[32]; termite_dense_reduce(input, weight, bias, output, partials, p.in_dim, p.out_dim, 0u, group, lane);\n"
            "}\n"
+           // tile-codegen:end quant_metal.dense_bf16_1x family
            "template<uint Columns,uint Planes> __attribute__((always_inline)) inline void antfly_bf16_gemv_vec4(\n"
            "    device const float *x,device const ushort *w0,device const ushort *w1,\n"
            "    device const float *b0,device const float *b1,device float *y,\n"
@@ -10324,6 +10451,7 @@ static NSString *termite_metal_shader_source(void) {
            "  if(lane==0 && p.rows>r) y[r*p.out_dim+row]=value+b[row];\n"
            " }\n"
            "}\n"
+           // tile-codegen:begin projection.bf16_vec4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_lightonocr3_batch2_vec4(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            " termite_bf16_affine_vec4<2>(x,w,b,y,p,lane,row);\n"
            "}\n"
@@ -10336,6 +10464,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_lightonocr3_batch16_vec4(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            " termite_bf16_affine_vec4<16>(x,w,b,y,p,lane,row);\n"
            "}\n"
+           // tile-codegen:end projection.bf16_vec4 family
            "template<uint SN>inline void termite_lightonocr3_segment_body(device const float*x,device const ushort*w,device const float*bias,device float*y,constant termite_metal_linear_params&p,uint lane,uint group){\n"
            " uint col=group*(32/SN)+lane/SN,k=lane%SN;float4 acc[4];for(uint b=0;b<4;b++)acc[b]=0;\n"
            " for(uint i=k*4;i<p.in_dim;i+=SN*4){float4 weights=as_type<float4>(uint4(*((device const ushort4*)(w+col*p.in_dim+i)))<<16);\n"
@@ -10422,12 +10551,14 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    if (lane == 0u) { output_a[group] = partials_a[0]; output_b[group] = partials_b[0]; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.dense_f32_multi_row.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_linear_multi_row(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; termite_dense_scalar(input, weight, bias, output, p.in_dim, p.out_dim, gid / p.out_dim, gid % p.out_dim);\n"
            "}\n"
            "kernel void termite_apply_linear_multi_row_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    if (tg.x >= p.out_dim || tg.y >= p.rows) return; termite_dense_reduce(input, weight, bias, output, partials, p.in_dim, p.out_dim, tg.y, tg.x, lane);\n"
            "}\n"
+           // tile-codegen:end quant_metal.dense_f32_multi_row.0 family
            "template<uint TM, uint TN, bool Activate, typename W> inline void termite_dense_tile(device const float *input, device const W *weight, device const float *bias, device float *output, constant termite_metal_linear_params &p, uint activation, threadgroup float *a_tile, threadgroup float *b_tile, ushort2 tid, uint2 tg) {\n"
            "    constexpr uint TK = 32u; constexpr uint Cols = TN / 8u; constexpr uint Stride = TM * 8u;\n"
            "    uint row = tg.y * TM + uint(tid.y); uint col0 = tg.x * TN + uint(tid.x); uint lane = uint(tid.y) * 8u + uint(tid.x);\n"
@@ -10447,6 +10578,7 @@ static NSString *termite_metal_shader_source(void) {
            "    #pragma unroll\n"
            "    for (uint c = 0u; c < Cols; ++c) { uint col = col0 + c * 8u; if (row < p.rows && col < p.out_dim) output[row * p.out_dim + col] = Activate ? termite_apply_activation_scalar(acc[c], activation) : acc[c]; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.dense_f32_multi_row.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_DENSE_TILED(termite_apply_linear_multi_row_tiled_f32) "\n"
            "    threadgroup float a_tile[8][32]; threadgroup float b_tile[16][32];\n"
            "    termite_dense_tile<8u, 16u, false>(input, weight, bias, output, p, 0u, &a_tile[0][0], &b_tile[0][0], tid, tg);\n"
@@ -10455,6 +10587,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup float a_tile[8][32]; threadgroup float b_tile[16][32];\n"
            "    termite_dense_tile<8u, 16u, true>(input, weight, bias, output, p, ap.activation_kind, &a_tile[0][0], &b_tile[0][0], tid, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.dense_f32_multi_row.1 family
            TERMITE_MSL_ABI_DENSE_TILED(termite_apply_linear_multi_row_tiled32_f32) "\n"
            "    threadgroup float a_tile[8][32]; threadgroup float b_tile[32][32];\n"
            "    termite_dense_tile<8u, 32u, false>(input, weight, bias, output, p, 0u, &a_tile[0][0], &b_tile[0][0], tid, tg);\n"
@@ -10463,20 +10596,24 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup float a_tile[8][32]; threadgroup float b_tile[32][32];\n"
            "    termite_dense_tile<8u, 32u, true>(input, weight, bias, output, p, ap.activation_kind, &a_tile[0][0], &b_tile[0][0], tid, tg);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.dense_f16_multi_row.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_DENSE_TILED(termite_apply_linear_multi_row_tiled32_m16_f32) "\n"
            "    threadgroup float a_tile[16][32]; threadgroup float b_tile[32][32];\n"
            "    termite_dense_tile<16u, 32u, false>(input, weight, bias, output, p, 0u, &a_tile[0][0], &b_tile[0][0], tid, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.dense_f16_multi_row.0 family
            TERMITE_MSL_ABI_DENSE_ACTIVATION_TILED(termite_apply_linear_multi_row_tiled32_m16_activation_f32) "\n"
            "    threadgroup float a_tile[16][32]; threadgroup float b_tile[32][32];\n"
            "    termite_dense_tile<16u, 32u, true>(input, weight, bias, output, p, ap.activation_kind, &a_tile[0][0], &b_tile[0][0], tid, tg);\n"
            "}\n"
+           // tile-codegen:begin quant_metal.dense_f16_multi_row.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_linear_f16_multi_row(device const float *input [[buffer(0)]], device const half *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; termite_dense_scalar(input, weight, bias, output, p.in_dim, p.out_dim, gid / p.out_dim, gid % p.out_dim);\n"
            "}\n"
            "kernel void termite_apply_linear_f16_multi_row_reduce(device const float *input [[buffer(0)]], device const half *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    if (tg.x >= p.out_dim || tg.y >= p.rows) return; termite_dense_reduce(input, weight, bias, output, partials, p.in_dim, p.out_dim, tg.y, tg.x, lane);\n"
            "}\n"
+           // tile-codegen:end quant_metal.dense_f16_multi_row.1 family
            "inline void termite_bf16_matrix_stage_input_vec4(device const float *input, threadgroup float *a, constant termite_metal_linear_params &p, uint row0, uint k0, ushort tid) {\n"
            "    for (uint i = uint(tid); i < 512u; i += 256u) {\n"
            "        uint r = i / 8u, k = (i % 8u) * 4u;\n"
@@ -10491,6 +10628,7 @@ static NSString *termite_metal_shader_source(void) {
            "        a[(k / 8u * 8u + r / 8u) * 64u + r % 8u * 8u + k % 8u] = row0 + r < p.rows && k0 + k < p.in_dim ? input[(row0 + r) * p.in_dim + k0 + k] : 0.0f;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.bf16_gate_up_mm family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_BF16_GATE_UP_MATRIX(termite_apply_bf16_gate_up_mm_m64_n32_vec4) "\n"
            "    threadgroup float4 storage[1024];\n"
            "    threadgroup float *shared=reinterpret_cast<threadgroup float *>(storage);\n"
@@ -10548,6 +10686,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            TERMITE_MSL_BF16_GATE_UP_PUBLISH
            "}\n"
+           // tile-codegen:end quant_metal.bf16_gate_up_mm family
            TERMITE_MSL_ABI_BF16_LINEAR_MATRIX(termite_apply_linear_bf16_mm_m64_n32_vec4) "\n"
            "    // Preserve the production M64/N32/8-SG layout and F32 accumulation order.\n"
            "    threadgroup float4 storage[768];\n"
@@ -10605,6 +10744,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            TERMITE_MSL_BF16_LINEAR_PUBLISH
            "}\n"
+           // tile-codegen:begin quant_metal.dense_bf16_multi_row family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_linear_bf16_multi_row_tiled32_m16(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], ushort2 tid [[thread_position_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    threadgroup float a_tile[16][32]; threadgroup float b_tile[32][32];\n"
            "    termite_dense_tile<16u, 32u, false>(input, weight, bias, output, p, 0u, &a_tile[0][0], &b_tile[0][0], tid, tg);\n"
@@ -10615,6 +10755,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_apply_linear_bf16_multi_row_reduce(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    if (tg.x >= p.out_dim || tg.y >= p.rows) return; termite_dense_reduce(input, weight, bias, output, partials, p.in_dim, p.out_dim, tg.y, tg.x, lane);\n"
            "}\n"
+           // tile-codegen:end quant_metal.dense_bf16_multi_row family
            "kernel void termite_apply_linear_bf16_multi_row_shared_reduce(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_threadgroup]], uint o [[threadgroup_position_in_grid]]) {\n"
            "    if (o >= p.out_dim || p.rows == 0u || p.rows > 64u) return;\n"
            "    if (p.rows <= 4u) {\n"
@@ -10673,6 +10814,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[0] = best_idx;\n"
            "}\n"
+           // tile-codegen:begin argmax.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_argmax_logits_1x(device const float *logits [[buffer(0)]], device uint *output [[buffer(1)]], constant uint &out_dim [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid != 0) return;\n"
            "    if (out_dim == 0u) { output[0] = 0u; return; }\n"
@@ -10684,6 +10826,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[0] = best_idx;\n"
            "}\n"
+           // tile-codegen:end argmax.0 family
            "inline void termite_argmax_partial_tree(threadgroup float *sh_vals, threadgroup uint *sh_ids, uint tid, uint tg_size) {\n"
            "    for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) {\n"
            "        if (uint(tid) < stride) {\n"
@@ -10694,6 +10837,7 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin argmax.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_argmax_logits_partials(device const float *logits [[buffer(0)]], device float *partial_values [[buffer(1)]], device uint *partial_ids [[buffer(2)]], constant uint &out_dim [[buffer(3)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {\n"
            "    const uint block_size = 1024u;\n"
            "    uint start = block * block_size;\n"
@@ -10710,6 +10854,7 @@ static NSString *termite_metal_shader_source(void) {
            "    termite_argmax_partial_tree(sh_vals, sh_ids, tid, tg_size);\n"
            "    if (tid == 0u) { partial_values[block] = sh_vals[0]; partial_ids[block] = sh_ids[0]; }\n"
            "}\n"
+           // tile-codegen:end argmax.1 family
            "inline bool termite_argmax_suppressed_token(uint token_id, device const int *suppress_ids, uint suppress_count) {\n"
            "    for (uint i = 0u; i < suppress_count; ++i) {\n"
            "        int raw = suppress_ids[i];\n"
@@ -10717,6 +10862,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    return false;\n"
            "}\n"
+           // tile-codegen:begin argmax.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_argmax_logits_suppress_partials(device const float *logits [[buffer(0)]], device const int *suppress_ids [[buffer(1)]], device float *partial_values [[buffer(2)]], device uint *partial_ids [[buffer(3)]], constant termite_metal_argmax_suppress_params &p [[buffer(4)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {\n"
            "    const uint block_size = 1024u;\n"
            "    uint start = block * block_size;\n"
@@ -10791,6 +10937,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[0] = best_idx;\n"
            "}\n"
+           // tile-codegen:end argmax.2 family
            "inline void termite_whisper_lse_push(thread float &m, thread float &s, float v) {\n"
            "    if (v > m) { s = s * exp(m - v) + 1.0f; m = v; } else { s += exp(v - m); }\n"
            "}\n"
@@ -10945,6 +11092,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float total = valid ? simd_sum(sumf) : -INFINITY; if (lane == 0u) scores[sgitg] = total; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    if (sgitg == 0u && lane == 0u) { float best = scores[0]; uint best_id = candidate_ids[0]; for (uint k = 1u; k < top_k; ++k) { float value = scores[k]; uint id = candidate_ids[k]; if (value > best || (value == best && id < best_id)) { best = value; best_id = id; } } output[0] = best_id < p.out_dim ? best_id : 0u; }\n"
            "}\n"
+           // tile-codegen:begin argmax.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_argmax_logits_reduce_tg(device const float *partial_values [[buffer(0)]], device const uint *partial_ids [[buffer(1)]], device uint *output [[buffer(2)]], constant uint &partial_count [[buffer(3)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]]) {\n"
            "    float best = -INFINITY; uint best_idx = 0xffffffffu;\n"
            "    for (uint i = uint(tid); i < partial_count; i += uint(tg_size)) { float value = partial_values[i]; uint idx = partial_ids[i]; if (value > best || (value == best && idx < best_idx)) { best = value; best_idx = idx; } }\n"
@@ -10952,6 +11100,7 @@ static NSString *termite_metal_shader_source(void) {
            "    termite_argmax_partial_tree(sh_vals, sh_ids, tid, tg_size);\n"
            "    if (tid == 0u) { if (partial_count == 0u) output[0] = 0u; else if (isnan(partial_values[0])) output[0] = partial_ids[0]; else output[0] = sh_ids[0] == 0xffffffffu ? 0u : sh_ids[0]; }\n"
            "}\n"
+           // tile-codegen:end argmax.3 family
            "inline float termite_apply_sampling_penalties(float logit, uint token_id, const device termite_metal_penalty_entry *entries, uint entry_count, constant termite_metal_sample_logits_params &p) {\n"
            "    if (entry_count == 0u) return logit;\n"
            "    for (uint i = 0u; i < entry_count; ++i) {\n"
@@ -10968,6 +11117,7 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            "struct termite_metal_nucleus_state { float max_logit; float total_mass; float target_mass; float mass_above; uint prefix; uint cutoff_key; uint pass; uint block_count; };\n"
            "inline uint termite_nucleus_ordered_key(float value) { uint bits = as_type<uint>(value); return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u); }\n"
+           // tile-codegen:begin reduce.sample.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_sample_nucleus_max_partials(device const float *logits [[buffer(0)]], device float *partials [[buffer(1)]], constant termite_metal_sample_logits_params &p [[buffer(2)]], device const termite_metal_penalty_entry *penalties [[buffer(3)]], threadgroup float *shared [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {\n"
            "    const uint block_size = 1024u; const uint block_count = (p.out_dim + block_size - 1u) / block_size; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); float best = -INFINITY; float special = -INFINITY;\n"
            "    for (uint i = start + uint(tid); i < end; i += uint(tg_size)) { float raw = logits[i]; if (p.defer_monotonic_max != 0u && isfinite(raw)) { best = max(best, raw); } else { if (p.final_logit_softcap > 0.0f) raw = p.final_logit_softcap * tanh(raw / p.final_logit_softcap); float adjusted = termite_apply_sampling_penalties(raw, i, penalties, p.penalty_count, p); float scaled = adjusted / p.temperature; if (isfinite(scaled)) { if (p.defer_monotonic_max != 0u) special = max(special, scaled); else best = max(best, scaled); } } }\n"
@@ -10994,16 +11144,20 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint b = 0u; b < 16u; ++b) { float mass = simd_sum(bins[b]); if (lane == 0u) simd_histograms[uint(simdgroup) * 16u + b] = mass; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    if (tid < 16u) { float mass = 0.0f; uint simdgroup_count = (uint(tg_size) + 31u) >> 5u; for (uint group = 0u; group < simdgroup_count; ++group) mass += simd_histograms[group * 16u + uint(tid)]; histograms[block * 16u + uint(tid)] = mass; }\n"
            "}\n"
+           // tile-codegen:end reduce.sample.0 family
            "kernel void termite_sample_nucleus_radix_select(device const float *histograms [[buffer(0)]], device termite_metal_nucleus_state *state [[buffer(1)]], threadgroup float *bins [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]]) {\n"
            "    for (uint b = uint(tid); b < 16u; b += uint(tg_size)) { float mass = 0.0f; for (uint block = 0u; block < state->block_count; ++block) mass += histograms[block * 16u + b]; bins[b] = mass; } threadgroup_barrier(mem_flags::mem_threadgroup); if (tid != 0u) return; uint lowest_nonzero = 0u; for (uint b = 0u; b < 16u; ++b) if (bins[b] > 0.0f) lowest_nonzero = b; uint selected = lowest_nonzero; float above = state->mass_above; bool found = false; for (int b = 15; b >= 0; --b) { if (bins[uint(b)] <= 0.0f) continue; lowest_nonzero = uint(b); if (above + bins[uint(b)] >= state->target_mass) { selected = uint(b); found = true; break; } above += bins[uint(b)]; } if (!found) { selected = lowest_nonzero; above -= bins[selected]; } uint shift = 28u - state->pass * 4u; state->prefix |= selected << shift; state->mass_above = above; state->pass += 1u; if (state->pass == 8u) state->cutoff_key = state->prefix;\n"
            "}\n"
+           // tile-codegen:begin reduce.sample.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_sample_nucleus_gumbel_partials(device const float *probs [[buffer(0)]], device float *partial_values [[buffer(1)]], device uint *partial_ids [[buffer(2)]], device const termite_metal_nucleus_state *state [[buffer(3)]], constant termite_metal_sample_logits_params &p [[buffer(4)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {\n"
            "    const uint block_size = 1024u; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); float best = -INFINITY; uint best_idx = 0xffffffffu;\n"
            "    for (uint i = start + uint(tid); i < end; i += uint(tg_size)) { float prob = probs[i]; if (!(prob > 0.0f) || as_type<uint>(prob) < state->cutoff_key) continue; uint h = (i ^ p.seed) * 0x9E3779B9u; h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16; float u = (float(h >> 8) + 0.5f) * (1.0f / 16777216.0f); float score = log(prob) - log(-log(u)); if (score > best || (score == best && i < best_idx)) { best = score; best_idx = i; } }\n"
            "    sh_vals[tid] = best; sh_ids[tid] = best_idx; threadgroup_barrier(mem_flags::mem_threadgroup); termite_argmax_partial_tree(sh_vals, sh_ids, tid, tg_size); if (tid == 0u) { bool invalid = !(state->total_mass > 0.0f) || !isfinite(state->total_mass); partial_values[block] = invalid && block == 0u ? NAN : sh_vals[0]; partial_ids[block] = invalid && block == 0u ? 0xffffffffu : sh_ids[0]; }\n"
            "}\n"
+           // tile-codegen:end reduce.sample.1 family
            "// Gumbel-max: argmax(logit/T + Gumbel(seed,i)) is an exact draw from\n"
            "// softmax(logits/T). Parallel two-stage max replaces the serial CDF walk.\n"
+           // tile-codegen:begin reduce.sample.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_sample_gumbel_partials(device const float *logits [[buffer(0)]], device float *partial_values [[buffer(1)]], device uint *partial_ids [[buffer(2)]], constant termite_metal_sample_logits_params &p [[buffer(3)]], device const termite_metal_penalty_entry *penalties [[buffer(4)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {\n"
            "    const uint block_size = 1024u;\n"
            "    uint start = block * block_size;\n"
@@ -11213,6 +11367,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[0] = best_idx;\n"
            "}\n"
+           // tile-codegen:end reduce.sample.2 family
            "kernel void termite_apply_activation_1x(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_apply_activation_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    output[gid] = termite_apply_activation_scalar(input[gid], p.activation_kind);\n"
@@ -11261,6 +11416,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (SaveUpstream) upstream_output[gid] = upstream;\n"
            "    gelu_output[gid] = termite_gelu_backward_scalar(gelu_input[gid], upstream, gid, p.activation_kind);\n"
            "}\n"
+           // tile-codegen:begin elementwise.gelu_backward.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_gelu_backward_1x(device const float *input [[buffer(0)]], device const float *upstream_grad [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_activation_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    output[gid] = termite_gelu_backward_scalar(input[gid], upstream_grad, gid, p.activation_kind);\n"
@@ -11277,11 +11433,13 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_ffn_gelu_backward_rank1_first_branch(device const float *first_lhs [[buffer(0)]], device const float *first_rhs [[buffer(1)]], device const float *second_output [[buffer(2)]], device const float *gelu_input [[buffer(3)]], device float *first_output [[buffer(4)]], device float *upstream_output [[buffer(5)]], device float *gelu_output [[buffer(6)]], constant termite_metal_apply_activation_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
            "    termite_ffn_gelu_backward_rank1_impl<true, false, true>(first_lhs, first_rhs, nullptr, nullptr, second_output, gelu_input, first_output, nullptr, upstream_output, gelu_output, p, gid);\n"
            "}\n"
+           // tile-codegen:end elementwise.gelu_backward.0 family
            "kernel void termite_apply_bias_activation_2d(device const float *input [[buffer(0)]], device const float *bias [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_activation_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total || p.dim == 0u) return;\n"
            "    uint col = gid % p.dim;\n"
            "    output[gid] = termite_apply_activation_scalar(input[gid] + bias[col], p.activation_kind);\n"
            "}\n"
+           // tile-codegen:begin elementwise.gelu_backward.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_activation_multiply_1x(device const float *gate [[buffer(0)]], device const float *up [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_activation_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    float y = termite_apply_activation_scalar(gate[gid], p.activation_kind);\n"
@@ -11292,6 +11450,8 @@ static NSString *termite_metal_shader_source(void) {
            "    float y = termite_apply_activation_scalar(gate[gid], p.activation_kind);\n"
            "    output[gid] = half(y == 0.0f ? 0.0f : y * up[gid]);\n"
            "}\n"
+           // tile-codegen:end elementwise.gelu_backward.1 family
+           // tile-codegen:begin reduce.rows.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_softmax_rows(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_apply_softmax_params &p [[buffer(2)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.dim == 0u) return;\n"
            "    const uint threads = 256u;\n"
@@ -11320,6 +11480,7 @@ static NSString *termite_metal_shader_source(void) {
            "        output[base + col] = p.log_softmax != 0u ? shifted - log_sum : exp(shifted) / row_sum;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:end reduce.rows.0 family
            "kernel void termite_moe_route_select(device const float *logits [[buffer(0)]], device uint *route_ids [[buffer(1)]], device float *route_weights [[buffer(2)]], constant termite_metal_moe_route_select_params &p [[buffer(3)]], uint row [[thread_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.num_experts == 0u || p.top_k == 0u || p.top_k > 8u) return;\n"
            "    const uint base = row * p.num_experts;\n"
@@ -11494,6 +11655,7 @@ static NSString *termite_metal_shader_source(void) {
            "    ulong first_row = ulong(expert) * ulong(p.source_out_dim) + ulong(p.row_offset); ulong span_start = ulong(p.weight_view_offset) + first_row * ulong(p.row_stride); ulong span_bytes = ulong(p.logical_out_dim) * ulong(p.row_stride); ulong first_page = (span_start / ulong(p.page_size)) * ulong(p.page_size); ulong end_page = ((span_start + span_bytes + ulong(p.page_size) - 1ul) / ulong(p.page_size)) * ulong(p.page_size); ulong page_count = (end_page - first_page) / ulong(p.page_size); if (ulong(local_page) >= page_count) { output[gid] = 0u; return; }\n"
            "    output[gid] = uint(input[first_page + ulong(local_page) * ulong(p.page_size)]);\n"
            "}\n"
+           // tile-codegen:begin reduce.rows.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_reduce_last_dim_rows(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_reduce_last_dim_params &p [[buffer(2)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.dim == 0u) return;\n"
            "    const uint threads = 256u;\n"
@@ -11515,6 +11677,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    if (tid == 0u) output[row] = p.kind == 2u ? shmem[0] / float(p.dim) : shmem[0];\n"
            "}\n"
+           // tile-codegen:end reduce.rows.1 family
            "kernel void termite_nomic_pool_normalize(device const float *hidden [[buffer(0)]], device const uint *mask [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_nomic_pool_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint b [[threadgroup_position_in_grid]]) {\n"
            "    if (b >= p.batch || p.seq_len == 0u || p.hidden_size == 0u) return;\n"
            "    const uint threads = 256u; const uint token_base = b * p.seq_len;\n"
@@ -11582,6 +11745,7 @@ static NSString *termite_metal_shader_source(void) {
            "        output[i] = scale * label_weight * m * (sig - label);\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin reduce.rows.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_multiply_reduce_last_dim_rows(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_reduce_last_dim_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.dim == 0u) return;\n"
            "    const uint threads = 256u;\n"
@@ -11596,6 +11760,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    if (tid == 0u) output[row] = shmem[0];\n"
            "}\n"
+           // tile-codegen:end reduce.rows.2 family
            "kernel void termite_broadcast_last_dim_f32_2d(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_broadcast_last_dim_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    const uint total = p.rows * p.out_dim;\n"
            "    if (gid >= total || p.in_dim == 0u || p.out_dim == 0u) return;\n"
@@ -11636,6 +11801,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (Kind == 2u) output[gid] = l / r;\n"
            "    if (Kind == 3u) output[gid] = l * r;\n"
            "}\n"
+           // tile-codegen:begin elementwise.apply.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_BINARY_ELEMENT(termite_apply_add_1x) "\n"
            "    termite_binary_impl<0u>(lhs, rhs, output, p, gid);\n"
            "}\n"
@@ -11660,6 +11826,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float g = grad[gid] * p.scale;\n"
            "    accum[gid] = (p.first != 0u) ? g : (accum[gid] + g);\n"
            "}\n"
+           // tile-codegen:end elementwise.apply.0 family
            "template<bool PublishFlag> __attribute__((always_inline)) inline void termite_training_adamw_impl(device const float *weight, device float *grad, device const float *m, device const float *v, device float *weight_out, device float *m_out, device float *v_out, constant termite_metal_training_adamw_params &p, device float *flag, uint gid) {\n"
            "    if (gid >= p.elem_count) return;\n"
            "    float g = grad[gid] * p.grad_scale;\n"
@@ -11676,12 +11843,15 @@ static NSString *termite_metal_shader_source(void) {
            "    grad[gid] = 0.0f;\n"
            "    if (PublishFlag && (!isfinite(w_new) || !isfinite(mv) || !isfinite(vv))) flag[0] = 1.0f;\n"
            "}\n"
+           // tile-codegen:begin elementwise.apply.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_training_adamw_f32(device float *weight [[buffer(0)]], device float *grad [[buffer(1)]], device float *m [[buffer(2)]], device float *v [[buffer(3)]], constant termite_metal_training_adamw_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    termite_training_adamw_impl<false>(weight, grad, m, v, weight, m, v, p, grad, gid);\n"
            "}\n"
+           // tile-codegen:end elementwise.apply.1 family
            // Out of place: the result is (previous + gradient / divisor) *
            // renormalize, each term only when its flag is set, in the same
            // operation order as separate divide, add and multiply passes.
+           // tile-codegen:begin elementwise.apply.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_training_accumulate_into_f32(device const float *previous [[buffer(0)]], device const float *grad [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_training_accumulate_into_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.elem_count) return;\n"
            "    float value = (p.flags & 1u) != 0u ? previous[gid] : 0.0f;\n"
@@ -11689,13 +11859,16 @@ static NSString *termite_metal_shader_source(void) {
            "    if ((p.flags & 4u) != 0u) value = value * p.renormalize;\n"
            "    output[gid] = value;\n"
            "}\n"
+           // tile-codegen:end elementwise.apply.2 family
            // termite_training_adamw_f32 with weight and moments written to new
            // buffers, so the inputs stay intact until the caller publishes.
            // flag[0] becomes 1 if any new weight or moment is not finite; every
            // writer stores the same value, so the race is benign.
+           // tile-codegen:begin elementwise.apply.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_training_adamw_into_f32(device const float *weight [[buffer(0)]], device float *grad [[buffer(1)]], device const float *m [[buffer(2)]], device const float *v [[buffer(3)]], device float *weight_out [[buffer(4)]], device float *m_out [[buffer(5)]], device float *v_out [[buffer(6)]], constant termite_metal_training_adamw_params &p [[buffer(7)]], device float *flag [[buffer(8)]], uint gid [[thread_position_in_grid]]) {\n"
            "    termite_training_adamw_impl<true>(weight, grad, m, v, weight_out, m_out, v_out, p, flag, gid);\n"
            "}\n"
+           // tile-codegen:end elementwise.apply.3 family
            "kernel void termite_training_sumsq_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_training_sumsq_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid != 0u) return;\n"
            "    float sum = 0.0f;\n"
@@ -11734,12 +11907,14 @@ static NSString *termite_metal_shader_source(void) {
            "    else less = lhs[li] < rhs[ri];\n"
            "    output[gid] = less ? 1.0f : 0.0f;\n"
            "}\n"
+           // tile-codegen:begin elementwise.apply.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_BINARY_ELEMENT(termite_apply_multiply_1x) "\n"
            "    termite_binary_impl<3u>(lhs, rhs, output, p, gid);\n"
            "}\n"
            "kernel void termite_apply_scale_1x(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant float &scale [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    output[gid] = input[gid] * scale;\n"
            "}\n"
+           // tile-codegen:end elementwise.apply.4 family
            // Gemma 4 audio conformer host ops moved on device: scalar clamp,
            // GLU over the last dim, depthwise causal conv1d, the conv-stack
            // flatten, channel layer norm + relu, and chunked local attention
@@ -11993,6 +12168,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float c = cond[(p.flags & 1u) != 0u ? 0u : gid]; float t = on_true[(p.flags & 2u) != 0u ? 0u : gid]; float f = on_false[(p.flags & 4u) != 0u ? 0u : gid];\n"
            "    output[gid] = c != 0.0f ? t : f;\n"
            "}\n"
+           // tile-codegen:begin quant_metal.gemv_q2_k.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_q2_k_linear) "\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 84u; float acc = 0.0f;\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 84u; const device uchar *scales_raw = weight + off; ushort d_bits = (ushort(weight[off + 17]) << 8) | ushort(weight[off + 16]); ushort dmin_bits = (ushort(weight[off + 19]) << 8) | ushort(weight[off + 18]); float d = float(as_type<half>(d_bits)); float dmin = float(as_type<half>(dmin_bits)); const device uchar *qs = weight + off + 20u; for (uint sub = 0; sub < 16; ++sub) { float sc = float(scales_raw[sub] & 0x0Fu); float m = float(scales_raw[sub] >> 4); float dsc = d * sc; float dmn = dmin * m; uint chunk = sub / 8u; uint group = (sub % 8u) / 2u; uint l_base = (sub % 2u) * 16u; uint q_base = chunk * 32u; uint shift = group * 2u; uint input_off = r * p.in_dim + b * 256u + sub * 16u; for (uint i = 0; i < 16; ++i) { int q = int((qs[q_base + l_base + i] >> shift) & 0x03u); acc += input[input_off + i] * (dsc * float(q) - dmn); } } }\n"
@@ -12006,11 +12182,13 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_q4_k_linear) "\n"
            "    termite_legacy_linear<termite_legacy_q4_k, 144u>(input, weight, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q2_k.0 family
            "__attribute__((always_inline)) inline float termite_q4k_scalar_dot8(thread const float *x, device const uchar *weight, uint row_blocks, uint o, uint b, uint sub, uint chunk, bool high, uint j0) {\n"
            "    const uint NQ = 8u;\n"
            "    uint off = o * row_blocks * 144u + b * 144u; ushort d_bits = (ushort(weight[off + 1]) << 8) | ushort(weight[off]); ushort dmin_bits = (ushort(weight[off + 3]) << 8) | ushort(weight[off + 2]); float d = float(as_type<half>(d_bits)); float dmin = float(as_type<half>(dmin_bits)); const device uchar *scales = weight + off + 4u; const device uchar *qs = weight + off + 16u; float dsc = d * q4k_scale_at(scales, sub); float dmn = dmin * q4k_min_at(scales, sub); uint q_off = chunk * 32u + j0; float block = 0.0f; for (uint i = 0; i < NQ; ++i) { uchar packed = qs[q_off + i]; float q = high ? float(packed >> 4) : float(packed & 0x0Fu); block += x[i] * (dsc * q - dmn); }\n"
            "    return block;\n"
            "}\n"
+           // tile-codegen:begin quant_metal.gemv_q2_k.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q4_k_linear_1x_reduce) "\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint sb0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; uint total_subblocks = p.row_blocks * 8u; float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n"
@@ -12019,6 +12197,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { for (uint row = 0u; row < NR0; ++row) shmem[row * 32u + sgitg] = acc[row]; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total[4]; for (uint row = 0u; row < NR0; ++row) total[row] = simd_sum(shmem[row * 32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = total[row]; } }\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q2_k.1 family
            "// ggml mul_mv_q4_K-style row-one mmv: 2 rows/simdgroup, activations\n"
            "// staged once with per-subblock sums so mins fold into one dot, and\n"
            "// nibbles consumed via uint16 masks (0x000F/0x0F00/0x00F0/0xF000)\n"
@@ -12053,6 +12232,7 @@ static NSString *termite_metal_shader_source(void) {
            "    output_b[r * p.out_dim + o] = acc_b;\n"
            "}\n"
            "__attribute__((always_inline)) inline float2 termite_q4k_pair_dot8(thread const float *x, device const uchar *weight_a, device const uchar *weight_b, uint row_blocks, uint o, uint b, uint sub, uint chunk, bool high, uint j0) { uint off = o * row_blocks * 144u + b * 144u; ushort d_bits_a = (ushort(weight_a[off + 1]) << 8) | ushort(weight_a[off]); ushort dmin_bits_a = (ushort(weight_a[off + 3]) << 8) | ushort(weight_a[off + 2]); ushort d_bits_b = (ushort(weight_b[off + 1]) << 8) | ushort(weight_b[off]); ushort dmin_bits_b = (ushort(weight_b[off + 3]) << 8) | ushort(weight_b[off + 2]); float d_a = float(as_type<half>(d_bits_a)); float dmin_a = float(as_type<half>(dmin_bits_a)); float d_b = float(as_type<half>(d_bits_b)); float dmin_b = float(as_type<half>(dmin_bits_b)); const device uchar *scales_a = weight_a + off + 4u; const device uchar *scales_b = weight_b + off + 4u; const device uchar *qs_a = weight_a + off + 16u; const device uchar *qs_b = weight_b + off + 16u; float dsc_a = d_a * q4k_scale_at(scales_a, sub); float dmn_a = dmin_a * q4k_min_at(scales_a, sub); float dsc_b = d_b * q4k_scale_at(scales_b, sub); float dmn_b = dmin_b * q4k_min_at(scales_b, sub); uint q_off = chunk * 32u + j0; float block_a = 0.0f; float block_b = 0.0f; for (uint i = 0; i < 8u; ++i) { uchar packed_a = qs_a[q_off + i]; uchar packed_b = qs_b[q_off + i]; float q_a = high ? float(packed_a >> 4) : float(packed_a & 0x0Fu); float q_b = high ? float(packed_b >> 4) : float(packed_b & 0x0Fu); block_a += x[i] * (dsc_a * q_a - dmn_a); block_b += x[i] * (dsc_b * q_b - dmn_b); } return float2(block_a, block_b); }\n"
+           // tile-codegen:begin quant_metal.q4_k_pair family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_PAIR_PROJECTION_REDUCE(termite_q4_k_pair_linear_1x_reduce) "\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint sb0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; uint total_subblocks = p.row_blocks * 8u; float acc_a0 = 0.0f; float acc_a1 = 0.0f; float acc_b0 = 0.0f; float acc_b1 = 0.0f;\n"
@@ -12088,6 +12268,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_q5_k_linear) "\n"
            "    termite_legacy_linear<termite_legacy_q5_k, 176u>(input, weight, output, p, gid);\n"
            "}\n"
+           // tile-codegen:end quant_metal.q4_k_pair family
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q5_k_linear_1x_reduce) "\n"
            "    const uint NSG = 2u; const uint NQ = 8u; const uint NW = 32u; uint o = tg.x; uint r = tg.y; if (o >= p.out_dim || r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint sb0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; uint total_subblocks = p.row_blocks * 8u; float acc = 0.0f;\n"
@@ -12096,11 +12277,13 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) shmem[sgitg] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total = simd_sum(shmem[lane]); if (lane == 0u && sgitg == 0u) output[r * p.out_dim + o] = total;\n"
            "}\n"
+           // tile-codegen:begin quant_metal.gemv_q6_k family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_q6_k_linear) "\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 210u; float acc = 0.0f;\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 210u; const device uchar *ql = weight + off; const device uchar *qh = weight + off + 128u; const device char *scales = reinterpret_cast<const device char *>(weight + off + 192u); ushort d_bits = (ushort(weight[off + 209]) << 8) | ushort(weight[off + 208]); float d = float(as_type<half>(d_bits)); for (uint sub = 0; sub < 16; ++sub) { float scale = d * float(scales[sub]); uint half_idx = sub / 8u; uint group = (sub % 8u) / 2u; uint l_base = (sub % 2u) * 16u; uint ql_off = half_idx * 64u + (group & 1u) * 32u; uint qh_off = half_idx * 32u; uint qh_shift = group * 2u; uint nibble_shift = (group / 2u) * 4u; uint input_off = r * p.in_dim + b * 256u + sub * 16u; for (uint i = 0; i < 16; ++i) { uint l = l_base + i; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0Fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u); int q = (low4 | (high2 << 4)) - 32; acc += input[input_off + i] * (scale * float(q)); } } }\n"
            "    output[gid] = acc;\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q6_k family
            "template<uint NSG> inline void termite_q6_k_scalar_even_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, threadgroup float *shmem, ushort lane, ushort sgitg, uint3 tg) {\n"
            "    const uint NR0 = 2u; const uint nb = p.row_blocks; uint first_row = (tg.x * NSG + uint(sgitg)) * NR0; uint r = tg.y; if (r >= p.rows || first_row >= p.out_dim) return;\n"
            "    const uint row_bytes = nb * 210u; device const uchar *x0 = weight + first_row * row_bytes; device const float *yy = input + r * p.in_dim; float sumf[2] = {0.0f, 0.0f}; float yl[16];\n"
@@ -12132,12 +12315,14 @@ static NSString *termite_metal_shader_source(void) {
            "    if (paired_nb != nb) { const uint i = paired_nb; const ushort split_l0 = ix * 2u; device const float *y = yy + i * 256u + y_offset; device const uchar *q1 = x0 + i * 210u + q_offset_l; device const uchar *q2 = q1 + 32u; device const uchar *qh = x0 + i * 210u + 128u + q_offset_h; device const char *sc = reinterpret_cast<device const char *>(x0 + i * 210u + 192u) + is; device const uchar *dp = x0 + i * 210u + 208u; for (uint row = 0; row < row_limit; ++row) { float4 sums = {0.0f, 0.0f, 0.0f, 0.0f}; TERMITE_FOR_UNROLL (ushort part = 0u; part < 2u; ++part) { ushort l = split_l0 + part; sums[0] += y[l] * float(char((q1[l] & 0x0Fu) | ((qh[l] & 0x03u) << 4)) - 32); sums[1] += y[l + 32u] * float(char((q2[l] & 0x0Fu) | ((qh[l] & 0x0Cu) << 2)) - 32); sums[2] += y[l + 64u] * float(char((q1[l] >> 4) | (qh[l] & 0x30u)) - 32); sums[3] += y[l + 96u] * float(char((q2[l] >> 4) | ((qh[l] & 0xC0u) >> 2)) - 32); } ushort d_bits = (ushort(dp[1]) << 8) | ushort(dp[0]); float d = float(as_type<half>(d_bits)); sumf[row] += d * (sums[0] * float(sc[0]) + sums[1] * float(sc[2]) + sums[2] * float(sc[4]) + sums[3] * float(sc[6])); q1 += row_bytes; q2 += row_bytes; qh += row_bytes; sc += row_bytes; dp += row_bytes; } }\n"
            "    for (uint row = 0; row < row_limit; ++row) { float total = simd_sum(sumf[row]); if (lane == 0u) output[r * p.out_dim + first_row + row] = total; }\n"
            "}\n"
+           // tile-codegen:begin quant_metal.q6_k_nbodd family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q6_k_linear_1x_reduce_nbodd) " termite_q6_k_linear_1x_reduce_nbodd_impl(input, weight, output, p, shmem, lane, sgitg, tg, 2u, 2u); }\n"
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q6_k_linear_1x_reduce_nbodd_nr1) " termite_q6_k_linear_1x_reduce_nbodd_impl(input, weight, output, p, shmem, lane, sgitg, tg, 1u, 2u); }\n"
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q6_k_linear_1x_reduce_nbodd_nr4_nsg1) " termite_q6_k_linear_1x_reduce_nbodd_impl(input, weight, output, p, shmem, lane, sgitg, tg, 4u, 1u); }\n"
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q6_k_linear_1x_reduce_nbodd_nr4_nsg2) " termite_q6_k_linear_1x_reduce_nbodd_impl(input, weight, output, p, shmem, lane, sgitg, tg, 4u, 2u); }\n"
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q6_k_linear_1x_reduce_nbodd_nr6_nsg1) " termite_q6_k_linear_1x_reduce_nbodd_impl(input, weight, output, p, shmem, lane, sgitg, tg, 6u, 1u); }\n"
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_q6_k_linear_1x_reduce_nbodd_nr8_nsg1) " termite_q6_k_linear_1x_reduce_nbodd_impl(input, weight, output, p, shmem, lane, sgitg, tg, 8u, 1u); }\n"
+           // tile-codegen:end quant_metal.q6_k_nbodd family
            "// q6_k mmv with TWO input rows sharing one weight stream (the MTP verify\n"
            "// lm_head tail: rows=2-3 x vocab-sized out_dim, where per-row mmv re-reads\n"
            "// the ~550MB head once per row and the generic small-batch kernel collapses).\n"
@@ -12165,6 +12350,7 @@ static NSString *termite_metal_shader_source(void) {
            "    output_a[r * p.out_dim + o] = acc_a;\n"
            "    output_b[r * p.out_dim + o] = acc_b;\n"
            "}\n"
+           // tile-codegen:begin quant_metal.gemv_iq4_nl family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_iq4_nl_linear) "\n"
            "    termite_legacy_linear<termite_legacy_iq4_nl, 18u>(input, weight, output, p, gid);\n"
            "}\n"
@@ -12187,19 +12373,24 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_REDUCE(termite_mxfp4_linear_1x_reduce) "\n"
            "    termite_legacy_reduce<termite_legacy_mxfp4, 17u, 2u, 4u>(input, weight, output, p, shmem, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_iq4_nl family
            "inline float termite_nvfp4_scale(uchar value) { if (value == 0u || value == 0x7Fu) return 0.0f; uint e = (uint(value) >> 3) & 0x0Fu; float m = float(uint(value) & 0x07u); float raw = e == 0u ? m * exp2(-9.0f) : (1.0f + m / 8.0f) * exp2(float(int(e) - 7)); return raw * 0.5f; }\n"
+           // tile-codegen:begin quant_metal.gemv_nvfp4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_nvfp4_linear) "\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 36u; float acc = 0.0f; constexpr int lut[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 36u; const device uchar *scales = weight + off; const device uchar *qs = weight + off + 4u; uint input_off = r * p.in_dim + b * 64u; for (uint sub = 0; sub < 4u; ++sub) { float d = termite_nvfp4_scale(scales[sub]); uint q_base = sub * 8u; uint x_base = input_off + sub * 16u; for (uint j = 0; j < 8u; ++j) { uchar packed = qs[q_base + j]; acc += input[x_base + j] * (d * float(lut[packed & 0x0Fu])); acc += input[x_base + 8u + j] * (d * float(lut[packed >> 4])); } } }\n"
            "    output[gid] = acc;\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_nvfp4 family
            "constant ushort termite_iq2_xs_grid[512] = {0,2,5,8,10,17,20,22,25,32,34,37,40,65,68,70,73,80,82,85,88,97,100,128,130,133,136,145,148,153,160,257,260,262,265,272,274,277,280,282,289,292,320,322,325,328,337,340,352,360,385,388,400,512,514,517,520,529,532,544,577,580,592,597,640,650,1025,1028,1030,1033,1040,1042,1045,1048,1057,1060,1088,1090,1093,1096,1105,1108,1110,1120,1153,1156,1168,1280,1282,1285,1288,1297,1300,1312,1345,1348,1360,1377,1408,1537,1540,1552,1574,1600,1602,1668,2048,2050,2053,2056,2058,2065,2068,2080,2085,2113,2116,2128,2136,2176,2208,2218,2305,2308,2320,2368,2433,2441,2560,2592,2600,2710,2720,4097,4100,4102,4105,4112,4114,4117,4120,4129,4132,4160,4162,4165,4168,4177,4180,4192,4202,4225,4228,4240,4352,4354,4357,4360,4369,4372,4384,4417,4420,4432,4480,4500,4502,4609,4612,4614,4624,4672,4704,5120,5122,5125,5128,5137,5140,5152,5185,5188,5193,5200,5220,5248,5377,5380,5392,5440,5632,5652,5705,6145,6148,6160,6162,6208,6228,6278,6400,6405,6502,6737,6825,8192,8194,8197,8200,8202,8209,8212,8224,8257,8260,8272,8320,8352,8449,8452,8464,8512,8520,8549,8704,8738,8832,8872,9217,9220,9232,9257,9280,9472,9537,9554,9625,9729,9754,9894,10240,10248,10250,10272,10325,10376,10402,10600,10640,10760,10784,10882,10888,10890,16385,16388,16390,16393,16400,16402,16405,16408,16417,16420,16448,16450,16453,16456,16458,16465,16468,16480,16485,16513,16516,16528,16640,16642,16645,16648,16657,16660,16672,16705,16708,16720,16768,16773,16802,16897,16900,16912,16914,16937,16960,17408,17410,17413,17416,17425,17428,17433,17440,17473,17476,17488,17536,17556,17665,17668,17680,17700,17728,17818,17920,17930,17988,18000,18433,18436,18448,18496,18501,18516,18530,18688,18705,18756,18768,18793,18948,20480,20482,20485,20488,20497,20500,20512,20520,20545,20548,20560,20608,20737,20740,20752,20757,20800,20802,20992,21060,21162,21505,21508,21520,21537,21568,21600,21633,21665,21760,21768,21888,21896,22049,22120,22177,22528,22548,22593,22608,22681,22810,22848,22850,23173,24577,24580,24592,24640,24660,24674,24710,24745,24832,25124,25162,25234,25600,25622,25872,25920,25925,26020,26625,26730,26917,27142,27220,27234,32768,32770,32773,32776,32785,32788,32800,32810,32833,32836,32848,32896,32898,32936,32938,33025,33028,33030,33040,33088,33105,33113,33280,33312,33408,33410,33440,33448,33793,33796,33808,33810,33813,33856,33888,33929,34048,34116,34213,34328,34410,34816,34824,34853,34906,34944,34946,34984,35078,35362,35456,35464,35478,35496,36865,36868,36880,36928,36950,36996,37120,37154,37220,37462,37513,37888,37893,37956,37968,37976,38185,38288,38290,38465,38993,39078,39241,39445,39520,40960,40962,40968,40970,40992,41002,41120,41297,41305,41382,41472,41474,41480,41514,41600,41632,42048,42133,42597,42648,43018,43040,43042,43048,43168,43176,43268,43396,43398,43560,43562,43665,43690};\n"
            "inline uchar termite_iq2_sign_mask(uint sign_index) { uchar low = uchar(sign_index & 0x7Fu); uint x = sign_index & 0x7Fu; uint parity = 0u; for (uint i = 0u; i < 7u; ++i) parity ^= (x >> i) & 1u; return uchar(low | (parity << 7)); }\n"
+           // tile-codegen:begin quant_metal.gemv_iq2_xs family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_QUANT_LINEAR_SCALAR(termite_iq2_xs_linear) "\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 74u; float acc = 0.0f;\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 74u; ushort d_bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(d_bits)); const device uchar *qs = weight + off + 2u; const device uchar *scales = weight + off + 66u; uint input_off = r * p.in_dim + b * 256u; for (uint ib32 = 0u; ib32 < 8u; ++ib32) { float db0 = d * (0.5f + float(scales[ib32] & 0x0Fu)) * 0.25f; float db1 = d * (0.5f + float(scales[ib32] >> 4)) * 0.25f; for (uint lane = 0u; lane < 4u; ++lane) { uint qoff = (4u * ib32 + lane) * 2u; ushort packed = ushort(qs[qoff]) | (ushort(qs[qoff + 1u]) << 8); ushort grid = termite_iq2_xs_grid[packed & 0x01FFu]; uchar signs = termite_iq2_sign_mask(uint(packed >> 9)); float dl = lane < 2u ? db0 : db1; uint base = input_off + ib32 * 32u + lane * 8u; for (uint j = 0u; j < 8u; ++j) { float raw = float(2u * ((uint(grid) >> (2u * j)) & 0x03u) + 1u); float sign = ((uint(signs) >> j) & 1u) != 0u ? -1.0f : 1.0f; acc += input[base + j] * (dl * raw * sign); } } } }\n"
            "    output[gid] = acc;\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_iq2_xs family
            "kernel void termite_tl1_linear(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_tl1_params &p [[buffer(3)]], uint2 tid [[thread_position_in_grid]]) {\n"
            "    uint o = tid.x; uint r = tid.y; if (o >= p.out_dim || r >= p.rows) return;\n"
            "    uint input_base = r * p.in_dim; float abs_max = 0.0f;\n"
@@ -12261,8 +12452,10 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void Kernel(device const float *src_k [[buffer(0)]], device const float *src_v [[buffer(1)]], device Out *dst_k [[buffer(2)]], device Out *dst_v [[buffer(3)]], device const uint *block_table [[buffer(4)]], constant termite_metal_paged_f32_kv_seed_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) { \\\n"
            "    antfly_paged_kv_seed(src_k, src_v, dst_k, dst_v, block_table, p, gid); \\\n"
            "}\n"
+           // tile-codegen:begin attention.kv_seed family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "ANTFLY_PAGED_KV_SEED(float, termite_paged_f32_kv_seed)\n"
            "ANTFLY_PAGED_KV_SEED(half, termite_paged_f16_kv_seed)\n"
+           // tile-codegen:end attention.kv_seed family
            "#undef ANTFLY_PAGED_KV_SEED\n"
            "kernel void termite_paged_f32_v_seed(device const float *src_v [[buffer(0)]], device float *dst_v [[buffer(1)]], device const uint *block_table [[buffer(2)]], constant termite_metal_paged_f32_kv_seed_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint values = p.v_row_stride; if (values == 0u) return; uint row = gid / values; uint col = gid - row * values; if (row >= p.suffix_tokens) return;\n"
@@ -12308,12 +12501,14 @@ static NSString *termite_metal_shader_source(void) {
            "    uint b_col = col - first_dim; if (b_col < second_dim) { b_out[row * second_dim + b_col] = Bias ? value + b_bias[b_col] : value; return; }\n"
            "    if (Third) { uint c_col = b_col - second_dim; if (c_col < second_dim) c_out[row * second_dim + c_col] = Bias ? value + c_bias[c_col] : value; }\n"
            "}\n"
+           // tile-codegen:begin attention.qkv_split family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_dense_qkv_split_f32_2d(device const float *packed [[buffer(0)]], device float *q_out [[buffer(1)]], device float *k_out [[buffer(2)]], device float *v_out [[buffer(3)]], constant termite_metal_dense_qkv_split_bias_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    antfly_dense_split<true, false>(packed, packed, packed, packed, q_out, k_out, v_out, p.rows, p.total_out_dim, p.q_out_dim, p.kv_out_dim, gid);\n"
            "}\n"
            "kernel void termite_dense_qkv_split_bias_f32_2d(device const float *packed [[buffer(0)]], device const float *q_bias [[buffer(1)]], device const float *k_bias [[buffer(2)]], device const float *v_bias [[buffer(3)]], device float *q_out [[buffer(4)]], device float *k_out [[buffer(5)]], device float *v_out [[buffer(6)]], constant termite_metal_dense_qkv_split_bias_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
            "    antfly_dense_split<true, true>(packed, q_bias, k_bias, v_bias, q_out, k_out, v_out, p.rows, p.total_out_dim, p.q_out_dim, p.kv_out_dim, gid);\n"
            "}\n"
+           // tile-codegen:end attention.qkv_split family
            "kernel void termite_dense_pair_split_f32_2d(device const float *packed [[buffer(0)]], device float *a_out [[buffer(1)]], device float *b_out [[buffer(2)]], constant termite_metal_dense_pair_split_bias_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    antfly_dense_split<false, false>(packed, packed, packed, packed, a_out, b_out, b_out, p.rows, p.total_out_dim, p.out_dim, p.out_dim, gid);\n"
            "}\n"
@@ -12333,9 +12528,11 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_gliner_boundary_ffn_bias_gelu_exact(device const float *product [[buffer(0)]], device const float *bias [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_activation_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total=p.rows*p.dim;if(gid>=total||p.dim==0u)return;float x=product[gid]+bias[gid%p.dim];output[gid]=0.5f*x*(1.0f+termite_erf_approx(x*0.7071067811865476f));\n"
            "}\n"
+           // tile-codegen:begin layer_norm.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_gliner_boundary_ffn_bias_add_layer_norm(device const float *projected [[buffer(0)]], device const float *bias [[buffer(1)]], device const float *residual [[buffer(2)]], device const float *gamma [[buffer(3)]], device const float *beta [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_apply_layer_norm_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
            "    uint row=gid/32u;if(p.hidden_size==0u)return;uint base=row*p.hidden_size;float sum=0.0f;for(uint d=lane;d<p.hidden_size;d+=32u){float v=(projected[base+d]+bias[d])+residual[base+d];sum+=v;}float mean=simd_sum(sum)/float(p.hidden_size);float sq=0.0f;for(uint d=lane;d<p.hidden_size;d+=32u){float v=(projected[base+d]+bias[d])+residual[base+d]-mean;sq+=v*v;}float inv=rsqrt(simd_sum(sq)/float(p.hidden_size)+p.eps);for(uint d=lane;d<p.hidden_size;d+=32u){float v=(projected[base+d]+bias[d])+residual[base+d];output[base+d]=(v-mean)*inv*gamma[d]+beta[d];}\n"
            "}\n"
+           // tile-codegen:end layer_norm.2 family
            "// GLiNER2.5: all metadata pointers below contain physical int32 values.\n"
            "kernel void termite_gliner_boundary_f32(\n"
            "    device const float *a0 [[buffer(0)]], device const float *a1 [[buffer(1)]],\n"
@@ -12680,18 +12877,22 @@ static NSString *termite_metal_shader_source(void) {
            "        sum += value; if (p.exclusive == 0u) output[index] = sum;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:begin reduce.scan.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_cumulative_sum_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    threadgroup float totals[256];\n"
            "    termite_cumulative_sum_impl<float>(input, output, p, tid, row, totals);\n"
            "}\n"
+           // tile-codegen:end reduce.scan.0 family
            "kernel void termite_cumulative_sum_i32(device const uint *input [[buffer(0)]], device uint *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    threadgroup uint totals[256];\n"
            "    termite_cumulative_sum_impl<uint>(input, output, p, tid, row, totals);\n"
            "}\n"
+           // tile-codegen:begin reduce.scan.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_cumulative_sum_i64(device const ulong *input [[buffer(0)]], device ulong *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    threadgroup ulong totals[256];\n"
            "    termite_cumulative_sum_impl<ulong>(input, output, p, tid, row, totals);\n"
            "}\n"
+           // tile-codegen:end reduce.scan.1 family
            TERMITE_MSL_ABI_CUMULATIVE_BYTE_SUM(termite_cumulative_sum_i8) "\n"
            "    threadgroup uchar totals[256];\n"
            "    termite_cumulative_sum_impl<uchar>(input, output, p, tid, row, totals);\n"
@@ -13806,17 +14007,21 @@ static NSString *termite_metal_shader_source(void) {
            "    if (q0 + 32u <= p.seq_len) { for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; const uint output_base = (b * p.seq_len + q0 + qgroup * 8u) * hidden + h * 64u + dslice; for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], output + output_base + dt * 8u, hidden); } return; }\n"
            "    for (uint qp = 0u; qp < 2u; ++qp) for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], so + (uint(sgitg) + qp * 8u) * 128u + dt * 8u, 16u); " ANTFLY_MSL_VISION64_TAIL() "\n"
            "}\n"
+           // tile-codegen:begin attention.vision_flash_q32.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_VISION_SDPA(termite_sdpa_f32_vision_hd64_flash_q32) "\n"
            "    threadgroup half sq[2048]; threadgroup half skv[2048]; threadgroup float ss[1024]; threadgroup half sp[1024]; threadgroup float sM[32]; threadgroup float sS[32]; threadgroup float sdiag[256]; threadgroup float so[2048];\n"
            "    termite_vision_hd64_flash_q32<half>(q, k, v, bias, mask, output, p, tid, lane, sgitg, tg, sq, skv, ss, sp, sM, sS, sdiag, so);\n"
            "}\n"
+           // tile-codegen:end attention.vision_flash_q32.0 family
            // Full F32 variant for retrieval-sensitive vision. Reuse Q storage
            // for the output tail after the final attention barrier: 25.25 KiB
            // of threadgroup memory rather than 33.25 KiB with a separate tail.
+           // tile-codegen:begin attention.vision_flash_q32.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_VISION_SDPA(termite_sdpa_f32_vision_hd64_flash_q32_full) "\n"
            "    threadgroup float sq[2048]; threadgroup float skv[2048]; threadgroup float ss[1024]; threadgroup float sp[1024]; threadgroup float sM[32]; threadgroup float sS[32]; threadgroup float sdiag[256]; \n"
            "    termite_vision_hd64_flash_q32<float>(q, k, v, bias, mask, output, p, tid, lane, sgitg, tg, sq, skv, ss, sp, sM, sS, sdiag, sq);\n"
            "}\n"
+           // tile-codegen:end attention.vision_flash_q32.1 family
            "template<bool Parallel>\n"
            "__attribute__((always_inline)) inline void antfly_window_hd32(device const float*q,device const float*k,device const float*v,device const float*bias,device const float*mask,device float*output,constant termite_metal_sdpa_f32_params&p,threadgroup float*scores,ushort lane,uint tg) {\n"
            "    (void)bias; (void)mask; if (p.seq_len == 0u || p.seq_len > 256u || p.head_dim != 32u || p.bias_mode != 0u || p.has_mask != 0u) return;\n"
@@ -13834,9 +14039,11 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { const uint v_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * 32u : (bh * p.seq_len + ki) * 32u; accum += scores[ki] * v[v_base + uint(lane)]; } output[q_base + uint(lane)] = denom > 0.0f ? accum / denom : 0.0f;\n"
            "}\n"
+           // tile-codegen:begin attention.shifted_window family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_sdpa_f32_florence_window_hd32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *scores [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) { antfly_window_hd32<false>(q,k,v,bias,mask,output,p,scores,lane,tg); }\n"
 
            "kernel void termite_sdpa_f32_florence_window_parallel(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *scores [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) { antfly_window_hd32<true>(q,k,v,bias,mask,output,p,scores,lane,tg); }\n"
+           // tile-codegen:end attention.shifted_window family
 
            TERMITE_MSL_ABI_VISION_SDPA(termite_sdpa_f32_bert_prefill_s256_hd64_q8) "\n"
            "    (void)bias; (void)mask; if (p.seq_len != 256u || p.head_dim != 64u || p.bias_mode != 0u || p.has_mask != 0u || sgitg >= 8u) return;\n"
@@ -14128,6 +14335,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint stride = 16u; stride > 0u; stride >>= 1u) { if (lane < stride) partials[lane] += partials[lane + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    if (lane == 0u) output[group] = partials[0];\n"
            "}\n"
+           // tile-codegen:begin projection.dot_small_m.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_DOT_SMALL_ROWS(termite_dot_general_2d_f32_small_m_tile) "\n"
            "    uint row = tg.y; uint col0 = tg.x * 8u; uint width = tpg.x; if (row >= p.m || p.k == 0u || width == 0u) return;\n"
            "    uint c0 = col0; uint c1 = col0 + 1u; uint c2 = col0 + 2u; uint c3 = col0 + 3u; uint c4 = col0 + 4u; uint c5 = col0 + 5u; uint c6 = col0 + 6u; uint c7 = col0 + 7u;\n"
@@ -14147,6 +14355,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) { for (uint i = 0u; i < 16u; ++i) partials[i * width + t] += partials[i * width + t + stride]; } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    if (tid == 0u) { uint b0 = r0 * p.n + col0; output[b0] = partials[0]; if (vc1) output[b0 + 1u] = partials[width]; if (vc2) output[b0 + 2u] = partials[2u * width]; if (vc3) output[b0 + 3u] = partials[3u * width]; if (vr1) { uint b1 = r1 * p.n + col0; output[b1] = partials[4u * width]; if (vc1) output[b1 + 1u] = partials[5u * width]; if (vc2) output[b1 + 2u] = partials[6u * width]; if (vc3) output[b1 + 3u] = partials[7u * width]; } if (vr2) { uint b2 = r2 * p.n + col0; output[b2] = partials[8u * width]; if (vc1) output[b2 + 1u] = partials[9u * width]; if (vc2) output[b2 + 2u] = partials[10u * width]; if (vc3) output[b2 + 3u] = partials[11u * width]; } if (vr3) { uint b3 = r3 * p.n + col0; output[b3] = partials[12u * width]; if (vc1) output[b3 + 1u] = partials[13u * width]; if (vc2) output[b3 + 2u] = partials[14u * width]; if (vc3) output[b3 + 3u] = partials[15u * width]; } }\n"
            "}\n"
+           // tile-codegen:end projection.dot_small_m.0 family
            "template<uint Cols> __attribute__((always_inline)) inline void termite_small_m_rows4_dot(\n"
            "    device const float *lhs, device const float *rhs, device float *output,\n"
            "    constant termite_metal_dot_general_2d_f32_params &p, threadgroup float *partials,\n"
@@ -14160,12 +14369,14 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) { for (uint i = 0u; i < 4u * Cols; ++i) partials[i * width + t] += partials[i * width + t + stride]; } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    if (tid == 0u) { for (uint r = 0u; r < 4u; ++r) { if (!valid_r[r]) continue; uint base = (row0 + r) * p.n + col0; for (uint c = 0u; c < Cols; ++c) { if (valid_c[c]) output[base + c] = partials[(r * Cols + c) * width]; } } }\n"
            "}\n"
+           // tile-codegen:begin projection.dot_small_m.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_DOT_SMALL_ROWS(termite_dot_general_2d_f32_small_m_rows4_cols8) "\n"
            "    termite_small_m_rows4_dot<8u>(lhs, rhs, output, p, partials, tid, tpg, tg);\n"
            "}\n"
            TERMITE_MSL_ABI_DOT_SMALL_ROWS(termite_dot_general_2d_f32_small_m_rows4_cols16) "\n"
            "    termite_small_m_rows4_dot<16u>(lhs, rhs, output, p, partials, tid, tpg, tg);\n"
            "}\n"
+           // tile-codegen:end projection.dot_small_m.1 family
            TERMITE_MSL_ABI_DOT_2D(termite_dot_general_rank1_outer_f32) "\n"
            "    uint total = p.m * p.n; if (gid >= total || p.k != 1u) return; uint row = gid / p.n; uint col = gid - row * p.n; output[gid] = lhs[row] * rhs[col];\n"
            "}\n"
@@ -14176,6 +14387,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) partials[sgitg] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total_acc = simd_sum(partials[lane]); if (lane == 0u && sgitg == 0u) output[row] = total_acc;\n"
            "}\n"
+           // tile-codegen:begin elementwise.lora.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_lora_after_a_f32(device const float *input [[buffer(0)]], device const float *lora_a [[buffer(1)]], device float *after_a [[buffer(2)]], constant termite_metal_lora_linear_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.rank; if (gid >= total || p.in_dim == 0u) return; uint row = gid / p.rank; uint rk = gid - row * p.rank; float acc = 0.0f;\n"
            "    uint in_base = row * p.in_dim; uint a_base = rk * p.in_dim;\n"
@@ -14188,6 +14400,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint rk = 0u; rk < p.rank; ++rk) acc += after_a[a_base + rk] * lora_b[b_base + rk];\n"
            "    after_b[gid] = acc; output[gid] = base[gid] + acc * p.scale;\n"
            "}\n"
+           // tile-codegen:end elementwise.lora.0 family
            "kernel void termite_lora_rank1_linear_f32(device const float *input [[buffer(0)]], device const float *base [[buffer(1)]], device const float *lora_a [[buffer(2)]], device const float *lora_b [[buffer(3)]], device float *after_a [[buffer(4)]], device float *after_b [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_lora_linear_f32_params &p [[buffer(7)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (p.rank != 1u || row >= p.rows || p.in_dim == 0u) return; float acc = 0.0f;\n"
            "    for (uint i = uint(sgitg) * 32u + uint(lane); i < p.in_dim; i += 256u) acc += input[row * p.in_dim + i] * lora_a[i];\n"
@@ -14196,6 +14409,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float a = simd_sum(partials[lane]); if (lane == 0u && sgitg == 0u) { partials[0] = a; after_a[row] = a; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    a = partials[0]; for (uint out = uint(sgitg) * 32u + uint(lane); out < p.out_dim; out += 256u) { uint idx = row * p.out_dim + out; float b = a * lora_b[out]; after_b[idx] = b; output[idx] = base[idx] + b * p.scale; }\n"
            "}\n"
+           // tile-codegen:begin elementwise.lora.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_lora_grad_b_f32(device const float *output_grad [[buffer(0)]], device const float *after_a [[buffer(1)]], device float *grad_b [[buffer(2)]], constant termite_metal_lora_linear_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.out_dim * p.rank; if (gid >= total || p.rows == 0u) return; uint out = gid / p.rank; uint rk = gid - out * p.rank; float acc = 0.0f;\n"
            "    for (uint row = 0u; row < p.rows; ++row) acc += output_grad[row * p.out_dim + out] * after_a[row * p.rank + rk];\n"
@@ -14226,6 +14440,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) partials[sgitg] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total_acc = simd_sum(partials[lane]); if (lane == 0u && sgitg == 0u) grad_after_a[row] = total_acc * p.scale;\n"
            "}\n"
+           // tile-codegen:end elementwise.lora.1 family
            "kernel void termite_dot_general_batched_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_batched_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint per_batch = p.m * p.n; uint total = p.batch_count * per_batch; if (gid >= total || p.k == 0u || per_batch == 0u) return; uint batch = gid / per_batch; uint inner = gid - batch * per_batch; uint row = inner / p.n; uint col = inner - row * p.n; uint lhs_base = batch * p.m * p.k; uint rhs_base = batch * p.n * p.k; float acc = 0.0f;\n"
            "    for (uint kk = 0u; kk < p.k; ++kk) { float r = p.rhs_contract_axis == 0u ? rhs[rhs_base + kk * p.n + col] : rhs[rhs_base + col * p.k + kk]; acc += lhs[lhs_base + row * p.k + kk] * r; }\n"
@@ -14332,6 +14547,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint position_base = p.position_id * p.hidden_size;\n"
            "    output[gid] = token_embedding[token_base + gid] + position_embedding[position_base + gid];\n"
            "}\n"
+           // tile-codegen:begin reduce.embedding_lookup.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_embedding_lookup(device const float *weight [[buffer(0)]], device const uint *ids [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_embedding_lookup_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.total * p.dim;\n"
            "    if (gid >= total) return;\n"
@@ -14340,7 +14556,9 @@ static NSString *termite_metal_shader_source(void) {
            "    uint idx = ids[row];\n"
            "    output[gid] = weight[idx * p.dim + col];\n"
            "}\n"
+           // tile-codegen:end reduce.embedding_lookup.0 family
            "static inline float termite_embedding_bf16_to_f32(ushort bits) { return as_type<float>((uint(bits) << 16u)); }\n"
+           // tile-codegen:begin reduce.embedding_lookup.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_DENSE_EMBEDDING_16(termite_embedding_lookup_bf16) "\n"
            "    uint total = p.total * p.dim;\n"
            "    if (gid >= total) return;\n"
@@ -14357,6 +14575,8 @@ static NSString *termite_metal_shader_source(void) {
            "    uint idx = ids[row];\n"
            "    output[gid] = float(as_type<half>(weight[idx * p.dim + col]));\n"
            "}\n"
+           // tile-codegen:end reduce.embedding_lookup.1 family
+           // tile-codegen:begin reduce.rope.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_rope(device const float *input [[buffer(0)]], device const uint *positions [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_rope_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.total_chunks * p.head_dim;\n"
            "    if (gid >= total) return;\n"
@@ -14377,6 +14597,7 @@ static NSString *termite_metal_shader_source(void) {
            "    else if (d == idx1) output[gid] = x0 * sin_val + x1 * cos_val;\n"
            "    else output[gid] = input[gid];\n"
            "}\n"
+           // tile-codegen:end reduce.rope.0 family
            ANTFLY_MSL_GDN_SOURCE
            "typedef antfly_gdn_params termite_qwen35_params;\n"
            "// One threadgroup owns one value head. Shared Q/K vectors avoid global\n"
@@ -14511,9 +14732,13 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    state[base]=values.x;state[base+32*128]=values.y;state[base+64*128]=values.z;state[base+96*128]=values.w;\n"
            "}\n"
+           // tile-codegen:begin reduce.gated_delta_norm.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
         ANTFLY_MSL_GDN_NORM(termite_qwen35_norm, termite_qwen35_params, 1, p.seq*p.value_heads, "", "0")
+           // tile-codegen:end reduce.gated_delta_norm.0 family
         ANTFLY_MSL_GDN_PREPARE(termite_qwen35_prepare_parallel, termite_qwen35_params, 32, false, p.value_heads, ", ushort lane [[thread_index_in_simdgroup]]", "uint(lane)")
+           // tile-codegen:begin reduce.gated_delta_norm.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
         ANTFLY_MSL_GDN_NORM(termite_qwen35_norm_parallel, termite_qwen35_params, 32, p.value_heads, ", ushort lane [[thread_index_in_simdgroup]]", "uint(lane)")
+           // tile-codegen:end reduce.gated_delta_norm.1 family
            "kernel void termite_packed_gelu(device const float *x [[buffer(0)]], device float *y [[buffer(1)]], constant uint2 &p [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i >= p.x * p.y) return; uint row = i / p.y, col = i % p.y; y[i] = termite_gated_activation_product(x[row * p.y * 2u + col], x[row * p.y * 2u + p.y + col], 0u); }\n"
            "struct antfly_rotary_params { uint dim, x, y, vision; float theta; };\n"
            "kernel void antfly_rotary_table(device float2 *out [[buffer(0)]], constant antfly_rotary_params &p [[buffer(1)]], uint i [[thread_position_in_grid]]) {\n"
@@ -14591,6 +14816,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float x1 = input[base + half_dim + pair];\n"
            "    output[gid] = d < half_dim ? antfly_rotary_component<false>(x0,x1,cos_val,sin_val) : antfly_rotary_component<true>(x0,x1,cos_val,sin_val);\n"
            "}\n"
+           // tile-codegen:begin reduce.rope.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_rope_pair(device const float *first_input [[buffer(0)]], device const float *second_input [[buffer(1)]], device const uint *positions [[buffer(2)]], device float *first_output [[buffer(3)]], device float *second_output [[buffer(4)]], constant termite_metal_rope_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.total_chunks * p.head_dim; if (gid >= total) return; uint chunk = gid / p.head_dim; uint d = gid - chunk * p.head_dim; uint base = chunk * p.head_dim;\n"
            "    if (p.rope_dim < 2u) { first_output[gid] = first_input[gid]; second_output[gid] = second_input[gid]; return; }\n"
@@ -14602,6 +14828,7 @@ static NSString *termite_metal_shader_source(void) {
            "    else if (d == idx1) { first_output[gid] = first_x0 * sin_val + first_x1 * cos_val; second_output[gid] = second_x0 * sin_val + second_x1 * cos_val; }\n"
            "    else { first_output[gid] = first_input[gid]; second_output[gid] = second_input[gid]; }\n"
            "}\n"
+           // tile-codegen:end reduce.rope.1 family
            "kernel void termite_attention_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], device const float *bias [[buffer(4)]], device const uchar *mask [[buffer(5)]], constant termite_metal_attention_f32_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.batch * p.q_len * p.num_heads;\n"
            "    if (gid >= total) return;\n"
@@ -14863,6 +15090,7 @@ static NSString *termite_metal_shader_source(void) {
            // 8-query tiles x 32-key chunks with online softmax and simdgroup
            // matmuls, staging f32 K/V to f16 in threadgroup memory. Constant
            // threadgroup footprint, so no kv-length ceiling. 128 threads/TG.
+           // tile-codegen:begin attention.dense_causal_sg.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_DENSE_CAUSAL_ATTENTION(termite_attention_f32_dense_causal_sg) "\n"
            "    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;\n"
            "    if (q0 >= p.q_len || h >= p.num_heads || p.num_kv_heads == 0u || hd % 32u != 0u || p.has_bias != 0u || p.has_mask != 0u) return;\n"
@@ -14890,6 +15118,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            TERMITE_MSL_ATTENTION_PUBLISH
            "}\n"
+           // tile-codegen:end attention.dense_causal_sg.0 family
            // 16-query variant: halves K/V traffic per token versus the 8-query
            // tile. Two 8-row simdgroup blocks per SG cap head_dim at 128 (8
            // accumulators); the dispatcher falls back to the 8-query kernel
@@ -14939,9 +15168,11 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint i = uint(tid); i < 16u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (16u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
            "}\n"
+           // tile-codegen:begin attention.dense_causal_sg.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_DENSE_CAUSAL_ATTENTION(termite_attention_f32_dense_causal_sg_q16) "\n"
            "    termite_attention_dense_q16_impl<float, false, 0u>(q, k, v, output, p, shmem, tid, lane, sgitg, tg);\n"
            "}\n"
+           // tile-codegen:end attention.dense_causal_sg.1 family
            // f16-K/V variant of the q16 kernel: K/V arrive as device half (the
            // host converts once per layer), so full 32-key chunks are consumed
            // with direct simdgroup loads — no threadgroup staging or its
@@ -15132,6 +15363,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_PAGED_GQA_SPLIT_STAGE_TILE
            "__attribute__((always_inline)) inline void termite_paged_gqa_split_reduce_body(device const float4 *partial_o, device float4 *output, constant termite_metal_paged_attention_params &p, constant termite_metal_decode_gqa_split_params &schedule, ushort lane, ushort sgitg, uint qi, uint h, uint hd, uint split_count) {\n"
            TERMITE_MSL_PAGED_GQA_SPLIT_REDUCE_TILE
+           // tile-codegen:begin attention.gqa_split family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_PAGED_GQA_SPLIT_STAGE(termite_paged_attention_kv_decode_gqa_split_stage)
            "    const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z; const uint hd = p.head_dim; const uint split_count = schedule.split_count;\n"
            "    const bool legacy_geometry = p.num_heads == 8u && (p.num_kv_heads == 1u || p.num_kv_heads == 2u) && ((hd == 256u && p.sliding_window == 512u) || (hd == 512u && p.sliding_window == 0u)); const bool a4b_geometry = p.num_heads == 16u && ((p.num_kv_heads == 8u && hd == 256u && p.sliding_window == 1024u) || (p.num_kv_heads == 2u && hd == 512u && p.sliding_window == 0u));\n"
@@ -15291,6 +15523,7 @@ static NSString *termite_metal_shader_source(void) {
            "        output[h * p.head_dim + d] *= inv_sum;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:end attention.gqa_split family
            TERMITE_MSL_ABI_COMPRESSED_ATTENTION_SPAN(termite_polar4_attention_span) "\n"
            "    termite_compressed_attention_span<termite_polar4_span_codec>(q, encoded_key, v, output, p, h);\n"
            "}\n"
@@ -18367,6 +18600,12 @@ static void termite_metal_load_pipeline_catalog(termite_metal_decode_runtime *ru
             resolved[policy] = YES;
         }
         *slot = termite_metal_make_catalog_pipeline(caches[policy], device, selected_library, i);
+        if (i == antfly_metal_index_whisper_logits_partials_pipeline && termite_metal_env_flag_enabled(getenv("ANTFLY_TILE_WHISPER_LOGITS"))) {
+            NSError *tile_error = nil;
+            id<MTLLibrary> tile_library = [device newLibraryWithSource:[NSString stringWithUTF8String:antfly_tile_whisper_logits_partials_msl] options:nil error:&tile_error];
+            id<MTLComputePipelineState> tile_pipeline = tile_library ? termite_metal_make_pipeline(device, tile_library, @"antfly_tile_whisper_logits_partials") : nil;
+            if (tile_pipeline != nil) *slot = tile_pipeline;
+        }
     }
 }
 

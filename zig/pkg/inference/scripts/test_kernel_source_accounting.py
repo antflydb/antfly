@@ -150,5 +150,41 @@ const multiline =
         self.assertEqual(emitted, generated)
 
 
+    def test_tile_regions_and_same_owner_nesting_conserve_bytes(self):
+        region = ('// tile-codegen:begin family\n'
+                  '// tile-codegen:begin specialization\nbody\n'
+                  '// tile-codegen:end specialization\n'
+                  '// tile-codegen:end family\n')
+        authored, generated = accounting.managed('before\n' + region + 'after\n')
+        self.assertEqual(authored, 'before\nafter\n')
+        self.assertEqual(generated, region)
+
+    def test_generated_regions_reject_overlapping_owners_and_broken_markers(self):
+        for source in (
+            '// tile-codegen:begin a\n// quant-kernel-codegen:begin b\n',
+            '// tile-codegen:end a\n',
+            '// tile-codegen:begin a\n',
+            '// tile-codegen:begin a\n// quant-kernel-codegen:end a\n',
+        ):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                accounting.managed(source)
+
+    def test_tile_owners_are_charged_as_production(self):
+        name = 'zig/pkg/inference/src/tile/families/native/row.zig'
+        guide = 'zig/pkg/inference/src/tile/README.md'
+        payload = 'pub const program = "native source";\n'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / name
+            path.parent.mkdir(parents=True)
+            path.write_text(payload)
+            (root / guide).write_text(payload)
+            with mock.patch.object(accounting.subprocess, 'check_output', side_effect=['0' * 40, name + '\n' + guide + '\n', '', '1' * 40]), mock.patch.object(accounting.subprocess, 'run', return_value=SimpleNamespace(stdout=b'')):
+                receipt = accounting.account(root, 'baseline')
+        self.assertEqual(receipt['authored_production']['bytes_removed'], -len(payload))
+        self.assertEqual(receipt['groups']['authored_tile_program_owners']['bytes_removed'], -len(payload))
+        self.assertEqual(receipt['groups']['documentation']['bytes_removed'], -len(payload))
+
+
 if __name__ == '__main__':
     unittest.main()
