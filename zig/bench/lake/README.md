@@ -2560,3 +2560,53 @@ The observation records exact commands, source hashes and retained log hashes. A
 license, formatting and whitespace checks pass. Earlier kernel measurements
 retain their original source identities; no new CPU or RSS claim is made.
 Real-provider retention qualification remains deferred.
+
+## Adaptive spill residency and notified joins
+
+The [retained observation](adaptive-spill-cache-and-notified-joins-v1-observation.json)
+qualifies runtime `69c65746520df8591e7721d8636522c792dd9bdc` with main
+`c2896f43244e2e46d1cd1e294d93fde8604989f4` merged. Runtime ABI **78** fences the
+changed in-process spill owners; reader protocol **97** and artifact formats
+remain unchanged.
+
+A fixed four-entry, 64-KiB payload cache repeatedly decoded the same physical
+bodies during wide full drains. The production cache now uses an indexed LRU,
+counts shared owners once, and adapts within existing statement admission.
+Scoped managers and direct statement-budget allocations reclaim idle sibling
+roots. Reclamation skips busy caches and allocator paths; only refundable frees
+can reuse locks held by the current thread. Arena, monotonic and opaque paths
+retain conservative caching outside shared reclamation. Allocation failures,
+duplicate physical-address allocations, cancellation, pins, direct/nested
+budgets, shared-lock arena growth and independent manager registries are tested.
+
+An 8,192-row fixture checks every sorted key and ordinal/column tag across eight
+128-byte strings. The same final Debug binary compares fixed and adaptive
+policies with **32 MiB post-finish headroom** in both. With Snappy compression,
+spill bytes read during the drain fall **70,618,654 → 5,166,118**;
+payload reads fall **8,192 → 512**, with unchanged writes.
+Total setup-plus-drain read/write bytes fall
+**93,252,674 → 27,800,138**.
+The uncompressed comparison and every raw sample remain in the observation.
+
+After one warmup per variant, six alternating Snappy pairs have median drain
+thread CPU **1022.116 → 117.790 ms (8.68×)**.
+Setup/add and Sort.finish are excluded; first page advancement, the full drain
+and independent oracles are included. Peak tracked live allocation increases
+**403,053 → 13,829,101 bytes** as the cache uses available
+memory; both retain the same **33,594,433-byte** limit. This is
+a spill I/O and native drain CPU result, with no RSS, archive, cloud, HTTP or
+whole-publication throughput claim. Task-owned builds, tests and cleanup did not
+overlap timing; other host activity was uncontrolled.
+
+The outer covering wave now shares completion-driven joins with raw ranges. A
+later immediate failure cancels a blocked earlier sibling, preserving the
+injected error instead of waiting for its two-second safeguard and returning
+Timeout. Caller cancellation joins all child work before callback teardown.
+
+Final qualification passes **266 shared and 85 API checks**, with no failures,
+skips or leaks, and **50 real Parquet/Iceberg E2E cases in 383.50 seconds**.
+The frozen CLI SHA-256 is
+`58d1a35b8b0ba4a145e48db9125f4a23bfb04f720de07689cbbb48b241508ca7`.
+The observation records native executable identity, commands, source and log
+hashes. Apache boundary (2,338 files), license, formatting and whitespace checks
+pass. Real-provider retention qualification remains deferred.
