@@ -18,8 +18,19 @@
 const r = @import("../region.zig");
 const split = @import("../attention_split.zig");
 const cu = @import("../attention_cuda_pairs.zig");
+const mtl = @import("../attention_metal_pairs.zig");
 
 pub const regions = [_]r.Region{
+    r.metal("attention.kv_seed", mtl.kv_seed.kernel("termite_paged_f32_kv_seed", false) ++
+        mtl.kv_seed.kernel("termite_paged_f16_kv_seed", true)),
+    r.metal("attention.qkv_split", mtl.qkv_split.kernel("termite_dense_qkv_split_f32_2d", false) ++
+        mtl.qkv_split.kernel("termite_dense_qkv_split_bias_f32_2d", true)),
+    r.metal("attention.vision_flash_q32", mtl.vision_flash_q32.kernel("termite_sdpa_f32_vision_hd64_flash_q32", false) ++
+        mtl.vision_flash_q32.kernel("termite_sdpa_f32_vision_hd64_flash_q32_full", true)),
+    r.metal("attention.florence_window", mtl.florence_window.kernel("termite_sdpa_f32_florence_window_hd32", false) ++
+        mtl.florence_window.kernel("termite_sdpa_f32_florence_window_parallel", true)),
+    r.metal("attention.dense_causal_sg", mtl.dense_causal_sg.kernel("termite_attention_f32_dense_causal_sg", false) ++
+        mtl.dense_causal_sg.kernel("termite_attention_f32_dense_causal_sg_q16", true)),
     r.metal("attention.gqa_split", split.split_region),
     r.metal("attention.gqa_batch", split.batch_region),
     r.cuda("attention.block", cu.block.kernel("termite_attention_f32_block", false)),
