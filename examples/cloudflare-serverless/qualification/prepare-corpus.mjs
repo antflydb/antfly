@@ -16,10 +16,10 @@
 import{readFile,writeFile,mkdir,copyFile}from'node:fs/promises';
 import{resolve,basename}from'node:path';
 import{createHash}from'node:crypto';
-import{planCorpus}from'./corpus.mjs';
+import{planCorpus,corpusId}from'./corpus.mjs';
 import{assertGateRun,assertGateConfig}from'./gate-scope.mjs';
-import{verifySealedRun}from'./gate-provenance.mjs';
-if(process.argv.length!==5)throw Error('usage: prepare-corpus GATE_JSON TRIAL COMPLETED_REPORT');
+import{verifySealedRun,verifyReportedRun}from'./gate-provenance.mjs';
+const adopt=process.argv[5]==='--adopt-completed-rehearsal';if(process.argv.length!==5&&!(process.argv.length===6&&adopt))throw Error('usage: prepare-corpus GATE_JSON TRIAL COMPLETED_REPORT [--adopt-completed-rehearsal]');
 const gate=JSON.parse(await readFile(process.argv[2])),trial=Number(process.argv[3]),source=resolve(process.argv[4]),pair=gate.trials.find(p=>p.trial===trial);
 if(!pair)throw Error('TrialMissing');
 const bytes=await readFile(source),report=JSON.parse(bytes),id=crypto.randomUUID(),plans=[];
@@ -28,11 +28,11 @@ for(const path of[pair.baseline,pair.candidate]){
  const run=JSON.parse(await readFile(path));assertGateRun(run,{account:gate.account,dir:gate.dir});
  const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));
  const configs=await Promise.all(run.services.map(async service=>{const c=JSON.parse(await readFile(service.config));assertGateConfig(run,service,c);return c;}));
- plans.push({path,before:run,...planCorpus(run,configs,report,id)});
+ let current=run;if(adopt&&run.last_execution_id==null){const side=report.sides?.find(s=>s.run===run.id);if(report.qualification!==false||report.stage!=='complete'||!Number.isFinite(report.finished_at)||!corpusId(report.execution_id)||!side||side.execution_id!==report.execution_id||!Array.isArray(side.cold)||side.cold.length||verifyReportedRun(side,run).length)throw Error('CompletedRehearsalAdoptionInvalid');current={...run,last_execution_id:report.execution_id,last_phase:'complete',adopted_completed_rehearsal_sha256:createHash('sha256').update(bytes).digest('hex')};}plans.push({path,before:run,...planCorpus(current,configs,report,id)});
 }
 const archive=resolve(gate.dir,'corpus-'+id);await mkdir(archive);
 await copyFile(source,resolve(archive,'previous-report.json'));
-await writeFile(resolve(archive,'transition.json'),JSON.stringify({id,trial,previous_report:source,previous_report_sha256:createHash('sha256').update(bytes).digest('hex'),runs:plans.map(p=>({id:p.run.id,previous_corpus:p.before.corpus??null,next_corpus:p.run.corpus}))},null,2));
+await writeFile(resolve(archive,'transition.json'),JSON.stringify({id,trial,previous_report:source,previous_report_sha256:createHash('sha256').update(bytes).digest('hex'),runs:plans.map(p=>({id:p.run.id,adopted_completed_rehearsal_sha256:p.run.adopted_completed_rehearsal_sha256??null,previous_corpus:p.before.corpus??null,next_corpus:p.run.corpus}))},null,2));
 for(const p of plans){
  const dir=resolve(archive,p.run.id);await mkdir(dir);await copyFile(p.path,resolve(dir,'run.json'));
  for(const service of p.before.services)await copyFile(service.config,resolve(dir,basename(service.config)));

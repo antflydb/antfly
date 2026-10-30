@@ -277,3 +277,12 @@ bounded slices. The revised local suite passes 479 Node tests and seven focused
 workerd integrations, including the dense export and 32-caller Tail burst. The
 first failed hosted generation remains failed; these local results authorize a
 new reproduction, not relabeling the old evidence.
+
+The rehearsal driver now claims each paired corpus execution in the run
+manifests and closes that claim after its report completes. A fresh retry must
+use `prepare-corpus`; it cannot silently reuse a failed or completed corpus.
+The one older completed rehearsal predates that claim. An explicit
+`--adopt-completed-rehearsal` transition verifies its source/module/bundle/corpus
+identity and unused recovery actors, records its report hash in the transition,
+and archives the original manifests before assigning fresh namespace identities.
+It does not amend the failed report or confer qualification.
