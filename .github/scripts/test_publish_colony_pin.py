@@ -122,5 +122,20 @@ class PublisherTests(unittest.TestCase):
         self.assertNotIn('SENTINEL_TOKEN', str(second.call_args))
 
 
+
+    def test_api_failure_reports_only_safe_status_and_permission_area(self):
+        api = p.GitHub('SENTINEL_TOKEN')
+        response = io.BytesIO(b'{"private_body":"MUST_NOT_APPEAR"}')
+        error = urllib.error.HTTPError('https://api.github.com/secret-url', 403, 'PRIVATE_REASON', {}, response)
+        with patch.object(api.opener, 'open', side_effect=error):
+            with self.assertRaises(p.PublicationError) as caught:
+                api.request('repos/antflydb/colony/actions/workflows/update-antfly-submodule.yml/runs')
+        message = str(caught.exception)
+        self.assertIn('Actions read', message)
+        self.assertIn('HTTP 403', message)
+        for secret in ('SENTINEL_TOKEN', 'MUST_NOT_APPEAR', 'PRIVATE_REASON', 'secret-url'):
+            self.assertNotIn(secret, message)
+
+
 if __name__ == '__main__':
     unittest.main()
