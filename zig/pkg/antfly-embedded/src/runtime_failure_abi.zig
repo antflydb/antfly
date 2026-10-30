@@ -932,6 +932,12 @@ test "Cypher statuses append after published upstream statuses" {
     try testing.expectEqual(@as(u32, 780), @backingInt(Status.decision_limit_exceeded));
     try testing.expectEqual(@as(u32, 837), @backingInt(Status.graph_start_identity_required));
     try testing.expectEqual(@as(u32, 841), @backingInt(Status.hierarchy_cursor_stale));
-    try testing.expectEqual(@as(u32, 842), @backingInt(Status.cypher_aggregate_scope));
-    try testing.expectEqual(@as(u32, 905), @backingInt(Status.cypher_invalid_regex));
+    try testing.expectEqual(@as(u32, 842), @backingInt(Status.read_transient_failure));
+    try testing.expectEqual(@as(u32, 843), @backingInt(Status.read_request_failed));
+    try testing.expectEqual(@as(u32, 844), @backingInt(Status.invalid_gcs_url));
+    try testing.expectEqual(@as(u32, 845), @backingInt(Status.gcs_connection_not_found_or_out_of_scope));
+    try testing.expectEqual(@as(u32, 846), @backingInt(Status.ambiguous_gcs_connection));
+    try testing.expectEqual(@as(u32, 847), @backingInt(Status.invalid_connection_credentials));
+    try testing.expectEqual(@as(u32, 848), @backingInt(Status.cypher_aggregate_scope));
+    try testing.expectEqual(@as(u32, 911), @backingInt(Status.cypher_invalid_regex));
 }
