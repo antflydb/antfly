@@ -19,7 +19,8 @@
 The large fixture drops the default text index to isolate storage traversal.
 Foreign writers exit without close. When the measured runtime publishes live
 certificates, use --foreign-library with a legacy writer to keep these mutations
-uncertified and require an actual graph walk. Only fresh synthetic paths
+uncertified and require an actual graph walk. Use --certified-handoff to measure
+checked live handoff instead and require zero repeated graph walks. Fresh paths
 are created. Use the contract suite for deterministic proof-over-deadline and
 cancellation coverage; this program reports actual observed proof duration.
 """
@@ -179,18 +180,22 @@ def run(args):
                 )["rows"]
                 assert len(rows) == 1 and int(rows[0][0]) == 7
             assert db.lookup("foreign")["sequence"] == sequence
-            if (
-                name != "read"
-                and after["allocator_proof_walks"] <= before["allocator_proof_walks"]
-            ):
-                raise RuntimeError(f"{name} did not exercise an allocator proof")
+            proof_walks = (
+                after["allocator_proof_walks"] - before["allocator_proof_walks"]
+            )
+            if name != "read":
+                if args.certified_handoff and proof_walks != 0:
+                    raise RuntimeError(f"{name} repeated a proof after checked handoff")
+                if not args.certified_handoff and proof_walks <= 0:
+                    raise RuntimeError(f"{name} did not exercise an allocator proof")
             emit(
                 kind="operation",
                 operation=name,
                 sql_key=sql_key if name == "sql" else None,
                 status="ok",
                 busy_timeout_seconds=5,
-                proof_required=name != "read",
+                proof_required=name != "read" and not args.certified_handoff,
+                certificate_expected=name != "read" and args.certified_handoff,
                 elapsed_seconds=elapsed,
                 proof_walks=after["allocator_proof_walks"]
                 - before["allocator_proof_walks"],
@@ -234,6 +239,11 @@ if __name__ == "__main__":
             "--foreign-library",
             help="legacy setup writer that leaves an uncertified tip on unclean exit",
         )
+        parser.add_argument(
+            "--certified-handoff",
+            action="store_true",
+            help="use the measured runtime as setup writer and require no repeated proof",
+        )
         parser.add_argument("--directory", required=True)
         parser.add_argument("--records", type=int, default=12288)
         parser.add_argument(
@@ -248,6 +258,8 @@ if __name__ == "__main__":
             default=["batch", "sql", "read"],
         )
         arguments = parser.parse_args()
+        if arguments.certified_handoff and arguments.foreign_library:
+            parser.error("--certified-handoff cannot use --foreign-library")
         if arguments.records < 16:
             parser.error("records must be at least 16")
         run(arguments)
