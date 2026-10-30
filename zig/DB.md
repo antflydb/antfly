@@ -1695,3 +1695,17 @@ Qualify native delivery with `e2e/antfly/bench_source_projection.py` using pinne
 baseline/candidate servers. Its certificate-hit counters establish proof reuse,
 not physical disk-read counts. Remaining metadata, frame layout and ordinary
 source fallback still determine physical I/O.
+
+Selected-copy scopes also expose optional cancellation-aware batching. One
+engine scratch owner serves a bounded sorted batch and polls before every
+whole-value read; per-key resets release payload pins and loans while retaining
+bounded metadata capacity. Erased adapters without this capability retain
+per-key polling. The C polling view is borrowed only for the call and carries
+fixed status codes. Failure leaves partial outputs that the caller must discard.
+
+The [batch and physical-read qualification](../docs/design/antfly-grep.md#batch-cancellation-and-structured-native-media-2026-10-30)
+records 32.3% fewer scratch allocations in its persisted-row fixture. Reopened
+storage probes also confirm that selecting 32 bytes currently reads the same
+checksummed/compressed blocks as a full value. Physical I/O improvements require
+separate integrity-preserving evidence; selected output ownership alone cannot
+justify changing physical-byte admission or introducing a persistent format.

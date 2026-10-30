@@ -157,14 +157,18 @@ const CheckedScope = struct {
         try self.upstream.getManySorted(keys, output);
     }
     pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
-        if (self.mode == .selected_read) {
-            try @import("query/search_exec.zig").checkSearchRequestDeadline(self.request.*);
-            return self.upstream.getRangesMany(requests);
-        }
-        for (requests) |request| {
-            try @import("query/search_exec.zig").checkSearchRequestDeadline(self.request.*);
-            try self.upstream.getRangesMany(&.{request});
-        }
+        try @import("query/search_exec.zig").checkSearchRequestDeadline(self.request.*);
+        const Poll = struct {
+            fn check(raw: ?*const anyopaque) callconv(.c) u8 {
+                const req: *const @import("types.zig").SearchRequest = @ptrCast(@alignCast(raw orelse return 3));
+                @import("query/search_exec.zig").checkSearchRequestDeadline(req.*) catch |err| return switch (err) {
+                    error.Cancelled => 1,
+                    error.Timeout => 2,
+                };
+                return 0;
+            }
+        };
+        return self.upstream.getRangesManyControlled(requests, .{ .ptr = self.request, .poll = Poll.check });
     }
 };
 
@@ -505,6 +509,9 @@ test "api query contract selected copy windows cancel between whole value reads"
     signal.store(false, .release);
     calls = 0;
     checked.mode = .selected_read;
+    var selected_vtable = upstream.vtable.*;
+    selected_vtable.range_read_mode = .selected_read;
+    upstream.vtable = &selected_vtable;
     try checked.getRangesMany(&requests);
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(@as(usize, 2), count);
@@ -556,4 +563,51 @@ test "api query contract oversized copy batches use capability metadata without 
     vtable.read_scope_range_mode = .selected_read;
     try std.testing.expectError(error.UnexpectedScope, batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands));
     try std.testing.expectEqual(@as(usize, 1), opens);
+}
+
+test "api query contract controlled copy batch retains one owner and stops between keys" {
+    const backend = @import("../backend_erased.zig");
+    const Fake = struct {
+        signal: *std.atomic.Value(bool),
+        calls: *usize,
+        rows: *usize,
+        pub const range_read_mode = backend.RangeReadMode.selected_copy;
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.UnexpectedFullRead;
+        }
+        pub fn getRangesManyControlled(self: *@This(), requests: []const backend.RangeRequest, control: backend.ReadControl) !void {
+            self.calls.* += 1;
+            for (requests) |_| {
+                try control.check();
+                self.rows.* += 1;
+                self.signal.store(true, .release);
+            }
+        }
+        pub fn close(_: *@This()) void {}
+    };
+    var signal = std.atomic.Value(bool).init(false);
+    var calls: usize = 0;
+    var rows: usize = 0;
+    var upstream = try backend.readScopeFrom(std.testing.allocator, Fake{ .signal = &signal, .calls = &calls, .rows = &rows });
+    defer upstream.close();
+    const request: @import("types.zig").SearchRequest = .{ .cancellation = @import("types.zig").CancellationToken.fromAtomic(&signal) };
+    var checked: CheckedScope = .{ .upstream = &upstream, .mode = .selected_copy, .request = &request };
+    const requests = [_]backend.RangeRequest{
+        .{ .key = "a", .ranges = &.{}, .output = &.{} },
+        .{ .key = "b", .ranges = &.{}, .output = &.{} },
+    };
+    try std.testing.expectError(error.Cancelled, checked.getRangesMany(&requests));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 1), rows);
+    // Admission and private error containment happen before engine invocation.
+    const Poll = struct {
+        fn check(raw: ?*const anyopaque) callconv(.c) u8 {
+            return @as(*const u8, @ptrCast(@alignCast(raw.?))).*;
+        }
+    };
+    for ([_]u8{ 2, 255 }) |code| {
+        const expected = if (code == 2) error.Timeout else error.RuntimeBoundaryFailure;
+        try std.testing.expectError(expected, upstream.getRangesManyControlled(&requests, .{ .ptr = &code, .poll = Poll.check }));
+        try std.testing.expectEqual(@as(usize, 1), calls);
+    }
 }

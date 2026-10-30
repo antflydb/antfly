@@ -17,6 +17,21 @@
 const std = @import("std");
 pub const Range = struct { offset: u64, length: usize };
 pub const Request = struct { key: []const u8, ranges: []const Range, output: [][]const u8 };
+/// Invocation-borrowed polling. Fixed C integer codes keep private Zig error
+/// identities out of callback arguments crossing independently compiled units.
+pub const ReadControl = struct {
+    ptr: ?*const anyopaque = null,
+    poll: ?*const fn (?*const anyopaque) callconv(.c) u8 = null,
+    pub fn check(self: @This()) !void {
+        const callback = self.poll orelse return;
+        return switch (callback(self.ptr)) {
+            0 => {},
+            1 => error.Cancelled,
+            2 => error.Timeout,
+            else => error.RuntimeBoundaryFailure,
+        };
+    }
+};
 pub const maximum_ranges = 512;
 pub const maximum_span = 256 * 1024;
 pub const maximum_gap = 4096;

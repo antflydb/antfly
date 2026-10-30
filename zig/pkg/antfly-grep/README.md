@@ -5085,3 +5085,12 @@ isolated 1 MiB JSON transport stage measures about 10–19% lower elapsed time,
 with about 33% more allocated bytes; tiny transport inputs are slower.
 Ownership and budget guarantees are directly tested. These measurements do not
 establish universal speed, process RSS or provider-cost improvements.
+
+The [batch cancellation and structured-media follow-up](../../../docs/design/antfly-grep.md#batch-cancellation-and-structured-native-media-2026-10-30)
+keeps one native scratch owner across selected-copy batches while polling between
+whole-value reads. Its persisted-row fixture uses 32.3% fewer scratch allocations.
+Structured native generation also passes verified codec bytes through borrowed
+attachments with compact canonical metadata, preserving generation options and
+request controls. Worker protocol 7 requires a matching explicitly configured
+worker CLI. Physical-read probes still fetch complete checksummed/compressed
+blocks; this follow-up introduces no document-format migration.

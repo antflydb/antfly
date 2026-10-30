@@ -206,6 +206,19 @@ pub fn encodeSegmentsAlloc(
     };
 }
 
+/// Validate borrowed in-process views against the same descriptor limits as
+/// framed requests. No ownership or request-body reservation is transferred.
+pub fn validateBorrowed(metadata: []const u8, items: []const Attachment, limits: Limits) !void {
+    if (metadata.len > limits.max_metadata_bytes or items.len > limits.max_attachments) return error.AttachmentEnvelopeTooLarge;
+    var total: usize = 0;
+    for (items) |item| {
+        if (item.mime_type.len == 0 or item.mime_type.len > limits.max_mime_bytes or item.data.len == 0 or item.data.len > limits.max_attachment_bytes) return error.AttachmentEnvelopeTooLarge;
+        total = std.math.add(usize, total, item.data.len) catch return error.AttachmentEnvelopeTooLarge;
+        if (total > limits.max_total_attachment_bytes) return error.AttachmentEnvelopeTooLarge;
+    }
+    _ = try encodedSize(metadata, items);
+}
+
 pub fn parseAlloc(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -485,4 +498,31 @@ test "attachment envelope rejects trailing and over-budget data" {
         error.InvalidAttachmentEnvelope,
         parseAlloc(std.testing.allocator, with_trailing, .{}),
     );
+}
+
+test "attachment borrowed descriptor limits agree with framed parsing" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { metadata: []const u8 = "{}", items: []const Attachment, limits: Limits = .{}, valid: bool = false }{
+        .{ .items = &.{}, .valid = true },
+        .{ .items = &.{.{ .mime_type = "image/png", .data = "x" }}, .valid = true },
+        .{ .items = &.{.{ .mime_type = "", .data = "x" }} },
+        .{ .items = &.{.{ .mime_type = "image/png", .data = "" }} },
+        .{ .items = &.{}, .limits = .{ .max_metadata_bytes = 1 } },
+        .{ .items = &.{.{ .mime_type = "image/png", .data = "x" }}, .limits = .{ .max_attachments = 0 } },
+        .{ .items = &.{.{ .mime_type = "image/png", .data = "xx" }}, .limits = .{ .max_attachment_bytes = 1 } },
+        .{ .items = &.{.{ .mime_type = "image/png", .data = "x" }}, .limits = .{ .max_mime_bytes = 1 } },
+        .{ .items = &.{ .{ .mime_type = "image/png", .data = "x" }, .{ .mime_type = "image/png", .data = "x" } }, .limits = .{ .max_total_attachment_bytes = 1 } },
+    };
+    for (cases) |case| {
+        const frame = try encodeAlloc(a, case.metadata, case.items);
+        defer a.free(frame);
+        if (case.valid) {
+            try validateBorrowed(case.metadata, case.items, case.limits);
+            var parsed = try parseAlloc(a, frame, case.limits);
+            defer parsed.deinit();
+        } else {
+            try std.testing.expectError(error.AttachmentEnvelopeTooLarge, validateBorrowed(case.metadata, case.items, case.limits));
+            try std.testing.expectError(error.AttachmentEnvelopeTooLarge, parseAlloc(a, frame, case.limits));
+        }
+    }
 }

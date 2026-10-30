@@ -2429,3 +2429,146 @@ returns between invocations; native token budgets and cancellation survive
 adaptation. Timings vary across controls, so this is not described as universally
 faster, sparse LSM I/O, a process RSS bound, or zero inference cost. Independent
 Linux hardware, cold storage and live-provider quality/cost remain unqualified.
+
+## Batch cancellation and structured native media (2026-10-30)
+
+This follow-up merges main `911aa2f2fa` into PR #1365. Native selected-copy
+batches now keep one scratch owner while checking cancellation before each
+whole-value read. The erased storage scope has an optional controlled-batch
+callback; older adapters retain per-key polling, and genuine selected-I/O
+adapters retain their bounded batches. The polling callback uses fixed C integer
+statuses, so private Zig error identities do not cross compilation owners.
+Temporary payload loans and pins retire between keys, including cancellation and
+failure exits. Existing source admission windows and snapshot cuts remain in
+force.
+
+The native allocation fixture reads 32 persisted 32 KiB values, selecting 32
+bytes from each. Four alternating trials per variant allocate 384 scratch
+objects through individual calls and 260 through a controlled batch: 124 fewer
+allocations, or 32.3%. This is an allocation result. It does not establish a
+whole-query latency improvement. The quota fixture also verifies cancellation
+between values, no second-key delivery, released working-set credit and reuse
+of the same pinned snapshot after cancellation.
+
+Structured native generation now adapts verified image parts before serializing
+the canonical request. Message headers contain explicit `attachment:N`
+references, and codec bytes remain borrowed through the synchronous invocation.
+Every occurrence gets a distinct reference; repeated occurrences can borrow the
+same source buffer. Tools, tool history, response format, sampling parameters,
+token limits, usage and completion handling use the existing canonical builder
+and generation handler. High-detail parts, unmatched URLs and unrelated media
+retain their existing representations. Ineligible requests allocate no adapter
+headers; matching copied URLs still require an exact comparison. Source
+materialization, authorization and revision verification remain required.
+
+The internal provider operation is `generate_json_with_attachments`, advertised
+by the optional `structured_attachments` capability. Older linked runtimes use
+the existing JSON route. In-process calls borrow payloads; worker RPC sends
+scatter/gather segments and the receiver owns one admitted payload slab.
+Descriptor counts are checked before header allocation/reference validation, and
+borrowed views use the same MIME, nonempty payload and aggregate limits as
+framed requests. The shared generation handler retains model/pixel/token
+admission, cancellation, explicit deadlines and document-store access. Borrowed
+calls complete synchronously; ordinary HTTP streaming is unchanged.
+
+Worker protocol **7** includes this operation. The existing exact startup
+handshake rejects mismatched workers before processing provider requests.
+Applications that explicitly set `ANTFLY_INFERENCE_WORKER` must supply a CLI with
+the matching worker protocol when updating the native library. The public HTTP
+API, document schema and storage format are unchanged.
+
+### Physical-read qualification
+
+An engine-cold fixture reopens persisted storage, disables application block
+caches and counts storage API reads after reopening. It compares full-value
+reads with a 32-byte selected copy using the same input. Byte counts include the
+first query's index/data reads. These are MemoryStorage traffic measurements;
+they do not measure device traffic or an operating-system cold cache.
+
+| Value | Compression / contents | Full storage bytes | Selected storage bytes | Reads per variant |
+|---|---|---:|---:|---:|
+| 32 KiB | none / repeated ASCII | 33,046 | 33,046 | 3 |
+| 1 MiB | none / repeated ASCII | 1,048,854 | 1,048,854 | 3 |
+| 32 KiB | adaptive Snappy / repeated ASCII | 1,819 | 1,819 | 3 |
+| 1 MiB | adaptive Snappy / repeated ASCII | 49,434 | 49,434 | 3 |
+| 1 MiB | adaptive Snappy / high entropy | 1,048,854 | 1,048,854 | 3 |
+
+Selecting fewer output bytes currently reduces retained output, while block
+checksums and compression still require complete physical blocks. No sparse
+read claim follows from the selected-copy capability. Bypassing block integrity
+checks would weaken the storage contract. A future physical-range mechanism
+needs independently verified field locations/content under the pinned source
+authority, bounded decompression and workload evidence. Any persistent layout
+migration remains separate from this follow-up.
+
+Reproduce the native contracts with:
+
+```sh
+cd zig
+zig build query-contract-test logical-field-query-test antfly-inference-host-test \
+  antfly-inference-gateway-test antfly-system-catalog-api-test \
+  runtime-error-identities-test -j2
+zig build bench-native-generation-media -Doptimize=ReleaseFast -Dstrip=true -j2
+```
+
+The new transport tool measures request construction and received metadata
+parsing for framed versus borrowed structured generation. Both variants start
+with the same verified codec, source data URL and generation options. Seven
+alternating rounds of 64 iterations cover 64-byte, 256 KiB and 1 MiB inputs,
+check delivered bytes/references/options, and verify all measured allocations
+are freed. Source authorization, codec/source materialization, caller-retained
+inputs, fixed runtime dispatch and model execution are outside its scope.
+Its timings therefore cannot be compared directly with the earlier encoder-only
+benchmark or described as inference/provider-billing savings.
+
+### Release transport measurements and artifact identity
+
+The final tool uses pinned Zig 0.17.0 with `ReleaseFast`, stripping and two
+build jobs on a shared Apple M4 Max (14 logical CPUs, 36 GiB RAM), macOS 27.0.1.
+These are median elapsed microseconds per invocation from seven alternating
+rounds, with 64 invocations per round. Allocation counts/bytes cover request
+construction, adaptation/framing and received metadata parsing; the identical
+caller-owned codec and source data URL are retained outside both variants.
+
+| Codec bytes | Framed µs/op | Borrowed µs/op | Allocated bytes/op framed → borrowed | Allocations/op framed → borrowed |
+|---|---:|---:|---:|---:|
+| 64 | 4.587 | 1.878 | 15,625 → 9,913 | 32 → 31 |
+| 262,144 | 862.424 | 2.096 | 2,111,257 → 9,913 | 31 → 31 |
+| 1,048,576 | 3,650.948 | 2.168 | 8,402,713 → 9,913 | 31 → 31 |
+
+For the 1 MiB input, measured allocation volume falls by 99.88%. This stage
+removes payload-sized JSON construction and contiguous-frame copies when the
+verified view is reusable. Metadata still allocates, copied URLs still need
+comparison, source materialization still constructs/verifies its inputs, and
+worker transfers still copy at the process boundary. Model execution and fixed
+runtime dispatch are excluded from this tool. Whole-query and provider-cost
+conclusions require their own measurements.
+
+The server baseline is the prior PR runtime plus the same main merge. Release
+server SHA-256:
+
+- Baseline, 234,755,720 bytes:
+  `3acb3c28909cb4d5fe777a34705d57cc82394aea7b19d2c61a73b2dfe5a9a5b9`.
+- Candidate, 234,822,248 bytes:
+  `56a6f5067ef03c3bcad71aeb6f80f9731ff87769fb80b2524da1f78833e8bbe0`.
+
+The candidate grows by 66,528 bytes (about 0.03%). The fresh standalone CLI is
+7,596,584 bytes, SHA-256
+`4a3e8a1559f839a1b7faac29b76778299da592b911a7bedcb75f35e8b1d9d87d`.
+The measured tool source SHA-256 is
+`6de49d8d56fa4ae843254b6f9e5673c39054498da50a9ade981612a1c32c6c15`;
+its executable SHA-256 is
+`366c64a5e332adeeb3aa3deafc2fc64b034fb9a7065a5c277f4bb060b06e192b`.
+The ignored qualification manifest retains the exact 17 production-source
+hashes, driver hashes, versions and per-run evidence. Raw reports, logs and
+executables are not committed.
+
+Native validation includes the full 98-step pass and final 67-step affected
+suite: 213 query contracts, 94 logical cases (one optional skip), 32 provider,
+73 gateway and 25 host cases across the corresponding owners. Seven standalone
+envelope tests and the 2,332-file Apache source-boundary check pass. One existing
+two-second hydration-lease fixture expired under concurrent compilation; it
+passed the earlier full pass and the unchanged-source repeat. Real-server
+indexed integration passes 57 cases, including persisted upgrade/rollback and
+permission checks; seven optional profiling cases are skipped unless their
+report environment variables are set.

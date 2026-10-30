@@ -949,6 +949,10 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
 
 pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void {
     try checkProviderInvokeControls(context);
+    if (context.operation == @backingInt(inference_bridge.ProviderOperation.generate_json_with_attachments)) {
+        const limit = (httpx.attachment_envelope.Limits{}).max_attachments;
+        if (context.binary_payloads_len > limit or context.attachment_refs_len > limit) return error.InvalidArguments;
+    }
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
     if (state.worker) |worker| {
         // Mirror the shared local request gate before crossing the transport.
@@ -1273,6 +1277,28 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             );
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .generate_json_with_attachments => blk: {
+            const decoded = try decodeProviderAttachments(alloc, context.binary_payloads_len, context.binary_payloads, context.binary_payloads_len, context.attachment_refs, context.attachment_refs_len);
+            defer alloc.free(decoded);
+            const attachments = try alloc.alloc(httpx.attachment_envelope.Attachment, decoded.len);
+            defer alloc.free(attachments);
+            for (attachments, decoded) |*target, source| target.* = .{ .mime_type = source.content_type, .data = source.bytes };
+            var http_request = try httpx.Request.init(alloc, .POST, "/ai/v1/generate");
+            defer http_request.deinit();
+            http_request.body = request_json;
+            var http_context = httpx.Context.init(alloc, state.io, &http_request);
+            defer http_context.deinit();
+            http_context.application_deadline_ns = deadline_ns;
+            if (context.document_store.configured()) try http_context.setData("antfly.document_store", @ptrCast(@constCast(&context.document_store)), null);
+            const no_body: http_abi.RequestBodySource = .{};
+            const no_stream: http_abi.StreamSink = .{};
+            runtime_http_bridge.installInbound(&http_context, &context.cancellation, &no_body, &no_stream);
+            var response = try state.node.generateContentWithBorrowedAttachments(&http_context, attachments);
+            defer response.deinit();
+            try execution_control.check();
+            if (response.status.code >= 300) return inference_types.localGenerationStatusError(alloc, response.status.code, response.body orelse "");
+            break :blk try alloc.dupe(u8, response.body orelse return error.InferenceProviderFailure);
         },
         .model_capabilities => blk: {
             var parsed = try std.json.parseFromSlice(ModelCapabilitiesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
@@ -3904,4 +3930,63 @@ test "provider attachment generation preserves explicit budgets and legacy defau
     var explicit = try std.json.parseFromSlice(GenerateMessagesWithAttachmentsRequest, a, "{\"model\":\"vision\",\"messages\":[],\"attachment_count\":0,\"options\":{\"max_tokens\":37}}", .{});
     defer explicit.deinit();
     try std.testing.expectEqual(@as(i32, 37), explicit.value.options.max_tokens);
+}
+
+test "standalone structured borrowed generation retains validation and controls" {
+    try testStructuredBorrowedGenerationValidation();
+}
+
+fn testStructuredBorrowedGenerationValidation() !void {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try inference.server.Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    const Case = struct { body: []const u8, attachments: []const httpx.attachment_envelope.Attachment = &.{}, cancel: bool = false, deadline: ?u64 = null, status: u16 = 400 };
+    const part = "{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"attachment:0\"}";
+    const cases = [_]Case{
+        .{ .body = "{" },
+        .{ .body = "{\"model\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":[" ++ part ++ "]}]}" },
+        .{ .body = "{\"model\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":[" ++ part ++ "," ++ part ++ "]}]}", .attachments = &.{.{ .mime_type = "image/png", .data = "x" }} },
+        .{ .body = "{\"model\":\"fixture\",\"messages\":[]}", .attachments = &.{.{ .mime_type = "image/png", .data = "x" }} },
+        .{ .body = "{\"model\":\"fixture\",\"stream\":true,\"messages\":[]}" },
+        .{ .body = "{}", .cancel = true, .status = 408 },
+        .{ .body = "{}", .deadline = 1, .status = 504 },
+    };
+    for (cases) |case| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/generate");
+        defer request.deinit();
+        request.body = case.body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var cancelled = std.atomic.Value(bool).init(case.cancel);
+        ctx.cancellation = &cancelled;
+        ctx.application_deadline_ns = case.deadline;
+        var response = try node.generateContentWithBorrowedAttachments(&ctx, case.attachments);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+    }
+}
+
+test "standalone structured borrowed generation bounds descriptors before runtime access" {
+    const limit = (httpx.attachment_envelope.Limits{}).max_attachments;
+    for ([_][2]usize{ .{ limit + 1, 0 }, .{ 0, limit + 1 } }) |counts| {
+        var handle: ?*anyopaque = null;
+        var json: inference_bridge.String = undefined;
+        try std.testing.expectError(error.InvalidArguments, linkedInferenceInvokeProvider(&.{
+            .abi_version = inference_bridge.abi_version,
+            .handle = undefined,
+            .operation = @backingInt(inference_bridge.ProviderOperation.generate_json_with_attachments),
+            .request_json = .init("{}"),
+            .deadline_ns = 0,
+            .has_deadline = 0,
+            .binary_payloads_len = counts[0],
+            .attachment_refs_len = counts[1],
+            .out_response_handle = &handle,
+            .out_response_json = &json,
+        }));
+        try std.testing.expect(handle == null);
+    }
 }

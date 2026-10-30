@@ -239,6 +239,7 @@ pub const Cursor = struct {
 /// copy the current pending overlay; cursor fallbacks use their cursor view.
 pub const RangeRequest = @import("value_ranges.zig").Request;
 pub const ValueRange = @import("value_ranges.zig").Range;
+pub const ReadControl = @import("value_ranges.zig").ReadControl;
 /// Ownership and physical work differ: a cursor can copy selected spans while
 /// still reading a complete value. Unknown adapters retain conservative costs.
 pub const RangeReadMode = enum(u8) { full_value, selected_copy, selected_read };
@@ -270,18 +271,37 @@ pub const ReadScope = struct {
         visit_prepared_scores: ?*const fn (*anyopaque, *@import("prepared_score_plan.zig").PreparedScorePlan, backend_types.CompleteScoreSink) anyerror!void = null,
         get_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, []?f64) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
+        get_ranges_many_controlled: ?*const fn (*anyopaque, []const RangeRequest, ReadControl) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     /// Sorted document keys share one index traversal on capable backends.
     pub fn getRangesMany(self: *@This(), requests: []const RangeRequest) !void {
+        return self.getRangesManyControlled(requests, .{});
+    }
+    /// Capable engines retain one batch owner and poll before each whole-value
+    /// read. Legacy adapters keep their bounded-batch or per-key fallback.
+    pub fn getRangesManyControlled(self: *@This(), requests: []const RangeRequest, control: ReadControl) !void {
         if (requests.len > 64) return error.InvalidBatch;
         if (requests.len == 0) return;
         for (requests, 0..) |request, i| {
             if (request.ranges.len != request.output.len or request.ranges.len > @import("value_ranges.zig").maximum_ranges) return error.InvalidBatch;
             if (i != 0 and std.mem.order(u8, requests[i - 1].key, request.key) == .gt) return error.InvalidBatch;
         }
-        if (self.vtable.get_ranges_many) |read| return BoundaryAbi.call("get_ranges_many", self.boundary_dispatch, read, .{ self.ptr, requests });
-        for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+        try control.check();
+        if (self.vtable.get_ranges_many_controlled) |read| return BoundaryAbi.call("get_ranges_many_controlled", self.boundary_dispatch, read, .{ self.ptr, requests, control });
+        if (self.vtable.get_ranges_many) |read| {
+            if (control.poll == null or self.rangeReadMode() == .selected_read)
+                return BoundaryAbi.call("get_ranges_many", self.boundary_dispatch, read, .{ self.ptr, requests });
+            for (requests) |request| {
+                try control.check();
+                try BoundaryAbi.call("get_ranges_many", self.boundary_dispatch, read, .{ self.ptr, @as([]const RangeRequest, &.{request}) });
+            }
+            return;
+        }
+        for (requests) |request| {
+            try control.check();
+            try self.getRanges(request.key, request.ranges, request.output);
+        }
     }
     pub fn getRanges(self: *@This(), key: []const u8, ranges: []const ValueRange, output: [][]const u8) !void {
         if (ranges.len != output.len or ranges.len > @import("value_ranges.zig").maximum_ranges) return error.InvalidBatch;
@@ -450,6 +470,10 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRangesMany(requests);
         }
+        fn getRangesManyControlled(ptr: *anyopaque, requests: []const RangeRequest, control: ReadControl) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getRangesManyControlled(requests, control);
+        }
         fn getRanges(ptr: *anyopaque, key: []const u8, ranges: []const ValueRange, output: [][]const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRanges(key, ranges, output);
@@ -547,7 +571,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = comptime &.{ .range_read_mode = if (@hasDecl(@TypeOf(handle), "range_read_mode")) @TypeOf(handle).range_read_mode else null, .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = comptime &.{ .range_read_mode = if (@hasDecl(@TypeOf(handle), "range_read_mode")) @TypeOf(handle).range_read_mode else null, .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges_many_controlled = if (@hasDecl(@TypeOf(handle), "getRangesManyControlled")) State.getRangesManyControlled else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies

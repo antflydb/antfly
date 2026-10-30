@@ -17,7 +17,10 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 6;
+// Version 7 adds canonical structured generation with binary attachments.
+// Workers use an exact startup version check; an explicitly configured older
+// executable must fail before the parent can advertise this operation to it.
+pub const version: u32 = 7;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
@@ -415,4 +418,35 @@ test "native checkpoint worker streaming stays limited to exact POST resume rout
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/checkpoint"));
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/chat/completions"));
     }
+}
+
+test "inference worker canonical generation requires the matching startup protocol" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var handle: ?*anyopaque = null;
+    var create: Create = .{
+        .data_dir = "fixture",
+        .models_dir = null,
+        .ml_dir = null,
+        .host_limit_bytes = 4096,
+        .backend_limit_bytes = 4096,
+        .combined_limit_bytes = 4096,
+        .kv_limit_bytes = 4096,
+        .scratch_limit_bytes = 4096,
+        .process_memory_limit_bytes = 4096,
+        .process_memory_limit_provenance = .explicit,
+        .preload = &.{},
+        .keep_alive = null,
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 1,
+        .content_security_json = null,
+        .s3_credentials_json = null,
+        .runtime_config_json = "{}",
+    };
+    create.protocol_version = version - 1;
+    try std.testing.expectError(error.UnsupportedVersion, create.toContext(a, &io, &handle));
+    create.protocol_version = version;
+    const context = try create.toContext(a, &io, &handle);
+    defer if (context.preload_ptr) |ptr| a.free(ptr[0..context.preload_len]);
+    try std.testing.expectEqual(bridge.abi_version, context.abi_version);
 }

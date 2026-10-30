@@ -3695,18 +3695,23 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 try @import("../value_ranges.zig").read(value.len, ranges, output, Copy{ .owner = self, .bytes = value });
             }
             pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
+                return self.getRangesManyControlled(requests, .{});
+            }
+            pub fn getRangesManyControlled(self: *@This(), requests: []const @import("../value_ranges.zig").Request, control: @import("../value_ranges.zig").ReadControl) !void {
                 if (requests.len > 64) return error.InvalidBatch;
                 for (requests, 0..) |request, i| {
                     if (request.ranges.len != request.output.len or request.ranges.len > @import("../value_ranges.zig").maximum_ranges) return error.InvalidBatch;
                     if (i != 0 and std.mem.order(u8, requests[i - 1].key, request.key) == .gt) return error.InvalidBatch;
                 }
                 if (requests.len == 0) return;
+                try control.check();
                 var work = PointReadScratch.init(self.parent.backend);
                 defer work.deinit();
                 var temporary: @This() = .{ .parent = self.parent, .allocator = work.allocator(), .last_l0_group_index = self.last_l0_group_index };
                 defer temporary.close();
                 for (requests) |request| {
                     if (request.ranges.len == 0) continue;
+                    try control.check();
                     // Reuse bounded metadata capacity, never a prior value or
                     // payload pin. Only the numeric L0 hint survives reset.
                     defer {

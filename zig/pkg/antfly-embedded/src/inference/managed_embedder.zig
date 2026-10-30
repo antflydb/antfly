@@ -373,7 +373,14 @@ pub const AntflyProvider = struct {
         context: ?RequestContext,
     ) anyerror![]u8 = null,
 
+    generate_json_with_attachments: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const @import("antfly_inference_work").Attachment, ?RequestContext) anyerror![]u8 = null,
+
     document_json: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, bool, RequestContext) anyerror![]u8 = null,
+
+    pub fn generateJsonWithAttachments(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, attachments: []const @import("antfly_inference_work").Attachment, context: ?RequestContext) ![]u8 {
+        const callback = self.generate_json_with_attachments orelse return error.UnsupportedGeneratorProvider;
+        return AntflyProviderBoundary.call("generate_json_with_attachments", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, attachments, context });
+    }
 
     pub fn decideJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
         const callback = self.decide_json orelse return error.UnsupportedDecisionProvider;
