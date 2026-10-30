@@ -2275,3 +2275,105 @@ Other work on the shared host is uncontrolled. HTTP observations use warm local
 Debug with process/OS/persistent caches and readiness warming. There is no cloud,
 empty-cache, archive-scale, Release HTTP or full-query-memory qualification.
 Real-provider cloud retention qualification remains deferred.
+
+
+## Physical page admission and compact routing fences
+
+Runtime `306ec780312f95f215a156fc245a4ea5212c2e3e` includes main
+`7ca4b04b814c13310c27718dea1ffd7059f5f6b1`. The new
+[retained observation](physical-page-admission-and-compact-fences-v1-observation.json)
+compares the production kernels with control
+`f3b3b458c06166ee5fa126179fff502acf7a31f3`, the clean main merge before these fixes.
+Both variants use ReleaseSafe and the same process/allocator. Each probe records
+six pairs, alternating which variant runs first. No task-owned build, native
+check, E2E or cleanup overlaps timing; other host work is uncontrolled.
+
+| Kernel | Control median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| One value update in a dense routing tree | 0.898 ms | 0.532 ms | 1.69x |
+| Decode 1,024 independent PLAIN i64 pages | 21.436 ms | 11.421 ms | 1.88x |
+
+The routing fixture has 512 keys of 16,384 bytes, with 32,768-byte values. It is
+built by the production sorted builder and has height two; this deliberately
+exercises dense **internal** pages rather than just one compressed leaf. Every
+returned key/value is checked independently. Initial construction remains 515
+pages and 25,284,367 encoded bytes in both variants. Build and GC allocation totals
+are unchanged, and no new improvement is claimed for those controls.
+
+The edit's cumulative requested allocation falls from **8,110,540 to 701,009
+bytes**, a **91.4% reduction**. The separate native allocator test reports 705,713
+bytes with its testing allocator, returns every allocation, and succeeds with a
+4-MiB allocator. The original implementation fails that same bounded fixture.
+Shared immutable seeds and owned suffixes also pass allocation-failure injection.
+
+The scanner fixture contains 8,192 required PLAIN i64 values in each 65,536-byte
+payload. It validates the complete vector outside the timed interval and checks
+selected values on every iteration. Cumulative allocation over 1,024 iterations
+falls from **235,012,096 to 134,217,728 bytes**. These are allocation totals, not
+peak memory. A separate live-budget test measures **65,536 retained bytes** and a
+**131,072-byte peak**. The old scanner cannot fit that payload-plus-final-vector
+budget; the candidate passes. Required, nullable, dictionary, and compact delta
+string pages adopt their final owned vectors/buffers, while multi-page chunks
+retain aggregation. Single- and multi-page compact string paths also pass every
+allocation-failure point.
+
+Physical scan scheduling is qualified separately from kernel timings. The gated
+native provider test covers default and constrained quotas, validated OffsetIndex
+ranges and unindexed headers, cancellation, unrelated CPU work, and zero available
+I/O workers. It skips a tiny earlier page, blocks both larger surviving payload
+reads simultaneously, and asserts exact physical I/O reservations with no active
+CPU workers. Thus directory pruning cannot leave a reservation sized for the
+skipped page. No provider-latency percentage is inferred from these gates.
+
+Final focused qualification passes **153 shared and 17 API checks**, with no
+failures, skips or leaks, including the final indexed-range and compact string
+refinements. **47 standalone ReleaseSafe tree checks** also pass. A broader
+preceding run passed 263 shared and 531 API-selection checks before those last
+refinements; one unrelated `fresh sparse fragment mutations keep quantization
+error bounded across updates` stress test was explicitly excluded after running
+CPU-bound in existing storage code for over twelve minutes. These suites overlap;
+the counts must not be summed as distinct checks. Final real-file qualification
+and the frozen executable identity are recorded in the observation. The final
+candidate passes **50 real Parquet/Iceberg E2E cases in 367.76 seconds**, including
+cold/warm reads, restart, unequal wide SQL projections, highlights, exact decimals,
+ordering, deletes and refresh. Its executable SHA-256 is
+`4d97fc7e24213996103df0aedaad60df441c15e3c2f6eecb4164c1ee0ec4d680`.
+
+To reproduce, run from the worktree root, retaining dependencies under each
+snapshot's `src` directory:
+
+```sh
+results=.benchmark-results/lake/physical-pages-v1
+mkdir -p "$results/before/src" "$results/after/src"
+git show f3b3b458c06166ee5fa126179fff502acf7a31f3:zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig \
+  > "$results/before/page_tree.zig"
+git archive f3b3b458c06166ee5fa126179fff502acf7a31f3:zig/pkg/antfly-embedded/src \
+  | tar -x -C "$results/before/src"
+git archive 306ec780312f95f215a156fc245a4ea5212c2e3e:zig/pkg/antfly-embedded/src \
+  | tar -x -C "$results/after/src"
+for variant in before after; do
+  cat > "$results/$variant/src/root.zig" <<'ZIG'
+pub const page = @import("serverless/query/lake_parquet_page.zig");
+ZIG
+done
+~/bin/zig test -lc -O ReleaseSafe --cache-dir zig/.zig-cache \
+  --global-cache-dir zig/.zig-cache/global --test-no-exec \
+  -femit-bin="$results/compact-fence-probe" \
+  --test-filter compact_fence_production_comparison --dep before --dep after \
+  -Mroot=zig/bench/lake/compact_fence_probe.zig \
+  -Mbefore="$results/before/page_tree.zig" \
+  -Mafter=zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig
+~/bin/zig test -lc -O ReleaseSafe --cache-dir zig/.zig-cache \
+  --global-cache-dir zig/.zig-cache/global --test-no-exec \
+  -femit-bin="$results/physical-page-probe" \
+  --test-filter physical_page_production_comparison --dep before --dep after \
+  -Mroot=zig/bench/lake/physical_page_probe.zig \
+  -Mbefore="$results/before/src/root.zig" -Mafter="$results/after/src/root.zig"
+```
+
+Finish all task-owned builds/checks first, then run each probe serially and retain
+its complete output. The observation includes all raw samples, exact helper and
+source hashes, executable hashes, and independent count/value/memory oracles.
+These are synthetic in-memory kernels. They establish neither a new HTTP scan
+speedup nor cloud, empty-cache or archive-throughput performance. Earlier HTTP
+observations remain separately attributed to their original revisions.
