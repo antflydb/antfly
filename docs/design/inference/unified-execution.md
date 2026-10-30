@@ -3449,3 +3449,7 @@ qualification of seven native entrypoints.
 [BE: native CUDA WMMA score-product owner](unified-execution-be-outcomes.md)
 records ten shared score phases, identical shipping/native images and resource
 reports, and real-device reference qualification of five entrypoints.
+
+[BF: CPU online attention row programs](unified-execution-bf-outcomes.md)
+records the closed three-schedule row owner, five-target original-function
+identity, CPU pipeline bitwise parity and paired hardware timing.

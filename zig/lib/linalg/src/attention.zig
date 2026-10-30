@@ -43,6 +43,62 @@ const FlashScratch = struct {
     }
 };
 
+/// Admitted online-softmax row schedules. Maximum reduction, empty-tile handling,
+/// output scaling and store order are numerical/performance policies, not models.
+pub const OnlineRowSchedule = enum { flash, segment, dense };
+
+/// In-place probability tile and running output/statistics update. Callers own
+/// disjoint score/output/stat planes, GEMM boundaries, cancellation and scratch.
+pub inline fn updateOnlineRow(comptime schedule: OnlineRowSchedule, scores: []f32, output: []f32, maximum: *f32, sum: *f32) void {
+    // Dense evaluates the prior maximum before its SIMD tile reduction.
+    const prior_max = if (schedule == .dense) maximum.* else 0;
+    var block_max: f32 = -std.math.inf(f32);
+    switch (schedule) {
+        .flash => for (scores) |score| {
+            if (score > block_max) block_max = score;
+        },
+        .segment => for (scores) |score| {
+            block_max = @max(block_max, score);
+        },
+        .dense => block_max = denseRowMax(scores),
+    }
+    const old_max = if (schedule == .dense) prior_max else maximum.*;
+    const new_max = @max(old_max, block_max);
+    if (schedule != .dense and new_max == -std.math.inf(f32)) {
+        @memset(scores, 0);
+        return;
+    }
+    if (sum.* != 0 and (schedule != .dense or new_max != old_max)) {
+        const rescale = @exp(old_max - new_max);
+        if (schedule == .dense or rescale != 1.0) {
+            switch (schedule) {
+                .flash => {
+                    const r_splat: F32xN = @splat(rescale);
+                    var d: usize = 0;
+                    while (d + vec_len <= output.len) : (d += vec_len) {
+                        const ov: F32xN = output[d..][0..vec_len].*;
+                        output[d..][0..vec_len].* = ov * r_splat;
+                    }
+                    while (d < output.len) : (d += 1) output[d] *= rescale;
+                },
+                .segment => for (output) |*value| {
+                    value.* *= rescale;
+                },
+                .dense => denseScaleRow(output, rescale),
+            }
+            sum.* *= rescale;
+        }
+    }
+    if (schedule == .flash) {
+        const block_sum = primitives.expSubtractAndSum(scores, new_max);
+        maximum.* = new_max;
+        sum.* += block_sum;
+    } else {
+        sum.* += primitives.expSubtractAndSum(scores, new_max);
+        maximum.* = new_max;
+    }
+}
+
 /// T5 relative position bucket computation.
 /// Maps a relative position (key_pos - query_pos) to a bucket index.
 pub fn t5RelativePositionBucket(relative_position: i64, num_buckets_: usize, max_distance_: usize, bidirectional: bool) usize {
@@ -259,39 +315,7 @@ pub fn flashCausalAttentionHost(
                     for (0..cur_bq) |qi_local| {
                         const out_row = out_pack[qi_local * head_dim ..][0..head_dim];
 
-                        var block_max: f32 = -std.math.inf(f32);
-                        for (0..cur_bkv) |ki_local| {
-                            const s = score_tile[qi_local * cur_bkv + ki_local];
-                            if (s > block_max) block_max = s;
-                        }
-
-                        const old_max = row_max[qi_local];
-                        const new_max = @max(old_max, block_max);
-                        if (new_max == -std.math.inf(f32)) {
-                            @memset(score_tile[qi_local * cur_bkv ..][0..cur_bkv], 0.0);
-                            continue;
-                        }
-
-                        if (row_sum[qi_local] != 0.0) {
-                            const rescale = @exp(old_max - new_max);
-                            if (rescale != 1.0) {
-                                const r_splat: F32xN = @splat(rescale);
-                                var d: usize = 0;
-                                while (d + vec_len <= head_dim) : (d += vec_len) {
-                                    const ov: F32xN = out_row[d..][0..vec_len].*;
-                                    out_row[d..][0..vec_len].* = ov * r_splat;
-                                }
-                                while (d < head_dim) : (d += 1) {
-                                    out_row[d] *= rescale;
-                                }
-                                row_sum[qi_local] *= rescale;
-                            }
-                        }
-
-                        const score_row = score_tile[qi_local * cur_bkv ..][0..cur_bkv];
-                        const block_sum = primitives.expSubtractAndSum(score_row, new_max);
-                        row_max[qi_local] = new_max;
-                        row_sum[qi_local] += block_sum;
+                        updateOnlineRow(.flash, score_tile[qi_local * cur_bkv ..][0..cur_bkv], out_row, &row_max[qi_local], &row_sum[qi_local]);
                     }
 
                     // Batched V projection: out_pack[bq, hd] += score_tile[bq, bkv] @ V_pack[bkv, hd].
@@ -629,41 +653,7 @@ const FlashHeadWork = struct {
                         const qi = q_start + qi_local;
                         const out_ptr = output[bh_offset + qi * head_dim ..][0..head_dim];
 
-                        var block_max: f32 = -std.math.inf(f32);
-                        for (0..cur_bkv) |ki_local| {
-                            const s = score_tile[qi_local * cur_bkv + ki_local];
-                            if (s > block_max) block_max = s;
-                        }
-
-                        const old_max = row_max[qi_local];
-                        const new_max = @max(old_max, block_max);
-                        if (new_max == -std.math.inf(f32)) {
-                            // All scores -inf for this row → zero its score_row
-                            // so the deferred GEMM contributes nothing.
-                            @memset(score_tile[qi_local * cur_bkv ..][0..cur_bkv], 0.0);
-                            continue;
-                        }
-
-                        if (row_sum[qi_local] != 0.0) {
-                            const rescale = @exp(old_max - new_max);
-                            if (rescale != 1.0) {
-                                const r_splat: F32xN = @splat(rescale);
-                                var d: usize = 0;
-                                while (d + vec_len <= head_dim) : (d += vec_len) {
-                                    const ov: F32xN = out_ptr[d..][0..vec_len].*;
-                                    out_ptr[d..][0..vec_len].* = ov * r_splat;
-                                }
-                                while (d < head_dim) : (d += 1) {
-                                    out_ptr[d] *= rescale;
-                                }
-                                row_sum[qi_local] *= rescale;
-                            }
-                        }
-
-                        const score_row = score_tile[qi_local * cur_bkv ..][0..cur_bkv];
-                        const block_sum = primitives.expSubtractAndSum(score_row, new_max);
-                        row_max[qi_local] = new_max;
-                        row_sum[qi_local] += block_sum;
+                        updateOnlineRow(.flash, score_tile[qi_local * cur_bkv ..][0..cur_bkv], out_ptr, &row_max[qi_local], &row_sum[qi_local]);
                     }
 
                     // V projection: out[bq, hd] += score_tile[bq, bkv] @
@@ -992,22 +982,7 @@ fn SegmentHeadWork(comptime Gemm: type) type {
                                     if (!in_range or !near) score.* = -std.math.inf(f32);
                                 }
                             }
-                            var block_max: f32 = -std.math.inf(f32);
-                            for (row) |score| block_max = @max(block_max, score);
-                            const new_max = @max(row_max[r], block_max);
-                            if (new_max == -std.math.inf(f32)) {
-                                @memset(row, 0);
-                                continue;
-                            }
-                            if (row_sum[r] != 0) {
-                                const rescale = @exp(row_max[r] - new_max);
-                                if (rescale != 1.0) {
-                                    for (out_block[r * head_dim ..][0..head_dim]) |*o| o.* *= rescale;
-                                    row_sum[r] *= rescale;
-                                }
-                            }
-                            row_sum[r] += primitives.expSubtractAndSum(row, new_max);
-                            row_max[r] = new_max;
+                            updateOnlineRow(.segment, row, out_block[r * head_dim ..][0..head_dim], &row_max[r], &row_sum[r]);
                         }
                         Gemm.sgemmSync(cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block);
                         kv_start = kv_end;
@@ -3158,14 +3133,7 @@ const DenseTileRows = struct {
         for (self.first..self.last) |r| {
             if (self.io) |runtime| try runtime.checkCancel();
             const row = self.tile[r * self.keys ..][0..self.keys];
-            const next = @max(self.maxima[r], denseRowMax(row));
-            if (self.sums[r] != 0 and next != self.maxima[r]) {
-                const rescale = @exp(self.maxima[r] - next);
-                denseScaleRow(self.output[r * self.dim ..][0..self.dim], rescale);
-                self.sums[r] *= rescale;
-            }
-            self.sums[r] += primitives.expSubtractAndSum(row, next);
-            self.maxima[r] = next;
+            updateOnlineRow(.dense, row, self.output[r * self.dim ..][0..self.dim], &self.maxima[r], &self.sums[r]);
         }
     }
 };
