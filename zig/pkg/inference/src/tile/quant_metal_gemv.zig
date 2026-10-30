@@ -221,7 +221,6 @@ pub fn reduceTail(comptime nr: u32) []const u8 {
         \\    if (sgitg == 0u) { ${zero} } ${simd} threadgroup_barrier(mem_flags::mem_threadgroup);
         \\    if (lane == 0u) { ${put} } threadgroup_barrier(mem_flags::mem_threadgroup);
         \\    ${total} if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; ${store} }
-        \\}
         \\
     , .{
         .zero = each(nr, "shmem[${sh}lane] = 0.0f;", " "),
@@ -253,7 +252,7 @@ fn reduceKernel(comptime name: []const u8, comptime nr: u32, comptime nsg: u32, 
         .extra = extra,
         .accs = each(nr, "float acc${k} = 0.0f;", " "),
         .loop = loop,
-    }) ++ reduceTail(nr));
+    }) ++ reduceTail(nr) ++ "}\n");
 }
 
 /// Eight values per lane, four lanes per 32-value block.
@@ -277,3 +276,46 @@ pub fn reduce(comptime name: []const u8) msl.Item {
     if (eql(name, "q8_k")) return reduceKernel(name, 2, 2, false, "", "uint ix = lane / 4u; uint il = lane - ix * 4u; uint chunk0 = uint(sgitg) * 8u + ix;", " uint total_chunks = p.row_blocks * 64u;", "for (uint chunk = chunk0; chunk < total_chunks; chunk += NSG * 8u) { uint b = chunk >> 6; uint qj = ((chunk & 63u) << 2) + il; float x = input[in_row + b * 256u + qj]; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 292u + b * 292u; uint bits = uint(weight[off]) | (uint(weight[off + 1u]) << 8) | (uint(weight[off + 2u]) << 16) | (uint(weight[off + 3u]) << 24); float d = as_type<float>(bits); char q = as_type<char>(weight[off + 4u + qj]); float block = x * (d * float(q)); " ++ accumulate(2, "block") ++ " } }");
     @compileError("no 1x_reduce for " ++ name);
 }
+
+/// The reduction of an `acc[NR0]` array (rows of 32 in shmem) and its
+/// store, for kernels that keep `n` = NR0 accumulators in an array.
+pub fn arrayTail(comptime n: u32) []const u8 {
+    return fill(
+        \\    if (sgitg == 0u) { for (uint row = 0u; row < NR0; ++row) shmem[row * 32u + lane] = 0.0f; } for (uint row = 0u; row < NR0; ++row) acc[row] = simd_sum(acc[row]); threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\    if (lane == 0u) { for (uint row = 0u; row < NR0; ++row) shmem[row * 32u + sgitg] = acc[row]; } threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\    float total[${n}]; for (uint row = 0u; row < NR0; ++row) total[row] = simd_sum(shmem[row * 32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = total[row]; } }
+        \\
+    , .{ .n = n });
+}
+
+/// `termite_q8_0_linear{,_rms_scale}_mmv[_in_f16]`: eight int8 values per
+/// lane, NQ = 8 blocks per simdgroup pass. `rms` folds RMSNorm (weight and
+/// per-row inverse scale) into the activation load.
+pub fn q8_0Mmv(comptime name: []const u8, comptime nr: u32, comptime in_half: bool, comptime rms: bool) msl.Item {
+    var args: []const []const u8 = &.{ if (in_half) wrap.in_f16 else wrap.in_f32, wrap.w, wrap.out_f32, wrap.linear_p };
+    if (rms) args = args ++ .{ "device const float *norm_weight", "device const float *inv_scale" };
+    args = args ++ .{"threadgroup float *shmem"} ++ wrap.sg;
+    return msl.msl(msl.signature(name, args) ++ fill(
+        \\
+        \\    weight += p.weight_offset;
+        \\    const uint NR0 = ${nr}u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;
+        \\    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = uint(sgitg) * NQ + ix; uint in_row = r * p.in_dim;${scale} ${accs}
+        \\    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ;${norm} for (uint i = 0u; i < NQ; ++i) { x[i] = ${ld}; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 34u + b * 34u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float block_acc = 0.0f; for (uint i = 0u; i < NQ; ++i) { char q = as_type<char>(weight[off + 2u + il * NQ + i]); block_acc += x[i] * float(q); } ${acc} } }
+        \\${tail}}
+        \\
+    , .{
+        .nr = nr,
+        .scale = if (rms) " float scale = inv_scale[r];" else "",
+        .accs = if (rms) "float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};" else each(nr, "float acc${k} = 0.0f;", " "),
+        .norm = if (rms) " uint norm_off = b * 32u + il * NQ;" else "",
+        .ld = if (rms) "input[in_off + i] * norm_weight[norm_off + i] * scale" else if (in_half) "float(input[in_off + i])" else "input[in_off + i]",
+        .acc = if (rms) "acc[row] += d * block_acc;" else accumulate(nr, "d * block_acc"),
+        .tail = if (rms) arrayTail(nr) else reduceTail(nr),
+    }));
+}
+
+pub const q8_0_mmv = [_]msl.Item{
+    q8_0Mmv("termite_q8_0_linear_mmv", 2, false, false),
+    q8_0Mmv("termite_q8_0_linear_mmv_in_f16", 2, true, false),
+    q8_0Mmv("termite_q8_0_linear_rms_scale_mmv", 4, false, true),
+};

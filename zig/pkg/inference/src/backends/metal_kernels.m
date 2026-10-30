@@ -7968,7 +7968,6 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { shmem[sgitg] = acc0; shmem[32u + sgitg] = acc1; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total0 = simd_sum(shmem[lane]); float total1 = simd_sum(shmem[32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = total0; if (first_o + 1u < p.out_dim) output[idx + 1u] = total1; }\n"
            "}\n"
-           // tile-codegen:end quant_metal.gemv_q8_1 family
            "kernel void termite_q8_0_linear_mmv(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    weight += p.weight_offset;\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
@@ -7996,6 +7995,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) { for (uint row = 0u; row < NR0; ++row) shmem[row * 32u + sgitg] = acc[row]; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float total[4]; for (uint row = 0u; row < NR0; ++row) total[row] = simd_sum(shmem[row * 32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = total[row]; } }\n"
            "}\n"
+           // tile-codegen:end quant_metal.gemv_q8_1 family
            "inline void termite_q8_0_linear_r_ext_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg, uint RPTG) {\n"
            "    weight += p.weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint first_r = tg.y * RPTG; if (o >= p.out_dim) return; float acc[5]; for (uint i = 0u; i < 5u; ++i) acc[i] = 0.0f; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u;\n"

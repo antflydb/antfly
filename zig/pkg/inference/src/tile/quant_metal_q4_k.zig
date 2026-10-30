@@ -22,6 +22,7 @@
 const msl = @import("quant_metal_msl.zig");
 const wrap = @import("quant_metal_wrap.zig");
 const q4_0 = @import("quant_metal_q4_0.zig");
+const gemv = @import("quant_metal_gemv.zig");
 const fill = msl.fill;
 const join = msl.join;
 const Weight = q4_0.Weight;
@@ -81,12 +82,7 @@ pub const linear = kernel(.{
     .nr = 4,
     .accs = "float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};",
     .accumulate = "acc[row] += block;",
-    .tail =
-    \\    if (sgitg == 0u) { for (uint row = 0u; row < NR0; ++row) shmem[row * 32u + lane] = 0.0f; } for (uint row = 0u; row < NR0; ++row) acc[row] = simd_sum(acc[row]); threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    if (lane == 0u) { for (uint row = 0u; row < NR0; ++row) shmem[row * 32u + sgitg] = acc[row]; } threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    float total[4]; for (uint row = 0u; row < NR0; ++row) total[row] = simd_sum(shmem[row * 32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = total[row]; } }
-    \\
-    ,
+    .tail = gemv.arrayTail(4),
 });
 
 pub const pair_linear = kernel(.{

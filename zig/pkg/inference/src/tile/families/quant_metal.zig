@@ -49,7 +49,7 @@ pub const regions = [_]Region{
     msl.metal("q6_k_nbodd", wrap.q6_kNbOdd()),
     msl.metal("gemv_q1_0", &.{ gemv.scalar("q1_0"), gemv.scalar("i8_s"), gemv.scalar("q4_0") }),
     msl.metal("gemv_q8_0", &.{gemv.scalar("q8_0")}),
-    msl.metal("gemv_q8_1", &.{ gemv.scalar("q8_1"), gemv.reduce("q8_1") }),
+    msl.metal("gemv_q8_1", &[_]msl.Item{ gemv.scalar("q8_1"), gemv.reduce("q8_1") } ++ gemv.q8_0_mmv),
     msl.metal("gemv_q8_k", &.{ gemv.scalar("q8_k"), gemv.reduce("q8_k") }),
     msl.metal("gemv_q2_k", &.{ gemv.scalar("q2_k"), gemv.scalar("q3_k"), gemv.scalar("q4_k"), q4_k.linear }),
     msl.metal("q4_k_pair", &[_]msl.Item{q4_k.pair_linear} ++ q4_k.pair_activation ++ .{gemv.scalar("q5_k")}),
