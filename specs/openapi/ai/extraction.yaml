@@ -12,6 +12,11 @@ components:
       - antfly
       - pioneer
       - cloudflare
+      - openai
+      - gemini
+      - vertex
+      - anthropic
+      - bedrock
       - mock
     ExtractionConfig:
       type: object
@@ -30,6 +35,18 @@ components:
           type: string
         api_url:
           type: string
+        project_id:
+          type: string
+          description: Google Cloud project for the vertex provider.
+        location:
+          type: string
+          description: Vertex AI location.
+        region:
+          type: string
+          description: AWS region for the bedrock provider.
+        credentials_path:
+          type: string
+          description: Path to Google service account credentials for the vertex provider.
         account_id:
           type: string
           description: Cloudflare Workers AI account identifier.

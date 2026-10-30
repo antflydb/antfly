@@ -309,6 +309,14 @@ pub const ExtractionConfig = struct {
     schema_version: ?std.json.Value = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
+    /// Google Cloud project for the vertex provider.
+    project_id: ?[]const u8 = null,
+    /// Vertex AI location.
+    location: ?[]const u8 = null,
+    /// AWS region for the bedrock provider.
+    region: ?[]const u8 = null,
+    /// Path to Google service account credentials for the vertex provider.
+    credentials_path: ?[]const u8 = null,
     /// Cloudflare Workers AI account identifier.
     account_id: ?[]const u8 = null,
     /// Optional Cloudflare AI Gateway identifier.
@@ -325,6 +333,10 @@ pub const ExtractionConfig = struct {
         .{ "schema_version", "schema_version", true },
         .{ "url", "url", true },
         .{ "api_url", "api_url", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "region", "region", true },
+        .{ "credentials_path", "credentials_path", true },
         .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "api_key", "api_key", true },
@@ -359,6 +371,22 @@ pub const ExtractionConfig = struct {
         }
         if (self.api_url) |value| {
             try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
             try jw.write(value);
         }
         if (self.account_id) |value| {
@@ -1694,6 +1722,11 @@ pub const ExtractionProvider = enum {
     antfly,
     pioneer,
     cloudflare,
+    openai,
+    gemini,
+    vertex,
+    anthropic,
+    bedrock,
     mock,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1701,6 +1734,11 @@ pub const ExtractionProvider = enum {
             .antfly => "antfly",
             .pioneer => "pioneer",
             .cloudflare => "cloudflare",
+            .openai => "openai",
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .anthropic => "anthropic",
+            .bedrock => "bedrock",
             .mock => "mock",
         };
         try jw.write(s);
@@ -1715,6 +1753,11 @@ pub const ExtractionProvider = enum {
             .{ "antfly", .antfly },
             .{ "pioneer", .pioneer },
             .{ "cloudflare", .cloudflare },
+            .{ "openai", .openai },
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "anthropic", .anthropic },
+            .{ "bedrock", .bedrock },
             .{ "mock", .mock },
         });
         return map.get(s) orelse error.UnexpectedToken;

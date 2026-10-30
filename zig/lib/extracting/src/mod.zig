@@ -25,6 +25,13 @@ pub const Provider = enum {
     antfly,
     pioneer,
     cloudflare,
+    /// Hosted generators: configs with these providers are rewritten to
+    /// generated extraction (antfly_structured) before any extractor runs.
+    openai,
+    gemini,
+    vertex,
+    anthropic,
+    bedrock,
     mock,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -32,6 +39,11 @@ pub const Provider = enum {
             .antfly => "antfly",
             .pioneer => "pioneer",
             .cloudflare => "cloudflare",
+            .openai => "openai",
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .anthropic => "anthropic",
+            .bedrock => "bedrock",
             .mock => "mock",
         });
     }
@@ -44,6 +56,7 @@ pub const Provider = enum {
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
         if (std.mem.eql(u8, raw, "pioneer")) return .pioneer;
         if (std.mem.eql(u8, raw, "cloudflare")) return .cloudflare;
+        inline for (.{ "openai", "gemini", "vertex", "anthropic", "bedrock" }) |name| if (std.mem.eql(u8, raw, name)) return @field(@This(), name);
         if (std.mem.eql(u8, raw, "mock")) return .mock;
         return error.UnexpectedToken;
     }
@@ -388,7 +401,8 @@ fn initExtractorWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, 
         .antfly => try HttpExtractorState.init(alloc, http, cfg, options),
         .pioneer => try PioneerExtractor.init(alloc, http, cfg, options),
         .cloudflare => try CloudflareExtractor.init(alloc, http, cfg, options),
-        .mock => error.UnsupportedExtractionProvider,
+        // Hosted generator providers run as generated extraction.
+        .openai, .gemini, .vertex, .anthropic, .bedrock, .mock => error.UnsupportedExtractionProvider,
     };
 }
 
@@ -1164,6 +1178,7 @@ fn parseProvider(raw: []const u8) !Provider {
     if (std.mem.eql(u8, raw, "antfly")) return .antfly;
     if (std.mem.eql(u8, raw, "pioneer")) return .pioneer;
     if (std.mem.eql(u8, raw, "cloudflare")) return .cloudflare;
+    inline for (.{ "openai", "gemini", "vertex", "anthropic", "bedrock" }) |name| if (std.mem.eql(u8, raw, name)) return @field(Provider, name);
     if (std.mem.eql(u8, raw, "mock")) return .mock;
     return error.InvalidExtractionConfig;
 }
