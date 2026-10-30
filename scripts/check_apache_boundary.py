@@ -160,6 +160,12 @@ SOURCE_MODULES = {
     "cloudflare_api": (
         "zig/pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig",
     ),
+    "anthropic_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig",
+    ),
+    "fastino_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig",
+    ),
     "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
