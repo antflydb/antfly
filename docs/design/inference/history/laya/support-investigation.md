@@ -203,7 +203,7 @@ The implementation follow-up below adds model execution and measured validation.
 
 Implemented on `codex/investigate-laya`: a pinned-checkpoint importer, native
 ModernBERT/Laya decision heads, extraction-v2 dispatch, typed results and generated
-SDKs, and enrichment preservation. See [usage and validation](../../../../guides/models/laya.md).
+SDKs, and enrichment preservation. See [usage and validation](../../../../guides/models/laya.mdx).
 The deterministic upstream-PyTorch fixture validates CPU and Metal tokenization
 and logits within `2e-4`, reordered batches through 512 tasks, and HTTP/embedded
 extraction. The released English checkpoint also matches all 192 sampled upstream
@@ -211,7 +211,7 @@ decisions on CPU and Metal, with maximum probability errors below `1e-5`, and
 passes batch scaling through 128 tasks. See the
 [accuracy, parity, and performance report](qualification.md) for results,
 regression fixes, and reproducible commands. CUDA is qualified on NVIDIA L4 (see
-[Laya](../../../../guides/models/laya.md)). Multilingual checkpoints,
+[Laya](../../../../guides/models/laya.mdx)). Multilingual checkpoints,
 fine-tuned checkpoints, and application-specific tool-routing accuracy remain
 unqualified. Tool selection is available through classification results; agent
 tool execution is outside this change.

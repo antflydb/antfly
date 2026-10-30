@@ -66,6 +66,7 @@ pub fn configureBrowserModule(
     mod.addImport("httpx", httpx_mod);
     mod.addImport("antfly_platform", platform_mod);
     mod.addImport("antfly_chunking", chunking_mod);
+    mod.addImport("antfly_chunking_api_openapi", chunking_mod.import_table.get("antfly_chunking_api_openapi").?);
     mod.addImport("bloom", bloom_mod);
     mod.addImport("antfly_vector", vector_mod);
     mod.addImport("antfly_vectorindex", vectorindex_mod);

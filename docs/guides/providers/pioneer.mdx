@@ -1,32 +1,75 @@
 ---
 title: Pioneer
-description: Entity and structured extraction through a Pioneer inference endpoint
+description: Hosted GLiNER entity, relation, classification, and structured extraction from Fastino Labs
+order: 10
 ---
 
-The `pioneer` provider sends extraction requests to a Pioneer `/inference`
-endpoint.
+[Pioneer](https://pioneer.ai) is Fastino Labs' hosted inference API for GLiNER
+models, including fine-tuned ones. The `pioneer` provider sends each input to
+Pioneer's chat completions endpoint with the model you name and a GLiNER schema
+built from your extraction schema. To run the same open GLiNER models on your
+own hardware instead, use the [`antfly` provider](/docs/guides/providers/antfly).
 
 ## What It Provides
 
 | Component | Inputs | Notes |
 |---|---|---|
-| Extractor | Text | `url` is required; requests go to `{url}/inference` |
+| Extractor | Text | Entities, relations, classifications, and structured records; one request per input |
+
+`model` is required, for example `fastino/gliner2-base-v1`,
+`fastino/gliner2.5-multi-v1`, or the ID of a model you fine-tuned on Pioneer.
+`url` defaults to `https://api.fastino.ai`.
 
 ## Credentials
 
-`api_key`, sent as a bearer token.
+`api_key`, defaulting to `FASTINO_API_KEY`. Store it as a secret reference such
+as `${secret:pioneer.api_key}`. It is sent as a bearer token.
 
 ## Example
 
 ```json
 {
   "extractors": {
-    "entities": {
+    "contacts": {
       "provider": "pioneer",
-      "url": "https://pioneer.example.com",
-      "model": "your-model",
-      "api_key": "${secret:pioneer.api_key}"
+      "model": "fastino/gliner2.5-multi-v1",
+      "api_key": "${secret:pioneer.api_key}",
+      "schema": {
+        "entities": ["person", "company"],
+        "relations": [{"type": "works_for"}],
+        "classifications": [{"name": "sentiment", "labels": ["positive", "negative", "neutral"]}],
+        "structures": {"contact": {"fields": {"name": "str", "email": "str", "phones": "list"}}}
+      },
+      "options": {"threshold": 0.5}
     }
   }
 }
 ```
+
+## Schema Mapping
+
+| Antfly schema | Sent to Pioneer |
+|---|---|
+| `entities`, with optional `entity_definitions` descriptions | `entities` |
+| `relations[].type`, with optional `description` | `relations` |
+| `classifications[]` with `name`, `labels`, `multi_label` | `classifications` |
+| `structures` fields of type `str` or `list`, with optional `choices` and `description` | `structures` |
+| `options.threshold` | `threshold` |
+
+Results come back in Antfly's normal extraction format. Spans are reported in
+UTF-8 bytes and are kept only when they match the returned text exactly.
+
+## Limits
+
+- Schema version 1 only. Relation endpoint labels (`source`, `target`),
+  entity attributes, constrained classification, joint IE, and numeric, date,
+  or estimate structure fields are rejected before any request is sent.
+- Text inputs only; images and other attachments are rejected.
+- Relation, classification, and structure tasks must have distinct names.
+  `entities` and `relation_extraction` are reserved task names.
+- Requests set `store: false`, so Pioneer does not retain enrichment inputs.
+
+## Related
+
+- [Inference providers](/docs/guides/inference-providers): every provider and component
+- [Antfly](/docs/guides/providers/antfly): run GLiNER2 locally

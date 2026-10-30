@@ -29,15 +29,22 @@ logical replication managed by Antfly.
 | [grepstein](grepstein/) | Go | Public-records showcase: PDF reading and OCR, full-text, semantic, and graph enrichment, and grep over a GCS-backed corpus on Antfly Cloud |
 | [hackernews](hackernews/) | Python | Historical Hacker News search over GCS Parquet with Antfly index artifacts, including deployment tooling; qualification records are in [`docs/operations/hackernews/history`](../docs/operations/hackernews/history/) |
 
-## Embedded (Antfly Lite) and agent memory
+## Embedded (Antfly Lite)
 
 | Example | Language | What it shows |
 |---|---|---|
 | [antfly-docs-knowledge-base](antfly-docs-knowledge-base/) | Go | The same knowledge base on an embedded `.aflite` file, plus a model-free `smoke` command for the embedded API |
-| [native-memory](native-memory/) | README | The `/memory/v1` native memory API, and the Codex integration that builds on it |
 
 The Lite examples need `libantfly`: run `zig build capi` in `zig/` first. The
 [Lite guide](../docs/guides/lite.mdx) has a minimal Go program.
+
+## Agent memory
+
+For the `/memory/v1` native memory API, follow
+[Give an Agent Long-Term Memory](../docs/guides/agent-memory.mdx), which runs
+over HTTP and embedded. [Codex on Antfly](https://github.com/antflydb/codex/blob/antfly/integration/ANTFLY_INTEGRATION.md)
+is the full integration: a fork of the Codex CLI that keeps its knowledge,
+decisions, and session history in Antfly.
 
 ## Testing
 

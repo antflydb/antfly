@@ -168,6 +168,12 @@ pub fn addOpenApiSourceSteps(
     // Always inspect the destination, even when generation is cached. Missing
     // and extra files must be detected without mutating the source tree.
     check.has_side_effects = true;
+    const bedrock_contract = b.addSystemCommand(&.{"python3"});
+    bedrock_contract.addFileArg2(b.path("../scripts/generate_bedrock_openapi.py"), .{ .make_absolute = true });
+    bedrock_contract.addArg("--check");
+    bedrock_contract.has_side_effects = true;
+    check.step.dependOn(&bedrock_contract.step);
+    regen.step.dependOn(&bedrock_contract.step);
 
     const antfly_generated_root = "pkg/antfly-embedded/src/openapi/generated";
     const inference_generated_root = "pkg/inference/src/api/generated";
@@ -302,6 +308,9 @@ pub fn addOpenApiSourceSteps(
             .{ "../ai/decision.yaml", "antfly_decision_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/cloudflare-openapi.json"), "cloudflare_api", antfly_generated_root ++ "/cloudflare_api", "types", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/fastino-openapi.json"), "fastino_api", antfly_generated_root ++ "/fastino_api", "types", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/anthropic-openapi.json"), "anthropic_api", antfly_generated_root ++ "/anthropic_api", "types", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/bedrock-openapi.json"), "bedrock_api", antfly_generated_root ++ "/bedrock_api", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
         .{
             .directory = openapi_build.addGeneratedDirectory(b, .{
