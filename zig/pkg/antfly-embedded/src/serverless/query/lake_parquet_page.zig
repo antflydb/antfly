@@ -444,6 +444,9 @@ pub fn scanPackedByteArraysAlloc(a: Allocator, chunk: []const u8, compression: C
         defer payload.deinit(a);
         cursor += parsed.header.compressed_page_size;
         var page = try packedBytePage(a, parsed.header, payload.bytes, optional);
+        // The page's string slices, null mask and byte buffers already have
+        // independent ownership. A single-page cursor adopts all three arrays.
+        if (cursor == chunk.len and values.capacity == 0 and nulls.capacity == 0 and buffers.capacity == 0) return page;
         var retained = false;
         defer if (!retained) page.deinit(a);
         try values.ensureUnusedCapacity(a, page.values.len);
@@ -5037,15 +5040,17 @@ test "parquet compact strings use page buffers preserve null prefixes and unwind
     const chunk = try std.mem.concat(a, u8, &.{ physical_header.items, payload, physical_header.items, payload });
     defer a.free(chunk);
     const ChunkCheck = struct {
-        fn run(alloc: Allocator, bytes: []const u8) !void {
+        fn run(alloc: Allocator, bytes: []const u8, pages: usize) !void {
             var decoded = (try scanPackedByteArraysAlloc(alloc, bytes, .uncompressed, true)).?;
             defer decoded.deinit(alloc);
-            try std.testing.expectEqual(@as(usize, 2), decoded.buffers.len);
-            try std.testing.expectEqual(@as(usize, 8), decoded.values.len);
-            try std.testing.expectEqualStrings("abx", decoded.values[7]);
+            try std.testing.expectEqual(pages, decoded.buffers.len);
+            try std.testing.expectEqual(pages * 4, decoded.values.len);
+            try std.testing.expectEqualStrings("abx", decoded.values[decoded.values.len - 1]);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, ChunkCheck.run, .{chunk});
+    try std.testing.checkAllAllocationFailures(a, ChunkCheck.run, .{ chunk, @as(usize, 2) });
+    const single = chunk[0 .. physical_header.items.len + payload.len];
+    try std.testing.checkAllAllocationFailures(a, ChunkCheck.run, .{ single, @as(usize, 1) });
     const nulls_only: Header = .{ .page_type = .data_page_v2, .encoding = .delta_byte_array, .compressed_page_size = 2, .uncompressed_page_size = 2, .value_count = 8, .definition_level_bytes = 2, .data_payload_offset = 2 };
     var empty = try packedBytePage(a, nulls_only, &.{ 16, 0 }, true);
     defer empty.deinit(a);
