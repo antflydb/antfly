@@ -265,6 +265,40 @@ pub fn build(b: *std.Build) void {
     def test_portable_install_retains_local_tests_after_binding_and_repeated_finalize(
         self,
     ):
+        self.check_portable_install()
+
+    def test_portable_install_retains_direct_embedded_tests(self):
+        self.write(
+            "pkg/antfly-embedded/src/direct_test_root.zig",
+            'test "local owned" { try @import("std").testing.expectEqual(@as(u32, 42), @import("options").value); }\n',
+        )
+        build = self.root / "build.zig"
+        source = build.read_text().replace(
+            'b.path("pkg/antfly/src/fixture.zig")',
+            'b.path("pkg/antfly-embedded/src/direct_test_root.zig")',
+        )
+        # Match linked_tests.add's object + final executable representation.
+        source = source.replace("const tests = b.addTest", "const object = b.addTest")
+        source = source.replace(
+            '.name = "fixture", .root_module = root,',
+            '.name = "fixture", .root_module = root, .emit_object = true,',
+        )
+        source = source.replace(
+            "    const wrapped =",
+            """    const final = b.createModule(.{ .target = target, .optimize = .debug });
+    final.addObject(object);
+    const tests = b.addExecutable(.{ .name = "fixture", .root_module = final });
+    const wrapped =""",
+        )
+        build.write_text(source)
+        self.check_portable_install()
+
+    def test_portable_install_rejects_missing_server_partition(self):
+        source = self.root / "pkg/antfly/src/fixture.zig"
+        source.write_text('test "server owned" {}\n')
+        self.check_portable_install(succeeds=False)
+
+    def check_portable_install(self, *, succeeds=True):
         build = self.root / "build.zig"
         build.write_text(
             build.read_text().replace(
@@ -273,7 +307,10 @@ pub fn build(b: *std.Build) void {
                 "    const wrapped =",
             )
         )
-        output = self.build(step="portable-tests")
+        output = self.build(step="portable-tests", succeeds=succeeds)
+        if not succeeds:
+            self.assertIn("portable tests require a local implementation owner", output)
+            return
         self.assertNotIn("local owned...", output)
         result = subprocess.run(
             [
