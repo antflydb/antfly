@@ -427,3 +427,65 @@ The replay-only attempt before this fresh run stalled at control tenant A /
 and completed. Stable seed operation IDs guarantee replay identity, not liveness
 of an older control after interrupted publication; the replay is retained as a
 failed reproduction, with no claim that its cause is established.
+
+
+### Next twofold target: bound metadata recovery on the read path
+
+The current targets are read p95 at most 754 ms and write p95 at most 1,044 ms,
+half of the latest candidate measurements. They are objectives, not measured
+improvements. Further archival profiling identifies concrete dependency chains:
+one slow admission performs ten GETs in ten I/O waves in 1,233 ms; another
+performs nine GETs in nine waves in 1,202 ms. Both have zero kernel queue delay.
+Their native document lookup stages are 331 ms and 384 ms, respectively.
+Existing fenced leases, admission cohorts, fused metadata reads and warm
+floor/slot batching are already implemented; merely enabling those features
+again does not address this observed recovery path.
+
+First measure checkpoint lag and recovery cause for every admission: initial
+observation, expired certificate, owner/epoch change, checkpoint advancement,
+lease miss and admitted fallback. Audit the existing idle-checkpoint lifecycle
+and its busy/retry/cancellation outcomes before adding a new persisted format.
+A checkpoint should be scheduled according to reader replay cost as well as
+commit cadence, with coalesced background work and a recoverable dirty revision.
+Foreground durability must not depend on successful publication of that hint.
+
+If reliable checkpoint publication still permits long tails under active
+maintenance or high commit rates, extend the shared native metadata journal
+with an authenticated serving checkpoint and/or seekable immutable recovery
+index. The checkpoint includes the accepted root, owner/epoch, serving LSN and
+GC fence. It is a starting point for fresh validation, never authority supplied
+by an untrusted cache. Resolve the remaining independent floor/next-slot checks
+in a bounded native I/O wave; avoid replaying nine or ten entries serially just
+to admit an ordinary point read. Keep old journal recovery as the strict fallback
+for changed owners, stale hints and concurrent advancement. This belongs in the
+shared object-store engine, preserving R2/S3 typed ETags and GCS generations.
+
+For writes, retain the existing small immutable WAL commits and deferred index
+folding. Capture writer-authority, refresh, preparation, admission wait and
+finalization durations separately before attributing its p95. Target duplicate
+proof/recovery work, retain prepared immutable uploads across a rebase, and
+overlap independent proof/data reads where the native dependency graph permits.
+The durable commit remains the acknowledgement boundary. A twofold write gain
+is still a hypothesis pending that phase attribution.
+
+Use local actual-workerd/native-module comparisons with metadata lag of 1/8/32
+entries, 31-second idle gaps, 50/100/200 ms binding delays, concurrent
+read/write/maintenance, cache loss and namespace churn. Reverse candidate/control
+order with identical keys, modules, corpus and resource limits. Report first-use
+and warm p95 separately, plus metadata GETs and dependent I/O waves. Qualify the
+winner on the original offered workload before consuming hour-long/cold trials.
+Measure compute-to-storage placement independently: hints are optimization
+requests, not evidence that the services are colocated. Preserve lease lifetimes,
+ownership checks, request-owned I/O, memory caps, exact body/receipt verification
+and all original gates throughout these experiments.
+
+Cleanup of the explicitly approved disposable deployment is complete. Independent
+before/after inventory verifies removal of all 11 Workers, six Durable Object
+namespaces, four Queues/DLQs and four R2 buckets; no other `antfly-1278-*` test
+resources remain in that account. The observer drain encountered one transport
+reset, was resumed idempotently, and completed. Reports and sanitized selected
+archives remain local. All 494 final Node tests pass; the unchanged Worker
+pipeline retains its eight actual-workerd passes and SQL/KV-forbidden native R2
+integration pass. The four recent evidence closures reverify all 349 artifacts
+with no missing files or changed hashes. The older 163-artifact availability gap
+remains historical and is not relabeled as recovered by this audit.
