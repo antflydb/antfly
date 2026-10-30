@@ -15,6 +15,7 @@
 
 // Native WASM metadata recovery model; this does not measure cloud or app SLOs.
 import{readFile,writeFile,mkdir}from'node:fs/promises';import{resolve}from'node:path';import{createHash}from'node:crypto';import assert from'node:assert/strict';
+import{execFileSync}from'node:child_process';
 import{Bucket}from'../test/object-fixture.mjs';import{R2CoordinatorStore}from'../r2-coordinator-store.mjs';import{resourceFailureCode}from'../performance.mjs';
 const arg=(name,fallback)=>process.argv.find(a=>a.startsWith('--'+name+'='))?.slice(name.length+3)??fallback;
 const control=resolve(arg('control','../../.zig-cache/twofold-control/antfly-serverless.wasm')),candidate=resolve(arg('candidate','dist/antfly-serverless.wasm')),out=resolve(arg('out','dist/qualification/metadata-recovery-'+Date.now())),delays=arg('delays','0,50,100,200').split(',').map(Number),lags=arg('lags','1,8,32').split(',').map(Number),samples=Number(arg('samples','3'));
@@ -22,7 +23,9 @@ if(delays.some(n=>!Number.isInteger(n)||n<0||n>200)||lags.some(n=>![1,8,32].incl
 const sha=b=>createHash('sha256').update(b).digest('hex'),modules=await Promise.all([control,candidate].map(async path=>{const bytes=await readFile(path);return{path,sha256:sha(bytes),module:await WebAssembly.compile(bytes)};}));
 const clone=b=>{const copy=new Bucket();copy.revision=b.revision;copy.objects=new Map([...b.objects].map(([k,v])=>[k,{...v,body:v.body.slice()}]));return copy;};
 const fixtureHash=b=>sha(Buffer.from(JSON.stringify([...b.objects].sort(([a],[b])=>a.localeCompare(b)).map(([key,v])=>({key,etag:v.etag,sha256:sha(v.body)})))));
-const report={schema:1,qualification:false,kind:'Native WASM + isolated R2-binding model; metadata-only dependency-depth experiment',modules:modules.map(({module,...m})=>m),limits:{snapshot_deadline_ms:5000,metadata_operations:254,metadata_transfer_bytes:8*1024*1024,parallel_binding_calls:4},samples_per_case:samples,cases:[]};
+const experiment=await readFile(new URL(import.meta.url));await writeFile(resolve(out,'experiment.mjs'),experiment);
+const provenance={revision:execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),dirty:!!execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim(),experiment_sha256:sha(experiment),arguments:process.argv.slice(2)};
+const report={schema:1,qualification:false,source:provenance,kind:'Native WASM + isolated R2-binding model; metadata-only dependency-depth experiment',modules:modules.map(({module,...m})=>m),limits:{snapshot_deadline_ms:5000,metadata_operations:254,metadata_transfer_bytes:8*1024*1024,parallel_binding_calls:4},samples_per_case:samples,cases:[]};
 const stats=values=>{const v=values.toSorted((a,b)=>a-b);return{n:v.length,p50:v[Math.ceil(v.length*.5)-1]??null,p95:v[Math.ceil(v.length*.95)-1]??null};};
 for(const lag of lags){
  let offset=0;const clock=()=>Date.now()+offset,seed=new Bucket(),writer=new R2CoordinatorStore(modules[0].module,seed,'metadata-recovery-uniform',{clock,owner:Array(16).fill(1)});writer.configureAuthority({mode:'r2-bounded'});await writer.transaction(tx=>tx.put('value',0));offset+=1100;await writer.checkpointHint();const before=clone(seed);

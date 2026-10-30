@@ -12,11 +12,13 @@ results.
 
 The existing immutable journal, accepted checkpoint, owner fencing and
 certificate format remain authoritative. Cold observers read the checkpoint
-and validate its contiguous journal suffix. After two positive commit slots,
-the native observer requests at most eight independent slot addresses at once.
+and validate its contiguous journal suffix. Cold/expired recovery starts
+prefetch after two positive commit slots; a warm session requires eight.
+The native observer requests at most eight independent slot addresses at once.
 The window is bounded by the remaining 64-step recovery budget and the current
 epoch. Each response is capped at 16 KiB and validated before its state is used.
-Idle observations still use one slot probe; one new commit still needs two.
+Idle observations still use one slot probe; short warm tails through seven
+commits retain exactly one probe per accepted slot plus the fresh end probe.
 
 Prefetch does not establish order or authority. Every consumed frame must match
 the expected epoch, position, parent revision and owner. A seal resets the
@@ -126,3 +128,15 @@ exploratory: its ratios are not accepted as evidence of an end-to-end gain.
 An earlier pre-anchor model and a harness attempt that failed its physical
 settlement assertion also remain preserved, rather than being relabeled as
 qualified results.
+
+The first ordered comparison exposes a concrete limit of eager warm prefetch.
+At 50 ms injected delay, a warm admission with two new commits fetched an
+eight-slot speculative window, taking eleven physical GETs and four I/O waves.
+Forward-order read p95 regressed 532 → 649 ms while write p95 improved
+526 → 283 ms. Affinity and write read-ahead were also mixed. These results are
+preserved as prototype evidence, not promoted to a twofold claim. The revised
+policy protects short warm tails and keeps aggressive overlap on cold/expired
+recovery; its 34-test native suite verifies every warm tail length through seven,
+deep cold/warm catch-up, allocation failures, concurrent appends and fencing.
+New WASM and end-to-end measurements are required before selecting that policy
+for a hosted deployment.

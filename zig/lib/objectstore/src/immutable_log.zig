@@ -395,7 +395,7 @@ pub const Log = struct {
         const anchor = authority.now();
         const cp = (try self.checkpoint(a)) orelse return error.ImmutableLogProofRequiresRecovery;
         const proof = try authority.issue(self, cp.state, anchor);
-        return self.observeCertifiedMode(a, cp.state, authority, proof, true, null, anchor);
+        return self.observeCertifiedMode(a, cp.state, authority, proof, true, null, anchor, 2);
     }
     /// Capture both independent proof objects in one native I/O wave. The
     /// certificate anchor precedes the batch; late responses cannot reset it.
@@ -430,7 +430,7 @@ pub const Log = struct {
                 // The old cursor's speculative next slot cannot validate that
                 // root; observe its own next slot under the original anchor.
                 const rebased = try authority.issue(self, cp.state, anchor);
-                return self.observeCertifiedMode(a, cp.state, authority, rebased, follow_owners, null, anchor);
+                return self.observeCertifiedMode(a, cp.state, authority, rebased, follow_owners, null, anchor, 2);
             }
             if (cp.state.revision == source.revision and !same(cp.state, source)) return error.InvalidImmutableLog;
         } else {
@@ -439,7 +439,7 @@ pub const Log = struct {
             if (try self.read(a, required)) |_| return error.ImmutableLogCheckpointMissing;
         }
         const renewed = try authority.issue(self, source, anchor);
-        return self.observeCertifiedMode(a, source, authority, renewed, follow_owners, &results[1], anchor);
+        return self.observeCertifiedMode(a, source, authority, renewed, follow_owners, &results[1], anchor, 2);
     }
     /// The seal competes for this exact next slot. A valid bounded source
     /// therefore needs no cross-object floor probes. The collector grace keeps
@@ -469,7 +469,7 @@ pub const Log = struct {
     /// One fresh next-slot probe suffices within a protected epoch: every seal
     /// is first linearized in that same slot, before its recovery marker.
     pub fn observeCertified(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool) !CertifiedRecovery {
-        return self.observeCertifiedMode(result_alloc, source, authority, proof, follow_owners, null, authority.now());
+        return self.observeCertifiedMode(result_alloc, source, authority, proof, follow_owners, null, authority.now(), 8);
     }
     const ObservationBatch = struct {
         arena: std.heap.ArenaAllocator,
@@ -509,7 +509,7 @@ pub const Log = struct {
             return std.mem.eql(u8, &self.epoch, &state.epoch) and state.next >= self.first and state.next - self.first < self.results.len;
         }
     };
-    fn observeCertifiedMode(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool, first: ?*const ?types.GetResult, anchor: ProofTime) !CertifiedRecovery {
+    fn observeCertifiedMode(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool, first: ?*const ?types.GetResult, anchor: ProofTime, batch_after: usize) !CertifiedRecovery {
         try authority.check(self, source, proof);
         var arena = std.heap.ArenaAllocator.init(result_alloc);
         defer arena.deinit();
@@ -528,10 +528,11 @@ pub const Log = struct {
             _ = arena.reset(.retain_capacity);
             try authority.check(self, source, proof);
             if (!follow_owners and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
-            // Keep idle and one-append observations on the single-probe path.
-            // Once a tail is established, overlap at most eight independent
-            // addresses. Serial-only providers retain their existing path.
-            if (self.read_batch and self.client.vtable.get_objects != null and consecutive >= 2 and !batch.contains(state) and state.next < epoch_commits)
+            // Preserve short warm tails: speculative misses otherwise add more
+            // waves than a fresh exact-slot read. Cold/expired recovery starts
+            // prefetch after two commits; warm observation requires eight.
+            // Serial-only providers retain their existing path.
+            if (self.read_batch and self.client.vtable.get_objects != null and consecutive >= batch_after and !batch.contains(state) and state.next < epoch_commits)
                 try batch.load(self, state, max_steps - step);
             const stored = if (step == 0 and first != null) first.?.* else if (batch.contains(state)) blk: {
                 if (batch.results[@intCast(state.next - batch.first)]) |value| break :blk value;
@@ -1112,7 +1113,7 @@ test "immutable log bounded cold observation follows the checkpoint chain withou
     try authority.check(log, observed.recovery.state, observed.proof);
 }
 
-test "immutable log batched catchup bounds waves and keeps idle and one append probes unchanged" {
+test "immutable log batched catchup bounds waves and preserves short warm tail probes" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -1136,12 +1137,25 @@ test "immutable log batched catchup bounds waves and keeps idle and one append p
     _ = try log.observeCertified(m, initial, auth, proof, true);
     try std.testing.expectEqual(@as(usize, 2), backend.scalar_reads);
     try std.testing.expectEqual(@as(usize, 0), backend.batch_reads);
-    for (1..32) |_| accepted = try log.appendCertified(m, accepted.recovery.state, "many", auth, accepted.proof);
+    for (1..7) |count| {
+        accepted = try log.appendCertified(m, accepted.recovery.state, "short", auth, accepted.proof);
+        backend.scalar_reads = 0;
+        backend.batch_reads = 0;
+        _ = try log.observeCertified(m, initial, auth, proof, true);
+        try std.testing.expectEqual(count + 2, backend.scalar_reads);
+        try std.testing.expectEqual(@as(usize, 0), backend.batch_reads);
+    }
+    for (7..32) |_| accepted = try log.appendCertified(m, accepted.recovery.state, "many", auth, accepted.proof);
     backend.scalar_reads = 0;
     const observed = try log.observeCertified(m, initial, auth, proof, true);
     try std.testing.expectEqual(accepted.recovery.state.revision, observed.recovery.state.revision);
     try std.testing.expect(!observed.recovery.has_more);
-    try std.testing.expect(backend.scalar_reads + backend.batch_reads <= 7);
+    try std.testing.expect(backend.scalar_reads + backend.batch_reads <= 13);
+    backend.scalar_reads = 0;
+    backend.batch_reads = 0;
+    const cold = try log.observeFromCheckpointCertified(m, auth);
+    try std.testing.expectEqualStrings(observed.recovery.state.root, cold.recovery.state.root);
+    try std.testing.expect(backend.scalar_reads + backend.batch_reads <= 8);
     try std.testing.expectEqual(@as(usize, 8), backend.maximum_batch);
     var serial = log;
     serial.read_batch = false;
