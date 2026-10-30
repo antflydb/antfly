@@ -14223,6 +14223,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint stride = 16u; stride > 0u; stride >>= 1u) { if (lane < stride) partials[lane] += partials[lane + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    if (lane == 0u) output[group] = partials[0];\n"
            "}\n"
+           // tile-codegen:begin model.dot_general_small_m family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_dot_general_2d_f32_small_m_tile(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], threadgroup float *partials [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    uint row = tg.y; uint col0 = tg.x * 8u; uint width = tpg.x; if (row >= p.m || p.k == 0u || width == 0u) return;\n"
            "    uint c0 = col0; uint c1 = col0 + 1u; uint c2 = col0 + 2u; uint c3 = col0 + 3u; uint c4 = col0 + 4u; uint c5 = col0 + 5u; uint c6 = col0 + 6u; uint c7 = col0 + 7u;\n"
@@ -14261,6 +14262,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) { for (uint i = 0u; i < 64u; ++i) partials[i * width + t] += partials[i * width + t + stride]; } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    if (tid == 0u) { for (uint r = 0u; r < 4u; ++r) { if (!valid_r[r]) continue; uint base = (row0 + r) * p.n + col0; for (uint c = 0u; c < 16u; ++c) { if (valid_c[c]) output[base + c] = partials[(r * 16u + c) * width]; } } }\n"
            "}\n"
+           // tile-codegen:end model.dot_general_small_m family
            "kernel void termite_dot_general_rank1_outer_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.m * p.n; if (gid >= total || p.k != 1u) return; uint row = gid / p.n; uint col = gid - row * p.n; output[gid] = lhs[row] * rhs[col];\n"
            "}\n"

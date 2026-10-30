@@ -19,6 +19,7 @@ const r = @import("../region.zig");
 const lightonocr = @import("../model_lightonocr.zig");
 const deberta = @import("../model_deberta_attention.zig");
 const gliner_boundary = @import("../model_gliner_boundary.zig");
+const dot_general = @import("../model_dot_general.zig");
 
 const Region = r.Region;
 
@@ -29,4 +30,5 @@ pub const regions = [_]Region{
     r.region("src/ops/cuda/kernels/gliner25_attention.cuh", "", "model.deberta_attention", deberta.cudaSource()),
     r.metal("model.gliner_boundary", r.metalLines(r.metal_indent, gliner_boundary.metalSource())),
     r.region("src/ops/cuda/kernels/gliner25_boundary.cuh", "", "model.gliner_boundary", gliner_boundary.cudaSource()),
+    r.metal("model.dot_general_small_m", r.metalLines(r.metal_indent, dot_general.source())),
 };
