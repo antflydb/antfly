@@ -20,6 +20,10 @@ API_ROOT = 'https://api.github.com/'
 SHA = re.compile(r'[0-9a-f]{40}')
 
 
+class PublicationError(ValueError):
+    """Only deliberately sanitized, public-safe diagnostics use this type."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -39,7 +43,8 @@ class GitHub:
             with self.opener.open(request, timeout=30) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            raise ValueError(f'GitHub {method} failed with HTTP {exc.code}; no token/body logged') from None
+            area = 'Actions read' if '/actions/' in path else 'repository contents'
+            raise PublicationError(f'GitHub {method} {area} failed with HTTP {exc.code}; no token/body logged') from None
 
     def archive(self, artifact_id):
         request = urllib.request.Request(API_ROOT+f'repos/{COLONY}/actions/artifacts/{int(artifact_id)}/zip',
@@ -48,22 +53,22 @@ class GitHub:
             response = self.opener.open(request, timeout=30)
         except urllib.error.HTTPError as exc:
             if exc.code != 302:
-                raise ValueError(f'Artifact download failed: HTTP {exc.code}') from None
+                raise PublicationError(f'Artifact download failed: HTTP {exc.code}') from None
             location = exc.headers.get('Location', '')
             if not location.startswith('https://'):
-                raise ValueError('Artifact redirect must use HTTPS')
+                raise PublicationError('Artifact redirect must use HTTPS')
             # Deliberately a new unauthenticated request, never forwarding the PAT.
             response = urllib.request.urlopen(location, timeout=30)
         with response:
             data = response.read(65537)
         if len(data) > 65536:
-            raise ValueError('Unexpectedly large validation artifact')
+            raise PublicationError('Unexpectedly large validation artifact')
         return data
 
 
 def require(condition, message):
     if not condition:
-        raise ValueError(message)
+        raise PublicationError(message)
 
 
 def read_manifest(data):
@@ -96,7 +101,7 @@ def wait_for_validation(api, request, timeout=2100):
                 require(manifest['request'] == request and manifest['base_sha'] == run['head_sha'], 'Manifest is not bound to this validation run/base')
                 return run, manifest
         time.sleep(15)
-    raise ValueError('Timed out waiting for private Colony validation; main unchanged')
+    raise PublicationError('Timed out waiting for private Colony validation; main unchanged')
 
 
 def entries(tree):
@@ -146,6 +151,8 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except PublicationError as exc:
+        raise SystemExit('Automatic pin publication stopped: '+str(exc)) from None
     except (ValueError, KeyError, OSError, zipfile.BadZipFile):
         # API bodies/redirect URLs and private repository contents stay out of public logs.
         raise SystemExit('Automatic pin publication stopped; inspect private Colony validation and protected-main permissions. No forced update or protection change was attempted.')
