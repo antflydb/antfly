@@ -290,3 +290,14 @@ build run hit an existing three-second timing assertion; the unchanged assertion
 passes in the focused 120-test repeat and in the final serial Node suite. Mail
 still emits the pre-existing RPC-result-disposal warning seen before this work;
 its correctness integration passes, but that warning is not claimed resolved.
+
+The clean implementation commit is `ffea7b18d6742e67d8d8aa4187f473a321205cb3`.
+Its final rebuild matches all three module variants in both frozen benchmark
+snapshots byte for byte. Evidence is sealed under
+`examples/cloudflare-serverless/dist/qualification/bounded-journal-1793329058104/evidence.json`:
+80 artifacts, 28,379,882 bytes, manifest SHA-256
+`9891b3ca61f0b47a55592bee006eafe3055b8bafdf78bca8cb5ee14347eb597f`.
+All 1,144 artifacts in the eight earlier closures remain hash-valid. The cache
+collector was run and honored its active-native-build guard. Local test resource
+stacks were disposed; no new paid Cloudflare resources were created for this
+comparison.
