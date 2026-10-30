@@ -11481,6 +11481,76 @@ pub const DB = struct {
         };
     }
 
+    /// Bounds the artifact-ledger scan behind one index-level summary row.
+    const index_enrichment_failure_summary_scan_limit: u32 = 500;
+
+    const IndexEnrichmentFailureSummary = struct {
+        count: u64,
+        /// The scan hit its bound, so `count` is a lower bound.
+        truncated: bool,
+        latest: types.ArtifactRepairIssue,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            self.latest.deinit(alloc);
+        }
+
+        fn indexIssueAlloc(self: *const @This(), alloc: Allocator, index_name: []const u8) !types.ArtifactRepairIssue {
+            const latest = self.latest;
+            var issue = types.ArtifactRepairIssue{
+                .artifact_kind = latest.artifact_kind,
+                .repairable = true,
+                .reason = .enrichment_failed,
+                .sequence = latest.sequence,
+                .generation_attempts = latest.generation_attempts,
+                .attempts = latest.attempts,
+                .first_seen_ns = latest.first_seen_ns,
+                .last_seen_ns = latest.last_seen_ns,
+            };
+            errdefer issue.deinit(alloc);
+            issue.index_name = try dupeNonEmpty(alloc, index_name);
+            issue.doc_key = try dupeNonEmpty(alloc, latest.doc_key);
+            issue.source_artifact_name = try dupeNonEmpty(alloc, latest.source_artifact_name);
+            issue.artifact_name = try dupeNonEmpty(alloc, latest.artifact_name);
+            issue.generation_error = try dupeNonEmpty(alloc, latest.generation_error);
+            issue.last_error = try std.fmt.allocPrint(
+                alloc,
+                "{d}{s} document(s) failed enrichment; list them with target=artifact and index={s}, and retry them with repair",
+                .{ self.count, if (self.truncated) "+" else "", index_name },
+            );
+            return issue;
+        }
+
+        fn dupeNonEmpty(alloc: Allocator, value: []const u8) ![]const u8 {
+            return if (value.len == 0) "" else try alloc.dupe(u8, value);
+        }
+    };
+
+    /// Summarizes `enrichment_failed` artifact debt recorded for one index.
+    /// Returns null when the index has none.
+    // Explicit error set: this re-enters listArtifactRepairIssuesPage, which
+    // dispatches index targets back to listIndexRepairIssuesPage.
+    fn indexEnrichmentFailureSummary(self: *DB, alloc: Allocator, index_name: []const u8) anyerror!?IndexEnrichmentFailureSummary {
+        var page = try self.listArtifactRepairIssuesPage(alloc, .{
+            .target = .artifact,
+            .index_name = index_name,
+            .limit = index_enrichment_failure_summary_scan_limit,
+        });
+        defer page.deinit(alloc);
+        var count: u64 = 0;
+        var latest: ?usize = null;
+        for (page.issues, 0..) |issue, i| {
+            if (issue.reason != .enrichment_failed) continue;
+            if (!std.mem.eql(u8, issue.index_name, index_name)) continue;
+            count += 1;
+            if (latest == null or issue.last_seen_ns >= page.issues[latest.?].last_seen_ns) latest = i;
+        }
+        const chosen = latest orelse return null;
+        const issue = page.issues[chosen];
+        // Transfer ownership; the default value owns no allocations.
+        page.issues[chosen] = .{};
+        return .{ .count = count, .truncated = page.has_more, .latest = issue };
+    }
+
     fn listIndexRepairIssuesPage(
         self: *DB,
         alloc: Allocator,
@@ -11513,11 +11583,28 @@ pub const DB = struct {
             if (req.artifact_kind) |requested_kind| {
                 if (requested_kind != artifact_kind) continue;
             }
-            if (!(try self.indexGenerationRepairRequired(alloc, cfg.name))) continue;
+            const generation_repair = try self.indexGenerationRepairRequired(alloc, cfg.name);
+            // Permanently failed enrichment documents are durable artifact
+            // debt, not a degraded generation. Surface them on the index so
+            // `index maintenance issues` shows why the index never converges.
+            var enrichment_failures: ?IndexEnrichmentFailureSummary = if (generation_repair)
+                null
+            else
+                try self.indexEnrichmentFailureSummary(alloc, cfg.name);
+            defer if (enrichment_failures) |*summary| summary.deinit(alloc);
+            if (!generation_repair and enrichment_failures == null) continue;
             scanned += 1;
             if (req.limit != 0 and issues.items.len >= req.limit) {
                 has_more = true;
                 break;
+            }
+
+            if (enrichment_failures) |*summary| {
+                var issue = try summary.indexIssueAlloc(alloc, cfg.name);
+                errdefer issue.deinit(alloc);
+                try issues.append(alloc, issue);
+                last_returned = cfg.name;
+                continue;
             }
 
             const load_error = self.core.index_manager.loadFailure(cfg.name);
@@ -16590,7 +16677,50 @@ pub const DB = struct {
         return result;
     }
 
+    /// Index repair and rebuild also retry the index's permanently failed
+    /// enrichment documents. Those are durable artifact debt keyed by the
+    /// index, so this runs the existing artifact reprocess path for them after
+    /// any generation repair. Operator controls only change automatic repair.
     fn repairIndexIssuesWithRequest(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairRunRequest,
+        options: types.ArtifactRepairRunOptions,
+        lease_authority: IndexRepairLeaseAuthority,
+    ) anyerror!types.ArtifactRepairResult { // explicit: re-enters the artifact repair dispatch
+        var result = try self.repairIndexGenerationIssuesWithRequest(alloc, req, options, lease_authority);
+        errdefer result.deinit(alloc);
+        if (req.control != null) return result;
+        // The durable generation-repair owner re-enters here with the lease
+        // already held. It must stay a bounded generation rebuild, so only
+        // operator entry retries enrichment documents.
+        if (lease_authority != .acquire) return result;
+        const index_name = req.index_name orelse return result;
+        var enrichment = try self.repairArtifactIssuesWithRequestOptionsInternal(alloc, .{
+            .target = .artifact,
+            .index_name = index_name,
+            .limit = if (req.limit == 0) @as(u32, 100) else req.limit,
+        }, options, .acquire);
+        defer enrichment.deinit(alloc);
+        mergeIndexEnrichmentRepairResult(&result, enrichment);
+        return result;
+    }
+
+    fn mergeIndexEnrichmentRepairResult(result: *types.ArtifactRepairResult, enrichment: types.ArtifactRepairResult) void {
+        result.scanned +|= enrichment.scanned;
+        result.reprocessed +|= enrichment.reprocessed;
+        result.repaired +|= enrichment.repaired;
+        result.missing_source_docs +|= enrichment.missing_source_docs;
+        result.failed +|= enrichment.failed;
+        result.unsupported +|= enrichment.unsupported;
+        result.unresolved +|= enrichment.unresolved;
+        result.in_progress +|= enrichment.in_progress;
+        // The index target has no cursor, so remaining artifact pages are
+        // reported as remaining debt; running repair again continues them.
+        if (enrichment.debt_remaining or enrichment.has_more) result.debt_remaining = true;
+    }
+
+    fn repairIndexGenerationIssuesWithRequest(
         self: *DB,
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
@@ -95400,6 +95530,119 @@ test "db shared enrichment repair regenerates one physical artifact once" {
     const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(alloc, "embedding", artifact_key_hex);
     defer alloc.free(completion_key);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, completion_key));
+}
+
+fn parkedEnrichmentFailureTestOptions(gated: *GateDenseEmbedder) OpenOptions {
+    gated.allowed_successes.store(0, .release);
+    return .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 2,
+        },
+    };
+}
+
+/// Exhausts the worker retry budget so `doc:a` is parked as
+/// `enrichment_failed` artifact debt on index `dv_a`.
+fn parkEnrichmentFailureForTest(db: *DB) !void {
+    try db.addIndex(.{
+        .name = "dv_a",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"parked enrichment\"}" }},
+        .sync_level = .write,
+    });
+    const sequence = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
+    sleepNs(550 * std.time.ns_per_ms);
+    try db.runEnrichmentUntil(sequence);
+}
+
+test "db index repair issues surface permanently failed enrichment documents" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), parkedEnrichmentFailureTestOptions(&gated));
+    defer db.close();
+    try parkEnrichmentFailureForTest(&db);
+
+    var page = try db.listArtifactRepairIssuesPage(alloc, .{ .target = .index });
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.issues.len);
+    const issue = page.issues[0];
+    try std.testing.expectEqualStrings("dv_a", issue.index_name);
+    try std.testing.expectEqual(types.ArtifactRepairReason.enrichment_failed, issue.reason);
+    try std.testing.expectEqualStrings("doc:a", issue.doc_key);
+    try std.testing.expect(issue.generation_attempts > 0);
+    try std.testing.expect(issue.generation_error.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, issue.last_error, "1 document(s) failed enrichment"));
+
+    // Filtering by another index or kind hides it; the index-level cursor
+    // still pages by index name.
+    var other = try db.listArtifactRepairIssuesPage(alloc, .{ .target = .index, .index_name = "missing" });
+    defer other.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), other.issues.len);
+}
+
+test "db index repair and rebuild retry permanently failed enrichment documents" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |force| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+
+        var gated = GateDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), parkedEnrichmentFailureTestOptions(&gated));
+        defer db.close();
+        try parkEnrichmentFailureForTest(&db);
+
+        // A pause control changes automatic repair only and never calls the
+        // provider for parked documents.
+        if (!force) {
+            const before_control = gated.snapshot();
+            var paused = try db.repairArtifactIssuesWithRequest(alloc, .{
+                .target = .index,
+                .index_name = "dv_a",
+                .control = .pause_automatic,
+            });
+            defer paused.deinit(alloc);
+            try std.testing.expectEqual(before_control.total_requests, gated.snapshot().total_requests);
+            var resumed = try db.repairArtifactIssuesWithRequest(alloc, .{
+                .target = .index,
+                .index_name = "dv_a",
+                .control = .resume_automatic,
+            });
+            defer resumed.deinit(alloc);
+        }
+
+        gated.allowAll();
+        var repaired = try db.repairArtifactIssuesWithRequest(alloc, .{
+            .target = .index,
+            .index_name = "dv_a",
+            .force = force,
+        });
+        defer repaired.deinit(alloc);
+        try std.testing.expect(repaired.reprocessed >= 1);
+        try std.testing.expect(repaired.repaired >= 1);
+
+        const remaining = try db.listArtifactRepairIssues(alloc, null, "dv_a", 0);
+        defer types.freeArtifactRepairIssues(alloc, remaining);
+        for (remaining) |issue| try std.testing.expect(issue.reason != .enrichment_failed);
+
+        var index_page = try db.listArtifactRepairIssuesPage(alloc, .{ .target = .index, .index_name = "dv_a" });
+        defer index_page.deinit(alloc);
+        for (index_page.issues) |issue| try std.testing.expect(issue.reason != .enrichment_failed);
+    }
 }
 
 test "db chunked enrichment failure repair completes from request coverage" {
