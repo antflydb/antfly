@@ -239,6 +239,7 @@ def native_worker(config, index, ready, start, results):
             busy_timeout=config["timeout_ms"] / 1000,
         ) as db:
             initial_stats = measurement_stats(db)
+            proof_observed_from = time.monotonic()
             ready.put({"index": index, "status": "ok"})
             announced = True
             if not start.wait(config["watchdog"]):
@@ -263,6 +264,7 @@ def native_worker(config, index, ready, start, results):
             ended = time.monotonic()
             usage = usage_delta(before, resource.getrusage(resource.RUSAGE_SELF))
             final_stats = measurement_stats(db)
+            proof_observed_until = time.monotonic()
             proofs = {
                 field: final_stats[field] - initial_stats[field]
                 for field in PROOF_FIELDS
@@ -275,6 +277,7 @@ def native_worker(config, index, ready, start, results):
                 "max_ns": (
                     final_stats["mutation_admission_max_ns"]
                     if initial_stats["mutation_admission_count"] == 0
+                    and final_stats["mutation_admission_count"] > 0
                     else None
                 ),
                 "log2_ns": [
@@ -286,20 +289,23 @@ def native_worker(config, index, ready, start, results):
                     )
                 ],
             }
-            results.put(
-                {
-                    "index": index,
-                    "status": "ok",
-                    "started": began,
-                    "ended": ended,
-                    "success_latency_ns": success,
-                    "busy_latency_ns": busy,
-                    "proofs": proofs,
-                    "admission": admission,
-                    "last_write": last_write,
-                    **usage,
-                }
-            )
+            result = {
+                "index": index,
+                "status": "ok",
+                "started": began,
+                "ended": ended,
+                "success_latency_ns": success,
+                "busy_latency_ns": busy,
+                "proofs": proofs,
+                "proof_observed_from": proof_observed_from,
+                "proof_observed_until": proof_observed_until,
+                "admission": admission,
+                "last_write": last_write,
+                **usage,
+            }
+        # close()/__exit__ is part of worker success. Emit exactly one terminal
+        # result so a close failure cannot follow an already accepted success.
+        results.put(result)
     except BaseException:
         failure = {
             "index": index,
@@ -356,14 +362,22 @@ def aggregate(workers: list[dict]) -> dict:
     )
     total = len(successful) + len(busy)
     walks = sum(row["proofs"]["allocator_proof_walks"] for row in workers)
+    proof_elapsed = max(row["proof_observed_until"] for row in workers) - min(
+        row["proof_observed_from"] for row in workers
+    )
+    if proof_elapsed <= 0:
+        raise RuntimeError("invalid proof-observation interval")
     result = {
         "elapsed_seconds": elapsed,
         "successful_calls": len(successful),
         "busy_calls": len(busy),
         "busy_fraction": len(busy) / total if total else None,
         "successful_calls_per_second": len(successful) / elapsed,
-        "proof_walks_per_second": walks / elapsed,
-        "proof_walks_per_success": walks / len(successful) if successful else None,
+        "proof_observation_seconds": proof_elapsed,
+        "proof_walks_per_second": walks / proof_elapsed,
+        "observed_proof_walks_per_success": (
+            walks / len(successful) if successful else None
+        ),
         "per_worker_successful_calls": [
             len(row["success_latency_ns"]) for row in workers
         ],
@@ -386,13 +400,17 @@ def aggregate(workers: list[dict]) -> dict:
         admission_ns=admission_ns,
         admission_mean_ns=admission_ns / admission_count if admission_count else None,
         admission_log2_ns=histogram,
-        admission_max_ns=max(
-            (
-                row["admission"]["max_ns"]
-                for row in workers
-                if row["admission"]["max_ns"] is not None
-            ),
-            default=None,
+        admission_max_ns=(
+            max(
+                (
+                    row["admission"]["max_ns"]
+                    for row in workers
+                    if row["admission"]["max_ns"] is not None
+                ),
+                default=None,
+            )
+            if admission_count
+            else None
         ),
     )
     for percent in (50, 95, 99):
@@ -487,13 +505,14 @@ def native_cases(args):
                 "seed_stats": seed_stats,
                 "latency_scope": "whole batch call including admission and mutation",
                 "admission_metric_scope": "successful positive-timeout mutation admission before its body; percentile bounds from log2 nanosecond buckets",
-                "proof_counter_scope": "process-owner totals between diagnostic snapshots; includes background work and final diagnostic admission",
+                "proof_counter_scope": "process-owner totals between diagnostic snapshots; includes readiness wait, background work, and final diagnostic admission",
             }
             try:
+                ready_by = time.monotonic() + args.watchdog
                 for process in processes:
                     process.start()
                 for _ in processes:
-                    notice = ready.get(timeout=args.watchdog)
+                    notice = ready.get(timeout=max(0.01, ready_by - time.monotonic()))
                     if notice["status"] != "ok":
                         raise RuntimeError(notice["diagnostic"])
                 start.set()
@@ -625,9 +644,12 @@ def main():
     failed = False
     for row in queue_cases(args) if args.mode == "queue" else native_cases(args):
         emit(output, row)
-        failed |= row["status"] != "ok" and (
-            args.mode == "native" or row.get("condition") == "epoch"
+        expected_baseline_stall = (
+            args.mode == "queue"
+            and row.get("condition") == "std"
+            and row["status"] == "watchdog_timeout"
         )
+        failed |= row["status"] != "ok" and not expected_baseline_stall
     emit(
         output,
         {
