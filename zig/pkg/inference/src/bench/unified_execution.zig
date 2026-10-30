@@ -415,6 +415,9 @@ fn runDecoder(init: std.process.Init, model: *inference.server.model_manager.Loa
     if (options.soak_seconds != 0) std.debug.print("decoder_soak_complete backend={s} iterations={d} elapsed_s={d} runtime_evictions={d}\n", .{ @tagName(model.session.backend()), iteration, (inference.platform.time.awakeNs(init.io) - soak_started) / std.time.ns_per_s, (iteration - 1) / 256 });
     if (options.output) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(reference.items) });
     // Chunked prefill must preserve the same state/positions as a whole prompt.
+    // Export both forms for the independent oracle; retain the strict gate.
+    const chunked_prefill_tolerance: f32 = 1e-4;
+    var chunked_prefill_pass = true;
     try runtime.reset();
     const split = prompt.len / 2;
     {
@@ -427,19 +430,26 @@ fn runDecoder(init: std.process.Init, model: *inference.server.model_manager.Loa
         var max_delta: f32 = 0;
         var squared: f64 = 0;
         for (logits, reference.items[0..config.vocab_size]) |actual, expected| {
+            if (!std.math.isFinite(actual)) return error.NonFiniteOutput;
             const delta = @abs(actual - expected);
             max_delta = @max(max_delta, delta);
             squared += @as(f64, delta) * delta;
         }
         std.debug.print("decoder_chunked_prefill max_abs={d:.9} rms={d:.9}\n", .{ max_delta, @sqrt(squared / @as(f64, @floatFromInt(logits.len))) });
-        if (max_delta > 1e-4) return error.ChunkedPrefillOutputChanged;
+        if (options.output) |path| {
+            const prefill_path = try std.fmt.allocPrint(a, "{s}.prefill.f32", .{path});
+            defer a.free(prefill_path);
+            try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = prefill_path, .data = std.mem.sliceAsBytes(logits) });
+        }
+        chunked_prefill_pass = max_delta <= chunked_prefill_tolerance;
     }
     std.mem.sort(u64, samples, {}, std.sort.asc(u64));
     var checksum: f64 = 0;
     for (reference.items) |value| checksum += value;
     const stats = runtime.debugTimingStats();
-    std.debug.print("unified_decoder backend={s} prompt={d} decode_steps={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d} reset_parity=exact chunked_prefill_tolerance=0.0001\n", .{ @tagName(model.session.backend()), prompt.len, options.decoder_steps, options.iterations, reference.items.len, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0] });
+    std.debug.print("unified_decoder backend={s} prompt={d} decode_steps={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d} reset_parity=exact chunked_prefill_tolerance={d:.4}\n", .{ @tagName(model.session.backend()), prompt.len, options.decoder_steps, options.iterations, reference.items.len, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0], chunked_prefill_tolerance });
     std.debug.print("decoder_kernels prefill_calls={d} decode_greedy_calls={d} prepared_hits={d} runtime_prepared_hits={d}\n", .{ stats.prefill_calls, stats.decode_greedy_calls, stats.ensure_prepared_fast_hits, stats.runtime_prepare_fast_hits });
+    if (!chunked_prefill_pass) return error.ChunkedPrefillOutputChanged;
 }
 
 // Isolate tiny primitive timings from the CLI's other mode frames. Aligning

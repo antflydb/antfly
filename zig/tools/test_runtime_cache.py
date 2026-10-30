@@ -1815,7 +1815,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/gpu/masked_pool_program.h",
                     "src/graph/cuda_kernel_fold.zig",
                     "src/tile/source_inputs.zig",
-                    "src/ops/cuda/embedded_module.zig",
+                    "src/ops/cuda/driver_contract.zig", "src/ops/cuda/artifact.zig", "src/ops/cuda/context.zig", "src/ops/cuda/embedded_module.zig",
                     "src/ops/cuda/gated_delta.zig",
                     "src/ops/cuda/paged_attention_bf16.zig",
                     "src/ops/cuda/bf16_fusions.zig",

@@ -75,6 +75,43 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_models()
 
+    def model_reference(self, value=1.0, tolerance=.002):
+        import struct
+        path = self.root / 'oracle.bin'
+        raw = struct.pack('<f', value)
+        path.write_bytes(raw)
+        config = json.loads(self.config.read_text())
+        config['cases'][0]['output_reference'] = dict(path=str(path), sha256=qualification.digest(raw), atol=tolerance)
+        self.config.write_text(json.dumps(config))
+        return path
+
+    def test_model_reference_preserves_default_bitwise_gate_and_checks_both_arms(self):
+        self.executable('candidate', '1.001')
+        self.assertFalse(self.run_models())
+        self.model_reference()
+        self.assertTrue(self.run_models())
+        receipt = json.loads((self.root / 'receipt.json').read_text())
+        self.assertTrue(all(x['reference_pass'] for x in receipt['cases'][0]['arms']))
+        self.assertFalse(receipt['cases'][0]['arms'][1]['byte_identical'])
+        self.executable('baseline', '1.01')
+        self.assertFalse(self.run_models())
+        self.executable('baseline', '1.0')
+        self.executable('candidate', '1.01')
+        self.assertFalse(self.run_models())
+
+    def test_model_reference_rejects_stale_nonfinite_and_invalid_budgets(self):
+        for tolerance in (-1, float('nan'), float('inf'), True):
+            self.model_reference(tolerance=tolerance)
+            with self.assertRaises(ValueError):
+                self.run_models()
+        self.model_reference(value=float('nan'))
+        with self.assertRaises(ValueError):
+            self.run_models()
+        path = self.model_reference()
+        path.write_bytes(b'changed')
+        with self.assertRaises(ValueError):
+            self.run_models()
+
     def test_reference_output_uses_versioned_protocol(self):
         import struct
         (self.root / 'reference.bin').write_bytes(struct.pack('<f', 1) + b'guard')

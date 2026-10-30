@@ -31,6 +31,17 @@ FLASH_SYMBOLS = (
 
 
 class RegenCudaArtifactsTest(unittest.TestCase):
+    def test_deployment_driver_floors_match_the_artifact_compiler(self) -> None:
+        # A future toolkit bump must update PTX admission instead of accepting
+        # an older JIT driver merely because the fatbin compression is readable.
+        header = (ARTIFACTS / "inference_cuda_kernels.ptx").read_text()[:4096]
+        major, minor = map(int, re.search(r"release (\d+)\.(\d+),", header).groups())
+        contract = (ARTIFACTS.parent / "driver_contract.zig").read_text()
+        native = int(re.search(r"native_driver_version = (\d+);", contract)[1])
+        ptx = int(re.search(r"ptx_driver_version = (\d+);", contract)[1])
+        self.assertEqual(native, major * 1000)
+        self.assertEqual(ptx, major * 1000 + minor * 10)
+
     def test_jit_identity_covers_transitive_local_headers_and_launch_contracts(self) -> None:
         inference = SCRIPT.parent.parent
         identity = (inference / "build" / "jit_identity.zig").read_text()

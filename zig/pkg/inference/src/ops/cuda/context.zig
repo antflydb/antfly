@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const driver_mod = @import("driver.zig");
+const artifact = @import("artifact.zig");
 
 const CudaDriver = driver_mod.CudaDriver;
 const CUcontext = driver_mod.CUcontext;
@@ -119,6 +120,24 @@ pub const CudaContext = struct {
         info.name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;
 
         checkStep(&driver, "cuDeviceComputeCapability", driver.fns.cuDeviceComputeCapability(&info.compute_major, &info.compute_minor, device)) catch |err| return err;
+
+        // Reject incompatible images before retaining a context or allocating
+        // device storage. Do not confuse toolkit installation with driver API
+        // capability, or impose the PTX compiler floor on bundled native code.
+        _ = artifact.contract.admit(artifact.profile, info.driver_version, info.compute_major, info.compute_minor) catch |err| {
+            if (err == error.CudaDriverTooOld) {
+                const path = try artifact.contract.loadPath(artifact.profile, info.compute_major, info.compute_minor);
+                const required = artifact.contract.requiredDriver(path);
+                std.log.err("CUDA {s} on {s} (sm_{d}{d}) needs driver API {d}.{d} for {s} code; found {d}.{d}. Upgrade the NVIDIA driver{s}.", .{
+                    artifact.mode,                                  info.nameSlice(),                                                                                       info.compute_major, info.compute_minor,
+                    @divTrunc(required, 1000),                      @divTrunc(@mod(required, 1000), 10),                                                                    @tagName(path),     @divTrunc(info.driver_version, 1000),
+                    @divTrunc(@mod(info.driver_version, 1000), 10), if (path == .ptx) "; use the fatbin build on supported GPUs to avoid PTX JIT" else " to R580 or newer",
+                });
+            } else {
+                std.log.err("CUDA {s} artifact cannot run on {s} (sm_{d}{d}); use a matching fatbin or portable build on compute capability 7.5 or newer.", .{ artifact.mode, info.nameSlice(), info.compute_major, info.compute_minor });
+            }
+            return err;
+        };
 
         var ctx: CUcontext = null;
         checkStep(&driver, "cuDevicePrimaryCtxRetain", driver.fns.cuDevicePrimaryCtxRetain(&ctx, device)) catch |err| return err;

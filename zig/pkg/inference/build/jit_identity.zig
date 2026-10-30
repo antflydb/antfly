@@ -103,6 +103,9 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/metal/generated/tile_whisper_logits_partials.msl.h",
     };
     const cuda_dependencies = [_][]const u8{
+        "src/ops/cuda/driver_contract.zig",
+        "src/ops/cuda/artifact.zig",
+        "src/ops/cuda/context.zig",
         "src/ops/cuda/embedded_module.zig",
         "src/ops/cuda/gated_delta.zig",
         "src/ops/cuda/paged_attention_bf16.zig",

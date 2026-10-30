@@ -6,7 +6,8 @@
 Model configs contain cases [{name, args, timing_prefix?}], arm_order and
 optional environment/cpu_affinity. Args are literal argv (no shell); --output
 is supplied by this runner. All arms must produce finite, byte-identical F32
-outputs. Independent operator references remain separate required gates.
+outputs by default. A case may explicitly pin an independent F32 reference and
+absolute tolerance instead. Independent operator references remain required gates.
 """
 import argparse
 import array
@@ -51,6 +52,21 @@ def models(args):
         current = {'name': case['name'], 'arms': []}
         receipt['cases'].append(current)
         reference = None
+        oracle = None
+        spec = case.get('output_reference')
+        if spec is not None:
+            if not isinstance(spec, dict) or set(spec) != {'path', 'sha256', 'atol'}:
+                raise ValueError('output_reference requires path, sha256 and atol')
+            tolerance = spec['atol']
+            if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) or tolerance < 0:
+                raise ValueError('reference tolerance must be finite and nonnegative')
+            raw = Path(spec['path']).read_bytes()
+            if digest(raw) != spec['sha256'] or not raw or len(raw) % 4:
+                raise ValueError('invalid or changed model reference')
+            oracle = array.array('f')
+            oracle.frombytes(raw)
+            if not all(math.isfinite(x) for x in oracle):
+                raise ValueError('model reference must be finite')
         for index, arm in enumerate(order):
             stem = args.results / (case['name'] + '-%02d-' % index + arm)
             output = Path(str(stem) + '.f32')
@@ -82,10 +98,16 @@ def models(args):
                     row['finite'] = bool(values) and all(math.isfinite(x) for x in values)
                     reference = raw if reference is None else reference
                     row.update(sha256=digest(raw), byte_identical=raw == reference)
+                    if oracle is not None:
+                        row['reference_pass'] = bool(row['finite'] and len(values) == len(oracle))
+                        if row['reference_pass']:
+                            delta = max(abs(x - y) for x, y in zip(values, oracle))
+                            row['reference_max_abs'] = delta
+                            row['reference_pass'] = delta <= tolerance
             current['arms'].append(row)
             save(args.results / 'receipt.json', receipt)
             print(case['name'], index, arm, row['returncode'], row['timing'], flush=True)
-        summary = {'numerical_pass': all(x.get('finite') and x.get('byte_identical')
+        summary = {'numerical_pass': all(x.get('finite') and (x.get('reference_pass') if oracle is not None else x.get('byte_identical'))
                                          and x['returncode'] == 0 for x in current['arms'])}
         for key, limit in [('p50_ns', 1.05), ('p95_ns', 1.10)]:
             values = {arm: [int(x['timing'][key]) for x in current['arms']

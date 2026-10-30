@@ -19,7 +19,7 @@ set -euo pipefail
 usage() {
   printf 'usage: %s [--check|--write|--check-source-policy] [--portable|--fatbin|--sm89|--all]\n' "$0"
   printf 'Regenerates checked-in CUDA artifacts with the pinned CUDA 13.2 toolkit contract.\n'
-  printf 'Fatbin uses fast compression for every image and requires CUDA 12.4+ drivers.\n'
+  printf 'Fatbin uses fast compression (format floor CUDA 12.4); deployment requires CUDA 13 native / 13.2 PTX driver support.\n'
 }
 
 mode="check"

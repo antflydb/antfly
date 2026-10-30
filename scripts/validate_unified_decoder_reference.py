@@ -151,6 +151,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--output", action="append", required=True, type=Path)
+    parser.add_argument("--prefill-output", action="append", default=[], type=Path, help="Chunked-prefill final-prompt logits, checked against the same independent reference")
+    parser.add_argument("--reference-output", type=Path, help="Write the independently computed full-logit F32 reference")
     parser.add_argument("--prompt-length", type=int, default=8)
     parser.add_argument("--decode-steps", type=int, default=4)
     parser.add_argument("--tolerance", type=float, required=True)
@@ -166,12 +168,16 @@ def main():
     for step in range(options.decode_steps):
         hidden = model.forward(11 + step, options.prompt_length + step)
         reference.extend(model.logits(hidden))
+    if options.reference_output:
+        options.reference_output.write_bytes(array.array("f", reference).tobytes())
     passed = True
-    for path in options.output:
+    outputs = [(path, options.decode_steps + 1) for path in options.output]
+    outputs += [(path, 1) for path in options.prefill_output]
+    for path, steps in outputs:
         values = float32_values(path.read_bytes())
-        if len(values) != len(reference) or not all(math.isfinite(v) for v in values):
+        if len(values) != model.vocab * steps or not all(math.isfinite(v) for v in values):
             raise ValueError(f"invalid output length or nonfinite logits: {path}")
-        for step in range(options.decode_steps + 1):
+        for step in range(steps):
             start, end = step * model.vocab, (step + 1) * model.vocab
             deltas = [abs(a - b) for a, b in zip(values[start:end], reference[start:end])]
             maximum = max(deltas)

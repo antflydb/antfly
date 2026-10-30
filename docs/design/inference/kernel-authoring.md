@@ -148,9 +148,20 @@ model adapters around operation-named launch ownership when needed.
 
 `regen-cuda-artifacts.sh` preserves all seven native targets and compute75 PTX,
 and uses fast compression for every fatbin image. That format requires CUDA
-12.4-compatible or newer drivers and trades about 1 ms of measured module
+12.4-compatible or newer drivers at the format level; the canonical runtime
+enforces CUDA Driver API 13.0 for native images and 13.2 for bundled PTX JIT.
+See the inference README for deployment requirements. Compression trades about
+1 ms of measured module
 loading/first-launch time for a substantially smaller packaged image. Validate
 exports through `cuobjdump` entry symbol tables; compressed blobs cannot be
 checked reliably with raw byte searches. Portable PTX and standalone SM89 remain
 separate profiles. Record packaged size, native code/resource identity and
 startup cost separately; see `unified-execution-bk-outcomes.md`.
+
+Model comparisons use exact output identity by default. If a model has an
+explicit numerical budget, pin an independently generated F32 reference by SHA-256
+and declare its absolute tolerance in the qualification case. Both revisions
+must meet that reference; the baseline is never implicitly trusted as an oracle.
+A baseline reference failure remains a failure, even when the candidate passes.
+Export full and chunked-prefill logits to check state/position handling against
+the same independent decoder reference without widening the chunk parity gate.

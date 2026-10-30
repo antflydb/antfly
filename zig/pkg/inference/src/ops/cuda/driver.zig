@@ -88,7 +88,7 @@ pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: CUjit_option = 4;
 pub const CU_JIT_ERROR_LOG_BUFFER: CUjit_option = 5;
 pub const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: CUjit_option = 6;
 
-pub const Error = error{
+pub const Error = @import("driver_contract.zig").Error || error{
     CudaUnavailable,
     CudaSymbolMissing,
     CudaDriverError,
