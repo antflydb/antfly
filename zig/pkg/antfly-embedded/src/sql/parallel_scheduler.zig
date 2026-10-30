@@ -197,24 +197,34 @@ pub const Scheduler = struct {
     /// caches. Release execution admission at completion, while Task still owns
     /// the join and the descriptor needed for canceled-before-start workers.
     pub fn submitTransient(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
-        return self.submitTransientClass(.cpu, io, bytes, function, args);
+        return self.submitTransientClass(.cpu, io, bytes, null, function, args);
     }
     pub fn submitIoTransient(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
-        return self.submitTransientClass(.io, io, bytes, function, args);
+        return self.submitTransientClass(.io, io, bytes, null, function, args);
     }
-    fn submitTransientClass(self: *Scheduler, class: Class, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+    /// Notify only after execution admission is released and readiness published.
+    /// A bounded coordinator can drain whichever phase finishes first without
+    /// retaining a CPU slot during provider I/O or polling ordered futures.
+    pub fn submitNotified(self: *Scheduler, io: std.Io, bytes: usize, done: *std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        return self.submitTransientClass(.cpu, io, bytes, done, function, args);
+    }
+    pub fn submitIoNotified(self: *Scheduler, io: std.Io, bytes: usize, done: *std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        return self.submitTransientClass(.io, io, bytes, done, function, args);
+    }
+    fn submitTransientClass(self: *Scheduler, class: Class, io: std.Io, bytes: usize, done: ?*std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         const Result = @TypeOf(@call(.auto, function, args));
         if (!self.acquireClass(class, bytes)) return null;
         const admission = std.heap.page_allocator.create(Admission) catch {
             self.releaseClass(class, bytes);
             return null;
         };
-        admission.* = .{ .scheduler = self, .bytes = bytes, .class = class };
+        admission.* = .{ .scheduler = self, .bytes = bytes, .class = class, .done = done, .io = io };
         const Worker = struct {
             fn run(control: *Admission, arguments: @TypeOf(args)) Result {
                 defer {
                     control.release();
                     control.completed.store(true, .release);
+                    if (control.done) |event| event.set(control.io);
                 }
                 return @call(.auto, function, arguments);
             }
@@ -350,6 +360,8 @@ pub const Execution = struct {
 };
 
 const Admission = struct {
+    done: ?*std.Io.Event = null,
+    io: std.Io,
     scheduler: *Scheduler,
     bytes: usize,
     class: Class,

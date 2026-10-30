@@ -192,7 +192,7 @@ pub const Cache = struct {
                 // Consumer allocation/materialization policy is deliberately
                 // absent from physical page keys. Retry with this reader's
                 // loader instead of inheriting another reader's smaller cap.
-                if (failure == error.Canceled or failure == error.DeadlineExceeded or failure == error.OutOfMemory or failure == error.SqlMemoryLimitExceeded or failure == error.ParquetRowGroupTooLarge) continue;
+                if (failure == error.Canceled or failure == error.DeadlineExceeded or failure == error.OutOfMemory or failure == error.SqlMemoryLimitExceeded or failure == error.ParquetRowGroupTooLarge or failure == error.ParquetPageTooLarge) continue;
                 return failure;
             }
             if (self.exclusive_loading or (!exclusive and self.exclusive_waiters != 0) or (exclusive and self.flights.count() != 0) or self.flights.count() >= self.max_loaders) {

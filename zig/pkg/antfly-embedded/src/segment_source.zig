@@ -53,6 +53,7 @@ pub const SourceVisitor = struct {
 /// Optional provider-owned immutable interpretations. The loader is borrowed
 /// only during acquire; cached values contain no source or request callbacks.
 pub const Decoded = struct {
+    retained_bytes: usize = 0,
     value: *const anyopaque,
     owner: *anyopaque,
     item: *anyopaque,
@@ -61,7 +62,10 @@ pub const Decoded = struct {
         self.release_fn(self.owner, self.item);
     }
 };
+pub const DecodeClass = enum { navigation, text_page };
 pub const DecodeRequest = struct {
+    /// Payload pages have separate residency from compact navigation.
+    class: DecodeClass = .navigation,
     offset: u64,
     length: u64,
     interpretation: [32]u8,

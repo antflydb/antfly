@@ -10856,3 +10856,162 @@ test "external lake Parquet live admission wakes parallel input waiters without 
     try future.await(io);
     try std.testing.expectEqual(@as(usize, 0), state.input);
 }
+
+test "external lake Parquet live admission cold flight retries under each reader quota" {
+    const Admission = @import("lake_parquet_admission.zig");
+    const Decoded = @import("lake_decoded_cache.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const tight = try Admission.create(a, 8192, 8192, 8192);
+    defer tight.release();
+    const held = try tight.claim(4096, null);
+    defer held.release();
+    try held.cached(15 * 1024);
+    const page = try tight.claim(512, null);
+    defer page.release();
+    const broad = try Admission.create(a, 65536, 65536, 8192);
+    defer broad.release();
+    var cache: Decoded.Cache = .{ .a = a };
+    defer cache.deinit();
+    var started: std.Io.Event = .unset;
+    var finish: std.Io.Event = .unset;
+    const Loader = struct {
+        cache: *Decoded.Cache,
+        admission: *Admission,
+        started: *std.Io.Event,
+        finish: *std.Io.Event,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn load(raw: *anyopaque, item: *Decoded.Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            var loading: Admission.Loading = undefined;
+            try loading.begin(self.admission, item);
+            defer loading.end();
+            self.started.set(std.testing.io);
+            try self.finish.wait(std.testing.io);
+            _ = item.arena.allocator().alloc(u8, 4096) catch |err| {
+                if (loading.failed) return error.ParquetPageTooLarge;
+                return err;
+            };
+        }
+        fn run(self: *@This()) !Decoded.Lease {
+            return self.cache.acquire(@splat(19), 8192, .{ .io = std.testing.io }, .{ .ptr = self, .load = load });
+        }
+    };
+    var first: Loader = .{ .cache = &cache, .admission = tight, .started = &started, .finish = &finish };
+    var second: Loader = .{ .cache = &cache, .admission = broad, .started = &started, .finish = &finish };
+    var leader = try io.concurrent(Loader.run, .{&first});
+    defer _ = leader.cancel(io) catch {};
+    try started.wait(io);
+    var follower = try io.concurrent(Loader.run, .{&second});
+    var follower_joined = false;
+    defer if (!follower_joined) {
+        if (follower.cancel(io)) |lease| lease.release() else |_| {}
+    };
+    var joined = false;
+    for (0..1000) |_| {
+        while (!cache.mutex.tryLock()) std.atomic.spinLoopHint();
+        joined = if (cache.flights.get(@splat(19))) |flight| flight.refs > 1 else false;
+        cache.mutex.unlock();
+        if (joined) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // Unblock both tasks even if the synchronization assertion fails.
+    finish.set(io);
+    try std.testing.expect(joined);
+    try std.testing.expectError(error.ParquetPageTooLarge, leader.await(io));
+    const outcome = follower.await(io);
+    follower_joined = true;
+    const result = try outcome;
+    defer result.release();
+    try std.testing.expectEqual(@as(usize, 1), second.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 15 * 1024), tight.resident);
+    try std.testing.expectEqual(@as(usize, 0), broad.resident);
+}
+
+test "external lake Parquet page phases leave CPU admission free during delayed fetch and cancel cleanly" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Scheduler = @import("../../sql/parallel_scheduler.zig");
+    const serving = @import("lake_serving_cache.zig");
+    const Cursor = @import("lake_parquet_cursor.zig").Cursor;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try appendPlainI64DataPage(&bytes, a, &.{11});
+    const split = bytes.items.len;
+    try appendPlainI64DataPage(&bytes, a, &.{22});
+    var chunks = [_]external_source.ColumnChunk{
+        .{ .column_id = @constCast("a"), .file_offset = 0, .compressed_len = split, .uncompressed_len = split, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+        .{ .column_id = @constCast("b"), .file_offset = split, .compressed_len = bytes.items.len - split, .uncompressed_len = bytes.items.len - split, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+    };
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 1, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = @constCast("version"), .byte_len = bytes.items.len, .row_count = 1, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const Reader = struct {
+        bytes: []const u8,
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn read(raw: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.calls.fetchAdd(1, .acq_rel) + 1 == 2) self.entered.set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+            return allocator.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+        }
+        fn run(cursor: *Cursor) !?@import("../../storage/rowsource/types.zig").ColumnBatch {
+            return cursor.next();
+        }
+        fn cpu() usize {
+            return 7;
+        }
+    };
+    var delayed: Reader = .{ .bytes = bytes.items };
+    var scheduler: Scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 2 };
+    var cache = serving.Cache.init(a);
+    defer cache.deinit();
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var shared: serving.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(memory.client()), .scope = @splat(0), .context = .{ .io = io } };
+    defer shared.drain(true);
+    for ([_]bool{ false, true }) |cancel| {
+        delayed.entered.reset();
+        delayed.gate.reset();
+        delayed.calls.store(0, .release);
+        var cursor = try Cursor.init(a, .{ .ctx = &delayed, .read_range_alloc = Reader.read }, inventory, "data", 0, &.{ "a", "b" }, .{ .max_input_bytes = 1024 * 1024, .max_decoded_bytes = 1024 * 1024 });
+        defer cursor.deinit();
+        cursor.shared_reader = &shared;
+        cursor.scheduler = &scheduler;
+        // A separate scope makes both passes physically cold.
+        shared.scope = @splat(@intFromBool(cancel));
+        var future = try io.concurrent(Reader.run, .{&cursor});
+        var joined = false;
+        defer if (!joined) {
+            _ = future.cancel(io) catch {};
+        };
+        try delayed.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
+        while (!scheduler.mutex.tryLock()) std.atomic.spinLoopHint();
+        const io_workers = scheduler.io_workers;
+        const cpu_workers = scheduler.workers - scheduler.io_workers;
+        scheduler.mutex.unlock();
+        try std.testing.expectEqual(@as(usize, 2), io_workers);
+        try std.testing.expectEqual(@as(usize, 0), cpu_workers);
+        var unrelated = scheduler.submit(io, 1, Reader.cpu, .{}) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 7), unrelated.await(io));
+        if (cancel) {
+            const result = future.cancel(io);
+            joined = true;
+            try std.testing.expectError(error.Canceled, result);
+        } else {
+            delayed.gate.set(io);
+            const outcome = future.await(io);
+            joined = true;
+            const batch = (try outcome).?;
+            try std.testing.expectEqual(@as(i64, 11), try batch.columns[0].integerAt(0));
+            try std.testing.expectEqual(@as(i64, 22), try batch.columns[1].integerAt(0));
+        }
+        try std.testing.expectEqual(@as(usize, 0), cursor.admission.input);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
+}

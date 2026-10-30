@@ -289,18 +289,94 @@ pub const Text = struct {
         const size = std.mem.readInt(u32, entry[40..44], .little);
         return try offsets.prepare(a, try View.init(self.view.source, self.view.offset + start, size), self.length, std.mem.readInt(u32, entry[44..48], .little), std.mem.readInt(u32, entry[48..52], .little), selection, control);
     }
-    /// Own only final bounded UTF-8 chunks; decompression buffers are reclaimable.
+    /// Adopts a cache pin on both success and failure. The result owner must
+    /// release all adopted pins, including after a later chunk fails.
+    pub const Retainer = struct {
+        ptr: *anyopaque,
+        adopt: *const fn (*anyopaque, @import("../segment_source.zig").Decoded) anyerror!void,
+        dispatch: @import("antfly_runtime_abi").callback_abi.CallbackDispatch = Boundary.local_dispatch,
+        const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { adopt: *const fn (*anyopaque, @import("../segment_source.zig").Decoded) anyerror!void });
+        fn retain(self: @This(), lease: @import("../segment_source.zig").Decoded) !void {
+            return Boundary.call("adopt", self.dispatch, self.adopt, .{ self.ptr, lease });
+        }
+    };
+    const DecodedPage = struct { bytes: []const u8 };
+    const PageBytes = struct {
+        bytes: []const u8,
+        lease: ?@import("../segment_source.zig").Decoded = null,
+        allocation: ?A = null,
+        fn deinit(self: PageBytes) void {
+            if (self.lease) |lease| lease.release();
+            if (self.allocation) |a| a.free(self.bytes);
+        }
+    };
+    /// Decode into cache-owned memory once. Only immutable bytes survive the
+    /// synchronous loader; neither a source nor a query callback is retained.
+    fn page(self: Text, a: A, index: usize, control: Token) !PageBytes {
+        try control.check();
+        const entry = self.pages[index * 32 ..][0..16];
+        const offset = std.mem.readInt(u64, entry[0..8], .little);
+        const wire = std.mem.readInt(u32, entry[8..12], .little);
+        const raw = std.mem.readInt(u32, entry[12..16], .little);
+        const Loader = struct {
+            text: Text,
+            offset: u64,
+            wire: u32,
+            raw: u32,
+            fn bytes(loader_: @This(), output: A, temporary: A) ![]u8 {
+                const encoded = try temporary.alloc(u8, loader_.wire);
+                defer temporary.free(encoded);
+                try loader_.text.view.readInto(loader_.offset, encoded);
+                const out = try output.alloc(u8, loader_.raw);
+                errdefer output.free(out);
+                try snappy.decodeInto(encoded, out);
+                return out;
+            }
+            fn decode(context: *anyopaque, output: A) !*const anyopaque {
+                const loader_: *@This() = @ptrCast(@alignCast(context));
+                const value = try output.create(DecodedPage);
+                value.* = .{ .bytes = try loader_.bytes(output, @import("../sql/memory_budget.zig").reclaimingAllocator(output)) };
+                return value;
+            }
+        };
+        var loader: Loader = .{ .text = self, .offset = offset, .wire = wire, .raw = raw };
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("source-text-page-snappy-v1");
+        hash.update(entry[12..16]);
+        var interpretation: [32]u8 = undefined;
+        hash.final(&interpretation);
+        if (try self.view.source.acquireDecoded(.{ .class = .text_page, .offset = self.view.offset + offset, .length = wire, .interpretation = interpretation, .context = &loader, .decode = Loader.decode })) |lease| {
+            errdefer lease.release();
+            try control.check();
+            const value: *const DecodedPage = @ptrCast(@alignCast(lease.value));
+            if (value.bytes.len != raw) return error.InvalidData;
+            return .{ .bytes = value.bytes, .lease = lease };
+        }
+        return .{ .bytes = try loader.bytes(a, a), .allocation = a };
+    }
+    /// Own final bounded UTF-8 chunks when no cache-pin consumer is supplied.
     pub fn readChunks(self: Text, a: A, control: Token) ![]const []const u8 {
+        return self.chunks(a, control, null);
+    }
+    /// Borrow decoded pages through the result owner's pins. Only a codepoint
+    /// split at a physical boundary needs copying. Fallback remains owned.
+    pub fn readChunksRetained(self: Text, a: A, control: Token, retainer: Retainer) ![]const []const u8 {
+        return self.chunks(a, control, retainer);
+    }
+    fn chunks(self: Text, a: A, control: Token, retainer: ?Retainer) ![]const []const u8 {
         const work = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
-        var parts: std.ArrayList([]const u8) = .empty;
+        const Part = struct { bytes: []const u8, owned: bool };
+        var parts: std.ArrayList(Part) = .empty;
         defer parts.deinit(work);
-        errdefer for (parts.items) |part| a.free(part);
+        errdefer for (parts.items) |part| if (part.owned) {
+            a.free(part.bytes);
+        };
         const Append = struct {
-            fn copy(output: A, temporary: A, list: *std.ArrayList([]const u8), bytes: []const u8) !void {
+            fn add(output: A, temporary: A, list: *std.ArrayList(Part), bytes: []const u8, borrow: bool) !void {
                 if (bytes.len == 0) return;
-                const owned = try output.dupe(u8, bytes);
-                errdefer output.free(owned);
-                try list.append(temporary, owned);
+                const value = if (borrow) bytes else try output.dupe(u8, bytes);
+                errdefer if (!borrow) output.free(value);
+                try list.append(temporary, .{ .bytes = value, .owned = !borrow });
             }
         };
         var carry: [4]u8 = undefined;
@@ -316,16 +392,22 @@ pub const Text = struct {
                     self.view.source.prefetch(self.view.offset + std.mem.readInt(u64, entry[0..8], .little), std.mem.readInt(u32, entry[8..12], .little));
                 }
             }
-            const end = @min(self.length, at +| page_size);
-            const bytes = try self.read(work, at, end, control);
-            defer work.free(bytes);
+            var fetched = try self.page(work, index, control);
+            defer fetched.deinit();
+            const bytes = fetched.bytes;
+            const borrow = retainer != null and fetched.lease != null;
+            if (borrow) {
+                const lease = fetched.lease.?;
+                fetched.lease = null;
+                try retainer.?.retain(lease);
+            }
             var begin: usize = 0;
             if (held != 0) {
                 const width = try std.unicode.utf8ByteSequenceLength(carry[0]);
                 const needed = width - held;
                 if (needed > bytes.len) return error.InvalidData;
                 @memcpy(carry[held..width], bytes[0..needed]);
-                try Append.copy(a, work, &parts, carry[0..width]);
+                try Append.add(a, work, &parts, carry[0..width], false);
                 begin = needed;
                 held = 0;
             }
@@ -340,11 +422,13 @@ pub const Text = struct {
                     stop = lead;
                 }
             }
-            try Append.copy(a, work, &parts, bytes[begin..stop]);
-            at = end;
+            try Append.add(a, work, &parts, bytes[begin..stop], borrow);
+            at += @intCast(bytes.len);
         }
         if (held != 0) return error.InvalidData;
-        return a.dupe([]const u8, parts.items);
+        const result = try a.alloc([]const u8, parts.items.len);
+        for (result, parts.items) |*out, part| out.* = part.bytes;
+        return result;
     }
     pub fn read(self: Text, a: A, first: u32, end: u32, control: Token) ![]u8 {
         if (first > end or end > self.length) return error.InvalidData;
@@ -365,15 +449,9 @@ pub const Text = struct {
                 const future = self.pages[hinted * 32 ..][0..16];
                 self.view.source.prefetch(self.view.offset + std.mem.readInt(u64, future[0..8], .little), std.mem.readInt(u32, future[8..12], .little));
             }
-            const entry = self.pages[index * 32 ..][0..16];
-            const offset = std.mem.readInt(u64, entry[0..8], .little);
-            const n = std.mem.readInt(u32, entry[8..12], .little);
-            const encoded = try work.alloc(u8, n);
-            defer work.free(encoded);
-            try self.view.readInto(offset, encoded);
-            const raw = try work.alloc(u8, std.mem.readInt(u32, entry[12..16], .little));
-            defer work.free(raw);
-            try snappy.decodeInto(encoded, raw);
+            const fetched = try self.page(work, index, control);
+            defer fetched.deinit();
+            const raw = fetched.bytes;
             const at = begin % page_size;
             const stop = @min(end - begin, raw.len - at);
             @memcpy(out[begin - first ..][0..stop], raw[at..][0..stop]);
@@ -805,4 +883,128 @@ test "highlight chunked source delivery preserves UTF8 across page boundaries wi
     }
     try std.testing.expectEqual(text.items.len, at);
     try std.testing.expect(parts.len >= 3);
+}
+
+test "highlight shared decoded text pages retain immutable chunks and fence authority on warm hits" {
+    const source_module = @import("../segment_source.zig");
+    const Decoded = @import("../serverless/query/lake_decoded_cache.zig");
+    const a = std.testing.allocator;
+    const Provider = struct {
+        const Self = @This();
+        bytes: []const u8,
+        cache: Decoded.Cache,
+        reads: usize = 0,
+        decodes: usize = 0,
+        denied: bool = false,
+        missing: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.missing) return error.FileNotFound;
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.denied) return error.Canceled;
+        }
+        fn acquire(raw: *anyopaque, request: source_module.DecodeRequest) !?source_module.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (request.class != .text_page) return null;
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update(&request.interpretation);
+            hash.update(std.mem.asBytes(&request.offset));
+            hash.update(std.mem.asBytes(&request.length));
+            var key: [32]u8 = undefined;
+            hash.final(&key);
+            const Loader = struct {
+                provider: *Self,
+                request: source_module.DecodeRequest,
+                fn load(context: *anyopaque, item: *Decoded.Item) !void {
+                    const loader: *@This() = @ptrCast(@alignCast(context));
+                    loader.provider.decodes += 1;
+                    item.payload = .{ .extension = @constCast(try loader.request.invoke(item.arena.allocator())) };
+                }
+            };
+            var loader: Loader = .{ .provider = self, .request = request };
+            const lease = try self.cache.acquire(key, 256 * 1024, .{}, .{ .ptr = &loader, .load = Loader.load });
+            return .{ .value = lease.item.payload.extension, .owner = &self.cache, .item = lease.item, .release_fn = release, .retained_bytes = lease.item.budget.live };
+        }
+        fn release(owner: *anyopaque, item: *anyopaque) void {
+            (Decoded.Lease{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) }).release();
+        }
+    };
+    const Pins = struct {
+        items: std.ArrayList(source_module.Decoded) = .empty,
+        reject: bool = false,
+        fn adopt(raw: *anyopaque, lease: source_module.Decoded) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            errdefer lease.release();
+            if (self.reject) return error.InjectedFailure;
+            try self.items.append(std.testing.allocator, lease);
+        }
+        fn deinit(self: *@This()) void {
+            for (self.items.items) |lease| lease.release();
+            self.items.deinit(std.testing.allocator);
+        }
+    };
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendNTimes(a, 'x', page_size - 1);
+    try body.appendSlice(a, "🙂\n\"\\");
+    try body.appendNTimes(a, 'y', page_size + 17);
+    var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = body.items }, &.{});
+    try std.testing.expect(try writer.finish());
+    var provider: Provider = .{ .bytes = memory.out.items, .cache = .{ .a = a } };
+    defer provider.cache.deinit();
+    var cursor = Cursor.init(try Reader.init(a, try View.init(.{ .ranges = .{ .ptr = &provider, .length = provider.bytes.len, .read_into = Provider.read, .close = Provider.close, .check_read_context = Provider.check, .acquire_decoded = Provider.acquire } }, 0, provider.bytes.len)));
+    defer cursor.deinit();
+    const text = (try cursor.text(0)).?;
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    var pins: Pins = .{};
+    defer pins.deinit();
+    const chunks = try text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.adopt });
+    try std.testing.expectEqual(@as(usize, 3), provider.decodes);
+    const read_count = provider.reads;
+    provider.missing = true;
+    // Warm pages need neither source I/O nor a second decompression. Pins own
+    // full immutable payloads, independent of the cursor and its directory.
+    const again = try text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.adopt });
+    try std.testing.expectEqual(@as(usize, 3), provider.decodes);
+    try std.testing.expectEqual(read_count, provider.reads);
+    for (chunks, again) |before, after| try std.testing.expectEqualStrings(before, after);
+    try std.testing.expect(chunks[0].ptr == again[0].ptr);
+    var at: usize = 0;
+    for (chunks) |part| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(part));
+        try std.testing.expectEqualSlices(u8, body.items[at..][0..part.len], part);
+        at += part.len;
+    }
+    try std.testing.expectEqual(body.items.len, at);
+    provider.denied = true;
+    try std.testing.expectError(error.Canceled, text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.adopt }));
+    provider.denied = false;
+    var rejected: Pins = .{ .reject = true };
+    defer rejected.deinit();
+    try std.testing.expectError(error.InjectedFailure, text.readChunksRetained(output.allocator(), .none, .{ .ptr = &rejected, .adopt = Pins.adopt }));
+    // Uncached, retained results are reclaimed through the same result owner.
+    provider.missing = false;
+    var uncached = Provider{ .bytes = memory.out.items, .cache = .{ .a = a, .max_entries = 0 } };
+    defer uncached.cache.deinit();
+    var temporary = Cursor.init(try Reader.init(a, try View.init(.{ .ranges = .{ .ptr = &uncached, .length = uncached.bytes.len, .read_into = Provider.read, .close = Provider.close, .acquire_decoded = Provider.acquire } }, 0, uncached.bytes.len)));
+    var live = true;
+    defer if (live) temporary.deinit();
+    var temporary_pins: Pins = .{};
+    defer temporary_pins.deinit();
+    const retained = try (try temporary.text(0)).?.readChunksRetained(output.allocator(), .none, .{ .ptr = &temporary_pins, .adopt = Pins.adopt });
+    temporary.deinit();
+    live = false;
+    for (chunks, retained) |left, right| try std.testing.expectEqualStrings(left, right);
+    try std.testing.expectEqual(@as(usize, 0), uncached.cache.entries.count());
 }

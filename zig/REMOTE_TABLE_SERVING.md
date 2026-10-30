@@ -2330,3 +2330,57 @@ output options keep the standard encoder's semantics.
 These additional in-memory layout changes advance runtime ABI to **74**. Stored
 source recipe **v10**, reader protocol **96**, `AFOV0005` and persisted artifacts
 are unchanged.
+
+### Reader-local failures, shared text payloads and compact writes
+
+A shared cold decode does not give its initiating reader authority over another
+reader's memory policy. Waiters retry `ParquetPageTooLarge`, alongside other
+reader-local allocation and cancellation failures, using their own loader and
+live-byte owner. Physical cache keys remain independent of query quotas. An
+initiating reader still fails its own limit; a waiter cannot bypass that limit
+on its behalf.
+
+Native source interpretations distinguish compact navigation from decoded text
+payloads. Text pages use an independent bounded cache: at most 32 MiB resident
+(and no more than half the configured range-cache allowance), 512 entries and
+8 MiB of active loader admission. Each interpretation remains bounded to a
+64-KiB raw source page, authenticated by the immutable artifact, exact encoded
+range, codec and raw length. Its loader retains no source or request callbacks.
+Authority, cancellation and deadlines are checked even on warm hits. Cache
+pressure can fall back to independently owned bounded decoding.
+
+Result pages adopt decoded payload pins and borrow their UTF-8 chunks. A
+codepoint crossing a physical page boundary is copied into a tiny owned chunk;
+ordinary chunks share immutable page bytes. Pins outlive the corpus cursor and
+release before the result arena. Result residency includes pinned arena capacity,
+including uncached values returned when residency is unavailable. Snippet reads
+reuse a decoded page transiently and copy only their requested interval. There
+is no change to final response limits or canonical JSON escaping.
+
+Parquet advancement separates encoded fetching from CPU decoding. A coordinator
+keeps at most four column phases active and drains whichever phase completes
+first. Fetching uses I/O admission; only a complete encoded lease can enter CPU
+decoding. Dictionary pages return to fetching before the next data page. Encoded
+input credits remain owned across that transition, including while a decoder is
+queued. Cancellation joins every phase and releases even a decoder's input whose
+worker never started. Saturated execution admission retains a single caller
+fallback; scheduler workspace estimates do not replace actual cursor admission.
+
+Compact keys now remain as prefix/suffix views through sorted publication,
+incremental edits, retention, boundary joins, range differences, reductions and
+GC. Each builder level owns one seed and suffixes against it. Long comparisons
+use bounded vector loads; mutation probes normalize onto their input page once.
+Maintenance callbacks that require contiguous keys reuse one key buffer rather
+than expanding a complete page. Explicit compatibility `readPage` calls still
+reject more than 1 MiB of key expansion. Serving and maintenance use compact
+navigation, including row-identity health checks and aggregate routing.
+
+Prefix-enabled occupancy is bounded by encoded bytes, with the existing 1-MiB
+hard page limit, individual key/record limits, aggregate allowance and pending
+pack-locator reservation. The wire's logical key-byte total remains a checked
+u32. A long shared prefix no longer forces one object for each small handful of
+identities. This changes neither identity nor ordering semantics. Runtime ABI
+**75** fences the new callback layouts, and native reader protocol **97** fences
+publications whose compact pages exceed the older expansion policy. Stored
+source recipe **v10**, `AFOV0005`, `AFSC0005` and the page wire layout remain
+unchanged; older compact pages remain readable by the new reader.

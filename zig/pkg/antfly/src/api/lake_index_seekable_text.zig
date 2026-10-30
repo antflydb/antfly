@@ -1129,6 +1129,7 @@ const Owner = struct {
             std.mem.writeInt(u64, bounds[8..16], request.length, .little);
             hash.update(&bounds);
             hash.update(&request.interpretation);
+            hash.update(&.{@backingInt(request.class)});
             const Loader = struct {
                 request: local.segment_source.DecodeRequest,
                 fn load(context: *anyopaque, item: *Decoded.Item) !void {
@@ -1155,14 +1156,22 @@ const Owner = struct {
             context.additional_checkpoint = null;
             var key: [32]u8 = undefined;
             hash.final(&key);
-            const held = cached.cache.decoded.acquire(key, 1024 * 1024, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
+            const lane = switch (request.class) {
+                .navigation => &cached.cache.decoded,
+                .text_page => &cached.cache.text_pages,
+            };
+            const limit: usize = switch (request.class) {
+                .navigation => 1024 * 1024,
+                .text_page => 256 * 1024,
+            };
+            const held = lane.acquire(key, limit, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
                 try checkContext(self);
                 if (err == error.SqlMemoryLimitExceeded) return null;
                 return err;
             };
             errdefer held.release();
             try checkContext(self);
-            return .{ .value = held.item.payload.extension, .owner = held.cache, .item = held.item, .release_fn = releaseDecoded };
+            return .{ .value = held.item.payload.extension, .owner = held.cache, .item = held.item, .release_fn = releaseDecoded, .retained_bytes = held.item.budget.live };
         }
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));

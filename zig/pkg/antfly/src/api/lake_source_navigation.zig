@@ -220,7 +220,7 @@ fn reduceFiles(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
         const summary = if (height == 0) leaf: {
             const record = try std.json.parseFromSliceLeaky(Record, scratch.allocator(), entry.value, .{});
             const id = key(record.file.file_id);
-            if (!std.mem.eql(u8, entry.key, &id)) return error.InvalidNativeLakeFileState;
+            if (entry.keyView().order(tree.KeyView.from(&id)) != .eq) return error.InvalidNativeLakeFileState;
             break :leaf Summary{ .first = id, .last = id, .count = 1, .digest = proofHash(id, record.digest) };
         } else branch: {
             if (entry.aggregate.len == 0) return try a.alloc(u8, 0);

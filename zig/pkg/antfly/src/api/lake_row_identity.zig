@@ -440,7 +440,7 @@ pub fn validateRoots(backing: A, store: *stores.ArtifactStore, root: Root, token
         // generation repair hint. Health polling never performs an archive walk.
         if (value.bytes > reads) return;
         _ = scratch.reset(.retain_capacity);
-        var page = tree.readPage(scratch.allocator(), pages.store(), value) catch |err| return derivedReadFailure(err);
+        var page = tree.readNavigationPage(scratch.allocator(), pages.store(), value) catch |err| return derivedReadFailure(err);
         page.deinit(scratch.allocator());
     }
     var navigation_seen: std.StringHashMapUnmanaged(void) = .empty;

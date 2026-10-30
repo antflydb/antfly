@@ -23,6 +23,7 @@ Run before/after and after/before without overlapping builds, E2E or cleanup.
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -44,7 +45,12 @@ spec.loader.exec_module(bench)
 label, executable, source, mode = sys.argv[1:]
 assert mode in ("wide", "ascii", "escaped", "statistics")
 binary = Path(executable).resolve()
-base = root / ".benchmark-results/lake/live-admission-v1-qualified" / mode
+base = Path(
+    os.environ.get(
+        "ANTFLY_LAKE_DELIVERY_RESULTS",
+        root / ".benchmark-results/lake/live-admission-v1-qualified",
+    )
+) / mode
 shared = base / "input"
 shared.mkdir(parents=True, exist_ok=True)
 out = base / label

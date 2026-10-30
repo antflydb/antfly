@@ -279,16 +279,27 @@ pub const Hydrator = struct {
             fn retain(raw: *anyopaque, lease: local.storage_rowsource_types.ColumnOwner) !void {
                 try @as(*@This(), @ptrCast(@alignCast(raw))).page.adoptNativeLease(lease);
             }
+            fn adoptText(raw: *anyopaque, lease: local.segment_source.Decoded) !void {
+                const output: *@This() = @ptrCast(@alignCast(raw));
+                const Pin = struct {
+                    lease: local.segment_source.Decoded,
+                    fn release(context: *anyopaque) void {
+                        const pin: *@This() = @ptrCast(@alignCast(context));
+                        pin.lease.release();
+                    }
+                };
+                const pin = output.page.arena.allocator().create(Pin) catch |err| {
+                    lease.release();
+                    return err;
+                };
+                pin.* = .{ .lease = lease };
+                try output.page.adoptNativeLease(.{ .ptr = pin, .release_fn = Pin.release, .retained_bytes = lease.retained_bytes });
+            }
             fn text(raw: *anyopaque, _: A, row: usize, name: []const u8, value: local.section_source_column.Text) !bool {
                 const output: *@This() = @ptrCast(@alignCast(raw));
                 const control: @import("antfly_cancellation").CancellationToken = .{ .ptr = &output.input, .check_fn = Input.checkToken };
-                if (value.length > local.section_source_column.page_size) {
-                    const parts = try value.readChunks(output.page.arena.allocator(), control);
-                    try output.page.setNativeChunks(row, try output.index(name), parts);
-                } else {
-                    const bytes = try value.read(output.page.arena.allocator(), 0, value.length, control);
-                    try output.page.setNative(row, try output.index(name), .{ .string = bytes });
-                }
+                const parts = try value.readChunksRetained(output.page.arena.allocator(), control, .{ .ptr = output, .adopt = adoptText });
+                try output.page.setNativeChunks(row, try output.index(name), parts);
                 return true;
             }
         };

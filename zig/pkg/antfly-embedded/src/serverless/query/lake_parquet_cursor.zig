@@ -40,6 +40,7 @@ pub const Cursor = struct {
     prune_ptr: ?*anyopaque = null,
     prune_page: ?*const fn (*anyopaque, external.ColumnChunk, @import("lake_parquet_metadata.zig").IndexedPage) bool = null,
     shared_reader: ?*@import("lake_serving_cache.zig").Reader = null,
+    scheduler: ?*@import("../../sql/parallel_scheduler.zig").Scheduler = null,
     dictionary_decodes: usize = 0,
     pages_decoded: usize = 0,
     output: std.heap.ArenaAllocator,
@@ -269,9 +270,22 @@ pub const Cursor = struct {
         }
         try credit.cached(bytes);
     }
+    const Fetched = struct {
+        parsed: page.ParsedHeader,
+        len: usize,
+        end: u64,
+        lease: ranges.RangeLease,
+        cache_key: ?[32]u8,
+    };
     fn advance(self: *Cursor, column: *Column) !void {
         self.retire(column);
         try self.loadIndex(column);
+        while (try self.fetch(column)) |fetched| {
+            defer fetched.lease.release();
+            if (try self.decodeFetched(column, fetched)) return;
+        }
+    }
+    fn fetch(self: *Cursor, column: *Column) !?Fetched {
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         while (column.offset < end) {
             if (column.directory) |directory| {
@@ -304,7 +318,7 @@ pub const Cursor = struct {
                         column.offset += entry.len;
                         column.count = entry.rows;
                         column.consumed = @intCast(self.position - column.first);
-                        return;
+                        return null;
                     }
                 }
             }
@@ -316,7 +330,7 @@ pub const Cursor = struct {
                 column.offset += parsed.header_len + parsed.header.compressed_page_size;
                 column.count = parsed.header.value_count;
                 column.consumed = @intCast(self.position - column.first);
-                return;
+                return null;
             }
             const probe = try self.headerRead(column);
             var probe_held = true;
@@ -353,7 +367,7 @@ pub const Cursor = struct {
                     column.offset += len;
                     column.count = parsed.header.value_count;
                     column.consumed = @intCast(self.position - column.first);
-                    return;
+                    return null;
                 }
             };
             // Small pages are often already complete in the header probe.
@@ -366,136 +380,144 @@ pub const Cursor = struct {
                 probe_held = false;
             }
             const encoded_lease = if (reuse_probe) null else try self.read(column.offset, len);
-            defer if (encoded_lease) |lease| lease.release();
-            const encoded = if (encoded_lease) |lease| lease.bytes else probe.lease.bytes[0..len];
-            column.offset += len;
-            const credit = try self.admission.claim(parsed.header.uncompressed_page_size, if (parsed.header.page_type == .dictionary_page) null else column.dictionary_credit);
-            defer credit.release();
-            switch (parsed.header.page_type) {
-                .dictionary_page => {
-                    if (column.dictionary != null or column.first != 0) return error.InvalidParquetPage;
-                    if (self.shared_reader) |reader| {
-                        const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "chunk-dictionary-v1", .chunk = column.chunk }, .{});
-                        defer self.a.free(interpretation);
-                        const key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset - len, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
-                        var loader = struct {
-                            admission: *Admission,
-                            chunk: external.ColumnChunk,
-                            header: @TypeOf(parsed.header),
-                            bytes: []const u8,
-                            fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
-                                const value: *@This() = @ptrCast(@alignCast(raw));
-                                var loading: Admission.Loading = undefined;
-                                try loading.begin(value.admission, item);
-                                defer loading.end();
-                                const decoded = decodeDictionaryAlloc(item.arena.allocator(), value.chunk, value.header, value.bytes) catch |err| {
-                                    if (loading.failed) return error.ParquetPageTooLarge;
-                                    return err;
-                                };
-                                item.payload = .{ .dictionary = decoded };
-                            }
-                        }{ .admission = self.admission, .chunk = column.chunk, .header = parsed.header, .bytes = encoded[parsed.header_len..] };
-                        const lease = try reader.cache.decoded.acquire(key, @min(reader.cache.decoded.max_loading_bytes, self.limits.max_decoded_bytes *| 4), reader.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
-                        errdefer lease.release();
-                        try credit.growRaw(lease.item.payload.dictionary.retainedBytes());
-                        try credit.cached(lease.item.budget.live);
-                        column.dictionary_credit = credit.retain();
-                        column.dictionary_lease = lease;
-                        column.dictionary = lease.item.payload.dictionary;
-                    } else {
-                        const owner = try SharedDictionary.create(self.a, credit);
-                        var initialized = false;
-                        errdefer owner.discard(initialized);
-                        owner.value = try decodeDictionaryAlloc(owner.budget.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..]);
-                        initialized = true;
-                        try credit.growRaw(owner.value.retainedBytes());
-                        column.dictionary_credit = credit.retain();
-                        column.dictionary_owner = owner;
-                        column.dictionary = owner.value;
-                    }
-                    self.dictionary_decodes += 1;
-                    continue;
-                },
-                .data_page, .data_page_v2 => {},
-                else => return error.UnsupportedParquetPage,
-            }
-            const count: usize = parsed.header.value_count;
-            if (count == 0 or column.first + count > self.group.row_count) return error.ParquetRowGroupRowCountMismatch;
-            // A broad cohort benefits from a reusable complete decode. Choose
-            // sparse projection from this page's actual mask intersection,
-            // rather than a differently aligned predicate page's density.
-            const start: usize = @intCast(self.position - column.first);
-            const considered = @min(self.selected.len, count - start);
-            var survivors: usize = 0;
-            for (self.selected[0..considered]) |active| survivors += @intFromBool(active);
-            const sparse = considered != 0 and survivors <= considered / 2;
-            if ((!column.required and sparse) or (column.required and self.filter != null and self.filter.?.encoded and self.filter.?.select != null and !std.mem.eql(u8, column.chunk.logical_type, "decimal"))) {
-                if (try @import("lake_parquet_selected.zig").create(self.admission.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..], column.dictionary, self.limits.max_decoded_bytes *| 2 +| self.limits.max_struct_allocation_bytes)) |projection| {
-                    column.projection = projection;
-                    column.credit = credit.retain();
-                    self.encoded_predicate_pages += @intFromBool(column.required);
-                    column.count = count;
-                    column.consumed = @intCast(self.position - column.first);
-                    self.pages_decoded += 1;
-                    if (column.first + count == self.group.row_count and column.offset != end) return error.ParquetRowGroupRowCountMismatch;
-                    return;
-                }
-            }
-            var limits = self.limits;
-            limits.decimal_representation = .native_decimal;
-            limits.page_row_count = count;
-            limits.preserve_dictionary = true;
-            limits.page_encoding = parsed.header.encoding;
-            limits.max_rows = @max(limits.max_rows, count);
-            const input = [_]parquet.ColumnChunkInput{.{ .column_id = column.chunk.column_id, .bytes = encoded, .dictionary = if (column.dictionary) |*dictionary| dictionary else null }};
-            if (cache_key) |key| {
-                const cache = &self.shared_reader.?.cache.decoded;
-                if (column.dictionary_lease != null) limits.borrow_dictionary = true;
-                var loader = struct {
-                    cursor: *Cursor,
-                    input: []const parquet.ColumnChunkInput,
-                    limits: parquet.MaterializationLimits,
-                    dictionary: ?@import("lake_decoded_cache.zig").Lease,
-                    parsed: page.ParsedHeader,
-                    fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
-                        const value: *@This() = @ptrCast(@alignCast(raw));
-                        const cursor = value.cursor;
-                        var loading: Admission.Loading = undefined;
-                        try loading.begin(cursor.admission, item);
-                        defer loading.end();
-                        const decoded = parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits) catch |err| {
-                            if (loading.failed) return error.ParquetPageTooLarge;
-                            return err;
-                        };
-                        item.payload = .{ .columns = decoded.columns };
-                        item.parquet_page_header = value.parsed;
-                        if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
-                    }
-                }{ .cursor = self, .input = &input, .limits = limits, .dictionary = column.dictionary_lease, .parsed = parsed };
-                const lease = try cache.acquire(key, @min(cache.max_loading_bytes, self.limits.max_decoded_bytes *| 4 +| self.limits.max_struct_allocation_bytes), self.shared_reader.?.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
-                errdefer lease.release();
-                try self.chargeCached(column, lease, credit, parsed.header.uncompressed_page_size);
-                column.cached = lease;
-            } else {
-                // Uncached page leases retain their dictionary owner across
-                // cursor advancement and closure without copying dictionary values.
-                limits.borrow_dictionary = true;
-                const owner = try SharedColumns.create(self.a, credit);
-                var initialized = false;
-                errdefer owner.discard(initialized);
-                owner.value = try parquet.buildSupportedColumnsAllocWithLimits(owner.budget.allocator(), self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
-                initialized = true;
-                if (column.dictionary_owner) |dictionary| owner.dictionary = dictionary.retain();
-                column.decoded = owner;
-            }
-            column.credit = credit.retain();
-            column.count = count;
-            column.consumed = @intCast(self.position - column.first);
-            self.pages_decoded += 1;
-            if (column.first + count == self.group.row_count and column.offset != end) return error.ParquetRowGroupRowCountMismatch;
-            return;
+            if (reuse_probe) probe_held = false;
+            return .{ .parsed = parsed, .len = len, .end = end, .lease = encoded_lease orelse probe.lease, .cache_key = cache_key };
         }
         return error.ParquetRowGroupRowCountMismatch;
+    }
+
+    fn decodeFetched(self: *Cursor, column: *Column, fetched: Fetched) !bool {
+        const parsed = fetched.parsed;
+        const len = fetched.len;
+        const end = fetched.end;
+        const encoded = fetched.lease.bytes[0..len];
+        const cache_key = fetched.cache_key;
+        column.offset += len;
+        const credit = try self.admission.claim(parsed.header.uncompressed_page_size, if (parsed.header.page_type == .dictionary_page) null else column.dictionary_credit);
+        defer credit.release();
+        switch (parsed.header.page_type) {
+            .dictionary_page => {
+                if (column.dictionary != null or column.first != 0) return error.InvalidParquetPage;
+                if (self.shared_reader) |reader| {
+                    const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "chunk-dictionary-v1", .chunk = column.chunk }, .{});
+                    defer self.a.free(interpretation);
+                    const key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset - len, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
+                    var loader = struct {
+                        admission: *Admission,
+                        chunk: external.ColumnChunk,
+                        header: @TypeOf(parsed.header),
+                        bytes: []const u8,
+                        fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+                            const value: *@This() = @ptrCast(@alignCast(raw));
+                            var loading: Admission.Loading = undefined;
+                            try loading.begin(value.admission, item);
+                            defer loading.end();
+                            const decoded = decodeDictionaryAlloc(item.arena.allocator(), value.chunk, value.header, value.bytes) catch |err| {
+                                if (loading.failed) return error.ParquetPageTooLarge;
+                                return err;
+                            };
+                            item.payload = .{ .dictionary = decoded };
+                        }
+                    }{ .admission = self.admission, .chunk = column.chunk, .header = parsed.header, .bytes = encoded[parsed.header_len..] };
+                    const lease = try reader.cache.decoded.acquire(key, @min(reader.cache.decoded.max_loading_bytes, self.limits.max_decoded_bytes *| 4), reader.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+                    errdefer lease.release();
+                    try credit.growRaw(lease.item.payload.dictionary.retainedBytes());
+                    try credit.cached(lease.item.budget.live);
+                    column.dictionary_credit = credit.retain();
+                    column.dictionary_lease = lease;
+                    column.dictionary = lease.item.payload.dictionary;
+                } else {
+                    const owner = try SharedDictionary.create(self.a, credit);
+                    var initialized = false;
+                    errdefer owner.discard(initialized);
+                    owner.value = try decodeDictionaryAlloc(owner.budget.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..]);
+                    initialized = true;
+                    try credit.growRaw(owner.value.retainedBytes());
+                    column.dictionary_credit = credit.retain();
+                    column.dictionary_owner = owner;
+                    column.dictionary = owner.value;
+                }
+                self.dictionary_decodes += 1;
+                return false;
+            },
+            .data_page, .data_page_v2 => {},
+            else => return error.UnsupportedParquetPage,
+        }
+        const count: usize = parsed.header.value_count;
+        if (count == 0 or column.first + count > self.group.row_count) return error.ParquetRowGroupRowCountMismatch;
+        // A broad cohort benefits from a reusable complete decode. Choose
+        // sparse projection from this page's actual mask intersection,
+        // rather than a differently aligned predicate page's density.
+        const start: usize = @intCast(self.position - column.first);
+        const considered = @min(self.selected.len, count - start);
+        var survivors: usize = 0;
+        for (self.selected[0..considered]) |active| survivors += @intFromBool(active);
+        const sparse = considered != 0 and survivors <= considered / 2;
+        if ((!column.required and sparse) or (column.required and self.filter != null and self.filter.?.encoded and self.filter.?.select != null and !std.mem.eql(u8, column.chunk.logical_type, "decimal"))) {
+            if (try @import("lake_parquet_selected.zig").create(self.admission.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..], column.dictionary, self.limits.max_decoded_bytes *| 2 +| self.limits.max_struct_allocation_bytes)) |projection| {
+                column.projection = projection;
+                column.credit = credit.retain();
+                self.encoded_predicate_pages += @intFromBool(column.required);
+                column.count = count;
+                column.consumed = @intCast(self.position - column.first);
+                self.pages_decoded += 1;
+                if (column.first + count == self.group.row_count and column.offset != end) return error.ParquetRowGroupRowCountMismatch;
+                return true;
+            }
+        }
+        var limits = self.limits;
+        limits.decimal_representation = .native_decimal;
+        limits.page_row_count = count;
+        limits.preserve_dictionary = true;
+        limits.page_encoding = parsed.header.encoding;
+        limits.max_rows = @max(limits.max_rows, count);
+        const input = [_]parquet.ColumnChunkInput{.{ .column_id = column.chunk.column_id, .bytes = encoded, .dictionary = if (column.dictionary) |*dictionary| dictionary else null }};
+        if (cache_key) |key| {
+            const cache = &self.shared_reader.?.cache.decoded;
+            if (column.dictionary_lease != null) limits.borrow_dictionary = true;
+            var loader = struct {
+                cursor: *Cursor,
+                input: []const parquet.ColumnChunkInput,
+                limits: parquet.MaterializationLimits,
+                dictionary: ?@import("lake_decoded_cache.zig").Lease,
+                parsed: page.ParsedHeader,
+                fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+                    const value: *@This() = @ptrCast(@alignCast(raw));
+                    const cursor = value.cursor;
+                    var loading: Admission.Loading = undefined;
+                    try loading.begin(cursor.admission, item);
+                    defer loading.end();
+                    const decoded = parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits) catch |err| {
+                        if (loading.failed) return error.ParquetPageTooLarge;
+                        return err;
+                    };
+                    item.payload = .{ .columns = decoded.columns };
+                    item.parquet_page_header = value.parsed;
+                    if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
+                }
+            }{ .cursor = self, .input = &input, .limits = limits, .dictionary = column.dictionary_lease, .parsed = parsed };
+            const lease = try cache.acquire(key, @min(cache.max_loading_bytes, self.limits.max_decoded_bytes *| 4 +| self.limits.max_struct_allocation_bytes), self.shared_reader.?.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+            errdefer lease.release();
+            try self.chargeCached(column, lease, credit, parsed.header.uncompressed_page_size);
+            column.cached = lease;
+        } else {
+            // Uncached page leases retain their dictionary owner across
+            // cursor advancement and closure without copying dictionary values.
+            limits.borrow_dictionary = true;
+            const owner = try SharedColumns.create(self.a, credit);
+            var initialized = false;
+            errdefer owner.discard(initialized);
+            owner.value = try parquet.buildSupportedColumnsAllocWithLimits(owner.budget.allocator(), self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
+            initialized = true;
+            if (column.dictionary_owner) |dictionary| owner.dictionary = dictionary.retain();
+            column.decoded = owner;
+        }
+        column.credit = credit.retain();
+        column.count = count;
+        column.consumed = @intCast(self.position - column.first);
+        self.pages_decoded += 1;
+        if (column.first + count == self.group.row_count and column.offset != end) return error.ParquetRowGroupRowCountMismatch;
+        return true;
     }
     fn header(self: *Cursor, column: *const Column) !page.ParsedHeader {
         if (try self.cachedIndexedPage(column)) |lease| {
@@ -653,19 +675,28 @@ pub const Cursor = struct {
         try reader.prefetch(reads[0..count]);
     }
     const DecodeStats = struct { pages: usize, dictionaries: usize, encoded_predicates: usize };
-    fn decode(template: Cursor, column: *Column, a: A) anyerror!DecodeStats {
-        // A worker mutates its own column only. Heap-owned admission serializes
-        // allocator mutations while provider I/O and decoding overlap.
+    const DecodedStep = struct { stats: DecodeStats, ready: bool };
+    fn fetchWorker(template: Cursor, column: *Column) anyerror!?Fetched {
         var worker = template;
-        worker.a = a;
+        worker.a = worker.admission.backing.allocator();
+        return worker.fetch(column);
+    }
+    fn decodeWorker(template: Cursor, column: *Column, fetched: Fetched) anyerror!DecodedStep {
+        var worker = template;
+        worker.a = worker.admission.backing.allocator();
         worker.pages_decoded = 0;
         worker.dictionary_decodes = 0;
         worker.encoded_predicate_pages = 0;
-        worker.advance(column) catch |err| {
+        const ready = worker.decodeFetched(column, fetched) catch |err| {
             if (err == error.OutOfMemory and worker.admission.memory.isLocallyExhausted()) return error.ParquetPageTooLarge;
             return err;
         };
-        return .{ .pages = worker.pages_decoded, .dictionaries = worker.dictionary_decodes, .encoded_predicates = worker.encoded_predicate_pages };
+        return .{ .ready = ready, .stats = .{ .pages = worker.pages_decoded, .dictionaries = worker.dictionary_decodes, .encoded_predicates = worker.encoded_predicate_pages } };
+    }
+    fn addStats(self: *Cursor, stats: DecodeStats) void {
+        self.pages_decoded += stats.pages;
+        self.dictionary_decodes += stats.dictionaries;
+        self.encoded_predicate_pages += stats.encoded_predicates;
     }
     fn advanceColumns(self: *Cursor, required_only: bool) !void {
         // Outer metadata owners return to the coordinator allocator after joining;
@@ -697,47 +728,103 @@ pub const Cursor = struct {
             }
             return;
         }
-        var pending: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!DecodeStats) = @splat(null);
-        // Every worker joins on all error/cancellation paths before the scoped
-        // cursor metadata can leave scope.
-        defer for (&pending) |*future| if (future.*) |*active| {
-            _ = active.cancel(io.?) catch {};
-            future.* = null;
+        const scheduler = @import("../../sql/parallel_scheduler.zig");
+        const Pending = union(enum) {
+            fetch: scheduler.Task(anyerror!?Fetched),
+            decode: struct { task: scheduler.Task(anyerror!DecodedStep), input: ranges.RangeLease },
+        };
+        var pending: [4]?Pending = @splat(null);
+        var columns: [4]?*Column = @splat(null);
+        var changed: std.Io.Event = .unset;
+        // Cancel and join before releasing any request metadata. A finished
+        // but unjoined fetch still owns its input credit and must be drained.
+        defer for (&pending) |*slot| if (slot.*) |*task| {
+            switch (task.*) {
+                .fetch => |*active| if (active.cancel(io.?)) |result| {
+                    if (result) |fetched| fetched.lease.release();
+                } else |_| {},
+                .decode => |*active| {
+                    _ = active.task.cancel(io.?) catch {};
+                    active.input.release();
+                },
+            }
+            slot.* = null;
         };
         var next_column: usize = 0;
-        while (next_column < self.columns.len) {
-            for (&pending) |*future| {
-                while (next_column < self.columns.len and ((required_only and !self.columns[next_column].required) or self.columns[next_column].first + self.columns[next_column].count > self.position)) next_column += 1;
-                if (next_column == self.columns.len) break;
-                const column = &self.columns[next_column];
-                // This remains a fan-out estimate, not a column allocation
-                // limit. Shared live admission above bounds the actual cohort;
-                // charging its entire quota per task would serialize ordinary
-                // wide scans even when every physical page is small.
-                const workspace = (self.limits.max_input_bytes +| self.limits.max_decoded_bytes) / @max(@as(usize, 1), self.columns.len);
-                future.* = @import("../../sql/parallel_scheduler.zig").global().submit(io.?, workspace, decode, .{ self.*, column, self.admission.backing.allocator() }) orelse {
-                    const stats = try decode(self.*, column, self.admission.backing.allocator());
-                    self.pages_decoded += stats.pages;
-                    self.dictionary_decodes += stats.dictionaries;
-                    self.encoded_predicate_pages += stats.encoded_predicates;
+        while (true) {
+            changed.reset();
+            var active_count: usize = 0;
+            var progressed = false;
+            for (&pending, &columns) |*slot, *column_slot| {
+                if (slot.*) |*task| switch (task.*) {
+                    .fetch => |*active| if (active.isComplete()) {
+                        const outcome = active.await(io.?);
+                        slot.* = null;
+                        progressed = true;
+                        if (try outcome) |fetched| {
+                            // CPU admission begins only after the complete
+                            // encoded lease is ready; input residency remains
+                            // bounded by the independent live request owner.
+                            const workspace = (self.limits.max_input_bytes +| self.limits.max_decoded_bytes) / @max(@as(usize, 1), self.columns.len);
+                            if ((self.scheduler orelse scheduler.global()).submitNotified(io.?, workspace, &changed, decodeWorker, .{ self.*, column_slot.*.?, fetched })) |decode_task| {
+                                slot.* = .{ .decode = .{ .task = decode_task, .input = fetched.lease } };
+                            } else {
+                                defer fetched.lease.release();
+                                const step = try decodeWorker(self.*, column_slot.*.?, fetched);
+                                self.addStats(step.stats);
+                                if (step.ready) column_slot.* = null;
+                            }
+                        } else column_slot.* = null;
+                    },
+                    .decode => |*active| if (active.task.isComplete()) {
+                        const outcome = active.task.await(io.?);
+                        active.input.release();
+                        slot.* = null;
+                        progressed = true;
+                        const step = try outcome;
+                        self.addStats(step.stats);
+                        if (step.ready) column_slot.* = null;
+                    },
+                };
+                if (slot.* != null) {
+                    active_count += 1;
+                    continue;
+                }
+                while (column_slot.* == null and next_column < self.columns.len) {
+                    const column = &self.columns[next_column];
                     next_column += 1;
-                    continue;
-                };
-                next_column += 1;
+                    if ((required_only and !column.required) or column.first + column.count > self.position) continue;
+                    column_slot.* = column;
+                }
+                if (column_slot.*) |column| {
+                    const workspace = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
+                    if ((self.scheduler orelse scheduler.global()).submitIoNotified(io.?, workspace, &changed, fetchWorker, .{ self.*, column })) |fetch_task| {
+                        slot.* = .{ .fetch = fetch_task };
+                        active_count += 1;
+                        progressed = true;
+                    }
+                }
             }
-            var failure: ?anyerror = null;
-            for (&pending) |*future| if (future.*) |*active| {
-                const stats = active.await(io.?) catch |err| {
-                    future.* = null;
-                    failure = failure orelse err;
-                    continue;
+            if (active_count == 0) {
+                var waiting: ?*?*Column = null;
+                for (&columns) |*column| if (column.* != null) {
+                    waiting = column;
+                    break;
                 };
-                future.* = null;
-                self.pages_decoded += stats.pages;
-                self.dictionary_decodes += stats.dictionaries;
-                self.encoded_predicate_pages += stats.encoded_predicates;
-            };
-            if (failure) |err| return err;
+                if (waiting) |column_slot| {
+                    // No live phase can own input here. A saturated global I/O
+                    // lane uses one caller lane without parking behind our own
+                    // completed encoded pages.
+                    self.advance(column_slot.*.?) catch |err| {
+                        if (err == error.OutOfMemory and self.admission.memory.isLocallyExhausted()) return error.ParquetPageTooLarge;
+                        return err;
+                    };
+                    column_slot.* = null;
+                    continue;
+                }
+                break;
+            }
+            if (!progressed) try changed.wait(io.?);
         }
         for (self.columns) |*column| if (!required_only or column.required) {
             column.consumed = @intCast(self.position - column.first);

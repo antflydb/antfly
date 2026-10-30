@@ -1628,7 +1628,7 @@ pub const SortCursor = struct {
         var owned = true;
         defer if (owned) self.deinit();
         self.reader.init(root.domain);
-        var page = try tree.readPage(a, self.reader.pages.store(), ref);
+        var page = try tree.readNavigationPage(a, self.reader.pages.store(), ref);
         defer page.deinit(a);
         if (page.aggregate.len != 32 or std.mem.allEqual(u8, page.aggregate, 0)) return null;
         var first = try tree.Cursor.init(a, self.reader.pages.store(), ref, "", null);
