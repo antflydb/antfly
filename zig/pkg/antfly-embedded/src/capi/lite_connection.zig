@@ -1752,10 +1752,15 @@ pub const Connection = struct {
                 lease.* = try self.acquirePathLeaseAssumeLocked();
                 root = try self.owner.refresh();
             }
-            while (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
+            if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
                 try self.owner.verifyAllocatorAssumeLocked(lease, self);
                 if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked();
                 root = try self.owner.refresh();
+                // Another process may move the tip during the detached walk.
+                // Do not repeat whole-file proofs while holding this
+                // connection's admission queue. No transaction has started:
+                // refuse safely and let a later request prove the new tip.
+                if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) return error.FileBusy;
             }
         }
         self.current = root;
@@ -2882,4 +2887,85 @@ test "capi resolver curation publication proofs skip large catalogs and fence ch
     }
     try std.testing.expectError(error.EnrichmentSourceChanged, absent.verify(root));
     std.debug.print("PUBLICATION PROOF catalog_bytes=4194304 primary_commits=20 hydrated_catalogs=0 same_content=accepted changed_content=fenced\n", .{});
+}
+
+test "capi native allocator proof refuses admission on a moving tip" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("moving-allocator-admission");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        const value: [32768]u8 = @splat('v');
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+        }
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+        }
+        _ = try seed.reclaimPages(4096);
+        try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+    }
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.verification_cancel.requested.store(false, .release);
+    const Probe = struct {
+        owner: *Owner,
+        captures: usize = 0,
+        failure: ?anyerror = null,
+        fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            // Bound the unfixed regression instead of hanging the test suite.
+            if (self.captures > 1) {
+                self.owner.verification_cancel.request();
+                return;
+            }
+            self.publish() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn publish(self: *@This()) !void {
+            var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.owner.path);
+            defer lease.close();
+            var file = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.owner.path, .{ .externally_locked = true, .no_sync = true });
+            defer file.close();
+            file.defer_allocator_verification = true;
+            try file.putCatalogRecord("foreign", "move the tip while the proof is detached");
+        }
+    };
+    var probe: Probe = .{ .owner = owner };
+    owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+    defer owner.test_after_allocator_capture = null;
+    var lease: ?native.PathWriterLock = try connection.acquire();
+    defer {
+        connection.detach();
+        if (lease) |*held| held.close();
+        connection.gate.mutex.unlock(io);
+    }
+    owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+    const result = connection.refresh(&lease, .mutation);
+    if (probe.failure) |err| return err;
+    try std.testing.expectError(error.FileBusy, result);
+    try std.testing.expectEqual(@as(usize, 1), probe.captures);
+    try std.testing.expect(!owner.verification_cancel.requested.load(.acquire));
+    // The refusal occurs before a transaction starts. A later, stable request
+    // can obtain a new proof and proceed using the same connection.
+    owner.test_after_allocator_capture = null;
+    const root = try connection.refresh(&lease, .mutation);
+    try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
 }
