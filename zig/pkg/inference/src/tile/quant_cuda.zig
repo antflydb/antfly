@@ -51,11 +51,6 @@ pub fn paramName(comptime p: []const u8) []const u8 {
     return p[i + 1 ..];
 }
 
-fn hasParam(comptime sig: []const []const u8, comptime name: []const u8) bool {
-    for (sig) |p| if (std.mem.eql(u8, paramName(p), name)) return true;
-    return false;
-}
-
 fn join(comptime items: []const []const u8, comptime sep: []const u8) []const u8 {
     var out: []const u8 = "";
     for (items, 0..) |it, i| out = out ++ (if (i == 0) "" else sep) ++ it;
