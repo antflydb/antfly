@@ -29,10 +29,14 @@ The matching Colony implementation and runbook are in
 application release: it adds a pinned first-boot native runtime, immutable remote
 artifact placement, instance-bound default-identity GCS connections and trusted
 principal forwarding for native composed queries. A runtime catalog edit alone
-cannot install it. RC.6 is published and pinned in `runtime.json`;
+cannot install it. RC.7 is published and pinned in `runtime.json`;
 its build success or a local library test does not qualify a managed instance.
+Deploy Colony's RC.7 signing compatibility change (#877, backported to v0.2.83)
+before upgrading an existing managed instance. RC.7 verifies signed Cloud
+principals in standalone mode and preserves object generations during catalog
+binding; these fixes unblock scoped overlay queries and object-table searches.
 
-The plan defaults to the exact published RC.6 OCI index in `runtime.json`. An
+The plan defaults to the exact published RC.7 OCI index in `runtime.json`. An
 optional `--image` accepts a registry mirror only when its digest matches that pin.
 Generate reviewable requests in a new directory, without contacting Cloud:
 
@@ -101,7 +105,7 @@ and native producer retain the tenant prefix and reject redirects, so credential
 and exact write retries cannot silently move to another host. Browser requests
 cannot select backend URLs, table names or pass their own upstream credential.
 
-Prepare the producer's matching RC.6 library from the repository root. This checks
+Prepare the producer's matching RC.7 library from the repository root. This checks
 published source/version metadata, archive size and SHA-256 against `runtime.json`;
 it refuses to overwrite an existing extracted library. The receipt is included in
 the producer image. Select the same architecture for preparation and Docker build.
@@ -234,9 +238,12 @@ The historical view reads the immutable export; the combined view applies curren
 replacements by numeric `hn_id`. Results link to original HN items. Administration,
 SQL, ingestion and arbitrary query DSL are not public gateway routes.
 
-`/healthz` checks the gateway process. `/readyz` requires both text indexes to be
+`/health` checks the gateway process. `/ready` requires both text indexes to be
 queryable and the saved source to exist. Readiness does not prove feed freshness,
 latency targets, or replacement-pod recovery; monitor these independently.
+The legacy `/healthz` and `/readyz` aliases remain available. Use `/health` and
+`/ready` for external Cloud Run checks because Cloud Run
+[reserves some URL paths ending in `z`](https://docs.cloud.google.com/run/docs/known-issues#reserved-url-paths).
 
 ## Optional standalone qualification
 
