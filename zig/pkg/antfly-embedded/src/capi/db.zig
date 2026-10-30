@@ -944,8 +944,9 @@ fn enterWithAdmissionRetry(initial: HandleEntry, ptr: ?*anyopaque, access: Handl
     var entry = initial;
     var guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
     defer if (intent == .mutation and guard.entry_error == null) {
-        // Successful admission still owns the path gate. Count once per
-        // export, including all its pre-execution retries and proof work.
+        // Successful admission still owns the path gate. Count this admission,
+        // including retries and proof work. Resuming a suspended operation is
+        // another admission; these are not counts of unique exported calls.
         std.debug.assert(guard.connection_gate_held);
         const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started));
         const stats = &guard.connection.?.owner.publication_stats;
