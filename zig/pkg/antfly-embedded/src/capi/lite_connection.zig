@@ -1140,6 +1140,10 @@ pub const Owner = struct {
         var gate_locked = true;
         defer if (gate_locked) self.gate.mutex.unlock(io);
         if (self.stopping.load(.acquire)) return false;
+        // A foreground proof owns the admission lane. Refresh can open index
+        // sources and publish lease metadata, so yield before even capturing
+        // a runtime. The gate protects this flag through the capture boundary.
+        if (self.allocator_verification_active) return true;
         var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         var lease_held = true;
         defer if (lease_held) lease.close();
@@ -1437,6 +1441,9 @@ pub const Owner = struct {
         var gate_locked = true;
         defer if (gate_locked) self.gate.mutex.unlock(io);
         if (self.stopping.load(.acquire)) return true;
+        // Keep the scheduled storage turn pending while foreground admission
+        // proves the tip; even its runtime refresh can publish index leases.
+        if (self.allocator_verification_active) return false;
         var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         var lease_held = true;
         defer if (lease_held) lease.close();
@@ -3479,6 +3486,50 @@ const AdmissionFollowupProbe = struct {
         return error.Canceled;
     }
 };
+
+test "capi native allocator proof maintenance yields before refreshing an active proof" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("proof-maintenance-yield", 1000, .batch);
+    defer fixture.deinit();
+    const Probe = struct {
+        connection: *Connection,
+        captures: usize = 0,
+        failure: ?anyerror = null,
+        fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This()) !void {
+            const owner = self.connection.owner;
+            try std.testing.expect(owner.allocator_verification_active);
+            const captured = owner.current.?;
+            if (self.captures == 1) {
+                // A peer moves the tip while the foreground owns a detached
+                // proof. Background refresh must not reopen index sources and
+                // publish more leases before checking that proof's admission.
+                var change = AdmissionFollowupProbe{ .connection = self.connection, .captures = 1 };
+                try change.duringProof();
+            }
+            defer owner.maintenance_storage_pending = false;
+            for ([_]bool{ false, true }) |storage_pending| {
+                owner.maintenance_storage_pending = storage_pending;
+                try std.testing.expect(try owner.maintenanceTurn());
+                try std.testing.expect(owner.current.? == captured);
+                if (storage_pending) try std.testing.expect(owner.maintenance_storage_pending);
+            }
+        }
+    };
+    var probe = Probe{ .connection = fixture.connection };
+    fixture.connection.owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+    const result = fixture.call(.batch);
+    if (probe.failure) |err| return err;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, result);
+    try std.testing.expectEqual(@as(usize, 2), probe.captures);
+    try fixture.expectWritten(.batch, true);
+}
 
 test "capi native allocator proof admits a slow stable proof after the retry deadline" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;

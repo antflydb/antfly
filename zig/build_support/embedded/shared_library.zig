@@ -23,7 +23,9 @@ pub fn inferenceCompileMaxRss(os: std.Target.Os.Tag, shared: bool, measured_darw
     const gib = 1024 * 1024 * 1024;
     // Linux -> macOS SDK 26.1: 11G rounded MaxRSS, plus a GiB and 10%.
     if (os == .macos and shared and measured_cross) return 14 * gib;
-    if (os == .macos and shared) return (if (measured_darwin) @as(u64, 12) else 20) * gib;
+    // Native SDK 26.6.2 / Zig 0.17 cold fast build: 24,912,183,296 bytes.
+    // Keep more than 10% margin on unqualified native Darwin SDKs.
+    if (os == .macos and shared) return (if (measured_darwin) @as(u64, 12) else 26) * gib;
     return (if (os == .macos and measured_darwin) @as(u64, 8) else 12) * gib;
 }
 
@@ -51,7 +53,10 @@ test "cross Darwin provider claims retain peak margins and admit storage with in
     try std.testing.expect(inference >= 12 * gib + 12 * gib / 10);
     try std.testing.expect(storage + inference <= 32 * gib);
     try std.testing.expectEqual(24 * gib, storageCompileMaxRss(.macos, false, false, false));
-    try std.testing.expectEqual(20 * gib, inferenceCompileMaxRss(.macos, true, false, false));
+    const native_peak: u64 = 24_912_183_296;
+    const native_inference = inferenceCompileMaxRss(.macos, true, false, false);
+    try std.testing.expect(native_inference >= native_peak + native_peak / 10);
+    try std.testing.expect(native_inference <= 28 * gib);
     try std.testing.expectEqual(12 * gib, inferenceCompileMaxRss(.linux, true, false, true));
     try std.testing.expectEqual(16 * gib, storageCompileMaxRss(.linux, false, false, true));
 }
