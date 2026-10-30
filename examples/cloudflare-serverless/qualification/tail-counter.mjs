@@ -31,9 +31,9 @@ export async function persistTailDelivery(events,env){
   if(env.WINDOWED_EVIDENCE==='true'){let boundary=false;try{boundary=new URL(item.event?.request?.url).searchParams.get('__antfly_qualification_boundary')==='1';}catch{}if(boundary){if(witnesses.length>=8)throw Error('CounterWitnessBudgetExceeded');witnesses.push(await portableAttemptIdentity(requestAttemptUuid(item.event?.request?.url)));}}
   records.push({script:item.scriptName,timestamp:item.eventTimestamp,version_id:uuid(item.scriptVersion?.id)?item.scriptVersion.id.toLowerCase():null,event,attempt_id_sha256:await portableAttemptIdentity(requestAttemptUuid(item.event?.request?.url))});
  }
- const delivery=crypto.randomUUID(),value=JSON.stringify({schema:1,qualification:false,source:'provider-tail-dispatch',delivery_id:delivery,producer:env.SOURCE_WORKER,received_at:Date.now(),collector_version:env.WORKER_VERSION?.id??null,foreign_events:foreign,count:records.length,records});
+ const delivery=crypto.randomUUID(),record={schema:1,qualification:false,source:'provider-tail-dispatch',delivery_id:delivery,producer:env.SOURCE_WORKER,received_at:Date.now(),collector_version:env.WORKER_VERSION?.id??null,foreign_events:foreign,count:records.length,records},value=JSON.stringify(record);
  if(new TextEncoder().encode(value).byteLength>4*1024*1024)throw Error('CounterDeliveryBudgetExceeded');
- if(env.WINDOWED_EVIDENCE==='true'){await persistCanonicalTail(env,JSON.parse(value),witnesses);return{delivery_id:delivery,count:records.length};}
+ if(env.WINDOWED_EVIDENCE==='true'){await persistCanonicalTail(env,record,witnesses);return{delivery_id:delivery,count:records.length};}
  const result=await env.LOGS.put('probe-v1/'+env.CAPTURE_ID+'/counter/'+delivery+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});
  if(!result)throw Error('CounterDeliveryCollision');
  return{delivery_id:delivery,count:records.length};

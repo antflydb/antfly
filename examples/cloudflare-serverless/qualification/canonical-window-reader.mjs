@@ -44,6 +44,6 @@ export async function readCanonicalWindow(env, scope, mode, input) {
  if(page.truncated&&(!page.cursor||page.cursor===input.cursor))throw Error('ObserverCursorInvalid');
  // A provider cursor must never escape the selected partition.
  if(page.objects.some(o=>!o.key.startsWith(selected)))throw Error('ObserverCursorInvalid');
- const outcomes=await Promise.allSettled(page.objects.map(get));if(outcomes.some(o=>o.status==='rejected'))throw Error('ObserverPageReadFailed');
+ const outcomes=await Promise.allSettled(page.objects.map(get));const failed=outcomes.find(o=>o.status==='rejected');if(failed)throw Error('ObserverPageReadFailed',{cause:failed.reason});
  return reply({objects:outcomes.map(o=>o.value),cursor:page.truncated?page.cursor:null});
 }

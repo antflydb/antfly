@@ -14,6 +14,7 @@
 // limitations under the License.
 
 // Diagnostic only. Source identities and delivery completeness are not assumed.
+import{parseDiagnosticJson}from'./diagnostic-memory.mjs';
 import{persistCanonicalRows}from'./canonical-windows.mjs';
 import{resourceFailureCode}from'../performance.mjs';
 import{sanitizeTailEvent}from'./metrics-tail.mjs';
@@ -29,7 +30,7 @@ export async function sanitizeLogpushProbe(row,source){
  const rawLogs=Array.isArray(row.Logs)?row.Logs:[],logs=rawLogs.slice(0,256).map(log=>({timestamp:log.timestamp??log.Timestamp,message:Array.isArray(log.message??log.Message)?log.message??log.Message:typeof(log.message??log.Message)==='string'?[log.message??log.Message]:[]}));
  const probes=[];
  for(const log of logs)for(const message of log.message.slice(0,32)){
-  let value;try{value=typeof message==='string'?JSON.parse(message):null;}catch{continue;}
+  let value;try{value=typeof message==='string'?parseDiagnosticJson(message):null;}catch{continue;}
   if(value?.event==='antfly.qualification_probe'&&uuid(value.id)&&['fetch','rpc'].includes(value.kind)&&['start','late','complete'].includes(value.phase))probes.push({id:value.id,kind:value.kind,phase:value.phase});
  }
  const exceptions=(Array.isArray(row.Exceptions)?row.Exceptions:[]).map(e=>({name:e.name??e.Name,message:e.message??e.Message}));
@@ -51,9 +52,16 @@ export async function readBody(request){
   finally{reader.releaseLock();}
   const body=new Uint8Array(bytes);let at=0;for(const chunk of chunks){body.set(chunk,at);at+=chunk.byteLength;}return body;
  }
- const bytes=await bounded(request.body);
- // Logpush uploads a gzip file; file uploads need not set Content-Encoding.
- return bytes[0]===31&&bytes[1]===139?bounded(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))):bytes;
+ // Sniff file magic without retaining a second complete compressed body.
+ // Enforce the original 6 MiB limits on both wire and decompressed bytes.
+ const source=request.body.getReader(),first=[];let wireBytes=0,closed=false;
+ const release=()=>{if(!closed){closed=true;source.releaseLock();}};
+ const next=async()=>{const item=await source.read();if(!item.done){wireBytes+=item.value.byteLength;if(wireBytes>6*1024*1024){await source.cancel();fail('TelemetryBodyExceeded');}}return item;};
+ try{while(wireBytes<2){const item=await next();if(item.done)break;if(item.value.byteLength)first.push(item.value);}}
+ catch(error){release();throw error;}
+ const prefix=first.flatMap(chunk=>Array.from(chunk.subarray(0,2))).slice(0,2),gzip=prefix[0]===31&&prefix[1]===139;
+ const stream=new ReadableStream({async pull(controller){try{if(first.length){controller.enqueue(first.shift());return;}const item=await next();if(item.done){release();controller.close();}else controller.enqueue(item.value);}catch(error){release();controller.error(error);}},async cancel(reason){try{await source.cancel(reason);}finally{release();}}});
+ return bounded(gzip?stream.pipeThrough(new DecompressionStream('gzip')):stream);
 }
 
 export default {async fetch(request,env){
@@ -68,25 +76,25 @@ export default {async fetch(request,env){
    const bytes=await readBody(request),text=new TextDecoder('utf-8',{fatal:true}).decode(bytes),lines=text.trim().split('\n');
    if(bytes.length<=4096){let challenge;try{challenge=JSON.parse(text);}catch{}if(['test','tests'].includes(challenge?.content)&&Object.keys(challenge).length===1)return Response.json({validation:true,qualification:false});}
    if(path!=='/ingest'){
-    const signal=path==='/v1/traces'?'traces':'logs';let envelopes;try{envelopes=[JSON.parse(text)];}catch{try{envelopes=lines.map(line=>JSON.parse(line));}catch{fail('TelemetryJsonInvalid');}}
+    const signal=path==='/v1/traces'?'traces':'logs';let parsed;try{parsed=parseDiagnosticJson(text,{lines:true});}catch(error){if(error.message==='TelemetryJsonComplexityExceeded')throw error;fail('TelemetryJsonInvalid');}const envelopes=Array.isArray(parsed)?parsed:[parsed];
     if(envelopes.length>1000)fail('TelemetryRecordBudgetExceeded');const rows=[];for(const envelope of envelopes){rows.push(...await sanitizeOtel(envelope,env.SOURCE_WORKER,signal));if(rows.length>1000)fail('TelemetryRecordBudgetExceeded');}
-    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,signal,collector_version:env.WORKER_VERSION?.id??null,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');if(rows.length){if(env.WINDOWED_EVIDENCE==='true')await persistCanonicalRows(env,JSON.parse(value));else await env.LOGS.put(prefix+'batches/'+signal+'-'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});}return Response.json({});
+    const digest=await hash(bytes),record={schema:1,qualification:false,signal,collector_version:env.WORKER_VERSION?.id??null,received_at:Date.now(),raw_batch_sha256:digest,rows},value=JSON.stringify(record);if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');if(rows.length){if(env.WINDOWED_EVIDENCE==='true')await persistCanonicalRows(env,record);else await env.LOGS.put(prefix+'batches/'+signal+'-'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});}return Response.json({});
    }
    if(env.WINDOWED_EVIDENCE==='true')fail('TelemetryCanonicalOtelRequired');
    if(lines.length>1000)fail('TelemetryRecordBudgetExceeded');
-   const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=JSON.parse(line);}catch{fail('TelemetryJsonInvalid');}rejectionShape={json_type:row===null?'null':Array.isArray(row)?'array':typeof row,content:row?.content==='tests'?'tests':row?.content==='test'?'test':row&&Object.hasOwn(row,'content')?'other':'absent',has_script_name:typeof row?.ScriptName==='string',keys:row&&typeof row==='object'?Object.keys(row).filter(key=>['content','test','filename','ScriptName','Event','Logs'].includes(key)):[],key_count:row&&typeof row==='object'?Object.keys(row).length:0};rows.push(await sanitizeLogpushProbe(row,env.SOURCE_WORKER));}
+   const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=parseDiagnosticJson(line);}catch{fail('TelemetryJsonInvalid');}rejectionShape={json_type:row===null?'null':Array.isArray(row)?'array':typeof row,content:row?.content==='tests'?'tests':row?.content==='test'?'test':row&&Object.hasOwn(row,'content')?'other':'absent',has_script_name:typeof row?.ScriptName==='string',keys:row&&typeof row==='object'?Object.keys(row).filter(key=>['content','test','filename','ScriptName','Event','Logs'].includes(key)):[],key_count:row&&typeof row==='object'?Object.keys(row).length:0};rows.push(await sanitizeLogpushProbe(row,env.SOURCE_WORKER));}
    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');
    await env.LOGS.put(prefix+'batches/'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});
    return Response.json({stored:true,records:rows.length,qualification:false});
   }
-  if(path==='/counter-witness'&&request.method==='POST'){const input=JSON.parse(new TextDecoder().decode(await readBody(request)));if(!uuid(input.id)||!env.COUNTER)fail('TelemetryWitnessInvalid');return Response.json(await env.COUNTER.witness(input.id));}
+  if(path==='/counter-witness'&&request.method==='POST'){const input=parseDiagnosticJson(new TextDecoder().decode(await readBody(request)));if(!uuid(input.id)||!env.COUNTER)fail('TelemetryWitnessInvalid');return Response.json(await env.COUNTER.witness(input.id));}
   if(path==='/exercise'&&request.method==='POST'){
-   const input=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await readBody(request))),count=input.count??8;if(!Number.isInteger(count)||count<1||count>32)fail('TelemetryProbeBudgetInvalid');
+   const input=parseDiagnosticJson(new TextDecoder('utf-8',{fatal:true}).decode(await readBody(request))),count=input.count??8;if(!Number.isInteger(count)||count<1||count>32)fail('TelemetryProbeBudgetInvalid');
    const expected=[];for(let i=0;i<count;i++){const id=crypto.randomUUID(),response=await env.FIXTURE.fetch('https://probe.invalid/?nonce='+id,{method:'POST',headers:{Authorization:'Bearer '+env.API_TOKEN}});if(!response.ok)fail('TelemetryProbeFailed');const value=await response.json();if(value.id!==id||!uuid(value.rpc))fail('TelemetryProbeIdentityInvalid');expected.push(value);}
    const id=crypto.randomUUID();await env.LOGS.put(prefix+'plans/'+id+'.json',JSON.stringify({id,expected}),{onlyIf:{etagDoesNotMatch:'*'}});return Response.json({qualification:false,id,expected});
   }
   if(path==='/page'&&request.method==='POST'){
-   const input=JSON.parse(new TextDecoder().decode(await readBody(request)));
+   const input=parseDiagnosticJson(new TextDecoder().decode(await readBody(request)));
    if(Object.keys(input).some(k=>k!=='cursor')||input.cursor!=null&&(typeof input.cursor!=='string'||input.cursor.length>4096))fail('TelemetryCursorInvalid');
    // Re-list with a smaller native limit to preserve R2's actual continuation
    // cursor. A cursor over concurrently written keys is NOT a closed snapshot.

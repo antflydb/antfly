@@ -117,3 +117,92 @@ attempted; its active-build/process-inspection guard skipped deletion.
 This closes this disposable deployment's cleanup, not qualification or the
 historical platform allocator diagnosis. Future live trials require fresh owned
 resources and complete diagnostic evidence.
+
+## Diagnostic memory hardening and the next hosted reproduction
+
+The October 30 follow-up distinguishes prevention from root-cause proof. The
+historical live SQLite failure remains unreproduced; the native R2 storage path
+already removes application SQL/KV. The incomplete later hosted captures do not
+establish a new occurrence of that same failure. Do not describe an intentional
+local injection or a native `OutOfMemory` as a recovered live `SQLITE_NOMEM`.
+
+Current official references support investigating the complete isolate:
+
+- [Cloudflare memory metrics](https://developers.cloudflare.com/durable-objects/observability/metrics-and-analytics/)
+  describe a 128 MB isolate shared by Worker code and potentially multiple
+  Durable Objects, with sampled memory quantiles rather than per-object peaks.
+- [Worker limits](https://developers.cloudflare.com/workers/platform/limits/)
+  count JavaScript and WebAssembly memory and recommend streaming large bodies.
+- [SQLite's result-code definition](https://www.sqlite.org/rescode.html#nomem)
+  identifies an allocation failure; the code alone does not identify which
+  allocation or caller exhausted memory. The current
+  [workerd SQLite implementation](https://github.com/cloudflare/workerd/blob/main/src/workerd/util/sqlite.c%2B%2B)
+  has per-database memory scopes. Inferring the original production cause from
+  these mechanisms would be premature.
+
+The new observer's per-upload byte bound did not limit simultaneous parsing
+across invocations. It also buffered an entire compressed body before making
+another decompressed copy. These are concrete, independently fixable pressure
+risks, not a demonstrated explanation of the historical SQL failure.
+
+The next observer release adds an isolate-wide diagnostic admission lane:
+
+- One heavy parse/capture executes at a time, with at most four waiting callers
+  and a 15-second admission wait bound. Waiting HTTP bodies remain unread.
+  Tickets carry no shared request promise, callback, transport or body. Each
+  caller waits using its own timer and performs I/O in its own invocation.
+  This protects the receiver, independent Tail observer and read-only reader in
+  their separate deployments. It is not per-tenant admission that would multiply
+  the memory allowance across colocated sources.
+- Gzip magic detection and decompression stream from the bounded wire input.
+  The original 6 MiB wire/decompressed bounds remain; no second complete
+  compressed-body buffer is created. OTLP and Tail persistence reuse sanitized
+  records rather than serializing and reparsing a duplicate object tree.
+- JSON preflight counts at most 262,144 allocation nodes and depth 32 before
+  parsing, including NDJSON and embedded log bodies. Byte limits alone do not
+  bound allocation expansion from tiny JSON values. A complexity rejection is
+  durable; an oversized/complex log remains a truncation/gap signal. It cannot
+  silently become an empty clean diagnostic.
+- Resource failures at proof/archive R2 calls emit only fixed component,
+  boundary, storage and operation labels. Original errors and causes survive;
+  no key, token, URL, arbitrary exception text or body is logged.
+
+These bounds reduce identifiable application pressure. They do not measure
+absolute heap usage or fix Cloudflare's internal SQLite allocator. Admission
+exhaustion/expiry is a failed delivery and prevents a clean trial. The observed
+queue/active counts on receiver health are per current isolate and are not a
+fleet-wide memory census.
+
+Two gate-evidence gaps were corrected as part of the investigation. Reader
+health now includes the receiver's rejection prefix in addition to the Tail
+observer's rejection prefix; a bounded successful shape sample cannot hide a
+later export failure. A read-only reader resource failure returns a fixed
+resource code to the driver. The driver retains a bounded failure ledger across
+all capture attempts, saves it with the report and carries it into offline
+reconciliation. Later successful reads do not erase it or permit a clean
+rehearsal verdict. The reader remains read-only.
+
+Local validation includes five simultaneous one-MiB gzip uploads in actual
+workerd, complete archive record counts, FIFO/cancellation/overflow/expiry,
+gzip split-magic and expansion/wire rejection, JSON depth/node amplification,
+safe boundary labels, receiver rejections beyond the successful health sample,
+and a test-only reader `SQLITE_NOMEM` followed by a successful response. The
+latter still fails the run verdict. The five-upload experiment observes a
+single active parser; it is not a measurement of production peak memory.
+
+For the next hosted attempt, preserve corrected control `c44896ac8c` and its
+original WASM modules, use the same newly sealed observer format for both
+sides, and create fresh workload identities. Start with the existing short
+four-tenant/512-document rehearsal, not the reserved cold epochs or hour-long
+trials. Check all source/receiver rejection prefixes and retain every driver
+resource signal. Re-run exact body/receipt verification and collector/restart
+checks. Any real `SQLITE_NOMEM` remains a failed trial even if retry succeeds.
+
+If it recurs, the component/boundary identifies the next investigation:
+application SQLite means the compatibility path or a regression; native WASM
+allocation means the native working set; proof/archive R2 means the diagnostic
+binding path; a storage-startup/reset exception before Antfly work remains a
+provider investigation. Capture exact Worker versions, time ranges, sanitized
+failure codes, sampled isolate metrics and a minimal reproducer for Cloudflare.
+A sampled low-memory interval or a successful run cannot establish the absence
+of every transient allocator fault.

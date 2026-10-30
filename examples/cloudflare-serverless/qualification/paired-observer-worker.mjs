@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{diagnosticAdmission}from'./diagnostic-memory.mjs';
+import{diagnosticStorage}from'./diagnostic-storage.mjs';
 import{resourceFailureCode}from'../performance.mjs';
 import{fetchObserver,persistObserverTail}from'./paired-observer.mjs';
-export default{fetch:fetchObserver,tail(events,env,ctx){ctx.waitUntil(persistObserverTail(events,env).catch(async(error)=>{await env.LOGS.put('observer-v1/rejections/'+crypto.randomUUID()+'.json',JSON.stringify({at:Date.now(),error:'ObserverTailFailed',cause:/^(?:Counter|Observer|Telemetry)[A-Za-z]+$/.test(error?.message??'')?error.message:resourceFailureCode(error)??'ObserverStorageFailed'}));throw Error('ObserverTailFailed');}));}};
+export default{async fetch(request,env){if(!env.API_TOKEN||request.headers.get('Authorization')!=='Bearer '+env.API_TOKEN)return new Response('unauthorized',{status:401});env=diagnosticStorage(env,'tail-observer');try{return await diagnosticAdmission.run(()=>fetchObserver(request,env),{signal:request.signal});}catch(error){await tailRejected(env,error);return Response.json({error:'ObserverAdmissionFailed'},{status:503});}},tail(events,env,ctx){env=diagnosticStorage(env,'tail-observer');ctx.waitUntil(diagnosticAdmission.run(()=>persistObserverTail(events,env)).catch(async(error)=>{await tailRejected(env,error);throw Error('ObserverTailFailed');}));}};
+async function tailRejected(env,error){await env.LOGS.put('observer-v1/rejections/'+crypto.randomUUID()+'.json',JSON.stringify({at:Date.now(),error:'ObserverTailFailed',cause:/^(?:Counter|Observer|Telemetry)[A-Za-z]+$/.test(error?.message??'')?error.message:resourceFailureCode(error)??'ObserverStorageFailed'}));}

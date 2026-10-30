@@ -15,6 +15,7 @@
 
 // Versioned proof projection. Verbose sanitized data is archived separately;
 // resource/unknown errors, truncation and physical I/O lifetimes stay canonical.
+import{parseDiagnosticJson}from'./diagnostic-memory.mjs';
 const enc=new TextEncoder();
 export const canonicalLayout='window-v1';
 export const minuteOf=t=>{if(!Number.isSafeInteger(t)||t<0)throw Error('TelemetryCanonicalTimestampInvalid');return Math.floor(t/60000)*60000;};
@@ -36,7 +37,7 @@ function critical(v){
 function criticalNested(v){if(Array.isArray(v))return v.some(x=>x&&typeof x==='object'&&critical(x));return critical(v);}
 export function compactEvent(event={}){
  const out={};for(const key of['outcome','cpuTime','wallTime','scriptVersion','truncated','exceptions'])if(Object.hasOwn(event,key))out[key]=structuredClone(event[key]);
- const logs=(event.logs??[]).filter(log=>(log.message??[]).some(message=>{try{return critical(JSON.parse(message));}catch{return true;}}));
+ const logs=(event.logs??[]).filter(log=>(log.message??[]).some(message=>{try{return critical(parseDiagnosticJson(message));}catch{return true;}}));
  if(logs.length)out.logs=structuredClone(logs);
  return out;
 }

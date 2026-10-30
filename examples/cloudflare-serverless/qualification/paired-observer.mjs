@@ -15,6 +15,7 @@
 
 // One isolated observer for an exact paired deployment. No database credentials
 // or database storage bindings are installed here. Source routing is allowlisted.
+import{parseDiagnosticJson}from'./diagnostic-memory.mjs';
 import collector,{readBody}from'./logpush-probe-collector.mjs';
 import{persistTailDelivery,counterWitness}from'./tail-counter.mjs';
 const uuid=v=>typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v);
@@ -42,7 +43,7 @@ export async function fetchObserver(request,env){
   if(path==='/health'){const p=await env.LOGS.list({prefix:'observer-v1/rejections/',limit:1});return Response.json({qualification:false,rejections_present:p.objects.length>0,scopes:scopes.map(s=>({source:s.source,capture_id:s.capture_id})),collector_version:env.WORKER_VERSION?.id??null});}
   if(path==='/drain-all'&&request.method==='POST'&&env.RETIRE_MODE==='true'){let deleted=0;for(const bucket of[env.LOGS,...(env.WINDOWED_EVIDENCE==='true'&&env.ARCHIVE?[env.ARCHIVE]:[])]){const p=await bucket.list({limit:1000});if(p.objects.length)await bucket.delete(p.objects.map(o=>o.key));deleted+=p.objects.length;}return Response.json({done:deleted===0,deleted});}
   if(['/v1/traces','/v1/logs'].includes(path)&&request.method==='POST'){
-   const text=new TextDecoder('utf-8',{fatal:true}).decode(await readBody(request)),signal=path.endsWith('traces')?'traces':'logs';let envelopes;try{envelopes=[JSON.parse(text)];}catch{envelopes=text.trim().split('\n').map(line=>JSON.parse(line));}if(envelopes.length>128)throw Error('TelemetryRecordBudgetExceeded');
+   const text=new TextDecoder('utf-8',{fatal:true}).decode(await readBody(request)),signal=path.endsWith('traces')?'traces':'logs';const parsed=parseDiagnosticJson(text,{lines:true}),envelopes=Array.isArray(parsed)?parsed:[parsed];if(envelopes.length>128)throw Error('TelemetryRecordBudgetExceeded');
    // Validate all resource scopes before persisting any part of a request.
    const parts=envelopes.flatMap(e=>splitObserverEnvelope(e,signal,scopes));if(parts.length>128)throw Error('TelemetryRecordBudgetExceeded');
    for(const part of parts){const s=scopes.find(s=>s.source===part.source),response=await collector.fetch(new Request('https://observer.invalid'+path,{method:'POST',headers:{Authorization:'Bearer '+env.API_TOKEN},body:JSON.stringify(part.envelope)}),scopedEnv(env,s));if(!response.ok)return response;}

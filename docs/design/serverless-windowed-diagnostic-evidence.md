@@ -150,3 +150,10 @@ All 249 artifacts in the two preceding compact-serving closures were also
 reverified without changes. The older, separately documented 163-artifact
 availability gap remains. Guarded `make gc` deferred cleanup while native builds
 were active or process inspection was unavailable; no guard was overridden.
+
+The subsequent [memory investigation](cloudflare-sqlite-memory.md#diagnostic-memory-hardening-and-the-next-hosted-reproduction)
+adds per-isolate diagnostic admission, streaming gzip input, JSON complexity
+preflight and fixed storage-boundary attribution. It also includes receiver
+rejections in reader health and retains reader resource failures across capture
+retries and offline reconciliation. These are required for the next observer
+release; local success does not establish a hosted allocator fix.
