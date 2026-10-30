@@ -1639,8 +1639,11 @@ pub fn clampDiscreteDeviceLimits(limits: Limits, device_bytes: usize, process_li
     out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, physical.host_limit_bytes);
     out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, physical.backend_limit_bytes);
     out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, out.host_limit_bytes +| out.backend_limit_bytes);
-    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.backend_limit_bytes);
-    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.backend_limit_bytes);
+    // KV and scratch account for both host and device allocations. Physical
+    // residency is bounded independently above; a small VRAM policy must not
+    // turn an admitted host staging buffer into a permanent size failure.
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.combined_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.combined_limit_bytes);
     return out;
 }
 
@@ -1650,8 +1653,8 @@ pub fn clampUnifiedDeviceLimits(limits: Limits, shared_bytes: usize) Limits {
     out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, shared_bytes);
     out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, shared_bytes);
     out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, shared_bytes);
-    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.backend_limit_bytes);
-    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.backend_limit_bytes);
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.combined_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.combined_limit_bytes);
     return out;
 }
 
@@ -4650,4 +4653,31 @@ test "LightOnOCR3 automatic CUDA recurrent state has serial admission and rollba
     budget.releaseEstimate(device_state);
     try std.testing.expectEqual(@as(usize, 0), budget.backend_kv_bytes);
     try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
+}
+
+test "LightOnOCR3 physical CUDA clamping preserves host scratch and KV within combined limits" {
+    const requested = Limits{ .host_limit_bytes = mib(64), .backend_limit_bytes = mib(16), .combined_limit_bytes = mib(80), .kv_limit_bytes = mib(64), .scratch_limit_bytes = mib(64) };
+    const discrete = clampDiscreteDeviceLimits(requested, gib(24), gib(2));
+    const unified = clampUnifiedDeviceLimits(discrete, mib(80));
+    for ([_]Limits{ discrete, unified }) |limits| {
+        try std.testing.expectEqual(mib(64), limits.scratch_limit_bytes);
+        try std.testing.expectEqual(mib(64), limits.kv_limit_bytes);
+        var controller = AdmissionController{};
+        defer controller.deinit();
+        var scratch = try controller.tryAcquire(.gpu, limits, .{ .host_scratch_bytes = mib(48), .backend_scratch_bytes = mib(8) }, false);
+        scratch.release();
+        var kv = try controller.tryAcquire(.gpu, limits, .{ .host_kv_bytes = mib(48), .backend_kv_bytes = mib(8) }, false);
+        kv.release();
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = mib(17) }, false));
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    }
+    const tighter = clampUnifiedDeviceLimits(discrete, mib(40));
+    try std.testing.expectEqual(mib(40), tighter.scratch_limit_bytes);
+    try std.testing.expectEqual(mib(40), tighter.kv_limit_bytes);
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, tighter, .{ .host_scratch_bytes = mib(33), .backend_scratch_bytes = mib(8) }, false));
+    var explicit = requested;
+    explicit.scratch_limit_bytes = mib(32);
+    try std.testing.expectEqual(mib(32), clampDiscreteDeviceLimits(explicit, gib(24), gib(2)).scratch_limit_bytes);
 }

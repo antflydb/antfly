@@ -44700,6 +44700,7 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     var model: model_manager_mod.LoadedModel = undefined;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
+    ctx.cb = null;
     ctx.features = .{};
     ctx.cfg = .{};
     ctx.auxiliary_ready = .init(true);
@@ -44852,6 +44853,7 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     var model: model_manager_mod.LoadedModel = undefined;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
+    ctx.cb = null;
     ctx.features = features;
     ctx.cfg = .{};
     ctx.auxiliary_lease = null;
