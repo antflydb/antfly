@@ -41,6 +41,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const antfly_vector = @import("antfly_vector");
+const rq = antfly_vector.quantizer;
+const vproto = antfly_vector.proto;
+const vmath = antfly_vector.vector;
+const vrabitq = antfly_vector.rabitq;
 
 /// Distance metric. Values match `antfly_vector.vector.DistanceMetric`.
 pub const Metric = enum(u8) {
@@ -52,9 +57,18 @@ pub const Metric = enum(u8) {
     cosine = 2,
 };
 
+/// How vectors are compressed for approximate distances.
+pub const Quantizer = enum(u8) {
+    /// Product quantization, as in the paper. No error bounds.
+    pq = 0,
+    /// 1-bit RaBitQ with per-candidate error bounds (repo RaBitQ kernel).
+    rabitq = 1,
+};
+
 pub const Config = struct {
     dims: u32,
     metric: Metric = .l2_squared,
+    quantizer: Quantizer = .pq,
     /// M: degree cap for hub nodes and for any list grown by reverse links.
     max_degree: u32 = 30,
     /// m: forward degree for non-hub nodes. Zero means max(2, M / 5).
@@ -76,6 +90,7 @@ pub const Config = struct {
         if (self.dims == 0) return error.InvalidConfig;
         if (self.max_degree < 2) return error.InvalidConfig;
         if (self.ef_construction == 0) return error.InvalidConfig;
+        if (self.quantizer == .rabitq and self.dims < 2) return error.InvalidConfig;
         if (!(self.hub_fraction >= 0 and self.hub_fraction <= 1)) return error.InvalidConfig;
         var out = self;
         if (out.low_degree == 0) out.low_degree = @max(2, out.max_degree / 5);
@@ -140,10 +155,25 @@ pub const SliceEmbeddingSource = struct {
     }
 };
 
+/// How candidates are chosen for exact recomputation.
+pub const Rerank = enum {
+    /// `bounds` with RaBitQ, `ratio` with PQ.
+    auto,
+    /// Promote the top `rerank_ratio` of the approximate queue after each
+    /// expansion (the paper's two-level search).
+    ratio,
+    /// Walk with estimates only, then recompute candidates whose RaBitQ
+    /// lower bound can still beat the k-th exact result. RaBitQ only.
+    bounds,
+};
+
 pub const SearchOptions = struct {
     k: u32 = 10,
-    /// Exact-result beam width. Raised to `k` when smaller.
-    ef: u32 = 64,
+    /// Beam width, raised to `k` when smaller. Zero picks a default per
+    /// rerank mode: 64 for `ratio`, where every beam slot costs
+    /// recomputation, and 512 for `bounds`, where the walk only costs
+    /// estimates.
+    ef: u32 = 0,
     /// α: fraction of the approximate queue promoted to exact recomputation
     /// after each expansion. At least one candidate is promoted per step.
     rerank_ratio: f32 = 0.1,
@@ -157,6 +187,10 @@ pub const SearchOptions = struct {
     /// PQ distances. Costs roughly levels x M recomputations per query but
     /// avoids starting layer 0 in the wrong region when PQ is coarse.
     exact_descent: bool = false,
+    rerank: Rerank = .auto,
+    /// Multiplies RaBitQ error bounds in `bounds` mode. Larger is safer and
+    /// recomputes more. The kernel's bound is about one standard error.
+    bound_scale: f32 = 1.0,
 };
 
 pub const SearchStats = struct {
@@ -164,7 +198,7 @@ pub const SearchStats = struct {
     recomputed: u32 = 0,
     /// Recompute calls (batches) made.
     batches: u32 = 0,
-    /// PQ distances evaluated.
+    /// Approximate (PQ or RaBitQ) distances evaluated.
     approx_evaluated: u32 = 0,
     /// Nodes whose neighbor lists were expanded.
     expanded: u32 = 0,
@@ -246,11 +280,16 @@ pub const Index = struct {
     /// Upper-layer neighbor lists per node; `upper.items[v].len` is v's level.
     upper: std.ArrayListUnmanaged([]NeighborList) = .empty,
     flags: std.ArrayListUnmanaged(u8) = .empty,
+    /// PQ codes, `pq_subspaces` bytes per node (PQ quantizer only).
     codes: std.ArrayListUnmanaged(u8) = .empty,
-    pq: ProductQuantizer,
+    pq: ?ProductQuantizer = null,
+    rabitq: ?RaBitQCodes = null,
     /// Build statistic: unreachable layer-0 nodes the connectivity pass
     /// linked. Not serialized.
     repaired: u32 = 0,
+    /// Layer-0 in-degree per node, kept in memory (rebuilt on load) so
+    /// inserts never evict a node's last inbound edge.
+    indegree: std.ArrayListUnmanaged(u32) = .empty,
 
     /// Builds an index from `vectors` (row-major, `dims` floats each). The
     /// vectors are only used during the build; the index keeps none of them.
@@ -268,12 +307,23 @@ pub const Index = struct {
             for (0..n) |i| normalize(work[i * dims ..][0..dims]);
         }
 
-        const pq = try ProductQuantizer.train(alloc, work, dims, cfg.pq_subspaces, cfg.pq_train_iterations, cfg.pq_train_sample, cfg.seed);
-        var index = Index{ .alloc = alloc, .config = cfg, .pq = pq };
+        var index = Index{ .alloc = alloc, .config = cfg };
         errdefer index.deinit();
-
-        try index.codes.resize(alloc, n_usize * cfg.pq_subspaces);
-        for (0..n) |i| pq.encode(work[i * dims ..][0..dims], index.codes.items[i * cfg.pq_subspaces ..][0..cfg.pq_subspaces]);
+        switch (cfg.quantizer) {
+            .pq => {
+                index.pq = try ProductQuantizer.train(alloc, work, dims, cfg.pq_subspaces, cfg.pq_train_iterations, cfg.pq_train_sample, cfg.seed);
+                const pq = &index.pq.?;
+                try index.codes.resize(alloc, n_usize * cfg.pq_subspaces);
+                for (0..n) |i| pq.encode(work[i * dims ..][0..dims], index.codes.items[i * cfg.pq_subspaces ..][0..cfg.pq_subspaces]);
+            },
+            .rabitq => {
+                // Rotation preserves distances, so the graph below is built
+                // on the rotated vectors directly.
+                index.rabitq = try RaBitQCodes.init(alloc, cfg);
+                try index.rabitq.?.rotateInPlace(alloc, work);
+                try index.rabitq.?.encodeAll(alloc, work, n_usize);
+            },
+        }
         try index.flags.appendNTimes(alloc, 0, n_usize);
 
         try index.upper.ensureTotalCapacity(alloc, n_usize);
@@ -336,7 +386,16 @@ pub const Index = struct {
             for (pruned) |list| index.adjacency.appendAssumeCapacity(list);
         }
         index.node_count = n;
+        try index.rebuildIndegree();
         return index;
+    }
+
+    fn rebuildIndegree(self: *Index) !void {
+        try self.indegree.resize(self.alloc, self.adjacency.items.len);
+        @memset(self.indegree.items, 0);
+        for (self.adjacency.items) |list| for (list.items) |nb| {
+            self.indegree.items[nb] += 1;
+        };
     }
 
     pub fn deinit(self: *Index) void {
@@ -346,7 +405,9 @@ pub const Index = struct {
         self.upper.deinit(self.alloc);
         self.flags.deinit(self.alloc);
         self.codes.deinit(self.alloc);
-        self.pq.deinit(self.alloc);
+        self.indegree.deinit(self.alloc);
+        if (self.pq) |*pq| pq.deinit(self.alloc);
+        if (self.rabitq) |*r| r.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -407,21 +468,31 @@ pub const Index = struct {
         if (query.len != self.dimension()) return error.DimensionMismatch;
         var stats = SearchStats{};
         if (self.node_count == 0 or opts.k == 0) return .{ .results = try alloc.alloc(Result, 0), .stats = stats };
+        const rerank: Rerank = switch (opts.rerank) {
+            .auto => if (self.rabitq != null) .bounds else .ratio,
+            else => opts.rerank,
+        };
+        if (rerank == .bounds and self.rabitq == null) return error.BoundsRequireRaBitQ;
+        var eff = opts;
+        if (eff.ef == 0) eff.ef = if (rerank == .bounds) 512 else 64;
 
         const q = try alloc.dupe(f32, query);
         defer alloc.free(q);
         if (self.config.metric == .cosine) normalize(q);
-        const table = try alloc.alloc(f32, self.pq.tableLen());
-        defer alloc.free(table);
-        self.pq.buildTable(self.config.metric, q, table);
+        var approx = try Approx.init(alloc, self, q);
+        defer approx.deinit();
 
-        const start = if (opts.exact_descent)
+        const start = if (eff.exact_descent)
             try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats)
         else
-            self.greedyDescentApprox(table, self.entry, self.max_level, 0, &stats);
+            try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats);
+
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
-        try self.twoLevelSearch(alloc, source, q, table, start, opts, &found, &stats);
+        switch (rerank) {
+            .bounds => try self.boundedSearch(alloc, source, q, &approx, start, eff, &found, &stats),
+            else => try self.twoLevelSearch(alloc, source, q, &approx, start, eff, &found, &stats),
+        }
 
         var out = std.ArrayListUnmanaged(Result).empty;
         errdefer out.deinit(alloc);
@@ -437,26 +508,25 @@ pub const Index = struct {
     /// assigned in insertion order, so the caller's EmbeddingSource must be
     /// able to recompute the new id afterwards.
     ///
-    /// Upper layers are linked with PQ distances, so they cost no
+    /// Upper layers are linked with approximate distances, so they cost no
     /// recomputation. Layer 0 uses the paper's simplified neighbor selection:
-    /// a two-level search, then the closest `low_degree` live candidates
-    /// become forward edges. Full reverse lists drop their farthest member by
-    /// PQ distance.
+    /// the closest `low_degree` live candidates become forward edges. With PQ
+    /// they come from a two-level search (which recomputes); with RaBitQ from
+    /// an estimate-only search (which does not). Full reverse lists drop their
+    /// farthest member by approximate distance.
     pub fn insert(self: *Index, source: EmbeddingSource, vector: []const f32) !u32 {
         const alloc = self.alloc;
         const d = self.dimension();
         if (vector.len != d) return error.DimensionMismatch;
         if (self.node_count == std.math.maxInt(u32) - 1) return error.IndexFull;
-        const sub = self.config.pq_subspaces;
         const id = self.node_count;
         const level = levelFor(self.config.seed, id, self.config.max_degree);
 
         const v = try alloc.dupe(f32, vector);
         defer alloc.free(v);
         if (self.config.metric == .cosine) normalize(v);
-        const table = try alloc.alloc(f32, self.pq.tableLen());
-        defer alloc.free(table);
-        self.pq.buildTable(self.config.metric, v, table);
+        var approx = try Approx.init(alloc, self, v);
+        defer approx.deinit();
 
         const new_upper = try alloc.alloc(NeighborList, level);
         @memset(new_upper, NeighborList.empty);
@@ -468,12 +538,12 @@ pub const Index = struct {
         };
 
         var stats = SearchStats{};
-        var ep = self.greedyDescentApprox(table, self.entry, self.max_level, level, &stats);
+        var ep = try self.greedyDescentApprox(&approx, self.entry, self.max_level, level, &stats);
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
         var layer = @min(level, self.max_level);
         while (layer > 0) : (layer -= 1) {
-            try self.beamSearchApprox(alloc, table, layer, ep, self.config.ef_construction, &found);
+            try self.beamSearchApprox(alloc, &approx, layer, ep, self.config.ef_construction, &found);
             for (found.items) |c| {
                 if (new_upper[layer - 1].items.len >= self.config.max_degree) break;
                 try new_upper[layer - 1].append(alloc, c.id);
@@ -482,7 +552,11 @@ pub const Index = struct {
         }
 
         const ef = self.config.ef_construction;
-        try self.twoLevelSearch(alloc, source, v, table, ep, .{ .k = ef, .ef = ef }, &found, &stats);
+        if (self.rabitq != null) {
+            try self.beamSearchApprox(alloc, &approx, 0, ep, ef, &found);
+        } else {
+            try self.twoLevelSearch(alloc, source, v, &approx, ep, .{ .k = ef, .ef = ef }, &found, &stats);
+        }
         for (found.items) |c| {
             if (forward.items.len >= self.config.low_degree) break;
             if (self.isDeleted(c.id)) continue;
@@ -490,11 +564,19 @@ pub const Index = struct {
         }
 
         // Reserve everything up front: nothing below the commit may fail.
-        try self.codes.ensureUnusedCapacity(alloc, sub);
+        var rq_row: ?RaBitQCodes.Row = null;
+        defer if (rq_row) |*row| row.deinit(alloc);
+        if (self.rabitq) |*r| {
+            rq_row = try r.encodeRow(alloc, v);
+            try r.reserve(alloc, 1);
+        } else {
+            try self.codes.ensureUnusedCapacity(alloc, self.config.pq_subspaces);
+        }
         try self.flags.ensureUnusedCapacity(alloc, 1);
+        try self.indegree.ensureUnusedCapacity(alloc, 1);
         try self.adjacency.ensureUnusedCapacity(alloc, 1);
         try self.upper.ensureUnusedCapacity(alloc, 1);
-        for (forward.items) |u| try self.adjacency.items[u].ensureUnusedCapacity(alloc, 1);
+        for (forward.items, 0..) |u, i| try self.adjacency.items[u].ensureUnusedCapacity(alloc, if (i == 0) 2 else 1);
         for (new_upper, 1..) |list, l| {
             for (list.items) |u| try self.upper.items[u][l - 1].ensureUnusedCapacity(alloc, 1);
         }
@@ -503,18 +585,32 @@ pub const Index = struct {
         const b = try alloc.alloc(f32, d);
         defer alloc.free(b);
 
-        const code_start = self.codes.items.len;
-        self.codes.items.len += sub;
-        self.pq.encode(v, self.codes.items[code_start..][0..sub]);
+        if (self.rabitq) |*r| {
+            r.appendRowAssumeCapacity(&rq_row.?);
+        } else {
+            const sub = self.config.pq_subspaces;
+            const code_start = self.codes.items.len;
+            self.codes.items.len += sub;
+            self.pq.?.encode(v, self.codes.items[code_start..][0..sub]);
+        }
         self.flags.appendAssumeCapacity(0);
+        self.indegree.appendAssumeCapacity(0);
+        for (forward.items) |u| self.indegree.items[u] += 1;
         self.adjacency.appendAssumeCapacity(forward);
         self.upper.appendAssumeCapacity(new_upper);
         self.node_count += 1;
         committed = true;
 
-        for (forward.items) |u| self.addReverseLink(&self.adjacency.items[u], u, id, a, b);
+        for (forward.items) |u| _ = self.addReverseLink(&self.adjacency.items[u], u, id, a, b, self.indegree.items);
+        // Keep the new node reachable on layer 0: if every full reverse list
+        // rejected it, attach it to its closest neighbor over the cap, as the
+        // build's connectivity pass does.
+        if (self.indegree.items[id] == 0 and forward.items.len > 0) {
+            self.adjacency.items[forward.items[0]].appendAssumeCapacity(id);
+            self.indegree.items[id] += 1;
+        }
         for (new_upper, 1..) |list, l| {
-            for (list.items) |u| self.addReverseLink(&self.upper.items[u][l - 1], u, id, a, b);
+            for (list.items) |u| _ = self.addReverseLink(&self.upper.items[u][l - 1], u, id, a, b, null);
         }
         if (level > self.max_level) {
             self.max_level = level;
@@ -524,26 +620,43 @@ pub const Index = struct {
     }
 
     /// Appends `id` to `list` (owned by `owner`), or replaces the member
-    /// farthest from `owner` by PQ distance when the list is full. Capacity
-    /// must already be reserved.
-    fn addReverseLink(self: *const Index, list: *NeighborList, owner: u32, id: u32, a: []f32, b: []f32) void {
+    /// farthest from `owner` by approximate distance when the list is full.
+    /// Capacity must already be reserved. With `indegree` (layer 0), a member
+    /// whose only inbound edge is this one is never evicted, and the counts
+    /// are kept current. Returns whether `id` was linked.
+    fn addReverseLink(self: *const Index, list: *NeighborList, owner: u32, id: u32, a: []f32, b: []f32, indegree: ?[]u32) bool {
         if (list.items.len < self.config.max_degree) {
             list.appendAssumeCapacity(id);
-            return;
+            if (indegree) |deg| deg[id] += 1;
+            return true;
         }
-        self.pq.decode(self.code(owner), a);
-        self.pq.decode(self.code(id), b);
+        self.decodeApprox(owner, a);
+        self.decodeApprox(id, b);
         var worst_i: usize = list.items.len;
         var worst = distance(self.config.metric, a, b);
         for (list.items, 0..) |w, i| {
-            self.pq.decode(self.code(w), b);
+            if (indegree) |deg| if (deg[w] <= 1) continue;
+            self.decodeApprox(w, b);
             const dist = distance(self.config.metric, a, b);
             if (dist > worst) {
                 worst = dist;
                 worst_i = i;
             }
         }
-        if (worst_i < list.items.len) list.items[worst_i] = id;
+        if (worst_i == list.items.len) return false;
+        if (indegree) |deg| {
+            deg[list.items[worst_i]] -= 1;
+            deg[id] += 1;
+        }
+        list.items[worst_i] = id;
+        return true;
+    }
+
+    /// Approximate reconstruction of a stored vector (in rotated space for
+    /// RaBitQ). Only used to compare stored vectors with each other.
+    fn decodeApprox(self: *const Index, id: u32, out: []f32) void {
+        if (self.rabitq) |*r| return r.decode(id, out);
+        self.pq.?.decode(self.code(id), out);
     }
 
     fn code(self: *const Index, id: u32) []const u8 {
@@ -551,21 +664,23 @@ pub const Index = struct {
         return self.codes.items[@as(usize, id) * sub ..][0..sub];
     }
 
-    /// Greedy descent with PQ distances from layer `from` down to layer
-    /// `to + 1`. Costs no recomputation.
-    fn greedyDescentApprox(self: *const Index, table: []const f32, start: u32, from: u8, to: u8, stats: *SearchStats) u32 {
+    /// Greedy descent with approximate distances from layer `from` down to
+    /// layer `to + 1`. Costs no recomputation.
+    fn greedyDescentApprox(self: *const Index, approx: *Approx, start: u32, from: u8, to: u8, stats: *SearchStats) !u32 {
+        if (from <= to) return start;
         var cur = start;
-        var cur_d = self.pq.adc(table, self.code(cur));
+        var cur_d = (try approx.scoreOne(cur)).dist;
         var layer = from;
         while (layer > to) : (layer -= 1) {
             var improved = true;
             while (improved) {
                 improved = false;
-                for (self.upper.items[cur][layer - 1].items) |nb| {
-                    stats.approx_evaluated += 1;
-                    const dist = self.pq.adc(table, self.code(nb));
-                    if (dist < cur_d) {
-                        cur_d = dist;
+                const nbs = self.upper.items[cur][layer - 1].items;
+                const ests = try approx.score(nbs);
+                stats.approx_evaluated += @intCast(nbs.len);
+                for (nbs, ests) |nb, e| {
+                    if (e.dist < cur_d) {
+                        cur_d = e.dist;
                         cur = nb;
                         improved = true;
                     }
@@ -585,26 +700,15 @@ pub const Index = struct {
         defer ids.deinit(alloc);
         var buf = std.ArrayListUnmanaged(f32).empty;
         defer buf.deinit(alloc);
+        var dists = std.ArrayListUnmanaged(f32).empty;
+        defer dists.deinit(alloc);
 
-        const Batch = struct {
-            fn run(index: *const Index, a: Allocator, src: EmbeddingSource, query: []const f32, todo: []const u32, vectors: *std.ArrayListUnmanaged(f32), dists: *std.AutoHashMapUnmanaged(u32, f32), st: *SearchStats) !void {
-                if (todo.len == 0) return;
-                const dd = index.dimension();
-                try vectors.resize(a, todo.len * dd);
-                try src.recompute(todo, vectors.items);
-                st.batches += 1;
-                st.recomputed += @intCast(todo.len);
-                for (todo, 0..) |id, i| {
-                    const row = vectors.items[i * dd ..][0..dd];
-                    if (index.config.metric == .cosine) normalize(row);
-                    try dists.put(a, id, distance(index.config.metric, query, row));
-                }
-            }
-        };
-
-        try Batch.run(self, alloc, source, q, &.{start}, &buf, &seen, stats);
+        try ids.append(alloc, start);
+        try dists.resize(alloc, 1);
+        try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
+        try seen.put(alloc, start, dists.items[0]);
         var cur = start;
-        var cur_d = seen.get(start).?;
+        var cur_d = dists.items[0];
         var layer = from;
         while (layer > 0) : (layer -= 1) {
             var improved = true;
@@ -613,7 +717,9 @@ pub const Index = struct {
                 const nbs = self.upper.items[cur][layer - 1].items;
                 ids.clearRetainingCapacity();
                 for (nbs) |nb| if (!seen.contains(nb)) try ids.append(alloc, nb);
-                try Batch.run(self, alloc, source, q, ids.items, &buf, &seen, stats);
+                try dists.resize(alloc, ids.items.len);
+                try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
+                for (ids.items, dists.items) |id, dist| try seen.put(alloc, id, dist);
                 for (nbs) |nb| {
                     const dist = seen.get(nb).?;
                     if (dist < cur_d) {
@@ -627,25 +733,51 @@ pub const Index = struct {
         return cur;
     }
 
-    /// Beam search on an upper layer with PQ distances (used by insert).
-    fn beamSearchApprox(self: *const Index, alloc: Allocator, table: []const f32, layer: u8, start: u32, ef: u32, out: *std.ArrayListUnmanaged(Cand)) !void {
+    /// Recomputes `ids` in one EmbeddingSource call and writes their exact
+    /// distances to `q` into `out`.
+    fn recomputeDistances(self: *const Index, alloc: Allocator, source: EmbeddingSource, q: []const f32, ids: []const u32, buf: *std.ArrayListUnmanaged(f32), out: []f32, stats: *SearchStats) !void {
+        if (ids.len == 0) return;
+        const d = self.dimension();
+        try buf.resize(alloc, ids.len * d);
+        try source.recompute(ids, buf.items);
+        stats.batches += 1;
+        stats.recomputed += @intCast(ids.len);
+        for (out, 0..) |*o, i| {
+            const row = buf.items[i * d ..][0..d];
+            if (self.config.metric == .cosine) normalize(row);
+            o.* = distance(self.config.metric, q, row);
+        }
+    }
+
+    fn neighbors(self: *const Index, v: u32, layer: u8) []const u32 {
+        return if (layer == 0) self.adjacency.items[v].items else self.upper.items[v][layer - 1].items;
+    }
+
+    /// Beam search on one layer with approximate distances only.
+    fn beamSearchApprox(self: *const Index, alloc: Allocator, approx: *Approx, layer: u8, start: u32, ef: u32, out: *std.ArrayListUnmanaged(Cand)) !void {
         var visited = std.AutoHashMapUnmanaged(u32, void).empty;
         defer visited.deinit(alloc);
         var candidates = Heap(false){};
         defer candidates.deinit(alloc);
         var results = Heap(true){};
         defer results.deinit(alloc);
-        const first = Cand{ .dist = self.pq.adc(table, self.code(start)), .id = start };
+        var fresh = std.ArrayListUnmanaged(u32).empty;
+        defer fresh.deinit(alloc);
+        const first = Cand{ .dist = (try approx.scoreOne(start)).dist, .id = start };
         try visited.put(alloc, start, {});
         try candidates.push(alloc, first);
         try results.push(alloc, first);
         while (candidates.len() > 0) {
             const c = candidates.pop();
             if (results.len() >= ef and c.dist > results.top().dist) break;
-            for (self.upper.items[c.id][layer - 1].items) |nb| {
+            fresh.clearRetainingCapacity();
+            for (self.neighbors(c.id, layer)) |nb| {
                 const gop = try visited.getOrPut(alloc, nb);
-                if (gop.found_existing) continue;
-                const nc = Cand{ .dist = self.pq.adc(table, self.code(nb)), .id = nb };
+                if (!gop.found_existing) try fresh.append(alloc, nb);
+            }
+            const ests = try approx.score(fresh.items);
+            for (fresh.items, ests) |nb, e| {
+                const nc = Cand{ .dist = e.dist, .id = nb };
                 if (results.len() < ef) {
                     try results.push(alloc, nc);
                 } else if (nc.dist < results.top().dist) {
@@ -659,6 +791,115 @@ pub const Index = struct {
         std.mem.sortUnstable(Cand, out.items, {}, candLessThan);
     }
 
+    /// Bound-driven search (RaBitQ only). Phase 1 walks layer 0 with
+    /// estimates alone. Phase 2 recomputes candidates in increasing order of
+    /// their lower bound (estimate - bound_scale * error bound) and stops once
+    /// the next lower bound cannot beat the k-th exact distance found so far.
+    /// Fills `out` with up to `k` exact live results in ascending order.
+    fn boundedSearch(
+        self: *const Index,
+        alloc: Allocator,
+        source: EmbeddingSource,
+        q: []const f32,
+        approx: *Approx,
+        start: u32,
+        opts: SearchOptions,
+        out: *std.ArrayListUnmanaged(Cand),
+        stats: *SearchStats,
+    ) !void {
+        const ef: usize = @max(opts.ef, opts.k);
+        const k: usize = opts.k;
+        const scale = @max(opts.bound_scale, 0);
+
+        const Pooled = struct { id: u32, lower: f32 };
+        var pool = std.ArrayListUnmanaged(Pooled).empty;
+        defer pool.deinit(alloc);
+        var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.node_count);
+        defer visited.deinit(alloc);
+        var candidates = Heap(false){};
+        defer candidates.deinit(alloc);
+        var beam = Heap(true){};
+        defer beam.deinit(alloc);
+        var fresh = std.ArrayListUnmanaged(u32).empty;
+        defer fresh.deinit(alloc);
+
+        const first = try approx.scoreOne(start);
+        visited.set(start);
+        try pool.append(alloc, .{ .id = start, .lower = first.dist - scale * first.bound });
+        try candidates.push(alloc, .{ .dist = first.dist, .id = start });
+        try beam.push(alloc, .{ .dist = first.dist, .id = start });
+        stats.approx_evaluated += 1;
+        while (candidates.len() > 0) {
+            const c = candidates.pop();
+            if (beam.len() >= ef and c.dist > beam.top().dist) break;
+            stats.expanded += 1;
+            fresh.clearRetainingCapacity();
+            for (self.adjacency.items[c.id].items) |nb| {
+                if (visited.isSet(nb)) continue;
+                visited.set(nb);
+                try fresh.append(alloc, nb);
+            }
+            const ests = try approx.score(fresh.items);
+            stats.approx_evaluated += @intCast(fresh.items.len);
+            for (fresh.items, ests) |nb, e| {
+                try pool.append(alloc, .{ .id = nb, .lower = e.dist - scale * e.bound });
+                const nc = Cand{ .dist = e.dist, .id = nb };
+                if (beam.len() < ef) {
+                    try beam.push(alloc, nc);
+                } else if (nc.dist < beam.top().dist) {
+                    beam.replaceTop(nc);
+                } else continue;
+                try candidates.push(alloc, nc);
+            }
+        }
+
+        const ByLower = struct {
+            fn lessThan(_: void, a: Pooled, b: Pooled) bool {
+                return a.lower < b.lower;
+            }
+        };
+        std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
+
+        var top = Heap(true){};
+        defer top.deinit(alloc);
+        var ids = std.ArrayListUnmanaged(u32).empty;
+        defer ids.deinit(alloc);
+        var dists = std.ArrayListUnmanaged(f32).empty;
+        defer dists.deinit(alloc);
+        var buf = std.ArrayListUnmanaged(f32).empty;
+        defer buf.deinit(alloc);
+        const chunk: usize = if (opts.batch_size > 0) opts.batch_size else @max(k, 1);
+        var i: usize = 0;
+        while (i < pool.items.len) {
+            const tau = if (top.len() >= k) top.top().dist else std.math.inf(f32);
+            ids.clearRetainingCapacity();
+            while (i < pool.items.len and ids.items.len < chunk) : (i += 1) {
+                const p = pool.items[i];
+                if (p.lower >= tau) break;
+                if (self.isDeleted(p.id)) continue;
+                try ids.append(alloc, p.id);
+            }
+            if (ids.items.len == 0) {
+                if (i < pool.items.len and pool.items[i].lower >= tau) break;
+                continue;
+            }
+            try dists.resize(alloc, ids.items.len);
+            try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
+            for (ids.items, dists.items) |id, dist| {
+                const c = Cand{ .dist = dist, .id = id };
+                if (top.len() < k) {
+                    try top.push(alloc, c);
+                } else if (c.dist < top.top().dist) {
+                    top.replaceTop(c);
+                }
+            }
+        }
+
+        out.clearRetainingCapacity();
+        try out.appendSlice(alloc, top.items.items);
+        std.mem.sortUnstable(Cand, out.items, {}, candLessThan);
+    }
+
     /// Algorithm 2 on layer 0, starting at `start`. Fills `out` with up to
     /// `ef` exact candidates in ascending distance order, including deleted
     /// nodes.
@@ -667,7 +908,7 @@ pub const Index = struct {
         alloc: Allocator,
         source: EmbeddingSource,
         q: []const f32,
-        table: []const f32,
+        approx: *Approx,
         start: u32,
         opts: SearchOptions,
         out: *std.ArrayListUnmanaged(Cand),
@@ -688,6 +929,10 @@ pub const Index = struct {
         defer pending.deinit(alloc);
         var buf = std.ArrayListUnmanaged(f32).empty;
         defer buf.deinit(alloc);
+        var dists = std.ArrayListUnmanaged(f32).empty;
+        defer dists.deinit(alloc);
+        var fresh = std.ArrayListUnmanaged(u32).empty;
+        defer fresh.deinit(alloc);
 
         const Flush = struct {
             fn run(
@@ -697,21 +942,17 @@ pub const Index = struct {
                 query: []const f32,
                 ids: *std.ArrayListUnmanaged(u32),
                 vectors: *std.ArrayListUnmanaged(f32),
+                ds: *std.ArrayListUnmanaged(f32),
                 eq: *Heap(false),
                 res: *Heap(true),
                 limit: usize,
                 st: *SearchStats,
             ) !void {
                 if (ids.items.len == 0) return;
-                const dd = index.dimension();
-                try vectors.resize(a, ids.items.len * dd);
-                try src.recompute(ids.items, vectors.items);
-                st.batches += 1;
-                st.recomputed += @intCast(ids.items.len);
-                for (ids.items, 0..) |id, i| {
-                    const row = vectors.items[i * dd ..][0..dd];
-                    if (index.config.metric == .cosine) normalize(row);
-                    const c = Cand{ .dist = distance(index.config.metric, query, row), .id = id };
+                try ds.resize(a, ids.items.len);
+                try index.recomputeDistances(a, src, query, ids.items, vectors, ds.items, st);
+                for (ids.items, ds.items) |id, dist| {
+                    const c = Cand{ .dist = dist, .id = id };
                     if (res.len() < limit) {
                         try res.push(a, c);
                     } else if (c.dist < res.top().dist) {
@@ -725,38 +966,41 @@ pub const Index = struct {
 
         visited.set(start);
         try pending.append(alloc, start);
-        try Flush.run(self, alloc, source, q, &pending, &buf, &exact_queue, &results, ef, stats);
+        try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
 
         while (true) {
             if (exact_queue.len() == 0) {
                 if (pending.items.len > 0) {
-                    try Flush.run(self, alloc, source, q, &pending, &buf, &exact_queue, &results, ef, stats);
+                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
                     continue;
                 }
                 // The exact queue ran dry. Like the paper, stop once the beam
                 // is full; only keep promoting while it still has room.
                 if (approx_queue.len() == 0 or results.len() >= ef) break;
                 try promote(alloc, &approx_queue, &pending, ratio);
-                try Flush.run(self, alloc, source, q, &pending, &buf, &exact_queue, &results, ef, stats);
+                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
                 continue;
             }
 
             const c = exact_queue.pop();
             if (results.len() >= ef and c.dist > results.top().dist) {
                 if (pending.items.len > 0) {
-                    try Flush.run(self, alloc, source, q, &pending, &buf, &exact_queue, &results, ef, stats);
+                    try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
                     continue;
                 }
                 break;
             }
 
             stats.expanded += 1;
+            fresh.clearRetainingCapacity();
             for (self.adjacency.items[c.id].items) |nb| {
                 if (visited.isSet(nb)) continue;
                 visited.set(nb);
-                stats.approx_evaluated += 1;
-                try approx_queue.push(alloc, .{ .dist = self.pq.adc(table, self.code(nb)), .id = nb });
+                try fresh.append(alloc, nb);
             }
+            const ests = try approx.score(fresh.items);
+            stats.approx_evaluated += @intCast(fresh.items.len);
+            for (fresh.items, ests) |nb, e| try approx_queue.push(alloc, .{ .dist = e.dist, .id = nb });
 
             if (opts.two_level) {
                 try promote(alloc, &approx_queue, &pending, ratio);
@@ -764,7 +1008,7 @@ pub const Index = struct {
                 while (approx_queue.len() > 0) try pending.append(alloc, approx_queue.pop().id);
             }
             if (opts.batch_size == 0 or pending.items.len >= opts.batch_size) {
-                try Flush.run(self, alloc, source, q, &pending, &buf, &exact_queue, &results, ef, stats);
+                try Flush.run(self, alloc, source, q, &pending, &buf, &dists, &exact_queue, &results, ef, stats);
             }
         }
 
@@ -779,10 +1023,10 @@ pub const Index = struct {
     // ---------------------------------------------------------------------
 
     const magic = "LEANNIDX";
-    pub const format_version: u32 = 2;
+    pub const format_version: u32 = 3;
 
-    /// Serializes the graph layers, PQ codebooks, codes, and flags. No
-    /// embeddings are written. Layout after the header: centroids, codes,
+    /// Serializes the graph layers, quantizer state, codes, and flags. No
+    /// embeddings are written. Layout after the header: quantizer section,
     /// flags, levels, layer-0 CSR offsets and neighbors, then for each node
     /// with level > 0 and each of its layers a u32 count and the neighbors.
     pub fn serialize(self: *const Index, alloc: Allocator) ![]u8 {
@@ -794,18 +1038,23 @@ pub const Index = struct {
         try wr.writeInt(u32, format_version, .little);
         try wr.writeInt(u32, cfg.dims, .little);
         try wr.writeByte(@backingInt(cfg.metric));
+        try wr.writeByte(@backingInt(cfg.quantizer));
         try wr.writeInt(u32, cfg.max_degree, .little);
         try wr.writeInt(u32, cfg.low_degree, .little);
         try wr.writeInt(u32, cfg.ef_construction, .little);
         try wr.writeInt(u32, @bitCast(cfg.hub_fraction), .little);
         try wr.writeInt(u32, cfg.pq_subspaces, .little);
         try wr.writeInt(u64, cfg.seed, .little);
-        try wr.writeInt(u32, self.pq.k, .little);
         try wr.writeInt(u32, self.node_count, .little);
         try wr.writeInt(u32, self.entry, .little);
         try wr.writeByte(self.max_level);
-        for (self.pq.centroids) |f| try wr.writeInt(u32, @bitCast(f), .little);
-        try wr.writeAll(self.codes.items);
+        if (self.pq) |*pq| {
+            try wr.writeInt(u32, pq.k, .little);
+            for (pq.centroids) |f| try wr.writeInt(u32, @bitCast(f), .little);
+            try wr.writeAll(self.codes.items);
+        } else {
+            try self.rabitq.?.write(wr);
+        }
         try wr.writeAll(self.flags.items);
         for (self.upper.items) |lists| try wr.writeByte(@intCast(lists.len));
         var offset: u32 = 0;
@@ -839,8 +1088,8 @@ pub const Index = struct {
         if (!std.mem.eql(u8, head, magic)) return error.InvalidFormat;
         if ((try readU32(&r)) != format_version) return error.UnsupportedVersion;
         var cfg = Config{ .dims = try readU32(&r) };
-        const metric_byte = r.takeByte() catch return error.InvalidFormat;
-        cfg.metric = std.enums.fromInt(Metric, metric_byte) orelse return error.InvalidFormat;
+        cfg.metric = std.enums.fromInt(Metric, r.takeByte() catch return error.InvalidFormat) orelse return error.InvalidFormat;
+        cfg.quantizer = std.enums.fromInt(Quantizer, r.takeByte() catch return error.InvalidFormat) orelse return error.InvalidFormat;
         cfg.max_degree = try readU32(&r);
         cfg.low_degree = try readU32(&r);
         cfg.ef_construction = try readU32(&r);
@@ -848,39 +1097,41 @@ pub const Index = struct {
         cfg.pq_subspaces = try readU32(&r);
         cfg.seed = r.takeInt(u64, .little) catch return error.InvalidFormat;
         cfg = cfg.resolved() catch return error.InvalidFormat;
-        const k = try readU32(&r);
         const n = try readU32(&r);
         const entry = try readU32(&r);
         const max_level = r.takeByte() catch return error.InvalidFormat;
-        if (k == 0 or k > 256) return error.InvalidFormat;
         if (n == 0 or entry >= n or max_level > max_level_cap) return error.InvalidFormat;
 
-        const sub: usize = cfg.pq_subspaces;
-        const centroid_len = @as(usize, k) * cfg.dims;
-        // Cheap size check before allocating anything large.
-        const fixed_len = centroid_len * 4 + @as(usize, n) * (sub + 2) + (@as(usize, n) + 1) * 4;
-        if (r.bufferedLen() < fixed_len) return error.InvalidFormat;
-
-        const centroids = try alloc.alloc(f32, centroid_len);
-        for (centroids) |*f| f.* = @bitCast(readU32(&r) catch unreachable);
-        var index = Index{
-            .alloc = alloc,
-            .config = cfg,
-            .pq = .{ .dims = cfg.dims, .subspaces = cfg.pq_subspaces, .sub_dims = cfg.dims / cfg.pq_subspaces, .k = k, .centroids = centroids },
-            .node_count = n,
-            .entry = entry,
-            .max_level = max_level,
-        };
+        var index = Index{ .alloc = alloc, .config = cfg, .node_count = n, .entry = entry, .max_level = max_level };
         errdefer index.deinit();
 
-        try index.codes.appendSlice(alloc, r.take(@as(usize, n) * sub) catch return error.InvalidFormat);
-        for (index.codes.items) |c| if (c >= k) return error.InvalidFormat;
-        try index.flags.appendSlice(alloc, r.take(n) catch return error.InvalidFormat);
+        switch (cfg.quantizer) {
+            .pq => {
+                const k = try readU32(&r);
+                if (k == 0 or k > 256) return error.InvalidFormat;
+                const sub: usize = cfg.pq_subspaces;
+                const centroid_len = @as(usize, k) * cfg.dims;
+                if (r.bufferedLen() < centroid_len * 4 + @as(usize, n) * sub) return error.InvalidFormat;
+                const centroids = try alloc.alloc(f32, centroid_len);
+                for (centroids) |*f| f.* = @bitCast(readU32(&r) catch unreachable);
+                index.pq = .{ .dims = cfg.dims, .subspaces = cfg.pq_subspaces, .sub_dims = cfg.dims / cfg.pq_subspaces, .k = k, .centroids = centroids };
+                try index.codes.appendSlice(alloc, r.take(@as(usize, n) * sub) catch unreachable);
+                for (index.codes.items) |c| if (c >= k) return error.InvalidFormat;
+            },
+            .rabitq => {
+                index.rabitq = try RaBitQCodes.init(alloc, cfg);
+                try index.rabitq.?.read(alloc, &r, n);
+            },
+        }
+
+        // Fixed-size tail before allocating per-node structures.
+        if (r.bufferedLen() < @as(usize, n) * 2 + (@as(usize, n) + 1) * 4) return error.InvalidFormat;
+        try index.flags.appendSlice(alloc, r.take(n) catch unreachable);
         for (index.flags.items) |f| {
             if (f & ~(flag_hub | flag_deleted) != 0) return error.InvalidFormat;
             if (f & flag_deleted != 0) index.deleted_count += 1;
         }
-        const levels = r.take(n) catch return error.InvalidFormat;
+        const levels = r.take(n) catch unreachable;
         for (levels) |l| if (l > max_level) return error.InvalidFormat;
         if (levels[entry] != max_level) return error.InvalidFormat;
 
@@ -921,7 +1172,277 @@ pub const Index = struct {
             }
         }
         if (r.bufferedLen() != 0) return error.InvalidFormat;
+        try index.rebuildIndegree();
         return index;
+    }
+};
+
+const Est = struct { dist: f32, bound: f32 };
+
+/// Per-query approximate scorer over PQ codes (ADC table, bound 0) or RaBitQ
+/// codes (repo RaBitQ kernel, with error bounds). Not thread-safe; create one
+/// per query.
+const Approx = struct {
+    alloc: Allocator,
+    index: *const Index,
+    table: []f32 = &.{},
+    scratch: ?*rq.RaBitQuantizer.EstimateScratch = null,
+    prepared: rq.RaBitQuantizer.PreparedEstimate = undefined,
+    view: vproto.RaBitQuantizedVectorSet = .{},
+    pairs: std.ArrayListUnmanaged(Pair) = .empty,
+    ranges: std.ArrayListUnmanaged(rq.ScoreRange) = .empty,
+    out: std.ArrayListUnmanaged(Est) = .empty,
+
+    const Pair = struct { id: u32, slot: u32 };
+
+    /// `q` must already be normalized for cosine and is in the original
+    /// (unrotated) space.
+    fn init(alloc: Allocator, index: *const Index, q: []const f32) !Approx {
+        var self = Approx{ .alloc = alloc, .index = index };
+        errdefer self.deinit();
+        if (index.pq) |*pq| {
+            self.table = try alloc.alloc(f32, pq.tableLen());
+            pq.buildTable(index.config.metric, q, self.table);
+            return self;
+        }
+        const r = &index.rabitq.?;
+        const rotated = try alloc.alloc(f32, q.len);
+        defer alloc.free(rotated);
+        _ = r.rotation.transform(q, rotated);
+        const scratch = try alloc.create(rq.RaBitQuantizer.EstimateScratch);
+        errdefer alloc.destroy(scratch);
+        scratch.* = try rq.RaBitQuantizer.EstimateScratch.init(alloc, q.len);
+        self.scratch = scratch;
+        self.view = r.view();
+        self.prepared = try r.quantizer.prepareEstimate(&self.view, rotated, scratch, null);
+        return self;
+    }
+
+    fn deinit(self: *Approx) void {
+        if (self.table.len > 0) self.alloc.free(self.table);
+        if (self.scratch) |s| {
+            s.deinit(self.alloc);
+            self.alloc.destroy(s);
+        }
+        self.pairs.deinit(self.alloc);
+        self.ranges.deinit(self.alloc);
+        self.out.deinit(self.alloc);
+    }
+
+    /// Scores `ids` (unique). The returned slice is valid until the next call.
+    fn score(self: *Approx, ids: []const u32) ![]const Est {
+        try self.out.resize(self.alloc, ids.len);
+        const out = self.out.items;
+        if (ids.len == 0) return out;
+        if (self.index.pq) |*pq| {
+            for (ids, out) |id, *o| o.* = .{ .dist = pq.adc(self.table, self.index.code(id)), .bound = 0 };
+            return out;
+        }
+        // The RaBitQ kernel scores sorted, non-overlapping ranges.
+        self.pairs.clearRetainingCapacity();
+        try self.pairs.ensureTotalCapacity(self.alloc, ids.len);
+        for (ids, 0..) |id, slot| self.pairs.appendAssumeCapacity(.{ .id = id, .slot = @intCast(slot) });
+        const ById = struct {
+            fn lessThan(_: void, a: Pair, b: Pair) bool {
+                return a.id < b.id;
+            }
+        };
+        std.mem.sortUnstable(Pair, self.pairs.items, {}, ById.lessThan);
+        self.ranges.clearRetainingCapacity();
+        for (self.pairs.items) |p| {
+            const id: usize = p.id;
+            if (self.ranges.items.len > 0) {
+                const last = &self.ranges.items[self.ranges.items.len - 1];
+                if (id < last.end) continue; // duplicate id
+                if (id == last.end) {
+                    last.end += 1;
+                    continue;
+                }
+            }
+            try self.ranges.append(self.alloc, .{ .start = id, .end = id + 1 });
+        }
+        const Sink = struct {
+            pairs: []const Pair,
+            out: []Est,
+            cursor: usize = 0,
+            pub fn write(sink: *@This(), i: usize, d: f32, b: f32) void {
+                while (sink.pairs[sink.cursor].id != i) sink.cursor += 1;
+                while (sink.cursor < sink.pairs.len and sink.pairs[sink.cursor].id == i) : (sink.cursor += 1) {
+                    sink.out[sink.pairs[sink.cursor].slot] = .{ .dist = d, .bound = b };
+                }
+            }
+        };
+        var sink = Sink{ .pairs = self.pairs.items, .out = out };
+        try self.index.rabitq.?.quantizer.estimatePreparedDistancesInRangesTo(&self.view, self.prepared, null, self.ranges.items, &sink);
+        return out;
+    }
+
+    fn scoreOne(self: *Approx, id: u32) !Est {
+        return (try self.score(&.{id}))[0];
+    }
+};
+
+/// 1-bit RaBitQ codes (Gao & Long, 2024) using the repo's RaBitQ kernel,
+/// stored in growable lists so inserts can append. Vectors are rotated with
+/// a seeded random orthogonal (Givens) transform and encoded relative to the
+/// mean of the build set.
+pub const RaBitQCodes = struct {
+    quantizer: rq.RaBitQuantizer,
+    rotation: vmath.RandomOrthogonalTransformer,
+    metric: vmath.DistanceMetric,
+    dims: usize,
+    width: usize,
+    centroid: []f32 = &.{},
+    centroid_norm: f32 = 0,
+    codes: std.ArrayListUnmanaged(u64) = .empty,
+    code_counts: std.ArrayListUnmanaged(u32) = .empty,
+    centroid_distances: std.ArrayListUnmanaged(f32) = .empty,
+    quantized_dot_products: std.ArrayListUnmanaged(f32) = .empty,
+    /// Empty for l2_squared.
+    centroid_dot_products: std.ArrayListUnmanaged(f32) = .empty,
+
+    fn init(alloc: Allocator, cfg: Config) !RaBitQCodes {
+        const metric: vmath.DistanceMetric = @fromBackingInt(@intCast(@backingInt(cfg.metric)));
+        var quantizer = try rq.RaBitQuantizer.init(alloc, cfg.dims, cfg.seed, metric);
+        errdefer quantizer.deinit();
+        const rotation = try vmath.RandomOrthogonalTransformer.init(alloc, .givens, cfg.dims, cfg.seed);
+        return .{ .quantizer = quantizer, .rotation = rotation, .metric = metric, .dims = cfg.dims, .width = vrabitq.codeWidth(cfg.dims) };
+    }
+
+    fn deinit(self: *RaBitQCodes, alloc: Allocator) void {
+        self.quantizer.deinit();
+        self.rotation.deinit();
+        if (self.centroid.len > 0) alloc.free(self.centroid);
+        self.codes.deinit(alloc);
+        self.code_counts.deinit(alloc);
+        self.centroid_distances.deinit(alloc);
+        self.quantized_dot_products.deinit(alloc);
+        self.centroid_dot_products.deinit(alloc);
+    }
+
+    fn count(self: *const RaBitQCodes) usize {
+        return self.code_counts.items.len;
+    }
+
+    fn rotateInPlace(self: *const RaBitQCodes, alloc: Allocator, rows: []f32) !void {
+        const tmp = try alloc.alloc(f32, self.dims);
+        defer alloc.free(tmp);
+        var i: usize = 0;
+        while (i < rows.len) : (i += self.dims) {
+            const row = rows[i..][0..self.dims];
+            _ = self.rotation.transform(row, tmp);
+            @memcpy(row, tmp);
+        }
+    }
+
+    /// Sets the centroid to the mean of `rotated` and encodes every row.
+    fn encodeAll(self: *RaBitQCodes, alloc: Allocator, rotated: []const f32, n: usize) !void {
+        const sum = try alloc.alloc(f64, self.dims);
+        defer alloc.free(sum);
+        @memset(sum, 0);
+        for (0..n) |i| for (rotated[i * self.dims ..][0..self.dims], sum) |x, *s| {
+            s.* += x;
+        };
+        self.centroid = try alloc.alloc(f32, self.dims);
+        for (self.centroid, sum) |*c, s| c.* = @floatCast(s / @as(f64, @floatFromInt(n)));
+        self.centroid_norm = if (self.metric == .l2_squared) 0 else @sqrt(dot(self.centroid, self.centroid));
+
+        var set = try self.quantizer.quantize(self.centroid, rotated, n);
+        defer set.deinit(alloc);
+        try self.codes.appendSlice(alloc, set.codes.data);
+        try self.code_counts.appendSlice(alloc, set.code_counts);
+        try self.centroid_distances.appendSlice(alloc, set.centroid_distances);
+        try self.quantized_dot_products.appendSlice(alloc, set.quantized_dot_products);
+        try self.centroid_dot_products.appendSlice(alloc, set.centroid_dot_products);
+    }
+
+    const Row = struct {
+        set: vproto.RaBitQuantizedVectorSet,
+
+        fn deinit(self: *Row, alloc: Allocator) void {
+            self.set.deinit(alloc);
+        }
+    };
+
+    /// Encodes one unrotated vector without touching the stored codes.
+    fn encodeRow(self: *const RaBitQCodes, alloc: Allocator, v: []const f32) !Row {
+        const rotated = try alloc.alloc(f32, self.dims);
+        defer alloc.free(rotated);
+        _ = self.rotation.transform(v, rotated);
+        return .{ .set = try self.quantizer.quantize(self.centroid, rotated, 1) };
+    }
+
+    fn reserve(self: *RaBitQCodes, alloc: Allocator, extra: usize) !void {
+        try self.codes.ensureUnusedCapacity(alloc, extra * self.width);
+        try self.code_counts.ensureUnusedCapacity(alloc, extra);
+        try self.centroid_distances.ensureUnusedCapacity(alloc, extra);
+        try self.quantized_dot_products.ensureUnusedCapacity(alloc, extra);
+        if (self.metric != .l2_squared) try self.centroid_dot_products.ensureUnusedCapacity(alloc, extra);
+    }
+
+    fn appendRowAssumeCapacity(self: *RaBitQCodes, row: *const Row) void {
+        self.codes.appendSliceAssumeCapacity(row.set.codes.data);
+        self.code_counts.appendSliceAssumeCapacity(row.set.code_counts);
+        self.centroid_distances.appendSliceAssumeCapacity(row.set.centroid_distances);
+        self.quantized_dot_products.appendSliceAssumeCapacity(row.set.quantized_dot_products);
+        if (self.metric != .l2_squared) self.centroid_dot_products.appendSliceAssumeCapacity(row.set.centroid_dot_products);
+    }
+
+    /// Borrowed set view for the RaBitQ kernel. Valid until the next append.
+    fn view(self: *const RaBitQCodes) vproto.RaBitQuantizedVectorSet {
+        return .{
+            .metric = self.metric,
+            .centroid = self.centroid,
+            .codes = .{ .count = @intCast(self.count()), .width = @intCast(self.width), .data = self.codes.items },
+            .code_counts = self.code_counts.items,
+            .centroid_distances = self.centroid_distances.items,
+            .quantized_dot_products = self.quantized_dot_products.items,
+            .centroid_dot_products = self.centroid_dot_products.items,
+            .centroid_norm = self.centroid_norm,
+        };
+    }
+
+    /// Reconstruction in rotated space: centroid + |r| * sign(code) / sqrt(D).
+    fn decode(self: *const RaBitQCodes, id: u32, out: []f32) void {
+        const words = self.codes.items[@as(usize, id) * self.width ..][0..self.width];
+        const scale = self.centroid_distances.items[id] / @sqrt(@as(f32, @floatFromInt(self.dims)));
+        for (out, 0..) |*o, j| {
+            const bit = (words[j / 64] >> @intCast(63 - j % 64)) & 1;
+            o.* = self.centroid[j] + (if (bit == 1) scale else -scale);
+        }
+    }
+
+    fn write(self: *const RaBitQCodes, wr: *std.Io.Writer) !void {
+        for (self.centroid) |f| try wr.writeInt(u32, @bitCast(f), .little);
+        try wr.writeInt(u32, @bitCast(self.centroid_norm), .little);
+        for (self.codes.items) |c| try wr.writeInt(u64, c, .little);
+        for (self.code_counts.items) |c| try wr.writeInt(u32, c, .little);
+        for (self.centroid_distances.items) |f| try wr.writeInt(u32, @bitCast(f), .little);
+        for (self.quantized_dot_products.items) |f| try wr.writeInt(u32, @bitCast(f), .little);
+        for (self.centroid_dot_products.items) |f| try wr.writeInt(u32, @bitCast(f), .little);
+    }
+
+    fn read(self: *RaBitQCodes, alloc: Allocator, r: *std.Io.Reader, n: u32) !void {
+        const per_node: usize = self.width * 8 + 4 * 3 + (if (self.metric != .l2_squared) @as(usize, 4) else 0);
+        if (r.bufferedLen() < self.dims * 4 + 4 + per_node * n) return error.InvalidFormat;
+        self.centroid = try alloc.alloc(f32, self.dims);
+        for (self.centroid) |*f| f.* = @bitCast(readU32(r) catch unreachable);
+        self.centroid_norm = @bitCast(readU32(r) catch unreachable);
+        try self.codes.resize(alloc, @as(usize, n) * self.width);
+        for (self.codes.items) |*c| c.* = r.takeInt(u64, .little) catch unreachable;
+        try self.code_counts.resize(alloc, n);
+        for (self.code_counts.items) |*c| {
+            c.* = readU32(r) catch unreachable;
+            if (c.* > self.dims) return error.InvalidFormat;
+        }
+        inline for (.{ &self.centroid_distances, &self.quantized_dot_products }) |list| {
+            try list.resize(alloc, n);
+            for (list.items) |*f| f.* = @bitCast(readU32(r) catch unreachable);
+        }
+        if (self.metric != .l2_squared) {
+            try self.centroid_dot_products.resize(alloc, n);
+            for (self.centroid_dot_products.items) |*f| f.* = @bitCast(readU32(r) catch unreachable);
+        }
     }
 };
 
@@ -1728,7 +2249,7 @@ test "leann: storage is a fraction of raw embeddings" {
     const bytes = try index.serialize(alloc);
     defer alloc.free(bytes);
     // The PQ codebook is a fixed cost that does not grow with the corpus.
-    const codebook = index.pq.centroids.len * @sizeOf(f32);
+    const codebook = index.pq.?.centroids.len * @sizeOf(f32);
     const per_vector = (bytes.len - codebook) / n;
     testing.expect(per_vector * 8 < dims * @sizeOf(f32)) catch |err| {
         std.debug.print("per-vector bytes={d} raw={d}\n", .{ per_vector, dims * @sizeOf(f32) });
@@ -1821,4 +2342,64 @@ test "leann: recompute failures propagate" {
     var src = SliceEmbeddingSource{ .vectors = fx.data[0 .. 10 * 8], .dims = 8 };
     try testing.expectError(error.UnknownNode, index.search(alloc, src.source(), fx.query(0), .{}));
     try testing.expectError(error.DimensionMismatch, index.search(alloc, src.source(), fx.data[0..4], .{}));
+}
+
+test "leann: rabitq bounds search recall and recompute budget" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 30, 128, 24, 37);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 128, .quantizer = .rabitq, .max_degree = 24, .ef_construction = 96 }, fx.data);
+    defer index.deinit();
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 128 };
+    const tight = try recallAt(alloc, &index, &fx, src.source(), .{ .ef = 64, .bound_scale = 0.5 }, 30, std.math.maxInt(usize));
+    const loose = try recallAt(alloc, &index, &fx, src.source(), .{ .ef = 64, .bound_scale = 2 }, 30, std.math.maxInt(usize));
+    testing.expect(loose.recall >= 0.85) catch |err| {
+        std.debug.print("rabitq recall tight={d:.3}/{d:.1} loose={d:.3}/{d:.1}\n", .{ tight.recall, tight.recomputed, loose.recall, loose.recomputed });
+        return err;
+    };
+    // Wider bounds can only admit more candidates.
+    try testing.expect(loose.recomputed >= tight.recomputed);
+    try testing.expect(loose.recall >= tight.recall);
+    // Bound-driven verification recomputes a fraction of what it scores.
+    try testing.expect(loose.recomputed < 2000 / 4);
+
+    var pq_index = try Index.build(alloc, .{ .dims = 128, .max_degree = 8 }, fx.data[0 .. 300 * 128]);
+    defer pq_index.deinit();
+    try testing.expectError(error.BoundsRequireRaBitQ, pq_index.search(alloc, src.source(), fx.query(0), .{ .rerank = .bounds }));
+}
+
+test "leann: rabitq serialization and inserts without recomputation" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 1500, 10, 64, 12, 41);
+    defer fx.deinit(alloc);
+    for ([_]Metric{ .l2_squared, .cosine }) |metric| {
+        var index = try Index.build(alloc, .{ .dims = 64, .metric = metric, .quantizer = .rabitq, .max_degree = 16 }, fx.data[0 .. 1000 * 64]);
+        defer index.deinit();
+        var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 64 };
+        for (1000..1500) |i| _ = try index.insert(src.source(), fx.data[i * 64 ..][0..64]);
+        // RaBitQ inserts link with estimates only.
+        try testing.expectEqual(@as(u64, 0), src.recomputed);
+        for ([_]usize{ 1000, 1499 }) |i| {
+            var resp = try index.search(alloc, src.source(), fx.data[i * 64 ..][0..64], .{ .k = 1, .ef = 256 });
+            defer resp.deinit(alloc);
+            try testing.expectEqual(@as(u32, @intCast(i)), resp.results[0].id);
+        }
+
+        const bytes = try index.serialize(alloc);
+        defer alloc.free(bytes);
+        var copy = try Index.deserialize(alloc, bytes);
+        defer copy.deinit();
+        try testing.expect(copy.rabitq != null);
+        for (0..10) |qi| {
+            var a = try index.search(alloc, src.source(), fx.query(qi), .{});
+            defer a.deinit(alloc);
+            var b = try copy.search(alloc, src.source(), fx.query(qi), .{});
+            defer b.deinit(alloc);
+            try testing.expectEqualSlices(Result, a.results, b.results);
+        }
+        const bad = try alloc.dupe(u8, bytes);
+        defer alloc.free(bad);
+        bad[bad.len / 3] ^= 0x10;
+        try testing.expectError(error.InvalidFormat, Index.deserialize(alloc, bad));
+    }
 }
