@@ -72,7 +72,7 @@ fn per(comptime ws: []const Weight, comptime t: []const u8) []const u8 {
 /// masked dot, and the per-row accumulation.
 pub fn rowDot(comptime ws: []const Weight, comptime loop: []const u8, comptime u: []const u8) []const u8 {
     return join(&.{
-        per(ws, fill("ushort $${pre}bits = (ushort($${w}[off + 1${u}]) << 8) | ushort($${w}[off]);", .{ .u = u })),                               " ",
+        per(ws, fill("ushort $${pre}bits = (ushort($${w}[off + 1${u}]) << 8) | ushort($${w}[off]);", .{ .u = u })),     " ",
         per(ws, "float d${s} = float(as_type<half>(${pre}bits));"),                                                     " ",
         per(ws, "const device ushort *qs${s} = reinterpret_cast<const device ushort *>(${w} + off + 2u) + (il >> 1);"), " ",
         per(ws, "float qacc${s} = 0.0f;"),                                                                              " ",
@@ -87,7 +87,7 @@ pub fn rowDot(comptime ws: []const Weight, comptime loop: []const u8, comptime u
 /// `j0`, nibbles decoded with the -8 offset, `hi` the high-nibble read.
 pub fn rowDot8(comptime ws: []const Weight, comptime j0: []const u8, comptime hi: []const u8, comptime u: []const u8) []const u8 {
     return join(&.{
-        per(ws, fill("ushort $${pre}bits = (ushort($${w}[off + 1${u}]) << 8) | ushort($${w}[off]);", .{ .u = u })),                                                " ",
+        per(ws, fill("ushort $${pre}bits = (ushort($${w}[off + 1${u}]) << 8) | ushort($${w}[off]);", .{ .u = u })),                       " ",
         per(ws, "float d${s} = float(as_type<half>(${pre}bits));"),                                                                       " ",
         per(ws, "const device uchar *qs${s} = ${w} + off + 2u;"),                                                                         " ",
         per(ws, "float block${s} = 0.0f;"),                                                                                               " for (uint i = 0u; i < NQ; ++i) { uint j = ",

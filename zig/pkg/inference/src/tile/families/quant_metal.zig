@@ -20,6 +20,7 @@ const msl = @import("../quant_metal_msl.zig");
 const wrap = @import("../quant_metal_wrap.zig");
 const gemv = @import("../quant_metal_gemv.zig");
 const q4_0 = @import("../quant_metal_q4_0.zig");
+const dense = @import("../quant_metal_dense.zig");
 
 pub const regions = [_]Region{
     msl.raw("rows", @import("../quant_metal_rows.zig").region()),
@@ -55,4 +56,10 @@ pub const regions = [_]Region{
     msl.metal("gemv_iq4_nl", &.{ gemv.scalar("iq4_nl"), gemv.reduce("iq4_nl"), gemv.scalar("iq4_xs"), gemv.reduce("iq4_xs"), gemv.scalar("mxfp4"), gemv.reduce("mxfp4") }),
     msl.metal("gemv_nvfp4", &.{gemv.scalar("nvfp4")}),
     msl.metal("gemv_iq2_xs", &.{gemv.scalar("iq2_xs")}),
+    msl.metal("dense_f32_1x", &.{ dense.single(dense.f32_), dense.singleReduce(dense.f32_) }),
+    msl.metal("dense_f16_1x", &.{ dense.single(dense.f16_), dense.singleReduce(dense.f16_) }),
+    msl.metal("dense_bf16_1x", &.{ dense.single(dense.bf16_), dense.singleReduce(dense.bf16_) }),
+    msl.metal("dense_f32_multi_row", &.{ dense.multiRow(dense.f32_), dense.multiRowReduce(dense.f32_) }),
+    msl.metal("dense_f16_multi_row", &.{ dense.multiRow(dense.f16_), dense.multiRowReduce(dense.f16_) }),
+    msl.metal("dense_bf16_multi_row", &.{ dense.multiRow(dense.bf16_), dense.multiRowReduce(dense.bf16_) }),
 };
