@@ -15,6 +15,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | Rotary products and axes | `src/ops/cuda/kernels/rotary_program.cuh` and Metal rotary helpers | Axis-local versus head-wide halves, product rounding, frequency evaluation and upper-product order |
 | MPP projection | `antfly_mpp_affine`, `antfly_mpp_split_projection`, `TERMITE_MSL_MPP_GATE_PROGRAM` in `metal_kernels.m` | Rows/columns, SIMD groups, split-K, projection planes, F32/BF16 storage and finite-gate epilogue |
 | Gated delta recurrence | `metal_gdn_source.h`, `prototypes/gated_delta_recurrent.cu` | Register/shared staging, history ownership, epsilon placement and state-update schedule |
+| Segmented inference tile attention | `ANTFLY_MSL_SEGMENT_*` phases in `metal_kernels.m` | Wide/blocked row ownership, 8/16-key MMA and softmax schedules, explicit scales and GQA storage |
 | Range/segment training attention | `range_attention_reference.zig`, `segment_training_attention.zig`, Metal segment fragments | Mask/control layout, replay/dropout, orientation, tile geometry and gradient ownership |
 | Relative training attention | `kernels/relative_attention_training.cuh`, `relative_attention_tensor_*` and the GPU training renderer | Relative terms, bucket layout, deterministic replay and distinct tensor-core schedules |
 | Dense projection admission | `dense_projection_policy.zig` | Workload, rows, output width, quant layout and packed-expert exclusion |
@@ -83,3 +84,7 @@ Report maintained device code, host policy, tests/docs, generated text and image
 bytes separately. Count every shared owner once. Renaming a file or generating
 several copies of one body does not itself reduce authored code. Use
 `scripts/kernel_source_accounting.py --revision BASELINE --output RECEIPT`.
+
+`check_metal_segment_blocks.m` can freeze the main shader with `--dump-source`
+and validate a source-phase refactor with `--require-source-identity`. Check
+authored owners before estimating savings from expanded-shader similarity.

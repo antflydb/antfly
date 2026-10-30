@@ -7189,6 +7189,65 @@ static NSString *termite_metal_tensor_program_source(void) {
     "    for (uint d4 = uint(sgitg); d4 < hd4; d4 += schedule.reduce_simdgroups) { float4 value = lane < split_count ? partial_o[(qh * hd4 + d4) * split_count + uint(lane)] : float4(0.0f); float4 merged = simd_sum(value * weight); if (lane == 0u) output[qh * hd4 + d4] = merged * inv_denom; }\n" \
     "}\n"
 
+// Shared range admission, key staging and publication for native segment tiles.
+// These source phases retain the exact qualified compiler inputs and schedules.
+#define ANTFLY_MSL_SEGMENT_RANGE_ENVELOPE() \
+    "    uint lo = 0xffffffffu, hi = 0u;\n" \
+    "    int pmin = 2147483647, pmax = -2147483647 - 1;\n" \
+    "    if (L < nq) { for (uint r = 0u; r < 3u; ++r) { uint a = rg[L * 6u + 2u * r], b = rg[L * 6u + 2u * r + 1u]; if (a < b) { lo = min(lo, a); hi = max(hi, b); } } pmin = qp[L]; pmax = qp[L]; }\n" \
+    "    lo = simd_min(lo); hi = simd_max(hi); pmin = simd_min(pmin); pmax = simd_max(pmax);\n"
+
+#define ANTFLY_MSL_SEGMENT_KEY_STAGE(Advance,ReadKey) \
+    "        const uint nk = min(BK, hi - kb);\n" \
+    "        const int key_pos = L < nk ? kpos[kb + L] : 0;\n" \
+    "        const uint gap = key_pos < pmin ? uint(pmin) - uint(key_pos) : key_pos > pmax ? uint(key_pos) - uint(pmax) : 0u;\n" \
+    "        if (!simd_any(L < nk && (p.window == 0xffffffffu || gap <= p.window))) continue;\n" \
+    "        if (t < BK) kp[t] = t < nk ? kpos[kb + t] : 0;\n" \
+    "        for (uint i = t; i < BK * D; " Advance ") { uint c = i / D, d = i % D; kv[c * DM + d] = c < nk ? " ReadKey " : 0.0f; }\n" \
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+
+#define ANTFLY_MSL_SEGMENT_BLOCK_PUBLISH(Fragments,Store) \
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "    simdgroup_float8x8 dg; simdgroup_load(dg, parts + pb, 8u);\n" \
+    "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < " Fragments "; ++dt) if (dt < nd) {\n" \
+    Store "\n" \
+    "        simdgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "        for (uint i = L; i < 64u; i += 32u) { uint r = qb * 8u + i / 8u; if (r < nq) output[(q0 + r) * hidden + h * D + s * panel + dt * 8u + i % 8u] = kv[uint(sg) * 64u + i]; }\n" \
+    "        simdgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "    }\n"
+
+#define ANTFLY_MSL_SEGMENT_QK8(Storage) \
+    "        simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" \
+    "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 16u; ++dt) if (dt < nd) {\n" \
+    "            simdgroup_float8x8 km;\n" \
+    "            simdgroup_load(km, kv + s * panel + dt * 8u, DM, ulong2(0, 0), true);\n" \
+    "            simdgroup_multiply_accumulate(acc, qm[dt], km, acc);\n" \
+    "        }\n" \
+    "        simdgroup_store(acc, " Storage ", BK);\n"
+
+#define ANTFLY_MSL_SEGMENT_PV8(Storage) \
+    "        simdgroup_float8x8 dg, pm;\n" \
+    Storage "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 16u; ++dt) if (dt < nd) {\n" \
+    "            simdgroup_float8x8 vm;\n" \
+    "            simdgroup_load(vm, kv + s * panel + dt * 8u, DM);\n" \
+    "            simdgroup_multiply(o[dt], dg, o[dt]);\n" \
+    "            simdgroup_multiply_accumulate(o[dt], pm, vm, o[dt]);\n" \
+    "        }\n"
+
+#define ANTFLY_MSL_SEGMENT_SCORE_VISIBLE() \
+    "                const uint distance = qp[r] >= kp[c] ? uint(qp[r]) - uint(kp[c]) : uint(kp[c]) - uint(qp[r]);\n" \
+    "                const bool visible = r < nq && c < nk && ((key >= x[0] && key < x[1]) || (key >= x[2] && key < x[3]) || (key >= x[4] && key < x[5])) && (p.window == 0xffffffffu || distance <= p.window);\n"
+
+#define ANTFLY_MSL_SEGMENT_SOFTMAX8(Weights) \
+    "            float mx = max(x0, x1);\n" \
+    "            mx = max(mx, simd_shuffle_xor(mx, 1)); mx = max(mx, simd_shuffle_xor(mx, 2));\n" \
+    "            const float mold = mrow[r], mnew = max(mold, mx);\n" \
+    "            const float a = mnew == neg ? 1.0f : mold == neg ? 0.0f : exp(mold - mnew);\n" \
+    "            const float w0 = x0 == neg ? 0.0f : exp(x0 - mnew), w1 = x1 == neg ? 0.0f : exp(x1 - mnew);\n" \
+    Weights "            float sum = w0 + w1;\n" \
+    "            sum += simd_shuffle_xor(sum, 1); sum += simd_shuffle_xor(sum, 2);\n" \
+    "            if (L % 4u == 0u) { lrow[r] = lrow[r] * a + sum; mrow[r] = mnew; alpha[r] = a; }\n"
+
 static NSString *termite_metal_shader_source(void) {
     return [[NSString stringWithUTF8String:antfly_msl_depthwise_source] stringByAppendingString:@"#include <metal_stdlib>\n"
            "using namespace metal;\n"
@@ -12766,10 +12825,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (t < BQ) { qp[t] = t < nq ? qpos[q0 + t] : 0; mrow[t] = neg; lrow[t] = 0.0f; }\n"
            "    for (uint i = t; i < BQ * D; i += 128u) { uint r = i / D, d = i % D; kv[r * DM + d] = r < nq ? q[(q0 + r) * hidden + h * D + d] : 0.0f; }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    uint lo = 0xffffffffu, hi = 0u;\n"
-           "    int pmin = 2147483647, pmax = -2147483647 - 1;\n"
-           "    if (L < nq) { for (uint r = 0u; r < 3u; ++r) { uint a = rg[L * 6u + 2u * r], b = rg[L * 6u + 2u * r + 1u]; if (a < b) { lo = min(lo, a); hi = max(hi, b); } } pmin = qp[L]; pmax = qp[L]; }\n"
-           "    lo = simd_min(lo); hi = simd_max(hi); pmin = simd_min(pmin); pmax = simd_max(pmax);\n"
+           ANTFLY_MSL_SEGMENT_RANGE_ENVELOPE()
            "    simdgroup_float8x8 qm[16], o[16];\n"
            "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 16u; ++dt) if (dt < nd) {\n"
            "        simdgroup_load(qm[dt], kv + s * panel + dt * 8u, DM);\n"
@@ -12777,55 +12833,27 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint kb = lo; kb < hi; kb += BK) {\n"
-           "        const uint nk = min(BK, hi - kb);\n"
-           "        const int key_pos = L < nk ? kpos[kb + L] : 0;\n"
-           "        const uint gap = key_pos < pmin ? uint(pmin) - uint(key_pos) : key_pos > pmax ? uint(key_pos) - uint(pmax) : 0u;\n"
-           "        if (!simd_any(L < nk && (p.window == 0xffffffffu || gap <= p.window))) continue;\n"
-           "        if (t < BK) kp[t] = t < nk ? kpos[kb + t] : 0;\n"
-           "        for (uint i = t; i < BK * D; i += 128u) { uint c = i / D, d = i % D; kv[c * DM + d] = c < nk ? k[(kb + c) * hidden + h * D + d] : 0.0f; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 16u; ++dt) if (dt < nd) {\n"
-           "            simdgroup_float8x8 km;\n"
-           "            simdgroup_load(km, kv + s * panel + dt * 8u, DM, ulong2(0, 0), true);\n"
-           "            simdgroup_multiply_accumulate(acc, qm[dt], km, acc);\n"
-           "        }\n"
-           "        simdgroup_store(acc, parts + s * 64u, BK);\n"
+           ANTFLY_MSL_SEGMENT_KEY_STAGE("i += 128u", "k[(kb + c) * hidden + h * D + d]")
+           ANTFLY_MSL_SEGMENT_QK8("parts + s * 64u")
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        if (s == 0u) {\n"
            "            for (uint i = L; i < 64u; i += 32u) {\n"
            "                const uint r = i / BK, c = i % BK;\n"
            "                threadgroup const uint *x = rg + r * 6u;\n"
            "                const uint key = kb + c;\n"
-           "                const uint distance = qp[r] >= kp[c] ? uint(qp[r]) - uint(kp[c]) : uint(kp[c]) - uint(qp[r]);\n"
-           "                const bool visible = r < nq && c < nk && ((key >= x[0] && key < x[1]) || (key >= x[2] && key < x[3]) || (key >= x[4] && key < x[5])) && (p.window == 0xffffffffu || distance <= p.window);\n"
+           ANTFLY_MSL_SEGMENT_SCORE_VISIBLE()
            "                parts[i] = visible ? (parts[i] + parts[64u + i] + parts[128u + i] + parts[192u + i]) * scale : neg;\n"
            "            }\n"
            "            simdgroup_barrier(mem_flags::mem_threadgroup);\n"
            "            const uint r = L / 4u, c0 = (L % 4u) * 2u;\n"
            "            float x0 = parts[r * BK + c0], x1 = parts[r * BK + c0 + 1u];\n"
-           "            float mx = max(x0, x1);\n"
-           "            mx = max(mx, simd_shuffle_xor(mx, 1)); mx = max(mx, simd_shuffle_xor(mx, 2));\n"
-           "            const float mold = mrow[r], mnew = max(mold, mx);\n"
-           "            const float a = mnew == neg ? 1.0f : mold == neg ? 0.0f : exp(mold - mnew);\n"
-           "            const float w0 = x0 == neg ? 0.0f : exp(x0 - mnew), w1 = x1 == neg ? 0.0f : exp(x1 - mnew);\n"
-           "            parts[r * BK + c0] = w0; parts[r * BK + c0 + 1u] = w1;\n"
-           "            float sum = w0 + w1;\n"
-           "            sum += simd_shuffle_xor(sum, 1); sum += simd_shuffle_xor(sum, 2);\n"
-           "            if (L % 4u == 0u) { lrow[r] = lrow[r] * a + sum; mrow[r] = mnew; alpha[r] = a; }\n"
+           ANTFLY_MSL_SEGMENT_SOFTMAX8("            parts[r * BK + c0] = w0; parts[r * BK + c0 + 1u] = w1;\n")
            "        }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        if (t < 64u) parts[64u + t] = t / 8u == t % 8u ? alpha[t / 8u] : 0.0f;\n"
            "        for (uint i = t; i < BK * D; i += 128u) { uint c = i / D, d = i % D; kv[c * DM + d] = c < nk ? v[(kb + c) * hidden + h * D + d] : 0.0f; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        simdgroup_float8x8 dg, pm;\n"
-           "        simdgroup_load(dg, parts + 64u, 8u); simdgroup_load(pm, parts, BK);\n"
-           "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 16u; ++dt) if (dt < nd) {\n"
-           "            simdgroup_float8x8 vm;\n"
-           "            simdgroup_load(vm, kv + s * panel + dt * 8u, DM);\n"
-           "            simdgroup_multiply(o[dt], dg, o[dt]);\n"
-           "            simdgroup_multiply_accumulate(o[dt], pm, vm, o[dt]);\n"
-           "        }\n"
+           ANTFLY_MSL_SEGMENT_PV8("        simdgroup_load(dg, parts + 64u, 8u); simdgroup_load(pm, parts, BK);\n")
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    if (t < 64u) parts[t] = t / 8u == t % 8u && lrow[t / 8u] > 0.0f ? 1.0f / lrow[t / 8u] : 0.0f;\n"
@@ -12862,10 +12890,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint i = t; i < BQ * 6u; i += width) rg[i] = i / 6u < nq ? ranges[(q0 + i / 6u) * 6u + i % 6u] : 0u;\n"
            "    if (t < BQ) { qp[t] = t < nq ? qpos[q0 + t] : 0; mrow[t] = neg; lrow[t] = 0.0f; }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    uint lo = 0xffffffffu, hi = 0u;\n"
-           "    int pmin = 2147483647, pmax = -2147483647 - 1;\n"
-           "    if (L < nq) { for (uint r = 0u; r < 3u; ++r) { uint a = rg[L * 6u + 2u * r], b = rg[L * 6u + 2u * r + 1u]; if (a < b) { lo = min(lo, a); hi = max(hi, b); } } pmin = qp[L]; pmax = qp[L]; }\n"
-           "    lo = simd_min(lo); hi = simd_max(hi); pmin = simd_min(pmin); pmax = simd_max(pmax);\n"
+           ANTFLY_MSL_SEGMENT_RANGE_ENVELOPE()
            "    simdgroup_float8x8 qm[16], o[16];\n"
            "    for (uint block = 0u; block < blocks; ++block) {\n"
            "        for (uint i = t; i < 8u * D; i += width) { uint r = i / D + block * 8u, d = i % D; kv[(i / D) * DM + d] = r < nq ? q[(q0 + r) * hidden + h * D + d] : 0.0f; }\n"
@@ -12877,67 +12902,31 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    for (uint kb = lo; kb < hi; kb += BK) {\n"
-           "        const uint nk = min(BK, hi - kb);\n"
-           "        const int key_pos = L < nk ? kpos[kb + L] : 0;\n"
-           "        const uint gap = key_pos < pmin ? uint(pmin) - uint(key_pos) : key_pos > pmax ? uint(key_pos) - uint(pmax) : 0u;\n"
-           "        if (!simd_any(L < nk && (p.window == 0xffffffffu || gap <= p.window))) continue;\n"
-           "        if (t < BK) kp[t] = t < nk ? kpos[kb + t] : 0;\n"
-           "        for (uint i = t; i < BK * D; i += width) { uint c = i / D, d = i % D; kv[c * DM + d] = c < nk ? k[(kb + c) * kv_hidden + kh * D + d] : 0.0f; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 16u; ++dt) if (dt < nd) {\n"
-           "            simdgroup_float8x8 km;\n"
-           "            simdgroup_load(km, kv + s * panel + dt * 8u, DM, ulong2(0, 0), true);\n"
-           "            simdgroup_multiply_accumulate(acc, qm[dt], km, acc);\n"
-           "        }\n"
-           "        simdgroup_store(acc, parts + pb + s * 64u, BK);\n"
+           ANTFLY_MSL_SEGMENT_KEY_STAGE("i += width", "k[(kb + c) * kv_hidden + kh * D + d]")
+           ANTFLY_MSL_SEGMENT_QK8("parts + pb + s * 64u")
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        if (s == 0u) {\n"
            "            for (uint i = L; i < 64u; i += 32u) {\n"
            "                const uint r = qb * 8u + i / BK, c = i % BK;\n"
            "                threadgroup const uint *x = rg + r * 6u;\n"
            "                const uint key = kb + c;\n"
-           "                const uint distance = qp[r] >= kp[c] ? uint(qp[r]) - uint(kp[c]) : uint(kp[c]) - uint(qp[r]);\n"
-           "                const bool visible = r < nq && c < nk && ((key >= x[0] && key < x[1]) || (key >= x[2] && key < x[3]) || (key >= x[4] && key < x[5])) && (p.window == 0xffffffffu || distance <= p.window);\n"
+           ANTFLY_MSL_SEGMENT_SCORE_VISIBLE()
            "                parts[pb + i] = visible ? (parts[pb + i] + parts[pb + 64u + i] + parts[pb + 128u + i] + parts[pb + 192u + i]) * scale : neg;\n"
            "            }\n"
            "            simdgroup_barrier(mem_flags::mem_threadgroup);\n"
            "            const uint r = qb * 8u + L / 4u, pr = (L / 4u) * BK + pb, c0 = (L % 4u) * 2u;\n"
            "            float x0 = parts[pr + c0], x1 = parts[pr + c0 + 1u];\n"
-           "            float mx = max(x0, x1);\n"
-           "            mx = max(mx, simd_shuffle_xor(mx, 1)); mx = max(mx, simd_shuffle_xor(mx, 2));\n"
-           "            const float mold = mrow[r], mnew = max(mold, mx);\n"
-           "            const float a = mnew == neg ? 1.0f : mold == neg ? 0.0f : exp(mold - mnew);\n"
-           "            const float w0 = x0 == neg ? 0.0f : exp(x0 - mnew), w1 = x1 == neg ? 0.0f : exp(x1 - mnew);\n"
-           "            parts[pr + c0] = w0; parts[pr + c0 + 1u] = w1;\n"
-           "            float sum = w0 + w1;\n"
-           "            sum += simd_shuffle_xor(sum, 1); sum += simd_shuffle_xor(sum, 2);\n"
-           "            if (L % 4u == 0u) { lrow[r] = lrow[r] * a + sum; mrow[r] = mnew; alpha[r] = a; }\n"
+           ANTFLY_MSL_SEGMENT_SOFTMAX8("            parts[pr + c0] = w0; parts[pr + c0 + 1u] = w1;\n")
            "        }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        if (t < blocks * 64u) { uint b = t / 64u, i = t % 64u; parts[b * 256u + 64u + i] = i / 8u == i % 8u ? alpha[b * 8u + i / 8u] : 0.0f; }\n"
            "        for (uint i = t; i < BK * D; i += width) { uint c = i / D, d = i % D; kv[c * DM + d] = c < nk ? v[(kb + c) * kv_hidden + kh * D + d] : 0.0f; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        simdgroup_float8x8 dg, pm;\n"
-           "        simdgroup_load(dg, parts + pb + 64u, 8u); simdgroup_load(pm, parts + pb, BK);\n"
-           "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 16u; ++dt) if (dt < nd) {\n"
-           "            simdgroup_float8x8 vm;\n"
-           "            simdgroup_load(vm, kv + s * panel + dt * 8u, DM);\n"
-           "            simdgroup_multiply(o[dt], dg, o[dt]);\n"
-           "            simdgroup_multiply_accumulate(o[dt], pm, vm, o[dt]);\n"
-           "        }\n"
+           ANTFLY_MSL_SEGMENT_PV8("        simdgroup_load(dg, parts + pb + 64u, 8u); simdgroup_load(pm, parts + pb, BK);\n")
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    if (t < blocks * 64u) { uint b = t / 64u, i = t % 64u, r = b * 8u + i / 8u; parts[b * 256u + i] = i / 8u == i % 8u && lrow[r] > 0.0f ? 1.0f / lrow[r] : 0.0f; }\n"
-           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    simdgroup_float8x8 dg; simdgroup_load(dg, parts + pb, 8u);\n"
-           "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 16u; ++dt) if (dt < nd) {\n"
-           "        simdgroup_multiply(o[dt], dg, o[dt]);\n"
-           "        simdgroup_store(o[dt], kv + uint(sg) * 64u, 8u);\n"
-           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint i = L; i < 64u; i += 32u) { uint r = qb * 8u + i / 8u; if (r < nq) output[(q0 + r) * hidden + h * D + s * panel + dt * 8u + i % 8u] = kv[uint(sg) * 64u + i]; }\n"
-           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+           ANTFLY_MSL_SEGMENT_BLOCK_PUBLISH("16u","        simdgroup_multiply(o[dt], dg, o[dt]);\n        simdgroup_store(o[dt], kv + uint(sg) * 64u, 8u);")
            "}\n"
            TERMITE_MSL_ABI_SEGMENTS_BLOCKS(termite_sdpa_f32_segments_blocks) "\n"
            "    threadgroup float kv[8u * 512u], parts[16u * 64u], mrow[32u], lrow[32u], alpha[32u];\n"
@@ -13220,10 +13209,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint i = t; i < BQ * 6u; i += width) rg[i] = i / 6u < nq ? ranges[(q0 + i / 6u) * 6u + i % 6u] : 0u;\n"
            "    if (t < BQ) { qp[t] = t < nq ? qpos[q0 + t] : 0; mrow[t] = neg; lrow[t] = 0.0f; }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    uint lo = 0xffffffffu, hi = 0u;\n"
-           "    int pmin = 2147483647, pmax = -2147483647 - 1;\n"
-           "    if (L < nq) { for (uint r = 0u; r < 3u; ++r) { uint a = rg[L * 6u + 2u * r], b = rg[L * 6u + 2u * r + 1u]; if (a < b) { lo = min(lo, a); hi = max(hi, b); } } pmin = qp[L]; pmax = qp[L]; }\n"
-           "    lo = simd_min(lo); hi = simd_max(hi); pmin = simd_min(pmin); pmax = simd_max(pmax);\n"
+           ANTFLY_MSL_SEGMENT_RANGE_ENVELOPE()
            "    simdgroup_float8x8 qm[8], o[8];\n"
            "    for (uint block = 0u; block < blocks; ++block) {\n"
            "        for (uint i = t; i < 8u * D; i += width) { uint r = i / D + block * 8u, d = i % D; kv[(i / D) * DM + d] = r < nq ? q[(q0 + r) * hidden + h * D + d] : 0.0f; }\n"
@@ -13232,13 +13218,7 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    for (uint kb = lo; kb < hi; kb += BK) {\n"
-           "        const uint nk = min(BK, hi - kb);\n"
-           "        const int key_pos = L < nk ? kpos[kb + L] : 0;\n"
-           "        const uint gap = key_pos < pmin ? uint(pmin) - uint(key_pos) : key_pos > pmax ? uint(key_pos) - uint(pmax) : 0u;\n"
-           "        if (!simd_any(L < nk && (p.window == 0xffffffffu || gap <= p.window))) continue;\n"
-           "        if (t < BK) kp[t] = t < nk ? kpos[kb + t] : 0;\n"
-           "        for (uint i = t; i < BK * D; i += width) { uint c = i / D, d = i % D; kv[c * DM + d] = c < nk ? k[(kb + c) * kv_hidden + kh * D + d] : 0.0f; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           ANTFLY_MSL_SEGMENT_KEY_STAGE("i += width", "k[(kb + c) * kv_hidden + kh * D + d]")
            "        for (uint ki = 0; ki < 2; ++ki) {\n"
            "            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "            TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) { simdgroup_float8x8 km; simdgroup_load(km, kv + ki * 8u * DM + s * panel + dt * 8u, DM, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc, qm[dt], km, acc); }\n"
@@ -13249,8 +13229,7 @@ static NSString *termite_metal_shader_source(void) {
            "            for (uint i = L; i < PS; i += 32u) {\n"
            "                const uint r = qb * 8u + i / BK, c = i % BK, key = kb + c;\n"
            "                threadgroup const uint *x = rg + r * 6u;\n"
-           "                const uint distance = qp[r] >= kp[c] ? uint(qp[r]) - uint(kp[c]) : uint(kp[c]) - uint(qp[r]);\n"
-           "                const bool visible = r < nq && c < nk && ((key >= x[0] && key < x[1]) || (key >= x[2] && key < x[3]) || (key >= x[4] && key < x[5])) && (p.window == 0xffffffffu || distance <= p.window);\n"
+           ANTFLY_MSL_SEGMENT_SCORE_VISIBLE()
            "                parts[pb + i] = visible ? (parts[pb + i] + parts[pb + PS + i] + parts[pb + 2u * PS + i] + parts[pb + 3u * PS + i]) * scale : neg;\n"
            "            }\n"
            "            simdgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -13278,14 +13257,7 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    if (t < blocks * 64u) { uint b = t / 64u, i = t % 64u, r = b * 8u + i / 8u; parts[b * 4u * PS + i] = i / 8u == i % 8u && lrow[r] > 0.0f ? 1.0f / lrow[r] : 0.0f; }\n"
-           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    simdgroup_float8x8 dg; simdgroup_load(dg, parts + pb, 8u);\n"
-           "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
-           "        simdgroup_multiply(o[dt], dg, o[dt]); simdgroup_store(o[dt], kv + uint(sg) * 64u, 8u);\n"
-           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint i = L; i < 64u; i += 32u) { uint r = qb * 8u + i / 8u; if (r < nq) output[(q0 + r) * hidden + h * D + s * panel + dt * 8u + i % 8u] = kv[uint(sg) * 64u + i]; }\n"
-           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+           ANTFLY_MSL_SEGMENT_BLOCK_PUBLISH("8u","        simdgroup_multiply(o[dt], dg, o[dt]); simdgroup_store(o[dt], kv + uint(sg) * 64u, 8u);")
            "}\n"
            // ModernBERT training attention (ops/range_attention_reference.zig).
            // Control: tokens*6 disjoint in-row key ranges, then tokens logical

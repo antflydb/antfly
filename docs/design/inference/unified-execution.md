@@ -3437,3 +3437,7 @@ records the next model-family consolidation and native device qualification.
 [BB: operation-based native program owners](unified-execution-bb-outcomes.md)
 records MPP/backward score sharing, portable causal stencils, rotary and row
 policies, typed CPU admission, and the [kernel authoring guide](kernel-authoring.md).
+
+[BC: source-preserving segmented-attention phases](unified-execution-bc-outcomes.md)
+records seven shared tile phases, exact emitted-program identity, and the
+discarded template prototype with its retained timing miss.
