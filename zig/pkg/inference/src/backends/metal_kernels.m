@@ -10079,6 +10079,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lane == 0u) output[r * p.out_dim + o] = partials[0];\n"
            "}\n"
            // tile-codegen:end quant_metal.dense_f16_multi_row family
+           // tile-codegen:begin quant_metal.bf16_gate_up_mm family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_bf16_gate_up_mm_m64_n32_vec4(\n"
            "    device const float *x [[buffer(0)]], device const ushort *wg [[buffer(1)]], device const ushort *wu [[buffer(2)]],\n"
            "    device const float *bg [[buffer(3)]], device const float *bu [[buffer(4)]], device float *out [[buffer(5)]],\n"
@@ -10201,6 +10202,7 @@ static NSString *termite_metal_shader_source(void) {
            "        }\n"
            "    }\n"
            "}\n"
+           // tile-codegen:end quant_metal.bf16_gate_up_mm family
            "kernel void termite_apply_linear_bf16_mm_m64_n32_vec4(\n"
            "    device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]],\n"
            "    device const float *bias [[buffer(2)]], device float *output [[buffer(3)]],\n"

@@ -96,4 +96,5 @@ pub const regions = [_]Region{
     msl.metal("q8_0_mm_sg", &.{mm_sg.q8_0_kernel}),
     msl.metal("florence_q4_k_mm_matrix", &.{io.florence_q4_k_mm_matrix_m64_n64}),
     msl.metal("florence_q4_k_mm_matrix_in_f16", &.{io.florence_q4_k_mm_matrix_m64_n64_in_f16}),
+    msl.metal("bf16_gate_up_mm", &.{ io.bf16_gate_up_mm_m64_n32_vec4, io.bf16_gate_up_mm_m64_n32 }),
 };

@@ -13,10 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Kernels that exist as an f32 and an f16 flavour of the same schedule,
-//! differing only in the activation input or output element type. Each is
-//! written once with holes for the name, the element type and its
-//! conversion.
+//! Kernels that exist as two flavours of one schedule: f32 / f16 / bf16
+//! element types, an activation epilogue, or an added vectorized staging
+//! path. Each schedule is written once with holes for the name and the
+//! parts that differ.
 
 const msl = @import("quant_metal_msl.zig");
 const fill = msl.fill;
@@ -183,3 +183,100 @@ const multi_row_tiled32_m16 =
 
 pub const multi_row_tiled32_m16_f32 = msl.msl(fill(multi_row_tiled32_m16, .{ .name = "termite_apply_linear_multi_row_tiled32_m16_f32", .w = "float", .wload = "weight[g_col * p.in_dim + g_k]" }));
 pub const multi_row_tiled32_m16_bf16 = msl.msl(fill(multi_row_tiled32_m16, .{ .name = "termite_apply_linear_bf16_multi_row_tiled32_m16", .w = "ushort", .wload = "termite_bf16_to_f32(weight[g_col * p.in_dim + g_k])" }));
+
+/// BF16 gate/up matmul with a SiLU-multiply epilogue, 64 x 32 tiles over
+/// eight simdgroups. The vec4 flavour adds a float4 / ushort4 staging path
+/// for full aligned tiles and keeps the scalar staging for tails.
+const bf16_gate_up_mm_m64_n32_t =
+    \\kernel void ${name}(
+    \\    device const float *x [[buffer(0)]], device const ushort *wg [[buffer(1)]], device const ushort *wu [[buffer(2)]],
+    \\    device const float *bg [[buffer(3)]], device const float *bu [[buffer(4)]], device float *out [[buffer(5)]],
+    \\    constant termite_metal_linear_params &p [[buffer(6)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+    \\${storage}    threadgroup float *a=shared, *g=shared+2048, *u=g+1024;
+    \\    uint row0=tg.y*64u, col0=tg.x*32u;
+    \\    uint sr=(uint(sg)/2u)*16u, sc=(uint(sg)%2u)*16u;
+    \\    simdgroup_float8x8 ag[4],au[4];
+    \\    TERMITE_FOR_UNROLL(uint i=0;i<4u;i++){ag[i]=make_filled_simdgroup_matrix<float,8>(0.0f);au[i]=make_filled_simdgroup_matrix<float,8>(0.0f);}
+    \\    for(uint k0=0;k0<p.in_dim;k0+=32u){
+    \\${fast}        for(uint i=uint(tid);i<2048u;i+=256u){
+    \\            uint r=i/32u,k=i%32u;
+    \\            a[(k/8u*8u+r/8u)*64u+r%8u*8u+k%8u]=row0+r<p.rows&&k0+k<p.in_dim?x[(row0+r)*p.in_dim+k0+k]:0.0f;
+    \\        }
+    \\        for(uint i=uint(tid);i<1024u;i+=256u){
+    \\            uint c=i/32u,k=i%32u,j=(k/8u*4u+c/8u)*64u+k%8u*8u+c%8u;
+    \\            bool valid=col0+c<p.out_dim&&k0+k<p.in_dim;
+    \\            g[j]=valid?termite_bf16_to_f32(wg[(col0+c)*p.in_dim+k0+k]):0.0f;
+    \\            u[j]=valid?termite_bf16_to_f32(wu[(col0+c)*p.in_dim+k0+k]):0.0f;
+    \\        }
+    \\${close}        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\        TERMITE_FOR_UNROLL(uint k=0;k<32u;k+=8u){
+    \\            simdgroup_float8x8 ma[2],mg[2],mu[2];
+    \\            TERMITE_FOR_UNROLL(uint r=0;r<2u;r++)simdgroup_load(ma[r],a+(k/8u*8u+sr/8u+r)*64u,8u);
+    \\            TERMITE_FOR_UNROLL(uint c=0;c<2u;c++){
+    \\                simdgroup_load(mg[c],g+(k/8u*4u+sc/8u+c)*64u,8u);
+    \\                simdgroup_load(mu[c],u+(k/8u*4u+sc/8u+c)*64u,8u);
+    \\            }
+    \\            TERMITE_FOR_UNROLL(uint r=0;r<2u;r++)TERMITE_FOR_UNROLL(uint c=0;c<2u;c++){
+    \\                simdgroup_multiply_accumulate(ag[r*2u+c],ma[r],mg[c],ag[r*2u+c]);
+    \\                simdgroup_multiply_accumulate(au[r*2u+c],ma[r],mu[c],au[r*2u+c]);
+    \\            }
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    }
+    \\    TERMITE_FOR_UNROLL(uint r=0;r<2u;r++)TERMITE_FOR_UNROLL(uint c=0;c<2u;c++){
+    \\        simdgroup_store(ag[r*2u+c],shared+(sr+r*8u)*32u+sc+c*8u,32u);
+    \\        simdgroup_store(au[r*2u+c],shared+2048u+(sr+r*8u)*32u+sc+c*8u,32u);
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    for(uint i=uint(tid);i<2048u;i+=256u){
+    \\        uint row=row0+i/32u,col=col0+i%32u;
+    \\        if(row<p.rows&&col<p.out_dim){
+    \\            float gate=shared[i]+bg[col],up=shared[2048u+i]+bu[col];
+    \\            float y=termite_silu(gate);out[row*p.out_dim+col]=y*up;
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+const bf16_gate_up_vec4_staging =
+    \\        // Dispatch admits aligned bases. All tails retain the measured
+    \\        // scalar staging. Float4 shared storage guarantees alignment.
+    \\        bool full=(p.in_dim&3u)==0u&&row0+64u<=p.rows&&col0+32u<=p.out_dim&&k0+32u<=p.in_dim;
+    \\        if(full){
+    \\            for(uint i=uint(tid);i<512u;i+=256u){
+    \\                uint r=i/8u,k=(i%8u)*4u;
+    \\                float4 v=*reinterpret_cast<device const float4 *>(x+(row0+r)*p.in_dim+k0+k);
+    \\                uint j=(k/8u*8u+r/8u)*64u+r%8u*8u+k%8u;
+    \\                *reinterpret_cast<threadgroup float4 *>(a+j)=v;
+    \\            }
+    \\            for(uint i=uint(tid);i<256u;i+=256u){
+    \\                uint c=i/8u,k=(i%8u)*4u;
+    \\                ushort4 gb=*reinterpret_cast<device const ushort4 *>(wg+(col0+c)*p.in_dim+k0+k);
+    \\                ushort4 ub=*reinterpret_cast<device const ushort4 *>(wu+(col0+c)*p.in_dim+k0+k);
+    \\                float4 gv=as_type<float4>(uint4(gb)<<16u),uv=as_type<float4>(uint4(ub)<<16u);
+    \\                uint j=(k/8u*4u+c/8u)*64u+k%8u*8u+c%8u;
+    \\                TERMITE_FOR_UNROLL(uint q=0u;q<4u;q++){g[j+q*8u]=gv[q];u[j+q*8u]=uv[q];}
+    \\            }
+    \\        }else{
+    \\
+;
+
+pub const bf16_gate_up_mm_m64_n32_vec4 = msl.msl(fill(bf16_gate_up_mm_m64_n32_t, .{
+    .name = "termite_apply_bf16_gate_up_mm_m64_n32_vec4",
+    .storage = "    threadgroup float4 storage[1024];\n    threadgroup float *shared=reinterpret_cast<threadgroup float *>(storage);\n",
+    .fast = bf16_gate_up_vec4_staging,
+    .close = "        }\n",
+}));
+pub const bf16_gate_up_mm_m64_n32 = msl.msl(fill(bf16_gate_up_mm_m64_n32_t, .{
+    .name = "termite_apply_bf16_gate_up_mm_m64_n32",
+    .storage =
+    \\    // Share exact F32 activations across two BF16 projections; accumulate in F32.
+    \\    // Eight simdgroups cover a 64x32 tile. Reuse the 16 KiB staging area for
+    \\    // both results before the precise SiLU/multiply epilogue. No global temporaries.
+    \\    threadgroup float shared[4096];
+    \\
+    ,
+    .fast = "",
+    .close = "",
+}));
