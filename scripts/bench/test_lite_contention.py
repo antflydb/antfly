@@ -14,12 +14,12 @@
 # limitations under the License.
 
 import queue
-import unittest
 import sys
 import tempfile
+import unittest
 from pathlib import Path
-from unittest.mock import patch
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import lite_contention as bench
 
@@ -28,51 +28,51 @@ def admission(*samples):
     histogram = [0] * 64
     for value in samples:
         histogram[max(0, value.bit_length() - 1)] += 1
-    return dict(
-        count=len(samples),
-        ns=sum(samples),
-        max_ns=max(samples, default=0),
-        log2_ns=histogram,
-    )
+    return {
+        "count": len(samples),
+        "ns": sum(samples),
+        "max_ns": max(samples, default=0),
+        "log2_ns": histogram,
+    }
 
 
 class ContentionReportTests(unittest.TestCase):
     def test_unequal_worker_windows_and_busy_calls_are_not_successful_throughput(self):
         workers = [
-            dict(
-                started=1,
-                ended=3,
-                proof_observed_from=0,
-                proof_observed_until=5,
-                success_latency_ns=[10, 20],
-                admission=admission(10, 20),
-                busy_latency_ns=[100],
-                proofs=dict(
-                    allocator_proof_walks=1,
-                    allocator_proof_failures=0,
-                    allocator_proof_ns=1000,
-                ),
-                cpu_seconds=0.25,
-                voluntary_context_switches=4,
-                involuntary_context_switches=2,
-            ),
-            dict(
-                started=2,
-                ended=4,
-                proof_observed_from=1,
-                proof_observed_until=5,
-                success_latency_ns=[30],
-                admission=admission(30),
-                busy_latency_ns=[200],
-                proofs=dict(
-                    allocator_proof_walks=2,
-                    allocator_proof_failures=1,
-                    allocator_proof_ns=2000,
-                ),
-                cpu_seconds=0.5,
-                voluntary_context_switches=6,
-                involuntary_context_switches=3,
-            ),
+            {
+                "started": 1,
+                "ended": 3,
+                "proof_observed_from": 0,
+                "proof_observed_until": 5,
+                "success_latency_ns": [10, 20],
+                "admission": admission(10, 20),
+                "busy_latency_ns": [100],
+                "proofs": {
+                    "allocator_proof_walks": 1,
+                    "allocator_proof_failures": 0,
+                    "allocator_proof_ns": 1000,
+                },
+                "cpu_seconds": 0.25,
+                "voluntary_context_switches": 4,
+                "involuntary_context_switches": 2,
+            },
+            {
+                "started": 2,
+                "ended": 4,
+                "proof_observed_from": 1,
+                "proof_observed_until": 5,
+                "success_latency_ns": [30],
+                "admission": admission(30),
+                "busy_latency_ns": [200],
+                "proofs": {
+                    "allocator_proof_walks": 2,
+                    "allocator_proof_failures": 1,
+                    "allocator_proof_ns": 2000,
+                },
+                "cpu_seconds": 0.5,
+                "voluntary_context_switches": 6,
+                "involuntary_context_switches": 3,
+            },
         ]
         result = bench.aggregate(workers)
         self.assertEqual(result["elapsed_seconds"], 3)
@@ -128,24 +128,26 @@ class ContentionReportTests(unittest.TestCase):
             mutation_admission_max_ns=0,
             mutation_admission_log2_ns=[0] * 64,
         )
-        final = dict(
-            allocator_proof_walks=1, allocator_proof_failures=0, allocator_proof_ns=500
-        )
+        final = {
+            "allocator_proof_walks": 1,
+            "allocator_proof_failures": 0,
+            "allocator_proof_ns": 500,
+        }
         final.update(
             mutation_admission_count=1,
             mutation_admission_ns=20,
             mutation_admission_max_ns=20,
             mutation_admission_log2_ns=admission(20)["log2_ns"],
         )
-        config = dict(
-            library="fake",
-            database="fresh",
-            no_sync=True,
-            timeout_ms=5,
-            watchdog=1,
-            seconds=1,
-            workload="churn",
-        )
+        config = {
+            "library": "fake",
+            "database": "fresh",
+            "no_sync": True,
+            "timeout_ms": 5,
+            "watchdog": 1,
+            "seconds": 1,
+            "workload": "churn",
+        }
         with (
             patch.object(bench, "sdk", return_value=api),
             patch.object(
@@ -168,7 +170,7 @@ class ContentionReportTests(unittest.TestCase):
         result = results.get_nowait()
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["success_latency_ns"], [50])
-        self.assertEqual(result["last_write"], dict(key="worker-4-0", sequence=0))
+        self.assertEqual(result["last_write"], {"key": "worker-4-0", "sequence": 0})
         self.assertEqual(result["proofs"]["allocator_proof_ns"], 500)
         self.assertIn("worker-4-0", database.payload["inserts"])
 
@@ -192,15 +194,15 @@ class ContentionReportTests(unittest.TestCase):
             mutation_admission_log2_ns=[0] * 64,
         )
         ready, results = queue.Queue(), queue.Queue()
-        config = dict(
-            library="fake",
-            database="fresh",
-            no_sync=True,
-            timeout_ms=5,
-            watchdog=1,
-            seconds=1,
-            workload="churn",
-        )
+        config = {
+            "library": "fake",
+            "database": "fresh",
+            "no_sync": True,
+            "timeout_ms": 5,
+            "watchdog": 1,
+            "seconds": 1,
+            "workload": "churn",
+        }
         with (
             patch.object(bench, "sdk", return_value=api),
             patch.object(bench, "measurement_stats", side_effect=[stats, stats]),
@@ -224,8 +226,8 @@ class ContentionReportTests(unittest.TestCase):
                 str(Path(directory) / "out.jsonl"),
             ]
             rows = [
-                dict(condition="std", status="error"),
-                dict(condition="epoch", status="ok"),
+                {"condition": "std", "status": "error"},
+                {"condition": "epoch", "status": "ok"},
             ]
             with (
                 patch.object(sys, "argv", argv),
@@ -238,20 +240,40 @@ class ContentionReportTests(unittest.TestCase):
                     bench.main()
                 self.assertEqual(error.exception.code, 1)
 
+    def test_all_busy_workers_cannot_qualify_as_success(self):
+        worker = {
+            "started": 0,
+            "ended": 1,
+            "proof_observed_from": 0,
+            "proof_observed_until": 1,
+            "success_latency_ns": [],
+            "busy_latency_ns": [10, 20],
+            "admission": admission(),
+            "proofs": dict.fromkeys(bench.PROOF_FIELDS, 0),
+            "cpu_seconds": 0,
+            "voluntary_context_switches": 0,
+            "involuntary_context_switches": 0,
+        }
+        result = bench.aggregate([worker, worker])
+        self.assertEqual(result["status"], "no_progress")
+        self.assertEqual(result["workers_without_success"], 2)
+        self.assertEqual(result["busy_fraction"], 1)
+        self.assertEqual(result["successful_calls_per_second"], 0)
+
     def test_unsampled_admission_has_no_latency_even_with_successful_calls(self):
-        worker = dict(
-            started=0,
-            ended=1,
-            proof_observed_from=0,
-            proof_observed_until=1,
-            success_latency_ns=[10],
-            busy_latency_ns=[],
-            admission=admission(),
-            proofs=dict.fromkeys(bench.PROOF_FIELDS, 0),
-            cpu_seconds=0,
-            voluntary_context_switches=0,
-            involuntary_context_switches=0,
-        )
+        worker = {
+            "started": 0,
+            "ended": 1,
+            "proof_observed_from": 0,
+            "proof_observed_until": 1,
+            "success_latency_ns": [10],
+            "busy_latency_ns": [],
+            "admission": admission(),
+            "proofs": dict.fromkeys(bench.PROOF_FIELDS, 0),
+            "cpu_seconds": 0,
+            "voluntary_context_switches": 0,
+            "involuntary_context_switches": 0,
+        }
         result = bench.aggregate([worker])
         self.assertEqual(result["successful_calls"], 1)
         self.assertEqual(result["admission_count"], 0)

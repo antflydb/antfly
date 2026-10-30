@@ -300,17 +300,12 @@ fn encodeScalar(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: Scala
     }
 }
 
+/// Escapes `value` as JSON string characters (the caller writes the quotes).
+/// std.json escapes every control character, not just newline and tab.
 fn appendEscapedJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    for (value) |byte| {
-        switch (byte) {
-            '\\' => try out.appendSlice(alloc, "\\\\"),
-            '"' => try out.appendSlice(alloc, "\\\""),
-            '\n' => try out.appendSlice(alloc, "\\n"),
-            '\r' => try out.appendSlice(alloc, "\\r"),
-            '\t' => try out.appendSlice(alloc, "\\t"),
-            else => try out.append(alloc, byte),
-        }
-    }
+    var writer: std.Io.Writer.Allocating = .fromArrayList(alloc, out);
+    defer out.* = writer.toArrayList();
+    std.json.Stringify.encodeJsonStringChars(value, .{}, &writer.writer) catch return error.OutOfMemory;
 }
 
 fn appendInt(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !void {
@@ -391,4 +386,17 @@ test "row fragment stats capture nulls min max and dictionary samples" {
     defer alloc.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"row_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dictionary_samples\":[\"t2\",\"t1\"]") != null);
+}
+
+test "row fragment stats JSON escaping round-trips control characters" {
+    const a = std.testing.allocator;
+    const raw = "tab\tnul\x00bell\x07esc\x1bquote\"slash\\";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    try out.append(a, '"');
+    try appendEscapedJson(a, &out, raw);
+    try out.append(a, '"');
+    const parsed = try std.json.parseFromSlice([]const u8, a, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(raw, parsed.value);
 }

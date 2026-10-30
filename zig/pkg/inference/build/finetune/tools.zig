@@ -458,7 +458,7 @@ pub const specs = [_]common.CommandSpec{
         .name = "train-fused-chunker",
         .root_source_file = "src/finetune_train_fused_chunker_root.zig",
         .description = "End-to-end training for the fused chunker-embedder model",
-        .imports = &.{ .build_options, .ml, .antfly_platform, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg },
+        .imports = &.{ .build_options, .ml, .antfly_platform, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg, .antfly_video },
         .native_link = .default,
     },
 };

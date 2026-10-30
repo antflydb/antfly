@@ -30,7 +30,6 @@ import json
 import math
 import multiprocessing as mp
 import os
-from pathlib import Path
 import platform
 import queue
 import resource
@@ -38,6 +37,7 @@ import subprocess
 import sys
 import time
 import traceback
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SDK = ROOT / "py/packages/embedded/src"
@@ -124,6 +124,7 @@ def queue_cases(args):
                         [str(binary), condition, str(threads), str(args.operations)],
                         text=True,
                         capture_output=True,
+                        check=False,
                         timeout=args.watchdog,
                     )
                     if completed.returncode:
@@ -194,9 +195,13 @@ def measurement_stats(db) -> dict:
     return stats
 
 
-def seed(library: str, database: Path, count: int, no_sync: bool) -> None:
+def seed(
+    library: str, database: Path, count: int, no_sync: bool, no_index: bool = False
+) -> None:
     af = sdk(library)
     with af.create(database, no_sync=no_sync, busy_timeout=5.0) as db:
+        if no_index and not db.delete_index("full_text_index_v0"):
+            raise RuntimeError("default index was not removed")
         for start in range(0, count, 64):
             db.batch_json(
                 {
@@ -304,6 +309,21 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "success_latency_ns": success,
                 "busy_latency_ns": busy,
                 "proofs": proofs,
+                "background_publication_deltas": {
+                    field: final_stats.get(field, 0) - initial_stats.get(field, 0)
+                    for field in (
+                        "maintenance_rounds",
+                        "attempts",
+                        "refused",
+                        "rebased",
+                        "generated_attempts",
+                        "generated_refused",
+                        "replay_attempts",
+                        "replay_refused",
+                        "maintenance_errors",
+                    )
+                },
+                "last_maintenance_error": final_stats.get("last_maintenance_error"),
                 "proof_observed_from": proof_observed_from,
                 "proof_observed_until": proof_observed_until,
                 "admission": admission,
@@ -313,7 +333,7 @@ def native_worker(config, index, ready, start, results, finish=None):
         # close()/__exit__ is part of worker success. Emit exactly one terminal
         # result so a close failure cannot follow an already accepted success.
         results.put(result)
-    except BaseException:
+    except BaseException:  # noqa: BLE001 - report a terminal result even on worker interruption
         if finish is not None:
             finish.abort()
         failure = {
@@ -377,6 +397,18 @@ def aggregate(workers: list[dict]) -> dict:
     if proof_elapsed <= 0:
         raise RuntimeError("invalid proof-observation interval")
     result = {
+        "status": "ok" if successful else "no_progress",
+        "workers_without_success": sum(
+            not row["success_latency_ns"] for row in workers
+        ),
+        "per_worker_background_publication_deltas": [
+            row.get("background_publication_deltas", {}) for row in workers
+        ],
+        "last_maintenance_errors": [
+            row["last_maintenance_error"]
+            for row in workers
+            if row.get("last_maintenance_error")
+        ],
         "elapsed_seconds": elapsed,
         "successful_calls": len(successful),
         "busy_calls": len(busy),
@@ -458,8 +490,10 @@ def native_cases(args):
                         str(database),
                         str(args.seed_records),
                         str(int(args.no_sync)),
+                        str(int(args.no_index)),
                     ],
                     capture_output=True,
+                    check=False,
                     text=True,
                     timeout=args.watchdog,
                 )
@@ -512,6 +546,7 @@ def native_cases(args):
                 "timeout_ms": args.timeout_ms,
                 "no_sync": args.no_sync,
                 "workload": args.workload,
+                "no_index": args.no_index,
                 "seed_seconds": seed_seconds,
                 "seed_stats": seed_stats,
                 "latency_scope": "whole batch call including admission and mutation",
@@ -549,7 +584,7 @@ def native_cases(args):
                         exitcodes=[process.exitcode for process in processes],
                     )
                 else:
-                    row.update(aggregate(workers), status="ok")
+                    row.update(aggregate(workers))
             except RuntimeError as error:
                 row.update(status="error", diagnostic=str(error))
             except (queue.Empty, TimeoutError):
@@ -572,7 +607,7 @@ def native_cases(args):
                 results.close()
             row["worker_lifetime_seconds"] = time.monotonic() - worker_started
             row["file_bytes"] = database.stat().st_size
-            if row["status"] == "ok":
+            if row["status"] in ("ok", "no_progress"):
                 expected = [
                     worker["last_write"]
                     for worker in workers
@@ -589,6 +624,7 @@ def native_cases(args):
                             json.dumps(expected),
                         ],
                         capture_output=True,
+                        check=False,
                         text=True,
                         timeout=args.watchdog,
                     )
@@ -631,6 +667,11 @@ def main():
     parser.add_argument("--seed-records", type=int, default=1024)
     parser.add_argument("--workload", choices=("append", "churn"), default="churn")
     parser.add_argument("--no-sync", action="store_true")
+    parser.add_argument(
+        "--no-index",
+        action="store_true",
+        help="native control: remove the default full-text index before seeding",
+    )
     parser.add_argument("--watchdog", type=float, default=30)
     args = parser.parse_args()
     if (
@@ -677,7 +718,13 @@ def main():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "_seed":
-        seed(sys.argv[2], Path(sys.argv[3]), int(sys.argv[4]), bool(int(sys.argv[5])))
+        seed(
+            sys.argv[2],
+            Path(sys.argv[3]),
+            int(sys.argv[4]),
+            bool(int(sys.argv[5])),
+            bool(int(sys.argv[6])) if len(sys.argv) > 6 else False,
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "_verify":
         verify(sys.argv[2], Path(sys.argv[3]), json.loads(sys.argv[4]))
     else:
