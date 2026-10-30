@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "scope": "Focused CUDA recurrent regression on DGX Spark GB10; synthetic one-layer Qwen3.5 fixture, not real-model or hosted serving qualification.",
+  "base_commit": "cb2f9f679cd59a60443313ef9fb05573f573b8a0",
+  "source_file": "zig/pkg/inference/src/architectures/gpt.zig",
+  "source_sha256": "79566cd999ad159203be1997a4375866d5174e830e7eae3758a98df6c2dfa661",
+  "zig_version": "0.17.0",
+  "optimization": "ReleaseSafe",
+  "cuda_artifacts": "fatbin",
+  "hardware": "NVIDIA GB10, aarch64",
+  "filters": [
+    "LightOnOCR3 CUDA uncached hidden",
+    "LightOnOCR3 default CUDA dispatch",
+    "LightOnOCR3 CUDA recurrent core preserves"
+  ],
+  "result": {
+    "selected": 41,
+    "passed": 41,
+    "skipped": 0,
+    "failed": 0,
+    "note": "Includes imported test_0 declaration tests. No allocator leaks reported."
+  },
+  "assertions": [
+    "Null-context hiddenForward and forward succeed under CUDA device-only policy.",
+    "Repeated uncached logits match and remain finite and nonzero.",
+    "Uncached logits match a fresh cached forward.",
+    "Temporary state releases its admission lease after success.",
+    "Insufficient temporary-state admission returns ResourceLimitExceeded without host download or retained lease."
+  ],
+  "binary_sha256": "fb6ecf53aaa3e8f82a52faef243cf853102ecb7ca90764bfe55a3e1cdf262d4e",
+  "log_sha256": "562c9d9db599775881e366f0167c46c57c08a69cdcba5ea21593a4e63ed500de"
+}
