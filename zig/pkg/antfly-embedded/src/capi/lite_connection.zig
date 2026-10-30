@@ -1637,7 +1637,6 @@ pub const Owner = struct {
                             file.transaction_header == null and file.durable_header == null) can_prove_current = true;
                         continue;
                     }
-                    if (file.allocator_certificate_on_commit and try file.inheritAllocatorCertificate()) return;
                     try file.sync();
                     _ = try file.certifyAllocator();
                     return;

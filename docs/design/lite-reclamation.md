@@ -21,8 +21,9 @@ bitmap. This replaces the proposed free-extent tree: dense counters also represe
 shared value ownership and packed-slot occupancy, and a bitmap remains compact
 under arbitrary fragmentation. Allocation prefers the lowest free page, naturally
 consuming contiguous runs, with eight summary levels rather than a file scan.
-Journal replay and periodic metadata checkpoints supply durable free capacity;
-commits do not serialize the entire free set or traverse historical records.
+Journal replay and periodic metadata checkpoints supply durable free capacity.
+Routine persistence journals ownership deltas; native connection handoff also
+fingerprints the loaded ownership metadata as described below.
 
 This is an asymptotic design choice, not a claim of globally optimal measured
 latency. The memory/write tradeoff and qualification requirements are below.
@@ -320,6 +321,24 @@ pending retirement. Explicit integrity checks use the same proof. This one-time
 open/reuse proof can read retained values; routine mutations and service never
 perform a whole-file trace. Private vacuum publication rebases retirement epochs
 and writes a metadata checkpoint when discarding earlier private recovery roots.
+
+Checked native connection owners carry that invariant across live commits using
+a private allocator certificate in the physical index catalog. The certificate
+binds both recovery slots and the complete canonical ownership state. Its own
+pages are included before the fingerprint is filled, and publication shares the
+caller's existing transaction and durability barrier. An unchecked or deferred
+writer cannot produce a trusted seal. Allocator-only retirement service does not
+replace the certificate: doing so would create new retirement work while
+consuming the old work and prevent quiescence. A peer admitting such a tip uses
+the existing protected-graph proof. Legacy clean-close certificates in the
+primary catalog remain readable and are still published at clean close.
+
+Before opening a replacement runtime, native admission checks the current tip's
+certificate even when the previous runtime had a valid proof for an older tip.
+Missing or mismatched certificates retain the protected-graph fallback. Explicit
+integrity checks still traverse the graph. The handoff adds metadata records and
+fingerprinting proportional to the loaded ledger counters and pending entries;
+qualification must measure that cost alongside contending-writer progress.
 
 Opening an immutable artifact publishes an inode-local lease alias. These
 metadata-only commits have their own allocation policy. Mixed groups retain

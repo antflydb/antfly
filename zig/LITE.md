@@ -1175,6 +1175,15 @@ compact generation independently of routine reuse. See the
 [reclamation design](../docs/design/lite-reclamation.md) for policy options,
 storage admission, format encoding, memory costs, and qualification.
 
+Native connection owners publish checked allocator handoff certificates inside
+their existing commits, so another writer can validate the current ownership
+metadata without repeating a graph walk after each peer publication. Both
+recovery slots and the canonical ledger must match; an uncertified writer or
+changed state retains the full-proof path. Allocator-only cleanup also retains
+that path so sealing does not perpetuate retirement work. Clean-close certificates
+remain compatible with older runtimes. This adds metadata hashing and catalog writes,
+without another checkpoint publication or durability barrier per transaction.
+
 Small records in multi-key transactions share immutable record pages. A tagged
 reference identifies a physical page and a validated record offset; large
 records keep individual pages and external values keep their extent/chain
