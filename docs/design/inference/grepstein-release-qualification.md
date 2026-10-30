@@ -63,6 +63,26 @@ Also qualify the work-unit capacity: a single image with a 2048-token output
 allowance currently needs at least 12 generation admission units, exceeding
 the existing eight-unit serving profile. Raising only the token ceiling would
 still reject it. Keep request concurrency bounded while qualifying that change.
+The proposed reader-policy adjustment is below; retain the current memory,
+pixel, and input-token limits and qualify it on the intended hardware before
+applying it. Sixteen work units leave headroom above that twelve-unit minimum;
+the independent concurrency ceiling still admits one request.
+
+```json
+{
+  "resources": {
+    "inference": {
+      "admission": {"max_concurrent_requests": 1, "max_work_units": 16},
+      "request_limits": {"max_output_tokens_per_item": 2048}
+    }
+  }
+}
+```
+
+This is a partial configuration to merge into the existing policy, not a
+replacement for its other limits. Use the native pool probe's
+`--reader-max-output-tokens 2048` switch to check the intended ceiling and its
+exact rejection boundary after deployment to a qualification environment.
 Retry affected source versions after the policy change and require complete
 artifact coverage before semantic or graph enrichment. Avoid automatic image
 tiling without a tested ordering/deduplication policy.
