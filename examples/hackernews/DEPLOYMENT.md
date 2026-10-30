@@ -234,9 +234,12 @@ The historical view reads the immutable export; the combined view applies curren
 replacements by numeric `hn_id`. Results link to original HN items. Administration,
 SQL, ingestion and arbitrary query DSL are not public gateway routes.
 
-`/healthz` checks the gateway process. `/readyz` requires both text indexes to be
+`/health` checks the gateway process. `/ready` requires both text indexes to be
 queryable and the saved source to exist. Readiness does not prove feed freshness,
 latency targets, or replacement-pod recovery; monitor these independently.
+The legacy `/healthz` and `/readyz` aliases remain available. Use `/health` and
+`/ready` for external Cloud Run checks because Cloud Run
+[reserves some URL paths ending in `z`](https://docs.cloud.google.com/run/docs/known-issues#reserved-url-paths).
 
 ## Optional standalone qualification
 
