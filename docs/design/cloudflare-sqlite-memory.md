@@ -334,5 +334,29 @@ Qualification additionally reads the two owned Cloudflare destination job status
 Both signals must have a successful delivery after the measured interval, and
 any delivery error during capture or settlement remains disqualifying after a
 later success. Missing, stale, disabled or mismatched destination status fails
-closed. This covers receiver failures that can occur before JavaScript persists
-a rejection marker; it is additional evidence, not an allocator root-cause claim.
+closed. This retains observed provider delivery failures that may occur before
+JavaScript persists a rejection marker. It is additional evidence, not an
+allocator root-cause claim.
+
+
+### Preserve provider delivery history across recovery
+
+The third reproduction observed Cloudflare clearing `jobStatus.last_error`
+after recovery. A final destination snapshot therefore cannot establish that
+no earlier delivery error occurred. The driver now starts a serial status
+monitor before its boundary witnesses, persists each bounded observation in
+its report, and joins one final query after settlement. Errors observed during
+the capture remain disqualifying even if the last status clears them. Missing
+queries, changed scope/configuration, a monitoring gap over 75 seconds, a late
+start, an early stop or an exhausted 256-observation budget fail closed.
+The history and the final successful delivery status are both required;
+reconciliation cannot promote an old report that did not collect this history.
+
+Polling still cannot exclude failures cleared entirely between observations.
+The exhaustive source terminal population, fixed boundary resource ledgers and
+all capture/settlement checks remain required. No provider API percentile or
+last-success timestamp alone proves absence of allocator failures. Tests cover
+an error followed by an empty `last_error`, unavailable observations, changed
+identity, monitoring gaps and serial request settlement. All 491 Node tests pass;
+the previously passing eight receiver/Tail workerd integrations and guarded
+native R2 integration use unchanged Worker code for this driver-only increment.
