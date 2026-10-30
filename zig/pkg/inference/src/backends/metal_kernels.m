@@ -12017,6 +12017,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_encode_f16_convert(device const float *in [[buffer(0)]], device half *out [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.num_kv_heads * p.head_dim; if (gid >= total) return; out[gid] = half(in[gid]);\n"
            "}\n"
+           // tile-codegen:begin attention.kv_seed family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_paged_f32_kv_seed(device const float *src_k [[buffer(0)]], device const float *src_v [[buffer(1)]], device float *dst_k [[buffer(2)]], device float *dst_v [[buffer(3)]], device const uint *block_table [[buffer(4)]], constant termite_metal_paged_f32_kv_seed_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint values = p.values_per_row; uint width = max(values, p.v_row_stride); if (values == 0u || width == 0u) return; uint row = gid / width; uint col = gid - row * width; if (row >= p.suffix_tokens) return;\n"
            "    uint logical = p.total_tokens - p.suffix_tokens + row; uint logical_block = logical / p.page_size; uint token_in_block = logical - logical_block * p.page_size; uint physical = block_table[logical_block] + token_in_block;\n"
@@ -12029,6 +12030,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (col < values) dst_k[physical * p.key_row_floats + col] = half(src_k[row * values + col]);\n"
            "    if (col < p.v_row_stride) dst_v[physical * p.v_row_stride + col] = half(src_v[row * p.v_row_stride + col]);\n"
            "}\n"
+           // tile-codegen:end attention.kv_seed family
            "kernel void termite_paged_f32_v_seed(device const float *src_v [[buffer(0)]], device float *dst_v [[buffer(1)]], device const uint *block_table [[buffer(2)]], constant termite_metal_paged_f32_kv_seed_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint values = p.v_row_stride; if (values == 0u) return; uint row = gid / values; uint col = gid - row * values; if (row >= p.suffix_tokens) return;\n"
            "    uint logical = p.total_tokens - p.suffix_tokens + row; uint logical_block = logical / p.page_size; uint token_in_block = logical - logical_block * p.page_size; uint physical = block_table[logical_block] + token_in_block;\n"
@@ -12061,6 +12063,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint row = gid / out_dim; uint col = gid - row * out_dim;\n"
            "    output[gid] = col < p.dim_a ? a[row * p.dim_a + col] : b[row * p.dim_b + (col - p.dim_a)];\n"
            "}\n"
+           // tile-codegen:begin attention.qkv_split family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_dense_qkv_split_f32_2d(device const float *packed [[buffer(0)]], device float *q_out [[buffer(1)]], device float *k_out [[buffer(2)]], device float *v_out [[buffer(3)]], constant termite_metal_dense_qkv_split_bias_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.total_out_dim; if (gid >= total || p.total_out_dim == 0u) return; uint row = gid / p.total_out_dim; uint col = gid - row * p.total_out_dim; float value = packed[gid];\n"
            "    if (col < p.q_out_dim) { q_out[row * p.q_out_dim + col] = value; return; }\n"
@@ -12073,6 +12076,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint k_col = col - p.q_out_dim; if (k_col < p.kv_out_dim) { k_out[row * p.kv_out_dim + k_col] = value + k_bias[k_col]; return; }\n"
            "    uint v_col = k_col - p.kv_out_dim; if (v_col < p.kv_out_dim) v_out[row * p.kv_out_dim + v_col] = value + v_bias[v_col];\n"
            "}\n"
+           // tile-codegen:end attention.qkv_split family
            "kernel void termite_dense_pair_split_f32_2d(device const float *packed [[buffer(0)]], device float *a_out [[buffer(1)]], device float *b_out [[buffer(2)]], constant termite_metal_dense_pair_split_bias_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.total_out_dim; if (gid >= total || p.total_out_dim == 0u) return; uint row = gid / p.total_out_dim; uint col = gid - row * p.total_out_dim; float value = packed[gid];\n"
            "    if (col < p.out_dim) { a_out[row * p.out_dim + col] = value; return; }\n"
@@ -13847,6 +13851,7 @@ static NSString *termite_metal_shader_source(void) {
            "    const uint output_base = (b * p.seq_len + q0 + qgroup * 8u) * hidden + h * 64u + dslice; if (q0 + 16u <= p.seq_len) { for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[dt], output + output_base + dt * 8u, hidden); return; }\n"
            "    for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[dt], so + uint(sgitg) * 128u + dt * 8u, 16u); threadgroup_barrier(mem_flags::mem_threadgroup); const uint valid_rows = p.seq_len - q0; for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { const uint qr = i >> 6u; const uint d = i & 63u; const uint owner = (qr >> 3u) * 4u + (d >> 4u); const uint local_r = qr & 7u; const uint local_d = d & 15u; output[(b * p.seq_len + q0 + qr) * hidden + h * 64u + d] = so[owner * 128u + local_r * 16u + local_d]; }\n"
            "}\n"
+           // tile-codegen:begin attention.vision_flash_q32 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            // Q32 version of the dense vision FlashAttention tile. Each SIMD
            // group owns the same 16-column output slice for two eight-query
            // groups, halving repeated K/V loads relative to Q16 while staying
@@ -13906,6 +13911,8 @@ static NSString *termite_metal_shader_source(void) {
            "    if (q0 + 32u <= p.seq_len) { for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; const uint output_base = (b * p.seq_len + q0 + qgroup * 8u) * hidden + h * 64u + dslice; for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], output + output_base + dt * 8u, hidden); } return; }\n"
            "    for (uint qp = 0u; qp < 2u; ++qp) for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], sq + (uint(sgitg) + qp * 8u) * 128u + dt * 8u, 16u); threadgroup_barrier(mem_flags::mem_threadgroup); const uint valid_rows = p.seq_len - q0; for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { const uint qr = i >> 6u; const uint d = i & 63u; const uint owner = (qr >> 3u) * 4u + (d >> 4u); const uint local_r = qr & 7u; const uint local_d = d & 15u; output[(b * p.seq_len + q0 + qr) * hidden + h * 64u + d] = sq[owner * 128u + local_r * 16u + local_d]; }\n"
            "}\n"
+           // tile-codegen:end attention.vision_flash_q32 family
+           // tile-codegen:begin attention.florence_window family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_sdpa_f32_florence_window_hd32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *scores [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {\n"
            "    (void)bias; (void)mask; if (p.seq_len == 0u || p.seq_len > 256u || p.head_dim != 32u || p.bias_mode != 0u || p.has_mask != 0u) return;\n"
            "    const uint qi = tg % p.seq_len; const uint tmp = tg / p.seq_len; const uint h = tmp % p.num_heads; const uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
@@ -13924,6 +13931,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float partial = 0.0f; for (uint ki = uint(lane); ki < p.seq_len; ki += 32u) { float weight = exp(scores[ki] - best); scores[ki] = weight; partial += weight; }\n"
            "    const float denom = simd_sum(partial); threadgroup_barrier(mem_flags::mem_threadgroup); float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { const uint v_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * 32u : (bh * p.seq_len + ki) * 32u; accum += scores[ki] * v[v_base + uint(lane)]; } output[q_base + uint(lane)] = denom > 0.0f ? accum / denom : 0.0f;\n"
            "}\n"
+           // tile-codegen:end attention.florence_window family
            "kernel void termite_sdpa_f32_bert_prefill_s256_hd64_q8(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    (void)bias; (void)mask; if (p.seq_len != 256u || p.head_dim != 64u || p.bias_mode != 0u || p.has_mask != 0u || sgitg >= 8u) return;\n"
            "    const uint tile = tg.x & 31u; const uint tmp = tg.x >> 5u; const uint h = tmp % p.num_heads; const uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
@@ -15057,6 +15065,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (tid == 0u) { float sum = 0.0f; for (uint ki = 0u; ki < p.kv_len; ++ki) sum += exp(scores[ki] - local_best); partials[0] = sum > 0.0f ? 1.0f / sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup); const float inv_sum = partials[0];\n"
            "    for (uint d = tid; d < p.head_dim; d += NT) { float value = 0.0f; for (uint ki = 0u; ki < p.kv_len; ++ki) { float e = exp(scores[ki] - local_best) * inv_sum; uint v_base = ki * kv_stride + kv_head_off; value += e * v[v_base + d]; } output[out_base + d] = value; }\n"
            "}\n"
+           // tile-codegen:begin attention.dense_causal_sg family (do not edit; run: zig build tile-kernel-codegen -- --write)
            // Dense contiguous-K/V port of termite_paged_attention_kv_prefill_sg:
            // 8-query tiles x 32-key chunks with online softmax and simdgroup
            // matmuls, staging f32 K/V to f16 in threadgroup memory. Constant
@@ -15183,6 +15192,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint i = uint(tid); i < 16u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (16u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
            "}\n"
+           // tile-codegen:end attention.dense_causal_sg family
            // f16-K/V variant of the q16 kernel: K/V arrive as device half (the
            // host converts once per layer), so full 32-key chunks are consumed
            // with direct simdgroup loads — no threadgroup staging or its
@@ -15443,6 +15453,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (8u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
            "}\n"
+           // tile-codegen:begin attention.gqa_split family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "// Stage 1 of small-row split-K GQA attention. The z grid partitions\n"
            "// context while each TG reuses one KV head across four or eight query heads.\n"
            "kernel void termite_paged_attention_kv_decode_gqa_split_stage(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float4 *partial_o [[buffer(5)]], constant termite_metal_paged_attention_params &p [[buffer(6)]], constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
@@ -15478,7 +15489,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float S = lane < split_count ? partial_stats[qh * (2u * split_count) + uint(lane)] : 0.0f; float M = lane < split_count ? partial_stats[qh * (2u * split_count) + split_count + uint(lane)] : -3.402823466e+38f; float merged_m = simd_max(M); float weight = lane < split_count && S > 0.0f ? exp(M - merged_m) : 0.0f; float denom = simd_sum(S * weight); float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
            "    for (uint d4 = uint(sgitg); d4 < hd4; d4 += schedule.reduce_simdgroups) { float4 value = lane < split_count ? partial_o[(qh * hd4 + d4) * split_count + uint(lane)] : float4(0.0f); float4 merged = simd_sum(value * weight); if (lane == 0u) output[qh * hd4 + d4] = merged * inv_denom; }\n"
            "}\n"
-           // Qualified OCR global attention reuses the staged SIMD matrix algorithm.
+           "// Qualified OCR global attention reuses the staged SIMD matrix algorithm.\n"
            "kernel void termite_lightonocr3_gqa_split_stage(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float4 *partial_o [[buffer(5)]], constant termite_metal_paged_attention_params &p [[buffer(6)]], constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z; const uint hd = p.head_dim; const uint split_count = schedule.split_count;\n"
            "    const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u));\n"
@@ -15512,6 +15523,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float S = lane < split_count ? partial_stats[qh * (2u * split_count) + uint(lane)] : 0.0f; float M = lane < split_count ? partial_stats[qh * (2u * split_count) + split_count + uint(lane)] : -3.402823466e+38f; float merged_m = simd_max(M); float weight = lane < split_count && S > 0.0f ? exp(M - merged_m) : 0.0f; float denom = simd_sum(S * weight); float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
            "    for (uint d4 = uint(sgitg); d4 < hd4; d4 += schedule.reduce_simdgroups) { float4 value = lane < split_count ? partial_o[(qh * hd4 + d4) * split_count + uint(lane)] : float4(0.0f); float4 merged = simd_sum(value * weight); if (lane == 0u) output[qh * hd4 + d4] = merged * inv_denom; }\n"
            "}\n"
+           // tile-codegen:end attention.gqa_split family
            "struct termite_lighton_batch_row {\n"
            "    device const float *q;\n"
            "    device const uchar *k;\n"
@@ -15522,6 +15534,7 @@ static NSString *termite_metal_shader_source(void) {
            "    termite_metal_paged_attention_params params;\n"
            "    termite_metal_decode_gqa_split_params schedule;\n"
            "};\n"
+           // tile-codegen:begin attention.gqa_batch family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_lightonocr3_gqa_batch_stage(constant termite_lighton_batch_row *rows [[buffer(0)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    constant termite_lighton_batch_row &row=rows[tg.x];\n"
            "    constant termite_metal_paged_attention_params &p=row.params;\n"
@@ -15564,6 +15577,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float S = lane < split_count ? partial_stats[qh * (2u * split_count) + uint(lane)] : 0.0f; float M = lane < split_count ? partial_stats[qh * (2u * split_count) + split_count + uint(lane)] : -3.402823466e+38f; float merged_m = simd_max(M); float weight = lane < split_count && S > 0.0f ? exp(M - merged_m) : 0.0f; float denom = simd_sum(S * weight); float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
            "    for (uint d4 = uint(sgitg); d4 < hd4; d4 += schedule.reduce_simdgroups) { float4 value = lane < split_count ? partial_o[(qh * hd4 + d4) * split_count + uint(lane)] : float4(0.0f); float4 merged = simd_sum(value * weight); if (lane == 0u) output[qh * hd4 + d4] = merged * inv_denom; }\n"
            "}\n"
+           // tile-codegen:end attention.gqa_batch family
            "kernel void termite_polar4_attention_span(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_span_params &p [[buffer(4)]], uint h [[thread_position_in_grid]]) {\n"
            "    if (h >= p.num_heads) return;\n"
            "    uint heads_per_group = p.num_heads / p.num_kv_heads;\n"
