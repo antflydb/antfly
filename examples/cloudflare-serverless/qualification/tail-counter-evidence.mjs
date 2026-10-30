@@ -22,7 +22,7 @@ const worker=v=>typeof v==='string'&&/^antfly-1278-(?:telemetry-[a-z0-9]+-source
 // Delivery IDs are NOT invocation IDs and no sampling interval is invented.
 // Empty populations require named, version-matched witnesses on both sides.
 export function reconcileTailCounter(objects,roots,{source,version,counterVersion,captureId,timeframe,settledAt,witnesses}={}){
- const versions=Array.isArray(version)?version:[version];const failures=[],validWindow=Number.isSafeInteger(timeframe?.from)&&Number.isSafeInteger(timeframe?.to)&&timeframe.from<timeframe.to&&timeframe.to-timeframe.from<=60000;
+ const versions=Array.isArray(version)?version:[version];const failures=[],validWindow=Number.isSafeInteger(timeframe?.from)&&Number.isSafeInteger(timeframe?.to)&&timeframe.from<=timeframe.to&&timeframe.to-timeframe.from<=60000;
  if(!worker(source)||versions.length<1||versions.length>8||!versions.every(uuid)||new Set(versions).size!==versions.length||!uuid(counterVersion)||!uuid(captureId)||!validWindow||!Number.isSafeInteger(settledAt)||settledAt<timeframe.to+60000||!Array.isArray(objects)||objects.length>20000||!Array.isArray(roots)||roots.length>20000)return{qualification:false,complete:false,failures:['TailCounterScopeInvalid']};
  const prefix='probe-v1/'+captureId+'/counter/',seen=new Set(),records=[],all=[];
  for(const object of objects){

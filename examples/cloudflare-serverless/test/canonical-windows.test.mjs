@@ -75,9 +75,13 @@ test('native Tail capture uses the new format only when explicitly enabled and h
 test('successive closed windows deduplicate boundary partitions and prove the whole app ledger',async()=>{
  const env=fixture(),starts=[1500,61500,121500],attempts=starts.map(()=>crypto.randomUUID()),rows=starts.map((start,i)=>({...row(start),invocation_id_sha256:String(i+1).repeat(64),attempt_id_sha256:attemptIdentity(attempts[i])}));
  await persistCanonicalRows(env,envelope(rows));await persistCanonicalTail(env,delivery([records()[0],...rows.map(r=>({script:source,version_id:version,timestamp:r.start,attempt_id_sha256:r.attempt_id_sha256,event:r.event})),{...records()[2],timestamp:122000}]),Object.values(witnesses));
- await captures(env,async(a,b)=>{assert.equal(a.windows.length,3);const ledger={schema:1,overflow:false,attempts:attempts.map(id=>({id,finished_at:130000,status:200,version_id:version}))},proof=await reconcileObserverSource(a,b,{...scope,ledger});assert.equal(proof.complete,true,JSON.stringify(proof));assert.equal(proof.terminals,3);assert.equal(proof.native_terminals,3);assert.equal(proof.physical_attempts,3);
+ const windowScans=[],list=env.LOGS.list.bind(env.LOGS);env.LOGS.list=options=>{if(options.prefix.includes('/windows/'))windowScans.push(options.prefix);return list(options);};await captures(env,async(a,b,observer)=>{assert.equal(a.windows.length,3);assert.equal(a.window_partition,'utc-minute');const ledger={schema:1,overflow:false,attempts:attempts.map(id=>({id,finished_at:130000,status:200,version_id:version}))},proof=await reconcileObserverSource(a,b,{...scope,ledger});assert.equal(proof.complete,true,JSON.stringify(proof));assert.equal(proof.terminals,3);assert.equal(proof.native_terminals,3);assert.equal(proof.physical_attempts,3);
   const shifted=structuredClone(b);shifted.windows[1].timeframe.from++;assert.equal((await reconcileObserverSource(a,shifted,{...scope,ledger})).complete,false);
- });
+  const{partitionCanonicalTimeframe}=await import('../qualification/canonical-window-client.mjs');
+  async function legacy(catalog){const all=new Map();let template;for(const entry of catalog.windows){const snap=JSON.parse(await readFile(entry.path));template??=snap;for(const object of snap.objects)all.set(object.key,object);}const result={...catalog};delete result.window_partition;result.windows=[];for(const [i,timeframe]of partitionCanonicalTimeframe(catalog.timeframe,'elapsed-minute').entries()){const objects=[...all.values()],snapshot={...template,timeframe,objects,bytes:objects.reduce((n,o)=>n+Buffer.byteLength(JSON.stringify(o)),0)},body=JSON.stringify(snapshot),path=resolve(observer.dir,'legacy-'+catalog.snapshot_started_at+'-'+i+'.json');await writeFile(path,body,{flag:'wx'});result.windows.push({timeframe,path,sha256:await sha(body),bytes:Buffer.byteLength(body)});}return result;}
+  assert.equal((await reconcileObserverSource(await legacy(a),await legacy(b),{...scope,ledger})).complete,true,'old elapsed-minute catalogs remain verifiable');
+
+ });assert.equal(windowScans.length,6);assert.equal(new Set(windowScans).size,3);
 });
 test('unsafe OTLP children, rejected rows and changed canonical identities cannot disappear behind healthy native counts',async()=>{
  for(const patch of[{terminal:false,event:{logs:[{message:[JSON.stringify({failure_code:'SQLITE_NOMEM'})]}]}},{terminal:false,dropped:true},{terminal:false,warning:true,warning_type:'unexpected'}]){const env=fixture();await seed(env);await persistCanonicalRows(env,envelope([{...row(),...patch}]));await captures(env,async(a,b)=>{assert.equal((await reconcileObserverSource(a,b,scope)).complete,false);});}
@@ -90,4 +94,15 @@ test('the original 20000 terminal limit still applies inside a compact closed wi
  for(let i=1;i<21;i++)objects.push({...objects[0],key:windowPrefix(captureId,0)+'batches/'+i+'.json'});
  const first={qualification:false,evidence_layout:'window-v1',capture_id:captureId,collector_version:readerVersion,snapshot_started_at:62000,snapshot_finished_at:63000,objects},second={...first,snapshot_started_at:94000,snapshot_finished_at:95000};
  const proof=await reconcileTailCounterSnapshots(first,second,{...scope,timeframe:{from:1001,to:1999}});assert.equal(proof.complete,false);assert.ok(proof.failures.includes('TailCounterScopeInvalid'));
+});
+
+
+test('UTC windows read each physical minute once and preserve single-millisecond edges',async()=>{
+ const{partitionCanonicalTimeframe}=await import('../qualification/canonical-window-client.mjs');
+ const time={from:1001,to:121999},cuts=partitionCanonicalTimeframe(time),legacy=partitionCanonicalTimeframe(time,'elapsed-minute');
+ assert.deepEqual(cuts,[{from:1001,to:59999},{from:60000,to:119999},{from:120000,to:121999}]);
+ const scans=windows=>windows.flatMap(w=>{const a=[];for(let m=Math.floor(w.from/60000)*60000;m<=w.to;m+=60000)a.push(m);return a;});
+ assert.equal(scans(legacy).length,5);assert.equal(scans(cuts).length,3);assert.equal(new Set(scans(cuts)).size,3);
+ assert.deepEqual(partitionCanonicalTimeframe({from:59999,to:60000}),[{from:59999,to:59999},{from:60000,to:60000}]);
+ assert.throws(()=>partitionCanonicalTimeframe(time,'unknown'),/ScopeInvalid/);
 });

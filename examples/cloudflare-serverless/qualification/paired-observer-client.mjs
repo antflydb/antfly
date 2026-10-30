@@ -15,17 +15,19 @@
 
 import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{reconcileTailCounterSnapshots}from'./tail-counter-evidence.mjs';import{attemptIdentity}from'./invocation-accounting.mjs';
 import{DiagnosticCoverage}from'./live-diagnostics.mjs';
-import{collectCanonicalWindows,readCanonicalSnapshot}from'./canonical-window-client.mjs';
+import{collectCanonicalWindows,readCanonicalSnapshot,partitionCanonicalTimeframe}from'./canonical-window-client.mjs';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-export async function observerCall(observer,path,body={}, {fetch:request=fetch}={}){
+export async function observerCall(observer,path,body={}, {fetch:request=fetch,signal}={}){
  const useReader=observer.reader_origin&&(path==='/health'||/\/(?:page|inventory|objects|layout|window|witnesses|rejections)$/.test(path)),token=(await readFile(observer.token_file,'utf8')).trim(),origin=new URL(useReader?observer.reader_origin:observer.origin),owner=useReader?observer.reader_id:observer.id;if(origin.protocol!=='https:'||!origin.hostname.startsWith(owner+'.')||!origin.hostname.endsWith('.workers.dev'))throw Error('ObserverOriginInvalid');
+ const external=signal??observer.capture_signal;external?.throwIfAborted();
  const deadline=Date.now()+30000,readOnly=path==='/health'||/\/(?:page|inventory|objects|layout|window|witnesses|rejections)$/.test(path);
  for(let attempt=0;;attempt++)try{
-  const response=await request(new URL(path,origin),{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(body),signal:AbortSignal.timeout(Math.max(1,deadline-Date.now()))});const resource=response.headers.get('X-Antfly-Resource-Failure');if(['SQLITE_NOMEM','OutOfMemory','MemoryLimitExceeded','CPULimitExceeded'].includes(resource)){observer.observed_resource_failures??=[];if(observer.observed_resource_failures.length<128)observer.observed_resource_failures.push({at:Date.now(),component:useReader?'evidence-reader':'tail-observer',failure_code:resource});await response.body?.cancel();throw Error('ObserverResourceFailure:'+resource);}if(!response.ok){await response.body?.cancel();throw Error('ObserverHttpStatus'+response.status);}let bytes=0,parts=[];for await(const part of response.body){bytes+=part.byteLength;if(bytes>5*1024*1024)throw Error('ObserverResponseBudgetExceeded');parts.push(part);}const result=JSON.parse(Buffer.concat(parts));if(path==='/health'&&observer.observation_capture_id!=null&&result.observation_capture_id!==observer.observation_capture_id)throw Error('ObserverCaptureGenerationMismatch');return result;
- }catch(error){const transport=error instanceof TypeError&&error.message==='fetch failed'||['ECONNRESET','EAI_AGAIN','UND_ERR_SOCKET','UND_ERR_CONNECT_TIMEOUT'].includes(error.cause?.code);if(!readOnly||!transport||attempt>=2||Date.now()>=deadline)throw error;await new Promise(ok=>setTimeout(ok,100));}
+  const response=await request(new URL(path,origin),{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(body),signal:AbortSignal.any([AbortSignal.timeout(Math.max(1,deadline-Date.now())),...(external?[external]:[])])});const resource=response.headers.get('X-Antfly-Resource-Failure');if(['SQLITE_NOMEM','OutOfMemory','MemoryLimitExceeded','CPULimitExceeded'].includes(resource)){observer.observed_resource_failures??=[];if(observer.observed_resource_failures.length<128)observer.observed_resource_failures.push({at:Date.now(),component:useReader?'evidence-reader':'tail-observer',failure_code:resource});await response.body?.cancel();throw Error('ObserverResourceFailure:'+resource);}if(!response.ok){await response.body?.cancel();throw Error('ObserverHttpStatus'+response.status);}let bytes=0,parts=[];for await(const part of response.body){bytes+=part.byteLength;if(bytes>5*1024*1024)throw Error('ObserverResponseBudgetExceeded');parts.push(part);}const result=JSON.parse(Buffer.concat(parts));if(path==='/health'&&observer.observation_capture_id!=null&&result.observation_capture_id!==observer.observation_capture_id)throw Error('ObserverCaptureGenerationMismatch');return result;
+ }catch(error){external?.throwIfAborted();const transport=error instanceof TypeError&&error.message==='fetch failed'||['ECONNRESET','EAI_AGAIN','UND_ERR_SOCKET','UND_ERR_CONNECT_TIMEOUT'].includes(error.cause?.code);if(!readOnly||!transport||attempt>=2||Date.now()>=deadline)throw error;await new Promise(ok=>setTimeout(ok,100));}
 
 }
 export async function collectObserverSource(observer,scope,options={}){
+ if(options.signal){options.signal.throwIfAborted();observer.observed_resource_failures??=[];observer={...observer,capture_signal:options.signal};}
  if(observer.evidence_layout==='window-v1')return collectCanonicalWindows(observer,scope,options,observerCall);
  if(observer.reader_inventory)return collectInventorySource(observer,scope);
  const start=Date.now(),objects=[],seen=new Set(),cursors=new Set();let cursor=null,pages=0,bytes=0;
@@ -51,7 +53,7 @@ export async function reconcileObserverSource(first,second,{source,captureId,ver
  }
  if(second.evidence_layout==='window-v1'){const coverage=new DiagnosticCoverage([{id:source}]);for(const r of rows)if(r.script===source&&r.start>=timeframe.from&&r.start<=timeframe.to)coverage.observe(source,'app',r.event??{});const report=coverage.report().streams.find(r=>r.role==='app');if(report.resource_failures)failures.push('ObserverResourceFailure');if(report.gap)failures.push('ObserverTelemetryIncomplete');}
  if(objects.some(o=>o.value?.rejection))failures.push('ObserverIngestionRejected');
- const windows=[];for(let from=timeframe.from;from<=timeframe.to;from+=60000){const to=Math.min(timeframe.to,from+59999);if(to<=from){failures.push('ObserverWindowTooShort');break;}const proof=await reconcileTailCounterSnapshots(first,second,{source,version,counterVersion,captureId,timeframe:{from,to},witnesses});windows.push({timeframe:{from,to},...proof});failures.push(...proof.failures);}
+ const windows=[];for(let from=timeframe.from;from<=timeframe.to;from+=60000){const to=Math.min(timeframe.to,from+59999);if(to<from){failures.push('ObserverWindowTooShort');break;}const proof=await reconcileTailCounterSnapshots(first,second,{source,version,counterVersion,captureId,timeframe:{from,to},witnesses});windows.push({timeframe:{from,to},...proof});failures.push(...proof.failures);}
  const selected=records.filter(r=>r.timestamp>=timeframe.from&&r.timestamp<=timeframe.to),resources=selected.flatMap(r=>[r.event]).reduce((n,e)=>n+(e.outcome==='exceededMemory'||e.outcome==='exceededCpu'?1:0),0);
  // The strict native verifier retains recovered resource failures as well as
  // terminal outcomes. Recompute each window instead of trusting stored flags.
@@ -63,10 +65,10 @@ export async function reconcileObserverSource(first,second,{source,captureId,ver
 
 async function reconcileWindowCatalogs(first,second,scope){
  const valid=s=>s?.collector_version===second?.collector_version&&Number.isSafeInteger(s?.timeframe?.from)&&Number.isSafeInteger(s?.timeframe?.to)&&s.timeframe.from<s.timeframe.to&&s.timeframe.to-s.timeframe.from<=3600000&&s?.schema===1&&s.qualification===false&&s.evidence_layout==='window-v1'&&s.capture_id===scope.captureId&&Array.isArray(s.windows)&&s.windows.length>0&&s.windows.length<=61;
- if(!valid(first)||!valid(second)||JSON.stringify(first.timeframe)!==JSON.stringify(second.timeframe)||first.windows.length!==second.windows.length)return{qualification:false,complete:false,failures:['ObserverWindowScopeInvalid']};
+ if(!valid(first)||!valid(second)||!['utc-minute','elapsed-minute'].includes(first.window_partition??'elapsed-minute')||(first.window_partition??'elapsed-minute')!==(second.window_partition??'elapsed-minute')||JSON.stringify(first.timeframe)!==JSON.stringify(second.timeframe)||first.windows.length!==second.windows.length)return{qualification:false,complete:false,failures:['ObserverWindowScopeInvalid']};
  const failures=[],windows=[],identities=new Set(),attempts=new Map();let terminals=0,native=0,resources=0;const outcomes={};let from=second.timeframe.from;
  for(let i=0;i<second.windows.length;i++){
-  const a=first.windows[i],b=second.windows[i],to=Math.min(second.timeframe.to,from+59999);
+  const a=first.windows[i],b=second.windows[i],to=partitionCanonicalTimeframe(second.timeframe,second.window_partition??'elapsed-minute')[i]?.to;
   if(JSON.stringify(a.timeframe)!==JSON.stringify({from,to})||JSON.stringify(b.timeframe)!==JSON.stringify({from,to}))return{qualification:false,complete:false,failures:['ObserverWindowScopeInvalid']};
   const one=await readCanonicalSnapshot(a),two=await readCanonicalSnapshot(b);
   for(const s of[one,two])if(s.capture_id!==scope.captureId||s.collector_version!==second.collector_version)failures.push('ObserverSnapshotScopeInvalid');

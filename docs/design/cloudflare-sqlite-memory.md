@@ -360,3 +360,70 @@ an error followed by an empty `last_error`, unavailable observations, changed
 identity, monitoring gaps and serial request settlement. All 491 Node tests pass;
 the previously passing eight receiver/Tail workerd integrations and guarded
 native R2 integration use unchanged Worker code for this driver-only increment.
+
+
+### Hosted workload result and remaining admission/capture costs
+
+A fresh corpus (`84f4b595-addc-4afa-8766-77a3ed3aed48`) and observation capture
+(`1a900bc3-2a43-4348-89e1-6ad4759fe3f6`) ran rehearsal
+`81304f14-db04-4579-a52f-1c557e8106d3` on driver `e523695c56`. Both sides
+completed the unchanged six-round workload and verified 2,052 exact bodies and
+eight receipt replays. Final client errors and client resource-error ledgers
+are empty. Corrected control `c44896ac8c` and the candidate's sealed application
+bundles/WASM remain unchanged throughout this reproduction.
+
+| Measured p95 | Control | Candidate | Original short-run threshold |
+| --- | ---: | ---: | ---: |
+| Read, 72 logical calls/side | 9,128 ms | 1,508 ms | 1,000 ms |
+| Write, 24 logical calls/side | 10,257 ms | 2,087 ms | 3,000 ms |
+
+Timings include scheduling and transport retries. Candidate has one retried
+read; control has two retried reads and two retried writes. Candidate write
+latency passes the short-run threshold; read latency fails. These results do
+not establish the stronger fourfold targets or provider-placement equivalence.
+
+An independent closed measured minute (`18:40:00`–`18:40:59.999` UTC) reconciles
+all eight sources, 354 canonical/native terminal invocations, both app physical
+attempt ledgers and real before/after witnesses for quiet sources. It passes
+both separated observations with zero resource failures. The saved result is
+`minute-probe-e1063207-8deb-4658-9038-14cfbafbd465/result.json` under the observer
+directory. The earlier third-generation setup minute also passes its six active
+roles. These are explicitly minute-scoped checks, not whole-run qualification.
+
+Whole-run collection exceeded the intended ten-minute capture budget during
+its first observation pass. The pre-fix loop only checked the deadline between
+full eight-source passes and did not propagate cancellation into its current
+source traversal. The collector was stopped; its original partial report stays
+unchanged, with a separate `capture-interruption.json` recording the report hash
+and forced termination. It remains incomplete and cannot pass the gate.
+The native SQL/KV-forbidden regression remains passing, but the historical
+provider `SQLITE_NOMEM` is still unreproduced and not root-caused.
+
+The Node capture client now propagates the original aggregate deadline and
+manual cancellation through active requests, response reads and source/window
+pagination. A cancelled capture records a diagnostic failure and closes its
+report instead of traversing the remaining sources. UTC-aligned logical cuts
+also fetch each physical minute once instead of routinely reading it in two
+adjacent elapsed-minute slices. Catalogs explicitly identify their partition
+scheme; old elapsed-minute catalogs remain readable. Inclusive one-millisecond
+edge slices retain exact counts, identities and real boundary witnesses. The
+original byte/object/terminal, per-window and aggregate time limits remain.
+A three-minute fixture reduces physical minute scans from five to three per
+observation, while proving the same entire app ledger.
+
+Read profiling uses sanitized Tail archives, not the compact proof rows that
+intentionally omit benign timings. In one measured minute, 24 candidate lookups
+have native lookup I/O p95 512 ms, while several slow requests spend about
+1.0–1.25 seconds in read admission. These measurements overlap and must not be
+added as independent percentile components. They identify admission and
+preparation reuse as the next read-latency target; cutting only document-body
+I/O is insufficient. Candidate direct reads execute in the app-reader runtime,
+so an empty private-reader population must not be mistaken for missing app
+reads. Further admission experiments should preserve the current authority,
+lease-expiry, caller ownership and collection-fence semantics.
+
+The replay-only attempt before this fresh run stalled at control tenant A /
+256 published documents. Fresh setup subsequently progressed past that point
+and completed. Stable seed operation IDs guarantee replay identity, not liveness
+of an older control after interrupted publication; the replay is retained as a
+failed reproduction, with no claim that its cause is established.
