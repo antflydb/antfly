@@ -844,7 +844,9 @@ pub fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.
     defer alloc.free(models);
 
     for (models) |m| {
-        std.debug.print("{s:<12} {s}\n", .{ @tagName(m.kind), m.name });
+        if (m.load_error) |err| {
+            std.debug.print("{s:<12} {s}  unusable: {s}\n", .{ @tagName(m.kind), m.name, @errorName(err) });
+        } else std.debug.print("{s:<12} {s}\n", .{ @tagName(m.kind), m.name });
     }
 }
 
