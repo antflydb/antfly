@@ -250,7 +250,7 @@ pub const ReadScope = struct {
     const VTable = struct {
         /// Only copied range results remain scope-owned. Engine/cache and the
         /// cursor's current borrowed value have their own bounded owners.
-        range_read_mode: ?*const fn (*anyopaque) RangeReadMode = null,
+        range_read_mode: ?RangeReadMode = null,
         get_ranges_many: ?*const fn (*anyopaque, []const RangeRequest) anyerror!void = null,
         get_ranges: ?*const fn (*anyopaque, []const u8, []const ValueRange, [][]const u8) anyerror!void = null,
         get_range: ?*const fn (*anyopaque, []const u8, u64, usize) anyerror![]const u8 = null,
@@ -297,11 +297,11 @@ pub const ReadScope = struct {
     /// selected-copy adapters must not enlarge physical-I/O windows: their
     /// copied output is small, but each point read still visits a whole value.
     pub fn supportsSelectedRangeIo(self: *const @This()) bool {
-        if (self.vtable.range_read_mode != null) return self.rangeReadMode() == .selected_read;
+        if (self.vtable.range_read_mode) |mode| return mode == .selected_read;
         return self.vtable.get_range != null;
     }
     pub fn rangeReadMode(self: *const @This()) RangeReadMode {
-        return if (self.vtable.range_read_mode) |check| (BoundaryAbi.call("range_read_mode", self.boundary_dispatch, check, .{self.ptr}) catch .full_value) else .full_value;
+        return self.vtable.range_read_mode orelse .full_value;
     }
     pub fn retainsSelectedRanges(self: *const @This()) bool {
         return self.rangeReadMode() != .full_value;
@@ -446,10 +446,6 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
         handle: @TypeOf(handle),
         parent: ?ParentRelease,
         admission: if (pooled_metadata) ?Receipt else void,
-        fn rangeReadMode(ptr: *anyopaque) RangeReadMode {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.handle.rangeReadMode();
-        }
         fn getRangesMany(ptr: *anyopaque, requests: []const RangeRequest) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRangesMany(requests);
@@ -551,7 +547,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .range_read_mode = if (@hasDecl(@TypeOf(handle), "rangeReadMode")) State.rangeReadMode else null, .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = comptime &.{ .range_read_mode = if (@hasDecl(@TypeOf(handle), "range_read_mode")) @TypeOf(handle).range_read_mode else null, .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -565,9 +561,7 @@ pub fn cursorReadScope(alloc: Allocator, cursor: Cursor) !ReadScope {
             if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
             return self.scratch.allocator().dupe(u8, entry.value);
         }
-        pub fn rangeReadMode(_: *@This()) RangeReadMode {
-            return .selected_copy;
-        }
+        pub const range_read_mode = RangeReadMode.selected_copy;
         pub fn getRanges(self: *@This(), key: []const u8, ranges: []const ValueRange, output: [][]const u8) !void {
             if (ranges.len != output.len) return error.InvalidBatch;
             if (ranges.len == 0) return;
@@ -619,6 +613,8 @@ pub const ReadTxn = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        /// Immutable planning metadata; discovery must not require opening a scope.
+        read_scope_range_mode: ?RangeReadMode = null,
         decoded_results_namespace: ?*const fn (*anyopaque) ?[]const u8 = null,
         can_reuse_decoded_results: ?*const fn (*anyopaque) bool = null,
         abort: *const fn (Allocator, *anyopaque) void,
@@ -677,6 +673,10 @@ pub const ReadTxn = struct {
 
     pub fn forkBorrowedRead(self: *ReadTxn) !ReadTxn {
         return self.forkRead();
+    }
+
+    pub fn readScopeRangeMode(self: *const ReadTxn) ?RangeReadMode {
+        return if (self.vtable.open_read_scope == null) .selected_copy else self.vtable.read_scope_range_mode;
     }
 
     pub fn openReadScope(self: *ReadTxn, alloc: Allocator) !ReadScope {
@@ -1632,6 +1632,18 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
     };
 }
 
+// Capabilities describe the actual returned scope type, not a backing store
+// hidden behind an adapter. Erased/custom scopes remain unknown and conservative.
+fn readScopeModeFor(comptime Handle: type) ?RangeReadMode {
+    if (!@hasDecl(Handle, "openReadScope")) return .selected_copy;
+    const Return = @typeInfo(@TypeOf(Handle.openReadScope)).@"fn".return_type orelse return null;
+    const Scope = switch (@typeInfo(Return)) {
+        .error_union => |value| value.payload,
+        else => Return,
+    };
+    return if (@hasDecl(Scope, "range_read_mode")) Scope.range_read_mode else null;
+}
+
 pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
     return readTxnFromWithParent(allocator, handle, null);
 }
@@ -1714,7 +1726,10 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
         .identity = newReadTransactionIdentity(),
-        .vtable = &.{
+        // The type-only helper is explicitly evaluated at compile time. A
+        // runtime initializer would put this escaping table on the stack.
+        .vtable = comptime &.{
+            .read_scope_range_mode = readScopeModeFor(Handle),
             .decoded_results_namespace = if (@hasDecl(Handle, "decodedResultsNamespace")) vt.decodedResultsNamespace else null,
             .can_reuse_decoded_results = if (@hasDecl(Handle, "canReuseDecodedResults")) vt.canReuseDecodedResults else null,
             .abort = vt.abort,

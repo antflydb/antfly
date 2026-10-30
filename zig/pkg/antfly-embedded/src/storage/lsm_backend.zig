@@ -26379,7 +26379,10 @@ test "logical value native LSM ranges retain selected copies and release payload
         var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 8192 };
         var scope = try read.openReadScope(result_budget.allocator());
         defer scope.close();
-        try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, scope.rangeReadMode());
+        try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, @TypeOf(scope).range_read_mode);
+        var metadata_read = try store.beginRead();
+        defer metadata_read.abort();
+        try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, metadata_read.readScopeRangeMode().?);
         const first = try scope.getRange("a", 0, 16);
         const second = try scope.getRange("b", 32752, 16);
         try std.testing.expectEqual(@as(usize, 0), scope.held_blocks.items.len);

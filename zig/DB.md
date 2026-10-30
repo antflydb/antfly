@@ -550,7 +550,14 @@ including explicit selected-read and full-read decisions. Estimates include
 coalesced spans, reconstruction and setup; logical work still charges original
 source sizes. Whole-value readers check cancellation between documents. Native
 selected I/O keeps its bounded batch walk; other scanners retain their existing
-physical-work limits. These limits do not bound backend caches or process RSS.
+physical-work limits. Scope modes are immutable vtable metadata, not callbacks;
+read transactions expose known scope capabilities before a scope is allocated.
+Tables built from type-only helpers have explicit compile-time storage. Metadata
+fields are excluded from native method dispatch. Copy-backed projection windows admit at most 1 MiB of
+original values as well as bounding selected work; selected I/O can admit by
+selected work alone. Cached plans use pointers so ordinary fallback rows do not
+carry inline range arrays; temporary authority headers stay in a bounded stack
+array. These limits do not bound backend caches or process RSS.
 
 ## Write Contract
 

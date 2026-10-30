@@ -1926,3 +1926,199 @@ I/O retains selection-based admission. The ownership tests establish bounded
 retention and lifetimes independently of these throughput measurements.
 The initial reports remain separate from final merged-tree qualification;
 none of these numbers describe the corrected executable.
+
+The corrected implementation merges main `b6e576b8e5`; final merged-tree
+qualification uses an exact prior-PR-plus-main runtime baseline.
+
+
+### Corrected merged-tree qualification
+
+The corrected runtime at `23485ebe57` includes main `b6e576b8e5` and passes
+all 91 native build/test steps, with 236 standard-runner tests plus custom
+suites (211 query contracts, 90 logical-field tests with one optional skip,
+31 provider tests, 68 gateway tests and 24 catalog tests). No tests failed
+or leaked. License headers, Apache dependency boundaries, provenance and
+asset checks, storage-control catalog validation, Zig formatting and Ruff
+also pass on this merged tree.
+
+The matching baseline is merge tree
+`e4152d6f5f5323c6d574004a3638047dc2649e53`: the previous PR head
+`c1666f8859` combined with the same main revision. Only the ten runtime files
+changed by the follow-up differ between that baseline and the corrected
+runtime. Both executables use the pinned Zig 0.17.0 compiler and identical
+stripped ReleaseFast flags. The manifest records binary hashes, runtime and
+driver hashes, build flags and host details. This comparison separates the
+follow-up from unrelated changes in main. Recreate that baseline tree with
+`git merge-tree --write-tree c1666f8859 b6e576b8e5`; restore the ten runtime
+paths listed by the manifest while keeping the candidate checkout, toolchain
+and build options fixed. Restore the candidate files after capturing the
+baseline executable. No on-disk format or public API changes are involved.
+
+
+### Immutable capability metadata and cheap fallback planning
+
+The first same-main comparison of `496f1644` against `7499a2be` exposed a
+persistent medium-image regression: 0.853 → 0.970 ms CPU initially and
+0.758 → 0.827 ms in seven longer alternating rounds. Tiny-image CPU changed
+direction in the repeat, while the 64-document scalar repeats were approximately
+0.9–2.1% slower. These results remain separate from the following correction.
+
+Read modes are immutable capability metadata, not executable callbacks. They
+now live directly in scope vtables; read transactions expose the returned scope
+type's known capability before opening a scope. Unknown adapters remain
+conservative. Large copy-backed or uncertified rows decline batching before
+opening scopes, and the 64-row temporary authority headers stay on the stack.
+Scope lifetimes and returned plans/rows remain allocator-owned as before.
+Capability tables are constructed explicitly at compile time. A type-only helper
+must not turn an escaping table literal into a temporary runtime allocation;
+the per-type table has static storage, while its handles remain request-owned.
+
+The shared runtime dispatcher ignores non-callback metadata fields when building
+its method dispatch, preserving rejection of attempts to invoke metadata as a
+method. This avoids adding dispatch work to unrelated storage operations every
+time a capability is added. Regression checks cover forged metadata calls,
+metadata-only rejection without scope creation, and continued eligibility of
+actual selected I/O. The exact same-main baseline executable is retained for
+final qualification; the earlier reports are not overwritten.
+
+
+### Final ownership and capability qualification (2026-10-29)
+
+The final candidate executable is
+`114c5de324e4e3037b1c0c8164dec83ac0a917971116f3fd968cf87c19b09b8f`;
+the same-main baseline is
+`7499a2be8f72b980cd89c631becc76af3f4e456711e5253b23e019dc301be3d3`.
+Both use main `b6e576b8e5`, pinned Zig 0.17.0, stripped ReleaseFast builds
+and the same shared 14-core M4 Max with 36 GiB RAM. The executable grows
+from 234,013,512 to 234,094,984 bytes (81,472 bytes, about 0.035%). The baseline is the
+prior PR runtime plus that main merge (`e4152d6f5f5323c6d574004a3638047dc2649e53`).
+The manifest includes all twelve changed runtime paths, their source hashes,
+compiler identity, driver hashes and binary sizes. No public API or ASCH25
+format changes are involved.
+
+All 91 native steps pass: 167 standard-runner tests executed (other steps
+reuse previously validated results), 212 query contracts, 90 logical-field
+checks with one optional skip, 31 provider, 68 gateway and 24 catalog checks.
+The shared runtime ABI suite separately passes 47 tests. No failures or leaks.
+The release build passes all 71 steps; real-server HTTP integration passes
+57 tests with seven optional profile skips. Header, dependency-boundary,
+provenance, asset, storage-control, formatting and Ruff checks pass.
+
+The complete warm matrix below uses five alternating baseline/candidate
+rounds; the two small media controls use seven. Media/source phases use 50
+requests per round, narrow batch phases and small media controls use 100.
+Every response is checked for exact source values, identities, scores, totals
+or verified media evidence as applicable. Media ends at `ModelRequired` and
+measures no provider inference or billing. CPU includes the whole server;
+RSS is sampled every 5 ms and is affected by compression and background
+storage activity. Ingestion is included as a control even though these changes
+do not modify the write path. These are measurements, not universal speed or
+memory guarantees. Initial reports and independent repeats are both retained.
+
+| Workload / phase | Elapsed ms, baseline → candidate | CPU ms, baseline → candidate | RSS MiB, baseline → candidate |
+|---|---:|---:|---:|
+| tiny_shared_duplicates | 0.516 → 0.505 | 0.177 → 0.169 | 153.922 → 154.375 |
+| medium_shared_duplicates | 1.057 → 1.041 | 0.681 → 0.677 | 153.641 → 154.875 |
+| large_distinct_unique | 4.426 → 4.426 | 11.227 → 11.113 | 216.344 → 216.797 |
+| large_distinct_unique_eight | 8.144 → 8.168 | 22.151 → 21.962 | 252.766 → 256.688 |
+| skewed_distinct_eight | 10.863 → 10.724 | 13.129 → 12.969 | 219.852 → 221.172 |
+| large_512_distinct_unique_eight | 45.587 → 45.274 | 82.392 → 82.056 | 408.562 → 407.047 |
+| large_shared_duplicates | 11.310 → 11.720 | 10.862 → 11.262 | 189.398 → 191.453 |
+| large_distinct_repeated_refs | 7.053 → 7.220 | 11.532 → 11.821 | 209.312 → 206.078 |
+| large_512_distinct_repeated_refs | 48.113 → 45.836 | 48.378 → 46.393 | 321.609 → 317.750 |
+| batches-scalar-small | 2.306 → 2.149 | 1.768 → 1.670 | 164.297 → 161.148 |
+| batches-scalar-large | 3.930 → 3.972 | 3.379 → 3.437 | 429.703 → 414.109 |
+| batches-nested-small | 2.992 → 3.517 | 2.350 → 2.738 | 165.734 → 164.734 |
+| batches-nested-medium | 3.105 → 2.904 | 2.441 → 2.296 | 177.609 → 177.625 |
+| batches-nested-large | 5.415 → 7.026 | 4.703 → 6.159 | 474.969 → 476.000 |
+| source-small64/ingest | 13.300 → 11.992 | 23.310 → 20.840 | 151.781 → 152.156 |
+| source-small64/ordinary | 0.736 → 0.686 | 0.320 → 0.274 | 155.141 → 155.484 |
+| source-small64/full | 2.261 → 2.011 | 1.683 → 1.502 | 159.391 → 159.047 |
+| source-small64/reference_full | 2.251 → 2.012 | 1.727 → 1.517 | 158.641 → 158.438 |
+| source-small64/conditional | 2.339 → 2.120 | 1.771 → 1.595 | 159.562 → 159.438 |
+| source-small64/reference | 2.376 → 2.214 | 1.806 → 1.663 | 159.391 → 159.656 |
+| source-large/ingest | 147.703 → 171.806 | 153.562 → 177.336 | 270.531 → 271.391 |
+| source-large/ordinary | 21.369 → 24.247 | 16.581 → 18.841 | 468.156 → 484.727 |
+| source-large/full | 28.584 → 28.295 | 23.705 → 23.318 | 643.328 → 633.391 |
+| source-large/reference_full | 45.918 → 45.036 | 41.267 → 40.407 | 723.211 → 682.586 |
+| source-large/conditional | 1.382 → 1.458 | 0.844 → 0.892 | 624.250 → 652.734 |
+| source-large/reference | 18.979 → 20.045 | 18.561 → 19.741 | 624.469 → 624.438 |
+| source-escaped/ingest | 109.784 → 110.518 | 125.992 → 125.582 | 198.891 → 198.266 |
+| source-escaped/ordinary | 9.542 → 9.513 | 7.813 → 7.814 | 206.219 → 202.094 |
+| source-escaped/full | 17.239 → 16.952 | 15.740 → 15.465 | 210.859 → 209.188 |
+| source-escaped/reference_full | 31.083 → 29.845 | 29.851 → 28.817 | 211.188 → 209.000 |
+| source-escaped/conditional | 1.172 → 1.122 | 0.640 → 0.630 | 210.906 → 125.453 |
+| source-escaped/reference | 16.241 → 15.597 | 15.926 → 15.282 | 210.906 → 125.125 |
+| source-wide-small/ingest | 19.948 → 21.878 | 38.716 → 38.153 | 160.188 → 161.328 |
+| source-wide-small/ordinary | 2.231 → 2.157 | 1.331 → 1.295 | 165.516 → 167.094 |
+| source-wide-small/full | 3.681 → 3.775 | 2.757 → 2.856 | 172.242 → 171.055 |
+| source-wide-small/reference_full | 4.549 → 4.615 | 3.574 → 3.643 | 170.969 → 170.891 |
+| source-wide-small/conditional | 2.383 → 2.378 | 1.759 → 1.777 | 178.188 → 176.656 |
+| source-wide-small/reference | 3.485 → 3.316 | 2.719 → 2.723 | 178.391 → 176.688 |
+| source-wide-large/ingest | 153.290 → 169.555 | 154.360 → 158.750 | 273.594 → 279.234 |
+| source-wide-large/ordinary | 18.268 → 18.516 | 13.939 → 14.128 | 454.625 → 414.500 |
+| source-wide-large/full | 23.759 → 23.913 | 19.762 → 19.641 | 631.000 → 627.500 |
+| source-wide-large/reference_full | 34.877 → 35.901 | 31.275 → 31.663 | 630.008 → 588.422 |
+| source-wide-large/conditional | 2.632 → 2.917 | 1.967 → 2.145 | 623.219 → 519.547 |
+| source-wide-large/reference | 16.037 → 16.923 | 15.631 → 16.337 | 561.984 → 483.859 |
+
+
+The medium shared-image overhead seen before immutable capability metadata is
+absent in this matrix (0.681 → 0.677 ms CPU). Small scalar/nested-medium batches
+improve about 5.5–6%; repeated 512×512 references improve about 4.1% CPU.
+Other media gains are small, and some controls regress. The large nested batch
+initially regresses 31% CPU and the wide-large conditional phase regresses 9%.
+Those cases must not be advertised as performance wins. The selected-copy
+contract provides bounded retained output ownership even when physical reads
+still visit whole LSM values; it does not establish sparse LSM I/O or bounded
+process RSS. The original-byte admission cap and cancellation checks remain
+necessary independent of timing. Copy-backed engines can pay per-document
+working-set ownership and selected-copy overhead in exchange for not retaining
+irrelevant whole-value results until the scope ends. Actual selected I/O and
+full-value consumers retain separate cost and ownership contracts.
+
+Reproduce using the existing drivers with these exact binaries, alternating
+`--rounds 5 --queries-per-phase 100` for `bench_projection_batches.py`,
+`--rounds 5 --queries-per-phase 50` for `bench_source_projection.py` and
+`bench_media_materialization.py`, and `--baseline <same-main-baseline>`.
+Batch controls use 64 documents, scalar/nested metadata and 16 KiB/64 KiB/1 MiB
+values. Source controls cover small 60-output rows, ASCII 1 MiB, escaped values,
+and 60-output 64 KiB/1 MiB rows. Media controls cover tiny/medium/large shared
+fields, distinct/skewed images and repeated independently checked references.
+Raw manifests, per-request samples, logs and binaries stay ignored under
+`output/projection-followup/`; no raw JSON or logs are added to the repository.
+
+
+Independent repeats use seven alternating rounds and 100 requests per phase
+with the identical frozen binaries and drivers. Every output check passes.
+They do not replace the initial observations above.
+
+| Repeat / phase | Elapsed ms, baseline → candidate | CPU ms, baseline → candidate | RSS MiB, baseline → candidate |
+|---|---:|---:|---:|
+| nested-large | 4.394 → 4.438 | 3.695 → 3.739 | 488.672 → 482.297 |
+| nested-small | 2.769 → 2.810 | 2.116 → 2.172 | 165.766 → 165.742 |
+| source-large/ingest | 165.227 → 235.633 | 159.147 → 162.273 | 220.109 → 275.062 |
+| source-large/ordinary | 19.251 → 19.805 | 15.142 → 14.972 | 516.188 → 522.805 |
+| source-large/full | 23.662 → 32.437 | 19.248 → 21.395 | 632.328 → 556.781 |
+| source-large/reference_full | 35.958 → 37.871 | 31.215 → 31.833 | 607.367 → 604.523 |
+| source-large/conditional | 1.447 → 2.457 | 0.869 → 1.167 | 631.812 → 516.375 |
+| source-large/reference | 15.121 → 18.176 | 14.720 → 16.072 | 624.453 → 327.547 |
+| source-wide-large/ingest | 145.952 → 151.511 | 146.816 → 149.560 | 276.594 → 275.078 |
+| source-wide-large/ordinary | 17.388 → 17.270 | 13.499 → 13.423 | 615.492 → 609.133 |
+| source-wide-large/full | 22.345 → 22.725 | 18.560 → 18.973 | 745.078 → 746.367 |
+| source-wide-large/reference_full | 34.030 → 34.241 | 30.440 → 30.867 | 739.180 → 736.562 |
+| source-wide-large/conditional | 2.374 → 2.400 | 1.823 → 1.840 | 740.359 → 738.594 |
+| source-wide-large/reference | 15.863 → 15.908 | 15.503 → 15.521 | 728.188 → 731.594 |
+| media-shared/large_shared_duplicates | 10.629 → 10.612 | 10.168 → 10.160 | 191.656 → 192.031 |
+| media-shared/large_distinct_repeated_refs | 6.931 → 6.668 | 11.381 → 11.079 | 208.938 → 208.031 |
+
+
+The larger apparent nested-batch regressions shrink to 1.2% and 2.6% CPU;
+wide-large conditional CPU changes from an initial 9% regression to 0.9%.
+Shared-image CPU is flat in the repeat; independently checked repeated 256×256
+references improve about 2.7%. Ordinary large-source CPU is roughly flat, but conditional CPU
+rises from 0.869 to 1.167 ms, and full-source CPU rises from 19.248 to 21.395 ms.
+The evidence does not establish a universal improvement. These ownership and
+admission changes are retained for their directly tested quota/lifetime and
+bounded-work contracts, not described as a CPU win for these regressing cases.
+Independent Linux hardware, cold storage and live providers remain unqualified.

@@ -84,9 +84,11 @@ pub const Batch = struct {
         const full = req.include_all_fields or operands.full_read or operands.read_set.len > 64;
         const capacity = @min(ids.len - index, 64);
         if (capacity < 2) return null;
-        if (full) if (authorities[index].source.proof) |proof| {
-            if (proof.bytes > 1024 * 1024) return null;
-        };
+        const first = authorities[index].source.proof orelse return null;
+        // Capability metadata is available before opening a scope. Unsupported
+        // and whole-value adapters keep the original cheap per-row fallback.
+        if (first.bytes > 1024 * 1024 and
+            (full or (txn.readScopeRangeMode() orelse .full_value) != .selected_read)) return null;
         const a = self.arena.allocator();
         var scope = try txn.openReadScope(a);
         defer scope.close();
@@ -98,7 +100,9 @@ pub const Batch = struct {
         if (mode != .selected_read) if (authorities[index].source.proof) |proof| {
             if (proof.bytes > 1024 * 1024) return null;
         };
-        const selected = try a.alloc(logical.Authority, capacity);
+        // Used synchronously by loadPrepared; plans/returned rows live in the
+        // arena, while these bounded headers need no allocation or teardown.
+        var selected: [64]logical.Authority = undefined;
         const selective = !full and mode != .full_value;
         var end = index;
         var bytes: usize = 0;
@@ -504,4 +508,52 @@ test "api query contract selected copy windows cancel between whole value reads"
     try checked.getRangesMany(&requests);
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "api query contract oversized copy batches use capability metadata without opening scopes" {
+    const backend = @import("../backend_erased.zig");
+    const Fake = struct {
+        fn abort(_: A, _: *anyopaque) void {}
+        fn get(_: *anyopaque, _: []const u8) ![]const u8 {
+            return error.UnexpectedGet;
+        }
+        fn cursor(_: A, _: *anyopaque) !backend.Cursor {
+            return error.UnexpectedCursor;
+        }
+        fn scope(_: A, raw: *anyopaque) !backend.ReadScope {
+            const opens: *usize = @ptrCast(@alignCast(raw));
+            opens.* += 1;
+            return error.UnexpectedScope;
+        }
+    };
+    const a = std.testing.allocator;
+    var opens: usize = 0;
+    var vtable: backend.ReadTxn.VTable = .{
+        .read_scope_range_mode = .selected_copy,
+        .abort = Fake.abort,
+        .get = Fake.get,
+        .open_cursor = Fake.cursor,
+        .open_read_scope = Fake.scope,
+    };
+    var txn: @import("../docstore.zig").DocStore.Txn = .{ .alloc = a, .read = .{ .allocator = a, .ptr = &opens, .vtable = &vtable } };
+    var batch = Batch.init(a);
+    defer batch.deinit();
+    var operands: OperandPlans = .{ .selector = undefined, .read_set = &.{"metadata"} };
+    const authority: conditional.Authority = .{ .source = .{ .proof = .{ .revision = 1, .bytes = 2 * 1024 * 1024, .kind = @import("../internal_keys.zig").primary_kind, .digest = @splat(0) } } };
+    const authorities = [_]conditional.Authority{ authority, authority };
+    const physical = [_][]const u8{ "a", "b" };
+    const request: @import("types.zig").SearchRequest = .{ .include_all_fields = false };
+    try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands) == null);
+    try std.testing.expectEqual(@as(usize, 0), opens);
+    // Unknown adapters retain the same conservative fallback.
+    vtable.read_scope_range_mode = null;
+    try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands) == null);
+    try std.testing.expectEqual(@as(usize, 0), opens);
+    const uncertified = [_]conditional.Authority{ .{}, .{} };
+    try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &uncertified, request, &operands) == null);
+    try std.testing.expectEqual(@as(usize, 0), opens);
+    // Actual selected I/O remains eligible, rather than inheriting a copy cap.
+    vtable.read_scope_range_mode = .selected_read;
+    try std.testing.expectError(error.UnexpectedScope, batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands));
+    try std.testing.expectEqual(@as(usize, 1), opens);
 }

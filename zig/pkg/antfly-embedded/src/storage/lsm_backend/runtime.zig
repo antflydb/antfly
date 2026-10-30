@@ -3655,9 +3655,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 return getFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, &self.last_l0_group_index, &self.read_hint, &self.held_blocks, &self.held_values, self.allocator, p.namespace, key);
             }
 
-            pub fn rangeReadMode(_: *@This()) backend_erased.RangeReadMode {
-                return .selected_copy;
-            }
+            pub const range_read_mode = backend_erased.RangeReadMode.selected_copy;
 
             pub fn getRanges(self: *@This(), key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
                 if (ranges.len != output.len) return error.InvalidBatch;

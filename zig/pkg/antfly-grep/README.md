@@ -5053,3 +5053,16 @@ selected copies while temporary whole-value results retire after each document.
 Projection windows reuse both selected-read and full-read plans. Gateway media
 jobs transfer request-local payload leases while releasing query scratch at
 completion; repeated references to one field can share the retained bytes.
+
+
+The [final ownership qualification](../../../docs/design/antfly-grep.md#final-ownership-and-capability-qualification-2026-10-29)
+compares the exact prior PR runtime with the same main revision and toolchain.
+All 91 native steps, 47 standalone ABI checks and 57 HTTP integration cases
+pass (seven optional HTTP profiles skipped). The warm matrix measures about
+5.5–6% lower CPU for small scalar/nested-medium batches and about 4.1% for repeated
+512×512 media references. Other cases vary or regress, including large/wide
+source reads; the design preserves the complete controls and independent repeats.
+These changes bound retained selected buffers and remove concurrent media
+completion copies; they do not establish universal throughput gains, sparse
+LSM reads, a process RSS bound or zero provider cost. Public API and ASCH25
+remain unchanged.
