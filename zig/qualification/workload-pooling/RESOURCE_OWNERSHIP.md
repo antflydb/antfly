@@ -5698,3 +5698,44 @@ admit embedded model pulls, which currently have no shared execution grant, or
 qualify vendor/framework construction, downloads, mapped-page faults, or deployed
 cross-engine performance. Those remain in the full goal; full GNU qualification
 remains waived.
+
+### Embedded model pulls use the runtime execution owner
+
+Embedded inference now supplies its native runnable owner alongside its existing
+resource budget. Executor work, cold loads and public C API model pulls use that
+owner. A pull admits one background CPU slot on the caller before creating its
+helper. Queued pulls retain their original deadline and cancellation; they cannot
+create a helper merely to wait for admission. The retained capsule is allocated
+through the resource manager and retains the runtime until its final finish.
+
+The helper borrows that same admitted operation. HTTP request tasks do not inherit
+the caller's checkpoint TLS, so socket callbacks explicitly checkpoint, park and
+reenter the borrowed root. Socket/file waits and caller progress delivery lend its
+CPU while retaining its logical resources. Checked return combines the original
+lifetime with the HTTP operation ceiling. Refusal permanently fences that root;
+a subsequent pull must start a fresh operation. Streamed file writes use this
+same explicit control, while synchronous verification reads use admitted file
+I/O and hash only after return to CPU. Download lock acquisition also lends CPU.
+
+The registry retains its existing hidden staging, verified retry artifacts and
+publication/rollback protocol. Cancellation is checked immediately before
+publication. Internal inference ABI 47 carries the live runtime, borrowed
+execution and original lifetime. A trusted Hub endpoint override supports the
+local integration fixture; it is not a public pull request field.
+
+`model-pull-v9.json` records the production C API target, real native owner tests
+and worker-provider semantic check: 72/72 build steps, four public C API cases and
+four owner cases pass with unchanged inputs and no skips or leaks. The public
+fixture verifies install, original queued and network deadlines, caller-thread
+cancellation, unpublished failure and fresh-call retry. Ordinary query/control
+operations progress during Hub waits. Checked refusal retains ownership until
+finish and cannot be cleared to revive the failed operation.
+
+`model-pull-registry-v1.json` records 31 selected existing download, checksum,
+retry, dependency and publication regressions passing without skips. Its registry
+and host production inputs match the final build; later changes only corrected
+the C API fixture. `model-pull-final.json` binds the current source snapshots and
+both receipts. These are local deterministic integrations, not deployed model
+execution, performance or full GNU qualification. Framework construction, broader
+registry preparation, mapped-page faults and wider cross-engine and deployment
+evidence remain open in the full goal.

@@ -22,6 +22,8 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
+const execution = @import("../execution_control.zig");
+const admitted_file = @import("../util/admitted_file.zig");
 const managed_receipt = @import("managed_receipt.zig");
 const gliner_catalog = @import("gliner_catalog.zig");
 const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
@@ -34,6 +36,8 @@ pub const default_max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024;
 pub const default_max_model_bytes: u64 = 128 * 1024 * 1024 * 1024;
 
 pub const HubConfig = struct {
+    /// Borrowed only through the synchronous pull, never persisted in receipts.
+    socket_control: ?httpx.socket.WriteControl = null,
     /// HuggingFace Hub API token (optional, for private/gated models).
     token: ?[]const u8 = null,
     /// Base URL for the Hub API.
@@ -1181,7 +1185,12 @@ pub const ProgressSink = struct {
     /// artifact, so a cancel decided in a callback is always honored.
     cancelled: ?*const std.atomic.Value(bool) = null,
 
-    pub fn checkCancelled(self: ProgressSink) error{Canceled}!void {
+    /// Original lifetime may be checked while a physical transfer is parked.
+    authority: ?struct { context: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+
+    pub fn checkCancelled(self: ProgressSink) !void {
+        if (self.authority) |authority| try authority.check(authority.context);
+        try (execution.InferenceExecutionControl{}).check();
         const flag = self.cancelled orelse return;
         if (flag.load(.acquire)) return error.Canceled;
     }
@@ -1194,12 +1203,17 @@ const OffsetFileWriter = struct {
     io: std.Io,
     offset: u64,
     max_offset: u64,
+    socket_control: ?httpx.socket.WriteControl = null,
+    deadline: ?DownloadDeadline = null,
 
     pub fn writeAll(self: *OffsetFileWriter, data: []const u8) !void {
         const next_offset = std.math.add(u64, self.offset, data.len) catch
             return error.DownloadSizeLimitExceeded;
         if (next_offset > self.max_offset) return error.DownloadSizeLimitExceeded;
-        try self.file.writePositionalAll(self.io, data, self.offset);
+        if (self.socket_control) |original| {
+            const control = if (self.deadline) |deadline| original.withDeadline(self.io, std.math.cast(u64, deadline.expires_ns) orelse std.math.maxInt(u64)) else original;
+            try control.withWait(std.Io.File.writePositionalAll, .{ self.file, self.io, data, self.offset });
+        } else try execution.physicalWait(std.Io.File.writePositionalAll, .{ self.file, self.io, data, self.offset });
         self.offset = next_offset;
     }
 };
@@ -2451,6 +2465,7 @@ fn probeDownloadSize(
     }
 
     var resp = try client.request(.HEAD, url, .{
+        .socket_control = config.socket_control,
         .headers = if (n_headers > 0) headers_buf[0..n_headers] else null,
         .follow_redirects = false,
     });
@@ -2573,6 +2588,7 @@ pub fn resolveModelSnapshot(
     }
 
     var resp = try client.get(url, .{
+        .socket_control = config.socket_control,
         .headers = if (n_headers > 0) headers_buf[0..n_headers] else null,
     });
     defer resp.deinit();
@@ -2761,6 +2777,7 @@ pub fn readModelFileAlloc(
         headers_buf[0..n_headers],
         headers_buf[0..2],
         deadline,
+        config.socket_control,
     );
     defer allocator.free(download_url);
     const request_headers = if (sameHttpOrigin(url, download_url))
@@ -2768,6 +2785,7 @@ pub fn readModelFileAlloc(
     else
         headers_buf[0..2];
     var resp = try client.get(download_url, .{
+        .socket_control = config.socket_control,
         .headers = request_headers,
         .follow_redirects = false,
         .timeout_ms = try deadline.remainingMs(io),
@@ -2832,6 +2850,7 @@ fn resolveDownloadUrl(
     authenticated_headers: []const [2][]const u8,
     anonymous_headers: []const [2][]const u8,
     deadline: DownloadDeadline,
+    socket_control: ?httpx.socket.WriteControl,
 ) ![]u8 {
     var current_url = try allocator.dupe(u8, start_url);
     errdefer allocator.free(current_url);
@@ -2843,6 +2862,7 @@ fn resolveDownloadUrl(
         else
             anonymous_headers;
         var resp = try client.request(.HEAD, current_url, .{
+            .socket_control = socket_control,
             .headers = headers,
             .follow_redirects = false,
             .timeout_ms = try deadline.remainingMs(client.io),
@@ -2882,7 +2902,7 @@ const DownloadDeadline = struct {
 
     fn backoff(self: DownloadDeadline, io: std.Io, attempt: u32) !void {
         const delay_ms = @min(streamedDownloadRetryDelayMs(attempt), try self.remainingMs(io));
-        try io.sleep(std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake);
+        try execution.physicalWait(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), std.Io.Clock.awake });
         _ = try self.remainingMs(io);
     }
 };
@@ -3246,6 +3266,7 @@ fn downloadFileAtRevisionUnchecked(
         headers_buf[0..n_headers],
         headers_buf[0..2],
         deadline,
+        config.socket_control,
     );
     defer allocator.free(download_url);
 
@@ -3280,6 +3301,8 @@ fn downloadFileAtRevisionUnchecked(
             .io = io,
             .offset = resume_from,
             .max_offset = config.max_artifact_bytes,
+            .socket_control = config.socket_control,
+            .deadline = deadline,
         };
 
         var progress_ctx = FileProgressCtx{
@@ -3305,6 +3328,7 @@ fn downloadFileAtRevisionUnchecked(
         }
 
         var streamed = client.getToWriter(download_url, .{
+            .socket_control = config.socket_control,
             .headers = headers_buf[0..n_headers],
             .follow_redirects = false,
             .timeout_ms = request_timeout_ms,
@@ -3485,11 +3509,19 @@ fn existingFinalFileSatisfies(
         else => return err,
     };
     if (expected_sha256) |sum| {
-        verifyFileSha256(dir, io, path, sum) catch return false;
+        verifyFileSha256(dir, io, path, sum) catch |err| {
+            try (execution.InferenceExecutionControl{}).check();
+            if (err == error.ChecksumMismatch) return false;
+            return err;
+        };
         return true;
     }
     if (expected_git_blob_sha1) |sum| {
-        verifyFileGitBlobSha1(dir, io, path, sum) catch return false;
+        verifyFileGitBlobSha1(dir, io, path, sum) catch |err| {
+            try (execution.InferenceExecutionControl{}).check();
+            if (err == error.ChecksumMismatch) return false;
+            return err;
+        };
         return true;
     }
     // A size match alone is not an identity check. Re-fetch artifacts without
@@ -3515,16 +3547,17 @@ fn requiredFileSize(dir: std.Io.Dir, io: std.Io, path: []const u8) !u64 {
 }
 
 fn verifyFileSha256(dir: std.Io.Dir, io: std.Io, path: []const u8, expected_hex: []const u8) !void {
-    var file = try dir.openFile(io, path, .{});
+    var file = try execution.ownedPhysicalWait(std.Io.Dir.openFile, .{ dir, io, path, std.Io.Dir.OpenFileOptions{} }, struct {
+        fn close(file: std.Io.File, args: anytype) void {
+            file.close(args[1]);
+        }
+    }.close);
     defer file.close(io);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = file.readStreaming(io, &.{buf[0..]}) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
-        };
+        const n = try admitted_file.read(file, io, &buf);
         if (n == 0) break;
         hasher.update(buf[0..n]);
     }
@@ -3543,9 +3576,13 @@ fn verifyFileSha256(dir: std.Io.Dir, io: std.Io, path: []const u8, expected_hex:
 fn verifyFileGitBlobSha1(dir: std.Io.Dir, io: std.Io, path: []const u8, expected_hex: []const u8) !void {
     if (!isSha1Hex(expected_hex)) return error.ChecksumMismatch;
 
-    var file = try dir.openFile(io, path, .{});
+    var file = try execution.ownedPhysicalWait(std.Io.Dir.openFile, .{ dir, io, path, std.Io.Dir.OpenFileOptions{} }, struct {
+        fn close(file: std.Io.File, args: anytype) void {
+            file.close(args[1]);
+        }
+    }.close);
     defer file.close(io);
-    const stat = try file.stat(io);
+    const stat = try execution.physicalWait(std.Io.File.stat, .{ file, io });
 
     var hasher = std.crypto.hash.Sha1.init(.{});
     var header_buffer: [64]u8 = undefined;
@@ -3554,10 +3591,7 @@ fn verifyFileGitBlobSha1(dir: std.Io.Dir, io: std.Io, path: []const u8, expected
 
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = file.readStreaming(io, &.{buf[0..]}) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
-        };
+        const n = try admitted_file.read(file, io, &buf);
         if (n == 0) break;
         hasher.update(buf[0..n]);
     }

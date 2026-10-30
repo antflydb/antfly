@@ -38,6 +38,8 @@ const transcribing = @import("antfly_transcribing");
 const extracting = @import("antfly_extracting");
 const enrichment_types = @import("db/enrichment/enrichment_types.zig");
 const resource_manager = @import("resource_manager.zig");
+const runnable = @import("../common/runnable_scheduler.zig");
+const inference_execution = @import("inference_execution_owner.zig");
 
 pub const LocalInferenceConnectionContext = struct {
     handle: *anyopaque,
@@ -361,9 +363,15 @@ pub fn createEmbeddedInferenceNode(
 }
 
 /// Downloads models into `models_dir` (null for the default); see
-/// `inference_bridge.PullModelContext` for the callbacks. Needs no node.
+/// `inference_bridge.PullModelContext` for the callbacks. The live runtime
+/// supplies its shared execution owner for the entire synchronous call.
 pub fn pullEmbeddedInferenceModels(
     io: std.Io,
+    handle: *anyopaque,
+    hub_base_url: ?[]const u8,
+    execution: *const inference_bridge.runnable_abi.Borrowed,
+    deadline_ns: u64,
+    cancellation: runtime_http_abi.CancellationView,
     models_dir: ?[]const u8,
     request_json: []const u8,
     progress_context: ?*anyopaque,
@@ -375,7 +383,12 @@ pub fn pullEmbeddedInferenceModels(
     const context = inference_bridge.PullModelContext{
         .abi_version = inference_bridge.abi_version,
         .executor = .init(&borrowed_io),
+        .handle = handle,
+        .execution = execution,
+        .deadline_ns = deadline_ns,
+        .cancellation = cancellation,
         .models_dir = .init(models_dir),
+        .hub_base_url = .init(hub_base_url),
         .request_json = .init(request_json),
         .progress_context = progress_context,
         .on_progress = on_progress,
@@ -412,6 +425,8 @@ pub const LiteInferenceResourceOwner = struct {
     const Observer = struct { identity: usize = 0, bytes: u64 = 0 };
     alloc: std.mem.Allocator,
     manager: resource_manager.ResourceManager,
+    runnable: runnable.NodeOwner,
+    execution_port: inference_execution.Port = undefined,
     references: std.atomic.Value(usize) = .init(1),
     lease_mutex: std.atomic.Mutex = .unlocked,
     leases: [identity_capacity]Lease = @splat(.{}),
@@ -421,13 +436,17 @@ pub const LiteInferenceResourceOwner = struct {
 
     pub fn create(alloc: std.mem.Allocator, limit_bytes: usize) !*LiteInferenceResourceOwner {
         const self = try alloc.create(LiteInferenceResourceOwner);
+        errdefer alloc.destroy(self);
+        const policy = try @import("../common/config.zig").default_runnable_policy.resolveForStartup(limit_bytes);
         self.* = .{
             .alloc = alloc,
+            .runnable = try runnable.NodeOwner.init(policy),
             .manager = resource_manager.ResourceManager.init(.{
                 .memory_budget = .{ .hard_limit_bytes = limit_bytes },
                 .identity_allocator = alloc,
             }),
         };
+        self.execution_port = .{ .scheduler = &self.runnable.scheduler, .manager = &self.manager, .backing = alloc, .lifetime_context = self, .retain_lifetime = retainLiteInferenceExecutionOwner, .release_lifetime = releaseLiteInferenceResourceOwner };
         return self;
     }
 
@@ -596,10 +615,17 @@ pub const LiteInferenceResourceOwner = struct {
         for (self.leases) |entry| std.debug.assert(entry.token == 0 and entry.reservation == null);
         for (self.observers) |bank| for (bank) |entry| std.debug.assert(entry.identity == 0 and entry.bytes == 0);
         const alloc = self.alloc;
+        self.runnable.tryDeinit() catch @panic("embedded inference execution still retained");
         self.manager.deinit(alloc);
         alloc.destroy(self);
     }
 };
+
+fn retainLiteInferenceExecutionOwner(context: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(context));
+    if (!owner.retainReference()) return @import("antfly_runtime_abi").error_abi.statusFromError(error.SchedulerClosed);
+    return .ok;
+}
 
 fn retainLiteInferenceResourceOwner(context: *anyopaque) callconv(.c) u8 {
     const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(context));
@@ -677,10 +703,12 @@ fn adjustLiteInferenceTransientHost(context: *anyopaque, observer_id: usize, pre
 
 fn configureLiteInferenceResourceBudget(handle: *anyopaque, owner: *LiteInferenceResourceOwner) !void {
     var budget = owner.resourceBudget();
+    const execution_owner = owner.execution_port.owner();
     const configure_context = inference_bridge.ConfigureContext{
         .abi_version = inference_bridge.abi_version,
         .handle = handle,
         .resource_budget = &budget,
+        .runnable_owner = &execution_owner,
     };
     if (comptime inline_inference_codegen) {
         try inference_host.impl.linkedInferenceConfigure(&configure_context);

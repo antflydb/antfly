@@ -569,6 +569,7 @@ pub const storage_generation_publication = @import("storage/generation_publicati
 pub const storage_hbc_adapter = @import("storage/hbc_adapter.zig");
 pub const storage_hierarchy_navigation = @import("storage/hierarchy_navigation.zig");
 pub const storage_host_environment = @import("storage/host_environment.zig");
+pub const storage_inference_execution_owner = @import("storage/inference_execution_owner.zig");
 pub const storage_inference_provider = @import("storage/inference_provider.zig");
 pub const storage_internal_keys = @import("storage/internal_keys.zig");
 pub const storage_lite_allocator_v4 = @import("storage/lite/allocator_v4.zig");

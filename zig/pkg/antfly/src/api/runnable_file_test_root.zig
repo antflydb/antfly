@@ -227,3 +227,96 @@ fn testPhysicalArtifactOwnership(comptime directory: bool) !void {
         try std.testing.expectEqual(descriptors, try Fds.count());
     }
 }
+
+test "embedded inference shared owner funds parked capsules and preserves original refusal" {
+    const local = @import("antfly_local_sources");
+    const ResourceManager = local.storage_resource_manager.ResourceManager;
+    const Ref = struct {
+        count: usize = 1,
+        fn retain(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            return .ok;
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count -= 1;
+        }
+    };
+    const Cancel = struct {
+        stopped: bool = false,
+        fn check(raw: ?*const anyopaque) callconv(.c) u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(self.stopped);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var refs: Ref = .{};
+    var cancellation: Cancel = .{};
+    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1 << 20 }, .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var node = try runnable.NodeOwner.init(.{ .slots = 3 });
+    defer node.tryDeinit() catch @panic("embedded inference owner leaked");
+    var adapter: local.storage_inference_execution_owner.Port = .{ .scheduler = &node.scheduler, .manager = &manager, .backing = alloc, .lifetime_context = &refs, .retain_lifetime = Ref.retain, .release_lifetime = Ref.release };
+    const port = adapter.owner();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var parent: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .slots = 2, .retained_bytes = 123, .cancellation = .{ .context = &cancellation, .is_cancelled = Cancel.check }, .out_handle = &parent }).isOk());
+    defer if (parent) |value| port.finish(value);
+    try std.testing.expectEqual(@as(usize, 2), refs.count);
+    const retained = node.scheduler.stats().retained_bytes;
+    try std.testing.expect(retained > 123);
+    var refused: ?*anyopaque = null;
+    try std.testing.expect(!port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .allow_wait = 0, .out_handle = &refused }).isOk());
+    try std.testing.expect(refused == null);
+    try std.testing.expectEqual(@as(usize, 2), refs.count);
+    try std.testing.expectEqual(retained, node.scheduler.stats().retained_bytes);
+    try std.testing.expect(port.park(parent.?, @backingInt(runtime.runnable_abi.Wait.resource)).isOk());
+    for ([_]runtime.runnable_abi.Class{ .query, .control }) |class| {
+        var sibling: ?*anyopaque = null;
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(class), .allow_wait = 0, .out_handle = &sibling }).isOk());
+        port.finish(sibling.?);
+    }
+    try std.testing.expect(port.enter(parent.?, @backingInt(runtime.runnable_abi.Class.inference)).isOk());
+    try std.testing.expectEqual(@as(usize, 2), node.scheduler.stats().runnable_slots);
+    try std.testing.expect(port.park(parent.?, @backingInt(runtime.runnable_abi.Wait.resource)).isOk());
+    const Fence = struct {
+        denied: bool = true,
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.denied) runtime.error_abi.statusFromError(error.DeadlineExceeded) else .ok;
+        }
+    };
+    var fence: Fence = .{};
+    const enter_checked = port.enter_checked orelse return error.TestExpectedCheckedReentry;
+    const restriction: runtime.runnable_abi.Reentry = .{ .context = &fence, .check = Fence.check };
+    const denied = enter_checked(parent.?, @backingInt(runtime.runnable_abi.Class.inference), &restriction);
+    try std.testing.expect(!denied.isOk());
+    try std.testing.expectEqual(error.DeadlineExceeded, runtime.error_abi.errorFromStatus(denied));
+    try std.testing.expectEqual(@as(usize, 0), node.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(retained, node.scheduler.stats().retained_bytes);
+    fence.denied = false;
+    const still_denied = enter_checked(parent.?, @backingInt(runtime.runnable_abi.Class.inference), &restriction);
+    try std.testing.expect(!still_denied.isOk());
+    try std.testing.expectEqual(error.DeadlineExceeded, runtime.error_abi.errorFromStatus(still_denied));
+    try std.testing.expectEqual(@as(usize, 0), node.scheduler.stats().runnable_slots);
+    port.finish(parent.?);
+    parent = null;
+    try std.testing.expectEqual(@as(usize, 1), refs.count);
+    try std.testing.expectEqual(@as(usize, 0), node.scheduler.stats().operations);
+    // Retry starts a fresh operation; the refused root can never be revived.
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .slots = 2, .retained_bytes = 123, .cancellation = .{ .context = &cancellation, .is_cancelled = Cancel.check }, .out_handle = &parent }).isOk());
+    try std.testing.expect(port.park(parent.?, @backingInt(runtime.runnable_abi.Wait.resource)).isOk());
+    cancellation.stopped = true;
+    const returned = port.enter(parent.?, @backingInt(runtime.runnable_abi.Class.inference));
+    try std.testing.expect(!returned.isOk());
+    try std.testing.expectEqual(error.Canceled, runtime.error_abi.errorFromStatus(returned));
+    try std.testing.expectEqual(@as(usize, 0), node.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), node.scheduler.stats().operations);
+    try std.testing.expectEqual(retained, node.scheduler.stats().retained_bytes);
+    port.finish(parent.?);
+    parent = null;
+    try std.testing.expectEqual(@as(usize, 1), refs.count);
+    try std.testing.expectEqual(@as(usize, 0), node.scheduler.stats().operations);
+}

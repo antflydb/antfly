@@ -4114,22 +4114,121 @@ const PullModelRequest = struct {
     max_model_bytes: ?u64 = null,
 };
 
-pub fn linkedInferencePullModel(context: *const inference_bridge.PullModelContext) !void {
-    const alloc = std.heap.c_allocator;
-    var executor = try context.executor.receive();
-    const io = executor.io();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+const PullExecution = struct {
+    context: *const inference_bridge.PullModelContext,
+    owner: inference_bridge.runnable_abi.Owner,
+    handle: ?*anyopaque = null,
+    borrowed: ?inference_bridge.runnable_abi.Borrowed = null,
+    socket_parked: bool = false,
+    reentry_control: ?httpx.socket.WriteControl = null,
 
-    const result = pullModels(arena, io, context) catch |err| {
-        const failure = std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
-            .@"error" = @errorName(err),
-            .message = pullErrorMessage(err),
-        }, .{})}) catch "{\"error\":\"OutOfMemory\"}";
+    fn checkLifetime(raw: *anyopaque) !void {
+        const self: *PullExecution = @ptrCast(@alignCast(raw));
+        if (self.context.cancellation.requested()) return error.Canceled;
+        if (self.context.deadline_ns != 0 and @import("antfly_platform").time.monotonicNs() >= self.context.deadline_ns) return error.DeadlineExceeded;
+        if (self.borrowed) |borrow| try borrow.checkLifetime() else if (self.owner.check_lifetime) |check| try checked(check(self.handle.?));
+    }
+    fn checked(status: inference_bridge.Status) !void {
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    }
+    fn checkpoint(raw: *anyopaque) !void {
+        const self: *PullExecution = @ptrCast(@alignCast(raw));
+        try checkLifetime(raw);
+        if (self.borrowed) |borrow| try checked(borrow.checkpoint(borrow.context)) else try checked(self.owner.checkpoint(self.handle.?));
+    }
+    fn park(raw: *anyopaque) !void {
+        const self: *PullExecution = @ptrCast(@alignCast(raw));
+        if (self.borrowed) |borrow| try checked(borrow.park(borrow.context, @backingInt(inference_bridge.runnable_abi.Wait.resource))) else try checked(self.owner.park(self.handle.?, @backingInt(inference_bridge.runnable_abi.Wait.resource)));
+    }
+    fn enter(raw: *anyopaque) !void {
+        const self: *PullExecution = @ptrCast(@alignCast(raw));
+        if (self.reentry_control != null) {
+            const enter_checked = (if (self.borrowed) |borrow| borrow.enter_checked else self.owner.enter_checked) orelse return error.UnsupportedOperation;
+            try checked(enter_checked(self.handle.?, @backingInt(inference_bridge.runnable_abi.Class.background), &.{ .context = self, .check = checkReentry }));
+        } else if (self.borrowed) |borrow| try checked(borrow.enter(borrow.context, @backingInt(inference_bridge.runnable_abi.Class.background))) else try checked(self.owner.enter(self.handle.?, @backingInt(inference_bridge.runnable_abi.Class.background)));
+        try checkLifetime(raw);
+    }
+    fn checkReentry(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+        const self: *PullExecution = @ptrCast(@alignCast(raw));
+        checkLifetime(raw) catch |err| return inference_bridge.statusFromError(err);
+        if (self.reentry_control) |ceiling| _ = ceiling.timeout(null) catch |err| return inference_bridge.statusFromError(err);
+        return .ok;
+    }
+    fn socketCheck(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+        checkLifetime(raw.?) catch |err| return if (err == error.DeadlineExceeded or err == error.Timeout) error.Timeout else error.Canceled;
+    }
+    fn socketRemaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
+        try socketCheck(raw);
+        const self: *PullExecution = @ptrCast(@alignCast(raw.?));
+        if (self.context.deadline_ns == 0) return null;
+        const remaining = self.context.deadline_ns -| @import("antfly_platform").time.monotonicNs();
+        if (remaining == 0) return error.Timeout;
+        return (remaining - 1) / std.time.ns_per_ms + 1;
+    }
+    fn socketBegin(raw: ?*anyopaque) !void {
+        const self: *PullExecution = @ptrCast(@alignCast(raw.?));
+        // The HTTP request task synchronously borrows this root while its
+        // caller waits. It has no copy of the caller's checkpoint TLS.
+        std.debug.assert(!self.socket_parked);
+        try checkpoint(self);
+        try park(self);
+        self.socket_parked = true;
+    }
+    fn socketEnd(raw: ?*anyopaque) !void {
+        const self: *PullExecution = @ptrCast(@alignCast(raw.?));
+        if (!self.socket_parked) return error.InvalidRunnableTransition;
+        self.socket_parked = false;
+        try enter(self);
+    }
+    fn socketEndChecked(raw: ?*anyopaque, ceiling: httpx.socket.WriteControl) !void {
+        const self: *PullExecution = @ptrCast(@alignCast(raw.?));
+        self.reentry_control = ceiling;
+        defer self.reentry_control = null;
+        try socketEnd(raw);
+    }
+    fn socketControl(self: *PullExecution) httpx.socket.WriteControl {
+        return .{ .ptr = self, .check_fn = socketCheck, .remaining_ms_fn = socketRemaining, .wait_begin_fn = socketBegin, .wait_end_fn = socketEnd, .wait_end_checked_fn = socketEndChecked, .protect_reentry = true };
+    }
+};
+
+pub fn linkedInferencePullModel(context: *const inference_bridge.PullModelContext) !void {
+    return runInferencePullModel(context) catch |err| {
+        var buffer: [1024]u8 = undefined;
+        const failure = std.fmt.bufPrint(&buffer, "{f}", .{std.json.fmt(.{ .@"error" = @errorName(err), .message = pullErrorMessage(err) }, .{})}) catch "{\"error\":\"OutOfMemory\"}";
         context.on_result(context.result_context, .init(failure));
         return err;
     };
+}
+
+fn runInferencePullModel(context: *const inference_bridge.PullModelContext) !void {
+    var executor = try context.executor.receive();
+    const io = executor.io();
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
+    const owner = (state.runnable_owner orelse return error.ResourceOwnerNotConfigured).owner;
+    var execution: PullExecution = .{ .context = context, .owner = owner };
+    // Admission precedes parsing and arena growth. The caller keeps the compact
+    // request and its original cancellation/deadline valid through finish.
+    if (context.execution) |borrow| {
+        try borrow.validate();
+        if (borrow.cpu_slots != 1 or borrow.parent_class != @backingInt(inference_bridge.runnable_abi.Class.background)) return error.InvalidRunnableDemand;
+        execution.borrowed = borrow.*;
+        execution.handle = borrow.context;
+    } else {
+        try PullExecution.checked(owner.start(owner.context, &.{ .io = &context.executor, .class = @backingInt(inference_bridge.runnable_abi.Class.background), .has_deadline = @intFromBool(context.deadline_ns != 0), .native_deadline = 1, .deadline_ns = context.deadline_ns, .cancellation = context.cancellation, .retained_bytes = @as(u64, context.request_json.len) +| @sizeOf(PullExecution), .out_handle = &execution.handle }));
+    }
+    defer if (execution.borrowed == null) owner.finish(execution.handle.?);
+    var workers = try @import("inference_linalg").pool.WorkerScope.init(1);
+    defer workers.deinit();
+    var scope = inference.execution_control.CheckpointScope.init(.{ .context = &execution, .check_fn = PullExecution.checkpoint, .wait_begin_fn = PullExecution.park, .wait_end_fn = PullExecution.enter });
+    defer scope.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(state.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const result = pullModels(arena, io, context, &execution) catch |err| {
+        PullExecution.checkLifetime(&execution) catch |original| return original;
+        return err;
+    };
+    try PullExecution.checkpoint(&execution);
     context.on_result(context.result_context, .init(result));
 }
 
@@ -4146,7 +4245,8 @@ fn pullErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_bridge.PullModelContext) ![]const u8 {
+fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_bridge.PullModelContext, execution: *PullExecution) ![]const u8 {
+    try PullExecution.checkpoint(execution);
     const request = try std.json.parseFromSliceLeaky(PullModelRequest, arena, context.request_json.slice(), .{});
     if (request.model.len == 0) return error.InvalidArgument;
     const download = inference.registry.download;
@@ -4157,6 +4257,8 @@ fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_br
     const models_dir = context.models_dir.slice() orelse
         try runtime_paths.defaultModelsDirForDataDirAlloc(arena, ".");
     const hub_config = download.HubConfig{
+        .socket_control = execution.socketControl(),
+        .base_url = context.hub_base_url.slice() orelse "https://huggingface.co",
         .token = request.token orelse @import("antfly_platform").env.getenv("HF_TOKEN"),
         .max_artifact_bytes = request.max_artifact_bytes orelse download.default_max_artifact_bytes,
         .max_model_bytes = request.max_model_bytes orelse download.default_max_model_bytes,
@@ -4175,11 +4277,12 @@ fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_br
     var registry = inference.registry.ModelRegistry.init(arena, models_dir);
     defer registry.deinit();
     for (refs.items) |ref| {
-        var reporter = PullProgressReporter{ .context = context, .model = ref };
+        var reporter = PullProgressReporter{ .context = context, .model = ref, .execution = execution };
         try registry.pullWithProgress(io, ref, hub_config, tasks_csv, capabilities_csv, projector, .{
             .callback = PullProgressReporter.report,
             .context = &reporter,
             .cancelled = &reporter.cancelled,
+            .authority = .{ .context = execution, .check = PullExecution.checkLifetime },
         });
     }
     return std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(.{
@@ -4191,6 +4294,7 @@ fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_br
 const PullProgressReporter = struct {
     context: *const inference_bridge.PullModelContext,
     model: []const u8,
+    execution: *PullExecution,
     cancelled: std.atomic.Value(bool) = .init(false),
 
     fn report(progress: inference.registry.download.DownloadProgress, raw: ?*anyopaque) void {
@@ -4207,7 +4311,14 @@ const PullProgressReporter = struct {
             .files_total = progress.files_total,
             .cached = @intFromBool(progress.cached),
         };
-        if (callback(self.context.progress_context, &view) == 0) self.cancelled.store(true, .release);
+        const keep_going = self.execution.socketControl().withWait(invoke, .{ callback, self.context.progress_context, &view }) catch {
+            self.cancelled.store(true, .release);
+            return;
+        };
+        if (keep_going == 0) self.cancelled.store(true, .release);
+    }
+    fn invoke(callback: *const fn (?*anyopaque, *const inference_bridge.PullProgress) callconv(.c) u8, raw: ?*anyopaque, progress: *const inference_bridge.PullProgress) !u8 {
+        return callback(raw, progress);
     }
 };
 

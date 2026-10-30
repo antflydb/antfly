@@ -568,10 +568,14 @@ pub const ModelRegistry = struct {
         // directory cannot move the lock inode out from under another pull.
         const lock_path = try download.managedModelLockPathAlloc(self.allocator, dest);
         defer self.allocator.free(lock_path);
-        var download_lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{
-            .truncate = false,
-            .lock = .exclusive,
-        });
+        try progress_sink.checkCancelled();
+        const execution = @import("../execution_control.zig");
+        const DiscardLock = struct {
+            fn close(file: std.Io.File, args: anytype) void {
+                file.close(args[1]);
+            }
+        };
+        var download_lock = try execution.ownedPhysicalWait(std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, lock_path, std.Io.Dir.CreateFileOptions{ .truncate = false, .lock = .exclusive } }, DiscardLock.close);
         defer download_lock.close(io);
 
         // Immutable catalog pulls are idempotent. Do this before staging:
@@ -737,6 +741,7 @@ pub const ModelRegistry = struct {
                 try io.checkCancel();
             }
         }
+        try progress_sink.checkCancelled();
         try transaction.commit(io);
     }
 
@@ -919,6 +924,7 @@ pub const ModelRegistry = struct {
                 .callback = if (self.inner.callback != null) forward else null,
                 .context = self,
                 .cancelled = self.inner.cancelled,
+                .authority = self.inner.authority,
             };
         }
 

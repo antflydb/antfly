@@ -613,6 +613,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.object.step);
     const memory_capi_tests = linked_tests.add(b, .{ .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("memory-capi-test", "Verify native memory persistence through the public C ABI").dependOn(&capiTestRun(b, memory_capi_tests, &.{"capi native memory"}, false).step);
+    const inference_pull_tests = linked_tests.add(b, .{
+        .name = "inference-pull-tests",
+        .root_module = capi_root_mod,
+        .filters = &.{ "capi inference pull rejects invalid requests with a JSON error", "capi inference options are prefix compatible", "capi inference pull shared admission" },
+        .max_rss = 18 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-inference-pull-test", "Verify shared-owner model pulls through the public embedded C API")
+        .dependOn(&capiTestRun(b, inference_pull_tests, &.{ "capi inference pull rejects invalid requests with a JSON error", "capi inference options are prefix compatible", "capi inference pull shared admission" }, true).step);
+
     const capi_compile_filters = capi_default_filters ++ capi_model_filters;
     const capi_tests = linked_tests.add(b, .{
         .name = @import("../../pkg/antfly/build/test_owner_names.zig").capi_contract,

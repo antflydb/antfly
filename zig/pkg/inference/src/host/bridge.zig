@@ -20,7 +20,7 @@
 const std = @import("std");
 const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
-const native_abi = @import("antfly_runtime_abi").native_abi;
+pub const native_abi = @import("antfly_runtime_abi").native_abi;
 pub const MemoryParent = @import("antfly_runtime_abi").memory_abi.Parent;
 pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const antfly_image = @import("antfly_image");
@@ -33,7 +33,7 @@ const antfly_image = @import("antfly_image");
 // Version 41 introduced CUDA cache credits surviving cache/host teardown.
 // Version 40 introduced the parented/supervised host cache allocator contract.
 // Worker Create.bridge_version also fences older executables before startup.
-pub const abi_version: u32 = 46;
+pub const abi_version: u32 = 47;
 pub const DocumentStoreView = @import("antfly_runtime_abi").document_abi.View;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
@@ -398,8 +398,17 @@ pub const PullModelContext = extern struct {
     struct_size: u32 = @sizeOf(@This()),
     /// Host-owned executor for the downloads, borrowed for the call.
     executor: native_abi.IoBorrow,
+    /// Live configured runtime; retained by the caller until pull completion.
+    handle: *anyopaque,
+    /// Caller-admitted root, borrowed synchronously through helper join.
+    execution: ?*const runnable_abi.Borrowed = null,
+    deadline_ns: u64 = 0,
+    cancellation: http_abi.CancellationView = .{},
     /// Null uses the default models directory.
     models_dir: OptionalString,
+    /// Trusted transport selection, independent of untrusted request JSON.
+    /// Null uses the standard Hub endpoint. Borrowed only for this call.
+    hub_base_url: OptionalString = .{},
     /// `{"model": ..., "variants": [...], "token": ..., ...}`; see
     /// `antfly_inference_pull_json`.
     request_json: String,

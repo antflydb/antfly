@@ -1751,3 +1751,39 @@ The file-engine descriptor recovery gate remains closed for its unchanged macOS
 profile. The full goal remains open for framework/vendor construction, registry
 pull/download admission and preparation, mapped-page-fault scope, and wider
 cross-engine/deployment evidence. Full GNU qualification remains waived.
+
+
+### Embedded model pull admission and physical waits
+
+Public embedded model pulls now share the runtime's native runnable owner with
+executor and cold-load work. Admission happens on the caller before helper
+creation, preserving the original deadline and cancellation. The helper and HTTP
+request tasks borrow that same root. Explicit socket, streamed-write and progress
+controls lend CPU during physical/caller waits and use checked reentry; synchronous
+hash verification and lock acquisition also lend the original CPU. The resource
+manager funds retained capsules, which keep the runtime alive until final finish.
+Existing hidden staging, verified retry state and publication/rollback are retained.
+
+From `zig/`, run `zig build antfly-inference-pull-test
+antfly-inference-file-owner-test antfly-inference-worker-provider-check -Dcuda=true
+-Doptimize=Debug -j1` using the supported platform toolchain and local listener
+access. `model-pull-v9.json` records 72/72 build steps with unchanged inputs: four
+public C API and four owner cases pass without skips or leaks. The local Hub
+fixture verifies exact installed bytes and receipt, original queued/network
+deadlines, caller-thread cancellation without publication, fresh-call retry, and
+query/control progress during Hub waits. The checked-refusal test keeps resources
+until finish and refuses to revive the failed root.
+
+Run the separate `inference-test-inference-unit` target with test-filter prefixes
+`downloadFile`, `Hub snapshot`, `managed model transaction`, `pinned bundle re-pull`,
+`existing final file`, `managed pull limits`, `ONNX dependencies`, `safetensors
+index`, and `pull progress reports`. `model-pull-registry-v1.json` records 31/31
+selected regressions without skips. Production registry/host inputs match the
+final build; subsequent fixture corrections are recorded separately. The final
+receipt binds source snapshots and the verification receipts.
+
+This completes embedded pull admission and these physical wait paths. It does not
+qualify deployed model execution or throughput. Framework/vendor construction,
+broader registry preparation, mapped-page faults and wider cross-engine/deployment
+evidence remain in the full goal. The full GNU qualification waiver remains in
+effect. The installed CLI has not been rebuilt for this milestone.
