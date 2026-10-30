@@ -48,6 +48,29 @@ def prefill_stream_observation(text):
     }
 
 
+def recurrent_placement_observation(text, enabled):
+    """Require the loaded session's decision, not a CUDA backend banner."""
+    rows = [
+        dict(placement=placement, reason=reason, compute=f"{major}.{minor}")
+        for placement, reason, major, minor in re.findall(
+            r"inference recurrent placement backend=cuda placement=(\w+) "
+            r"reason=(\w+) compute=(\d+)\.(\d+)",
+            text,
+        )
+    ]
+    expected = (
+        ("host", "operator_disabled")
+        if enabled is False
+        else ("cuda", "supported_geometry")
+    )
+    return {
+        "sessions": rows,
+        "expected_placement": expected[0],
+        "matched": bool(rows)
+        and all((row["placement"], row["reason"]) == expected for row in rows),
+    }
+
+
 def run(args, model, label, mode, concurrency, output):
     env = os.environ.copy()
     for key in list(env):
@@ -414,11 +437,17 @@ def run(args, model, label, mode, concurrency, output):
         ANTFLY_BENCH_LIGHTONOCR3="1",
         ANTFLY_INFERENCE_PREFERRED_BACKEND=args.backend,
         ANTFLY_INFERENCE_REQUIRED_BACKEND=args.backend,
-        TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE="1"
-        if args.cuda_recurrent_core
-        else "0",
         ANTFLY_LIGHTONOCR3_CUDA_BATCH="1" if args.cuda_batch else "0",
     )
+    # Omitted means exercise the serving default, not the old CPU baseline.
+    # Clear inherited benchmark controls so the report's null records a real
+    # default. The explicit negative switch retains reproducible CPU rollback.
+    if args.cuda_recurrent_core is None:
+        env.pop("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE", None)
+    else:
+        env["TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE"] = (
+            "1" if args.cuda_recurrent_core else "0"
+        )
     if args.extended_epoch:
         env["ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH"] = "1"
     if args.images:
@@ -1756,6 +1785,15 @@ def run(args, model, label, mode, concurrency, output):
         )
     ):
         result["status"] = "missing_single_frame_packed_forwards"
+    if args.backend == "cuda":
+        placement = recurrent_placement_observation(text, args.cuda_recurrent_core)
+        result["recurrent_placement"] = placement
+        if (
+            args.require_recurrent_placement
+            and result["status"] == "ok"
+            and not placement["matched"]
+        ):
+            result["status"] = "recurrent_placement_mismatch"
     return result
 
 
@@ -1763,7 +1801,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-test", type=Path, required=True)
     parser.add_argument("--backend", choices=["metal", "cuda"], default="metal")
-    parser.add_argument("--cuda-recurrent-core", action="store_true")
+    parser.add_argument(
+        "--cuda-recurrent-core",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override recurrent execution; omitted exercises the runtime default",
+    )
+    parser.add_argument(
+        "--require-recurrent-placement",
+        action="store_true",
+        help="Require matching model-load placement diagnostics for every CUDA recurrent session",
+    )
     parser.add_argument("--cuda-batch", action="store_true")
     parser.add_argument(
         "--model", action="append", required=True, help="LABEL=CHECKPOINT_DIRECTORY"
@@ -2147,9 +2195,13 @@ def main():
         help="Overlap admitted single-page prefill layer groups after one complete warm prompt",
     )
     args = parser.parse_args()
+    if args.require_recurrent_placement and args.backend != "cuda":
+        parser.error("--require-recurrent-placement requires --backend=cuda")
     if args.cuda_recurrent_core and args.backend != "cuda":
         parser.error("--cuda-recurrent-core requires --backend=cuda")
-    if args.cuda_batch and (args.backend != "cuda" or not args.cuda_recurrent_core):
+    if args.cuda_batch and (
+        args.backend != "cuda" or args.cuda_recurrent_core is False
+    ):
         parser.error("--cuda-batch requires the CUDA recurrent core")
     if args.bf16_projection_rounds and (
         not args.policy_rounds

@@ -109,15 +109,37 @@ they are not Antfly runtime measurements.
 
 ## CUDA execution
 
-CUDA supports both original BF16 checkpoints with opt-in recurrent, attention
-and vision kernels. The experimental DGX Spark presets in
+CUDA supports both original BF16 checkpoints. On supported SM80+ devices,
+including A100, L4 and GB10, recurrent execution defaults to the portable CUDA
+core. This is a model geometry and device capability decision, independent of
+throughput benchmarks or the optional wide-batching preset. Recurrent histories
+are device-owned and reserved by the same per-page admission used for execution.
+Serial generation charges persistent state alongside its working set; cohorts
+retain that state per page while sharing only transient workspace.
+
+`TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE=0` explicitly selects host recurrent
+execution for a newly loaded model. Existing device histories never migrate or
+restart on the CPU after an execution failure. Startup logs report resolved
+placement, reason and compute capability. `/ml/v1/metrics` exposes
+`antfly_inference_recurrent_cuda_models` and
+`antfly_inference_recurrent_host_models` for loaded CUDA sessions. A CUDA model
+label alone does not imply every operation executes on the device.
+
+Batching remains separately bounded by the operator's request/admission limits.
+The benchmark driver's omitted `--cuda-recurrent-core` exercises the runtime
+default; `--no-cuda-recurrent-core` is the explicit host baseline.
+
+The experimental DGX Spark presets in
 `scripts/lightonocr3/cuda_ocr_profiles.json` require a CUDA build and cuDNN on the
 dynamic library search path. They preserve operator limits and retain F32
 decode projection outputs and recurrent state. Native attention KV is F16.
 The 0.8B preset keeps vision-block activations BF16 on SM12.1; patch embedding
 and the final merger retain F32. The 4B preset retains F32 vision. Set
 `ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=f32` to select the original vision path.
-This is a partial precision profile, not a full BF16 decoder.
+This is a partial precision profile, not a full BF16 decoder. The optional
+SM12.1 fused kernels and external recurrent-prefill library are architecture
+specific; A100 uses the portable CUDA implementation when those optimizations
+are unavailable. Do not copy the 128-slot GB10 benchmark budgets to a 40GB GPU.
 
 ```bash
 python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 --print-env
@@ -191,6 +213,10 @@ throughput is below the installed vLLM reference; the Florence canonical GEMM
 option remains opt-in while an older rare output mismatch is investigated.
 
 ## Measurements (as of 2026-10-27)
+
+For corpus deployment, also complete the [Grepstein release qualification](grepstein-release-qualification.md).
+It covers document completeness, embedding identity, extraction, cold starts,
+and memory pressure beyond these synthetic throughput measurements.
 
 The table combines archived Metal/Florence qualifications with the latest
 LightOn CUDA measurements. Each qualifies the named build and three synthetic

@@ -29,6 +29,7 @@ const std = @import("std");
 const is_freestanding = @import("builtin").os.tag == .freestanding;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const qwen35_execution = @import("qwen35_execution.zig");
 const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const ops = @import("../ops/ops.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
@@ -8813,7 +8814,6 @@ fn qwen35LinearAttentionWithResidual(
     }
     if (comptime build_options.enable_cuda) {
         if (cb.kind() == .cuda and config.qwen35_device_only_state and
-            platform.env.getenvBool("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE") and
             key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4)
         {
             var resident_states = true;
@@ -9078,7 +9078,7 @@ fn qwen35ProjectedCore(
     const conv_kernel: usize = @intCast(config.qwen35_linear_conv_kernel_dim);
     const total = seq_len;
     if (comptime build_options.enable_cuda) {
-        if (cb.kind() == .cuda and (getenvBool("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE") or
+        if (cb.kind() == .cuda and (config.qwen35_device_only_state or
             (maybe_state != null and (maybe_state.?.cuda_device.initialized or maybe_state.?.cuda_device.failed))))
         {
             if (maybe_state) |state| {
@@ -14770,5 +14770,56 @@ fn checkCudaPackedRecurrent(ragged: bool, fused_decode: bool) !void {
         try std.testing.expectEqual(@as(usize, if (ragged) 9 else 5), group_rows);
         if (ragged) try std.testing.expectEqual(@as(usize, 3), compute.lighton_recurrent.ragged_batch_calls);
         try std.testing.expectEqual(@as(usize, if (fused_decode) 3 else 0), compute.lighton_recurrent.fused_decode_calls);
+    }
+}
+
+test "LightOnOCR3 default CUDA dispatch keeps admitted recurrent histories on device" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    if (!qwen35_execution.cudaCoreEnabled()) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_][]const u8{ @embedFile("../models/testdata/lightonocr3/config.json"), @embedFile("../models/testdata/lightonocr3/config-4b.json") }) |json| {
+        var cfg = try gpt_config.parseConfig(a, json);
+        const decision = qwen35_execution.apply(&cfg, compute.ctx.info.compute_major, qwen35_execution.cudaCoreEnabled());
+        try std.testing.expectEqual(.cuda, decision.placement);
+        var controller = runtime.tier.memory.AdmissionController{};
+        defer controller.deinit();
+        const limits = runtime.tier.memory.Limits{ .backend_limit_bytes = 128 * 1024 * 1024 };
+        const state_bytes = try runtime.tier.memory.gptRecurrentBackendStateBytes(.cuda, cfg);
+        var lease = try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = state_bytes }, false);
+        defer lease.release();
+        compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = limits, .check_live_memory = false };
+        defer compute.ctx.video_cache_budget.admission = null;
+        var cache = try Qwen35LinearCache.init(a, cfg);
+        defer cache.deinit();
+        try std.testing.expectEqual(@as(usize, 0), cache.layers[0].conv.len);
+        try std.testing.expectEqual(@as(usize, 0), cache.layers[0].recurrent.len);
+        const kh: usize = cfg.qwen35_linear_num_key_heads;
+        const vh: usize = cfg.qwen35_linear_num_value_heads;
+        const channels = (2 * kh + vh) * 128;
+        const width = vh * 128;
+        const counts = [_]usize{ 3 * channels, 3 * width, 3 * vh, 3 * vh, channels * 4, vh, vh, 128 };
+        var tensors: [8]CT = undefined;
+        var loaded: usize = 0;
+        defer for (tensors[0..loaded]) |t| cb.free(t);
+        for (counts, 0..) |count, i| {
+            const values = try a.alloc(f32, count);
+            defer a.free(values);
+            @memset(values, if (i == 7) 1 else 0);
+            tensors[i] = try cb.fromFloat32(values);
+            loaded += 1;
+        }
+        const before = compute.stats.d2h_bytes;
+        const output = try qwen35ProjectedCore(&cb, a, cfg, tensors[0], tensors[1], tensors[2], tensors[3], tensors[4], tensors[5], tensors[6], tensors[7], &cache.layers[0], 3, null);
+        defer cb.free(output);
+        try std.testing.expect(cache.layers[0].cuda_device.initialized);
+        try std.testing.expectEqual(before, compute.stats.d2h_bytes);
+        try std.testing.expectEqual(state_bytes, controller.snapshot().backend_scratch_bytes);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (actual) |value| try std.testing.expectEqual(@as(f32, 0), value);
     }
 }
