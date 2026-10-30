@@ -2191,10 +2191,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors(b, &.{ "api module compiles", "api HTTP runtime discovery" }, api_http_runtime_filters),
-        // Native lake kernels peak at 18.50 GB in macOS ReleaseFast codegen.
-        // Reserve measured usage plus
-        // headroom; the shared runner still caps aggregate compilation.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 19 else 7) * 1024 * 1024 * 1024,
+        // Native macOS 26.6.2 / SDK 27.0 Debug qualification reached
+        // 20,413,906,944 bytes. Keep at least 10% headroom; the shared
+        // runner still caps aggregate compilation.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 21 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -7384,11 +7384,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
-        // The consolidated ReleaseFast engine artifact reaches about 9.1 GiB
-        // on current macOS Zig 0.16 builds. Reserve the measured envelope so
-        // the scheduler can keep independent artifacts parallel without
-        // rejecting this compiler after it crosses the stale 8 GiB estimate.
-        .max_rss = 10 * 1024 * 1024 * 1024,
+        // Native macOS 26.6.2 / SDK 27.0 Debug qualification reached
+        // 10,863,706,112 bytes in the local partition. Keep at least 10%
+        // headroom while preserving the existing claim on other targets.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 10) * 1024 * 1024 * 1024,
     });
     unit_storage_engine_tests.step.dependOn(&unit_storage_shard_audit.step);
     const run_unit_storage_engine_tests = b.addRunArtifact(unit_storage_engine_tests);
