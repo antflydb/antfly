@@ -97,6 +97,10 @@ pub const AddTestsResult = struct {
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const target = options.antfly_imports.platform_target;
     const optimize = options.optimize;
+    const native_darwin_debug = b.graph.host.result.os.tag == .macos and
+        b.graph.host.result.cpu.arch == .aarch64 and target.result.os.tag == .macos and
+        target.result.cpu.arch == .aarch64 and optimize == .debug and
+        target.result.os.version_range.semver.min.order(b.graph.host.result.os.version_range.semver.min) == .eq;
     const production_vopr_compile_max_rss = @import("../../../build_support/antfly/test_support.zig").productionVoprCompileMaxRss(target);
     const lmdb_backend = options.lmdb_backend;
     const lmdb_evented_async_io = options.lmdb_evented_async_io;
@@ -2194,7 +2198,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // Native macOS 26.6.2 / SDK 27.0 Debug qualification reached
         // 20,413,906,944 bytes. Keep at least 10% headroom; the shared
         // runner still caps aggregate compilation.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 21 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (native_darwin_debug) 21 else if (target.result.os.tag == .macos) 19 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -4856,7 +4860,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         // The physical-owner adapter root peaks at 11.49 GB on native macOS
         // ReleaseSafe; reserve enough memory before admitting compilation.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 10) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (native_darwin_debug) 12 else 10) * 1024 * 1024 * 1024,
         // These named module tests make the schema admission regressions
         // reachable; runtime filtering executes only the selected tests.
         .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, vopr_runtime_adapter_selected_filters),
