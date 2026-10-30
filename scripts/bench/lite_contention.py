@@ -639,7 +639,7 @@ def native_cases(args):
                 except subprocess.TimeoutExpired:
                     row.update(status="verification_watchdog_timeout", censored=True)
             yield row
-            if row["status"] != "ok":
+            if row["status"] not in ("ok", "no_progress", "starved_workers"):
                 return
 
 
