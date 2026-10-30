@@ -22,6 +22,7 @@ const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
 const engine = @import("../architectures/gliner/boundary_engine.zig");
 const device_request = @import("../architectures/gliner/boundary_request_device.zig");
+const device_engine = @import("../architectures/gliner/boundary_engine_device.zig");
 const processor = @import("../pipelines/gliner_boundary_processor.zig");
 const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const compute = @import("../ops/ops.zig");
@@ -195,6 +196,57 @@ fn workspaceGeometryFor(backend: compute.BackendKind, allocator: Allocator, conf
     return receiver.peak_tokens;
 }
 
+/// Encoder device bytes the reference (non-resident) Metal/CUDA path needs for
+/// this exact request: the largest encoder plan over the batches and windows it
+/// will execute. Admission reserves this instead of the configured encoder
+/// ceiling, so a short input does not hold the whole ceiling. Never exceeds
+/// `options.device.max_encoder_device_bytes`; planning fails if it would.
+pub fn referenceEncoderDeviceBytes(allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !usize {
+    const identity = options.identity orelse return error.MissingGlinerBoundaryIdentity;
+    const Precision = @TypeOf(identity.precision);
+    const Receiver = struct {
+        config: *const model.Config,
+        options: Options,
+        precision: Precision,
+        peak: usize = 0,
+        failure: ?anyerror = null,
+        fn note(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            if (self.failure != null) return;
+            const planned = device_engine.plan(self.config, prepared, .{
+                .precision = self.precision,
+                .execution_policy = .reference_v1,
+                .admission = self.options.engine.limits,
+                .max_device_bytes = self.options.device.max_encoder_device_bytes,
+                .control = self.options.control,
+            }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.peak = @max(self.peak, planned.device_upper_bound_bytes);
+        }
+        pub fn observe(self: *@This(), _: usize, _: usize, _: usize, prepared: *const processor.PreparedBatch) !void {
+            self.note(prepared);
+            if (self.failure) |err| return err;
+        }
+        pub fn observeSingle(self: *@This(), _: Allocator, _: []const u8, prepared: *const processor.PreparedBatch, _: processor.Options) !void {
+            self.note(prepared);
+            if (self.failure) |err| return err;
+        }
+        pub fn observeGroupBatch(self: *@This(), prepared: *const processor.PreparedBatch) !void {
+            self.note(prepared);
+            if (self.failure) |err| return err;
+        }
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.note(prepared);
+        }
+    };
+    var receiver = Receiver{ .config = config, .options = options, .precision = identity.precision };
+    try planRequestGeometry(.metal, allocator, config, tokenizer, request, options, &receiver);
+    if (receiver.failure) |err| return err;
+    if (receiver.peak == 0) return error.InvalidBoundaryPipelineInput;
+    return receiver.peak;
+}
+
 /// Contiguous compatible items share one forward pass without reordering results.
 /// The same preparation/planning routine runs before qualification and execution.
 fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, items: []const wire.Item, options: Options) !processor.PreparedBatch {
@@ -234,6 +286,8 @@ fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *con
 }
 
 fn observeGroup(allocator: Allocator, config: *const model.Config, items: []const wire.Item, prepared: *const processor.PreparedBatch, options: Options, gate: anytype) !void {
+    // Planners that size device work see the batch exactly as it executes.
+    if (comptime @hasDecl(@TypeOf(gate.*), "observeGroupBatch")) try gate.observeGroupBatch(prepared);
     for (items[0..prepared.samples.len], 0..) |*item, index| {
         // Preserve the physical padded length in every item's policy check.
         var view = prepared.*;
@@ -1023,6 +1077,14 @@ test "GPU boundary request groups distinct ragged inputs within physical limits"
     try std.testing.expectEqual(@max(metal.input_ids.len, tail.input_ids.len), peak);
     geometry_options.engine.limits.max_batch = 1;
     try std.testing.expect(peak > try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, geometry_options));
+    // The reference device path reserves the request's own encoder plan, not
+    // the configured ceiling, and refuses a ceiling the request cannot fit.
+    const encoder_bytes = try referenceEncoderDeviceBytes(a, &config, tokenizer.tokenizer(), &request, geometry_options);
+    try std.testing.expect(encoder_bytes > 0);
+    try std.testing.expect(encoder_bytes < geometry_options.device.max_encoder_device_bytes);
+    var tight = geometry_options;
+    tight.device.max_encoder_device_bytes = encoder_bytes - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(a, &config, tokenizer.tokenizer(), &request, tight));
 }
 
 test "CUDA boundary managed Multi-Decide batches windows and recovers after cancellation" {
