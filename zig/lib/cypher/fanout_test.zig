@@ -79,7 +79,7 @@ test "parallel acquisition preserves cohort barriers and cleans failed busy and 
                 // Metadata is an operation on the finalized read capability.
                 // No owner may start it while another still validates.
                 try std.testing.expectEqual(@as(usize, 12), self.f.validated.load(.acquire));
-                try std.testing.expectEqual(@as(usize, 12), self.f.held.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), self.f.held.load(.acquire));
                 if (self.index == 3 and self.f.mode == .routing_error) return error.Forbidden;
                 _ = self.f.routed.fetchAdd(1, .release);
                 return &.{.{ .index = "links", .outgoing = .{ .empty = true }, .incoming = .{ .empty = true } }};

@@ -4779,6 +4779,7 @@ combine quota failures with a forbidden owner.
 Routing metadata acquisition is a separate post-validation cohort phase.
 Deferred retained capabilities accept only the validation operation until their
 original fence has been finalized. Every owner finishes that barrier before
-any directory operation starts; a metadata failure closes every captured
-snapshot and releases every fence. The same bounded scheduler preserves local
+any directory operation starts. The original mutation fences are released
+before auxiliary metadata I/O; immutable snapshots retain their own roots. A
+metadata failure closes every captured snapshot. The same bounded scheduler preserves local
 thread affinity during validation and directory reads.

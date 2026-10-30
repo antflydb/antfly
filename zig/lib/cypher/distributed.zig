@@ -115,6 +115,9 @@ pub const ReadSet = struct {
         try phase.run();
         phase.kind = .validate;
         try phase.run();
+        // Finalized snapshots own their immutable roots independently. Release
+        // mutation fences before auxiliary metadata I/O extends the cohort.
+        phase.releaseFences();
         const routing = for (slots) |slot| {
             if (slot.snapshot.?.load_adjacency_routes != null) break true;
         } else false;
