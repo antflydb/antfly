@@ -424,7 +424,11 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
             return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
         }
         fn run(compressed: bool, fixed: bool) !Measurement {
-            var budget: local.sql_memory_budget = .{ .backing = std.heap.smp_allocator, .limit = 32 << 20 };
+            var resources = local.storage_resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 << 20 } });
+            defer resources.deinit(std.heap.smp_allocator);
+            const memory = try @import("sql_memory_owner.zig").create(std.heap.smp_allocator, std.heap.smp_allocator, &resources);
+            defer memory.release(memory.ptr);
+            var budget: local.sql_memory_budget = .{ .backing = memory.allocator, .limit = 32 << 20, .pressure = memory.pressure };
             const a = budget.allocator();
             var marker: u8 = 0;
             var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = check, .compression = if (compressed) .snappy else .none, .async_writes = false };

@@ -221,13 +221,13 @@ pub const Loaded = struct {
     hashed: bool,
     leases: std.ArrayList(metadata.Owned(Block)) = .empty,
     directory: ?metadata.Owned(Directory) = null,
-    wires: std.ArrayList([]u8) = .empty,
+    wire_leases: std.ArrayList(local.serverless_query_lake_serving_cache.Cache.ImmutableLease) = .empty,
     wire_allocator: ?A = null,
     pub fn deinit(self: *@This()) void {
         for (self.leases.items) |owned| owned.release();
         self.leases.deinit(self.a);
-        for (self.wires.items) |bytes| self.wire_allocator.?.free(bytes);
-        self.wires.deinit(self.a);
+        for (self.wire_leases.items) |*lease| lease.deinit();
+        self.wire_leases.deinit(self.a);
         if (self.directory) |owned| owned.release();
         if (self.scratch_owner) |owner| {
             owner.deinit();
@@ -356,13 +356,13 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
         admitted += section.bytes;
         try units.append(a, .{ .object = directory.pack, .offset = section.offset, .bytes = section.bytes, .digest = section.digest });
     }
-    var wire = try ranges.loadMany(result.wire_allocator.?, store, units.items, token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes });
+    var wire = try ranges.loadManyLeased(result.wire_allocator.?, store, units.items, token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes });
     defer wire.deinit();
     for (selected.items, 0..) |index, position| {
         const section = directory.sections[index];
-        const bytes = if (cold[position]) |slot| wire.values[slot] else null;
-        defer if (cold[position]) |slot| if (wire.values[slot]) |data| {
-            wire.a.free(data);
+        const bytes = if (cold[position]) |slot| (if (wire.values[slot]) |lease| lease.bytes() else null) else null;
+        defer if (cold[position]) |slot| if (wire.values[slot]) |*lease| {
+            lease.deinit();
             wire.values[slot] = null;
         };
         const Loader = struct {
@@ -386,7 +386,7 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
             break :blk owned.value.*;
         } else blk: {
             const slot = cold[position].?;
-            try result.wires.append(a, wire.values[slot].?);
+            try result.wire_leases.append(a, wire.values[slot].?);
             wire.values[slot] = null;
             break :blk try local.sql_spill.decodeColumnarBlockInArena(a, bytes.?, artifacts.max_block_bytes);
         };

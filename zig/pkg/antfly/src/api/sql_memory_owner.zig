@@ -33,7 +33,7 @@ const Owner = struct {
     }
     fn available(raw: *anyopaque) usize {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return std.math.cast(usize, self.budget.reservation.manager.availableAdmissionBytes(.sql_execution_working_set)) orelse std.math.maxInt(usize);
+        return self.budget.availableAllocationBytesThreadSafe();
     }
     fn exhausted(raw: *anyopaque) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -95,4 +95,33 @@ test "SQL shared memory owners reclaim cache capacity and retain host admission 
         try std.testing.expect(local.sql_memory_budget.reusableHeadroom(unknown.allocator()) == null);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.sql_execution_working_set).used_bytes);
+}
+
+test "SQL shared memory owners enable adaptive spill residency under real host admission" {
+    const a = std.heap.page_allocator;
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 4 << 20 } });
+    defer manager.deinit(a);
+    const memory = try create(a, a, &manager);
+    defer memory.release(memory.ptr);
+    var budget: local.sql_memory_budget = .{ .backing = memory.allocator, .limit = 2 << 20, .pressure = memory.pressure };
+    defer std.debug.assert(budget.live == 0);
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var spill: local.sql_spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Hook.check, .async_writes = false };
+    defer spill.deinit();
+    var pages = try local.sql_spill.JoinPayloads.init(&spill);
+    defer pages.close();
+    const row = [_]local.sql_scalar.Datum{local.sql_scalar.Datum.json(.{ .string = "host-backed payload" })};
+    const rows = [_][]const local.sql_scalar.Datum{&row};
+    const offset = try pages.appendBatch(.{ .rows = &rows });
+    try pages.file.seal();
+    var reader = local.sql_spill.PayloadReader.init(&pages);
+    defer reader.deinit();
+    const payload = try reader.read(.{ .offset = offset, .index = 0 });
+    defer payload.release();
+    try std.testing.expect(reader.cache.registered);
+    try std.testing.expect(spill.payload_budget_count == 2);
+    try std.testing.expect(!memory.pressure.?.exhausted(memory.ptr));
 }

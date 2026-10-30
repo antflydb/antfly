@@ -90,6 +90,8 @@ test {
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_sort_stream.zig");
+    _ = @import("api/lake_index_sql_rows.zig");
+    _ = @import("api/sql_memory_owner.zig");
     _ = @import("api/lake_artifact_ranges.zig");
     _ = @import("api/lake_index_text_statistics.zig");
     _ = @import("api/lake_index_seekable_text.zig");

@@ -36,6 +36,8 @@ pub const Batch = struct {
     }
 };
 const Decoded = local.serverless_query_lake_decoded_cache;
+const ImmutableLease = local.serverless_query_lake_serving_cache.Cache.ImmutableLease;
+const RangeLease = local.serverless_query_lake_range_io.RangeLease;
 const Job = struct {
     const Physical = struct { start: u64, bytes: []const u8 };
     store: stores.ArtifactStore,
@@ -48,8 +50,48 @@ const Job = struct {
     cached: ?artifacts.CachedRead,
     lease: ?Decoded.Lease = null,
     result: ?[]const u8 = null,
+    owned: ?*SharedBytes = null,
+    const SharedBytes = struct {
+        a: A,
+        bytes: []const u8,
+        refs: std.atomic.Value(usize) = .init(1),
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const a = self.a;
+            a.free(self.bytes);
+            a.destroy(self);
+        }
+    };
+    /// Each slice owns a share of the physical response, independently of the
+    /// stack-owned wave and its temporary synchronized allocator descriptor.
+    fn rangeLease(self: *Job, a: A, offset: usize, len: usize) !RangeLease {
+        const bytes = self.result.?[offset..][0..len];
+        if (self.lease) |held| {
+            const Pin = struct {
+                a: A,
+                held: Decoded.Lease,
+                fn release(raw: *anyopaque) void {
+                    const pin: *@This() = @ptrCast(@alignCast(raw));
+                    const alloc = pin.a;
+                    pin.held.release();
+                    alloc.destroy(pin);
+                }
+            };
+            const pin = try a.create(Pin);
+            pin.* = .{ .a = a, .held = held.retain() };
+            return .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = pin, .release_fn = Pin.release } } };
+        }
+        if (self.owned == null) {
+            const owner = try a.create(SharedBytes);
+            owner.* = .{ .a = a, .bytes = self.result.? };
+            self.owned = owner;
+        }
+        _ = self.owned.?.refs.fetchAdd(1, .monotonic);
+        return .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = self.owned.?, .release_fn = SharedBytes.release } } };
+    }
     fn deinit(self: *Job) void {
-        if (self.lease) |lease| lease.release() else if (self.result) |bytes| self.a.free(bytes);
+        if (self.owned) |owned| SharedBytes.release(owned) else if (self.lease) |lease| lease.release() else if (self.result) |bytes| self.a.free(bytes);
     }
     fn check(raw: *const anyopaque) !void {
         const self: *const Job = @ptrCast(@alignCast(raw));
@@ -138,24 +180,64 @@ pub const ManyBatch = struct {
         self.a.free(self.values);
     }
 };
+pub const LeasedBatch = struct {
+    a: A,
+    values: []?ImmutableLease,
+    pub fn deinit(self: *LeasedBatch) void {
+        for (self.values) |*value| if (value.*) |*lease| lease.deinit();
+        self.a.free(self.values);
+    }
+};
+const Output = union(enum) {
+    owned: []?[]u8,
+    leased: []?ImmutableLease,
+    fn len(self: Output) usize {
+        return switch (self) {
+            .owned => |v| v.len,
+            .leased => |v| v.len,
+        };
+    }
+    fn warm(self: Output, a: A, index: usize, lease: ImmutableLease) !void {
+        switch (self) {
+            .leased => |v| v[index] = lease,
+            .owned => |v| {
+                var held = lease;
+                defer held.deinit();
+                v[index] = try a.dupe(u8, held.bytes());
+            },
+        }
+    }
+};
+/// Required immutable units retain their physical/cache owner instead of an
+/// intermediate payload copy. Unit authentication, persistence and budgets are
+/// identical to the owning adapter. The allocator outlives the returned leases.
+pub fn loadManyLeased(a: A, store: stores.ArtifactStore, refs: []const Unit, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !LeasedBatch {
+    if (refs.len > 1025) return error.InvalidGraphPage;
+    const values = try a.alloc(?ImmutableLease, refs.len);
+    @memset(values, null);
+    var result: LeasedBatch = .{ .a = a, .values = values };
+    errdefer result.deinit();
+    try loadInto(a, store, refs, .{ .leased = values }, token, cached, budget, options);
+    return result;
+}
 pub fn loadMany(a: A, store: stores.ArtifactStore, refs: []const Unit, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !ManyBatch {
     if (refs.len > 1025) return error.InvalidGraphPage;
     const values = try a.alloc(?[]u8, refs.len);
     @memset(values, null);
     var result: ManyBatch = .{ .a = a, .values = values };
     errdefer result.deinit();
-    try loadInto(a, store, refs, values, token, cached, budget, options);
+    try loadInto(a, store, refs, .{ .owned = values }, token, cached, budget, options);
     return result;
 }
 pub fn load(a: A, store: stores.ArtifactStore, refs: []const Unit, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !Batch {
     if (refs.len > max_batch) return error.InvalidGraphPage;
     var result: Batch = .{ .a = a };
     errdefer result.deinit();
-    try loadInto(a, store, refs, result.values[0..refs.len], token, cached, budget, options);
+    try loadInto(a, store, refs, .{ .owned = result.values[0..refs.len] }, token, cached, budget, options);
     return result;
 }
-fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: []?[]u8, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !void {
-    if (refs.len != values.len or options.max_range == 0) return error.InvalidGraphPage;
+fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: Output, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !void {
+    if (refs.len != values.len() or options.max_range == 0) return error.InvalidGraphPage;
     try token.check();
     if (cached) |cache| try cache.context.ensureActive();
     if (refs.len == 0) return;
@@ -173,9 +255,7 @@ fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: []?[]
         keys[i] = if (ref.offset == 0 and ref.bytes == ref.object.byte_len) ref.object.artifact_id else try std.fmt.bufPrint(&key_storage[i], "{s}:page:{x}:{x}", .{ ref.object.artifact_id, ref.offset, ref.bytes });
         logical = std.math.add(u64, logical, ref.bytes) catch return error.InvalidGraphPage;
         if (cached) |cache| if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, keys[i], ref.bytes, ref.digest, cache.context)) |found| {
-            var lease = found;
-            defer lease.deinit();
-            values[i] = try a.dupe(u8, lease.bytes());
+            try values.warm(a, i, found);
             continue;
         };
         missing[count] = i;
@@ -260,7 +340,12 @@ fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: []?[]
             const bytes = job.result.?[offset..][0..ref.bytes];
             try stores.validatePayloadSha256WithCancellation(bytes, &std.fmt.bytesToHex(&ref.digest, .lower), token);
             var loader: Loader = .{ .data = bytes };
-            values[index] = if (cached) |cache| try cache.cache.readImmutableAlloc(a, cache.scope, keys[index], bytes.len, ref.digest, cache.context, .{ .ptr = &loader, .load = Loader.read, .provider_read = Loader.traffic }) else if (run.end - run.first == 1 and job.lease == null and ref.offset == job.begin and ref.bytes == job.length) transfer: {
+            if (values == .leased) {
+                const held = try job.rangeLease(a, offset, ref.bytes);
+                values.leased[index] = if (cached) |cache| try cache.cache.admitVerifiedBlock(a, cache.scope, keys[index], ref.bytes, ref.digest, cache.context, .{ .value = .{ .bytes = bytes, .digest = ref.digest }, .owner = held }) else .{ .shared = held };
+                continue;
+            }
+            values.owned[index] = if (cached) |cache| try cache.cache.readImmutableAlloc(a, cache.scope, keys[index], bytes.len, ref.digest, cache.context, .{ .ptr = &loader, .load = Loader.read, .provider_read = Loader.traffic }) else if (run.end - run.first == 1 and job.lease == null and ref.offset == job.begin and ref.bytes == job.length) transfer: {
                 job.result = null;
                 break :transfer @constCast(bytes);
             } else try a.dupe(u8, bytes);
@@ -390,4 +475,113 @@ test "external lake metadata navigation range failures cancel parked siblings be
     var remaining: u64 = 1024;
     try std.testing.expectError(error.InjectedRangeFailure, loadMany(a, store, &units, .none, cached, .{ .ptr = &remaining, .charge = Charge.charge }, .{ .max_range = 1024 }));
     try std.testing.expectEqual(@as(usize, 0), probe.live.load(.acquire));
+}
+
+test "external lake metadata navigation leased range units retain owners and reduce cold and warm copies" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("leased-range-units");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const payload = try a.alloc(u8, 2 << 20);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% i / 251);
+    var object = try store.putScoped(.{ .domain = @splat(7), .attempt = @splat(3) }, payload, .none);
+    defer object.deinit(a);
+    var units: [32]Unit = undefined;
+    for (&units, 0..) |*unit, i| {
+        const begin = i * (64 << 10);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(payload[begin..][0 .. 64 << 10], &digest, .{});
+        unit.* = .{ .object = .{ .artifact_id = object.artifact_id, .checksum = object.checksum, .byte_len = object.byte_len }, .offset = begin, .bytes = 64 << 10, .digest = digest };
+    }
+    const Provider = struct {
+        var active: *@This() = undefined;
+        original: *const stores.ArtifactStore.VTable,
+        calls: usize = 0,
+        bytes: usize = 0,
+        fn read(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, token: Token) ![]u8 {
+            const self = active;
+            self.calls += 1;
+            self.bytes += len;
+            return if (self.original.get_range_alloc_with_cancellation) |get| get(raw, alloc, id, offset, len, token) else self.original.get_range_alloc(raw, alloc, id, offset, len);
+        }
+    };
+    var provider: Provider = .{ .original = store.vtable };
+    Provider.active = &provider;
+    var traced = store.vtable.*;
+    traced.get_range_alloc_with_cancellation = Provider.read;
+    store.vtable = &traced;
+    const Charge = struct {
+        fn charge(raw: *anyopaque, bytes: u64) !void {
+            try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), bytes);
+        }
+    };
+    const Run = struct {
+        fn run(backing: A, storage: stores.ArtifactStore, refs: []const Unit, expected: []const u8, cached: ?artifacts.CachedRead, leased: bool) !usize {
+            var tracking = std.testing.FailingAllocator.init(backing, .{});
+            const alloc = tracking.allocator();
+            var output: std.ArrayList([]u8) = .empty;
+            defer {
+                for (output.items) |bytes| alloc.free(bytes);
+                output.deinit(alloc);
+            }
+            var reads: u64 = 4 << 20;
+            if (leased) {
+                var batch = try loadManyLeased(alloc, storage, refs, .none, cached, .{ .ptr = &reads, .charge = Charge.charge }, .{ .max_range = 4 << 20 });
+                defer batch.deinit();
+                for (refs, batch.values) |ref, value| {
+                    const bytes = value.?.bytes();
+                    try std.testing.expectEqualSlices(u8, expected[@intCast(ref.offset)..][0..ref.bytes], bytes);
+                    // Both variants include the decoded owner's required copy.
+                    const owned = try alloc.dupe(u8, bytes);
+                    errdefer alloc.free(owned);
+                    try output.append(alloc, owned);
+                }
+            } else {
+                var batch = try loadMany(alloc, storage, refs, .none, cached, .{ .ptr = &reads, .charge = Charge.charge }, .{ .max_range = 4 << 20 });
+                defer batch.deinit();
+                for (refs, batch.values) |ref, value| {
+                    try std.testing.expectEqualSlices(u8, expected[@intCast(ref.offset)..][0..ref.bytes], value.?);
+                    const owned = try alloc.dupe(u8, value.?);
+                    errdefer alloc.free(owned);
+                    try output.append(alloc, owned);
+                }
+            }
+            try std.testing.expectEqual(@as(u64, expected.len), (4 << 20) - reads);
+            return tracking.allocated_bytes;
+        }
+    };
+    for ([_]bool{ false, true }) |cached| {
+        var observed: [2][2]usize = undefined;
+        for ([_]bool{ false, true }, 0..) |leased, variant| {
+            var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+            defer cache.deinit();
+            const read: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{} };
+            for (0..2) |pass| {
+                const before = provider.calls;
+                const bytes = provider.bytes;
+                observed[variant][pass] = try Run.run(a, store, &units, payload, if (cached) read else null, leased);
+                try std.testing.expectEqual(@as(usize, if (cached and pass == 1) 0 else 1), provider.calls - before);
+                try std.testing.expectEqual(@as(usize, if (cached and pass == 1) 0 else payload.len), provider.bytes - bytes);
+            }
+        }
+        for (0..2) |pass| {
+            std.debug.print("LEASED_RANGE_UNITS cached={} pass={} owning_allocated={} leased_allocated={} payload_bytes={}\n", .{ cached, pass, observed[0][pass], observed[1][pass], payload.len });
+            try std.testing.expect(observed[1][pass] + payload.len / 2 < observed[0][pass]);
+        }
+    }
+    const Faults = struct {
+        fn run(alloc: A, storage: stores.ArtifactStore, refs: []const Unit, use_cache: bool) !void {
+            var cache = local.serverless_query_lake_serving_cache.Cache.init(std.testing.allocator);
+            defer cache.deinit();
+            const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{} };
+            var reads: u64 = 4 << 20;
+            var batch = try loadManyLeased(alloc, storage, refs, .none, if (use_cache) cached else null, .{ .ptr = &reads, .charge = Charge.charge }, .{ .max_range = 4 << 20 });
+            defer batch.deinit();
+            for (refs, batch.values) |ref, lease| try std.testing.expectEqual(ref.bytes, lease.?.bytes().len);
+        }
+    };
+    for ([_]bool{ false, true }) |cached| try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{ store, @as([]const Unit, units[0..3]), cached });
 }

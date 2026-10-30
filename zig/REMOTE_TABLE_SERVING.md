@@ -2591,3 +2591,40 @@ compares fixed and adaptive cache policies in the same binary, with equal
 statement limits, independently checked keys and values, and unchanged spill
 writes. Spill byte counters and thread CPU samples describe that native drain;
 real-file E2E qualification is recorded separately from kernel measurements.
+
+### Host-governed optional residency and leased range owners
+
+SQL spill residency recognizes the real statement-to-host allocator chain.
+Only the ResourceManager's explicitly reclaiming, synchronized allocator
+participates; ordinary callback-free allocators, arenas and opaque wrappers
+retain conservative caching. Recognition never substitutes a backing allocator
+for an allocation: host reservations, statement quotas, pins and refund
+semantics still govern every byte.
+
+Statement and host owners share an allocation-free residency registry with
+stable hook lifetimes and round-robin reclamation. Required host allocations
+preflight idle spill roots as well as statement allocations. Reclamation takes
+known deallocation locks without waiting, skips busy owners, and reuses only
+locks held by the current thread for refundable frees. Registration and teardown
+retain the existing nonblocking reverse lookup. The generic lock guard lives
+with the platform allocator contract so storage owners do not depend on SQL.
+Host headroom includes unused reservation credit already owned by that allocator;
+this credit is reusable capacity, not additional node or slice admission.
+
+Covering stripe reads retain immutable raw-cache or physical-response leases.
+Adjacent selected units can share one authenticated response after its wave
+retires; uncached response owners use reference counts, and cached responses
+retain their actual cache owner. Each unit keeps its existing integrity, scope,
+read-budget and persistent-cache identity. The decoded cache still owns its
+independent wire framing. This removes the intermediate result-buffer copy
+without borrowing a stack-owned allocator or provider callback. Owning range
+callers retain the original adapter. Allocation-failure tests exercise cached
+and uncached lease admission and partial results.
+
+Runtime ABI **79** fences the shared host-budget and residency layouts. Reader
+protocol **97** and persisted formats are unchanged. SMP allocator identity is
+checked only in threaded builds; page-allocator-only single-threaded execution
+uses the same refundable-owner contract. Qualification compares fixed and
+adaptive spill policies through `sql_memory_owner`, with identical statement
+and host limits, and compares owning and leased range delivery against equal
+physical reads and independently checked bytes.

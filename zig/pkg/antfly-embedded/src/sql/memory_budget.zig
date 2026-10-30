@@ -17,39 +17,8 @@
 //! The owner must have a stable address and outlive every allocated object.
 const std = @import("std");
 const Budget = @This();
-/// Track known allocator locks across nested calls. Reclamation skips busy
-/// foreign locks and can reuse this thread's locks only for refundable frees.
-pub const AllocationGuard = struct {
-    threadlocal var depth: usize = 0;
-    threadlocal var locks: [128]?*std.atomic.Mutex = @splat(null);
-    threadlocal var reclamation_depth: usize = 0;
-    pub fn active() bool {
-        return depth != 0;
-    }
-    pub fn allowed() bool {
-        return depth < locks.len;
-    }
-    pub fn held(mutex: *std.atomic.Mutex) bool {
-        for (locks[0..@min(depth, locks.len)]) |locked| if (locked == mutex) return true;
-        return false;
-    }
-    pub fn enter(mutex: *std.atomic.Mutex) void {
-        if (depth < locks.len) locks[depth] = mutex;
-        depth += 1;
-    }
-    pub fn leave() void {
-        depth -= 1;
-    }
-    pub fn beginReclaim() void {
-        reclamation_depth += 1;
-    }
-    pub fn endReclaim() void {
-        reclamation_depth -= 1;
-    }
-    pub fn reuse(mutex: *std.atomic.Mutex) bool {
-        return reclamation_depth != 0 and held(mutex);
-    }
-};
+pub const AllocationGuard = @import("antfly_platform").allocator.reclamation.Guard;
+const Residency = @import("antfly_platform").allocator.reclamation;
 
 pub fn parentAllocator(a: std.mem.Allocator) ?std.mem.Allocator {
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
@@ -68,11 +37,8 @@ pub const Pressure = struct {
 };
 /// Stable owners register optional residency without retaining a request or
 /// allocator callback beyond unregister. The list lock protects callback life.
-pub const Reclaimer = struct { ptr: *anyopaque, reclaim: *const fn (*anyopaque) bool, next: ?*Reclaimer = null };
-reclamation_mutex: std.atomic.Mutex = .unlocked,
-reclamation_count: std.atomic.Value(usize) = .init(0),
-reclaimers: ?*Reclaimer = null,
-reclaim_cursor: ?*Reclaimer = null,
+pub const Reclaimer = Residency.Reclaimer;
+residency: Residency.Registry = .{},
 pressure: ?Pressure = null,
 backing: std.mem.Allocator,
 limit: usize,
@@ -90,48 +56,16 @@ admission: ?struct { ptr: *anyopaque, reserve: *const fn (*anyopaque, usize) boo
 admission_exhausted: bool = false,
 
 pub fn registerReclaimer(self: *Budget, owner: *Reclaimer) void {
-    @import("antfly_platform").sync.lockYielding(&self.reclamation_mutex);
-    defer self.reclamation_mutex.unlock();
-    owner.next = self.reclaimers;
-    self.reclaimers = owner;
-    _ = self.reclamation_count.fetchAdd(1, .release);
+    self.residency.register(owner);
 }
 pub fn unregisterReclaimer(self: *Budget, owner: *Reclaimer) void {
-    @import("antfly_platform").sync.lockYielding(&self.reclamation_mutex);
-    defer self.reclamation_mutex.unlock();
-    var link = &self.reclaimers;
-    while (link.*) |current| {
-        if (current == owner) {
-            link.* = current.next;
-            if (self.reclaim_cursor == owner) self.reclaim_cursor = current.next;
-            owner.next = null;
-            _ = self.reclamation_count.fetchSub(1, .release);
-            return;
-        }
-        link = &current.next;
-    }
-    unreachable;
-}
-fn reclaimOne(self: *Budget) bool {
-    @import("antfly_platform").sync.lockYielding(&self.reclamation_mutex);
-    defer self.reclamation_mutex.unlock();
-    const first = self.reclaim_cursor orelse self.reclaimers orelse return false;
-    var current = first;
-    while (true) {
-        const next = current.next orelse self.reclaimers.?;
-        if (current.reclaim(current.ptr)) {
-            self.reclaim_cursor = next;
-            return true;
-        }
-        current = next;
-        if (current == first) return false;
-    }
+    self.residency.unregister(owner);
 }
 pub fn preflight(self: *Budget, a: std.mem.Allocator, growth: usize) void {
-    if (growth == 0 or !AllocationGuard.allowed() or self.reclamation_count.load(.acquire) == 0) return;
+    if (growth == 0 or !AllocationGuard.allowed() or !self.residency.active()) return;
     while (true) {
         const available = headroom(a) orelse headroom(self.allocator()) orelse return;
-        if (growth <= available or !self.reclaimOne()) return;
+        if (growth <= available or !self.residency.reclaimOne()) return;
     }
 }
 
@@ -216,6 +150,10 @@ pub fn footprint(self: *Budget) usize {
 pub fn headroom(a: std.mem.Allocator) ?usize {
     if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
     if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return headroom(parent);
+    if (@import("../storage/resource_manager.zig").BudgetedAllocator.reclamationLayer(a)) |layer| {
+        const available = layer.owner.availableAllocationBytesThreadSafe();
+        return if (headroom(layer.backing)) |parent| @min(available, parent) else available;
+    }
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     const held = AllocationGuard.held(&self.mutex);
