@@ -162,6 +162,44 @@ test "fixture consumer" {
         )
         self.assertIn("test filter matched no declared tests: missing", output)
 
+    @unittest.skipUnless(platform.system() == "Darwin", "native Mach-O linker")
+    def test_stripped_native_link_keeps_early_provider_and_tls_at_final_link(self):
+        self.write(
+            "provider.zig",
+            """const std = @import("std");
+const c = @import("contract.zig");
+const VTable = struct { get: *const fn () u32 };
+fn value() u32 { return c.minimum; }
+threadlocal var zero: [8192]u8 align(4096) = @splat(0);
+threadlocal var state: struct { tag: u32 = 42, ops: *const VTable = &.{ .get = value } } = .{};
+export fn fixtureValue() u32 {
+    zero[0] +%= 1;
+    const result = state.ops.get() + state.tag - 42 + zero[0] - 1;
+    std.debug.print("provider-tls={d}\\n", .{result});
+    return result;
+}
+""",
+        )
+        options = (
+            "-Dnative-link=true",
+            "-Dearly-provider=true",
+            "-Dstrip=true",
+            "-Doptimize=ReleaseFast",
+        )
+        output = self.build("test", *options)
+        self.assertIn("provider-tls=42", output)
+        self.assertIn("provider-value=42", output)
+        self.assertIn("fixture implementation...", output)
+        provider = self.build_dir / "provider.zig"
+        provider.write_text(
+            provider.read_text().replace("return c.minimum;", "return c.minimum + 1;")
+        )
+        output = self.build("test", *options)
+        self.assertIn("provider-tls=43", output)
+        self.assertIn("provider-value=43", output)
+        self.assertRegex(output, r"compile test_obj fixture-consumer \S+ \S+ cached")
+        self.assertRegex(output, r"compile lib fixture-provider \S+ \S+ success")
+
     def test_selection_and_failure_diagnostics(self):
         output = self.build("test", "--", "consumer")
         self.assertIn("1 passed", output)

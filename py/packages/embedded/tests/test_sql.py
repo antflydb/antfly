@@ -163,7 +163,13 @@ def test_issue_1141_fk_insert_subquery_delete_commit(require_native, aflite_path
     # The native regression forces the refresh race without background timing.
     # Keep the complete reported stress workload available without slowing every
     # binding test lane or accumulating hundreds of MiB of maintenance output.
-    iterations = 400 if os.environ.get("ANTFLY_EMBEDDED_SQL_STRESS") == "1" else 32
+    stress = os.environ.get("ANTFLY_EMBEDDED_SQL_STRESS") == "1"
+    iterations = 400 if stress else 2
+    children = 1 if stress else 9
+    # Nine children cross OFFSET 8: the normal binding regression exercises
+    # actual subquery deletion, not 32 repetitions of an empty deletion. Two
+    # commit/drain cycles cover reuse after maintenance; the native regression
+    # forces a generation refresh *between* the delete and commit.
     with closing(dbapi.connect(aflite_path, autocommit=True)) as connection:
         cursor = connection.cursor()
         cursor.execute("CREATE TABLE parent (id TEXT PRIMARY KEY)")
@@ -174,18 +180,30 @@ def test_issue_1141_fk_insert_subquery_delete_commit(require_native, aflite_path
             connection.autocommit = True
             cursor.execute("INSERT INTO parent (id) VALUES ($1)", (f"p{i}",))
             connection.autocommit = False
-            cursor.execute("INSERT INTO child (id, parent_id) VALUES ($1, $2)", (f"c{i}", f"p{i}"))
+            values = ",".join(f"(${2 * n + 1}, ${2 * n + 2})" for n in range(children))
+            parameters = tuple(value for n in range(children) for value in (f"c{i}:{n}", f"p{i}"))
+            cursor.execute(f"INSERT INTO child (id, parent_id) VALUES {values}", parameters)
             cursor.execute(
                 "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id = $1 ORDER BY id DESC OFFSET 8)",
                 (f"p{i}",),
             )
             connection.commit()
             # Bound unrelated text-index debt between committed transactions.
-            if (i + 1) % 16 == 0:
+            if not stress or (i + 1) % 16 == 0:
                 connection._database.run_until_idle()
+            if not stress:
+                connection.autocommit = True
+                cursor.execute("SELECT COUNT(*) FROM child WHERE parent_id = $1", (f"p{i}",))
+                assert cursor.fetchall() == [(8,)]
+                cursor.execute("SELECT id FROM child WHERE parent_id = $1 ORDER BY id", (f"p{i}",))
+                assert cursor.fetchall() == [(f"c{i}:{n}",) for n in range(1, 9)]
         connection.autocommit = True
         cursor.execute("SELECT COUNT(*) FROM child")
-        assert cursor.fetchall() == [(iterations,)]
+        assert cursor.fetchall() == [(iterations * min(children, 8),)]
+    # Keep real synchronous commits and verify persistence on an independent
+    # connection; this test does not opt out of the durability path.
+    with closing(dbapi.connect(aflite_path, autocommit=True)) as reopened:
+        assert reopened.cursor().execute("SELECT COUNT(*) FROM child").fetchall() == [(iterations * min(children, 8),)]
 
 
 def test_cross_table_foreign_keys_and_failed_transaction(require_native, aflite_path):

@@ -4802,11 +4802,11 @@ pub const AntflyApiHandler = struct {
         }
     };
 
-    fn gatewayRequest(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task) !httpx.Response {
+    fn gatewayRequest(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_inference_gateway.Task) !httpx.Response {
         return self.gatewayRequestOperation(ctx, task, null);
     }
 
-    fn gatewayRequestOperation(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task, operation: ?[]const u8) !httpx.Response {
+    fn gatewayRequestOperation(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_inference_gateway.Task, operation: ?[]const u8) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
@@ -20472,7 +20472,7 @@ test "httpx inference gateway request errors remain client errors without reclas
     var server = ApiHttpServer.init(a, .{ .node_config = &config }, source.iface(), null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const Task = @import("antfly_local_sources").common_provider_registry.gateway.Task;
+    const Task = @import("antfly_local_sources").common_inference_gateway.Task;
     const cases = .{
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":" },
         .{ Task.embed, "/ai/v1/embeddings", "" },
