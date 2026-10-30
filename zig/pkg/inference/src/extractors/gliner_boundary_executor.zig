@@ -228,10 +228,10 @@ pub fn referenceEncoderDeviceBytes(allocator: Allocator, config: *const model.Co
             self.note(prepared);
             if (self.failure) |err| return err;
         }
-        pub fn observeSingle(self: *@This(), _: Allocator, _: []const u8, prepared: *const processor.PreparedBatch, _: processor.Options) !void {
-            self.note(prepared);
-            if (self.failure) |err| return err;
-        }
+        // observeGroupBatch already planned the physical batch. Per-item
+        // qualification views retain its tensors but slice samples to one row,
+        // so they are not complete batches accepted by the device planner.
+        pub fn observeSingle(_: *@This(), _: Allocator, _: []const u8, _: *const processor.PreparedBatch, _: processor.Options) !void {}
         pub fn observeGroupBatch(self: *@This(), prepared: *const processor.PreparedBatch) !void {
             self.note(prepared);
             if (self.failure) |err| return err;
@@ -1070,18 +1070,20 @@ test "GPU boundary request groups distinct ragged inputs within physical limits"
     var serial = try prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, .{});
     defer serial.deinit();
     try std.testing.expectEqual(@as(usize, 1), serial.samples.len);
-    var geometry_options = Options{ .identity = .{ .backbone = .small, .precision = .fp32, .weight = artifact.Digest.of("geometry weight"), .sidecars = @splat(artifact.Digest.of("geometry sidecar")) } };
+    const geometry_options = Options{ .identity = .{ .backbone = .small, .precision = .fp32, .weight = artifact.Digest.of("geometry weight"), .sidecars = @splat(artifact.Digest.of("geometry sidecar")) } };
     var tail = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items[2..], geometry_options);
     defer tail.deinit();
     const peak = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, geometry_options);
     try std.testing.expectEqual(@max(metal.input_ids.len, tail.input_ids.len), peak);
-    geometry_options.engine.limits.max_batch = 1;
-    try std.testing.expect(peak > try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, geometry_options));
+    var serial_geometry_options = geometry_options;
+    serial_geometry_options.engine.limits.max_batch = 1;
+    try std.testing.expect(peak > try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, serial_geometry_options));
     // The reference device path reserves the request's own encoder plan, not
     // the configured ceiling, and refuses a ceiling the request cannot fit.
     const encoder_bytes = try referenceEncoderDeviceBytes(a, &config, tokenizer.tokenizer(), &request, geometry_options);
     try std.testing.expect(encoder_bytes > 0);
     try std.testing.expect(encoder_bytes < geometry_options.device.max_encoder_device_bytes);
+    try std.testing.expect(encoder_bytes > try referenceEncoderDeviceBytes(a, &config, tokenizer.tokenizer(), &request, serial_geometry_options));
     var tight = geometry_options;
     tight.device.max_encoder_device_bytes = encoder_bytes - 1;
     try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(a, &config, tokenizer.tokenizer(), &request, tight));

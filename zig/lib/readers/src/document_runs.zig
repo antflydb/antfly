@@ -1884,7 +1884,6 @@ test "document durable refusals before dispatch refund their reservation" {
     try std.testing.expectEqual(@as(usize, 0), refunded.pending.len);
     // The same stage dispatches once admission succeeds.
     const result = try session.execute(work, @splat(1), upper, 16, {}, Provider.ok);
-    defer a.free(result.bytes);
     try std.testing.expectEqualStrings("done", result.bytes);
     // Work that may have run is still charged as uncertain spend.
     try std.testing.expectError(error.Timeout, session.execute(work, @splat(2), .{ .tokens = 1 }, 16, {}, Provider.timeout));
