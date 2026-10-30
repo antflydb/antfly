@@ -29,6 +29,7 @@ pub const regions = [_]r.Region{
     metal("reduce.embedding_lookup", gather.metalRegion()),
     r.cuda("reduce.embedding_lookup", gather.cudaRegion()),
     r.cuda("reduce.rope", rope.cudaRegion()),
+    metal("reduce.rope", rope.metalRegion()),
     metal("reduce.rows", rows.rowsRegion()),
     metal("reduce.scan", rows.scanRegion()),
     metal("reduce.qwen35_norm", rows.qwen35NormRegion()),

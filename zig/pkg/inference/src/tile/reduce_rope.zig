@@ -208,3 +208,75 @@ pub fn cudaRegion() []const u8 {
         return out;
     }
 }
+
+// ---------------------------------------------------------------- Metal
+
+/// Metal elementwise RoPE over one or more same-shaped tensors sharing the
+/// positions; `prefixes` names them (`""` → input/output, `"first_"` →
+/// first_input/first_output, ...). Elements outside the rotated pairs copy
+/// through.
+fn metalRope(comptime name: []const u8, comptime prefixes: []const []const u8) []const u8 {
+    var args: []const u8 = "";
+    var pass: []const u8 = "";
+    var loads: []const u8 = "";
+    var first: []const u8 = "";
+    var second: []const u8 = "";
+    for (prefixes, 0..) |t, i| {
+        args = args ++ fmt("device const float *{s}input [[buffer({d})]], ", .{ t, i });
+        pass = pass ++ (if (i == 0) "" else " ") ++ fmt("{0s}output[gid] = {0s}input[gid];", .{t});
+        loads = loads ++ fmt("    float {0s}x0 = {0s}input[base + idx0];\n    float {0s}x1 = {0s}input[base + idx1];\n", .{t});
+        first = first ++ (if (i == 0) "" else " ") ++ fmt("{0s}output[gid] = {0s}x0 * cos_val - {0s}x1 * sin_val;", .{t});
+        second = second ++ (if (i == 0) "" else " ") ++ fmt("{0s}output[gid] = {0s}x0 * sin_val + {0s}x1 * cos_val;", .{t});
+    }
+    const n = prefixes.len;
+    args = args ++ fmt("device const uint *positions [[buffer({d})]], ", .{n});
+    for (prefixes, 0..) |t, i| args = args ++ fmt("device float *{s}output [[buffer({d})]], ", .{ t, n + 1 + i });
+    // One store is a bare statement, several a braced block.
+    const brace = struct {
+        fn f(comptime s: []const u8, comptime count: usize) []const u8 {
+            return if (count == 1) s else "{ " ++ s ++ " }";
+        }
+    }.f;
+    return fmt("kernel void {s}({s}constant termite_metal_rope_params &p [[buffer({d})]], uint gid [[thread_position_in_grid]]) {{\n", .{ name, args, 2 * n + 1 }) ++
+        \\    uint total = p.total_chunks * p.head_dim;
+        \\    if (gid >= total) return;
+        \\    uint chunk = gid / p.head_dim;
+        \\    uint d = gid - chunk * p.head_dim;
+        \\    uint base = chunk * p.head_dim;
+        \\
+    ++ "    if (p.rope_dim < 2u) { " ++ pass ++ " return; }\n" ++
+        \\    uint rope_half = p.rope_dim / 2u;
+        \\    uint head_half = p.head_dim / 2u;
+        \\    uint idx0 = 0u;
+        \\    uint idx1 = 0u;
+        \\    uint j = 0u;
+        \\    if (p.consecutive_pairs != 0u) {
+        \\
+    ++ "        if (d >= p.rope_dim) { " ++ pass ++ " return; }\n" ++
+        \\        j = d / 2u;
+        \\        idx0 = 2u * j;
+        \\        idx1 = idx0 + 1u;
+        \\    } else {
+        \\        if (d < rope_half) { j = d; idx0 = d; idx1 = head_half + d; }
+        \\        else if (d >= head_half && d < head_half + rope_half) { j = d - head_half; idx0 = j; idx1 = d; }
+        \\
+    ++ "        else { " ++ pass ++ " return; }\n" ++
+        \\    }
+        \\    float pos = float(positions[chunk]);
+        \\    float freq = 1.0f / pow(p.theta, float(2u * j) / float(p.rope_dim));
+        \\    float angle = pos * p.freq_scale * freq;
+        \\    float cos_val = cos(angle);
+        \\    float sin_val = sin(angle);
+        \\
+    ++ loads ++
+        "    if (d == idx0) " ++ brace(first, n) ++ "\n" ++
+        "    else if (d == idx1) " ++ brace(second, n) ++ "\n" ++
+        "    else " ++ brace(pass, n) ++ "\n}\n";
+}
+
+pub fn metalRegion() []const u8 {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        return metalRope("termite_apply_rope", &.{""}) ++ metalRope("termite_apply_rope_pair", &.{ "first_", "second_" });
+    }
+}
