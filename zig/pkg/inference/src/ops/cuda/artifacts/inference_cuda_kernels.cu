@@ -113,54 +113,6 @@ extern "C" __global__ void termite_add_weighted_scalars_f32(
     if (i < n) dst[i] = a[i] * scale_a + b[i] * scale_b;
 }
 
-extern "C" __global__ void termite_linear_f32(
-    float* dst,
-    const float* input,
-    const float* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int total = rows * out_dim;
-    if (idx >= total) return;
-    unsigned int row = idx / out_dim;
-    unsigned int col = idx - row * out_dim;
-    float acc = 0.0f;
-    for (unsigned int k = 0; k < in_dim; ++k) {
-        acc += input[row * in_dim + k] * weight[col * in_dim + k];
-    }
-    dst[idx] = acc;
-}
-
-extern "C" __global__ void termite_linear_f32_tiled(
-    float* dst,
-    const float* input,
-    const float* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    unsigned int global = blockIdx.x;
-    unsigned int total = rows * out_dim;
-    if (global >= total) return;
-    unsigned int row = global / out_dim;
-    unsigned int col = global - row * out_dim;
-    unsigned int tid = threadIdx.x;
-    __shared__ float partial[256];
-    float acc = 0.0f;
-    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        acc += input[row * in_dim + i] * weight[col * in_dim + i];
-    }
-    partial[tid] = acc;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    if (tid == 0u) dst[global] = partial[0];
-}
-
 __device__ __forceinline__ float termite_bf16_to_f32(unsigned short value) {
     return __uint_as_float(((unsigned int)value) << 16);
 }
@@ -217,6 +169,76 @@ extern "C" __global__ void termite_round_f32(
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
     dst[idx] = nearbyintf(input[idx]);
+}
+
+// tile-codegen:begin quant_cuda.dense_f32 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_linear_f32(
+    float* dst,
+    const float* input,
+    const float* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = rows * out_dim;
+    if (idx >= total) return;
+    unsigned int row = idx / out_dim;
+    unsigned int col = idx - row * out_dim;
+    float acc = 0.0f;
+    for (unsigned int k = 0; k < in_dim; ++k) {
+        acc += input[row * in_dim + k] * weight[col * in_dim + k];
+    }
+    dst[idx] = acc;
+}
+
+extern "C" __global__ void termite_linear_bias_f32(
+    float* dst,
+    const float* input,
+    const float* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = rows * out_dim;
+    if (idx >= total) return;
+    unsigned int row = idx / out_dim;
+    unsigned int col = idx - row * out_dim;
+    float acc = bias[col];
+    for (unsigned int k = 0; k < in_dim; ++k) {
+        acc += input[row * in_dim + k] * weight[col * in_dim + k];
+    }
+    dst[idx] = acc;
+}
+
+extern "C" __global__ void termite_linear_f32_tiled(
+    float* dst,
+    const float* input,
+    const float* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int global = blockIdx.x;
+    unsigned int total = rows * out_dim;
+    if (global >= total) return;
+    unsigned int row = global / out_dim;
+    unsigned int col = global - row * out_dim;
+    unsigned int tid = threadIdx.x;
+    __shared__ float partial[256];
+    float acc = 0.0f;
+    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+        acc += input[row * in_dim + i] * weight[col * in_dim + i];
+    }
+    partial[tid] = acc;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0u) dst[global] = partial[0];
 }
 
 extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(
@@ -279,6 +301,7 @@ extern "C" __global__ void termite_linear_f16_weight_f32_tiled(
     }
     if (tid == 0u) dst[global] = partial[0];
 }
+// tile-codegen:end quant_cuda.dense_f32 family
 
 // tile-codegen:begin argmax family (do not edit; run: zig build tile-kernel-codegen -- --write)
 static __device__ __forceinline__ bool antfly_tile_suppressed(unsigned int token, const int* ids, unsigned int count) {
@@ -1061,27 +1084,6 @@ extern "C" __global__ void termite_gemma4_mtp_verify_commit_u32(
     result[9] = correction_token;
     result[10] = bonus_token;
     result[11] = invalid_model_output;
-}
-
-extern "C" __global__ void termite_linear_bias_f32(
-    float* dst,
-    const float* input,
-    const float* weight,
-    const float* bias,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int total = rows * out_dim;
-    if (idx >= total) return;
-    unsigned int row = idx / out_dim;
-    unsigned int col = idx - row * out_dim;
-    float acc = bias[col];
-    for (unsigned int k = 0; k < in_dim; ++k) {
-        acc += input[row * in_dim + k] * weight[col * in_dim + k];
-    }
-    dst[idx] = acc;
 }
 
 extern "C" __global__ void termite_add_bias_rows_f32(
@@ -11038,6 +11040,7 @@ __device__ void termite_q4k_pair_tile_rows_cols(
     }
 }
 
+// tile-codegen:begin quant_cuda.k_quant_tile4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q6_k_f32_tile4(
     float* dst,
     const float* input,
@@ -11191,6 +11194,7 @@ extern "C" __global__ void termite_linear_q6_k_gated_down_f32_tile4(
         }
     }
 }
+// tile-codegen:end quant_cuda.k_quant_tile4 family
 
 // tile-codegen:begin quant_cuda.q4_k_tile family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_k_f32_tile4(
@@ -11482,6 +11486,7 @@ extern "C" __global__ void termite_linear_q4_k_bias_add_f32_tile4(
 }
 // tile-codegen:end quant_cuda.q4_k_tile family
 
+// tile-codegen:begin quant_cuda.q4_k_rows family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_k_f32(
     float* dst,
     const float* input,
@@ -11753,6 +11758,7 @@ extern "C" __global__ void termite_linear_q4_k_pair_bias_f32_tiled(
     }
     if (tid == 0u) dst[local] = partial[0] + bias[col];
 }
+// tile-codegen:end quant_cuda.q4_k_rows family
 
 extern "C" __global__ void termite_linear_q8_0_pair_nobias_f32_tile4(
     float* dst_a,
@@ -13472,6 +13478,7 @@ extern "C" __global__ void termite_linear_q4_k_pair_nobias_f32_tile4(
     }
 }
 
+// tile-codegen:begin quant_cuda.argmax_stage1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_argmax_stage1_tile4(
     float* partial_values,
     unsigned int* partial_indices,
@@ -13690,6 +13697,81 @@ extern "C" __global__ void termite_linear_q8_0_argmax_rows_stage1_tile4(
     }
 }
 
+extern "C" __global__ void termite_linear_q4_k_argmax_rows_stage1_tile4(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const float* input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) {
+    const unsigned int cols = 4u;
+    unsigned int col_tiles = (out_dim + cols - 1u) / cols;
+    unsigned int global_tile = blockIdx.x;
+    unsigned int row = col_tiles == 0u ? 0u : global_tile / col_tiles;
+    unsigned int tile = col_tiles == 0u ? 0u : global_tile - row * col_tiles;
+    unsigned int col_tile = tile * cols;
+    unsigned int tid = threadIdx.x;
+    unsigned int row_blocks = in_dim / 256u;
+    __shared__ float partial[4][256];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+
+    if (row < rows) {
+        for (unsigned int block = 0; block < row_blocks; ++block) {
+            float x = input[row * in_dim + block * 256u + tid];
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
+                    acc[c] += x * termite_q4k_value(bp, tid);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        float best_value = -3.402823466e+38f;
+        unsigned int best_index = 0xffffffffu;
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) {
+            unsigned int col = col_tile + c;
+            if (row >= rows || col >= out_dim) continue;
+            bool suppressed = false;
+            for (unsigned int j = 0; j < suppress_count; ++j) {
+                int token_id = suppress_token_ids[j];
+                if (token_id >= 0 && (unsigned int)token_id == col) {
+                    suppressed = true;
+                    break;
+                }
+            }
+            if (suppressed) continue;
+            float value = partial[c][0];
+            if (value > best_value || (value == best_value && col < best_index)) {
+                best_value = value;
+                best_index = col;
+            }
+        }
+        partial_values[global_tile] = best_value;
+        partial_indices[global_tile] = best_index;
+    }
+}
+// tile-codegen:end quant_cuda.argmax_stage1 family
+
 template <unsigned int Cols>
 __device__ __forceinline__ void termite_linear_q4_0_argmax_rows_stage1_tile_impl(
     float* partial_values,
@@ -13768,80 +13850,6 @@ __device__ __forceinline__ void termite_linear_q4_0_argmax_rows_stage1_tile_impl
         partial_indices[global_tile] = best_index;
     }
 }
-extern "C" __global__ void termite_linear_q4_k_argmax_rows_stage1_tile4(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const float* input,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) {
-    const unsigned int cols = 4u;
-    unsigned int col_tiles = (out_dim + cols - 1u) / cols;
-    unsigned int global_tile = blockIdx.x;
-    unsigned int row = col_tiles == 0u ? 0u : global_tile / col_tiles;
-    unsigned int tile = col_tiles == 0u ? 0u : global_tile - row * col_tiles;
-    unsigned int col_tile = tile * cols;
-    unsigned int tid = threadIdx.x;
-    unsigned int row_blocks = in_dim / 256u;
-    __shared__ float partial[4][256];
-    float acc[4];
-    #pragma unroll
-    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
-
-    if (row < rows) {
-        for (unsigned int block = 0; block < row_blocks; ++block) {
-            float x = input[row * in_dim + block * 256u + tid];
-            #pragma unroll
-            for (unsigned int c = 0; c < 4u; ++c) {
-                unsigned int col = col_tile + c;
-                if (col < out_dim) {
-                    const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
-                    acc[c] += x * termite_q4k_value(bp, tid);
-                }
-            }
-        }
-    }
-    #pragma unroll
-    for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
-    __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            #pragma unroll
-            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
-        }
-        __syncthreads();
-    }
-    if (tid == 0u) {
-        float best_value = -3.402823466e+38f;
-        unsigned int best_index = 0xffffffffu;
-        #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
-            unsigned int col = col_tile + c;
-            if (row >= rows || col >= out_dim) continue;
-            bool suppressed = false;
-            for (unsigned int j = 0; j < suppress_count; ++j) {
-                int token_id = suppress_token_ids[j];
-                if (token_id >= 0 && (unsigned int)token_id == col) {
-                    suppressed = true;
-                    break;
-                }
-            }
-            if (suppressed) continue;
-            float value = partial[c][0];
-            if (value > best_value || (value == best_value && col < best_index)) {
-                best_value = value;
-                best_index = col;
-            }
-        }
-        partial_values[global_tile] = best_value;
-        partial_indices[global_tile] = best_index;
-    }
-}
-
 template <unsigned int Cols>
 __device__ __forceinline__ void termite_linear_q6_k_argmax_rows_stage1_tile_impl(
     float* partial_values,

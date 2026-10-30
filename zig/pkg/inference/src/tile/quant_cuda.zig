@@ -68,10 +68,16 @@ fn passArgs(comptime sig: []const []const u8) []const u8 {
     return join(names, ", ");
 }
 
+/// A parameter list, one `    type name,` per line.
+pub fn sigText(comptime sig: []const []const u8) []const u8 {
+    var out: []const u8 = "";
+    for (sig, 0..) |p, i| out = out ++ "    " ++ p ++ (if (i + 1 < sig.len) ",\n" else "\n");
+    return out;
+}
+
 pub fn wrapper(comptime w: Wrapper) []const u8 {
     comptime {
-        var out: []const u8 = w.comment ++ "extern \"C\" __global__ void " ++ w.name ++ "(\n";
-        for (w.sig, 0..) |p, i| out = out ++ "    " ++ p ++ (if (i + 1 < w.sig.len) ",\n" else "\n");
+        var out: []const u8 = w.comment ++ "extern \"C\" __global__ void " ++ w.name ++ "(\n" ++ sigText(w.sig);
         const call = w.call ++ "(" ++ (w.args orelse passArgs(w.sig)) ++ ");";
         if (w.inline_body) return out ++ ") { " ++ call ++ " }\n";
         out = out ++ ") {\n" ++ w.pre;
@@ -410,10 +416,10 @@ const embedding_src =
 ;
 
 const EmbedFormat = struct { name: []const u8, block: []const u8, sub: []const u8, bytes: []const u8, value: []const u8, nibble: bool = false };
-const q4_k_rows = EmbedFormat{ .name = "q4_k", .block = "256", .sub = "value_index", .bytes = "144", .value = "termite_q4k_value(bp, value_index)" };
-const q6_k_rows = EmbedFormat{ .name = "q6_k", .block = "256", .sub = "value_index", .bytes = "210", .value = "termite_q6k_value(bp, value_index)" };
-const q8_0_rows = EmbedFormat{ .name = "q8_0", .block = "32", .sub = "lane", .bytes = "34", .value = "termite_q8_0_value(bp, lane)" };
-const q4_0_rows = EmbedFormat{ .name = "q4_0", .block = "32", .sub = "lane", .bytes = "18", .value = "termite_q4_0_value_nibble(bp, q_offset, high_nibble)", .nibble = true };
+const q4_k_fmt = EmbedFormat{ .name = "q4_k", .block = "256", .sub = "value_index", .bytes = "144", .value = "termite_q4k_value(bp, value_index)" };
+const q6_k_fmt = EmbedFormat{ .name = "q6_k", .block = "256", .sub = "value_index", .bytes = "210", .value = "termite_q6k_value(bp, value_index)" };
+const q8_0_fmt = EmbedFormat{ .name = "q8_0", .block = "32", .sub = "lane", .bytes = "34", .value = "termite_q8_0_value(bp, lane)" };
+const q4_0_fmt = EmbedFormat{ .name = "q4_0", .block = "32", .sub = "lane", .bytes = "18", .value = "termite_q4_0_value_nibble(bp, q_offset, high_nibble)", .nibble = true };
 
 fn embed(comptime f: EmbedFormat, comptime i32_ids: bool, comptime add: bool) struct {
     name: []const u8,
@@ -442,13 +448,384 @@ fn embed(comptime f: EmbedFormat, comptime i32_ids: bool, comptime add: bool) st
 }
 
 pub const embedding = fillAll(embedding_src, .{
-    embed(q4_k_rows, false, false),
-    embed(q6_k_rows, false, false),
-    embed(q8_0_rows, false, false),
-    embed(q4_0_rows, false, false),
-    embed(q4_k_rows, true, false),
-    embed(q6_k_rows, true, false),
-    embed(q6_k_rows, true, true),
-    embed(q8_0_rows, true, false),
-    embed(q4_0_rows, true, false),
+    embed(q4_k_fmt, false, false),
+    embed(q6_k_fmt, false, false),
+    embed(q8_0_fmt, false, false),
+    embed(q4_0_fmt, false, false),
+    embed(q4_k_fmt, true, false),
+    embed(q6_k_fmt, true, false),
+    embed(q6_k_fmt, true, true),
+    embed(q8_0_fmt, true, false),
+    embed(q4_0_fmt, true, false),
+});
+
+// ---------------------------------------------------------------- dense f32
+
+/// One output element per thread, or one per 256-thread block with a
+/// shared-memory tree; weights f32, bf16 or f16.
+const dense_scalar_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    \\    unsigned int total = rows * out_dim;
+    \\    if (idx >= total) return;
+    \\    unsigned int row = idx / out_dim;
+    \\    unsigned int col = idx - row * out_dim;
+    \\    float acc = $(init);
+    \\    for (unsigned int k = 0; k < in_dim; ++k) {
+    \\        acc += input[row * in_dim + k] * weight[col * in_dim + k];
+    \\    }
+    \\    dst[idx] = acc;
+    \\}
+    \\
+;
+
+const dense_tiled_src =
+    \\$(comment)extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    unsigned int global = blockIdx.x;
+    \\    unsigned int total = rows * out_dim;
+    \\    if (global >= total) return;
+    \\    unsigned int row = global / out_dim;
+    \\    unsigned int col = global - row * out_dim;
+    \\    unsigned int tid = threadIdx.x;
+    \\    __shared__ float partial[256];
+    \\    float acc = 0.0f;
+    \\    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+    \\        acc += input[row * in_dim + i] * $(load_open)weight[col * in_dim + i]$(load_close);
+    \\    }
+    \\    partial[tid] = acc;
+    \\    __syncthreads();
+    \\    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+    \\        if (tid < stride) partial[tid] += partial[tid + stride];
+    \\        __syncthreads();
+    \\    }
+    \\    if (tid == 0u) dst[global] = partial[0];
+    \\}
+    \\
+;
+
+const f32_weight = "const float* weight";
+const u16_weight = "const unsigned short* weight";
+
+pub const dense_f32 =
+    fill(dense_scalar_src, .{ .name = "termite_linear_f32", .sig = sigText(&([_][]const u8{ dst, input, f32_weight } ++ shape)), .init = "0.0f" }) ++ "\n" ++
+    fill(dense_scalar_src, .{ .name = "termite_linear_bias_f32", .sig = sigText(&([_][]const u8{ dst, input, f32_weight, bias } ++ shape)), .init = "bias[col]" }) ++ "\n" ++
+    fillAll(dense_tiled_src, .{
+        .{ .name = "termite_linear_f32_tiled", .sig = sigText(&([_][]const u8{ dst, input, f32_weight } ++ shape)), .comment = "", .load_open = "", .load_close = "" },
+        .{ .name = "termite_linear_bf16_weight_f32_tiled", .sig = sigText(&([_][]const u8{ dst, input, u16_weight } ++ shape)), .comment = "", .load_open = "termite_bf16_to_f32(", .load_close = ")" },
+        .{
+            .name = "termite_linear_f16_weight_f32_tiled",
+            .sig = sigText(&([_][]const u8{ dst, input, u16_weight } ++ shape)),
+            .comment =
+            \\// Compatibility route for native FP16 encoder weights when cuBLASLt cannot
+            \\// produce or execute an algorithm for a newly introduced dense shape. This is
+            \\// intentionally simple and universally shaped: qualified tensor-core plans
+            \\// remain the fast path, while an unsupported heuristic degrades to correct
+            \\// device-resident execution instead of failing the request.
+            \\
+            ,
+            .load_open = "__half2float(__ushort_as_half(",
+            .load_close = "))",
+        },
+    });
+
+// ---------------------------------------------------------------- Q4_K rows
+
+/// Q4_K linear without tiles: one output per thread (`scalar`) or per
+/// 256-thread block (`tiled`), optionally over 2-3 projections that share
+/// the input (`proj`, the projection picked from the flat index).
+const q4_k_scalar_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    \\?!proj     unsigned int total = rows * out_dim;
+    \\?!proj     if (idx >= total) return;
+    \\?!proj     unsigned int row = idx / out_dim;
+    \\?!proj     unsigned int col = idx - row * out_dim;
+    \\?proj     unsigned int plane = rows * out_dim;
+    \\?proj     unsigned int total = plane * $(count)u;
+    \\?proj     if (idx >= total) return;
+    \\?proj     unsigned int projection = idx / plane;
+    \\?proj     unsigned int local = idx - projection * plane;
+    \\?proj     unsigned int row = local / out_dim;
+    \\?proj     unsigned int col = local - row * out_dim;
+    \\?proj $(select)
+    \\    unsigned int row_blocks = in_dim / 256u;
+    \\    float acc = $(init);
+    \\    for (unsigned int block = 0; block < row_blocks; ++block) {
+    \\        const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
+    \\        for (unsigned int i = 0; i < 256u; ++i) {
+    \\            acc += input[row * in_dim + block * 256u + i] * termite_q4k_value(bp, i);
+    \\        }
+    \\    }
+    \\    dst[$(out)] = acc;
+    \\}
+    \\
+;
+
+const q4_k_tiled_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\?!proj     unsigned int out_idx = blockIdx.x;
+    \\?!proj     unsigned int total = rows * out_dim;
+    \\?!proj     if (out_idx >= total) return;
+    \\?!proj     unsigned int row = out_idx / out_dim;
+    \\?!proj     unsigned int col = out_idx - row * out_dim;
+    \\?proj     unsigned int plane = rows * out_dim;
+    \\?proj     unsigned int global = blockIdx.x;
+    \\?proj     if (global >= plane * $(count)u) return;
+    \\?proj     unsigned int projection = global / plane;
+    \\?proj     unsigned int local = global - projection * plane;
+    \\?proj     unsigned int row = local / out_dim;
+    \\?proj     unsigned int col = local - row * out_dim;
+    \\?proj $(select)
+    \\    unsigned int row_blocks = in_dim / 256u;
+    \\    unsigned int tid = threadIdx.x;
+    \\    __shared__ float partial[256];
+    \\    float acc = 0.0f;
+    \\    if (tid < 256u) {
+    \\        for (unsigned int block = 0; block < row_blocks; ++block) {
+    \\            const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
+    \\            acc += input[row * in_dim + block * 256u + tid] * termite_q4k_value(bp, tid);
+    \\        }
+    \\        partial[tid] = acc;
+    \\    }
+    \\    __syncthreads();
+    \\    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+    \\        if (tid < stride) partial[tid] += partial[tid + stride];
+    \\        __syncthreads();
+    \\    }
+    \\    if (tid == 0u) $(store)
+    \\}
+    \\
+;
+
+/// Signature and per-projection selects of a 2- or 3-way projection kernel.
+fn projSig(comptime count: usize) []const u8 {
+    const suffix = [_][]const u8{ "_a", "_b", "_c" };
+    var sig: []const []const u8 = &.{};
+    for (suffix[0..count]) |sx| sig = sig ++ .{"float* dst" ++ sx};
+    sig = sig ++ .{input};
+    for (suffix[0..count]) |sx| sig = sig ++ .{ weight ++ sx, bias ++ sx };
+    return sigText(sig ++ shape);
+}
+
+fn projSelect(comptime count: usize) []const u8 {
+    const suffix = [_][]const u8{ "_a", "_b", "_c" };
+    return "    const unsigned char* weight = " ++ select("weight", suffix[0..count]) ++ ";\n" ++
+        "    const float* bias = " ++ select("bias", suffix[0..count]) ++ ";\n" ++
+        "    float* dst = " ++ select("dst", suffix[0..count]) ++ ";";
+}
+
+const q4_k_sig = sigText(&linear_sig);
+const q4_k_bias_sig = sigText(&([_][]const u8{ dst, input, weight, bias } ++ shape));
+
+pub const q4_k_rows =
+    fill(q4_k_scalar_src, .{ .name = "termite_linear_q4_k_f32", .sig = q4_k_sig, .proj = false, .init = "0.0f", .out = "idx" }) ++ "\n" ++
+    fill(q4_k_scalar_src, .{ .name = "termite_linear_q4_k_bias_f32", .sig = q4_k_bias_sig, .proj = false, .init = "bias[col]", .out = "idx" }) ++ "\n" ++
+    fillAll(q4_k_tiled_src, .{
+        .{ .name = "termite_linear_q4_k_f32_tiled", .sig = q4_k_sig, .proj = false, .store = "dst[out_idx] = partial[0];" },
+        .{ .name = "termite_linear_q4_k_bias_f32_tiled", .sig = q4_k_bias_sig, .proj = false, .store = "dst[out_idx] = partial[0] + bias[col];" },
+        .{ .name = "termite_linear_q4_k_bias_quick_gelu_f32_tiled", .sig = q4_k_bias_sig, .proj = false, .store =
+        \\{
+        \\        float x = partial[0] + bias[col];
+        \\        dst[out_idx] = x / (1.0f + expf(-1.702f * x));
+        \\    }
+        },
+    }) ++ "\n" ++
+    fill(q4_k_scalar_src, .{ .name = "termite_linear_q4_k_triple_bias_f32", .sig = projSig(3), .proj = true, .count = "3", .select = projSelect(3), .init = "bias[col]", .out = "local" }) ++ "\n" ++
+    fillAll(q4_k_tiled_src, .{
+        .{ .name = "termite_linear_q4_k_triple_bias_f32_tiled", .sig = projSig(3), .proj = true, .count = "3", .select = projSelect(3), .store = "dst[local] = partial[0] + bias[col];" },
+        .{ .name = "termite_linear_q4_k_pair_bias_f32_tiled", .sig = projSig(2), .proj = true, .count = "2", .select = projSelect(2), .store = "dst[local] = partial[0] + bias[col];" },
+    });
+
+// ---------------------------------------------------------------- K-quant tile4
+
+/// Four output columns per block over 256-value Q4_K / Q6_K super-blocks,
+/// optionally of a gated activation `act(gate) * up` instead of `input`.
+const k_tile4_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    unsigned int col_tile = blockIdx.x * 4u;
+    \\    unsigned int row = blockIdx.y;
+    \\    if (row >= rows) return;
+    \\    unsigned int tid = threadIdx.x;
+    \\    unsigned int row_blocks = in_dim / 256u;
+    \\    __shared__ float partial[4][256];
+    \\    float acc[4];
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    \\    if (tid < 256u) {
+    \\        for (unsigned int block = 0; block < row_blocks; ++block) {
+    \\            unsigned int input_idx = row * in_dim + block * 256u + tid;
+    \\            float x = $(x);
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0; c < 4u; ++c) {
+    \\                unsigned int col = col_tile + c;
+    \\                if (col < out_dim) {
+    \\                    const unsigned char* bp = weight + (col * row_blocks + block) * $(bytes)u;
+    \\                    acc[c] += x * $(value)(bp, tid);
+    \\                }
+    \\            }
+    \\        }
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    \\    }
+    \\    __syncthreads();
+    \\    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+    \\        if (tid < stride) {
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+    \\        }
+    \\        __syncthreads();
+    \\    }
+    \\    if (tid == 0u) {
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\            if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+const gated_x = "termite_decoder_activation_f32(gate[input_idx], activation) * up[input_idx]";
+
+pub const k_quant_tile4 = fillAll(k_tile4_src, .{
+    .{ .name = "termite_linear_q6_k_f32_tile4", .sig = sigText(&linear_sig), .x = "input[input_idx]", .bytes = "210", .value = "termite_q6k_value" },
+    .{ .name = "termite_linear_q4_k_gated_down_f32_tile4", .sig = sigText(&gated_down_sig), .x = gated_x, .bytes = "144", .value = "termite_q4k_value" },
+    .{ .name = "termite_linear_q6_k_gated_down_f32_tile4", .sig = sigText(&gated_down_sig), .x = gated_x, .bytes = "210", .value = "termite_q6k_value" },
+});
+
+// ---------------------------------------------------------------- argmax stage 1
+
+/// Fused linear + argmax first stage over 4-column tiles: the last row
+/// (`termite_*_argmax_stage1_tile4`) or every row (`*_rows_*`, blockIdx.x =
+/// row * col_tiles + tile), skipping suppressed token ids. One partial
+/// (value, index) per block.
+const argmax_stage1_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    const unsigned int cols = 4u;
+    \\?!rows     unsigned int tile = blockIdx.x;
+    \\?rows     unsigned int col_tiles = (out_dim + cols - 1u) / cols;
+    \\?rows     unsigned int global_tile = blockIdx.x;
+    \\?rows     unsigned int row = col_tiles == 0u ? 0u : global_tile / col_tiles;
+    \\?rows     unsigned int tile = col_tiles == 0u ? 0u : global_tile - row * col_tiles;
+    \\    unsigned int col_tile = tile * cols;
+    \\    unsigned int tid = threadIdx.x;
+    \\?!rows     unsigned int row = rows == 0u ? 0u : rows - 1u;
+    \\    unsigned int row_blocks = in_dim / $(block)u;
+    \\    __shared__ float partial[4][256];
+    \\    float acc[4];
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    \\
+    \\$(loop)    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    \\    __syncthreads();
+    \\    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+    \\        if (tid < stride) {
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+    \\        }
+    \\        __syncthreads();
+    \\    }
+    \\    if (tid == 0u) {
+    \\        float best_value = -3.402823466e+38f;
+    \\        unsigned int best_index = 0xffffffffu;
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\?!rows             if (col >= out_dim) continue;
+    \\?rows             if (row >= rows || col >= out_dim) continue;
+    \\            bool suppressed = false;
+    \\            for (unsigned int j = 0; j < suppress_count; ++j) {
+    \\                int token_id = suppress_token_ids[j];
+    \\                if (token_id >= 0 && (unsigned int)token_id == col) {
+    \\                    suppressed = true;
+    \\                    break;
+    \\                }
+    \\            }
+    \\            if (suppressed) continue;
+    \\            float value = partial[c][0];
+    \\            if (value > best_value || (value == best_value && col < best_index)) {
+    \\                best_value = value;
+    \\                best_index = col;
+    \\            }
+    \\        }
+    \\        partial_values[$(tile)] = best_value;
+    \\        partial_indices[$(tile)] = best_index;
+    \\    }
+    \\}
+    \\
+;
+
+/// The input · weight accumulation into acc[4] of one row.
+const q8_0_cols4_loop =
+    \\for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+    \\    float x = input[row * in_dim + i];
+    \\    unsigned int block = i / 32u;
+    \\    unsigned int lane = i - block * 32u;
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) {
+    \\        unsigned int col = col_tile + c;
+    \\        if (col < out_dim) {
+    \\            const unsigned char* bp = weight + (col * row_blocks + block) * 34u;
+    \\            acc[c] += x * termite_q8_0_value(bp, lane);
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+const q4_k_cols4_loop =
+    \\for (unsigned int block = 0; block < row_blocks; ++block) {
+    \\    float x = input[row * in_dim + block * 256u + tid];
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) {
+    \\        unsigned int col = col_tile + c;
+    \\        if (col < out_dim) {
+    \\            const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
+    \\            acc[c] += x * termite_q4k_value(bp, tid);
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+/// Prefixes every line of `text` with `prefix`.
+fn indent(comptime prefix: []const u8, comptime text: []const u8) []const u8 {
+    @setEvalBranchQuota(1_000_000);
+    var out: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, text[0 .. text.len - 1], '\n');
+    while (lines.next()) |l| out = out ++ prefix ++ l ++ "\n";
+    return out;
+}
+
+fn argmaxStage1(comptime quant: []const u8, comptime block: []const u8, comptime loop: []const u8, comptime rows_variant: bool) struct {
+    name: []const u8,
+    sig: []const u8,
+    rows: bool,
+    block: []const u8,
+    loop: []const u8,
+    tile: []const u8,
+} {
+    return .{
+        .name = "termite_linear_" ++ quant ++ (if (rows_variant) "_argmax_rows_stage1_tile4" else "_argmax_stage1_tile4"),
+        .sig = sigText(&argmax_sig),
+        .rows = rows_variant,
+        .block = block,
+        .loop = if (rows_variant) "    if (row < rows) {\n" ++ indent("        ", loop) ++ "    }\n" else indent("    ", loop),
+        .tile = if (rows_variant) "global_tile" else "tile",
+    };
+}
+
+pub const argmax_stage1 = fillAll(argmax_stage1_src, .{
+    argmaxStage1("q8_0", "32", q8_0_cols4_loop, false),
+    argmaxStage1("q4_k", "256", q4_k_cols4_loop, false),
+    argmaxStage1("q8_0", "32", q8_0_cols4_loop, true),
+    argmaxStage1("q4_k", "256", q4_k_cols4_loop, true),
 });
