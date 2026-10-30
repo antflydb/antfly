@@ -1,10 +1,12 @@
 #include "../../gpu/depthwise_program.h"
+#include "../../gpu/masked_pool_program.h"
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include "rotary_frequency_training.cuh"
 #include "row_program.cuh"
+#include "prefix_normalization_program.cuh"
 
 // Bidirectional BF16 encoder programs retain unscaled FP32 attention.
 // Decoder causal attention uses a different score scale and schedule.
@@ -181,10 +183,11 @@ extern "C" __global__ void termite_embedding_gemma2_training_rms_norm_bf16(
     float sum=((s0+s1)+s2)+s3;
     __shared__ float shared[512], inv[16];
     unsigned int lane=threadIdx.x, offset=threadIdx.y*blockDim.x;
-    shared[offset+lane]=sum;
-    for (unsigned int d=blockDim.x/2; d>=32; d>>=1) { __syncthreads(); if(lane<d) shared[offset+lane]+=shared[offset+lane+d]; }
-    sum=shared[offset+lane];
-    for (int d=16;d>0;d>>=1) sum+=__shfl_down_sync(0xffffffffu,sum,d);
+    ANTFLY_CUDA_TRAINING_FOLD(
+        shared[offset+lane]=sum;,
+        shared[offset+lane]+=shared[offset+lane+d];,
+        sum=shared[offset+lane];,
+        sum+=__shfl_down_sync(0xffffffffu,sum,d);)
     if(lane==0) inv[threadIdx.y]=rsqrtf(sum/(float)width+eps);
     __syncthreads();
     for(unsigned int i=lane;i<width;i+=blockDim.x){
@@ -251,10 +254,11 @@ extern "C" __global__ void termite_embedding_gemma2_training_rms_norm_input_vjp_
     float square=((q0+q1)+q2)+q3, dot=((d0+d1)+d2)+d3;
     __shared__ float ss[512],ds[512],inv[16],dmean[16];
     unsigned int lane=threadIdx.x,off=threadIdx.y*blockDim.x;
-    ss[off+lane]=square;ds[off+lane]=dot;
-    for(unsigned int d=blockDim.x/2;d>=32;d>>=1){__syncthreads();if(lane<d){ss[off+lane]+=ss[off+lane+d];ds[off+lane]+=ds[off+lane+d];}}
-    square=ss[off+lane];dot=ds[off+lane];
-    for(int d=16;d>0;d>>=1){square+=__shfl_down_sync(0xffffffffu,square,d);dot+=__shfl_down_sync(0xffffffffu,dot,d);}
+    ANTFLY_CUDA_TRAINING_FOLD(
+        ss[off+lane]=square;ds[off+lane]=dot;,
+        ss[off+lane]+=ss[off+lane+d];ds[off+lane]+=ds[off+lane+d];,
+        square=ss[off+lane];dot=ds[off+lane];,
+        square+=__shfl_down_sync(0xffffffffu,square,d);dot+=__shfl_down_sync(0xffffffffu,dot,d);)
     if(lane==0){float mean_eps=square/(float)width+eps;inv[threadIdx.y]=rsqrtf(mean_eps);dmean[threadIdx.y]=((dot*-0.5f)*powf(mean_eps,-1.5f))/(float)width;}
     __syncthreads();
     for(unsigned int i=lane;i<width;i+=blockDim.x){
@@ -1007,106 +1011,6 @@ extern "C" __global__ void termite_embedding_gemma2_unpack_bhsd_f32_bf16(
     antfly_reorder_heads<__nv_bfloat16,float,true>(out, input, batch, sequence, heads, dim);
 }
 
-// ATen's contiguous vector_norm/SumOps reduction uses four accumulators
-// per lane, then combines lanes in a width-dependent block tree. Squared
-// values use FMA; materialized DivBackward values use plain FP32 addition.
-__device__ __forceinline__ unsigned int eg2_training_reduction_lanes(
-    unsigned int width, unsigned int rows) {
-    unsigned int vectors = 1, outputs = 1;
-    while (vectors < 128 && vectors * 2 <= width / 4) vectors *= 2;
-    while (outputs <= rows / 2) outputs *= 2;
-    // ReduceConfig reserves output lanes before expanding reduction lanes.
-    unsigned int lanes = vectors < 32 ? vectors : 32;
-    unsigned int height = outputs < 512 / lanes ? outputs : 512 / lanes;
-    lanes = vectors < 512 / height ? vectors : 512 / height;
-    return lanes < 32 ? 32 : lanes;
-}
-
-__device__ __forceinline__ float eg2_training_reduce_four(
-    const float* values, unsigned int lanes) {
-    __shared__ float partials[128];
-    unsigned int lane = threadIdx.x;
-    float value = __fadd_rn(__fadd_rn(__fadd_rn(values[0], values[1]), values[2]), values[3]);
-    if (lane < lanes) partials[lane] = value;
-    __syncthreads();
-    for (unsigned int offset = lanes / 2; offset >= 32; offset >>= 1) {
-        if (lane < offset) {
-            value = __fadd_rn(value, partials[lane + offset]);
-            partials[lane] = value;
-        }
-        __syncthreads();
-    }
-    if (lane < 32) {
-        value = antfly_row_warp_sum(value);
-        if (lane == 0) partials[0] = value;
-    }
-    __syncthreads();
-    return partials[0];
-}
-
-__device__ __forceinline__ float eg2_training_vector_norm(
-    const float* input, unsigned int row, unsigned int width, unsigned int rows) {
-    const unsigned int lanes = eg2_training_reduction_lanes(width, rows);
-    float values[4] = {0, 0, 0, 0};
-    if (threadIdx.x < lanes) {
-        for (unsigned int vector = threadIdx.x; vector * 4 < width; vector += lanes) {
-            #pragma unroll
-            for (unsigned int i = 0; i < 4; ++i) {
-                unsigned int d = vector * 4 + i;
-                if (d < width) {
-                    float value = input[(size_t)row * 768 + d];
-                    values[i] = __fmaf_rn(value, value, values[i]);
-                }
-            }
-        }
-    }
-    return sqrtf(eg2_training_reduce_four(values, lanes));
-}
-
-extern "C" __global__ void termite_embedding_gemma2_mrl_normalize_f32(
-    float* out, const float* input, unsigned int rows, unsigned int width) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    float norm = fmaxf(eg2_training_vector_norm(input, row, width, rows), 1.0e-12f);
-    for (unsigned int d = threadIdx.x; d < width; d += blockDim.x)
-        out[(size_t)row * width + d] = __fdiv_rn(input[(size_t)row * 768 + d], norm);
-}
-
-extern "C" __global__ void termite_embedding_gemma2_mrl_normalize_vjp_f32(
-    float* dinput, const float* dout, const float* input,
-    unsigned int rows, unsigned int width, float objective_weight) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    float raw_norm = eg2_training_vector_norm(input, row, width, rows);
-    float norm = fmaxf(raw_norm, 1.0e-12f);
-    const unsigned int lanes = eg2_training_reduction_lanes(width, rows);
-    float values[4] = {0, 0, 0, 0};
-    if (threadIdx.x < lanes) {
-        for (unsigned int vector = threadIdx.x; vector * 4 < width; vector += lanes) {
-            #pragma unroll
-            for (unsigned int i = 0; i < 4; ++i) {
-                unsigned int d = vector * 4 + i;
-                if (d < width) {
-                    float ratio = __fdiv_rn(input[(size_t)row * 768 + d], norm);
-                    ratio = __fdiv_rn(ratio, norm);
-                    float product = __fmul_rn(dout[(size_t)row * width + d], ratio);
-                    float other = __fsub_rn(0.0f, product);
-                    values[i] = __fadd_rn(values[i], other);
-                }
-            }
-        }
-    }
-    float norm_gradient = eg2_training_reduce_four(values, lanes);
-    if (raw_norm < 1.0e-12f) norm_gradient = 0.0f;
-    for (unsigned int d = threadIdx.x; d < width; d += blockDim.x) {
-        size_t full = (size_t)row * 768 + d;
-        float direct = __fdiv_rn(dout[(size_t)row * width + d], norm);
-        float ratio = raw_norm > 0.0f ? __fdiv_rn(input[full], raw_norm) : 0.0f;
-        float value = __fadd_rn(direct, __fmul_rn(norm_gradient, ratio));
-        dinput[full] = __fadd_rn(dinput[full], __fmul_rn(objective_weight, value));
-    }
-}
-
 // Retain the mean and normalization division boundaries used by the training
 // graph. Frozen inference continues to use its separately qualified kernel.
 __device__ __forceinline__ float eg2_training_masked_mean(
@@ -1140,7 +1044,7 @@ __device__ __forceinline__ float eg2_training_masked_mean(
 __device__ __forceinline__ float eg2_training_mean_norm(
     const __nv_bfloat16* projected, const long long* mask, unsigned int b,
     unsigned int sequence, unsigned int width, unsigned int count, unsigned int batch) {
-    const unsigned int lanes = eg2_training_reduction_lanes(width, batch);
+    const unsigned int lanes = antfly_four_lane_reduction_width(width, batch);
     float values[4] = {0, 0, 0, 0};
     if (threadIdx.x < lanes) {
         for (unsigned int vector = threadIdx.x; vector * 4 < width; vector += lanes) {
@@ -1154,7 +1058,7 @@ __device__ __forceinline__ float eg2_training_mean_norm(
             }
         }
     }
-    return sqrtf(eg2_training_reduce_four(values, lanes));
+    return sqrtf(antfly_four_lane_reduce(values, lanes));
 }
 
 extern "C" __global__ void termite_embedding_gemma2_training_mean_l2_f32(
@@ -1182,7 +1086,7 @@ extern "C" __global__ void termite_embedding_gemma2_mean_l2_vjp_f32(
         if (!mask || mask[(size_t)b * seq + s]) ++count;
     float raw_norm = eg2_training_mean_norm(projected, mask, b, seq, width, count, batch);
     float norm = fmaxf(raw_norm, 1.0e-12f);
-    const unsigned int lanes = eg2_training_reduction_lanes(width, batch);
+    const unsigned int lanes = antfly_four_lane_reduction_width(width, batch);
     float values[4] = {0, 0, 0, 0};
     if (threadIdx.x < lanes) {
         for (unsigned int vector = threadIdx.x; vector * 4 < width; vector += lanes) {
@@ -1198,7 +1102,7 @@ extern "C" __global__ void termite_embedding_gemma2_mean_l2_vjp_f32(
             }
         }
     }
-    float norm_gradient = eg2_training_reduce_four(values, lanes);
+    float norm_gradient = antfly_four_lane_reduce(values, lanes);
     if (raw_norm < 1.0e-12f) norm_gradient = 0.0f;
     for (unsigned int d = threadIdx.x; d < width; d += blockDim.x) {
         float mean = eg2_training_masked_mean(projected, mask, b, seq, width, d, count);
@@ -1262,9 +1166,8 @@ extern "C" __global__ void termite_embedding_gemma2_mean_l2_f32(
     float norm = 0.0f;
     for (unsigned int d = threadIdx.x; d < width; d += blockDim.x) {
         float sum = 0.0f, count = 0.0f;
-        for (unsigned int s = 0; s < seq; ++s) if (!mask || mask[(size_t)b * seq + s]) {
-            sum += __bfloat162float(projected[((size_t)b * seq + s) * width + d]); count += 1.0f;
-        }
+        sum = antfly_masked_column_sum<true,true,false,unsigned,size_t>(projected, mask,
+            0u, seq, width, d, 1.0f, count, (size_t)b * seq);
         float x = count > 0.0f ? sum / count : 0.0f;
         out[(size_t)b * width + d] = x; norm += x * x;
     }

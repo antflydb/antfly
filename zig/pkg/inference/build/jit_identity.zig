@@ -86,6 +86,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/kernel_math.zig",
         "src/ops/kernel_reduction.zig",
         "src/ops/gpu/depthwise_program.h",
+        "src/ops/gpu/masked_pool_program.h",
     };
     // Native includes and host ABI consumers affect qualification even when
     // the translation-unit text is unchanged. Declare the complete local
@@ -125,6 +126,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
         "src/ops/cuda/kernels/kernel_abi.cuh",
         "src/ops/cuda/kernels/row_program.cuh",
+        "src/ops/cuda/kernels/prefix_normalization_program.cuh",
         "src/ops/cuda/kernels/wmma_tile_program.cuh",
         "src/ops/cuda/kernels/rotary_program.cuh",
         "src/ops/cuda/kernels/encoder_multimodal_programs.cuh",

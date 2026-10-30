@@ -113,13 +113,8 @@ extern "C" __global__ void termite_embedding_gemma2_audio_segment_conv_f32(
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * dim) return;
     unsigned row = i / dim, col = i % dim, start = (unsigned)starts[row];
-    float sum = 0.0f;
-    for (unsigned k = 0; k < kernel_size; ++k) {
-        if (row + k < kernel_size - 1 + start) continue;
-        unsigned source = row + k - (kernel_size - 1);
-        sum += input[(size_t)source * dim + col] * weight[(size_t)k * dim + col];
-    }
-    out[i] = sum;
+    out[i] = antfly_causal_depthwise<false,false,false,false,0,unsigned,size_t>(
+        input, weight, nullptr, row, col, dim, kernel_size, 0, start);
 }
 
 // One block owns a complete head. RMS reduction and every BF16 conversion

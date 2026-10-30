@@ -252,6 +252,8 @@ required_symbols=(
   termite_embedding_gemma2_mean_l2_f32
   termite_embedding_gemma2_training_mean_l2_f32
   termite_embedding_gemma2_mean_l2_vjp_f32
+  antfly_prefix_l2_normalize_f32
+  antfly_prefix_l2_accumulate_vjp_f32
   termite_embedding_gemma2_mrl_normalize_f32
   termite_embedding_gemma2_mrl_normalize_vjp_f32
   termite_embedding_gemma2_pack_bshd_bf16_f32

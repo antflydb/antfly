@@ -3453,3 +3453,8 @@ reports, and real-device reference qualification of five entrypoints.
 [BF: CPU online attention row programs](unified-execution-bf-outcomes.md)
 records the closed three-schedule row owner, five-target original-function
 identity, CPU pipeline bitwise parity and paired hardware timing.
+
+[BG: prefix, pooling and training-row programs](unified-execution-bg-outcomes.md)
+records explicit prefix geometry, portable pooling/stencil policies, shared
+training/Q8 phases and physical CPU naming, with original-program qualification
+and the complete source cost of the new reusable APIs.

@@ -22,6 +22,7 @@
 #include "metal_compile_options.h"
 #include "metal_gdn_source.h"
 #include "../ops/gpu/depthwise_program.h"
+#include "../ops/gpu/masked_pool_program.h"
 // Use libdispatch's exported implementation: the SDK inline fast path's
 // completion-state assumption trips Zig 0.17's C sanitizer on macOS.
 #undef dispatch_once
@@ -7250,6 +7251,18 @@ static NSString *termite_metal_tensor_program_source(void) {
 
 // Dense Q16 phases keep single-head and paired-head storage and native schedules.
 // Direct-half and staged tails retain their original casts, strides and barriers.
+// Eight-query scalar SIMD tiles: admission, addressing, mask and publication
+// remain caller policies. Source phases preserve the tuned shader verbatim.
+#define ANTFLY_MSL_Q8_DOT "simd_sum(q0 * kv_tile[key][uint(lane)] + q1 * kv_tile[key][uint(lane) + 32u]) * 0.125f"
+#define ANTFLY_MSL_Q8_ACCUMULATE "acc0 += weight * kv_tile[key][uint(lane)]; acc1 += weight * kv_tile[key][uint(lane) + 32u];"
+#define ANTFLY_MSL_Q8_STAGED_LOOP(Limit,Stage,Consume) \
+    "    for (uint key_start = 0u; key_start < " Limit "; key_start += 32u) {\n" \
+    Stage \
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    Consume \
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
+    "    }\n"
+
 #define ANTFLY_MSL_DENSE_Q16_QK(Key,Query,StagedKey,Score) \
     "        for (uint rb = 0u; rb < 2u; ++rb) {\n" \
     "            simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" \
@@ -7297,7 +7310,7 @@ static NSString *termite_metal_tensor_program_source(void) {
     "for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, " Scale ", " Accumulator "); " Accumulator " = scaled; }"
 
 static NSString *termite_metal_shader_source(void) {
-    return [[NSString stringWithUTF8String:antfly_msl_depthwise_source] stringByAppendingString:@"#include <metal_stdlib>\n"
+    return [[[NSString stringWithUTF8String:antfly_msl_depthwise_source] stringByAppendingString:[NSString stringWithUTF8String:antfly_msl_masked_pool_source]] stringByAppendingString:@"#include <metal_stdlib>\n"
            "using namespace metal;\n"
            "#define TERMITE_FOR_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)\n"
            "struct termite_metal_linear_params { " TERMITE_METAL_LINEAR_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_linear_params) "};\n"
@@ -11461,7 +11474,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (tid == 0u) { float count = 0.0f; for (uint t = 0u; t < p.seq_len; ++t) count += mask[token_base + t] != 0u ? 1.0f : 0.0f; shmem[0] = count; }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    const float count = shmem[0]; const float inv_count = count > 0.0f ? 1.0f / count : 0.0f; float local_sq = 0.0f;\n"
-           "    for (uint d = tid; d < p.hidden_size; d += threads) { float sum = 0.0f; for (uint t = 0u; t < p.seq_len; ++t) { if (mask[token_base + t] != 0u) sum += hidden[(token_base + t) * p.hidden_size + d]; } const float mean = sum * inv_count; output[b * p.hidden_size + d] = mean; local_sq += mean * mean; }\n"
+           "    for (uint d = tid; d < p.hidden_size; d += threads) { float unused_count = 0.0f; float sum = antfly_masked_column_sum<false,false,false>(hidden, mask, token_base, token_base + p.seq_len, p.hidden_size, d, 1.0f, unused_count); const float mean = sum * inv_count; output[b * p.hidden_size + d] = mean; local_sq += mean * mean; }\n"
            "    shmem[tid] = local_sq; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    const float scale = (p.normalize != 0u && shmem[0] > 0.0f) ? rsqrt(shmem[0]) : 1.0f;\n"
@@ -13166,7 +13179,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_masked_mean_rows(device const float *input [[buffer(0)]], device const long *mask [[buffer(1)]], device float *output [[buffer(2)]], constant uint4 &p [[buffer(3)]], uint d [[thread_position_in_grid]]) {\n"
            "    if (d >= p.z) return;\n"
            "    float sum = 0.0f;\n"
-           "    for (uint r = 0; r < p.x; ++r) if (mask[r] != 0) sum += input[r * p.y + d] / float(p.w);\n"
+           "    float unused_count = 0.0f; sum = antfly_masked_column_sum<false,false,true>(input, mask, 0u, p.x, p.y, d, float(p.w), unused_count);\n"
            "    output[d] = sum;\n"
            "}\n"
            "kernel void termite_normalize_embedding(device float *values [[buffer(0)]], constant uint &dimensions [[buffer(1)]], uint t [[thread_index_in_threadgroup]], uint3 group [[threads_per_threadgroup]], uint3 row [[threadgroup_position_in_grid]]) {\n"
@@ -13808,20 +13821,18 @@ static NSString *termite_metal_shader_source(void) {
            "    const uint tile = tg.x & 31u; const uint tmp = tg.x >> 5u; const uint h = tmp % p.num_heads; const uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
            "    const uint qi = tile * 8u + uint(sgitg); const uint hidden = p.num_heads * 64u; const uint bh = b * p.num_heads + h; const uint q_base = p.layout == 1u ? (b * 256u + qi) * hidden + h * 64u : (bh * 256u + qi) * 64u;\n"
            "    const float q0 = q[q_base + uint(lane)]; const float q1 = q[q_base + uint(lane) + 32u]; threadgroup float scores[8][256]; threadgroup float kv_tile[32][64]; float max_score = -3.402823466e+38f;\n"
-           "    for (uint key_start = 0u; key_start < 256u; key_start += 32u) {\n"
+           ANTFLY_MSL_Q8_STAGED_LOOP("256u",
            "        for (uint element = uint(tid); element < 2048u; element += 256u) { uint key = key_start + element / 64u; uint d = element & 63u; uint src = p.layout == 1u ? (b * 256u + key) * hidden + h * 64u + d : (bh * 256u + key) * 64u + d; kv_tile[element / 64u][d] = k[src]; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint key = 0u; key < 32u; ++key) { float score = simd_sum(q0 * kv_tile[key][uint(lane)] + q1 * kv_tile[key][uint(lane) + 32u]) * 0.125f; max_score = max(max_score, score); if (lane == 0u) scores[sgitg][key_start + key] = score; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+           ,
+           "        for (uint key = 0u; key < 32u; ++key) { float score = " ANTFLY_MSL_Q8_DOT "; max_score = max(max_score, score); if (lane == 0u) scores[sgitg][key_start + key] = score; }\n"
+           )
            "    float denom = 0.0f; for (uint key = uint(lane); key < 256u; key += 32u) { float weight = exp(scores[sgitg][key] - max_score); scores[sgitg][key] = weight; denom += weight; } denom = simd_sum(denom);\n"
            "    float acc0 = 0.0f; float acc1 = 0.0f;\n"
-           "    for (uint key_start = 0u; key_start < 256u; key_start += 32u) {\n"
+           ANTFLY_MSL_Q8_STAGED_LOOP("256u",
            "        for (uint element = uint(tid); element < 2048u; element += 256u) { uint key = key_start + element / 64u; uint d = element & 63u; uint src = p.layout == 1u ? (b * 256u + key) * hidden + h * 64u + d : (bh * 256u + key) * 64u + d; kv_tile[element / 64u][d] = v[src]; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint key = 0u; key < 32u; ++key) { float weight = scores[sgitg][key_start + key]; acc0 += weight * kv_tile[key][uint(lane)]; acc1 += weight * kv_tile[key][uint(lane) + 32u]; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+           ,
+           "        for (uint key = 0u; key < 32u; ++key) { float weight = scores[sgitg][key_start + key]; " ANTFLY_MSL_Q8_ACCUMULATE " }\n"
+           )
            "    output[q_base + uint(lane)] = acc0 / denom; output[q_base + uint(lane) + 32u] = acc1 / denom;\n"
            "}\n"
            // Nomic v1.5 is sequence-major with head-dim 64. Process eight
@@ -13834,22 +13845,20 @@ static NSString *termite_metal_shader_source(void) {
            "    const uint query_tiles = p.seq_len >> 3u; const uint query_tile = tg.x % query_tiles; const uint tmp = tg.x / query_tiles; const uint h = tmp % p.num_heads; const uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
            "    const uint qi = query_tile * 8u + uint(sgitg); const uint hidden = p.num_heads * 64u; const uint q_base = (b * p.seq_len + qi) * hidden + h * 64u;\n"
            "    const float q0 = q[q_base + uint(lane)]; const float q1 = q[q_base + uint(lane) + 32u]; threadgroup float scores[8][128]; threadgroup float kv_tile[32][64]; const float neg_inf = -3.402823466e+38f; float max_score = neg_inf;\n"
-           "    for (uint key_start = 0u; key_start < p.seq_len; key_start += 32u) {\n"
+           ANTFLY_MSL_Q8_STAGED_LOOP("p.seq_len",
            "        const uint tile_keys = min(32u, p.seq_len - key_start); const uint tile_elements = tile_keys * 64u;\n"
            "        for (uint element = uint(tid); element < tile_elements; element += 256u) { const uint key = key_start + element / 64u; const uint d = element & 63u; kv_tile[element / 64u][d] = k[(b * p.seq_len + key) * hidden + h * 64u + d]; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint key = 0u; key < tile_keys; ++key) { float score = simd_sum(q0 * kv_tile[key][uint(lane)] + q1 * kv_tile[key][uint(lane) + 32u]) * 0.125f; const uint absolute_key = key_start + key; if (p.has_mask != 0u && mask[b * p.seq_len + absolute_key] == 0.0f) score = neg_inf; max_score = max(max_score, score); if (lane == 0u) scores[sgitg][absolute_key] = score; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+           ,
+           "        for (uint key = 0u; key < tile_keys; ++key) { float score = " ANTFLY_MSL_Q8_DOT "; const uint absolute_key = key_start + key; if (p.has_mask != 0u && mask[b * p.seq_len + absolute_key] == 0.0f) score = neg_inf; max_score = max(max_score, score); if (lane == 0u) scores[sgitg][absolute_key] = score; }\n"
+           )
            "    float denom = 0.0f; for (uint key = uint(lane); key < p.seq_len; key += 32u) { const float score = scores[sgitg][key]; const float weight = score > neg_inf ? exp(score - max_score) : 0.0f; scores[sgitg][key] = weight; denom += weight; } denom = simd_sum(denom);\n"
            "    float acc0 = 0.0f; float acc1 = 0.0f;\n"
-           "    for (uint key_start = 0u; key_start < p.seq_len; key_start += 32u) {\n"
+           ANTFLY_MSL_Q8_STAGED_LOOP("p.seq_len",
            "        const uint tile_keys = min(32u, p.seq_len - key_start); const uint tile_elements = tile_keys * 64u;\n"
            "        for (uint element = uint(tid); element < tile_elements; element += 256u) { const uint key = key_start + element / 64u; const uint d = element & 63u; kv_tile[element / 64u][d] = v[(b * p.seq_len + key) * hidden + h * 64u + d]; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint key = 0u; key < tile_keys; ++key) { const float weight = scores[sgitg][key_start + key]; acc0 += weight * kv_tile[key][uint(lane)]; acc1 += weight * kv_tile[key][uint(lane) + 32u]; }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+           ,
+           "        for (uint key = 0u; key < tile_keys; ++key) { const float weight = scores[sgitg][key_start + key]; " ANTFLY_MSL_Q8_ACCUMULATE " }\n"
+           )
            "    output[q_base + uint(lane)] = denom > 0.0f ? acc0 / denom : 0.0f; output[q_base + uint(lane) + 32u] = denom > 0.0f ? acc1 / denom : 0.0f;\n"
            "}\n"
            TERMITE_MSL_ABI_FLORENCE_WINDOW(termite_florence_window_pack_f32) "\n"

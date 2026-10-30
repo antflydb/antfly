@@ -36246,9 +36246,9 @@ fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.
     const wide = self.cache_embeddinggemma2_bf16_weights and request.queries >= 256 and
         (request.queries <= 512 or request.head_dim == 512);
     const out = short orelse if (wide and request.keys > 512)
-        try segmentAttentionForSession(native.EmbeddingGemma2SegmentAttentionGemm(1024), self, q_values, k_values, v_values, request)
+        try segmentAttentionForSession(native.WideSegmentAttentionGemm(1024), self, q_values, k_values, v_values, request)
     else if (wide)
-        try segmentAttentionForSession(native.EmbeddingGemma2SegmentAttentionGemm(512), self, q_values, k_values, v_values, request)
+        try segmentAttentionForSession(native.WideSegmentAttentionGemm(512), self, q_values, k_values, v_values, request)
     else
         try segmentAttentionForSession(native.SegmentAttentionGemm, self, q_values, k_values, v_values, request);
     const result = try self.makeOwnedBuf(out);
@@ -36266,7 +36266,7 @@ fn segmentAttentionGroupedOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *con
     const bytes = try std.math.mul(usize, try std.math.add(usize, try std.math.add(usize, output_count, head_scratch), 512 * 1024), @sizeOf(f32));
     if (bytes > request.workspace_limit_bytes) return null;
     const out = if (r.queries >= 256 and (r.queries <= 512 or r.head_dim == 512))
-        try groupedAttentionForSession(native.EmbeddingGemma2SegmentAttentionGemm(1024), self, q, k, v, request)
+        try groupedAttentionForSession(native.WideSegmentAttentionGemm(1024), self, q, k, v, request)
     else
         try groupedAttentionForSession(native.SegmentAttentionGemm, self, q, k, v, request);
     const result = try self.makeOwnedBuf(out);
@@ -48359,7 +48359,7 @@ test "embeddinggemma2 grouped portable shared KV scheduling benchmark" {
         for (0..4) |sample| {
             const start = platform.time.monotonicNs();
             const serial = if (rows >= 256 and (rows <= 512 or dim == 512))
-                try linalg.segmentAttentionGroupedHostWithGemmIo(native.EmbeddingGemma2SegmentAttentionGemm(1024), a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1)
+                try linalg.segmentAttentionGroupedHostWithGemmIo(native.WideSegmentAttentionGemm(1024), a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1)
             else
                 try linalg.segmentAttentionGroupedHostWithGemmIo(native.SegmentAttentionGemm, a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1);
             defer a.free(serial);

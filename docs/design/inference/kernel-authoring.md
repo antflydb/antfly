@@ -10,18 +10,22 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | Operation | Existing owner | Static choices to preserve |
 |---|---|---|
 | Causal depthwise stencil | `src/ops/gpu/depthwise_program.h` | Weight order, history, fixed/dynamic kernel size, activation, separate product rounding and index width |
+| Masked token-major pooling | `src/ops/gpu/masked_pool_program.h` | Mask optionality, independent coordinate/address widths, count ownership and per-term versus post-sum division; callers retain row normalization |
+| Prefix L2 normalization and accumulated VJP | `cuda/prefix_normalization.zig`, `kernels/prefix_normalization_program.cuh` | Explicit input stride, dense output, untouched gradient suffix, four-accumulator reduction, clamp and division boundaries; static 768-stride compatibility schedule |
 | Spatial depthwise residual | `src/ops/cuda/prototypes/vision_f16_programs.cu` | Native 3x3 traversal and explicit FMA/add boundaries |
 | Native CUDA WMMA score products | `src/ops/cuda/kernels/wmma_tile_program.cuh` | F16/BF16 storage, B layout, depth, pitches and caller-owned shared arrays/fragment scope |
-| Row statistics and normalization | `src/ops/cuda/kernels/row_program.cuh` | Warp/block, shared tree and fixed-256 warp-finish reductions; publication dtype |
+| Row statistics and normalization | `src/ops/cuda/kernels/row_program.cuh` | Warp/block, shared tree, four-accumulator training fold and fixed-256 warp-finish reductions; publication dtype |
 | Rotary products and axes | `src/ops/cuda/kernels/rotary_program.cuh` and Metal rotary helpers | Axis-local versus head-wide halves, product rounding, frequency evaluation and upper-product order |
 | MPP projection | `antfly_mpp_affine`, `antfly_mpp_split_projection`, `TERMITE_MSL_MPP_GATE_PROGRAM` in `metal_kernels.m` | Rows/columns, SIMD groups, split-K, projection planes, F32/BF16 storage and finite-gate epilogue |
 | Gated delta recurrence | `metal_gdn_source.h`, `prototypes/gated_delta_recurrent.cu` | Register/shared staging, history ownership, epsilon placement and state-update schedule |
 | Dense decoder tile attention | `ANTFLY_MSL_DENSE_Q16_*` and causal-score phases in `metal_kernels.m` | One/two-head ownership, direct half-device loads, staged tails and diagonal publication |
+| Eight-query scalar SIMD attention | `ANTFLY_MSL_Q8_*` in `metal_kernels.m` | Fixed-256 versus tail tiles, token/head-major layout, mask and zero-denominator policies; identical staged shader phases |
 | Vision tile attention | `ANTFLY_MSL_VISION64_*` phases in `metal_kernels.m` | Q16/Q32 geometry, half/full staging and Q-storage tail reuse |
 | Segmented inference tile attention | `ANTFLY_MSL_SEGMENT_*` phases in `metal_kernels.m` | Wide/blocked row ownership, 8/16-key MMA and softmax schedules, explicit scales and GQA storage |
 | Range/segment training attention | `range_attention_reference.zig`, `segment_training_attention.zig`, Metal segment fragments | Mask/control layout, replay/dropout, orientation, tile geometry and gradient ownership |
 | Relative training attention | `kernels/relative_attention_training.cuh`, `relative_attention_tensor_*` and the GPU training renderer | Relative terms, bucket layout, deterministic replay and distinct tensor-core schedules |
 | CPU online attention rows | `linalg.attention.updateOnlineRow` | Conditional/scalar/SIMD maxima, empty-tile handling, rescale guards, vector width and statistic read/store order |
+| Wide CPU segment GEMM | `native.WideSegmentAttentionGemm` | 512-query BLAS tile, explicit key reuse; model admission remains in adapters |
 | Dense projection admission | `dense_projection_policy.zig` | Workload, rows, output width, quant layout and packed-expert exclusion |
 
 Paths above are relative to `zig/pkg/inference`; Metal helpers live under

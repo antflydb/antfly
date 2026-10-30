@@ -127,3 +127,11 @@ __device__ __forceinline__ void antfly_row_layer_norm(
     const float inverse = rsqrtf(variance + eps);
     for (unsigned i = tid; i < width; i += threads) store(i, load(i), mean, inverse);
 }
+
+// Native source phase: preserve scalar liveness, plane interleaving and the
+// caller's block-y slice. Moving these planes into arrays changes VJP lowering.
+#define ANTFLY_CUDA_TRAINING_FOLD(Store,Reduce,Reload,Shuffle) \
+    Store \
+    for(unsigned int d=blockDim.x/2;d>=32;d>>=1){__syncthreads();if(lane<d){Reduce}} \
+    Reload \
+    for(int d=16;d>0;d>>=1){Shuffle}

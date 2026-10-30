@@ -142,8 +142,7 @@ pub const Module = struct {
     mean_l2: driver.CUfunction,
     training_mean_l2: driver.CUfunction,
     mean_l2_vjp: driver.CUfunction,
-    mrl_normalize: driver.CUfunction,
-    mrl_normalize_vjp: driver.CUfunction,
+    prefix_normalization: @import("prefix_normalization.zig").Program,
     stats_: Stats = .{},
 
     pub fn init(ctx: *Context) !Module {
@@ -216,8 +215,7 @@ pub const Module = struct {
             .mean_l2 = try function(ctx, m, "termite_embedding_gemma2_mean_l2_f32"),
             .training_mean_l2 = try function(ctx, m, "termite_embedding_gemma2_training_mean_l2_f32"),
             .mean_l2_vjp = try function(ctx, m, "termite_embedding_gemma2_mean_l2_vjp_f32"),
-            .mrl_normalize = try function(ctx, m, "termite_embedding_gemma2_mrl_normalize_f32"),
-            .mrl_normalize_vjp = try function(ctx, m, "termite_embedding_gemma2_mrl_normalize_vjp_f32"),
+            .prefix_normalization = try @import("prefix_normalization.zig").Program.init(ctx, m),
         };
     }
 
@@ -1359,29 +1357,18 @@ pub const Module = struct {
     }
     pub fn launchMrlNormalize(self: *Module, ctx: *Context, out: Buffer, input: Buffer, rows: u32, width: u32) !void {
         if (rows == 0 or rows > 384 or width == 0 or width > 768) return error.InvalidEmbeddingGemma2TrainingShape;
-        try require(input, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(out, try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32)));
-        var op = out.ptr;
-        var ip = input.ptr;
-        var r = rows;
-        var w = width;
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w) };
-        try launchShared(ctx, self.mrl_normalize, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 }, 8 * @sizeOf(f32));
-        self.stats_.launches += 1;
+        try self.launchPrefixNormalize(ctx, out, input, .{ .rows = rows, .width = width, .input_stride = 768 });
     }
     pub fn launchMrlNormalizeVjp(self: *Module, ctx: *Context, dinput: Buffer, dout: Buffer, input: Buffer, rows: u32, width: u32, objective_weight: f32) !void {
         if (rows == 0 or rows > 384 or width == 0 or width > 768 or !std.math.isFinite(objective_weight)) return error.InvalidEmbeddingGemma2TrainingShape;
-        try require(dinput, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(input, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(dout, try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32)));
-        var dip = dinput.ptr;
-        var dop = dout.ptr;
-        var ip = input.ptr;
-        var r = rows;
-        var w = width;
-        var weight = objective_weight;
-        var args = [_]?*anyopaque{ @ptrCast(&dip), @ptrCast(&dop), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w), @ptrCast(&weight) };
-        try launchShared(ctx, self.mrl_normalize_vjp, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 }, 16 * @sizeOf(f32));
+        try self.launchPrefixNormalizeVjp(ctx, dinput, dout, input, .{ .rows = rows, .width = width, .input_stride = 768 }, objective_weight);
+    }
+    pub fn launchPrefixNormalize(self: *Module, ctx: *Context, out: Buffer, input: Buffer, shape: @import("prefix_normalization.zig").Geometry) !void {
+        try self.prefix_normalization.normalize(ctx, out, input, shape);
+        self.stats_.launches += 1;
+    }
+    pub fn launchPrefixNormalizeVjp(self: *Module, ctx: *Context, dinput: Buffer, dout: Buffer, input: Buffer, shape: @import("prefix_normalization.zig").Geometry, objective_weight: f32) !void {
+        try self.prefix_normalization.accumulateVjp(ctx, dinput, dout, input, shape, objective_weight);
         self.stats_.launches += 1;
     }
     fn launch1d(self: *Module, ctx: *Context, f: driver.CUfunction, args: []?*anyopaque, n: usize) !void {

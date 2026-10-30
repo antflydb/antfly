@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 // One native causal stencil owner. Layout, history, activation and separate
-// product rounding are static; each caller retains its launch and storage ABI.
+// product rounding and independent coordinate/address widths are static; each caller retains its launch and storage ABI.
 #define ANTFLY_DEPTHWISE_PROGRAM \
-template<bool ChannelMajor,bool History,bool Silu,bool ExplicitMultiplyAdd,unsigned FixedKernel=0,typename Index> \
+template<bool ChannelMajor,bool History,bool Silu,bool ExplicitMultiplyAdd,unsigned FixedKernel=0,typename Index,typename Address=Index> \
 ANTFLY_GPU_FUNCTION float antfly_causal_depthwise(ANTFLY_GPU_DEVICE const float*input, \
     ANTFLY_GPU_DEVICE const float*weight,ANTFLY_GPU_DEVICE const float*history, \
     Index time,unsigned channel,unsigned channels,unsigned kernel_size,unsigned initialized,unsigned start=0){ \
@@ -12,9 +12,11 @@ ANTFLY_GPU_FUNCTION float antfly_causal_depthwise(ANTFLY_GPU_DEVICE const float*
     for(unsigned k=0;k<size;++k){ \
         Index padded=time+Index(k); \
         if constexpr(!History){if(padded<Index(size-1)+Index(start))continue;} \
-        float x=padded>=Index(size-1)?input[(padded-Index(size-1))*channels+channel]: \
-            (initialized?history[Index(channel)*size+padded+1]:0.0f); \
-        float w=weight[ChannelMajor?Index(channel)*size+k:Index(k)*channels+channel]; \
+        float x; \
+        if constexpr(!History)x=input[Address(padded-Index(size-1))*channels+channel]; \
+        else x=padded>=Index(size-1)?input[Address(padded-Index(size-1))*channels+channel]: \
+            (initialized?history[Address(channel)*size+padded+1]:0.0f); \
+        float w=weight[ChannelMajor?Address(channel)*size+k:Address(k)*channels+channel]; \
         if constexpr(ExplicitMultiplyAdd)sum=ANTFLY_GPU_MADD(sum,x,w); \
         else sum+=x*w; \
     } \
