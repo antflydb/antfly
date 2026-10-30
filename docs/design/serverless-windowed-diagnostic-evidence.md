@@ -139,3 +139,14 @@ three paired hour trials and 100 physical-cold epochs. Actual placement and
 live-provider ingestion/load remain unqualified. A recovered live
 `SQLITE_NOMEM` remains a failing diagnostic; these changes do not fix the
 provider's internal SQLite allocator.
+
+The committed implementation `9a943f5168` passes 461 Node tests and four focused
+actual-workerd integration tests. The separate packed/deferred 50,000-record
+native regression passes with zero allocator leaks. Its binary, source, logs,
+failed local attempts and verifier are sealed in 37 artifacts / 15,064,285 bytes
+at `dist/qualification/windowed-evidence-1793375934794/evidence.json`, SHA-256
+`9fd6d6f3ad7efcadd6e4e1d12dea828431d5e9995432e0fee797a107f8e3109a`.
+All 249 artifacts in the two preceding compact-serving closures were also
+reverified without changes. The older, separately documented 163-artifact
+availability gap remains. Guarded `make gc` deferred cleanup while native builds
+were active or process inspection was unavailable; no guard was overridden.
