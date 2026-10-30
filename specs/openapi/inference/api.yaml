@@ -3805,6 +3805,23 @@ components:
             including backend, supported features and min/max geometry.
             Runtime admission revalidates artifact identity and resource limits.
             Omitted for artifacts without a qualification receipt.
+        compatibility:
+          type: string
+          enum: [compatible, unknown, incompatible]
+          description: |
+            Whether this artifact can run in the current build. `incompatible`
+            artifacts are rejected before load; a model whose directory cannot
+            be read is listed as `incompatible` with `error` set.
+        error:
+          type: object
+          description: Why the model is unusable, set when its directory could not be read. Other models still list.
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Error identifier, for example `MissingGlinerSpanEncoderConfig`.
+            message:
+              type: string
         capabilities:
           type: array
           items:

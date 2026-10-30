@@ -24133,6 +24133,19 @@ export interface components {
             qualified_limits?: {
                 [key: string]: unknown;
             };
+            /**
+             * @description Whether this artifact can run in the current build. `incompatible`
+             *     artifacts are rejected before load; a model whose directory cannot
+             *     be read is listed as `incompatible` with `error` set.
+             * @enum {string}
+             */
+            compatibility?: "compatible" | "unknown" | "incompatible";
+            /** @description Why the model is unusable, set when its directory could not be read. Other models still list. */
+            error?: {
+                /** @description Error identifier, for example `MissingGlinerSpanEncoderConfig`. */
+                code: string;
+                message: string;
+            };
             /** @description List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring. */
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
