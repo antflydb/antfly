@@ -2326,6 +2326,22 @@ test "capi SQL native read intent avoids allocator proofs with exclusive locking
     store.maintenance_policy.options.capacity_probe = null;
     store.disk_admission_limit = null;
     try std.testing.expect((try store.file.allocatorStats()).?.reusable_pages > 256);
+    // Catalog cache locking is exclusive, but listing/opening existing tables
+    // is a read operation. SDK opens must not demand whole-file reuse proofs.
+    const tables = @import("tables.zig");
+    try Check.ok(tables.antfly_db_list_tables_json(id, &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    try std.testing.expect(!owner.allocator_verification_started);
+    var table: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("seed_numbers"), &table));
+    defer api.antfly_db_close(table);
+    try std.testing.expect(!owner.allocator_verification_started);
+    var timestamp: u64 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_timestamp(table, .fromSlice("seed"), &timestamp));
+    try Check.ok(api.antfly_db_lookup_json(table, .fromSlice("seed"), &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    try std.testing.expect(!owner.allocator_verification_started);
+
     var session: u64 = 0;
     try Check.ok(@import("sql_session.zig").antfly_db_sql_session_open(id, &session), output, @src().line);
     for ([_][]const u8{
