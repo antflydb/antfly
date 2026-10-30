@@ -100,7 +100,9 @@ def test_gateway_uses_server_credential_for_readiness_and_search_and_bounds_rate
         t.start()
     try:
         root = f"http://127.0.0.1:{gateway.server_port}"
-        with urlopen(root + "/readyz") as response:
+        with urlopen(root + "/health") as response:
+            assert json.load(response) == {"ok": True}
+        with urlopen(root + "/ready") as response:
             assert json.load(response) == {"ready": True}
         with urlopen(root + "/readyz") as response:
             assert json.load(response) == {"ready": True}

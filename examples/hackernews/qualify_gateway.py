@@ -121,7 +121,7 @@ def main():
     ):
         parser.error("Resume requires successful evidence for this gateway and image")
     save(args.output, record)
-    for route in ("/healthz", "/readyz"):
+    for route in ("/health", "/ready"):
         result, evidence = probe(base, route, None, authorization)
         record["checks"].append({"route": route, **evidence})
         save(args.output, record)

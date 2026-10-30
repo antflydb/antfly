@@ -29,7 +29,10 @@ def test_separate_object_tables_and_scoped_cloud_keys():
     for name in ("archive-table.json", "current-table.json"):
         assert tables[name]["storage"] == {"engine": "object"}
         assert "num_shards" not in tables[name]
-        assert tables[name]["indexes"]["body_text"]["field"] == "body"
+        assert tables[name]["indexes"]["body_text"] == {
+            "type": "full_text",
+            "store_source": True,
+        }
         props = tables[name]["schema"]["document_schemas"]["row"]["schema"][
             "properties"
         ]
@@ -68,13 +71,13 @@ def test_separate_object_tables_and_scoped_cloud_keys():
         native_plan("antfly-showcases", "invalid", current)
 
 
-def test_first_boot_uses_exact_rc6_and_rejects_stale_or_unverified_images():
+def test_first_boot_uses_exact_rc7_and_rejects_stale_or_unverified_images():
     request = management_plan("antfly-showcases")["create-instance.json"]
     assert (
         request["tier"] == "standard"
     )  # Starter forbids the supplied custom capacity.
     assert request["initial_runtime"] == {
-        "version": "v0.3.0-rc.6",
+        "version": "v0.3.0-rc.7",
         "image": RUNTIME["image"],
         "image_digest": RUNTIME["image"].split("@")[1],
     }
@@ -92,7 +95,7 @@ def test_first_boot_uses_exact_rc6_and_rejects_stale_or_unverified_images():
         "ghcr.io/antflydb/antfly@sha256:" + "a" * 64,
         "ghcr.io/antflydb/antfly:v0.3.0-rc.5@" + digest,
     ):
-        with pytest.raises(ValueError, match="RC.6"):
+        with pytest.raises(ValueError, match="RC.7"):
             management_plan("antfly-showcases", image)
 
 
