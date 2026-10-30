@@ -15,6 +15,25 @@
 
 //! Generated kernel regions of the `reduce` families.
 
-const Region = @import("../region.zig").Region;
+const r = @import("../region.zig");
+const gather = @import("../reduce_gather.zig");
+const rope = @import("../reduce_rope.zig");
+const rows = @import("../reduce_rows.zig");
+const sample = @import("../reduce_sample.zig");
 
-pub const regions = [_]Region{};
+fn metal(comptime family: []const u8, comptime msl: []const u8) r.Region {
+    return r.metal(family, r.metalLines(r.metal_indent, msl));
+}
+
+pub const regions = [_]r.Region{
+    metal("reduce.embedding_lookup", gather.metalRegion()),
+    r.cuda("reduce.embedding_lookup", gather.cudaRegion()),
+    r.cuda("reduce.rope", rope.cudaRegion()),
+    metal("reduce.rope", rope.metalRegion()),
+    metal("reduce.rows", rows.rowsRegion()),
+    metal("reduce.scan", rows.scanRegion()),
+    metal("reduce.qwen35_norm", rows.qwen35NormRegion()),
+    metal("reduce.lightonocr3_norm", rows.lightonocr3NormRegion()),
+    metal("reduce.lightonocr3_norm_cached", rows.lightonocr3CachedRegion()),
+    metal("reduce.sample", sample.metalRegion()),
+};
