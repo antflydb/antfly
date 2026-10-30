@@ -1047,7 +1047,7 @@ pub const ReadSet = struct {
                     // Prefetch is advisory. A parallel scratch quota decline
                     // must not turn a readable scalar query into a failure.
                     // Joined work and worst-case physical reservations survive.
-                    if (err == error.CypherMemoryBudgetExceeded) {
+                    if (err == error.CypherMemoryBudgetExceeded or err == error.OutOfMemory) {
                         for (wave.jobs[0..width]) |job| if (job.err) |failure| {
                             if (failure != error.OutOfMemory and failure != error.CypherMemoryBudgetExceeded and failure != error.CypherStateBudgetExceeded and failure != error.CypherAnchorBudgetExceeded) return failure;
                         };

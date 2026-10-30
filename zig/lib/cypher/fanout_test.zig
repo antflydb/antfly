@@ -721,21 +721,26 @@ test "adjacency waves retain original first owner and charge speculative pages" 
         // Concurrent scratch pressure declines prefetch and keeps the scalar
         // path available. Every started owner is joined and physical attempts
         // retain their bounded reservations. Authority errors still win.
-        if (!skew) for ([_]bool{ false, true }) |forbidden| {
-            f.memory = true;
-            f.forbidden = forbidden;
-            var quota: @import("budget.zig") = .{ .backing = std.testing.allocator, .limit = 128 << 10 };
-            var limited = std.heap.ArenaAllocator.init(quota.allocator());
-            defer limited.deinit();
-            const attempt = backend.vtable.expand_many.?(backend.ptr, limited.allocator(), mapping, &.{.{ .table = "docs", .key = "a" }}, .out, 128, 4096);
-            if (forbidden) {
-                try std.testing.expectError(error.Forbidden, attempt);
-            } else {
-                const declined = (try attempt).?;
-                try std.testing.expect(declined.pages[0] == null);
-                try std.testing.expect(declined.examined > 0 and declined.examined <= 4096);
+        if (!skew) for ([_]bool{ false, true }) |wrapped| {
+            for ([_]bool{ false, true }) |forbidden| {
+                f.memory = true;
+                f.forbidden = forbidden;
+                var quota: @import("budget.zig") = .{ .backing = std.testing.allocator, .limit = 128 << 10 };
+                // A foreign runtime's allocator vtable cannot be recognized as a
+                // local Budget. A second wrapper models that opaque boundary.
+                var foreign: b.FanoutAllocator = .{ .backing = quota.allocator(), .io = threaded.io() };
+                var limited = std.heap.ArenaAllocator.init(if (wrapped) foreign.allocator() else quota.allocator());
+                defer limited.deinit();
+                const attempt = backend.vtable.expand_many.?(backend.ptr, limited.allocator(), mapping, &.{.{ .table = "docs", .key = "a" }}, .out, 128, 4096);
+                if (forbidden) {
+                    try std.testing.expectError(error.Forbidden, attempt);
+                } else {
+                    const declined = (try attempt).?;
+                    try std.testing.expect(declined.pages[0] == null);
+                    try std.testing.expect(declined.examined > 0 and declined.examined <= 4096);
+                }
+                try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.acquire));
             }
-            try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.acquire));
         };
         f.memory = false;
         f.forbidden = false;
