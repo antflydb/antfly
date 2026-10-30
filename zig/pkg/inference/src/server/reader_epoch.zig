@@ -486,7 +486,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (comptime build_options.enable_metal) {
                 if (cb.kind() == .metal) {
                     const M = @import("../ops/metal_compute.zig").MetalCompute;
-                    try M.setLightOnPreparedRows(&cb, ctx.features.prepared_rows);
+                    if (ctx.features.preparedRowCapacity()) |rows| try M.setLightOnPreparedRows(&cb, rows);
                     try M.setLightOnActivationPoolConfigured(&cb, ctx.features.activation_pool, ctx.features.prefill_activation_pool);
                     try M.setLightOnSharedCoreWeights(&cb, ctx.features.epoch_auxiliary and ctx.features.shared_core_weights);
                     try M.setLightOnStreamFirstLayers(&cb, ctx.features.stream_first_layers);
