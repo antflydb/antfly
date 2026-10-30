@@ -170,7 +170,7 @@ with antfly_embedded.create("agent.aflite") as db:
     print(memory("recall", {"subject": "production", "token_budget": 4096}))
 ```
 
-Against a server, the Python SDK uses the same action names: `AntflyClient(url).memory.execute("agent", "recall", body={...})`. MCP clients reach these actions as tools at `/memory/v1/mcp`.
+Against a server, the Python SDK uses the same action names: `AntflyClient(url).memory.execute("agent", "recall", body={...})`. MCP clients reach these actions as tools at `/memory/v1/mcp`. The full contract, covering evidence and temporal policy, identity and supersession judging, provenance, and recorded explanations, is in [MEMORY.md](https://github.com/antflydb/antfly/blob/main/zig/MEMORY.md).
 
 ## Tradeoffs
 
@@ -178,7 +178,7 @@ The decision you own is which claims are facts with one current value. Declare a
 
 Evidence IDs name immutable source versions. When a runbook changes, record the new version under a new evidence ID rather than editing the old one, so explanations keep pointing at what the agent actually read.
 
-This guide has the agent write its own claims. Spaces can also extract and judge claims with a model; [Codex on Antfly](https://github.com/antflydb/codex/blob/antfly/integration/ANTFLY_INTEGRATION.md) does that, building a knowledge graph of decisions and lessons from each session, and runs embedded or against a server from one setting.
+This guide has the agent write its own claims. Spaces can also extract and judge claims with a model; [Codex on Antfly](https://github.com/antflydb/codex/blob/antfly/integration/ANTFLY_INTEGRATION.md) does that, building a knowledge graph of decisions and lessons from each session. It also records each tool-approval verdict with its outcome so later approvals can follow precedent, indexes session history for search, and runs embedded or against a server from one setting.
 
 ## Use Agent Skills
 
