@@ -228,12 +228,10 @@ A JavaScript prefetch followed by a newly anchored native certificate is not
 correct: the certificate must bind an anchor preceding the I/O. This continuation
 protocol is not implemented or claimed as part of the measured result here.
 
-Next run the frozen candidate on the original paired hosted offered workload,
-measure compute/storage placement separately, and require complete independent
-whole-window diagnostics before proceeding to the three hour-long trials and
-100 physical cold samples. The new disposable scope is described in
-[the hosted proposal](cloudflare-twofold-trial.md); credential/cleanup approval
-is pending. No new cloud resources were deployed for these local experiments.
+The frozen candidate has now run on the original paired hosted offered workload;
+see the hosted results below and [the deployment record](cloudflare-twofold-trial.md).
+Complete independent whole-window diagnostics and passing rehearsal latency are
+still required before three hour-long trials and 100 physical cold samples.
 The historical live `SQLITE_NOMEM` and the hosted gate remain unresolved.
 
 The local work is sealed at
@@ -249,3 +247,28 @@ corrected audit; it did not indicate missing experimental evidence. The older
 163-artifact availability gap remains historical. Guarded `make gc` was attempted
 after the build/test sessions and skipped because a native build was active or
 process inspection was unavailable; no guard was bypassed.
+
+
+## Hosted follow-up
+
+The frozen candidate completed the original 180-second offered workload:
+read p95 1,922 ms versus control 9,766 ms; write p95 1,507 ms versus 11,723 ms.
+Both sides verified 2,052 bodies and eight receipt replays, with no final client
+errors. Six candidate logical reads retried (78 attempts for 72 samples).
+Write passes the unchanged 3,000 ms target; read fails the 1,000 ms target.
+This does not establish another twofold gain over the previous candidate.
+
+Selected hosted traces have zero metadata/point queue wait and substantial
+native I/O: one expired/rebased observation spends 1,444 ms across 18 GETs and
+11 waves; another read spends 832 ms in admission and 773 ms in lookup. Thus
+reducing checkpoint/recovery dependencies and point-read I/O takes priority over
+assuming resumable observation alone will halve hosted latency. Selected cold
+short tails still prefetch eight slots. The existing `read_prefix` hint selects
+an inline row and does not cause a metadata tree scan.
+
+The independent collector exhausted its original aggregate deadline after six
+first-pass source catalogs. Late preservation of two missing sources does not
+supply a complete second observation or repair the original failure. Whole-window
+resource coverage, historical `SQLITE_NOMEM` and the hosted gate remain open.
+[The hosted record](cloudflare-twofold-trial.md) retains the report hash,
+placement measurements, deployed artifact closure and cleanup status.

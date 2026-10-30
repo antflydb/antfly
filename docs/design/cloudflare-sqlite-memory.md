@@ -521,8 +521,15 @@ pool despite having no warm prefetch; resumable native metadata I/O is a
 possible next architectural step, with a pre-I/O authenticated clock anchor.
 It is not implemented or claimed as a measured gain here.
 
-The revised disposable hosted pair is prepared locally, with its original
-undeployed proposal preserved. No new cloud resources were created. Hosted
-latency, independent whole-window diagnostics, placement qualification and the
-historical allocator error remain unresolved; named token/cleanup authorization
-for the new deployment is pending. The original gate remains unpassed.
+The revised disposable hosted pair was approved, deployed and measured; its
+original undeployed proposal remains preserved. The 180-second rehearsal passes
+exact-body/receipt checks on both sides, but candidate read p95 is 1,922 ms
+against the unchanged 1,000 ms target; write p95 is 1,507 ms against 3,000 ms.
+The independent collector exhausted its original ten-minute aggregate deadline
+after six first-pass source catalogs, before a complete second observation.
+Two missing sources were preserved afterward as explicitly non-qualifying
+postmortem captures; they do not repair that original failure. Client resource
+errors and captured observer resource failures are empty, but coverage remains
+incomplete. This does not demonstrate that `SQLITE_NOMEM` is fixed.
+See [the hosted result](cloudflare-twofold-trial.md) for provenance, placement,
+selected native I/O traces and cleanup inventory. The original gate remains unpassed.

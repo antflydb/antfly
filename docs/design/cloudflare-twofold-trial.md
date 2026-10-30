@@ -1,4 +1,4 @@
-# Next disposable latency rehearsal
+# Disposable latency rehearsal and results
 
 The re-sealed pair uses the previously approved corrected control `c44896ac8c`
 and candidate production source `e8591354d3`. The revised policy passes local
@@ -8,13 +8,13 @@ checks (two live-provider skips), 34 focused journal tests, 18 app cases and all
 an overall app gain or a gate pass. The original eager-prefetch proposal is
 preserved without credential files at
 `dist/qualification/twofold-original-hosted-proposal` under the example.
-Resource names and the pending disposable-token authorization scope are unchanged.
+The named disposable tokens were approved and installed for this run.
 
 This is a short diagnostic
 rehearsal with the original offered workload, exact-body/receipt checks,
 independent whole-window evidence, and unchanged qualification thresholds.
 It cannot substitute for the three hour-long trials and cold samples.
-No resources have been deployed by this preparation.
+The approved pair and observer were deployed and the rehearsal completed.
 
 The locally built and verified configuration/bundle closure is in
 `examples/cloudflare-serverless/dist/qualification/gate-mvvfqcgjb124/gate.json`.
@@ -27,7 +27,7 @@ and `fa7e6af392149a884443f1bf27ffad5336d40ff46a7ed9c4ad6f892ef8d35c49`.
 The candidate retains the previous hosted feature configuration; affinity and
 write read-ahead remain disabled because local comparisons show no consistent benefit.
 
-The independent observer is prepared and locally sealed at
+The independent observer was sealed and deployed from
 `examples/cloudflare-serverless/dist/qualification/antfly-1278-observe-mvvfupn619ef/run.json`.
 Its bundle SHA-256 is
 `2eec19d4eb0f24170f5fc73c012732f14686795f592ade0a480af087100418e1`.
@@ -51,8 +51,90 @@ The concrete scope is:
   export destinations/attachments. Retain sanitized reports and bundles locally
   and independently verify the final resource inventory.
 
-The older named deployment has already been deleted; its token and cleanup
-approval does not name these new resources. Credential upload and permanent
-cleanup need authorization for this concrete scope before starting the hosted
-rehearsal. Local qualification continues independently. The historical live
-`SQLITE_NOMEM` remains unreproduced and is not relabeled as fixed.
+The user approved the named disposable-token uploads and cleanup. The historical
+live `SQLITE_NOMEM` remains unreproduced and is not relabeled as fixed.
+
+## Hosted result, 2026-10-30
+
+The unchanged 180-second offered workload completed under execution
+`d27f844b-432f-403f-81be-386b47087cea`, driver source `7728dfb982`.
+Both sides verified 2,052 exact bodies and eight receipt replays. Each side has
+72 logical measured reads and 24 writes; six candidate reads retried, producing
+78 physical read attempts. Final client errors/resource errors are empty.
+Retries remain included in the reported logical latency.
+
+| Hosted p95 | Corrected control | Candidate | Original target | Result |
+| --- | ---: | ---: | ---: | --- |
+| Read | 9,766 ms | 1,922 ms | 1,000 ms | Fail |
+| Write | 11,723 ms | 1,507 ms | 3,000 ms | Pass |
+
+Candidate read/write p50 are 896/1,004 ms. This is substantially faster than the
+frozen corrected control, but does not establish another twofold improvement
+over the previous candidate. Its earlier hosted p95 was 1,508/2,087 ms: reads
+are slower here, writes about 28% faster, and deployment/placement differ.
+The rehearsal and the overall gate remain failed; this short run does not
+replace the three hour-long trials or 100 physical cold samples.
+
+The independent collector honored its original ten-minute aggregate deadline.
+It saved six first-pass source catalogs but did not complete all eight sources
+and a second observation. The first writer catalog alone took 215,658 ms.
+There was no forced interruption. Missing candidate app/builder sources were
+preserved afterward as explicitly non-qualifying postmortem evidence. That
+late preservation does not amend the original report or repair completeness.
+Captured observer resource failures are empty, but incomplete coverage cannot
+rule out resource errors or close the historical live `SQLITE_NOMEM`.
+
+The original report is retained at
+`examples/cloudflare-serverless/dist/qualification/antfly-1278-observe-mvvfupn619ef/rehearsal-d27f844b-432f-403f-81be-386b47087cea/report.json`,
+SHA-256 `8a2924acbce630790a9c74a1ebd301aca4f0a5cf302fd42e1f3d4ee55e598eeb`.
+`deployment-snapshot` under the observer directory retains tested versions,
+configurations and bundled modules before cleanup changes lifecycle files.
+
+The separate placement probe restored all four reviewed candidate configurations
+before the workload. App colo was LAX; actual bucket/actor geography remains
+unverified. Five storage HEAD probes per role had app/writer/reader/builder
+median 84/87/86/64 ms and p95 214/139/96/75 ms. These are diagnostic probes,
+not proof of colocation or physical-cold qualification samples.
+
+Selected first/last measured-minute archives retain 86 sanitized native Tail
+objects and 264 derived events, with explicit incomplete-window labeling.
+An expired/rebased metadata observation took 1,444 ms, all in native I/O, with
+zero observation queue wait, seven followed slots, 18 physical GETs and 11 I/O
+waves. Nine reported transport errors include expected missing end/speculative
+slots; they are not nine network failures. Other selected expired observations
+needed five to seven serial waves; cold observations fetched eight speculative
+slots after only two or three positive slots. Another read spent 832 ms in
+admission and 773 ms in native lookup, with zero point-kernel queue wait.
+Do not attribute this hosted bottleneck to the shared WASM queue merely because
+that queue dominated an earlier local case. The native `read_prefix` hint only
+selects an existing inline row; it does not scan the metadata tree.
+
+The next implementation should reduce dependent storage work: repair checkpoint
+lag, evaluate a shared native authenticated serving projection/seekable recovery
+index, and bound short-tail cold/expired speculation using measured fixtures.
+Keep owner/epoch/GC fences, typed revisions, the pre-I/O clock anchor, fresh end
+validation and cumulative memory/I/O budgets. Point lookup I/O is a separate
+remaining cost. Measure placement separately. Resumable observation is useful
+where queue traces warrant it, but alone cannot remove these serial I/O waves.
+For diagnostics, improve closed-window evidence preparation/serving throughput
+under the existing memory and page caps; raising deadlines or promoting selected
+minutes would not pass the original gate. None of these additional architectural
+changes is claimed as implemented or measured by this rehearsal.
+
+
+Cleanup is complete. Independent inventory verifies absence of all 11 Workers,
+six Durable Object namespaces, four Queues/DLQs and four R2 buckets; no other
+`antfly-1278-*` test resources remain. Two export destinations were deleted.
+The observer drain was resumed after two connection resets; both failure logs
+remain preserved. A subsequent exact-name cleanup confirmation resolved the
+automatic review's inability to associate the earlier approval with this scope.
+
+The hosted closure is independently sealed at
+`examples/cloudflare-serverless/dist/qualification/twofold-hosted-1793401520945/evidence.json`:
+516 verified artifacts / 309,329,416 bytes, including all 224 referenced window
+files, frozen deployed bundles/configurations, original report, selected archives,
+postmortem captures, lifecycle failures and cleanup inventories. Manifest SHA-256
+`b3a3ffdeb04f5f552386ed94c0c7de44ee22f1d60f9a595c168c4b20797fa718`.
+Credential files are excluded; the pre-cleanup scan found no disposable token
+values in 335 report/source/log files. Original local and historical hosted
+closures remain separate and unchanged.
