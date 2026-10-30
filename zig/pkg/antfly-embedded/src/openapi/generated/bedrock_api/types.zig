@@ -1695,7 +1695,7 @@ pub const ConverseRequestBody = struct {
     /// <p>Configuration information for a guardrail that you want to use in the request. If you include <code>guardContent</code> blocks in the <code>content</code> field in the <code>messages</code> field, the guardrail operates only on those messages. If you include no <code>guardContent</code> blocks, the guardrail operates on all messages in the request body and in any included prompt resource.</p>
     guardrail_config: ?GuardrailConfiguration = null,
     /// <p>Additional inference parameters that the model supports, beyond the base set of inference parameters that <code>Converse</code> and <code>ConverseStream</code> support in the <code>inferenceConfig</code> field. For more information, see <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html">Model parameters</a>.</p>
-    additional_model_request_fields: ?Document = null,
+    additional_model_request_fields: OpenApiOptionalNullable(Document) = .absent,
     /// <p>Contains a map of variables in a prompt from Prompt management to objects containing the values to fill in for them when running model invocation. This field is ignored if you don't specify a prompt resource in the <code>modelId</code> field.</p>
     prompt_variables: ?PromptVariableMap = null,
     /// <p>Additional model parameters field paths to return in the response. <code>Converse</code> and <code>ConverseStream</code> return the requested fields as a JSON Pointer object in the <code>additionalModelResponseFields</code> field. The following is example JSON for <code>additionalModelResponseFieldPaths</code>.</p> <p> <code>[ "/stop_sequence" ]</code> </p> <p>For information about the JSON Pointer syntax, see the <a href="https://datatracker.ietf.org/doc/html/rfc6901">Internet Engineering Task Force (IETF)</a> documentation.</p> <p> <code>Converse</code> and <code>ConverseStream</code> reject an empty JSON Pointer or incorrectly structured JSON Pointer with a <code>400</code> error code. if the JSON Pointer is valid, but the requested field is not in the model response, it is ignored by <code>Converse</code>.</p>
@@ -1716,7 +1716,7 @@ pub const ConverseRequestBody = struct {
         .{ "inferenceConfig", "inference_config", true },
         .{ "toolConfig", "tool_config", true },
         .{ "guardrailConfig", "guardrail_config", true },
-        .{ "additionalModelRequestFields", "additional_model_request_fields", true },
+        .{ "additionalModelRequestFields", "additional_model_request_fields", false },
         .{ "promptVariables", "prompt_variables", true },
         .{ "additionalModelResponseFieldPaths", "additional_model_response_field_paths", true },
         .{ "requestMetadata", "request_metadata", true },
@@ -1755,9 +1755,16 @@ pub const ConverseRequestBody = struct {
             try jw.objectField("guardrailConfig");
             try jw.write(value);
         }
-        if (self.additional_model_request_fields) |value| {
-            try jw.objectField("additionalModelRequestFields");
-            try jw.write(value);
+        switch (self.additional_model_request_fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("additionalModelRequestFields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("additionalModelRequestFields");
+                try jw.write(value);
+            },
         }
         if (self.prompt_variables) |value| {
             try jw.objectField("promptVariables");
@@ -1797,7 +1804,7 @@ pub const ConverseResponse = struct {
     /// <p>Metrics for the call to <code>Converse</code>.</p>
     metrics: ConverseMetrics,
     /// <p>Additional fields in the response that are unique to the model. </p>
-    additional_model_response_fields: ?Document = null,
+    additional_model_response_fields: OpenApiOptionalNullable(Document) = .absent,
     /// <p>A trace object that contains information about the Guardrail behavior.</p>
     trace: ?ConverseTrace = null,
     /// <p>Model performance settings for the request.</p>
@@ -1811,7 +1818,7 @@ pub const ConverseResponse = struct {
         .{ "stopReason", "stop_reason", false },
         .{ "usage", "usage", false },
         .{ "metrics", "metrics", false },
-        .{ "additionalModelResponseFields", "additional_model_response_fields", true },
+        .{ "additionalModelResponseFields", "additional_model_response_fields", false },
         .{ "trace", "trace", true },
         .{ "performanceConfig", "performance_config", true },
         .{ "serviceTier", "service_tier", true },
@@ -1835,9 +1842,16 @@ pub const ConverseResponse = struct {
         try jw.write(self.usage);
         try jw.objectField("metrics");
         try jw.write(self.metrics);
-        if (self.additional_model_response_fields) |value| {
-            try jw.objectField("additionalModelResponseFields");
-            try jw.write(value);
+        switch (self.additional_model_response_fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("additionalModelResponseFields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("additionalModelResponseFields");
+                try jw.write(value);
+            },
         }
         if (self.trace) |value| {
             try jw.objectField("trace");
@@ -2314,7 +2328,7 @@ pub const ConverseStreamRequestBody = struct {
     /// <p>Configuration information for a guardrail that you want to use in the request. If you include <code>guardContent</code> blocks in the <code>content</code> field in the <code>messages</code> field, the guardrail operates only on those messages. If you include no <code>guardContent</code> blocks, the guardrail operates on all messages in the request body and in any included prompt resource.</p>
     guardrail_config: ?GuardrailStreamConfiguration = null,
     /// <p>Additional inference parameters that the model supports, beyond the base set of inference parameters that <code>Converse</code> and <code>ConverseStream</code> support in the <code>inferenceConfig</code> field. For more information, see <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html">Model parameters</a>.</p>
-    additional_model_request_fields: ?Document = null,
+    additional_model_request_fields: OpenApiOptionalNullable(Document) = .absent,
     /// <p>Contains a map of variables in a prompt from Prompt management to objects containing the values to fill in for them when running model invocation. This field is ignored if you don't specify a prompt resource in the <code>modelId</code> field.</p>
     prompt_variables: ?PromptVariableMap = null,
     /// <p>Additional model parameters field paths to return in the response. <code>Converse</code> and <code>ConverseStream</code> return the requested fields as a JSON Pointer object in the <code>additionalModelResponseFields</code> field. The following is example JSON for <code>additionalModelResponseFieldPaths</code>.</p> <p> <code>[ "/stop_sequence" ]</code> </p> <p>For information about the JSON Pointer syntax, see the <a href="https://datatracker.ietf.org/doc/html/rfc6901">Internet Engineering Task Force (IETF)</a> documentation.</p> <p> <code>Converse</code> and <code>ConverseStream</code> reject an empty JSON Pointer or incorrectly structured JSON Pointer with a <code>400</code> error code. if the JSON Pointer is valid, but the requested field is not in the model response, it is ignored by <code>Converse</code>.</p>
@@ -2335,7 +2349,7 @@ pub const ConverseStreamRequestBody = struct {
         .{ "inferenceConfig", "inference_config", true },
         .{ "toolConfig", "tool_config", true },
         .{ "guardrailConfig", "guardrail_config", true },
-        .{ "additionalModelRequestFields", "additional_model_request_fields", true },
+        .{ "additionalModelRequestFields", "additional_model_request_fields", false },
         .{ "promptVariables", "prompt_variables", true },
         .{ "additionalModelResponseFieldPaths", "additional_model_response_field_paths", true },
         .{ "requestMetadata", "request_metadata", true },
@@ -2374,9 +2388,16 @@ pub const ConverseStreamRequestBody = struct {
             try jw.objectField("guardrailConfig");
             try jw.write(value);
         }
-        if (self.additional_model_request_fields) |value| {
-            try jw.objectField("additionalModelRequestFields");
-            try jw.write(value);
+        switch (self.additional_model_request_fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("additionalModelRequestFields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("additionalModelRequestFields");
+                try jw.write(value);
+            },
         }
         if (self.prompt_variables) |value| {
             try jw.objectField("promptVariables");
@@ -5585,12 +5606,12 @@ pub const MessageStopEvent = struct {
     /// <p>The reason why the model stopped generating output.</p>
     stop_reason: StopReason,
     /// <p>The additional model response fields.</p>
-    additional_model_response_fields: ?Document = null,
+    additional_model_response_fields: OpenApiOptionalNullable(Document) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "stopReason", "stop_reason", false },
-        .{ "additionalModelResponseFields", "additional_model_response_fields", true },
+        .{ "additionalModelResponseFields", "additional_model_response_fields", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5605,9 +5626,16 @@ pub const MessageStopEvent = struct {
         try jw.beginObject();
         try jw.objectField("stopReason");
         try jw.write(self.stop_reason);
-        if (self.additional_model_response_fields) |value| {
-            try jw.objectField("additionalModelResponseFields");
-            try jw.write(value);
+        switch (self.additional_model_response_fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("additionalModelResponseFields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("additionalModelResponseFields");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -6861,6 +6889,26 @@ pub const ToolInputSchema = union(enum) {
 pub const ToolInputSchemaJsonVariant = struct {
     /// <p>The JSON schema for the tool. For more information, see <a href="https://json-schema.org/understanding-json-schema/reference">JSON Schema Reference</a>.</p>
     json: Document,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "json", "json", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("json");
+        try jw.write(self.json);
+        try jw.endObject();
+    }
 };
 
 pub const ToolName = []const u8;
@@ -7012,6 +7060,26 @@ pub const ToolResultBlockDelta = union(enum) {
 pub const ToolResultBlockDeltaJsonVariant = struct {
     /// <p>The JSON schema for the tool result content block. see <a href="https://json-schema.org/understanding-json-schema/reference">JSON Schema Reference</a>.</p>
     json: Document,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "json", "json", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("json");
+        try jw.write(self.json);
+        try jw.endObject();
+    }
 };
 
 pub const ToolResultBlockDeltaTextVariant = struct {
@@ -7153,6 +7221,26 @@ pub const ToolResultContentBlockImageVariant = struct {
 pub const ToolResultContentBlockJsonVariant = struct {
     /// <p>A tool result that is JSON format data. </p>
     json: Document,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "json", "json", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("json");
+        try jw.write(self.json);
+        try jw.endObject();
+    }
 };
 
 pub const ToolResultContentBlockSearchResultVariant = struct {
@@ -7621,6 +7709,51 @@ pub const WebLocation = struct {
         try jw.endObject();
     }
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.

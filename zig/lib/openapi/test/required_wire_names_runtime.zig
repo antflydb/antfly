@@ -51,3 +51,33 @@ test "closed tagged unions retain one member while nested fields can evolve" {
     , .{ .ignore_unknown_fields = true }));
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(types.ContentUnion, a, "{}", .{ .ignore_unknown_fields = true }));
 }
+
+test "untyped JSON preserves absent null and scalar documents through both parsers" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"requiredDocument\":null}",
+        "{\"requiredDocument\":null,\"optionalDocument\":null,\"inlineDocument\":null}",
+        "{\"requiredDocument\":true,\"optionalDocument\":[1,false],\"inlineDocument\":\"text\"}",
+        "{\"requiredDocument\":{\"nested\":null},\"optionalDocument\":42}",
+    }) |raw| {
+        var json = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer json.deinit();
+        inline for (.{ false, true }) |from_value| {
+            var parsed = if (from_value)
+                try std.json.parseFromValue(types.DocumentEnvelope, a, json.value, .{})
+            else
+                try std.json.parseFromSlice(types.DocumentEnvelope, a, raw, .{});
+            defer parsed.deinit();
+            const serialized = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+            defer a.free(serialized);
+            try std.testing.expectEqualStrings(raw, serialized);
+            if (!json.value.object.contains("optionalDocument")) {
+                try std.testing.expect(parsed.value.optional_document == .absent);
+            } else if (json.value.object.get("optionalDocument").? == .null) {
+                try std.testing.expect(parsed.value.optional_document == .null_value);
+            }
+        }
+    }
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(types.DocumentEnvelope, a, "{}", .{}));
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(types.DocumentEnvelope, a, "{\"requiredDocument\":null,\"objectOnly\":null}", .{}));
+}

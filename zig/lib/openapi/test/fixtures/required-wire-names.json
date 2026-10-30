@@ -77,6 +77,29 @@
             "$ref": "#/components/schemas/ToolVariant"
           }
         ]
+      },
+      "Document": {},
+      "DocumentAlias": {
+        "$ref": "#/components/schemas/Document"
+      },
+      "DocumentEnvelope": {
+        "type": "object",
+        "properties": {
+          "requiredDocument": {
+            "$ref": "#/components/schemas/DocumentAlias"
+          },
+          "optionalDocument": {
+            "$ref": "#/components/schemas/Document"
+          },
+          "inlineDocument": {},
+          "objectOnly": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "requiredDocument"
+        ]
       }
     }
   }

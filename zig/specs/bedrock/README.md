@@ -30,7 +30,9 @@ bodies are assembled from supported fields; both request and response validation
 permit opaque fields inside native blocks for upstream compatibility. The adapter
 still enforces admitted content variants, visible-turn replay matching, known
 field types, and stream lifecycle rules. Serialization retains the original
-request tree, preserving reasoning signatures and document-valued schemas. Generated types
+request tree, preserving reasoning signatures and document-valued schemas. Optional
+JSON documents distinguish omission from explicit null, and retain scalar and
+container values. Generated types
 check field types, required fields, and enums; numeric/string bounds and model
 capabilities still require application-level checks.
 

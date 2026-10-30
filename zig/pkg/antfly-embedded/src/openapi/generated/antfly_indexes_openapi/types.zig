@@ -8824,7 +8824,7 @@ pub const GraphRelationshipPropertyPredicate = struct {
     field: []const u8,
     op: []const u8,
     /// Non-null scalar comparison value. Omit for is_null and is_not_null.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Datetime compares RFC3339 instants rather than string ordering.
     value_type: ?[]const u8 = null,
 
@@ -8832,7 +8832,7 @@ pub const GraphRelationshipPropertyPredicate = struct {
     pub const openApiFieldMetadata = .{
         .{ "field", "field", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "value_type", "value_type", true },
     };
 
@@ -8850,9 +8850,16 @@ pub const GraphRelationshipPropertyPredicate = struct {
         try jw.write(self.field);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.value_type) |value| {
             try jw.objectField("value_type");

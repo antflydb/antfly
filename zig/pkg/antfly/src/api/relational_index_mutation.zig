@@ -55,8 +55,8 @@ pub fn configForDefinition(alloc: std.mem.Allocator, definition: wire.Relational
     };
     const conditions: ?[]const wire.RelationalIndexPredicate = if (definition.where) |where| blk: {
         const copies = try owned.dupe(wire.RelationalIndexPredicate, where);
-        for (copies) |*condition| if (condition.value) |value| {
-            condition.value = try columns.canonicalValue(owned, condition.column, value);
+        for (copies) |*condition| if (condition.value.valueOrNull()) |value| {
+            condition.value = .{ .value = try columns.canonicalValue(owned, condition.column, value) };
         };
         break :blk copies;
     } else null;
@@ -366,7 +366,7 @@ test "relational mutation partial predicates round trip unified indexes with typ
     defer parsed.deinit(alloc);
     const definition = parsed.relational_indexes.?.value[0];
     try std.testing.expectEqual(@as(usize, 2), definition.where.?.len);
-    try std.testing.expectEqualStrings("active", definition.where.?[0].value.?.string);
+    try std.testing.expectEqualStrings("active", definition.where.?[0].value.value.string);
     var columns: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = alloc, .source = .{ .parsed = &parsed } };
     defer columns.deinit();
     const projected = try configForDefinition(alloc, definition, &columns);

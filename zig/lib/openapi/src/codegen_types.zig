@@ -365,6 +365,14 @@ pub const TypeGenerator = struct {
             return;
         }
 
+        // Untyped JSON already carries null as a Value tag. Keep that
+        // representation for references, required fields, and collection items.
+        if (schemaIsUntypedJson(schema)) {
+            if (schema.description) |desc| try self.w.docComment(desc);
+            try self.w.line("pub const {s} = std.json.Value;", .{type_name});
+            return;
+        }
+
         // Component nullability is part of the named schema, not a property of
         // whichever document happens to reference it. Preserve that fact in
         // the generated Zig type so local aliases, array/map values, and mapped
@@ -1144,8 +1152,20 @@ pub const TypeGenerator = struct {
         null_representation: NullRepresentation,
     };
 
+    fn schemaIsUntypedJson(schema: types.Schema) bool {
+        return schema.schema_type == null and
+            schema.enum_values.len == 0 and !schema.enum_has_null and
+            schema.const_value == null and
+            schema.properties.count() == 0 and schema.required.len == 0 and
+            schema.additional_properties == null and schema.items == null and
+            schema.prefix_items.len == 0 and
+            schema.all_of.len == 0 and schema.one_of.len == 0 and schema.any_of.len == 0 and
+            schema.extensions.get("x-zig-type") == null;
+    }
+
     /// Whether a property schema permits JSON null. OpenAPI represents this
     /// through 3.0 `nullable`, a 3.1 type array, or a nullable composition.
+    /// An untyped JSON schema also permits null intrinsically as a Value tag.
     /// Local component aliases are resolved recursively. External schemas are
     /// unknown by construction; callers must preserve required-field presence
     /// conservatively instead of assuming that an unresolved type rejects null.
@@ -1153,6 +1173,10 @@ pub const TypeGenerator = struct {
         const schema = self.resolver.resolveSchema(schema_or_ref) catch return .{
             .nullability = .unknown,
             .null_representation = .unknown,
+        };
+        if (schemaIsUntypedJson(schema)) return .{
+            .nullability = .nullable,
+            .null_representation = .intrinsic,
         };
         const nullability: SchemaNullability = if (schema.isNullable() or nullableOneOfInner(schema.one_of) != null)
             .nullable

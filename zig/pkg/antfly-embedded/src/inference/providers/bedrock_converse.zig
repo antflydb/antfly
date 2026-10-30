@@ -427,6 +427,14 @@ pub fn testConverseWire() !void {
     ;
     var valid = try responseAlloc(a, valid_response);
     defer valid.deinit();
+    // Optional Smithy documents accept JSON null, scalars, and containers.
+    for ([_][]const u8{ "null", "42", "true", "\"value\"", "[1,null]", "{\"nested\":null}" }) |document| {
+        const body = try std.fmt.allocPrint(a, "{{\"additionalModelResponseFields\":{s},{s}", .{ document, valid_response[1..] });
+        defer a.free(body);
+        var with_document = try responseAlloc(a, body);
+        defer with_document.deinit();
+        try std.testing.expectEqualStrings("hi", with_document.content);
+    }
     var malformed = try std.json.parseFromSlice(Value, a, valid_response, .{});
     defer malformed.deinit();
     _ = malformed.value.object.swapRemove("metrics");
